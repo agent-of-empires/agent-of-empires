@@ -93,12 +93,15 @@ base.describe("session delete via sidebar context menu (#1220)", () => {
     try {
       await page.goto(`${serve.baseUrl}/`);
 
-      let deleteSeen = false;
-      await page.route("**/api/workspaces", (route) => {
-        if (route.request().method() === "DELETE") {
-          deleteSeen = true;
-        }
-        return route.continue();
+      await page.evaluate(() => {
+        const original = window.fetch;
+        (window as unknown as { __mutationCalls: number }).__mutationCalls = 0;
+        window.fetch = (...args) => {
+          if (args[1]?.method === "DELETE") {
+            (window as unknown as { __mutationCalls: number }).__mutationCalls += 1;
+          }
+          return original(...args);
+        };
       });
 
       const row = page.locator("[data-testid='sidebar-session-row']");
@@ -112,8 +115,7 @@ base.describe("session delete via sidebar context menu (#1220)", () => {
       await dialog.getByRole("button", { name: "Cancel" }).click();
       await expect(dialog).toBeHidden();
 
-      await page.waitForTimeout(200);
-      expect(deleteSeen).toBe(false);
+      expect(await page.evaluate(() => (window as unknown as { __mutationCalls: number }).__mutationCalls)).toBe(0);
 
       // Session remains listed after the cancel.
       const sessions = await listSessions(serve.baseUrl);
@@ -136,12 +138,15 @@ base.describe("session delete via sidebar context menu (#1220)", () => {
     try {
       await page.goto(`${serve.baseUrl}/`);
 
-      let deleteSeen = false;
-      await page.route("**/api/workspaces", (route) => {
-        if (route.request().method() === "DELETE") {
-          deleteSeen = true;
-        }
-        return route.continue();
+      await page.evaluate(() => {
+        const original = window.fetch;
+        (window as unknown as { __mutationCalls: number }).__mutationCalls = 0;
+        window.fetch = (...args) => {
+          if (args[1]?.method === "DELETE") {
+            (window as unknown as { __mutationCalls: number }).__mutationCalls += 1;
+          }
+          return original(...args);
+        };
       });
 
       const row = page.locator("[data-testid='sidebar-session-row']");
@@ -154,8 +159,7 @@ base.describe("session delete via sidebar context menu (#1220)", () => {
       await page.keyboard.press("Escape");
       await expect(dialog).toBeHidden();
 
-      await page.waitForTimeout(200);
-      expect(deleteSeen).toBe(false);
+      expect(await page.evaluate(() => (window as unknown as { __mutationCalls: number }).__mutationCalls)).toBe(0);
 
       const sessions = await listSessions(serve.baseUrl);
       expect(sessions).toHaveLength(1);

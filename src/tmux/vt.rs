@@ -641,6 +641,8 @@ struct DrainControl {
     next_generation: u64,
     #[cfg(test)]
     before_deadline: Option<TestRendezvous>,
+    #[cfg(test)]
+    next_now: Option<Instant>,
 }
 
 /// Ask the forwarder to put every byte it already read from `pipe-pane` onto
@@ -662,6 +664,10 @@ fn drain_forwarder_with_io(
     };
     #[cfg(test)]
     let before_deadline = control.before_deadline.take();
+    #[cfg(test)]
+    let fixed_now = control.next_now.take();
+    #[cfg(test)]
+    let now = || fixed_now.unwrap_or_else(&now);
     let generation = control.next_generation;
     control.next_generation = control.next_generation.wrapping_add(1);
     let Some(stream) = control.stream.as_mut() else {
@@ -3753,6 +3759,58 @@ pub(crate) fn register_live_for_test(
     channel
 }
 
+#[cfg(all(test, feature = "web"))]
+pub(crate) struct HeldVtDrain {
+    drain: Arc<Mutex<DrainControl>>,
+    original: Option<DrainControl>,
+    peer: UnixStream,
+}
+
+#[cfg(all(test, feature = "web"))]
+impl HeldVtDrain {
+    pub(crate) fn observed_probe(&mut self) -> bool {
+        self.peer
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        matches!(read_drain_frame(&mut self.peer), Ok((DRAIN_PROBE, _)))
+    }
+
+    pub(crate) fn acknowledge_next(&mut self) {
+        use std::io::Write;
+        let mut control = self.drain.lock().unwrap();
+        control.next_now = Some(Instant::now());
+        self.peer
+            .write_all(&drain_frame(DRAIN_ACK, control.next_generation))
+            .expect("queue next native drain ACK before its deadline");
+    }
+}
+
+#[cfg(all(test, feature = "web"))]
+impl Drop for HeldVtDrain {
+    fn drop(&mut self) {
+        *self.drain.lock().unwrap() = self.original.take().unwrap();
+    }
+}
+
+#[cfg(all(test, feature = "web"))]
+impl VtChannel {
+    pub(crate) fn hold_drain_for_test(&self) -> HeldVtDrain {
+        let (stream, peer) = UnixStream::pair().expect("held native drain socket");
+        let original = std::mem::replace(
+            &mut *self.drain.lock().unwrap(),
+            DrainControl {
+                stream: Some(stream),
+                ..DrainControl::default()
+            },
+        );
+        HeldVtDrain {
+            drain: self.drain.clone(),
+            original: Some(original),
+            peer,
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn unregister_for_test(name: &str) {
     REGISTRY.lock().unwrap().remove(name);
@@ -4635,10 +4693,26 @@ mod tests {
             .unwrap()
             .insert(name.clone(), Arc::downgrade(&dead));
 
+        let arm_lock = Arc::new(Mutex::new(()));
+        ARM_LOCKS
+            .lock()
+            .unwrap()
+            .insert(name.clone(), arm_lock.clone());
+        let held_arm = arm_lock.lock().unwrap();
         let n1 = name.clone();
         let t1 = std::thread::spawn(move || VtChannel::acquire(&n1));
         let n2 = name.clone();
         let t2 = std::thread::spawn(move || VtChannel::acquire(&n2));
+        let arrival = Instant::now() + Duration::from_secs(5);
+        while Arc::strong_count(&arm_lock) < 4 {
+            assert!(
+                Instant::now() < arrival,
+                "both acquires must reach the held arm lock"
+            );
+            std::thread::yield_now();
+        }
+        drop(held_arm);
+        drop(arm_lock);
         let r1 = t1.join().expect("thread 1");
         let r2 = t2.join().expect("thread 2");
         assert!(
@@ -4874,6 +4948,35 @@ mod tests {
         };
         assert_eq!(flags & libc::O_NONBLOCK, 0, "input socket must block");
 
+        // Saturate without changing the shared open-file description flags.
+        let mut prefilled = 0;
+        {
+            let mut published = stream.lock().expect("published stream");
+            let fd = published.as_ref().unwrap().as_raw_fd();
+            let fill = [b'p'; 4096];
+            loop {
+                let sent =
+                    unsafe { libc::send(fd, fill.as_ptr().cast(), fill.len(), libc::MSG_DONTWAIT) };
+                if sent < 0 {
+                    assert_eq!(
+                        std::io::Error::last_os_error().kind(),
+                        std::io::ErrorKind::WouldBlock
+                    );
+                    break;
+                }
+                assert!(sent > 0);
+                prefilled += sent as usize;
+            }
+            let input = published.as_mut().unwrap();
+            input
+                .set_write_timeout(Some(Duration::from_millis(20)))
+                .unwrap();
+            assert_eq!(
+                input.write(b"blocked").unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            input.set_write_timeout(None).unwrap();
+        }
         let payload = vec![b'x'; 1024 * 1024];
         let writer_stream = stream.clone();
         let writer_payload = payload.clone();
@@ -4886,9 +4989,12 @@ mod tests {
                 .write_all(&writer_payload)
                 .is_ok()
         });
-        std::thread::sleep(Duration::from_millis(20));
-        peer.set_read_timeout(Some(Duration::from_secs(1)))
+        peer.set_read_timeout(Some(Duration::from_secs(5)))
             .expect("read timeout");
+        let mut prefix = vec![0; prefilled];
+        peer.read_exact(&mut prefix)
+            .expect("drain saturated socket");
+        assert!(prefix.iter().all(|byte| *byte == b'p'));
         let mut received = vec![0; payload.len()];
         peer.read_exact(&mut received)
             .expect("read complete input payload");
@@ -5119,6 +5225,7 @@ mod tests {
             stream: Some(parent_control),
             next_generation: 0,
             before_deadline: None,
+            next_now: None,
         });
         assert_eq!(
             swap_drained_seeded_parser(
@@ -5167,6 +5274,7 @@ mod tests {
             stream: Some(parent_control),
             next_generation: 0,
             before_deadline: Some(before_deadline),
+            next_now: None,
         });
         let parser = Mutex::new(vt100::Parser::new(6, 40, 0));
         let app_cursor = AtomicBool::new(false);
@@ -5271,19 +5379,22 @@ mod tests {
             forwarder_control
                 .write_all(&drain_frame(DRAIN_ACK, generation))
                 .expect("acknowledge retry probe");
-            written_tx.send(()).expect("matching ACK written");
-            let (kind, generation) =
-                read_drain_frame(&mut forwarder_control).expect("receive seed probe");
-            assert_eq!(kind, DRAIN_PROBE);
+            // The final positive seed is not a scheduling test: queue its ACK
+            // before that operation starts its native deadline.
             forwarder_control
-                .write_all(&drain_frame(DRAIN_ACK, generation))
-                .expect("acknowledge seed probe");
+                .write_all(&drain_frame(DRAIN_ACK, generation.wrapping_add(1)))
+                .expect("prequeue seed ACK");
+            written_tx.send(()).expect("matching and seed ACKs written");
+            let (kind, next) =
+                read_drain_frame(&mut forwarder_control).expect("receive seed probe");
+            assert_eq!((kind, next), (DRAIN_PROBE, generation.wrapping_add(1)));
         });
 
         let control = Mutex::new(DrainControl {
             stream: Some(parent_control),
             next_generation: 0,
             before_deadline: None,
+            next_now: None,
         });
         let parser = Mutex::new(vt100::Parser::new(6, 40, 0));
         let app_cursor = AtomicBool::new(false);
@@ -5358,6 +5469,7 @@ mod tests {
             (rejected, written, retry.join())
         });
 
+        control.lock().unwrap().next_now = Some(Instant::now());
         assert_eq!(
             swap_drained_seeded_parser(
                 SeedSink {
@@ -5472,7 +5584,7 @@ mod tests {
         conn.write_all(b"echo-marker").expect("write pane output");
         let (wake_guard, res) = pair
             .1
-            .wait_timeout(guard, Duration::from_secs(5))
+            .wait_timeout_while(guard, Duration::from_secs(5), |generation| *generation == 0)
             .expect("wait");
         // Release the pair's mutex before joining: the reader's exit path
         // notifies the wakeup one last time (death), and that notify takes
@@ -5803,14 +5915,14 @@ mod tests {
         let mut probe = PaneSeedState::default();
         for _ in 0..50 {
             probe = pane_seed_state(&target, &deadline).unwrap_or_default();
-            if probe.cursor_y == 20 {
+            if probe.cursor_y == 20 && probe.cursor_x == 7 {
                 break;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
         assert_eq!(
-            (probe.pane_height, probe.cursor_y),
-            (40, 20),
+            (probe.pane_height, probe.cursor_y, probe.cursor_x),
+            (40, 20, 7),
             "fixture must park the cursor on the prompt row of a 40-row pane"
         );
 
@@ -6010,17 +6122,8 @@ mod tests {
         assert_eq!(held[0].uri, "https://example.com/live");
     }
 
-    /// The install's half of #3818's ordering: it takes the snapshot fence
-    /// before its drain and still holds it inside the swap, where it replaces
-    /// the link table. The reader cannot show this, and the seed's chunk guard
-    /// would keep catching the erase on its own, so a fence narrowed to either
-    /// side would leave `reconcile_links` racing the reader again with nothing
-    /// red.
-    ///
-    /// Probed at both ends, because one end does not imply the other. The
-    /// forwarder probes during the drain, which cannot complete until it
-    /// answers. The link table is then held so the install parks inside the
-    /// swap, and the parser lock going away is the install arriving there.
+    /// Observe the snapshot fence before the native drain deadline and again
+    /// inside the swap, while link reconciliation is held.
     #[test]
     fn an_install_holds_the_snapshot_fence_across_its_swap() {
         use std::io::Write;
@@ -6028,70 +6131,82 @@ mod tests {
         let (_data_reader, data_forwarder) = UnixStream::pair().expect("data pair");
         let (parent_control, mut forwarder_control) = UnixStream::pair().expect("control pair");
         let snapshot = Arc::new(Mutex::new(()));
-        let probed_fence = snapshot.clone();
-        let forwarder = std::thread::spawn(move || {
-            let (kind, generation) =
-                read_drain_frame(&mut forwarder_control).expect("receive drain probe");
-            assert_eq!(kind, DRAIN_PROBE);
-            let fenced = probed_fence.try_lock().is_err();
-            let _ = forwarder_control.write_all(&drain_frame(DRAIN_ACK, generation));
-            fenced
-        });
+        let (before_deadline, entered, resume) = TestRendezvous::new();
 
         let socket = Arc::new(Mutex::new(Some(data_forwarder)));
         let control = Mutex::new(DrainControl {
             stream: Some(parent_control),
             next_generation: 0,
-            before_deadline: None,
+            before_deadline: Some(before_deadline),
+            next_now: Some(Instant::now()),
         });
         let parser = Mutex::new(vt100::Parser::new(6, 40, 0));
         let app_cursor = AtomicBool::new(false);
         let grid_gen = AtomicU64::new(0);
         let links = LinkTable::default();
 
-        // Park the install inside the swap: `reconcile_links` waits on this.
-        let in_swap = links.table.lock().expect("hold the link table");
-        let (result, fenced_in_swap) = std::thread::scope(|scope| {
-            let install = scope.spawn(|| {
-                install_seeded_parser(
-                    SeedSink {
-                        parser: &parser,
-                        app_cursor: &app_cursor,
-                        grid_gen: &grid_gen,
-                        links: &links,
-                    },
-                    None,
-                    b"\x1b]8;;https://example.com/seeded\x1b\\docs\x1b]8;;\x1b\\\r\n",
-                    (40, 6),
-                    SeedGuard {
-                        chunk: None,
-                        pipe: None,
-                    },
-                    SeedInstallFence {
-                        snapshot: Some(&snapshot),
-                        socket: Some(&socket),
-                        control: Some(&control),
-                    },
+        let (result, entered, ack, resumed, reached_swap, fenced_at_drain, fenced_in_swap) =
+            std::thread::scope(|scope| {
+                // These guards must unwind before scope joins a blocked install.
+                let resume = resume;
+                let in_swap = links.table.lock().expect("hold the link table");
+                let install = scope.spawn(|| {
+                    install_seeded_parser(
+                        SeedSink {
+                            parser: &parser,
+                            app_cursor: &app_cursor,
+                            grid_gen: &grid_gen,
+                            links: &links,
+                        },
+                        None,
+                        b"\x1b]8;;https://example.com/seeded\x1b\\docs\x1b]8;;\x1b\\\r\n",
+                        (40, 6),
+                        SeedGuard {
+                            chunk: None,
+                            pipe: None,
+                        },
+                        SeedInstallFence {
+                            snapshot: Some(&snapshot),
+                            socket: Some(&socket),
+                            control: Some(&control),
+                        },
+                    )
+                });
+                let entered = entered.recv_timeout(Duration::from_secs(5));
+                let fenced_at_drain = snapshot.try_lock().is_err();
+                let ack = forwarder_control.write_all(&drain_frame(DRAIN_ACK, 0));
+                let resumed = resume.send(());
+                drop(resume);
+                let arrival = Instant::now() + Duration::from_secs(5);
+                while parser.try_lock().is_ok()
+                    && Instant::now() < arrival
+                    && !install.is_finished()
+                {
+                    std::thread::yield_now();
+                }
+                let reached_swap = parser.try_lock().is_err();
+                let fenced = snapshot.try_lock().is_err();
+                drop(in_swap);
+                (
+                    install.join(),
+                    entered,
+                    ack,
+                    resumed,
+                    reached_swap,
+                    fenced_at_drain,
+                    fenced,
                 )
             });
-            // The install takes the parser lock only inside the swap, so losing
-            // it here is the install past its drain and into the replacement.
-            let arrival = Instant::now() + Duration::from_secs(5);
-            while parser.try_lock().is_ok() {
-                assert!(
-                    Instant::now() < arrival,
-                    "the install never reached the swap"
-                );
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            let fenced = snapshot.try_lock().is_err();
-            drop(in_swap);
-            (install.join().expect("install thread"), fenced)
-        });
+
+        entered.expect("install reached native drain");
+        ack.expect("prequeue native ACK");
+        resumed.expect("release drain");
+        assert!(reached_swap, "the install never reached the swap");
+        let result = result.expect("install thread");
 
         assert_eq!(result, VtRefreshResult::Refreshed);
         assert!(
-            forwarder.join().expect("forwarder thread"),
+            fenced_at_drain,
             "the install must hold the fence across its drain"
         );
         assert!(
@@ -6196,6 +6311,7 @@ mod tests {
             stream: Some(parent_control),
             next_generation: 0,
             before_deadline: None,
+            next_now: None,
         }));
 
         let expected_chunk_seq = chunk_seq.load(Ordering::Acquire);
@@ -6607,6 +6723,10 @@ mod tests {
             1,
             "a queued chunk must remain unsettled until it mutates the parser"
         );
+        assert!(
+            snapshot.try_lock().is_err(),
+            "the reader must hold the snapshot fence while waiting to parse"
+        );
         let (swap_tx, swap_rx) = std::sync::mpsc::channel();
         let swap_parser = parser.clone();
         let swap_snapshot = snapshot.clone();
@@ -6635,10 +6755,8 @@ mod tests {
             );
             swap_tx.send(result).expect("report seed result");
         });
-        assert!(
-            swap_rx.recv_timeout(Duration::from_millis(30)).is_err(),
-            "snapshot must wait for a reader that has received but not parsed a chunk"
-        );
+        // Snapshot ownership was observed before starting the swap, so the
+        // held parser cannot mask a missing reader fence.
         stop.store(true, Ordering::Relaxed);
         drop(parser_guard);
         assert_eq!(

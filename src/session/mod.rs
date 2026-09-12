@@ -89,6 +89,8 @@ pub(crate) use move_journal::{
     record as record_move_journal, MoveJournalEntry, MOVE_JOURNAL_VERSION,
 };
 pub(crate) use storage::acquire_session_identity_lock;
+#[cfg(test)]
+pub(crate) use storage::observe_lock_contention_for_test;
 pub(crate) use storage::{reconcile_profile_duplicates, DuplicateIdReport};
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1061,14 +1063,12 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn favorites_first_flag_round_trips() {
-        let original = favorites_first();
+        let _flag = super::test_support::FavoritesFirstGuard::new();
 
         set_favorites_first(false);
         assert!(!favorites_first());
         set_favorites_first(true);
         assert!(favorites_first());
-
-        set_favorites_first(original);
     }
 
     /// The shipped default is on; the atomic's initial value only matters
@@ -1093,9 +1093,9 @@ mod tests {
     #[serial_test::serial]
     fn test_xdg_config_base_prefers_absolute_xdg_config_home() {
         let temp = tempfile::TempDir::new().unwrap();
-        std::env::set_var("HOME", temp.path());
+        let _home = super::test_support::isolate_home(temp.path());
         let custom = temp.path().join("custom-xdg");
-        std::env::set_var("XDG_CONFIG_HOME", &custom);
+        let _xdg = super::test_support::EnvGuard::set(&[("XDG_CONFIG_HOME", &custom)]);
 
         assert_eq!(xdg_config_base().unwrap(), custom);
         // The global config path is derived from that base on both Linux and
@@ -1108,13 +1108,13 @@ mod tests {
     #[serial_test::serial]
     fn test_xdg_config_base_falls_back_to_home_dot_config() {
         let temp = tempfile::TempDir::new().unwrap();
-        std::env::set_var("HOME", temp.path());
+        let _home = super::test_support::isolate_home(temp.path());
         // A relative (non-absolute) value is ignored per the XDG spec.
-        std::env::set_var("XDG_CONFIG_HOME", "relative/path");
+        let _xdg = super::test_support::EnvGuard::set(&[("XDG_CONFIG_HOME", "relative/path")]);
 
         assert_eq!(xdg_config_base().unwrap(), temp.path().join(".config"));
 
-        std::env::remove_var("XDG_CONFIG_HOME");
+        let _unset = super::test_support::EnvGuard::unset(&["XDG_CONFIG_HOME"]);
         assert_eq!(xdg_config_base().unwrap(), temp.path().join(".config"));
     }
 

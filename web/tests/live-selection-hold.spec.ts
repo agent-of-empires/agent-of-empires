@@ -39,11 +39,7 @@ async function setup(page: Page) {
   await openMobileSidebar(page);
   await clickSidebarSession(page, "pinch-test");
   await page.locator("[data-live-terminal]").waitFor({ state: "visible", timeout: 10_000 });
-  await expect.poll(() => handle.liveMessages.length, { timeout: 5_000 }).toBeGreaterThan(0);
-  // Let the client's opening window/cadence messages settle: the mock answers
-  // each one with a default (normal-screen) frame, which would clobber the
-  // alt-screen frames these tests push.
-  await page.waitForTimeout(400);
+  await handle.waitForLiveReady();
   return handle;
 }
 
@@ -67,21 +63,20 @@ async function selectRow(page: Page, text: string) {
 test("a selection over a full-screen agent survives its repaints", async ({ page }) => {
   const handle = await setup(page);
 
-  handle.pushLiveFrame(altFrame(1));
+  await handle.pushLiveFrame(altFrame(1));
   await expect.poll(() => content(page).textContent()).toContain("line 1");
 
   await selectRow(page, "line 2");
   expect(await selection(page)).toBe("line 2");
 
-  handle.pushLiveFrame(altFrame(2));
-  handle.pushLiveFrame(altFrame(3));
-  await page.waitForTimeout(300);
+  await handle.pushLiveFrame(altFrame(2));
+  await handle.pushLiveFrame(altFrame(3));
   expect(await selection(page)).toBe("line 2");
   await expect(content(page)).toContainText("line 1");
 
   // Letting go releases the hold and the view catches up to the live edge.
   await page.evaluate(() => window.getSelection()?.removeAllRanges());
-  handle.pushLiveFrame(altFrame(4));
+  await handle.pushLiveFrame(altFrame(4));
   await expect.poll(() => content(page).textContent()).toContain("line 6");
 });
 
@@ -92,7 +87,7 @@ test("a selection over a full-screen agent survives its repaints", async ({ page
 // row keys are untouched and the hold above still stands.
 test("a live selection releases the full-screen app's grip on touch gestures", async ({ page }) => {
   const handle = await setup(page);
-  handle.pushLiveFrame({ ...altFrame(1), mouse: true, mouseSgr: true });
+  await handle.pushLiveFrame({ ...altFrame(1), mouse: true, mouseSgr: true });
   await expect.poll(() => content(page).textContent()).toContain("line 1");
 
   const scroller = page.locator("[data-live-terminal] > div").first();

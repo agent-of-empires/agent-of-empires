@@ -13,6 +13,7 @@ import {
   type ServeHandle,
   type SpawnOptions,
 } from "../helpers/aoeServe";
+import { gitEnv } from "../helpers/gitFixture";
 import { clickSidebarSession, openMobileSidebar } from "../helpers/sidebar";
 
 test.use({ ...devices["iPhone 13"] });
@@ -127,7 +128,7 @@ function seedTool(title: string, script: string): SpawnOptions["seedFn"] {
     chmodSync(tool, 0o755);
     const pd = join(e.home, "project");
     mkdirSync(pd, { recursive: true });
-    const initialized = spawnSync("git", ["init", "-q"], { cwd: pd, env: e.env });
+    const initialized = spawnSync("git", ["init", "-q"], { cwd: pd, env: gitEnv(e.env) });
     if (initialized.status !== 0) throw new Error(String(initialized.stderr));
     const r = spawnSync(resolveAoeBinary(), ["add", pd, "-t", title, "-c", "claude", "--cmd-override", tool], {
       env: e.env,

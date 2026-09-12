@@ -12,6 +12,7 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { spawnAoeServe } from "../helpers/aoeServe";
+import { gitEnv } from "../helpers/gitFixture";
 
 const CIVILIZATION_NAMES = [
   "Armenians",
@@ -74,17 +75,8 @@ test("duplicate worktree branch returns the real collision error, not a generic 
     seedFn: ({ home, env }) => {
       const projectDir = join(home, "project");
       mkdirSync(projectDir, { recursive: true });
-      spawnSync("git", ["init", "-q"], { cwd: projectDir, env });
-      spawnSync("git", ["commit", "--allow-empty", "-q", "-m", "init"], {
-        cwd: projectDir,
-        env: {
-          ...env,
-          GIT_AUTHOR_NAME: "t",
-          GIT_AUTHOR_EMAIL: "t@t",
-          GIT_COMMITTER_NAME: "t",
-          GIT_COMMITTER_EMAIL: "t@t",
-        },
-      });
+      spawnSync("git", ["init", "-q"], { cwd: projectDir, env: gitEnv(env) });
+      spawnSync("git", ["commit", "--allow-empty", "-q", "-m", "init"], { cwd: projectDir, env: gitEnv(env) });
     },
   });
 
@@ -127,19 +119,10 @@ test("auto-generated worktree branch avoids civilization branch collisions", asy
     seedFn: ({ home, env }) => {
       const projectDir = join(home, "project");
       mkdirSync(projectDir, { recursive: true });
-      spawnSync("git", ["init", "-q"], { cwd: projectDir, env });
-      spawnSync("git", ["commit", "--allow-empty", "-q", "-m", "init"], {
-        cwd: projectDir,
-        env: {
-          ...env,
-          GIT_AUTHOR_NAME: "t",
-          GIT_AUTHOR_EMAIL: "t@t",
-          GIT_COMMITTER_NAME: "t",
-          GIT_COMMITTER_EMAIL: "t@t",
-        },
-      });
+      spawnSync("git", ["init", "-q"], { cwd: projectDir, env: gitEnv(env) });
+      spawnSync("git", ["commit", "--allow-empty", "-q", "-m", "init"], { cwd: projectDir, env: gitEnv(env) });
       for (const civ of CIVILIZATION_NAMES) {
-        spawnSync("git", ["branch", civ], { cwd: projectDir, env });
+        spawnSync("git", ["branch", civ], { cwd: projectDir, env: gitEnv(env) });
       }
     },
   });

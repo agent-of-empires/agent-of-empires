@@ -481,6 +481,16 @@ pub(crate) fn capture_launched_session_id_blocking(
     timeout: Duration,
     notify: bool,
 ) {
+    capture_launched_session_id_with_wait(inst, file_watch, timeout, notify, std::thread::sleep);
+}
+
+fn capture_launched_session_id_with_wait(
+    inst: &mut Instance,
+    file_watch: &Arc<FileWatchService>,
+    timeout: Duration,
+    notify: bool,
+    mut wait: impl FnMut(Duration),
+) {
     if inst.session_id_poller.is_none() {
         return;
     }
@@ -509,7 +519,7 @@ pub(crate) fn capture_launched_session_id_blocking(
             );
             notified = true;
         }
-        std::thread::sleep(CLI_CAPTURE_POLL_INTERVAL);
+        wait(CLI_CAPTURE_POLL_INTERVAL);
     }
 
     // Stop joins the producer and performs its final poll before this last
@@ -1477,16 +1487,34 @@ mod tests {
         inst.session_id_poller = Some(poller.clone());
 
         let inst_id = inst.id.clone();
-        let injector = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(400));
-            poller.lock().unwrap().inject_test_update(&inst_id, fresh);
-        });
-
+        let mut waited = false;
         let file_watch = FileWatchService::noop();
-        capture_launched_session_id_blocking(&mut inst, &file_watch, Duration::from_secs(5), false);
-        injector.join().unwrap();
+        capture_launched_session_id_with_wait(
+            &mut inst,
+            &file_watch,
+            Duration::from_secs(5),
+            false,
+            |_| {
+                assert!(
+                    !waited,
+                    "the late observation should satisfy the next drain"
+                );
+                waited = true;
+                poller.lock().unwrap().inject_test_update(&inst_id, fresh);
+            },
+        );
+        assert!(
+            waited,
+            "capture must reach its empty-mailbox wait before publication"
+        );
 
         assert_eq!(inst.agent_session_id.as_deref(), Some(fresh));
+        assert_eq!(
+            Storage::new_unwatched(profile).unwrap().load().unwrap()[0]
+                .agent_session_id
+                .as_deref(),
+            Some(fresh)
+        );
     }
 
     #[test]

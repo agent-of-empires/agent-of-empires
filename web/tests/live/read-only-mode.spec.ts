@@ -83,8 +83,7 @@ test("dashboard suppresses mutation UI in read-only", async ({ serveReadOnly, pa
   });
   await page.goto(serveReadOnly.baseUrl);
   await aboutPromise;
-  // Small settle so React commits the serverAbout state from the response.
-  await page.waitForTimeout(200);
+  await expect(page.getByText("This dashboard is in read-only mode.")).toBeVisible();
 
   await page.locator("body").click();
   await page.keyboard.press("n");

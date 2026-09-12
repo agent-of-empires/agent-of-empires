@@ -25,6 +25,7 @@ fn setup_legacy_repo_config(content: &str) -> TempDir {
 }
 
 #[test]
+#[serial_test::parallel]
 fn test_load_repo_config_from_temp_dir() {
     let tmp = setup_repo_config(
         r#"
@@ -49,6 +50,7 @@ default_tool = "claude"
 }
 
 #[test]
+#[serial_test::parallel]
 fn test_load_repo_config_empty_file() {
     let tmp = setup_repo_config("");
     let config =
@@ -57,6 +59,7 @@ fn test_load_repo_config_empty_file() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn test_load_repo_config_comments_only() {
     let tmp = setup_repo_config(agent_of_empires::session::config::repo_config::INIT_TEMPLATE);
     let config = agent_of_empires::session::config::repo_config::load_repo_config(tmp.path())
@@ -72,7 +75,7 @@ fn test_load_repo_config_comments_only() {
 #[serial]
 fn test_trust_untrust_cycle() {
     let temp_home = TempDir::new().unwrap();
-    set_temp_home(temp_home.path());
+    let _home = set_temp_home(temp_home.path());
 
     let project_dir = TempDir::new().unwrap();
     let project_path = project_dir.path();
@@ -99,6 +102,7 @@ fn test_trust_untrust_cycle() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn test_hook_execution_simple_echo() {
     let tmp = TempDir::new().unwrap();
     let marker = tmp.path().join("hook_ran");
@@ -110,6 +114,7 @@ fn test_hook_execution_simple_echo() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn test_hook_execution_failure() {
     let tmp = TempDir::new().unwrap();
     let result = agent_of_empires::session::config::repo_config::execute_hooks(
@@ -121,6 +126,7 @@ fn test_hook_execution_failure() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn test_changed_hooks_invalidate_trust() {
     use agent_of_empires::session::config::repo_config::{compute_hooks_hash, HooksConfig};
 
@@ -149,7 +155,7 @@ fn test_hook_trust_invalidated_on_config_change() {
     };
 
     let temp_home = TempDir::new().unwrap();
-    set_temp_home(temp_home.path());
+    let _home = set_temp_home(temp_home.path());
 
     // Create a repo with hooks
     let repo = setup_repo_config(
@@ -203,7 +209,7 @@ fn test_hook_re_trust_after_change() {
     };
 
     let temp_home = TempDir::new().unwrap();
-    set_temp_home(temp_home.path());
+    let _home = set_temp_home(temp_home.path());
 
     let repo = setup_repo_config(
         r#"
@@ -255,7 +261,7 @@ on_create = ["echo v2"]
 #[serial]
 fn test_repo_sandbox_config_merged_into_resolved_config() {
     let temp_home = TempDir::new().unwrap();
-    set_temp_home(temp_home.path());
+    let _home = set_temp_home(temp_home.path());
 
     let repo = setup_repo_config(
         r#"
@@ -299,7 +305,7 @@ mount_ssh = true
 #[serial]
 fn test_repo_worktree_config_merged_into_resolved_config() {
     let temp_home = TempDir::new().unwrap();
-    set_temp_home(temp_home.path());
+    let _home = set_temp_home(temp_home.path());
 
     let repo = setup_repo_config(
         r#"
@@ -340,7 +346,7 @@ fn test_project_path_that_resolves_to_global_config_is_not_a_repo_config() {
     };
 
     let temp_home = TempDir::new().unwrap();
-    set_temp_home(temp_home.path());
+    let _home = set_temp_home(temp_home.path());
 
     let app_dir = agent_of_empires::session::get_app_dir().unwrap();
     let global_config = app_dir.join("config.toml");
@@ -372,6 +378,7 @@ fn test_project_path_that_resolves_to_global_config_is_not_a_repo_config() {
 
 /// Legacy `.aoe/config.toml` should still be loaded via backwards compat fallback.
 #[test]
+#[serial_test::parallel]
 fn test_legacy_aoe_path_still_loads() {
     let repo = setup_legacy_repo_config(
         r#"
@@ -390,6 +397,7 @@ on_create = ["echo legacy"]
 
 /// New `.agent-of-empires/config.toml` takes priority over legacy `.aoe/config.toml`.
 #[test]
+#[serial_test::parallel]
 fn test_new_path_takes_priority_over_legacy() {
     let tmp = TempDir::new().unwrap();
 
@@ -437,11 +445,10 @@ on_create = ["echo legacy"]
 #[serial]
 fn test_empty_project_path_ignores_the_launch_directory() {
     let tmp = setup_repo_config("[session]\ndefault_tool = \"codex\"\n");
-    let original_dir = std::env::current_dir().unwrap();
-    std::env::set_current_dir(tmp.path()).unwrap();
+    let cwd = crate::common::CwdGuard::set(tmp.path());
     let loaded =
         agent_of_empires::session::config::repo_config::load_repo_config(std::path::Path::new(""));
-    std::env::set_current_dir(original_dir).unwrap();
+    drop(cwd);
 
     assert!(
         loaded.unwrap().is_none(),
@@ -461,13 +468,12 @@ fn test_empty_project_path_ignores_the_launch_directory() {
     )
     .unwrap();
 
-    let original_dir = std::env::current_dir().unwrap();
-    std::env::set_current_dir(worktree.path()).unwrap();
+    let cwd = crate::common::CwdGuard::set(worktree.path());
     let source = agent_of_empires::session::config::repo_config::repo_config_source_path(
         std::path::Path::new(""),
     );
     let loaded = agent_of_empires::session::config::repo_config::load_repo_config(&source);
-    std::env::set_current_dir(original_dir).unwrap();
+    drop(cwd);
 
     assert_eq!(
         source,

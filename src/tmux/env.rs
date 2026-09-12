@@ -583,15 +583,26 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_batch_output_frames_records_against_a_real_tmux() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
+        if !crate::tmux::tmux_command()
+            .arg("-V")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            eprintln!("skipping: tmux unavailable");
+            return;
+        }
         let session = crate::tmux::test_helpers::TmuxTestSession::new("aoe_env_batch_probe");
         let name = session.name();
         let created = crate::tmux::tmux_command()
             .args(["new-session", "-d", "-s", name, "sh"])
-            .output();
-        if !created.is_ok_and(|out| out.status.success()) {
-            eprintln!("skipping: tmux unavailable");
-            return;
-        }
+            .output()
+            .expect("create tmux fixture");
+        assert!(
+            created.status.success(),
+            "tmux fixture: {}",
+            String::from_utf8_lossy(&created.stderr)
+        );
 
         set_hidden_env(name, AOE_INSTANCE_ID_KEY, "real-id").unwrap();
         set_hidden_env(name, "ZZZ", "unrelated\nAOE_INSTANCE_ID=spoofed-id").unwrap();
@@ -632,6 +643,15 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_batch_marker_survives_a_sanitized_name_collision() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
+        if !crate::tmux::tmux_command()
+            .arg("-V")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            eprintln!("skipping: tmux unavailable");
+            return;
+        }
         let base = format!("aoe_env_collide_{}", std::process::id());
         // `sanitize_session_name` keeps any Unicode alphanumeric, and tmux
         // rewrites the last character of this one to `_`, producing `ascii`.
@@ -641,11 +661,13 @@ mod tests {
         for (session, id) in [(&unicode, "unicode-id"), (&ascii, "ascii-id")] {
             let created = crate::tmux::tmux_command()
                 .args(["new-session", "-d", "-s", session.name(), "sh"])
-                .output();
-            if !created.is_ok_and(|out| out.status.success()) {
-                eprintln!("skipping: tmux unavailable");
-                return;
-            }
+                .output()
+                .expect("create tmux fixture");
+            assert!(
+                created.status.success(),
+                "tmux fixture: {}",
+                String::from_utf8_lossy(&created.stderr)
+            );
             set_hidden_env(session.name(), AOE_INSTANCE_ID_KEY, id).unwrap();
         }
 

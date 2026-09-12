@@ -3,7 +3,7 @@
 // mouse-up must not start a drag; the order stays put and no PUT
 // flies. Locks the 8px threshold from drifting (#1419).
 
-import { test, expect } from "./helpers/mockedTest";
+import { test, expect, publishedRequests, observeFor } from "./helpers/mockedTest";
 import { installSidebarMocks, threeSessionsInOneRepo } from "./helpers/sidebarMocks";
 
 test("4px movement does not start a drag", async ({ page }) => {
@@ -33,7 +33,10 @@ test("4px movement does not start a drag", async ({ page }) => {
 
   // Give the sensor a tick; a regression that drops the threshold
   // check would still fire onDragEnd inside this window.
-  await page.waitForTimeout(200);
+  await observeFor(page, 200, async () => {
+    expect(await publishedRequests(page, "/api/workspace-ordering", "PUT")).toEqual([]);
+    expect(handle.puts).toEqual([]);
+  });
 
   const afterOrder = await wrappers.evaluateAll((els) =>
     els.map((el) => el.querySelector("span.truncate[title]")?.getAttribute("title") ?? ""),

@@ -55,16 +55,35 @@ fn assert_contains_in_order(haystack: &str, needles: &[&str]) {
 
 /// Test that tmux sessions can be created and killed
 #[test]
+#[serial_test::parallel]
 fn test_tmux_session_lifecycle() {
     if !tmux_available() {
         eprintln!("Skipping test: tmux not available");
         return;
     }
 
-    let session_name = "aoe_test_lifecycle_12345678";
+    struct Server(tempfile::TempDir);
+    impl Server {
+        fn command(&self) -> Command {
+            let mut command = Command::new("tmux");
+            command.arg("-S").arg(self.0.path().join("tmux.sock"));
+            command
+                .env("HOME", self.0.path())
+                .env("XDG_CONFIG_HOME", self.0.path().join(".config"));
+            command
+        }
+    }
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = self.command().arg("kill-server").output();
+        }
+    }
+    let server = Server(tempfile::tempdir().expect("private tmux server"));
+    let session_name = "lifecycle";
 
     // Create a detached session
-    let create = Command::new("tmux")
+    let create = server
+        .command()
         .args(["new-session", "-d", "-s", session_name])
         .output()
         .expect("Failed to create tmux session");
@@ -72,7 +91,8 @@ fn test_tmux_session_lifecycle() {
     assert!(create.status.success(), "Failed to create test session");
 
     // Verify session exists
-    let check = Command::new("tmux")
+    let check = server
+        .command()
         .args(["has-session", "-t", session_name])
         .output()
         .expect("Failed to check session");
@@ -83,7 +103,8 @@ fn test_tmux_session_lifecycle() {
     );
 
     // Kill session
-    let kill = Command::new("tmux")
+    let kill = server
+        .command()
         .args(["kill-session", "-t", session_name])
         .output()
         .expect("Failed to kill session");
@@ -91,7 +112,8 @@ fn test_tmux_session_lifecycle() {
     assert!(kill.status.success(), "Failed to kill test session");
 
     // Verify session no longer exists
-    let check_after = Command::new("tmux")
+    let check_after = server
+        .command()
         .args(["has-session", "-t", session_name])
         .output()
         .expect("Failed to check session");
@@ -104,6 +126,7 @@ fn test_tmux_session_lifecycle() {
 
 /// Test that session names are properly sanitized
 #[test]
+#[serial_test::parallel]
 fn test_session_name_format() {
     let prefix = "aoe_";
 
@@ -125,6 +148,7 @@ fn test_session_name_format() {
 /// The chrome math and worker behavior have direct tests; this guards the
 /// cross-module wiring.
 #[test]
+#[serial_test::parallel]
 fn test_live_send_resize_uses_chrome_aware_resize_window() {
     let dispatch =
         std::fs::read_to_string("src/tui/home/live_send.rs").expect("Failed to read live_send.rs");
@@ -167,6 +191,7 @@ fn test_live_send_resize_uses_chrome_aware_resize_window() {
 /// alternate screen are restored so the fresh reader is born into raw
 /// mode rather than attached to a briefly-cooked tty.
 #[test]
+#[serial_test::parallel]
 fn test_terminal_mode_sequence_documented() {
     let source = std::fs::read_to_string("src/tui/app.rs").expect("Failed to read app.rs");
     let helper_body = app_method_body(&source, "with_raw_mode_disabled");
@@ -204,6 +229,7 @@ fn test_terminal_mode_sequence_documented() {
 /// Attach paths go through `with_attached_status_hooks`, which wraps that
 /// helper while polling status hooks during a blocked tmux attach.
 #[test]
+#[serial_test::parallel]
 fn test_attach_uses_terminal_backend() {
     let source = std::fs::read_to_string("src/tui/app.rs").expect("Failed to read app.rs");
 
@@ -253,6 +279,7 @@ fn test_attach_uses_terminal_backend() {
 /// terminal. Apply their final snapshot after reload so the next normal
 /// poll sees the same runtime status and does not fire the transition again.
 #[test]
+#[serial_test::parallel]
 fn test_attach_applies_attached_status_snapshot_after_reload() {
     let source = std::fs::read_to_string("src/tui/app.rs").expect("Failed to read app.rs");
 
@@ -270,6 +297,7 @@ fn test_attach_applies_attached_status_snapshot_after_reload() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn test_attach_resets_status_refresh_without_watcher() {
     let source = std::fs::read_to_string("src/tui/app.rs").expect("Failed to read app.rs");
     let attached_status_body = app_method_body(&source, "with_attached_status_hooks");
@@ -293,6 +321,7 @@ fn test_attach_resets_status_refresh_without_watcher() {
 /// user-visible signal. This test guards the wiring that turns the failure
 /// into an `UpdateStatus::transient` toast.
 #[test]
+#[serial_test::parallel]
 fn test_attach_restart_failure_emits_transient_toast() {
     let source = std::fs::read_to_string("src/tui/app.rs").expect("Failed to read app.rs");
 

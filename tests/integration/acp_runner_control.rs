@@ -134,6 +134,7 @@ fn read_frame(stream: &mut UnixStream) -> serde_json::Value {
 /// the test writes an agent-to-client request into the runner (by having the
 /// runner send it to cat), and reads back the response the runner wrote.
 #[test]
+#[serial_test::parallel]
 fn runner_proxies_agent_requests_over_the_control_channel() {
     if cfg!(not(unix)) {
         return;
@@ -308,6 +309,7 @@ fn write_frame(stream: &mut UnixStream, body: &serde_json::Value) {
 /// reading a 17 MiB agent frame must time out without losing it or monopolizing
 /// the accept slot; the next daemon receives the same frame.
 #[test]
+#[serial_test::parallel]
 fn runner_requeues_large_frame_after_stalled_writer() {
     if cfg!(not(unix)) {
         return;
@@ -399,7 +401,7 @@ for line in sys.stdin:
         &mut stalled,
         &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
     );
-    std::thread::sleep(Duration::from_millis(2500));
+    // Replacement receipt below waits for eviction of the stalled writer.
 
     let mut accepted = UnixStream::connect(&control).expect("connect replacement peer");
     accepted
@@ -432,6 +434,7 @@ for line in sys.stdin:
 ///
 /// Asserts the session completes, which it cannot do if the loop parks.
 #[test]
+#[serial_test::parallel]
 fn agent_request_during_session_new_does_not_deadlock_the_runner() {
     if cfg!(not(unix)) {
         return;
@@ -612,6 +615,7 @@ fn find_python3() -> Option<PathBuf> {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn cancelled_attach_reaps_runner_and_replacement_survives_load_fallback() {
     if cfg!(not(unix)) {
         return;
@@ -629,6 +633,7 @@ async fn cancelled_attach_reaps_runner_and_replacement_survives_load_fallback() 
 
     let agent_log = scratch.0.join("agent-methods.log");
     let agent_pid_file = scratch.0.join("agent.pid");
+    let partial_read = scratch.0.join("partial-read");
     let agent_py = scratch.0.join("delayed_agent.py");
     std::fs::write(
         &agent_py,
@@ -692,6 +697,7 @@ for line in sys.stdin:
             .env("AOE_FAKE_AGENT_LOG", &agent_log)
             .env("AOE_FAKE_AGENT_PID", &agent_pid_file)
             .env("AOE_FAKE_INIT_DELAY_MS", delay)
+            .env("AOE_E2E_PARTIAL_FRAME_FILE", &partial_read)
             .env("AOE_FAKE_LOAD_ERROR", if fail_load { "1" } else { "0" })
             .env("AOE_ACP_WATCHDOG_POLL_MS", "5000")
             .spawn()
@@ -784,9 +790,17 @@ for line in sys.stdin:
         "method": "session/load",
         "request": {"sessionId": "stored-codex-thread", "cwd": home.to_str().unwrap()}
     }));
+    let _ = std::fs::remove_file(&partial_read);
     ctl.write_all(&load[..2]).expect("write partial frame");
     ctl.flush().expect("flush partial frame");
-    std::thread::sleep(Duration::from_millis(150));
+    let partial_deadline = Instant::now() + Duration::from_secs(10);
+    while std::fs::read_to_string(&partial_read).ok().as_deref() != Some("2") {
+        assert!(
+            Instant::now() < partial_deadline,
+            "runner did not consume partial header"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert_eq!(read_frame(&mut ctl)["kind"], "initialized");
     ctl.write_all(&load[2..]).expect("finish partial frame");
     ctl.flush().expect("flush completed frame");
@@ -830,6 +844,7 @@ for line in sys.stdin:
 /// second attach replays the cache without touching the agent, and that a
 /// prompt completes natively.
 #[test]
+#[serial_test::parallel]
 fn runner_owns_handshake_and_caches_across_attaches() {
     if cfg!(not(unix)) {
         return;
@@ -1018,6 +1033,7 @@ for line in sys.stdin:
 /// requested id for cancel, and replay the raw response from its handshake
 /// cache without issuing either a second load or a fallback session/new.
 #[test]
+#[serial_test::parallel]
 fn runner_load_uses_requested_id_and_caches_response() {
     if cfg!(not(unix)) {
         return;
@@ -1158,6 +1174,7 @@ fn runner_load_uses_requested_id_and_caches_response() {
 /// direct stdio path does. Guards the startup-error-banner live test at the
 /// runner layer.
 #[test]
+#[serial_test::parallel]
 fn runner_forwards_session_error_data_in_handshake_failed() {
     if cfg!(not(unix)) {
         return;
@@ -1268,6 +1285,7 @@ for line in sys.stdin:
 /// The replacement daemon must wait for an already-sent reset and use its
 /// committed identity, without loading or creating another agent session.
 #[tokio::test]
+#[serial_test::parallel]
 async fn resumed_client_uses_reset_committed_after_reattach() {
     use agent_of_empires::acp::control_protocol::{self, ControlBody};
     use agent_of_empires::acp::state::Event;
@@ -1424,6 +1442,7 @@ for line in sys.stdin:
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn resumed_prompt_completes_only_for_its_own_runner_request() {
     use agent_of_empires::acp::state::Event;
 

@@ -19,6 +19,7 @@ use agent_of_empires::acp::state::{AcpSessionId, Event};
 use crate::common::{shim_path, shim_ready};
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn shim_agent_round_trips_prompt() {
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
@@ -32,7 +33,10 @@ async fn shim_agent_round_trips_prompt() {
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
-            command: "node".into(),
+            command: crate::common::shim_node()
+                .expect("shim prerequisite")
+                .to_string_lossy()
+                .into_owned(),
             args: vec![shim.to_string_lossy().to_string()],
             description: "test shim".into(),
             env_allowlist: None,
@@ -150,6 +154,7 @@ async fn shim_agent_round_trips_prompt() {
 /// Permission round-trip: shim asks for permission, structured view resolves
 /// allow, agent observes the selected option_id and reports back.
 #[tokio::test]
+#[serial_test::parallel]
 async fn shim_agent_round_trips_approval_allow() {
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
@@ -163,7 +168,10 @@ async fn shim_agent_round_trips_approval_allow() {
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
-            command: "node".into(),
+            command: crate::common::shim_node()
+                .expect("shim prerequisite")
+                .to_string_lossy()
+                .into_owned(),
             args: vec![shim.to_string_lossy().to_string()],
             description: "test shim".into(),
             env_allowlist: None,
@@ -258,6 +266,7 @@ async fn shim_agent_round_trips_approval_allow() {
 /// carry those labels, be flagged as a choice, and resolve with the
 /// option the user actually picked instead of the first allow-once.
 #[tokio::test]
+#[serial_test::parallel]
 async fn shim_agent_round_trips_a_question_option_list() {
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
@@ -271,7 +280,10 @@ async fn shim_agent_round_trips_a_question_option_list() {
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
-            command: "node".into(),
+            command: crate::common::shim_node()
+                .expect("shim prerequisite")
+                .to_string_lossy()
+                .into_owned(),
             args: vec![shim.to_string_lossy().to_string()],
             description: "test shim".into(),
             env_allowlist: None,
@@ -361,6 +373,7 @@ async fn shim_agent_round_trips_a_question_option_list() {
 /// option by kind, so a list whose answers are all reject-kind would
 /// send the first one as the user's answer.
 #[tokio::test]
+#[serial_test::parallel]
 async fn shim_agent_sees_a_dismissed_question_as_cancelled() {
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
@@ -374,7 +387,10 @@ async fn shim_agent_sees_a_dismissed_question_as_cancelled() {
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
-            command: "node".into(),
+            command: crate::common::shim_node()
+                .expect("shim prerequisite")
+                .to_string_lossy()
+                .into_owned(),
             args: vec![shim.to_string_lossy().to_string()],
             description: "test shim".into(),
             env_allowlist: None,
@@ -441,6 +457,7 @@ async fn shim_agent_sees_a_dismissed_question_as_cancelled() {
 /// temp dir; aoe handles them via fs_handler with sandbox enforcement;
 /// shim echoes the read content back so we can assert the wire works.
 #[tokio::test]
+#[serial_test::parallel]
 async fn shim_agent_round_trips_fs() {
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
@@ -454,7 +471,10 @@ async fn shim_agent_round_trips_fs() {
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
-            command: "node".into(),
+            command: crate::common::shim_node()
+                .expect("shim prerequisite")
+                .to_string_lossy()
+                .into_owned(),
             args: vec![shim.to_string_lossy().to_string()],
             description: "test shim".into(),
             env_allowlist: None,
@@ -522,6 +542,7 @@ async fn shim_agent_round_trips_fs() {
 /// for exit, fetches output, and reports back. Validates the fs_policy
 /// + TerminalManager wiring end-to-end.
 #[tokio::test]
+#[serial_test::parallel]
 async fn shim_agent_round_trips_terminal() {
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
@@ -535,7 +556,10 @@ async fn shim_agent_round_trips_terminal() {
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
-            command: "node".into(),
+            command: crate::common::shim_node()
+                .expect("shim prerequisite")
+                .to_string_lossy()
+                .into_owned(),
             args: vec![shim.to_string_lossy().to_string()],
             description: "test shim".into(),
             env_allowlist: None,
@@ -615,6 +639,7 @@ async fn shim_agent_round_trips_terminal() {
 /// `yolo_mode_default = true` (#1142) and the post-`session/new` bypass
 /// in `Supervisor::spawn` depend on.
 #[tokio::test]
+#[serial_test::parallel]
 async fn shim_agent_set_mode_emits_current_mode_changed() {
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
@@ -628,7 +653,10 @@ async fn shim_agent_set_mode_emits_current_mode_changed() {
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
-            command: "node".into(),
+            command: crate::common::shim_node()
+                .expect("shim prerequisite")
+                .to_string_lossy()
+                .into_owned(),
             args: vec![shim.to_string_lossy().to_string()],
             description: "test shim".into(),
             env_allowlist: None,
@@ -691,6 +719,7 @@ async fn shim_agent_set_mode_emits_current_mode_changed() {
 /// emit RateLimit + Stopped{rate_limited} instead of letting the
 /// connection task die with an AgentStartupError. See #1281.
 #[tokio::test]
+#[serial_test::parallel]
 async fn shim_agent_emits_rate_limit_event() {
     use agent_of_empires::acp::state::Event;
     if let Err(reason) = shim_ready() {
@@ -705,7 +734,10 @@ async fn shim_agent_emits_rate_limit_event() {
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
-            command: "node".into(),
+            command: crate::common::shim_node()
+                .expect("shim prerequisite")
+                .to_string_lossy()
+                .into_owned(),
             args: vec![shim.to_string_lossy().to_string()],
             description: "test shim".into(),
             env_allowlist: None,

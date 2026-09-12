@@ -221,6 +221,7 @@ mod tests {
     #[serial_test::serial]
     #[cfg(unix)]
     fn one_shot_name_probes_when_the_snapshot_missed_tmux() {
+        let _env_read = crate::session::test_support::EnvGuard::read_lock();
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().unwrap();

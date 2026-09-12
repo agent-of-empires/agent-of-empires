@@ -882,7 +882,7 @@ mod tests {
         // A container publishes under its own bind, not the host hook dir.
         // Reading the wrong one is silent: the poller simply never observes.
         let temp = tempfile::tempdir().unwrap();
-        let _home = crate::session::test_support::EnvGuard::set(&[("HOME", temp.path())]);
+        let _home = crate::session::test_support::isolate_home(temp.path());
 
         let mut host = Instance::new("pi-host-poll", "/tmp/pi-poll");
         host.tool = "pi".to_string();
@@ -1205,6 +1205,7 @@ mod tests {
     #[serial_test::serial]
     #[cfg(unix)]
     fn an_aux_shaped_title_polls_its_marked_agent_pane() {
+        let _env_read = crate::session::test_support::EnvGuard::read_lock();
         use std::os::unix::fs::PermissionsExt;
 
         let _budget = crate::session::poller::test_support::IsolatedBudget::with_ceiling(1);

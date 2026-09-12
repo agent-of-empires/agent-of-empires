@@ -1371,19 +1371,6 @@ mod tests {
         let _ = fake.await;
     }
 
-    /// Clears a process-wide env var on drop, so a panicking test cannot leak
-    /// it into whatever runs next.
-    struct RestoreEnvOnDrop(&'static str);
-
-    impl Drop for RestoreEnvOnDrop {
-        fn drop(&mut self) {
-            // SAFETY: callers hold a default-key `#[serial]` lock.
-            unsafe {
-                std::env::remove_var(self.0);
-            }
-        }
-    }
-
     /// A runner whose `Hello` advertises an unknown control-protocol version
     /// is not trusted: no terminal event is fabricated and the guard remains
     /// unclaimed.
@@ -1452,16 +1439,10 @@ mod tests {
         // No control listener is bound at the sibling path.
         let main_socket = tmp.path().join("s.sock");
 
-        // A missing socket is legitimately retryable (the runner binds it
-        // shortly after spawn), so the dial waits out its deadline. Shrink the
-        // deadline rather than the retry, so the test does not spend the full
-        // production window proving a negative. `#[serial]` because this is a
-        // process-wide env var.
-        // SAFETY: serialized against other default-key serial tests.
-        unsafe {
-            std::env::set_var("AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS", "150");
-        }
-        let _restore = RestoreEnvOnDrop("AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS");
+        let _env = crate::session::test_support::EnvGuard::set(&[(
+            "AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS",
+            "150",
+        )]);
 
         let (event_tx, mut event_rx) = mpsc::channel::<Event>(8);
         let guard = Arc::new(TerminalClaim::new());

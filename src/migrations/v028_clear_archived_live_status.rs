@@ -172,6 +172,7 @@ mod tests {
             let (entered_tx, entered_rx) = mpsc::channel();
             let (release_tx, release_rx) = mpsc::channel::<()>();
             let (done_tx, done_rx) = mpsc::channel();
+            let (contended_tx, contended_rx) = mpsc::channel();
             // A peer update parked inside the storage lock, mid-commit.
             scope.spawn(move || {
                 storage
@@ -187,14 +188,23 @@ mod tests {
                 .recv_timeout(Duration::from_secs(5))
                 .expect("peer update never entered the storage lock");
             scope.spawn(move || {
+                let _observer = crate::session::observe_lock_contention_for_test(contended_tx);
                 clear_archived_live_status(path).unwrap();
                 done_tx.send(()).unwrap();
             });
-            assert!(
-                done_rx.recv_timeout(Duration::from_millis(300)).is_err(),
-                "migration ran while a storage update was in flight"
-            );
+            let contention = contended_rx.recv_timeout(Duration::from_secs(5));
+            let completed_while_held = done_rx.try_recv();
             release_tx.send(()).unwrap();
+            assert_eq!(
+                contention.expect("migration must contend on the real storage lock"),
+                path.parent()
+                    .unwrap()
+                    .join(crate::session::STORAGE_LOCK_FILENAME)
+            );
+            assert!(
+                matches!(completed_while_held, Err(mpsc::TryRecvError::Empty)),
+                "migration completed before the holder released"
+            );
             done_rx
                 .recv_timeout(Duration::from_secs(5))
                 .expect("migration did not finish after the update committed");

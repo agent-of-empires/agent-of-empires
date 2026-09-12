@@ -213,16 +213,9 @@ mod tests {
     use crate::session::mcp::mcp_model::load_global_mcp_servers;
     use crate::session::mcp::project_mcp::ProjectMcpTransport;
 
-    /// Serialized across the suite by `#[serial_test::serial]`; the returned
-    /// `TempDir` must outlive the test body.
-    fn set_tmp_home() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        // SAFETY: serialized by `#[serial]`; matches the existing pattern.
-        unsafe {
-            std::env::set_var("HOME", dir.path());
-            std::env::set_var("XDG_CONFIG_HOME", dir.path().join(".config"));
-        }
-        dir
+    /// Retain environment restoration and root isolation for the whole test.
+    fn set_tmp_home() -> crate::session::test_support::AppDirGuard {
+        crate::session::test_support::isolate_app_dir()
     }
 
     fn stdio(name: &str, command: &str) -> ProjectMcpServer {

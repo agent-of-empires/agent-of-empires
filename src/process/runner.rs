@@ -1221,6 +1221,12 @@ impl RunnerShared {
                 }
                 if channel.make_room(wire.len()) {
                     channel.push(scope, kind, Arc::clone(&wire));
+                    #[cfg(feature = "test-support")]
+                    if kind == QueuedKind::PromptCompleted {
+                        if let Some(path) = std::env::var_os("AOE_E2E_PROMPT_COMPLETED_FILE") {
+                            std::fs::write(path, b"queued").expect("publish e2e prompt completion");
+                        }
+                    }
                     drop(channel);
                     self.control_wake.notify_one();
                     return true;
@@ -2435,6 +2441,7 @@ mod tests {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
+            .kill_on_drop(true)
             .spawn()
             .expect("spawn cat");
         let stdin = child.stdin.take().expect("stdin piped");
@@ -2454,27 +2461,29 @@ mod tests {
             .collect()
     }
 
-    /// Read back whatever the runner wrote to the agent's stdin.
-    ///
-    /// Reads until the echo goes quiet rather than until EOF: the caller
-    /// still holds the stdin half (some tests write again afterwards), so
-    /// `cat` never sees EOF and `read_to_end` would block forever. The writes
-    /// under test are flushed before this is called, so one quiet window is
-    /// enough to have seen all of them.
-    async fn read_agent_stdin(child: &mut tokio::process::Child) -> String {
-        use tokio::io::AsyncReadExt;
-        let out = child.stdout.as_mut().expect("stdout piped");
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 8192];
-        while let Ok(Ok(n)) =
-            tokio::time::timeout(Duration::from_millis(150), out.read(&mut chunk)).await
-        {
-            if n == 0 {
-                break;
+    /// A marker echoed through the same pipe fences all preceding writes.
+    async fn read_agent_stdin(
+        stdin: &Mutex<tokio::process::ChildStdin>,
+        child: &mut tokio::process::Child,
+    ) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut input = stdin.lock().await;
+            input.write_all(b"\x1e").await.expect("write stream fence");
+            input.flush().await.expect("flush stream fence");
+            drop(input);
+            let out = child.stdout.as_mut().expect("stdout piped");
+            let mut buf = Vec::new();
+            loop {
+                let byte = out.read_u8().await.expect("echo before EOF");
+                if byte == 0x1e {
+                    return String::from_utf8(buf).expect("utf8");
+                }
+                buf.push(byte);
             }
-            buf.extend_from_slice(&chunk[..n]);
-        }
-        String::from_utf8(buf).expect("utf8")
+        })
+        .await
+        .expect("agent echo did not reach the stream fence")
     }
 
     #[test]
@@ -2784,7 +2793,7 @@ mod tests {
         };
         drop(stdin_guard);
         assert_eq!(prompt.await, Some(*prompt_req_id));
-        let written = read_agent_stdin(&mut child).await;
+        let written = read_agent_stdin(&stdin, &mut child).await;
         let request: serde_json::Value = serde_json::from_str(written.trim()).unwrap();
         assert_eq!(request["id"], *prompt_req_id);
         assert_eq!(request["method"], PROMPT_METHOD);
@@ -2809,7 +2818,7 @@ mod tests {
             .agent_prompt(&stdin, attachment_id, serde_json::json!({}))
             .await
             .is_none());
-        assert!(read_agent_stdin(&mut child).await.is_empty());
+        assert!(read_agent_stdin(&stdin, &mut child).await.is_empty());
     }
 
     /// An agent-issued request becomes a `ServerCall` with a stable id, and
@@ -2890,7 +2899,7 @@ mod tests {
                     );
                 }
             };
-            let written = read_agent_stdin(&mut child).await;
+            let written = read_agent_stdin(&stdin, &mut child).await;
             let sent: serde_json::Value =
                 serde_json::from_str(written.trim()).expect("a response line was written");
             assert_response(&sent, 42);
@@ -2907,7 +2916,7 @@ mod tests {
                 .await
                 .iter()
                 .any(|frame| matches!(frame, ControlBody::ServerCall { .. })));
-            let written = read_agent_stdin(&mut child).await;
+            let written = read_agent_stdin(&stdin, &mut child).await;
             let sent: serde_json::Value =
                 serde_json::from_str(written.trim()).expect("a detached response line was written");
             assert_response(&sent, 43);
@@ -2940,7 +2949,7 @@ mod tests {
             MAX_OUTSTANDING_REQUESTS,
             "the refused call is not tracked"
         );
-        let written = read_agent_stdin(&mut child).await;
+        let written = read_agent_stdin(&stdin, &mut child).await;
         let last: serde_json::Value = serde_json::from_str(
             written
                 .trim()
@@ -3042,7 +3051,7 @@ mod tests {
                 serde_json::json!({}),
             )
             .await;
-        let written = read_agent_stdin(&mut child).await;
+        let written = read_agent_stdin(&stdin, &mut child).await;
         let request: serde_json::Value = serde_json::from_str(written.trim()).unwrap();
         let request_id = request["id"].as_i64().unwrap();
 
@@ -3086,7 +3095,7 @@ mod tests {
                 serde_json::json!({"cwd": "/tmp"}),
             )
             .await;
-        let written = read_agent_stdin(&mut child).await;
+        let written = read_agent_stdin(&stdin, &mut child).await;
         let sent: serde_json::Value =
             serde_json::from_str(written.trim()).expect("request written");
         assert_eq!(sent["method"], "session/new");
@@ -3163,7 +3172,7 @@ mod tests {
                 serde_json::json!({}),
             )
             .await;
-        let written = read_agent_stdin(&mut child).await;
+        let written = read_agent_stdin(&stdin, &mut child).await;
         let sent: serde_json::Value = serde_json::from_str(written.trim()).unwrap();
         let req_id = sent["id"].as_i64().unwrap();
 
@@ -3230,7 +3239,7 @@ mod tests {
                 "s",
             )
             .await;
-        let written = read_agent_stdin(&mut child).await;
+        let written = read_agent_stdin(&stdin, &mut child).await;
         assert_eq!(
             written.trim().lines().count(),
             1,

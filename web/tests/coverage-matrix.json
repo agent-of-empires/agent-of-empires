@@ -2213,14 +2213,14 @@
         "tests/live/acp-disable.spec.ts",
         "tests/live/acp-force-end-turn.spec.ts",
         "tests/live/acp-replay-catchup.spec.ts",
-        "tests/live/acp-cancel.spec.ts",
-        "tests/live/acp-lagged-ws.spec.ts"
+        "tests/live/acp-cancel.spec.ts"
       ],
       "components": [
         "src/server/api/acp.rs",
         "web/src/components/acp/ContextPrimerBanner.tsx",
         "web/src/components/acp/useFilesIndex.ts"
-      ]
+      ],
+      "notes": "Lagged broadcast recovery is exercised through an upgraded WebSocket by src/server/acp_ws.rs::tests::lagged_broadcast_reports_gap_and_rebuilds_control_state; the former skipped browser sketch is not counted as coverage."
     },
     {
       "id": "acp.mode-switch-tmux-teardown",

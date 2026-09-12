@@ -1263,6 +1263,7 @@ mod tests {
     /// push subscriptions at the same moment.
     #[tokio::test(start_paused = true)]
     async fn rotation_cleanup_honors_the_configured_grace() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
         let lifetime = Duration::from_secs(60);
         let grace = Duration::from_secs(7);
         let manager = Arc::new(TokenManager::with_grace(
@@ -1288,7 +1289,7 @@ mod tests {
             .unwrap();
 
         let shutdown = CancellationToken::new();
-        tokio::spawn(remote_rotation_loop(
+        let rotation = tokio::spawn(remote_rotation_loop(
             manager.clone(),
             Some(push.clone()),
             shutdown.clone(),
@@ -1312,6 +1313,9 @@ mod tests {
         assert!(push.store.snapshot().await.is_empty());
 
         shutdown.cancel();
+        rotation
+            .await
+            .expect("rotation loop stops before app guard drops");
     }
 
     #[tokio::test]

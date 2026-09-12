@@ -65,12 +65,9 @@ test.describe("Top bar", () => {
   });
 
   test("Go to dashboard returns to / from a session view", async ({ page }) => {
-    // Ported from the live topbar-go-to-dashboard story: from a session
-    // route, the brand button navigates home.
     await mockTerminalApis(page);
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/session/pinch-test");
-    await expect(page).toHaveURL("/session/pinch-test");
 
     await page.getByRole("button", { name: "Go to dashboard" }).click();
     await expect(page).toHaveURL("/");

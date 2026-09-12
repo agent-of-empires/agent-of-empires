@@ -132,6 +132,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn perform_restart_preserves_session_id_and_returns_instance() {
+        let _app_guard = crate::session::test_support::isolate_app_dir();
         let instance = test_instance();
         let id = instance.id.clone();
         let title = instance.title.clone();

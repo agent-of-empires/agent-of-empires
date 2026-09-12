@@ -156,6 +156,22 @@ impl SessionFeed {
         self.worker.try_recv()
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_fetch_for_test(
+        mut fetch: impl FnMut() -> SessionFeedResult + Send + 'static,
+    ) -> Self {
+        Self {
+            worker: Worker::spawn("aoe-session-feed-test", move |()| fetch()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn finish_for_test(self) {
+        self.worker
+            .finish_for_test()
+            .expect("session feed worker panicked");
+    }
+
     /// Feed with one pre-seeded result and no daemon behind it.
     #[cfg(test)]
     pub(crate) fn seeded_for_test(result: SessionFeedResult) -> Self {

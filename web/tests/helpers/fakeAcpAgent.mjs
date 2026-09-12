@@ -357,6 +357,14 @@ function buildSessionModes(sessionId) {
 async function emitSessionUpdates(sessionId, updates) {
   for (const u of updates) {
     if (cancelFlags.get(sessionId)) return;
+    if (u && u.sessionUpdate === "wait_for_release") {
+      const releasePath = `${process.env.FAKE_ACP_SCRIPT}.release`;
+      while (!existsSync(releasePath)) {
+        if (cancelFlags.get(sessionId)) return;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      continue;
+    }
     if (u && u.sessionUpdate === "wait_ms") {
       // Story-spec helper: pause emission inside a turn so the UI
       // observes the turn as active long enough to click Stop, queue a

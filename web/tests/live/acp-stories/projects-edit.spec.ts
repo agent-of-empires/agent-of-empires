@@ -11,6 +11,7 @@ import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { test as base, expect } from "@playwright/test";
 import { spawnAoeServe } from "../../helpers/aoeServe";
+import { gitEnv } from "../../helpers/gitFixture";
 
 base("edit a project's base branch from the sidebar Projects section", async ({ page }, testInfo) => {
   let projectPath = "";
@@ -21,19 +22,13 @@ base("edit a project's base branch from the sidebar Projects section", async ({ 
     seedFn: ({ home, env }) => {
       projectPath = join(home, "story-projects-edit");
       mkdirSync(projectPath, { recursive: true });
-      const init = spawnSync("git", ["init", "-q"], { cwd: projectPath });
+      const init = spawnSync("git", ["init", "-q"], { cwd: projectPath, env: gitEnv(env) });
       if (init.status !== 0) {
         throw new Error(`git init failed: ${init.stderr?.toString() ?? ""}`);
       }
       const commit = spawnSync("git", ["commit", "--allow-empty", "-q", "-m", "init"], {
         cwd: projectPath,
-        env: {
-          ...env,
-          GIT_AUTHOR_NAME: "t",
-          GIT_AUTHOR_EMAIL: "t@t",
-          GIT_COMMITTER_NAME: "t",
-          GIT_COMMITTER_EMAIL: "t@t",
-        },
+        env: gitEnv(env),
       });
       if (commit.status !== 0) {
         throw new Error(`git commit failed: ${commit.stderr?.toString() ?? ""}`);

@@ -6,7 +6,7 @@
 // (line 1855). A press-and-hold attempt must produce no visual lift
 // and no PUT (#1419).
 
-import { test, expect } from "./helpers/mockedTest";
+import { test, expect, publishedRequests, observeFor, waitForResponseBody } from "./helpers/mockedTest";
 import { installSidebarMocks, threeSessionsInOneRepo } from "./helpers/sidebarMocks";
 
 test("read-only viewer cannot drag sidebar rows", async ({ page }) => {
@@ -17,6 +17,8 @@ test("read-only viewer cannot drag sidebar rows", async ({ page }) => {
 
   await page.setViewportSize({ width: 1280, height: 720 });
   await page.goto("/");
+  await waitForResponseBody(page, "/api/about");
+  await expect(page.getByTestId("sidebar-session-row")).toHaveCount(3);
 
   // The drag-enabled wrapper carries
   // `aria-roledescription="Press and hold to reorder"`. In read-only
@@ -45,6 +47,9 @@ test("read-only viewer cannot drag sidebar rows", async ({ page }) => {
   expect(ringedCount).toBe(0);
 
   await page.mouse.up();
-  await page.waitForTimeout(300);
+  await observeFor(page, 300, async () => {
+    expect(await publishedRequests(page, "/api/workspace-ordering", "PUT")).toEqual([]);
+    expect(handle.puts).toEqual([]);
+  });
   expect(handle.puts).toEqual([]);
 });

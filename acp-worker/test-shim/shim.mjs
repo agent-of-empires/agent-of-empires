@@ -49,7 +49,16 @@ function emitUnsolicitedNotifIfRequested(client) {
   if (!sessionId) return;
   const delayMs = Number.parseInt(raw, 10);
   setTimeout(
-    () => {
+    async () => {
+      const release = process.env.SHIM_UNSOLICITED_RELEASE_FILE;
+      if (release) {
+        const { access } = await import("node:fs/promises");
+        while (true) {
+          try { await access(release); break; } catch {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+        }
+      }
       client
         .notify("session/update", {
           sessionId,
@@ -659,6 +668,13 @@ async function handlePrompt(params, client) {
     },
   });
 
+  const completionRelease = process.env.SHIM_PROMPT_COMPLETION_RELEASE_FILE;
+  if (completionRelease) {
+    const { access } = await import("node:fs/promises");
+    while (true) {
+      try { await access(completionRelease); break; } catch { await sleep(10); }
+    }
+  }
   return {
     stopReason: userText.includes("MAX_TOKENS") ? "max_tokens" : "end_turn",
   };

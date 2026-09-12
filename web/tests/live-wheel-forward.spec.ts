@@ -21,12 +21,11 @@ async function openSession(page: Page, handle: MockHandle) {
   await openMobileSidebar(page);
   await clickSidebarSession(page, "pinch-test");
   await page.locator("[data-live-terminal]").waitFor({ state: "visible", timeout: 10_000 });
-  await expect.poll(() => handle.liveMessages.length, { timeout: 5_000 }).toBeGreaterThan(0);
-  await page.waitForTimeout(400);
+  await handle.waitForLiveReady();
 }
 
-function pushFrame(handle: MockHandle, flags: { altScreen: boolean; mouse: boolean; mouseSgr: boolean }) {
-  handle.pushLiveFrame({
+async function pushFrame(handle: MockHandle, flags: { altScreen: boolean; mouse: boolean; mouseSgr: boolean }) {
+  await handle.pushLiveFrame({
     ...makeLiveFrame({ rows: 24, history: 120, window: 24 }),
     ...flags,
   } as Parameters<MockHandle["pushLiveFrame"]>[0]);
@@ -55,7 +54,7 @@ async function swipeUp(page: Page) {
 
 test("swipe over a full-screen SGR-mouse app forwards SGR wheel bytes", async ({ page }) => {
   const handle = await setup(page);
-  pushFrame(handle, { altScreen: true, mouse: true, mouseSgr: true });
+  await pushFrame(handle, { altScreen: true, mouse: true, mouseSgr: true });
   await expect.poll(() => scroller(page).getAttribute("class")).toContain("overflow-hidden");
   // touch-action: none is what keeps the drag from panning the whole page:
   // React's delegated touch listeners are passive, so the component cannot
@@ -93,7 +92,7 @@ test("swipe over a full-screen SGR-mouse app forwards SGR wheel bytes", async ({
 
 test("a flick coasts: wheel bytes keep arriving after the finger lifts, and a touch stops it", async ({ page }) => {
   const handle = await setup(page);
-  pushFrame(handle, { altScreen: true, mouse: true, mouseSgr: true });
+  await pushFrame(handle, { altScreen: true, mouse: true, mouseSgr: true });
   await expect.poll(() => scroller(page).getAttribute("class")).toContain("overflow-hidden");
   // Fast multi-move swipe. Synthetic touchmoves land with ~1ms deltas, so the
   // raw release velocity is absurd; the component's velocity cap is what makes
@@ -120,7 +119,7 @@ test("a flick coasts: wheel bytes keep arriving after the finger lifts, and a to
 
 test("swipe over a full-screen LEGACY-mouse app forwards X10 wheel bytes", async ({ page }) => {
   const handle = await setup(page);
-  pushFrame(handle, { altScreen: true, mouse: true, mouseSgr: false });
+  await pushFrame(handle, { altScreen: true, mouse: true, mouseSgr: false });
   await expect.poll(() => scroller(page).getAttribute("class")).toContain("overflow-hidden");
   await swipeUp(page);
   await expect.poll(() => hasLegacyDown(handle)).toBe(true);
@@ -129,7 +128,7 @@ test("swipe over a full-screen LEGACY-mouse app forwards X10 wheel bytes", async
 
 test("normal-screen agent does NOT forward mouse bytes", async ({ page }) => {
   const handle = await setup(page);
-  pushFrame(handle, { altScreen: false, mouse: true, mouseSgr: true });
+  await pushFrame(handle, { altScreen: false, mouse: true, mouseSgr: true });
   await expect.poll(() => scroller(page).getAttribute("class")).toContain("overflow-y-auto");
   await swipeUp(page);
   await page.waitForTimeout(300);

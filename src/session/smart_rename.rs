@@ -2504,12 +2504,7 @@ Rewrote the getting-started section and fixed two broken links.";
     #[serial_test::serial]
     fn resolve_smart_rename_config_reads_repo_aware_config_but_not_repo_commands() {
         let home = tempfile::tempdir().expect("tempdir HOME");
-        // SAFETY: serialized by `#[serial]`; matches `set_tmp_home` in
-        // `src/session/mcp/mcp_state.rs`.
-        unsafe {
-            std::env::set_var("HOME", home.path());
-            std::env::set_var("XDG_CONFIG_HOME", home.path().join(".config"));
-        }
+        let _home_guard = crate::session::test_support::isolate_home(home.path());
 
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         let app_dir = home
@@ -2694,19 +2689,23 @@ claude = "repo-wrapper"
         let instance = Instance::new("Vikings", "/tmp/x");
         let id = instance.id.clone();
         let first_title_lock = crate::session::storage::acquire_session_title_lock(&id).unwrap();
+        let (title_contended_tx, title_contended_rx) = std::sync::mpsc::channel();
         let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
         let competing_id = id.clone();
         let competing_writer = std::thread::spawn(move || {
+            let _observer =
+                crate::session::storage::observe_lock_contention_for_test(title_contended_tx);
             let _lock = crate::session::storage::acquire_session_title_lock(&competing_id).unwrap();
             acquired_tx.send(()).unwrap();
         });
-        assert!(
-            acquired_rx
-                .recv_timeout(std::time::Duration::from_millis(150))
-                .is_err(),
-            "a competing title writer entered before release"
-        );
+        let contended = title_contended_rx.recv_timeout(std::time::Duration::from_secs(2));
+        let entered_early = acquired_rx.try_recv().is_ok();
         drop(first_title_lock);
+        assert!(
+            contended.is_ok(),
+            "title writer never demonstrated contention"
+        );
+        assert!(!entered_early, "title writer entered before release");
         acquired_rx
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("competing writer should enter after release");
@@ -2720,20 +2719,24 @@ claude = "repo-wrapper"
             })
             .unwrap();
         let identity_lock = crate::session::acquire_session_identity_lock().unwrap();
+        let (identity_contended_tx, identity_contended_rx) = std::sync::mpsc::channel();
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();
         let writer_id = id.clone();
         let identity_writer = std::thread::spawn(move || {
+            let _observer =
+                crate::session::storage::observe_lock_contention_for_test(identity_contended_tx);
             let storage = Storage::new_unwatched("identity-lock").unwrap();
             apply_terminal_title(&storage, &writer_id, Some("Shared title")).unwrap();
             finished_tx.send(()).unwrap();
         });
-        assert!(
-            finished_rx
-                .recv_timeout(std::time::Duration::from_millis(150))
-                .is_err(),
-            "smart rename bypassed the identity transaction"
-        );
+        let contended = identity_contended_rx.recv_timeout(std::time::Duration::from_secs(2));
+        let entered_early = finished_rx.try_recv().is_ok();
         drop(identity_lock);
+        assert!(
+            contended.is_ok(),
+            "smart rename never contended on identity transaction"
+        );
+        assert!(!entered_early, "smart rename bypassed identity transaction");
         finished_rx
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("smart rename should finish after identity release");

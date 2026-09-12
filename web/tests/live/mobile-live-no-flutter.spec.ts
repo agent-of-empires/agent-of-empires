@@ -11,6 +11,7 @@ import { writeFileSync, chmodSync, mkdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { test, expect } from "../helpers/liveTest";
 import { spawnAoeServe, resolveAoeBinary } from "../helpers/aoeServe";
+import { gitEnv } from "../helpers/gitFixture";
 import { clickSidebarSession, openMobileSidebar } from "../helpers/sidebar";
 
 test("oscillating bottom row does not flutter the viewport", async ({ browser }, testInfo) => {
@@ -30,8 +31,10 @@ clear
 echo "HEADER stable top line"
 for i in $(seq 1 16); do echo "body $i"; done
 on=1
+tick=0
 while true; do
-  tput cup 18 0; printf 'INPUTBOX> '
+  tick=$((tick + 1))
+  tput cup 18 0; printf 'INPUTBOX> tick=%s' "$tick"
   if [ "$on" = 1 ]; then tput cup 20 0; printf 'spinner working...'; on=0
   else tput cup 20 0; tput el; on=1; fi
   sleep 0.12
@@ -41,7 +44,7 @@ done
       chmodSync(tool, 0o755);
       const pd = join(e.home, "project");
       mkdirSync(pd, { recursive: true });
-      spawnSync("git", ["init", "-q"], { cwd: pd });
+      spawnSync("git", ["init", "-q"], { cwd: pd, env: gitEnv(e.env) });
       const r = spawnSync(
         resolveAoeBinary(),
         ["add", pd, "-t", "flutter-test", "-c", "claude", "--cmd-override", tool],
@@ -98,15 +101,23 @@ done
     }
 
     const ys: number[] = [];
+    const ticks = new Set<string>();
+    const spinnerStates = new Set<boolean>();
     for (let i = 0; i < 25; i++) {
       const y = await headerTop();
       if (y != null) ys.push(y);
+      const text = await page.locator("[data-live-content]").innerText();
+      const tick = /tick=(\d+)/.exec(text)?.[1];
+      if (tick) ticks.add(tick);
+      spinnerStates.add(text.includes("spinner working..."));
       await page.waitForTimeout(100);
     }
     // Guard against a false green: if the HEADER row never sampled, the
     // jitter math below would be Math.max(...[]) - Math.min(...[]) = -Infinity,
     // which trivially passes the assertion without measuring anything.
-    expect(ys.length).toBeGreaterThan(0);
+    expect(ys).toHaveLength(25);
+    expect(ticks.size, "live output advanced during geometry sampling").toBeGreaterThan(3);
+    expect(spinnerStates, "both bottom-row states were rendered during sampling").toEqual(new Set([true, false]));
     const jitter = Math.max(...ys) - Math.min(...ys);
     // Sub-row stability: 1px sampling slop is fine, a row (~10px) bounce is
     // the bug.

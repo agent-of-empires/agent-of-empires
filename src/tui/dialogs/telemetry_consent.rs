@@ -272,15 +272,12 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    // `#[serial]` because `render` reads `DO_NOT_TRACK`, which other telemetry
-    // tests mutate. With it set, `render_dnt` zeroes the button areas and the
-    // click lands on nothing, so a parallel run flakes this assertion.
     #[test]
     #[serial]
     fn click_after_render_submits_the_hit_button() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
-        unsafe { std::env::remove_var("DO_NOT_TRACK") };
+        let _env = crate::session::test_support::EnvGuard::unset(&["DO_NOT_TRACK"]);
         let theme = crate::tui::styles::load_theme("zinc");
         let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
         let mut d = TelemetryConsentDialog::new();
@@ -303,14 +300,12 @@ mod tests {
         assert_eq!(TelemetryConsentDialog::new().selected, None);
     }
 
-    // `#[serial]` because `handle_key` reads the `DO_NOT_TRACK` env var, which
-    // other telemetry tests mutate; serializing keeps it deterministic.
     #[test]
     #[serial]
     fn enter_with_no_focus_is_inert() {
         // The whole point of no default focus: a reflexive Enter must not
         // dismiss the prompt until the user has chosen a side.
-        unsafe { std::env::remove_var("DO_NOT_TRACK") };
+        let _env = crate::session::test_support::EnvGuard::unset(&["DO_NOT_TRACK"]);
         let mut d = TelemetryConsentDialog::new();
         assert!(matches!(
             d.handle_key(k(KeyCode::Enter)),
@@ -327,10 +322,9 @@ mod tests {
     fn enter_dismisses_under_do_not_track() {
         // Under DO_NOT_TRACK the popup shows no buttons and says "Press Enter
         // or Esc to dismiss", so Enter with no selection must decline-dismiss.
-        unsafe { std::env::set_var("DO_NOT_TRACK", "1") };
+        let _env = crate::session::test_support::EnvGuard::set(&[("DO_NOT_TRACK", "1")]);
         let mut d = TelemetryConsentDialog::new();
         let result = d.handle_key(k(KeyCode::Enter));
-        unsafe { std::env::remove_var("DO_NOT_TRACK") };
         assert!(matches!(result, DialogResult::Submit(false)));
     }
 

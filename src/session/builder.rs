@@ -2139,7 +2139,7 @@ mod tests {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let config_home = temp_home.join(".config");
-            std::env::set_var("XDG_CONFIG_HOME", &config_home);
+
             config_home.join(crate::session::APP_DIR_NAME_XDG)
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -2175,7 +2175,7 @@ mod tests {
     #[serial_test::serial]
     fn build_instance_preserves_custom_agent_detect_as_mapping() {
         let temp_home = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", temp_home.path());
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
         let app_dir = isolated_app_dir(temp_home.path());
         std::fs::create_dir_all(&app_dir).unwrap();
         std::fs::write(
@@ -2212,7 +2212,7 @@ mod tests {
     #[serial_test::serial]
     fn build_instance_keeps_empty_detect_as_without_mapping() {
         let temp_home = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", temp_home.path());
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
         let app_dir = isolated_app_dir(temp_home.path());
         std::fs::create_dir_all(&app_dir).unwrap();
         std::fs::write(
@@ -2243,7 +2243,7 @@ mod tests {
     #[serial_test::serial]
     fn build_instance_rejects_custom_agent_without_resolved_command() {
         let temp_home = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", temp_home.path());
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
         let app_dir = isolated_app_dir(temp_home.path());
         std::fs::create_dir_all(&app_dir).unwrap();
         std::fs::write(app_dir.join("config.toml"), "").unwrap();
@@ -2271,7 +2271,7 @@ mod tests {
     #[serial_test::serial]
     fn build_instance_rejects_custom_agent_with_whitespace_only_command() {
         let temp_home = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", temp_home.path());
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
         let app_dir = isolated_app_dir(temp_home.path());
         std::fs::create_dir_all(&app_dir).unwrap();
         std::fs::write(
@@ -2306,7 +2306,7 @@ mod tests {
     #[serial_test::serial]
     fn build_instance_scratch_provisions_app_dir() {
         let temp_home = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", temp_home.path());
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
         let app_dir = isolated_app_dir(temp_home.path());
         std::fs::create_dir_all(&app_dir).unwrap();
         std::fs::write(app_dir.join("config.toml"), "").unwrap();
@@ -2334,6 +2334,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn build_instance_applies_terminal_fork_seed() {
+        let _app_guard = crate::session::test_support::isolate_app_dir();
         use crate::session::ForkSeed;
         let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
         let params = InstanceParams {
@@ -2378,6 +2379,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn build_instance_applies_structured_fork_seed() {
+        let _app_guard = crate::session::test_support::isolate_app_dir();
         use crate::session::ForkSeed;
         let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
         let params = InstanceParams {
@@ -2425,6 +2427,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn fork_seed_tests_restore_default_profile_registry() {
+        let _app_guard = crate::session::test_support::isolate_app_dir();
         const ALIAS_AGENT: &str = "fork-seed-registry-alias";
         const RULE_AGENT: &str = "fork-seed-registry-rule";
         let cases: &[(&str, fn())] = &[
@@ -2469,7 +2472,7 @@ mod tests {
     #[serial_test::serial]
     fn build_instance_rejects_scratch_with_worktree() {
         let temp_home = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", temp_home.path());
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
         let app_dir = isolated_app_dir(temp_home.path());
         std::fs::create_dir_all(&app_dir).unwrap();
         std::fs::write(app_dir.join("config.toml"), "").unwrap();
@@ -2500,7 +2503,7 @@ mod tests {
         // GitError variants, so a string bail would surface the opaque
         // "Failed to create session" instead.
         let temp_home = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", temp_home.path());
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
         let app_dir = isolated_app_dir(temp_home.path());
         std::fs::create_dir_all(&app_dir).unwrap();
         std::fs::write(app_dir.join("config.toml"), "").unwrap();

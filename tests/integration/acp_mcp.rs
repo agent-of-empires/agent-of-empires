@@ -26,7 +26,10 @@ fn base_config(cwd: std::path::PathBuf, record_path: &std::path::Path) -> SpawnC
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
-            command: "node".into(),
+            command: crate::common::shim_node()
+                .expect("shim prerequisite")
+                .to_string_lossy()
+                .into_owned(),
             args: vec![shim.to_string_lossy().to_string()],
             description: "test shim".into(),
             env_allowlist: None,
@@ -59,7 +62,9 @@ fn read_record(path: &std::path::Path) -> String {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         if let Ok(s) = std::fs::read_to_string(path) {
-            return s;
+            if serde_json::from_str::<serde_json::Value>(&s).is_ok() {
+                return s;
+            }
         }
         if std::time::Instant::now() >= deadline {
             panic!("shim never wrote {}", path.display());
@@ -69,6 +74,7 @@ fn read_record(path: &std::path::Path) -> String {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn configured_mcp_servers_reach_new_session() {
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
@@ -107,6 +113,7 @@ async fn configured_mcp_servers_reach_new_session() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn native_and_global_merge_reaches_new_session() {
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
@@ -192,6 +199,7 @@ async fn native_and_global_merge_reaches_new_session() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn disabled_codex_server_does_not_reach_new_session() {
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
@@ -241,6 +249,7 @@ enabled = false
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn no_config_forwards_empty_list() {
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");

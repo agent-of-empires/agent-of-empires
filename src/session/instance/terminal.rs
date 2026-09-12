@@ -673,14 +673,20 @@ exec /usr/bin/env -i PATH="$TARGET_PATH" SHELL="$FALLBACK_SHELL" "$@"
             }
             let inst = Instance::new("ktid_alive", "/tmp");
             let name = crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title);
+            let _guard = crate::tmux::test_helpers::TmuxTestSession::from_name(name.clone());
             spawn_remain_on_exit(&name, "sleep 30");
-            // Give tmux a moment to register the pane.
-            std::thread::sleep(std::time::Duration::from_millis(200));
+            let pane = crate::tmux::test_helpers::only_pane_id(&name);
+            let session = inst.terminal_tmux_session().unwrap();
+            assert!(session.exists());
+            assert!(!session.is_pane_dead());
 
-            let result = inst.kill_terminal_if_dead();
-            cleanup(&name);
-
-            assert!(!result.unwrap(), "live pane should not trigger a kill");
+            assert!(
+                !inst.kill_terminal_if_dead().unwrap(),
+                "live pane should not trigger a kill"
+            );
+            assert_eq!(crate::tmux::test_helpers::only_pane_id(&name), pane);
+            assert!(session.exists());
+            assert!(!session.is_pane_dead());
         }
 
         #[test]

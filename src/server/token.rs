@@ -315,6 +315,7 @@ mod tests {
 
     #[tokio::test]
     async fn token_manager_validates_previous_in_grace() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
         let mgr = TokenManager::new(Some("old_token".to_string()), Duration::from_secs(3600));
         mgr.rotate().await;
 
@@ -332,6 +333,7 @@ mod tests {
 
     #[tokio::test]
     async fn token_manager_rotate_changes_token() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
         let mgr = TokenManager::new(Some("original".to_string()), Duration::from_secs(3600));
         let before = mgr.current_token().await;
         mgr.rotate().await;

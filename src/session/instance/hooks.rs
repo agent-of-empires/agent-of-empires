@@ -765,9 +765,7 @@ mod tests {
     fn test_custom_codex_detected_agent_uses_codex_hook_installer() {
         let tmp = tempfile::TempDir::new().unwrap();
         let _codex_home_guard = EnvGuard::unset(&["CODEX_HOME"]);
-        std::env::set_var("HOME", tmp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(tmp.path());
 
         acknowledge_hooks();
         let mut inst = Instance::new("wrapped", "/tmp/test");
@@ -788,9 +786,7 @@ mod tests {
     fn test_codex_hook_installer_uses_resolved_codex_home() {
         let tmp = tempfile::TempDir::new().unwrap();
         let _codex_home_guard = EnvGuard::unset(&["CODEX_HOME"]);
-        std::env::set_var("HOME", tmp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(tmp.path());
 
         let profile_codex_home = tmp.path().join("profile-codex-home");
         let resolved_codex_home = tmp.path().join("before-session-codex-home");
@@ -864,9 +860,7 @@ mod tests {
     fn test_codex_hook_installer_respects_profile_hooks_disabled() {
         let tmp = tempfile::TempDir::new().unwrap();
         let _codex_home_guard = EnvGuard::unset(&["CODEX_HOME"]);
-        std::env::set_var("HOME", tmp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(tmp.path());
 
         let profile_dir = crate::session::get_profile_dir("hooks-disabled").unwrap();
         std::fs::write(
@@ -889,7 +883,7 @@ mod tests {
     fn host_hook_mutation_requires_durable_acknowledgement() {
         let tmp = tempfile::TempDir::new().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
-        std::env::set_var("HOME", tmp.path());
+        let _home_guard = crate::session::test_support::isolate_home(tmp.path());
         let mut inst = Instance::new("cursor-unacknowledged", "/tmp/test");
         inst.tool = "cursor".to_string();
         inst.detect_as = "cursor".to_string();
@@ -908,9 +902,7 @@ mod tests {
     fn status_only_agent_needs_no_ack_when_status_hooks_are_disabled() {
         let tmp = tempfile::TempDir::new().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
-        std::env::set_var("HOME", tmp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(tmp.path());
         let profile_dir = crate::session::get_profile_dir("status-hooks-disabled").unwrap();
         std::fs::write(
             profile_dir.join("config.toml"),
@@ -937,9 +929,7 @@ agent_status_hooks = false
     fn identity_hooks_remain_when_status_hooks_are_disabled() {
         let tmp = tempfile::TempDir::new().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
-        std::env::set_var("HOME", tmp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(tmp.path());
         let profile_dir = crate::session::get_profile_dir("identity-only-hooks").unwrap();
         let custom_config = tmp.path().join("cursor-custom");
         std::fs::write(
@@ -984,9 +974,7 @@ agent_status_hooks = false
         for (profile, enabled, sandboxed, expected) in cases {
             let tmp = tempfile::TempDir::new().unwrap();
             let _guard = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
-            std::env::set_var("HOME", tmp.path());
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+            let _home_guard = crate::session::test_support::isolate_home(tmp.path());
 
             let profile_dir = crate::session::get_profile_dir(profile).unwrap();
             std::fs::write(
@@ -1028,9 +1016,7 @@ agent_status_hooks = false
     fn test_codex_hook_installer_respects_profile_hooks_enabled() {
         let tmp = tempfile::TempDir::new().unwrap();
         let _codex_home_guard = EnvGuard::unset(&["CODEX_HOME"]);
-        std::env::set_var("HOME", tmp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(tmp.path());
 
         crate::session::config::update_config(|global| {
             global.session.agent_status_hooks = false;

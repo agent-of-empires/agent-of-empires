@@ -36,7 +36,7 @@ impl Drop for EnvGuard {
 #[serial]
 async fn aoe_file_watch_off_returns_noop_service() {
     let _guard = EnvGuard::set("AOE_FILE_WATCH", "off");
-    let svc = agent_of_empires::file_watch::test_support::new_filewatch().expect("noop init");
+    let svc = agent_of_empires::file_watch::FileWatchService::new().expect("noop init");
     let tmp = TempDir::new().expect("tempdir");
     let target: PathBuf = tmp.path().join("watched");
     let (mut rx, _h) = svc

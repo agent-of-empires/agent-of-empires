@@ -975,6 +975,7 @@ done
     #[cfg(unix)]
     #[tokio::test]
     async fn unsupported_session_prompt_rejection_emits_context_reset_before_error() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         use crate::acp::acp_client::test_helpers::reset_fake_spawn_config;
         use crate::acp::Event;
 
@@ -1068,6 +1069,7 @@ done
     #[cfg(unix)]
     #[tokio::test]
     async fn handshake_rate_limit_parks_the_session_instead_of_failing_startup() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         use crate::acp::acp_client::test_helpers::reset_fake_spawn_config;
         use crate::acp::Event;
 

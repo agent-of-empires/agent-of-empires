@@ -967,6 +967,24 @@ mod tests {
         assert!(status.success());
     }
 
+    #[cfg(unix)]
+    fn assert_child_reaped(pid: u32) {
+        let mut status = 0;
+        let result = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
+        let error = std::io::Error::last_os_error().raw_os_error();
+        if result == 0 {
+            unsafe {
+                libc::kill(pid as i32, libc::SIGKILL);
+                libc::waitpid(pid as i32, &mut status, 0);
+            }
+        }
+        assert_eq!(
+            result, -1,
+            "timeout must reap its direct child before returning"
+        );
+        assert_eq!(error, Some(libc::ECHILD));
+    }
+
     #[test]
     #[cfg(unix)]
     fn wait_with_timeout_kills_child_that_outlives_deadline() {
@@ -974,6 +992,12 @@ mod tests {
 
         let start = Instant::now();
         let status = wait_with_timeout(&mut child, Duration::from_millis(200)).unwrap();
+        assert_child_reaped(child.id());
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            child.try_wait().unwrap().unwrap().signal(),
+            Some(libc::SIGKILL)
+        );
         assert!(
             status.is_none(),
             "expected the timeout to fire and kill the child"
@@ -1001,11 +1025,34 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn run_with_timeout_kills_child_that_outlives_deadline() {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::{net::UnixStream, process::CommandExt};
+
+        let (mut pid_reader, pid_writer) = UnixStream::pair().unwrap();
+        pid_reader
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         let mut cmd = Command::new("sleep");
         cmd.arg("5");
+        unsafe {
+            cmd.pre_exec(move || {
+                let pid = libc::getpid().to_ne_bytes();
+                let written = libc::write(pid_writer.as_raw_fd(), pid.as_ptr().cast(), pid.len());
+                if written != pid.len() as isize {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
 
         let start = Instant::now();
         let result = run_with_timeout(&mut cmd, Duration::from_millis(300)).unwrap();
+        let mut pid = [0; std::mem::size_of::<libc::pid_t>()];
+        pid_reader
+            .read_exact(&mut pid)
+            .expect("child must publish its PID before exec");
+        assert_child_reaped(libc::pid_t::from_ne_bytes(pid) as u32);
         assert!(
             result.is_none(),
             "expected the timeout to fire and kill the child"

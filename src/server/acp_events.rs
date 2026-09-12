@@ -1140,12 +1140,7 @@ mod tests {
     #[serial_test::serial]
     async fn persist_and_mirror_unread_mirrors_only_a_committed_mutation() {
         let temp = tempfile::tempdir().expect("tempdir");
-        // SAFETY: serialized test; no other test mutates HOME concurrently.
-        unsafe { std::env::set_var("HOME", temp.path()) };
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
-        }
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
 
         let owning = "acp-unread-owner";
         let mut inst = Instance::new("acp-session", "/tmp/acp");
@@ -1207,12 +1202,7 @@ mod tests {
     #[serial_test::serial]
     async fn persist_and_mirror_unread_skips_the_mirror_on_a_failed_write() {
         let temp = tempfile::tempdir().expect("tempdir");
-        // SAFETY: serialized test; no other test mutates HOME concurrently.
-        unsafe { std::env::set_var("HOME", temp.path()) };
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
-        }
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
 
         let profile = "acp-unread-write-failure";
         // Making `sessions.json` a directory makes the read-modify-write fail.
@@ -1256,12 +1246,7 @@ mod tests {
     #[serial_test::serial]
     async fn recover_structured_unread_after_lag_marks_only_a_missed_turn_end() {
         let temp = tempfile::tempdir().expect("tempdir");
-        // SAFETY: serialized test; no other test mutates HOME concurrently.
-        unsafe { std::env::set_var("HOME", temp.path()) };
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
-        }
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
         crate::session::set_unread_enabled(true);
 
         let profile = "acp-unread-lag-replay";
@@ -1348,6 +1333,7 @@ mod tests {
 
     #[tokio::test]
     async fn acp_event_listener_tracks_load_session_capability_updates() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
         let mut inst = Instance::new("acp-session", "/tmp/acp");
         inst.view = crate::session::View::Structured;
         inst.acp_session_id = Some("same-acp-id".to_string());
@@ -1488,6 +1474,7 @@ mod tests {
         );
 
         listener.abort();
+        let _ = listener.await;
     }
     /// End to end over `acp_event_listener` itself, the path that actually
     /// closes #3181. The predicate table and the TUI ownership tests all pass
@@ -1499,12 +1486,7 @@ mod tests {
     #[serial_test::serial]
     async fn acp_event_listener_marks_a_finished_turn_unread_on_disk_and_in_memory() {
         let temp = tempfile::tempdir().expect("tempdir");
-        // SAFETY: serialized test; no other test mutates HOME concurrently.
-        unsafe { std::env::set_var("HOME", temp.path()) };
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
-        }
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
         crate::session::set_unread_enabled(true);
 
         let profile = "acp-listener-turn-end";
@@ -1566,6 +1548,7 @@ mod tests {
             }
         }
         listener.abort();
+        let _ = listener.await;
 
         assert!(
             mirrored,

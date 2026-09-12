@@ -69,7 +69,7 @@ fn build_view_with_inst(profile: &str, inst: &Instance) -> HomeView {
         })
         .unwrap();
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some(profile.to_string()),
         tools,
         crate::file_watch::FileWatchService::noop(),

@@ -3104,6 +3104,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn every_kind_is_marked_at_creation_and_keeps_its_mark_across_a_rename() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         if !tmux_available() {
             eprintln!("Skipping test: tmux not available");
             return;
@@ -3899,8 +3900,7 @@ mod tests {
         // A var only this test reads, caught by the `XDG_` forwarding rule, so
         // it never collides with real config or another test's assertions.
         let key = "XDG_AOE_ENV_TEST_3075";
-        let original = std::env::var(key).ok();
-        std::env::set_var(key, "sentinel-value");
+        let _env = crate::session::test_support::EnvGuard::set(&[(key, "sentinel-value")]);
 
         let guard = TmuxTestSession::new("aoe_test_env_fwd");
         let session = super::Session::from_name(guard.name());
@@ -3912,11 +3912,6 @@ mod tests {
             .ok()
             .and_then(|o| String::from_utf8(o.stdout).ok())
             .map(|s| s.trim().to_string());
-
-        match original {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
 
         created.expect("create session");
         assert_eq!(
@@ -3962,14 +3957,18 @@ mod tests {
     }
     #[test]
     fn expired_deadline_stops_vt_owner_commands_immediately() {
-        let deadline = crate::tmux::TmuxCommandDeadline::with_timeout(Duration::from_millis(1));
-        std::thread::sleep(Duration::from_millis(5));
-        let started = Instant::now();
+        let _env = crate::session::test_support::EnvGuard::read_lock();
+        let deadline = crate::tmux::TmuxCommandDeadline::with_timeout(Duration::ZERO);
+        let before = crate::tmux::TMUX_COMMAND_EXECUTIONS.with(std::cell::Cell::get);
         let session = Session::from_name("aoe_test_expired_owner");
         assert!(!session.claim_vt_owner_with_deadline("owner", Duration::from_secs(10), &deadline,));
         session.release_vt_owner_with_deadline("owner", &deadline);
         session.release_vt_pipe_owner_with_deadline("owner", &deadline);
-        assert!(started.elapsed() < Duration::from_millis(50));
+        assert_eq!(
+            crate::tmux::TMUX_COMMAND_EXECUTIONS.with(std::cell::Cell::get),
+            before,
+            "expired owner operations must not attempt a subprocess"
+        );
     }
 
     /// #3071: is_attached gates the TUI's passive preview resize, so it has
@@ -5149,6 +5148,7 @@ mod tests {
 
     #[test]
     fn test_protected_env_file_keeps_secret_out_of_pane_argv_and_rejects_invalid_keys() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         let secret = "literal-secret-value";
         let file = EphemeralEnvFile::create(
             &[
@@ -5200,6 +5200,7 @@ mod tests {
 
     #[test]
     fn test_protected_env_file_preserves_multiline_values() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         let temp = tempfile::tempdir().unwrap();
         let output = temp.path().join("multiline");
         let value = "line one\nline two\r\nquote ' intact";
@@ -5325,6 +5326,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_protected_env_reaches_child_without_exposing_secret_in_ps() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         if !tmux_available() {
             eprintln!("Skipping test: tmux not available");
             return;

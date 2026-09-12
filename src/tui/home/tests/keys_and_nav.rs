@@ -59,7 +59,7 @@ fn rewire_disk_subscriptions_is_noop_without_tokio_runtime() {
     let _guard = setup_test_home(&temp);
     let _storage = Storage::new_unwatched("test").unwrap();
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         tools,
         crate::file_watch::FileWatchService::noop(),
@@ -99,7 +99,7 @@ fn watcher_refresh_does_not_reopen_hotkey_warning_dialog() {
     .unwrap();
 
     let tools = AvailableTools::with_tools(&["alpha"]);
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         tools,
         crate::file_watch::FileWatchService::noop(),
@@ -132,7 +132,7 @@ fn interactive_refresh_reopens_hotkey_warning_dialog() {
     .unwrap();
 
     let tools = AvailableTools::with_tools(&["alpha"]);
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         tools,
         crate::file_watch::FileWatchService::noop(),
@@ -156,7 +156,7 @@ fn watcher_refresh_stashes_pending_watcher_theme() {
     let global_config = crate::session::get_app_dir().unwrap().join("config.toml");
     std::fs::write(&global_config, "[theme]\nname = \"dracula\"\n").unwrap();
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         AvailableTools::with_tools(&["claude"]),
         crate::file_watch::FileWatchService::noop(),
@@ -184,7 +184,7 @@ fn interactive_refresh_does_not_stash_pending_watcher_theme() {
     let global_config = crate::session::get_app_dir().unwrap().join("config.toml");
     std::fs::write(&global_config, "[theme]\nname = \"dracula\"\n").unwrap();
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         AvailableTools::with_tools(&["claude"]),
         crate::file_watch::FileWatchService::noop(),
@@ -209,7 +209,7 @@ fn take_pending_watcher_theme_clears_the_field() {
     let _guard = setup_test_home(&temp);
     let _storage = Storage::new_unwatched("test").unwrap();
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         AvailableTools::with_tools(&["claude"]),
         crate::file_watch::FileWatchService::noop(),
@@ -242,7 +242,7 @@ fn watcher_refresh_stashes_global_theme_not_profile_override() {
             .expect("legacy hand-edited overrides may carry a theme key even though theme is global by contract");
     save_profile_config("test", &profile_overrides).unwrap();
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         AvailableTools::with_tools(&["claude"]),
         crate::file_watch::FileWatchService::noop(),
@@ -268,7 +268,7 @@ fn second_watcher_refresh_overwrites_stale_stash() {
     let _guard = setup_test_home(&temp);
     let _storage = Storage::new_unwatched("test").unwrap();
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         AvailableTools::with_tools(&["claude"]),
         crate::file_watch::FileWatchService::noop(),
@@ -1429,7 +1429,7 @@ fn test_enter_on_acp_session_opens_structured_view() {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         tools,
         crate::file_watch::FileWatchService::noop(),

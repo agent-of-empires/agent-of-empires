@@ -5,8 +5,9 @@
 //! substantially. New integration tests go here, not as loose files under
 //! `tests/`. Tests run as `cargo test --test integration [<module>::<test>]`.
 //!
-//! `#[serial]` does not exclude unmarked tests or other lock groups. Fixtures
-//! that poison concurrent consumers need separate processes:
+//! Environment writers use the default `#[serial]` key; all other tests use
+//! default `#[parallel]` so readers cannot overlap a writer. Fixtures that
+//! poison concurrent consumers beyond that lock still need separate processes:
 //! `branch_exists_spawn_failure.rs` isolates `PATH`, and
 //! `filewatch_degradation.rs` isolates `AOE_FILE_WATCH=off`.
 

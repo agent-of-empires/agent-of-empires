@@ -26,6 +26,7 @@ fn remote_peer() -> SocketAddr {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn hostile_host_is_rejected_with_403() {
     let state = build_test_app_state_with_policy(
         Vec::new(),
@@ -45,6 +46,7 @@ async fn hostile_host_is_rejected_with_403() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn injected_tunnel_host_passes_the_gate() {
     let state = build_test_app_state_with_policy(
         Vec::new(),

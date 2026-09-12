@@ -131,6 +131,7 @@ async fn serve_once(wire_response: Vec<u8>) -> (String, tokio::task::JoinHandle<
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn daemon_client_http_contract() {
     fn assert_traits<T: Clone + Send + Sync>() {}
     assert_traits::<DaemonClient>();

@@ -11,6 +11,7 @@ import { writeFileSync, chmodSync, mkdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { test, expect } from "../helpers/liveTest";
 import { spawnAoeServe, resolveAoeBinary } from "../helpers/aoeServe";
+import { gitEnv } from "../helpers/gitFixture";
 import { clickSidebarSession, openMobileSidebar } from "../helpers/sidebar";
 
 test("scrollback remains available through the web capture limit", async ({ browser }, testInfo) => {
@@ -27,7 +28,6 @@ test("scrollback remains available through the web capture limit", async ({ brow
       writeFileSync(
         tool,
         `#!/bin/bash
-sleep 5
 for i in $(seq 1 2500); do echo "scrollline $i"; done
 echo "PROMPT_READY"
 while true; do sleep 1; done
@@ -36,7 +36,7 @@ while true; do sleep 1; done
       chmodSync(tool, 0o755);
       const pd = join(e.home, "project");
       mkdirSync(pd, { recursive: true });
-      spawnSync("git", ["init", "-q"], { cwd: pd });
+      spawnSync("git", ["init", "-q"], { cwd: pd, env: gitEnv(e.env) });
       const bootstrap = spawnSync(
         "tmux",
         ["-S", e.env.AOE_TMUX_SOCKET!, "new-session", "-d", "-s", "history-bootstrap", "sleep 30"],
@@ -66,34 +66,27 @@ while true; do sleep 1; done
     await page.locator("[data-live-terminal]").waitFor({ state: "visible", timeout: 15_000 });
     await page
       .locator("[data-live-content]")
-      // The seed idles 5s before flooding 2,500 lines, so PROMPT_READY lands
-      // late; on a loaded CI runner (two live-serve workers per shard) the
-      // stream + render can outlast a 15s budget. 30s (well within the 90s
-      // test cap) keeps this deterministic without masking a real hang.
       .filter({ hasText: "PROMPT_READY" })
       .waitFor({ state: "attached", timeout: 30_000 });
-    // Let the sizing effect settle the grid + the buffered window land.
-    await page.waitForTimeout(1200);
-
     const scroller = page.locator("[data-live-terminal] > div").first();
-    const m = await scroller.evaluate((el) => {
-      const rows = Array.from(el.querySelectorAll("[data-live-content] > div")) as HTMLElement[];
-      const h = rows.length >= 2 ? rows[rows.length - 1]!.getBoundingClientRect().height : 16;
-      const nums = rows
-        .map((r) => /scrollline (\d+)/.exec(r.textContent ?? "")?.[1])
-        .filter((x): x is string => !!x)
-        .map(Number);
-      return {
-        screenRows: Math.round(el.clientHeight / h),
-        min: nums.length ? Math.min(...nums) : null,
-        max: nums.length ? Math.max(...nums) : null,
-      };
-    });
-    expect(m.min, "scrollback lines are rendered at the live edge").not.toBeNull();
-    // More than one screenful of distinct scrollback lines is loaded (the
-    // visible screen PLUS the overscan buffer above it). With only the screen
-    // captured the span would be ~one screen.
-    expect(m.max! - m.min!, "buffered scrollback spans more than one screen").toBeGreaterThan(m.screenRows);
+    await expect
+      .poll(async () => {
+        const m = await scroller.evaluate((el) => {
+          const rows = Array.from(el.querySelectorAll("[data-live-content] > div")) as HTMLElement[];
+          const h = rows.length >= 2 ? rows[rows.length - 1]!.getBoundingClientRect().height : 16;
+          const nums = rows
+            .map((r) => /scrollline (\d+)/.exec(r.textContent ?? "")?.[1])
+            .filter((x): x is string => !!x)
+            .map(Number);
+          return {
+            screenRows: Math.round(el.clientHeight / h),
+            min: nums.length ? Math.min(...nums) : null,
+            max: nums.length ? Math.max(...nums) : null,
+          };
+        });
+        return m.min !== null && m.max !== null && m.max - m.min > m.screenRows;
+      })
+      .toBe(true);
 
     // Jump to the oldest retained row. The fast VT path caches 2,000 lines,
     // but the browser's advertised capture limit is 4,000; its fallback must

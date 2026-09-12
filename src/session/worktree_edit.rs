@@ -640,24 +640,36 @@ mod tests {
         assert!(!ensure_sandbox_container_released("any-session-id", false));
     }
 
+    #[cfg(unix)]
     #[test]
     fn discard_after_move_short_circuits_without_sandbox() {
-        // After the #2596 fix, the `is_sandboxed` guard is the ONLY thing that
-        // keeps a plain (non-sandbox) worktree rename from spawning a `docker`
-        // subprocess. Time-bound to catch a future edit that reorders the
-        // guard below the runtime call: the sandbox-off path returns before
-        // any `DockerContainer::from_session_id` allocation, so wall time is
-        // sub-millisecond; 100 ms is a CI-safe upper bound that still catches
-        // a real `docker inspect` (dozens to hundreds of ms) or a
-        // `container.discard()` shell-out. The Teardown-variant branches
-        // (Removed / AlreadyGone / Failed) are covered by the
-        // `classify_removal` unit tests in `containers::mod`.
-        let start = std::time::Instant::now();
-        discard_sandbox_container_after_move("any-session-id", false);
-        let elapsed = start.elapsed();
+        use std::os::unix::fs::PermissionsExt;
+        let home = crate::session::test_support::isolate_app_dir();
+        let bin = home.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let marker = home.path().join("runtime-calls");
+        let _env =
+            crate::session::test_support::EnvGuard::set(&[("AOE_TEST_RUNTIME_CALLS", &marker)]);
+        for binary in ["docker", "podman", "container"] {
+            let script = bin.join(binary);
+            std::fs::write(
+                &script,
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$AOE_TEST_RUNTIME_CALLS\"\nexit 0\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _path = crate::session::test_support::path_prepended(&bin);
+        discard_sandbox_container_after_move("worktree-discard-probe", false);
         assert!(
-            elapsed < std::time::Duration::from_millis(100),
-            "non-sandbox path must short-circuit before any container runtime call; elapsed = {elapsed:?}"
+            !marker.exists(),
+            "non-sandbox move invoked the native runtime"
+        );
+        discard_sandbox_container_after_move("worktree-discard-probe", true);
+        let calls = std::fs::read_to_string(marker).unwrap();
+        assert!(
+            calls.lines().any(|line| line.starts_with("rm ")),
+            "sandbox control must reach the runtime removal command: {calls}"
         );
     }
 

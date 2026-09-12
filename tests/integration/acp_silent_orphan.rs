@@ -36,49 +36,7 @@ use serial_test::serial;
 
 use crate::common::{shim_ready, spawn_runner_with_shim};
 
-/// RAII helper that snapshots env-var values on construction and
-/// restores them on drop. The watchdog tests are `#[serial]` but the
-/// env mutations leak across test order regardless; the guard keeps
-/// each test hermetic so adding or reordering cases can't break the
-/// next one. See #1401 and CodeRabbit feedback on PR #1364.
-///
-/// The crate's own `session::test_support::EnvGuard` is `pub(crate)` and
-/// so out of reach from this integration-test crate; the snapshot logic
-/// is duplicated here rather than widening that helper's visibility.
-///
-/// Snapshots are `Option<OsString>` read via [`std::env::var_os`], not
-/// `Option<String>` via `env::var(..).ok()`. `env::var` returns
-/// `Err(NotUnicode(_))` for a non-UTF-8 prior value, which `.ok()` would
-/// collapse to `None`, making `Drop` *remove* the var instead of
-/// restoring its bytes and leaking the removal into every later
-/// `#[serial]` test in this binary. See issue #2751.
-struct EnvGuard {
-    vars: Vec<(&'static str, Option<std::ffi::OsString>)>,
-}
-
-impl EnvGuard {
-    fn set(pairs: &[(&'static str, &'static str)]) -> Self {
-        let vars: Vec<_> = pairs
-            .iter()
-            .map(|(k, _)| (*k, std::env::var_os(k)))
-            .collect();
-        for (k, v) in pairs {
-            std::env::set_var(k, v);
-        }
-        Self { vars }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (k, old) in self.vars.drain(..) {
-            match old {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
-    }
-}
+use crate::common::EnvGuard;
 
 /// What one drained turn produced.
 struct TurnOutcome {
@@ -89,6 +47,33 @@ struct TurnOutcome {
     usage_cost: Option<bool>,
     /// The turn's terminal reason, or `None` if the deadline came first.
     stopped: Option<String>,
+}
+
+async fn await_activity(client: &mut AcpClient, marker: Option<&str>) -> Option<bool> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match client
+                .next_event()
+                .await
+                .expect("ACP stream open before activity")
+            {
+                Event::UsageUpdated { usage } if marker.is_none() && usage.cost.is_some() => {
+                    return Some(usage.cost.is_some())
+                }
+                Event::ToolCallCompleted { content, .. }
+                    if marker.is_some_and(|needle| content.contains(needle)) =>
+                {
+                    return None
+                }
+                Event::Stopped { reason } => {
+                    panic!("turn stopped before qualifying activity: {reason}")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("qualifying native activity received")
 }
 
 async fn drain_turn(client: &mut AcpClient, deadline: Instant) -> TurnOutcome {
@@ -105,7 +90,7 @@ async fn drain_turn(client: &mut AcpClient, deadline: Instant) -> TurnOutcome {
                 }
             }
             Ok(Some(_)) => continue,
-            Ok(None) => break,
+            Ok(None) => panic!("ACP stream closed during watchdog observation"),
             Err(_) => continue,
         }
     }
@@ -134,7 +119,7 @@ async fn cost_bearing_wrap_up_without_response_ends_as_prompt_complete() {
     // the same reason later on the base grace. Polling cadence dropped to
     // 50ms so the watchdog evaluation tracks the configured grace closely
     // instead of waiting up to the default 5s tick.
-    let _env = EnvGuard::set(&[
+    let _env = EnvGuard::from_pairs(&[
         ("AOE_SILENT_ORPHAN_GRACE_MS", "60000"),
         ("AOE_SILENT_ORPHAN_FAST_GRACE_MS", "300"),
         ("AOE_SILENT_ORPHAN_CHECK_INTERVAL_MS", "50"),
@@ -201,7 +186,7 @@ async fn silent_orphan_fires_when_the_turn_never_wraps_up() {
     // Base grace tight, fast grace far longer: only the no-cost path can
     // fire inside the drain, so a usage frame that wrongly armed the fast
     // grace would not be mistaken for this one.
-    let _env = EnvGuard::set(&[
+    let _env = EnvGuard::from_pairs(&[
         ("AOE_SILENT_ORPHAN_GRACE_MS", "300"),
         ("AOE_SILENT_ORPHAN_FAST_GRACE_MS", "5000"),
         ("AOE_SILENT_ORPHAN_CHECK_INTERVAL_MS", "50"),
@@ -259,7 +244,7 @@ async fn silent_orphan_suppressed_during_normal_turn() {
     // the only Stopped we see is prompt_complete, not prompt_orphaned.
     // Tight polling cadence so a regressed grace would fire within the
     // assertion window instead of waiting for the default 5s tick.
-    let _env = EnvGuard::set(&[
+    let _env = EnvGuard::from_pairs(&[
         ("AOE_SILENT_ORPHAN_GRACE_MS", "10000"),
         ("AOE_SILENT_ORPHAN_FAST_GRACE_MS", "10000"),
         ("AOE_SILENT_ORPHAN_CHECK_INTERVAL_MS", "50"),
@@ -322,7 +307,7 @@ async fn silent_orphan_disabled_by_zero_grace() {
     // because the watchdog hadn't ticked yet. Forcing a 50ms cadence
     // means a wrongly-armed watchdog WOULD fire within the deadline,
     // turning a silent assertion into a real one.
-    let _env = EnvGuard::set(&[
+    let _env = EnvGuard::from_pairs(&[
         ("AOE_SILENT_ORPHAN_GRACE_MS", "0"),
         ("AOE_SILENT_ORPHAN_FAST_GRACE_MS", "200"),
         ("AOE_SILENT_ORPHAN_CHECK_INTERVAL_MS", "50"),
@@ -352,7 +337,9 @@ async fn silent_orphan_disabled_by_zero_grace() {
         .await
         .expect("send prompt");
 
-    let outcome = drain_turn(&mut client, Instant::now() + Duration::from_secs(2)).await;
+    let activity_cost = await_activity(&mut client, None).await;
+    let mut outcome = drain_turn(&mut client, Instant::now() + Duration::from_secs(2)).await;
+    outcome.usage_cost = outcome.usage_cost.or(activity_cost);
     let _ = client.shutdown().await;
 
     assert_eq!(
@@ -386,7 +373,7 @@ async fn silent_orphan_suppressed_during_async_agent_wait() {
     // must see no `prompt_orphaned`. The fast grace is set tight so a
     // wrongly ordered effective_grace branch (cost-seen > off-protocol)
     // would still false-fire and fail the assertion.
-    let _env = EnvGuard::set(&[
+    let _env = EnvGuard::from_pairs(&[
         ("AOE_SILENT_ORPHAN_GRACE_MS", "300"),
         ("AOE_SILENT_ORPHAN_FAST_GRACE_MS", "100"),
         ("AOE_SILENT_ORPHAN_CHECK_INTERVAL_MS", "50"),
@@ -416,6 +403,7 @@ async fn silent_orphan_suppressed_during_async_agent_wait() {
         .await
         .expect("send prompt");
 
+    await_activity(&mut client, Some("Async agent launched successfully")).await;
     let outcome = drain_turn(&mut client, Instant::now() + Duration::from_secs(2)).await;
     let _ = client.shutdown().await;
 
@@ -444,7 +432,7 @@ async fn silent_orphan_suppressed_during_background_bash() {
     // raw_input.run_in_background) feeds the off-protocol path, the
     // watchdog stays armed-but-suppressed and the 2s drain sees no
     // Stopped.
-    let _env = EnvGuard::set(&[
+    let _env = EnvGuard::from_pairs(&[
         ("AOE_SILENT_ORPHAN_GRACE_MS", "300"),
         ("AOE_SILENT_ORPHAN_FAST_GRACE_MS", "100"),
         ("AOE_SILENT_ORPHAN_CHECK_INTERVAL_MS", "50"),
@@ -474,6 +462,7 @@ async fn silent_orphan_suppressed_during_background_bash() {
         .await
         .expect("send prompt");
 
+    await_activity(&mut client, Some("Command running in background with ID:")).await;
     let outcome = drain_turn(&mut client, Instant::now() + Duration::from_secs(2)).await;
     let _ = client.shutdown().await;
 
@@ -505,7 +494,7 @@ async fn background_bash_wrap_up_ends_as_prompt_complete() {
     // Base grace outside the 15s drain below and the off-protocol floor
     // (30 min) further still, so only the fast grace the dropped floor
     // uncovers can end this turn in time.
-    let _env = EnvGuard::set(&[
+    let _env = EnvGuard::from_pairs(&[
         ("AOE_SILENT_ORPHAN_GRACE_MS", "60000"),
         ("AOE_SILENT_ORPHAN_FAST_GRACE_MS", "300"),
         ("AOE_SILENT_ORPHAN_CHECK_INTERVAL_MS", "50"),
@@ -564,7 +553,7 @@ async fn silent_orphan_suppressed_during_scheduled_wakeup() {
         return;
     }
 
-    let _env = EnvGuard::set(&[
+    let _env = EnvGuard::from_pairs(&[
         ("AOE_SILENT_ORPHAN_GRACE_MS", "300"),
         ("AOE_SILENT_ORPHAN_FAST_GRACE_MS", "100"),
         ("AOE_SILENT_ORPHAN_CHECK_INTERVAL_MS", "50"),
@@ -594,7 +583,9 @@ async fn silent_orphan_suppressed_during_scheduled_wakeup() {
         .await
         .expect("send prompt");
 
-    let outcome = drain_turn(&mut client, Instant::now() + Duration::from_secs(2)).await;
+    let activity_cost = await_activity(&mut client, None).await;
+    let mut outcome = drain_turn(&mut client, Instant::now() + Duration::from_secs(2)).await;
+    outcome.usage_cost = outcome.usage_cost.or(activity_cost);
     let _ = client.shutdown().await;
 
     assert_eq!(

@@ -21,12 +21,11 @@ async function openSession(page: Page, handle: MockHandle) {
   await openMobileSidebar(page);
   await clickSidebarSession(page, "pinch-test");
   await page.locator("[data-live-terminal]").waitFor({ state: "visible", timeout: 10_000 });
-  await expect.poll(() => handle.liveMessages.length, { timeout: 5_000 }).toBeGreaterThan(0);
-  await page.waitForTimeout(400);
+  await handle.waitForLiveReady();
 }
 
-function pushFrame(handle: MockHandle, flags: { altScreen: boolean; mouse: boolean; mouseSgr: boolean }) {
-  handle.pushLiveFrame({
+async function pushFrame(handle: MockHandle, flags: { altScreen: boolean; mouse: boolean; mouseSgr: boolean }) {
+  await handle.pushLiveFrame({
     ...makeLiveFrame({ rows: 24, history: 120, window: 24 }),
     ...flags,
   } as Parameters<MockHandle["pushLiveFrame"]>[0]);
@@ -52,7 +51,7 @@ async function pointer(page: Page, type: string, x: number, y: number, init: Rec
 
 test("a left click on a full-screen SGR-mouse app forwards press + release", async ({ page }) => {
   const handle = await setup(page);
-  pushFrame(handle, { altScreen: true, mouse: true, mouseSgr: true });
+  await pushFrame(handle, { altScreen: true, mouse: true, mouseSgr: true });
   await expect.poll(() => scroller(page).getAttribute("class")).toContain("overflow-hidden");
   const box = (await scroller(page).boundingBox())!;
   await pointer(page, "pointerdown", box.x + 30, box.y + 20);
@@ -65,7 +64,7 @@ test("a left click on a full-screen SGR-mouse app forwards press + release", asy
 test("a click on a bottom-aligned row reports that row to the mouse app", async ({ page }) => {
   const handle = await setup(page);
   const lines = ["first", "second", "third", ...Array<string>(21).fill("")];
-  handle.pushLiveFrame({
+  await handle.pushLiveFrame({
     content: `${lines.join("\n")}\n`,
     rows: 24,
     history: 120,
@@ -83,7 +82,7 @@ test("a click on a bottom-aligned row reports that row to the mouse app", async 
 
 test("dragging forwards a motion report (button + 32) per new cell", async ({ page }) => {
   const handle = await setup(page);
-  pushFrame(handle, { altScreen: true, mouse: true, mouseSgr: true });
+  await pushFrame(handle, { altScreen: true, mouse: true, mouseSgr: true });
   await expect.poll(() => scroller(page).getAttribute("class")).toContain("overflow-hidden");
   const box = (await scroller(page).boundingBox())!;
   await pointer(page, "pointerdown", box.x + 20, box.y + 20);
@@ -96,7 +95,7 @@ test("dragging forwards a motion report (button + 32) per new cell", async ({ pa
 
 test("a legacy-mouse app forwards X10 button bytes (ESC [ M), not SGR", async ({ page }) => {
   const handle = await setup(page);
-  pushFrame(handle, { altScreen: true, mouse: true, mouseSgr: false });
+  await pushFrame(handle, { altScreen: true, mouse: true, mouseSgr: false });
   await expect.poll(() => scroller(page).getAttribute("class")).toContain("overflow-hidden");
   const box = (await scroller(page).boundingBox())!;
   await pointer(page, "pointerdown", box.x + 30, box.y + 20);
@@ -108,7 +107,7 @@ test("a legacy-mouse app forwards X10 button bytes (ESC [ M), not SGR", async ({
 
 test("Shift+click is NOT forwarded (keeps local text selection)", async ({ page }) => {
   const handle = await setup(page);
-  pushFrame(handle, { altScreen: true, mouse: true, mouseSgr: true });
+  await pushFrame(handle, { altScreen: true, mouse: true, mouseSgr: true });
   await expect.poll(() => scroller(page).getAttribute("class")).toContain("overflow-hidden");
   const box = (await scroller(page).boundingBox())!;
   await pointer(page, "pointerdown", box.x + 30, box.y + 20, { shiftKey: true });
@@ -118,7 +117,7 @@ test("Shift+click is NOT forwarded (keeps local text selection)", async ({ page 
 
 test("a normal-screen agent does NOT forward a click", async ({ page }) => {
   const handle = await setup(page);
-  pushFrame(handle, { altScreen: false, mouse: true, mouseSgr: true });
+  await pushFrame(handle, { altScreen: false, mouse: true, mouseSgr: true });
   await expect.poll(() => scroller(page).getAttribute("class")).toContain("overflow-y-auto");
   const box = (await scroller(page).boundingBox())!;
   await pointer(page, "pointerdown", box.x + 30, box.y + 20);

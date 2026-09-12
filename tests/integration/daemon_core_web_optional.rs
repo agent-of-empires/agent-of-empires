@@ -44,6 +44,7 @@ async fn status_for(uri: &str) -> StatusCode {
 /// it. This is the whole point of making the daemon core, so it is asserted in
 /// both feature corners rather than only under `web`.
 #[tokio::test]
+#[serial_test::parallel]
 async fn api_routes_are_served_without_the_dashboard_bundle() {
     assert_eq!(
         status_for("/api/sessions").await,
@@ -56,6 +57,7 @@ async fn api_routes_are_served_without_the_dashboard_bundle() {
 /// browser path must 404 rather than serve a stale or empty shell.
 #[cfg(not(feature = "web"))]
 #[tokio::test]
+#[serial_test::parallel]
 async fn dashboard_routes_are_absent_without_web() {
     for uri in ["/", "/sessions", "/assets/index-abc123.js", "/sw.js"] {
         assert_eq!(
@@ -71,6 +73,7 @@ async fn dashboard_routes_are_absent_without_web() {
 /// falling through to axum's default 404.
 #[cfg(feature = "web")]
 #[tokio::test]
+#[serial_test::parallel]
 async fn spa_fallback_serves_the_bundle_with_web() {
     assert_eq!(
         status_for("/").await,

@@ -272,12 +272,16 @@ struct Inner {
 enum DispatchMsg {
     Kernel(notify::Result<notify::Event>),
     Local(PathBuf),
+    #[cfg(any(test, feature = "test-support"))]
+    Barrier(tokio::sync::oneshot::Sender<()>),
 }
 
 /// Process-singleton file-watch primitive. Constructed via [`Self::new`] (or
 /// [`Self::noop`]); shared via `Arc<Self>`.
 pub struct FileWatchService {
     inner: Mutex<Inner>,
+    #[cfg(any(test, feature = "test-support"))]
+    kernel_observers: Mutex<HashMap<PathBuf, Vec<tokio::sync::oneshot::Sender<()>>>>,
     dispatcher_dead: AtomicBool,
     /// Sender into the dispatcher channel for in-process Local events. The
     /// kernel drain thread holds the SOLE original sender; this clone is
@@ -367,6 +371,8 @@ impl FileWatchService {
 
         let (tokio_tx, tokio_rx) = mpsc::unbounded_channel::<DispatchMsg>();
         let svc = Arc::new(FileWatchService {
+            #[cfg(any(test, feature = "test-support"))]
+            kernel_observers: Mutex::new(HashMap::new()),
             inner: Mutex::new(Inner {
                 watcher: Some(watcher),
                 subscriptions: HashMap::new(),
@@ -442,6 +448,8 @@ impl FileWatchService {
         // `notify_local_change` Err path skip the error log.
         drop(tokio_rx);
         Arc::new(FileWatchService {
+            #[cfg(any(test, feature = "test-support"))]
+            kernel_observers: Mutex::new(HashMap::new()),
             inner: Mutex::new(Inner {
                 watcher: None,
                 subscriptions: HashMap::new(),
@@ -657,7 +665,35 @@ impl FileWatchService {
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod test_support {
-    use super::{Arc, FileWatchService, WatchError};
+    use super::{Arc, DispatchMsg, FileWatchService, Path, WatchError};
+
+    /// Acknowledge earlier dispatcher messages, not queued OS notifications or
+    /// pending debounce deadlines. Panics if the dispatcher is not live.
+    pub async fn dispatch_barrier(svc: &FileWatchService) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        assert!(svc.tokio_tx.send(DispatchMsg::Barrier(tx)).is_ok());
+        rx.await.expect("live dispatcher acknowledges barrier");
+    }
+
+    /// Arm before writing. Resolves after a relevant native event for this path
+    /// has traversed classification, filtering and immediate delivery.
+    pub fn observe_kernel_path(
+        svc: &FileWatchService,
+        path: &Path,
+    ) -> tokio::sync::oneshot::Receiver<()> {
+        assert!(!svc.dispatcher_dead.load(super::Ordering::Acquire));
+        let path = std::fs::canonicalize(path.parent().expect("parent"))
+            .expect("existing parent")
+            .join(path.file_name().expect("filename"));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        svc.kernel_observers
+            .lock()
+            .unwrap()
+            .entry(path)
+            .or_default()
+            .push(tx);
+        rx
+    }
 
     pub fn new_filewatch() -> Result<Arc<FileWatchService>, WatchError> {
         FileWatchService::new()
@@ -841,6 +877,10 @@ async fn run_dispatcher(
                         // write.
                         dispatch_path(&arc, &path, FileEventKind::Upserted, EventSource::Local);
                     }
+                    #[cfg(any(test, feature = "test-support"))]
+                    Some(DispatchMsg::Barrier(tx)) => {
+                        let _ = tx.send(());
+                    }
                     None => return "channel_closed",
                 }
             }
@@ -894,6 +934,12 @@ fn handle_kernel(svc: &Arc<FileWatchService>, res: notify::Result<notify::Event>
     }
     for path in ev.paths.iter() {
         dispatch_path(svc, path, kind, EventSource::Kernel);
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(observers) = svc.kernel_observers.lock().unwrap().remove(path) {
+            for observer in observers {
+                let _ = observer.send(());
+            }
+        }
     }
 }
 
@@ -989,7 +1035,10 @@ fn arm_debounce(svc: &Arc<FileWatchService>, id: SubscriptionId, ev: FileEvent, 
 /// Pop all due slots and fire them (skipping stale slots whose `fire_at`
 /// disagrees with the live entry).
 fn fire_due(svc: &Arc<FileWatchService>) {
-    let now = Instant::now();
+    fire_due_at(svc, Instant::now());
+}
+
+fn fire_due_at(svc: &Arc<FileWatchService>, now: Instant) {
     let mut to_deliver: Vec<(SubscriptionId, FileEvent, DeliverySink)> = Vec::new();
     {
         let mut inner = svc.inner.lock().expect("file_watch inner mutex poisoned");
@@ -1077,7 +1126,7 @@ mod tests {
     /// events typically deliver within tens of ms; macOS FSEvents can take
     /// up to ~1.5s to forward small writes, so the ceiling is generous.
     const KERNEL_WAIT: Duration = Duration::from_millis(2_500);
-    /// Negative-test budget: long enough to confidently say "no event".
+    /// Observation window retained after the relevant native dispatch is witnessed.
     const NEG_WAIT: Duration = Duration::from_millis(300);
 
     /// Test 1
@@ -1091,26 +1140,8 @@ mod tests {
         assert!(!svc.dispatcher_dead.load(Ordering::Acquire));
     }
 
-    /// Test 2
-    #[tokio::test]
-    #[serial(file_watch)]
-    async fn service_init_returns_noop_on_env_off() {
-        // SAFETY: `set_var`/`remove_var` are unsafe in 2024 edition for a
-        // good reason (data races with other threads reading env). The
-        // `#[serial(file_watch)]` annotation prevents in-process races,
-        // and no other thread reads `AOE_FILE_WATCH` concurrently here.
-        let prev = std::env::var("AOE_FILE_WATCH").ok();
-        // SAFETY: see comment above.
-        unsafe { std::env::set_var("AOE_FILE_WATCH", "off") };
-        let svc = FileWatchService::new().expect("noop init");
-        // Restore env before any panic-prone assertion.
-        match prev {
-            Some(v) => unsafe { std::env::set_var("AOE_FILE_WATCH", v) },
-            None => unsafe { std::env::remove_var("AOE_FILE_WATCH") },
-        }
-        let inner = svc.inner.lock().unwrap();
-        assert!(inner.watcher.is_none(), "noop service must lack watcher");
-    }
+    // Environment-disabled construction lives in tests/filewatch_degradation.rs
+    // so its process-wide switch cannot disable concurrent live-watch tests.
 
     /// Test 3
     #[tokio::test]
@@ -1163,8 +1194,12 @@ mod tests {
                 8,
             )
             .expect("subscribe");
+        let processed = test_support::observe_kernel_path(&svc, &tmp_path);
         write_file(dir.path(), "runtime_filter.tmp", "x");
-        // Negative wait: no event for the tempfile.
+        timeout(KERNEL_WAIT, processed)
+            .await
+            .expect("native tempfile event processed")
+            .expect("observer remains live");
         assert!(
             timeout(NEG_WAIT, rx.recv()).await.is_err(),
             "tempfile event must be filtered"
@@ -1188,7 +1223,12 @@ mod tests {
                 8,
             )
             .expect("subscribe");
+        let processed = test_support::observe_kernel_path(&svc, &dir.path().join("something-else"));
         write_file(dir.path(), "something-else", "x");
+        timeout(KERNEL_WAIT, processed)
+            .await
+            .expect("native unmatched event processed")
+            .expect("observer remains live");
         assert!(
             timeout(NEG_WAIT, rx.recv()).await.is_err(),
             "unmatched path must not deliver"
@@ -1201,29 +1241,41 @@ mod tests {
     async fn subscribe_channel_capacity_drops_on_full() {
         let dir = TempDir::new().unwrap();
         let svc = FileWatchService::new().expect("init");
-        let target = dir.path().join("burst");
+        let canonical = std::fs::canonicalize(dir.path()).unwrap();
+        let paths = ["first", "dropped", "after-drain"].map(|name| canonical.join(name));
         let (mut rx, _h) = svc
             .subscribe_channel(
                 WatchSpec {
                     dir: dir.path().to_path_buf(),
-                    matcher: FileMatcher::Exact(target.clone()),
+                    matcher: FileMatcher::AnyOf(paths.to_vec()),
                     debounce: None,
                 },
-                1, // capacity 1 forces drop on the second concurrent event
+                1,
             )
             .expect("subscribe");
-        // Hammer the file: kernel will produce >1 event without the consumer
-        // draining. We never drain `rx` here, so once the first event lands,
-        // any subsequent try_send hits TrySendError::Full and is dropped.
-        for _ in 0..20 {
-            write_file(dir.path(), "burst", "x");
-        }
-        // Receive at least one event; the rest may have been dropped.
-        let first = timeout(KERNEL_WAIT, rx.recv())
+        svc.notify_local_change(&paths[0]);
+        timeout(KERNEL_WAIT, test_support::dispatch_barrier(&svc))
             .await
-            .expect("at least one event")
-            .expect("channel open");
-        assert_eq!(first.path.file_name(), target.file_name());
+            .expect("first dispatch fills channel");
+        svc.notify_local_change(&paths[1]);
+        timeout(KERNEL_WAIT, test_support::dispatch_barrier(&svc))
+            .await
+            .expect("full channel must not block dispatcher");
+        assert_eq!(rx.try_recv().expect("first event retained").path, paths[0]);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        svc.notify_local_change(&paths[2]);
+        timeout(KERNEL_WAIT, test_support::dispatch_barrier(&svc))
+            .await
+            .expect("dispatcher remains usable after drop");
+        assert_eq!(rx.try_recv().expect("delivery resumes").path, paths[2]);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     /// Test 7
@@ -1284,19 +1336,11 @@ mod tests {
                 8,
             )
             .expect("subscribe");
-        // Drop the handle: dispatcher should no longer deliver.
         drop(h);
-        write_file(dir.path(), "watched", "x");
-        // After handle drop the dispatcher's matching set should not include
-        // this subscription. Receiver is still around but the corresponding
-        // sender lives inside the (now-removed) Subscription record, so the
-        // sender is dropped and `recv()` resolves to `None` quickly.
-        let res = timeout(NEG_WAIT, rx.recv()).await;
-        match res {
-            Ok(None) => {} // sender dropped, channel closed (expected)
-            Ok(Some(_)) => panic!("event delivered after handle drop"),
-            Err(_) => {} // timed out; also acceptable (no delivery)
-        }
+        assert!(timeout(KERNEL_WAIT, rx.recv())
+            .await
+            .expect("dropping subscription closes its sender")
+            .is_none());
     }
 
     /// Test 9
@@ -1412,7 +1456,7 @@ mod tests {
     async fn debounce_collapses_burst_to_one_event() {
         let dir = TempDir::new().unwrap();
         let svc = FileWatchService::new().expect("init");
-        let target = dir.path().join("debounced");
+        let target = std::fs::canonicalize(dir.path()).unwrap().join("debounced");
         let (mut rx, _h) = svc
             .subscribe_channel(
                 WatchSpec {
@@ -1423,23 +1467,48 @@ mod tests {
                 32,
             )
             .expect("subscribe");
-        // Burst of writes: kernel emits a flurry, debounce should collapse.
+        // No await: this current-thread dispatcher cannot fire between inputs.
+        // Native write delivery is covered by subscribe_channel_fires_on_real_write.
+        use notify::event::{
+            CreateKind, DataChange, EventKind, MetadataKind, ModifyKind, RenameMode,
+        };
         for i in 0..10 {
-            write_file(dir.path(), "debounced", &format!("v{i}"));
+            let kind = match i % 3 {
+                0 => EventKind::Create(CreateKind::File),
+                1 => EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+                _ => EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+            };
+            handle_kernel(&svc, Ok(notify::Event::new(kind).add_path(target.clone())));
         }
-        // First fire should land within roughly the debounce window after
-        // the last kernel event hits the dispatcher; budget generously.
-        let first = timeout(KERNEL_WAIT, rx.recv())
-            .await
-            .expect("debounced event")
-            .expect("open");
-        assert_eq!(first.path.file_name(), target.file_name());
-        // After collapse there should be no immediate follow-up.
-        let second = timeout(NEG_WAIT, rx.recv()).await;
-        assert!(
-            second.is_err() || matches!(second, Ok(None)),
-            "burst must collapse to a single delivery"
+        let deadline = *svc.inner.lock().unwrap().slots.keys().next_back().unwrap();
+        fire_due_at(&svc, deadline - Duration::from_nanos(1));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        fire_due_at(&svc, deadline);
+        let first = rx.try_recv().expect("one event at trailing-edge deadline");
+        assert_eq!(first.path, target);
+        assert_eq!(first.source, EventSource::Kernel);
+        assert_eq!(first.kind, FileEventKind::Upserted);
+        fire_due_at(&svc, deadline + Duration::from_secs(1));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        handle_kernel(
+            &svc,
+            Ok(notify::Event::new(EventKind::Modify(ModifyKind::Metadata(
+                MetadataKind::Permissions,
+            )))
+            .add_path(target)),
         );
+        fire_due_at(&svc, Instant::now() + Duration::from_millis(75));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     // No dispatcher runs between injections, so both paths coexist until fire_due.
@@ -1623,14 +1692,9 @@ mod tests {
     async fn notify_local_change_with_no_matching_subscribers_is_silent() {
         let dir = TempDir::new().unwrap();
         let svc = FileWatchService::new().expect("init");
-        let watched = dir.path().join("watched");
-        let missed = dir.path().join("missed");
-        // Seed only the path we publish, so canonicalize in
-        // notify_local_change resolves. `watched` is intentionally NOT
-        // created: the Exact matcher compares file names, so it needs no
-        // file on disk, and not creating it avoids a pre-subscribe write
-        // that macOS FSEvents can replay as a late kernel echo.
-        std::fs::write(&missed, "seed").expect("seed missed");
+        let canonical = std::fs::canonicalize(dir.path()).unwrap();
+        let watched = canonical.join("watched");
+        let missed = canonical.join("missed");
         let (mut rx, _h) = svc
             .subscribe_channel(
                 WatchSpec {
@@ -1641,19 +1705,24 @@ mod tests {
                 4,
             )
             .expect("subscribe");
+        svc.notify_local_change(&watched);
+        timeout(KERNEL_WAIT, test_support::dispatch_barrier(&svc))
+            .await
+            .expect("matching Local publish processed");
+        let delivered = rx
+            .try_recv()
+            .expect("live subscription receives matching publish");
+        assert_eq!(delivered.path, watched);
+        assert_eq!(delivered.source, EventSource::Local);
+
         svc.notify_local_change(&missed);
-        // The only Local publish was for `missed`, which must never match
-        // the `watched` subscription. Drain the budget and assert no
-        // Local-sourced delivery arrives; a stray Kernel echo (FSEvents may
-        // replay the pre-subscribe seed) is an acceptable artifact and not
-        // what this test guards.
-        while let Ok(Some(ev)) = timeout(Duration::from_millis(150), rx.recv()).await {
-            assert_ne!(
-                ev.source,
-                EventSource::Local,
-                "unmatched Local publish must not deliver to unrelated subscribers"
-            );
-        }
+        timeout(KERNEL_WAIT, test_support::dispatch_barrier(&svc))
+            .await
+            .expect("unmatched Local publish processed");
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
         assert!(
             !svc.dispatcher_dead.load(Ordering::Acquire),
             "unmatched Local publish must not trip dispatcher_dead"
@@ -1722,11 +1791,8 @@ mod tests {
         }
     }
 
-    /// Locks the primitive's self-heal contract: a peer-driven
-    /// `rm -rf X && mkdir X` of the same canonical path leaves the
-    /// kernel watch in IN_IGNORED limbo, so a subsequent
-    /// `subscribe_channel` on the same path (refcount > 0) MUST
-    /// detect the inode drift and re-arm the watch.
+    /// Replacing a watched directory must re-arm its stale native watch even
+    /// while an earlier subscription keeps the path's refcount above zero.
     #[cfg(unix)]
     #[tokio::test]
     #[serial(file_watch)]
@@ -1758,17 +1824,15 @@ mod tests {
                 .expect("identity recorded on install")
         };
 
-        // ext4/overlayfs recycle the freed inode number for an immediate
-        // same-path recreate, and inode timestamps come from the kernel's
-        // coarse clock (jiffy resolution, up to 10ms at HZ=100), so a
-        // recreate landing in the same tick as the original create would
-        // tie on (dev, ino, btime) and hide the drift from the identity
-        // check. Real recreates are seconds away from the original
-        // install; the sleep models that gap without flaking on fast
-        // filesystems.
-        std::thread::sleep(Duration::from_millis(50));
-        std::fs::remove_dir_all(&dir).unwrap();
+        // Retain the old inode so reuse cannot erase the identity stimulus,
+        // even on filesystems without birth times.
+        std::fs::rename(&dir, root.path().join("retired")).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
+        assert_ne!(
+            identity_before,
+            capture_watch_identity(&dir).unwrap(),
+            "replacement identity must differ before subscribing"
+        );
 
         let (mut rx, _h2) = svc
             .subscribe_channel(
@@ -1791,8 +1855,7 @@ mod tests {
         };
         assert_ne!(
             identity_before, identity_after,
-            "remove + recreate of the same path must yield a distinct identity \
-             (btime breaks the tie when the filesystem recycles the inode number)"
+            "second subscribe must install the replacement identity"
         );
 
         write_file(&dir, "file", "payload");

@@ -1,21 +1,7 @@
 // Playwright globalSetup for the live config.
 //
-// Runs exactly once before any worker spawns. Ensures the debug `aoe` binary
-// exists so per-test `spawnAoeServe()` calls don't pay cargo-build startup
-// cost or race each other on a cold build cache. Live tests use debug-only
-// timing overrides, matching the binary supplied by CI.
-//
-// Behavior:
-// - If `AOE_E2E_BINARY` is set and the file exists, do nothing.
-// - Else if `<repo>/target/debug/aoe` exists, do nothing.
-// - Else run `cargo build --features web` from the repo root.
-//   `web` is NOT a default feature (a plain build needs no Node/npm). A
-//   default build still runs `aoe serve`, but with no dashboard bundle
-//   embedded, so every live spec would load a 404 instead of the app.
-//
-// CI sets `AOE_E2E_BINARY` (see `.github/workflows/tests.yml`) so the build
-// happens in a dedicated job step where the output is visible. Local dev
-// gets the convenience of an automatic build on first run.
+// Use the supplied or existing debug web binary; build it if absent. Debug builds
+// forward the live harness's explicit watchdog timing control.
 
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";

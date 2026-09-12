@@ -72,8 +72,14 @@ impl RateLimiter {
     /// Record a failed auth attempt. Returns true if this failure triggered a lockout.
     pub async fn record_failure(&self, ip: IpAddr) -> bool {
         let mut failures = self.failures.write().await;
-        let now = Instant::now();
+        Self::record_failure_at(&mut failures, ip, Instant::now())
+    }
 
+    fn record_failure_at(
+        failures: &mut HashMap<IpAddr, FailureRecord>,
+        ip: IpAddr,
+        now: Instant,
+    ) -> bool {
         if failures.len() >= MAX_TRACKED_IPS && !failures.contains_key(&ip) {
             return false;
         }
@@ -247,16 +253,20 @@ mod tests {
 
     #[tokio::test]
     async fn burst_failures_coalesce() {
-        // A single page load's parallel API calls (all firing within ~milliseconds)
-        // must not exhaust the failure budget.
         let limiter = RateLimiter::new();
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
-
-        // 20 failures in a tight loop should count as 1
+        let now = Instant::now();
+        let mut failures = limiter.failures.write().await;
         for _ in 0..20 {
-            assert!(!limiter.record_failure(ip).await);
+            assert!(!RateLimiter::record_failure_at(&mut failures, ip, now));
         }
-        assert!(limiter.check_locked(ip).await.is_none());
+        for attempt in 1..MAX_FAILURES {
+            assert_eq!(
+                RateLimiter::record_failure_at(&mut failures, ip, now + COALESCE_WINDOW * attempt,),
+                attempt == MAX_FAILURES - 1,
+                "the burst consumes exactly one attempt, not zero or twenty",
+            );
+        }
     }
 
     #[tokio::test]

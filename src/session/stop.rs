@@ -82,6 +82,7 @@ mod tests {
 
     #[test]
     fn test_stop_result_preserves_session_id() {
+        let _app_guard = crate::session::test_support::isolate_app_dir();
         let instance = create_test_instance();
         let custom_id = "custom-session-id-123".to_string();
         let request = StopRequest {

@@ -618,11 +618,48 @@ fn open_storage_lock_file(dir: &Path, name: &str) -> Result<(fs::File, PathBuf)>
     Ok((file, path))
 }
 
+#[cfg(test)]
+thread_local! {
+    static LOCK_CONTENTION_OBSERVER: std::cell::RefCell<Option<std::sync::mpsc::Sender<PathBuf>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn observe_lock_contention_for_test(
+    sender: std::sync::mpsc::Sender<PathBuf>,
+) -> impl Drop {
+    struct Observer(std::marker::PhantomData<std::rc::Rc<()>>);
+    impl Drop for Observer {
+        fn drop(&mut self) {
+            LOCK_CONTENTION_OBSERVER.with(|slot| slot.borrow_mut().take());
+        }
+    }
+    LOCK_CONTENTION_OBSERVER.with(|slot| {
+        assert!(slot.borrow_mut().replace(sender).is_none());
+    });
+    Observer(std::marker::PhantomData)
+}
+
+#[cfg(test)]
+fn report_lock_contention_for_test(path: &Path) {
+    LOCK_CONTENTION_OBSERVER.with(|slot| {
+        if let Some(sender) = slot.borrow_mut().take() {
+            let _ = sender.send(path.to_path_buf());
+        }
+    });
+}
+
 fn acquire_open_storage_flock(file: fs::File, path: &Path) -> Result<StorageFlock> {
     if let Err(e) = file.try_lock_exclusive() {
         if e.kind() != std::io::ErrorKind::WouldBlock {
             return Err(e.into());
         }
+        #[cfg(feature = "test-support")]
+        if let Some(marker) = std::env::var_os("AOE_E2E_STORAGE_LOCK_CONTENDED") {
+            fs::write(marker, path.as_os_str().as_encoded_bytes())?;
+        }
+        #[cfg(test)]
+        report_lock_contention_for_test(path);
         let started = Instant::now();
         let mut warned = false;
         loop {
@@ -670,6 +707,8 @@ fn acquire_open_storage_shared_flock(file: fs::File, path: &Path) -> Result<Stor
         if e.kind() != std::io::ErrorKind::WouldBlock {
             return Err(e.into());
         }
+        #[cfg(test)]
+        report_lock_contention_for_test(path);
         let started = Instant::now();
         let mut warned = false;
         loop {
@@ -1283,6 +1322,18 @@ impl Storage {
     where
         F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
     {
+        #[cfg(test)]
+        let _mu = match self.save_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                report_lock_contention_for_test(&self.sessions_path);
+                self.save_lock
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+            }
+        };
+        #[cfg(not(test))]
         let _mu = self
             .save_lock
             .lock()
@@ -3919,21 +3970,24 @@ mod tests {
         let instance_id = Instance::new("locked", "/tmp/locked").id;
         let storage = Storage::new_unwatched(profile)?;
         let first = storage.acquire_instance_lifecycle_lock(&instance_id)?;
+        let (contended_tx, contended_rx) = std::sync::mpsc::channel();
         let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
 
         std::thread::scope(|scope| {
             scope.spawn(|| {
+                let _observer = observe_lock_contention_for_test(contended_tx);
                 let peer = Storage::new_unwatched(profile).unwrap();
                 let _second = peer.acquire_instance_lifecycle_lock(&instance_id).unwrap();
                 acquired_tx.send(()).unwrap();
             });
-            assert!(
-                acquired_rx
-                    .recv_timeout(Duration::from_millis(150))
-                    .is_err(),
-                "peer acquired the same lifecycle lock before release"
-            );
+            let contended = contended_rx.recv_timeout(Duration::from_secs(2));
+            let entered_early = acquired_rx.try_recv().is_ok();
             drop(first);
+            assert!(
+                contended.is_ok(),
+                "peer never demonstrated lifecycle lock contention"
+            );
+            assert!(!entered_early, "peer acquired before release");
             acquired_rx
                 .recv_timeout(Duration::from_secs(2))
                 .expect("peer did not acquire lifecycle lock after release");
@@ -3952,97 +4006,82 @@ mod tests {
     fn test_update_does_not_serialize_across_profiles() -> Result<()> {
         let temp = tempdir()?;
         let _guard = setup_test_home(temp.path());
-
         let storage_a = Storage::new_unwatched("test-update-profile-a")?;
         let storage_b = Storage::new_unwatched("test-update-profile-b")?;
-
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (overlap_tx, overlap_rx) = std::sync::mpsc::channel();
         std::thread::scope(|scope| {
-            scope.spawn(|| {
-                storage_a
-                    .update(|instances, _| {
-                        instances.push(Instance::new("a1", "/tmp/a1"));
-                        Ok(())
-                    })
-                    .unwrap();
+            let storage_a = &storage_a;
+            let storage_b = &storage_b;
+            let a = scope.spawn(move || {
+                storage_a.update(|instances, _| {
+                    entered_tx.send(()).unwrap();
+                    let overlap = overlap_rx.recv_timeout(Duration::from_secs(2));
+                    instances.push(Instance::new("a1", "/tmp/a1"));
+                    overlap.context("profile B must enter while profile A owns its update locks")
+                })
             });
-            scope.spawn(|| {
-                storage_b
-                    .update(|instances, _| {
-                        instances.push(Instance::new("b1", "/tmp/b1"));
-                        Ok(())
-                    })
-                    .unwrap();
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let b = scope.spawn(move || {
+                storage_b.update(|instances, _| {
+                    let _ = overlap_tx.send(());
+                    instances.push(Instance::new("b1", "/tmp/b1"));
+                    Ok(())
+                })
             });
-        });
-
-        assert_eq!(storage_a.load()?.len(), 1);
-        assert_eq!(storage_b.load()?.len(), 1);
+            a.join().unwrap()?;
+            b.join().unwrap()?;
+            Ok::<_, anyhow::Error>(())
+        })?;
+        assert_eq!(storage_a.load()?[0].title, "a1");
+        assert_eq!(storage_b.load()?[0].title, "b1");
         Ok(())
     }
 
     #[test]
     #[serial]
     fn test_update_takes_same_lock_across_threads() -> Result<()> {
-        use std::sync::Barrier;
-        use std::time::{Duration, Instant};
-
         let temp = tempdir()?;
         let _guard = setup_test_home(temp.path());
-
         let storage = Storage::new_unwatched("test-commit-lock")?;
-        storage.update(|i, g| {
-            *i = [].to_vec();
-            *g = GroupTree::new_with_groups(&[], &[]).get_all_groups();
-            Ok(())
-        })?;
-
-        let entered = Arc::new(Barrier::new(2));
-        let release = Arc::new(Barrier::new(2));
-        let entered_clone = Arc::clone(&entered);
-        let release_clone = Arc::clone(&release);
-
-        let updater = std::thread::spawn(move || {
-            let storage = Storage::new_unwatched("test-commit-lock").unwrap();
-            storage
-                .update(|instances, _| {
-                    instances.push(Instance::new("from-update", "/tmp/u"));
-                    entered_clone.wait();
-                    release_clone.wait();
-                    Ok(())
-                })
-                .unwrap();
-        });
-
-        entered.wait();
-        let start = Instant::now();
-        let committer = std::thread::spawn(|| {
-            let storage = Storage::new_unwatched("test-commit-lock").unwrap();
-            storage
-                .update(|i, g| {
-                    *i = [Instance::new("from-commit", "/tmp/c")].to_vec();
-                    *g = GroupTree::new_with_groups(&[], &[]).get_all_groups();
-                    Ok(())
-                })
-                .unwrap();
-        });
-
-        std::thread::sleep(Duration::from_millis(80));
-        assert!(
-            !committer.is_finished(),
-            "commit should be blocked by update's lock"
-        );
-        release.wait();
-        updater.join().unwrap();
-        committer.join().unwrap();
-
-        assert!(
-            start.elapsed() >= Duration::from_millis(50),
-            "commit returned suspiciously fast"
-        );
-
-        let loaded = storage.load()?;
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].title, "from-commit");
+        for layer in ["mutex", "flock"] {
+            let mutex = (layer == "mutex").then(|| storage.save_lock.lock().unwrap());
+            let flock = if layer == "flock" {
+                Some(acquire_storage_flock(
+                    storage.sessions_path.parent().unwrap(),
+                    STORAGE_LOCK_FILENAME,
+                )?)
+            } else {
+                None
+            };
+            let (contended_tx, contended_rx) = std::sync::mpsc::channel();
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let writer = std::thread::spawn(move || {
+                let _observer = observe_lock_contention_for_test(contended_tx);
+                Storage::new_unwatched("test-commit-lock")
+                    .unwrap()
+                    .update(|instances, _| {
+                        entered_tx.send(()).unwrap();
+                        *instances = vec![Instance::new(layer, "/tmp/committed")];
+                        Ok(())
+                    })
+                    .unwrap();
+            });
+            let contended = contended_rx.recv_timeout(Duration::from_secs(2));
+            let entered_early = entered_rx.try_recv().is_ok();
+            drop(mutex);
+            drop(flock);
+            writer.join().unwrap();
+            assert!(
+                contended.is_ok(),
+                "{layer}: writer never demonstrated contention"
+            );
+            assert!(
+                !entered_early,
+                "{layer}: mutation entered before lock release"
+            );
+            assert_eq!(storage.load()?[0].title, layer);
+        }
         Ok(())
     }
 
@@ -4175,6 +4214,7 @@ mod tests {
         let temp = tempdir()?;
         let _guard = setup_test_home(temp.path());
 
+        let _watch_env = crate::session::test_support::EnvGuard::unset(&["AOE_FILE_WATCH"]);
         let svc = FileWatchService::new().expect("live svc");
         let storage = Storage::new("test-update-no-notify", svc.clone())?;
         storage.update(|instances, _groups| {
@@ -4192,7 +4232,7 @@ mod tests {
                     matcher: FileMatcher::Exact(sessions_path),
                     debounce: None,
                 },
-                4,
+                128,
             )
             .expect("subscribe sessions");
         let (mut groups_rx, _groups_h) = svc
@@ -4202,18 +4242,36 @@ mod tests {
                     matcher: FileMatcher::Exact(groups_path),
                     debounce: None,
                 },
-                4,
+                128,
             )
             .expect("subscribe groups");
 
-        while tokio::time::timeout(std::time::Duration::from_millis(400), sessions_rx.recv())
-            .await
-            .is_ok()
-        {}
-        while tokio::time::timeout(std::time::Duration::from_millis(50), groups_rx.recv())
-            .await
-            .is_ok()
-        {}
+        storage.update(|instances, groups| {
+            instances.push(Instance::new("published", "/tmp/published"));
+            groups.push(Group::new("published", "published"));
+            Ok(())
+        })?;
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            crate::file_watch::test_support::dispatch_barrier(&svc),
+        )
+        .await?;
+        for rx in [&mut sessions_rx, &mut groups_rx] {
+            let mut local = false;
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => local |= event.source == crate::file_watch::EventSource::Local,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        panic!("live dispatcher closed")
+                    }
+                }
+            }
+            assert!(
+                local,
+                "successful write must positively witness local delivery"
+            );
+        }
 
         let original_mode = fs::metadata(&profile_dir)?.permissions().mode();
         let mut readonly = fs::metadata(&profile_dir)?.permissions();
@@ -4232,18 +4290,26 @@ mod tests {
 
         assert!(update_res.is_err(), "write failure must surface as Err");
 
-        let sessions_recv =
-            tokio::time::timeout(std::time::Duration::from_millis(150), sessions_rx.recv()).await;
-        assert!(
-            sessions_recv.is_err() || matches!(sessions_recv, Ok(None)),
-            "failed update must not emit a sessions notify_local_change delivery"
-        );
-        let groups_recv =
-            tokio::time::timeout(std::time::Duration::from_millis(150), groups_rx.recv()).await;
-        assert!(
-            groups_recv.is_err() || matches!(groups_recv, Ok(None)),
-            "failed update must not emit a groups notify_local_change delivery either; per-file gating means a write that never returned Ok must not fire its notify"
-        );
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            crate::file_watch::test_support::dispatch_barrier(&svc),
+        )
+        .await?;
+        for rx in [&mut sessions_rx, &mut groups_rx] {
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => assert_ne!(
+                        event.source,
+                        crate::file_watch::EventSource::Local,
+                        "failed write emitted a successful-write notification"
+                    ),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        panic!("live dispatcher closed")
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -4262,9 +4328,12 @@ mod tests {
         })?;
 
         let groups_path = storage.sessions_path.with_file_name("groups.json");
+        let sentinel = std::time::UNIX_EPOCH + Duration::from_secs(946_684_800);
+        fs::File::options()
+            .write(true)
+            .open(&groups_path)?
+            .set_times(fs::FileTimes::new().set_modified(sentinel))?;
         let groups_mtime_before = fs::metadata(&groups_path)?.modified()?;
-
-        std::thread::sleep(std::time::Duration::from_millis(10));
 
         storage.update(|instances, _groups| {
             instances.push(Instance::new("added", "/tmp/added"));
@@ -4293,20 +4362,18 @@ mod tests {
             Ok(())
         })?;
 
-        let groups_path = storage.sessions_path.with_file_name("groups.json");
-        let groups_mtime_before = fs::metadata(&groups_path)?.modified()?;
-
-        std::thread::sleep(std::time::Duration::from_millis(10));
-
         storage.update(|_instances, groups| {
             groups.push(Group::new("new-group", "work/new-group"));
             Ok(())
         })?;
 
-        let groups_mtime_after = fs::metadata(&groups_path)?.modified()?;
-        assert_ne!(
-            groups_mtime_before, groups_mtime_after,
-            "groups.json should be rewritten when closure mutates groups"
+        let (_, groups) = storage.load_with_groups()?;
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["seed-group", "work/new-group"]
         );
         Ok(())
     }
@@ -5386,14 +5453,14 @@ mod tests {
     fn dual_storage_lock_blocks_target_only_writer() -> Result<()> {
         let (_temp, _guard, source, target, _before, _after) = setup_recovery_env("dual-lock")?;
         let target_path = target.sessions_path().to_path_buf();
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (contended_tx, contended_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let mut writer = None;
 
-        with_two_storage_locks(&source, &target, || {
+        let (contended, entered_early) = with_two_storage_locks(&source, &target, || {
             writer = Some(std::thread::spawn(move || {
                 let target = Storage::new_for_test_path("dual-lock-target", target_path);
-                started_tx.send(()).unwrap();
+                let _observer = observe_lock_contention_for_test(contended_tx);
                 target
                     .update(|instances, _| {
                         instances.clear();
@@ -5402,22 +5469,24 @@ mod tests {
                     .unwrap();
                 done_tx.send(()).unwrap();
             }));
-            started_rx
-                .recv_timeout(std::time::Duration::from_secs(1))
-                .expect("writer reached the target update attempt");
-            assert!(
-                done_rx
-                    .recv_timeout(std::time::Duration::from_millis(150))
-                    .is_err(),
-                "target-only writer must block while repair owns both storage flocks"
-            );
-            Ok(())
+            let contended = contended_rx.recv_timeout(Duration::from_secs(2));
+            let entered_early = done_rx.try_recv().is_ok();
+            // Return the observations so assertion failure cannot retain the locks.
+            Ok((contended, entered_early))
         })?;
 
         done_rx
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("target writer proceeds after dual lock release");
         writer.unwrap().join().unwrap();
+        assert!(
+            contended.is_ok(),
+            "target writer never demonstrated lock contention"
+        );
+        assert!(
+            !entered_early,
+            "target writer entered before dual lock release"
+        );
         Ok(())
     }
 

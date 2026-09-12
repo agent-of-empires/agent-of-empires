@@ -25,14 +25,14 @@ use agent_of_empires::server::test_support::{
 use serial_test::serial;
 use tempfile::TempDir;
 
+use crate::common::set_temp_home;
 use crate::common::{pick_free_port, wait_for_port};
-use crate::home_isolation::isolate_home;
 
 #[tokio::test]
 #[serial]
 async fn dynamic_profile_rewire_inserts_and_removes_entries() {
     let temp = tempfile::tempdir().unwrap();
-    let _home = isolate_home(temp.path());
+    let _home = set_temp_home(temp.path());
     let _ = agent_of_empires::session::get_profile_dir("rewire-profile").expect("profile dir");
 
     let state = build_test_app_state(Vec::new());
@@ -80,7 +80,7 @@ async fn dynamic_profile_rewire_inserts_and_removes_entries() {
 #[serial]
 async fn dynamic_profile_rewire_overwrite_replaces_existing_subscription() {
     let temp = tempfile::tempdir().unwrap();
-    let _home = isolate_home(temp.path());
+    let _home = set_temp_home(temp.path());
     let _ = agent_of_empires::session::get_profile_dir("rewire-profile").expect("profile dir");
 
     let state = build_test_app_state(Vec::new());
@@ -117,7 +117,7 @@ async fn rewire_after_rename_drops_old_subscribes_new() {
     // `src/server/api/system.rs`. Without these two calls the old
     // canonical dir's handle leaks and the renamed dir is unwatched.
     let temp = tempfile::tempdir().unwrap();
-    let _home = isolate_home(temp.path());
+    let _home = set_temp_home(temp.path());
     let _ = agent_of_empires::session::get_profile_dir("rename-old").expect("profile dir");
     let _ = agent_of_empires::session::get_profile_dir("rename-new").expect("profile dir");
 

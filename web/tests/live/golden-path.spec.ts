@@ -10,6 +10,8 @@
 // state). Wizard-driven creation is exercised by mocked specs and will
 // land live in #1219.
 
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { test as base, expect } from "@playwright/test";
 import { spawnAoeServe, listSessions, seedSessionViaAoeAdd } from "../helpers/aoeServe";
 
@@ -18,7 +20,12 @@ base("create, view, delete a session via live backend", async ({ page }, testInf
     authMode: "none",
     workerIndex: testInfo.workerIndex,
     parallelIndex: testInfo.parallelIndex,
-    seedFn: seedSessionViaAoeAdd({ title: "golden" }),
+    seedFn: (seed) => {
+      seedSessionViaAoeAdd({ title: "golden" })(seed);
+      writeFileSync(join(seed.shimBin, "claude"), "#!/bin/sh\necho GOLDEN_LIVE_READY\nexec tail -f /dev/null\n", {
+        mode: 0o755,
+      });
+    },
   });
 
   try {
@@ -43,7 +50,7 @@ base("create, view, delete a session via live backend", async ({ page }, testInf
     // its own chrome), so the "Ctrl+b d to detach" footer must never
     // appear in any web terminal surface.
     await page.locator("[data-live-terminal]").first().waitFor({ state: "visible", timeout: 10_000 });
-    await page.waitForTimeout(1_000);
+    await expect(page.locator("[data-live-content]").filter({ hasText: "GOLDEN_LIVE_READY" })).toBeVisible();
     await expect(page.locator("body")).not.toContainText("to detach");
 
     // Delete via API; sidebar should remove the row.

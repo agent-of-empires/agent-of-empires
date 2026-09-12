@@ -1022,19 +1022,22 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn kill_session_if_present_kills_existing_session() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         if !tmux_available() {
             return;
         }
-        let name = "aoe_test_kill_if_present_alive";
-        let _ = crate::tmux::tmux_command()
-            .args(["kill-session", "-t", name])
-            .output();
+        let guard =
+            crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_kill_if_present_alive");
+        let name = guard.name();
         let spawn = crate::tmux::tmux_command()
-            .args(["new-session", "-d", "-s", name])
-            .status();
-        if !spawn.map(|s| s.success()).unwrap_or(false) {
-            return;
-        }
+            .args(["new-session", "-d", "-s", name, "sleep", "30"])
+            .output()
+            .expect("create tmux fixture");
+        assert!(
+            spawn.status.success(),
+            "tmux fixture: {}",
+            String::from_utf8_lossy(&spawn.stderr)
+        );
         assert!(kill_session_if_present(name).is_ok());
         let exists = crate::tmux::tmux_command()
             .args(["has-session", "-t", name])

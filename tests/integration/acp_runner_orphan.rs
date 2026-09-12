@@ -161,6 +161,7 @@ fn assert_pid_gone_within(pid: u32, secs: u64, what: &str) {
 }
 
 #[test]
+#[serial_test::parallel]
 fn orphaned_runner_self_terminates_when_record_deleted() {
     if cfg!(not(unix)) {
         return;
@@ -198,6 +199,7 @@ fn orphaned_runner_self_terminates_when_record_deleted() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn superseded_runner_exits_without_deleting_replacement_record() {
     if cfg!(not(unix)) {
         return;
