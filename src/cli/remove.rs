@@ -37,10 +37,11 @@ pub struct RemoveArgs {
     /// Permanently delete instead of moving to trash. By default `rm` moves
     /// the session to the trash (when `session.delete_to_trash` is enabled,
     /// the default) so it can be restored; `--purge` forces the irreversible
-    /// teardown (worktree/branch/container cleanup per the other flags, plus
-    /// the session's structured-view transcript and its own agent store, which
-    /// for a sandboxed session is that agent's config home). A host agent's
-    /// conversation history outside those is not removed.
+    /// teardown (worktree/branch/container cleanup per the other flags) and
+    /// removes the session's structured-view transcript. Removing the sandbox
+    /// container also attempts to remove its private agent stores, including
+    /// its config home; keeping the container keeps those stores. Host agent
+    /// conversation history outside these stores is not removed.
     #[arg(long)]
     purge: bool,
 }
