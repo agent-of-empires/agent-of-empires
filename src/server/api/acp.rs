@@ -938,6 +938,210 @@ pub async fn get_option_catalog() -> impl IntoResponse {
     Json(catalog).into_response()
 }
 
+/// The `GET /api/acp/models` request body. `profile` selects which
+/// config layer the saved gateway URL is read from (the trust anchor,
+/// below).
+#[derive(Debug, Default, Deserialize)]
+pub struct ModelDiscoveryQuery {
+    pub profile: Option<String>,
+}
+
+/// `GET /api/acp/models`: run model discovery against the configured model
+/// gateway and return the parsed catalogue. Runs on the daemon, not the
+/// browser: gateways commonly omit browser CORS, and the resolved key must
+/// never reach a terminal command or the frontend.
+///
+/// SECURITY GATE (mirrors nodeterm's `agent-env-ipc.ts`): the request body
+/// is not caller-extended — the ONLY URL the endpoint can fetch is the one
+/// persisted in config.toml, read here on the daemon. There is no
+/// caller-supplied baseUrl to forge, so the credential-exfiltration oracle
+/// nodeterm closed ("resolve `${env:VAR}`/`${secret:…}` for a URL I choose")
+/// is closed structurally: credential references resolve only against the
+/// daemon's own environment, for the daemon's own saved gateway.
+pub async fn discover_gateway_models(
+    axum::extract::Query(query): axum::extract::Query<ModelDiscoveryQuery>,
+) -> impl IntoResponse {
+    let profile = query.profile;
+    let (settings, error) = tokio::task::spawn_blocking(move || {
+        let config_result = if let Some(ref profile_name) = profile {
+            crate::session::resolve_config(profile_name)
+        } else {
+            crate::session::Config::load()
+        };
+        let config = match config_result {
+            Ok(c) => c,
+            Err(e) => return (None, Some(format!("Failed to load settings: {e}"))),
+        };
+        let acp = &config.acp;
+        if acp.gateway_base_url.trim().is_empty() {
+            return (
+                None,
+                Some("Enter a model gateway URL in settings.".to_string()),
+            );
+        }
+        (
+            Some(crate::acp::model_gateway::ModelGatewaySettings {
+                base_url: acp.gateway_base_url.clone(),
+                api_key: acp.gateway_api_key.clone(),
+                discovery_path: {
+                    let p = acp.gateway_discovery_path.trim();
+                    (!p.is_empty()).then(|| p.to_string())
+                },
+            }),
+            None,
+        )
+    })
+    .await
+    .unwrap_or_else(|e| (None, Some(format!("settings load task failed: {e}"))));
+
+    if let Some(error) = error {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "models": [], "error": error })),
+        )
+            .into_response();
+    }
+    let Some(settings) = settings else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "models": [], "error": "No gateway configured." })),
+        )
+            .into_response();
+    };
+
+    // Route + credential first: the same fail-closed rules as spawn-env
+    // derivation. A missing `${env:VAR}` is a hard failure — never send a
+    // partial credential to the gateway.
+    let Some(routes) = crate::acp::model_gateway::model_gateway_routes(
+        &settings.base_url,
+        settings.discovery_path.as_deref(),
+    ) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::json!({ "models": [], "error": "Enter a valid HTTP(S) gateway URL." }),
+            ),
+        )
+            .into_response();
+    };
+    let stored_secret =
+        std::env::var(crate::acp::model_gateway::MODEL_GATEWAY_SECRET_ENV_NAME).ok();
+    let resolved = crate::acp::model_gateway::resolve_model_gateway_api_key(
+        &settings.api_key,
+        &|name| std::env::var(name).ok(),
+        stored_secret.as_deref(),
+    );
+    if !resolved.missing.is_empty() {
+        let refs = resolved
+            .missing
+            .iter()
+            .map(|name| format!("${{env:{name}}}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "models": [],
+                "error": format!(
+                    "Gateway API key environment {} unset: {refs}.",
+                    if resolved.missing.len() == 1 { "variable is" } else { "variables are" }
+                )
+            })),
+        )
+            .into_response();
+    }
+    if resolved.stored_secret_missing {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "models": [],
+                "error": "Save a gateway API key or set MODEL_GATEWAY_API_KEY in the daemon environment."
+            })),
+        )
+            .into_response();
+    }
+    let api_key = resolved.value;
+    if api_key.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "models": [], "error": "Enter an API key." })),
+        )
+            .into_response();
+    }
+
+    // The fetch, with the same header pair as the reference implementation:
+    // the standard OpenAI-compatible bearer plus Bifrost's legacy
+    // `x-bf-vk` (needed by non-`sk-bf-` virtual keys).
+    const DISCOVERY_TIMEOUT_MS: u64 = 10_000;
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(DISCOVERY_TIMEOUT_MS))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "models": [], "error": format!("Model discovery failed: {e}") })),
+            )
+                .into_response();
+        }
+    };
+    let response = client
+        .get(&routes.discovery)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("x-bf-vk", &api_key)
+        .header("Accept", "application/json")
+        .send()
+        .await;
+    let response = match response {
+        Ok(r) => r,
+        Err(e) => {
+            let timed_out = e.is_timeout();
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "models": [],
+                    "error": if timed_out {
+                        "Model discovery timed out.".to_string()
+                    } else {
+                        format!("Model discovery failed: {e}")
+                    }
+                })),
+            )
+                .into_response();
+        }
+    };
+    if !response.status().is_success() {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "models": [],
+                "error": format!("Model discovery failed (HTTP {}).", response.status().as_u16())
+            })),
+        )
+            .into_response();
+    }
+    let payload: serde_json::Value = match response.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "models": [], "error": format!("Model discovery failed: {e}") })),
+            )
+                .into_response();
+        }
+    };
+    let models = crate::acp::model_gateway::parse_gateway_models(&payload);
+    if models.is_empty() {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "models": [], "error": "The gateway returned no usable models." })),
+        )
+            .into_response();
+    }
+    Json(serde_json::json!({ "models": models })).into_response()
+}
+
 /// Atomically move a structured view session from one ACP backend to another.
 /// Two callers drive this: the rate-limit recovery flow (#1282), which
 /// hands a Claude-rate-limited session off to `codex` (or another

@@ -362,6 +362,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/acp/agents", get(api::list_acp_agents))
         .route("/api/acp/option-catalog", get(api::get_option_catalog))
+        .route("/api/acp/models", get(api::discover_gateway_models))
         .route("/api/claude-sessions", get(api::list_claude_sessions));
 
     // Dashboard bundle (Vite build output) plus the SPA fallback. Without

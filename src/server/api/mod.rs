@@ -29,9 +29,9 @@ pub(crate) use acp::structured_spawn_error_message;
 pub use acp::{
     acp_attachment, acp_cancel, acp_context_primer, acp_disable, acp_enable, acp_files,
     acp_force_end_turn, acp_prompt, acp_prompt_diff_comments, acp_replay, acp_set_config_option,
-    acp_set_mode, acp_worker_log, get_option_catalog, install_agent, list_acp_agents,
-    list_claude_sessions, resolve_approval, resolve_elicitation, shutdown_acp, spawn_acp,
-    switch_acp_agent,
+    acp_set_mode, acp_worker_log, discover_gateway_models, get_option_catalog, install_agent,
+    list_acp_agents, list_claude_sessions, resolve_approval, resolve_elicitation, shutdown_acp,
+    spawn_acp, switch_acp_agent,
 };
 
 pub use queue::{queue_clear, queue_edit, queue_enqueue, queue_list, queue_remove};
