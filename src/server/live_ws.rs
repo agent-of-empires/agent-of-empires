@@ -735,11 +735,47 @@ async fn live_shell_ws(
 }
 
 async fn handle_live_ws(
+    socket: WebSocket,
+    tmux_name: String,
+    read_only: bool,
+    shutdown: tokio_util::sync::CancellationToken,
+    transport: LiveTransport,
+) {
+    handle_live_ws_inner(
+        socket,
+        tmux_name,
+        read_only,
+        shutdown,
+        transport,
+        #[cfg(test)]
+        false,
+    )
+    .await;
+}
+
+#[cfg(test)]
+struct CaptureCycleWitness(Option<tokio::sync::mpsc::OwnedPermit<Message>>, bool, bool);
+
+#[cfg(test)]
+impl Drop for CaptureCycleWitness {
+    fn drop(&mut self) {
+        if let Some(permit) = self.0.take() {
+            permit.send(Message::Text(
+                serde_json::json!({"type": "test_cycle", "grid": self.1, "settled_seed": self.2})
+                    .to_string()
+                    .into(),
+            ));
+        }
+    }
+}
+
+async fn handle_live_ws_inner(
     mut socket: WebSocket,
     tmux_name: String,
     read_only: bool,
     shutdown: tokio_util::sync::CancellationToken,
     transport: LiveTransport,
+    #[cfg(test)] witness_cycles: bool,
 ) {
     match wait_for_tmux_ready(&tmux_name).await {
         PaneReadiness::Ready => {}
@@ -966,6 +1002,36 @@ async fn handle_live_ws(
                 };
             }
 
+            #[cfg(test)]
+            let _cycle_witness = CaptureCycleWitness(
+                if witness_cycles {
+                    capture_tx.clone().reserve_owned().await.ok()
+                } else {
+                    None
+                },
+                {
+                    #[cfg(unix)]
+                    {
+                        grid_frame
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        false
+                    }
+                },
+                {
+                    #[cfg(unix)]
+                    {
+                        capture_vt
+                            .as_ref()
+                            .is_some_and(|ch| ch.seed_age() >= FRESH_SEED_MAX_AGE)
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        false
+                    }
+                },
+            );
             stats.samples += 1;
             stats.sample_micros += sample_started.elapsed().as_micros() as u64;
 
@@ -2230,12 +2296,9 @@ mod tests {
     }
 
     #[test]
-    fn a_resize_whose_reseed_missed_withholds_frames_until_it_lands() {
-        // The settle window is armed by every resize this connection drives as
-        // size owner, and by nothing else.
+    fn resize_follow_up_arms_only_an_owned_resize() {
         assert_eq!(resize_follow_up(true, 100), Some(100 + RESIZE_SETTLE_MS));
         assert_eq!(resize_follow_up(false, 100), None);
-
         let settings = LiveSettings::new();
         settings.record_owner_resize(true);
         let settle_until = settings.resize_settle_until_ms.load(Ordering::Relaxed);
@@ -2243,20 +2306,175 @@ mod tests {
         settings.record_owner_resize(false);
         assert_eq!(
             settings.resize_settle_until_ms.load(Ordering::Relaxed),
-            settle_until,
-            "a resize this connection did not own arms nothing"
+            settle_until
         );
+    }
 
-        // Whether the parser reached the new geometry is the channel's state,
-        // not this connection's, and it withholds frames rather than moving the
-        // view to another transport: see `VtChannel::grid_resync_pending`. The
-        // settle window expiring does not republish the old grid either.
-        assert!(!resize_settle_holds(
-            settle_until + 1,
-            settle_until,
-            (120, 40),
-            (120, 40)
-        ));
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn a_resize_whose_reseed_missed_withholds_frames_until_it_lands() {
+        use futures_util::FutureExt;
+
+        let home = crate::session::test_support::isolate_app_dir();
+        let _socket = crate::session::test_support::EnvGuard::set(&[(
+            "AOE_TMUX_SOCKET",
+            home.path().join("tmux.sock"),
+        )]);
+        if crate::tmux::tmux_command().arg("-V").output().is_err() {
+            eprintln!("Skipping test: tmux unavailable");
+            return;
+        }
+        let pane = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_ws_busy");
+        let output = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                pane.name(),
+                "-x",
+                "40",
+                "-y",
+                "6",
+                "printf 'RESYNC-LANDED'; exec cat",
+            ])
+            .output()
+            .expect("create resized pane");
+        assert!(output.status.success());
+        let target = crate::tmux::test_helpers::only_pane_id(pane.name());
+        crate::tmux::test_helpers::wait_for_pane_command(&target, "cat");
+        let native_dir = tempfile::tempdir().unwrap();
+        let channel =
+            crate::tmux::vt::register_live_for_test(pane.name(), native_dir.path(), false, false);
+        let mut held = channel.hold_drain_for_test();
+        let result =
+            channel.set_grid_size_with_deadline(40, 6, &crate::tmux::TmuxCommandDeadline::new());
+        assert_eq!(result, crate::tmux::vt::VtRefreshResult::Busy);
+        assert!(
+            held.observed_probe(),
+            "native drain exercised while ACK withheld"
+        );
+        assert!(channel.grid_resync_pending());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            // One capture cycle may use three native command budgets.
+            let progress_timeout = crate::tmux::TMUX_COMMAND_TIMEOUT * 3;
+            let (closed_tx, mut closed_rx) = tokio::sync::mpsc::unbounded_channel();
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let route_shutdown = shutdown.clone();
+            let name = pane.name().to_string();
+            let router = axum::Router::new().route(
+                "/live",
+                axum::routing::get(move |ws: WebSocketUpgrade| {
+                    let name = name.clone();
+                    let shutdown = route_shutdown.clone();
+                    let closed_tx = closed_tx.clone();
+                    async move {
+                        ws.on_upgrade(move |socket| async move {
+                            handle_live_ws_inner(
+                                socket,
+                                name,
+                                true,
+                                shutdown,
+                                LiveTransport::Grid,
+                                true,
+                            )
+                            .await;
+                            let _ = closed_tx.send(());
+                        })
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server_shutdown = shutdown.clone();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, router)
+                    .with_graceful_shutdown(server_shutdown.cancelled_owned())
+                    .await
+                    .unwrap();
+            });
+            let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{address}/live"))
+                .await
+                .unwrap();
+            let checked = std::panic::AssertUnwindSafe(async {
+                let withheld = tokio::time::timeout(progress_timeout, async {
+                    loop {
+                        let message = client
+                            .next()
+                            .await
+                            .expect("open websocket")
+                            .expect("websocket message");
+                        if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                            assert_ne!(
+                                value["type"], "frame",
+                                "stale grid escaped before its native resync"
+                            );
+                            assert_ne!(value["type"], "patch");
+                            if value["type"] == "test_cycle" {
+                                assert_eq!(
+                                    value["grid"], true,
+                                    "must exercise the grid publication path"
+                                );
+                                if value["settled_seed"] == true {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                })
+                .await;
+                withheld.expect("completed withheld grid cycles");
+                assert!(channel.grid_resync_pending());
+                held.acknowledge_next();
+                let landed = tokio::time::timeout(progress_timeout, async {
+                    loop {
+                        let message = client
+                            .next()
+                            .await
+                            .expect("open websocket")
+                            .expect("websocket message");
+                        if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                            if value["type"] == "frame" {
+                                assert!(value["content"]
+                                    .as_str()
+                                    .unwrap()
+                                    .contains("RESYNC-LANDED"));
+                                assert_eq!(value["rows"], 6);
+                                break;
+                            }
+                        }
+                    }
+                })
+                .await;
+                landed.expect("frame publishes after native ACK and real pane reseed");
+                assert!(!channel.grid_resync_pending());
+            })
+            .catch_unwind()
+            .await;
+            let close = tokio::time::timeout(progress_timeout, client.close(None)).await;
+            shutdown.cancel();
+            let closed = tokio::time::timeout(progress_timeout, closed_rx.recv()).await;
+            let served = server.await;
+            if let Err(panic) = checked {
+                std::panic::resume_unwind(panic);
+            }
+            close
+                .expect("websocket close completes")
+                .expect("close websocket");
+            closed
+                .expect("upgraded handler exits")
+                .expect("handler completion witness");
+            served.expect("HTTP server exits");
+        });
+        drop(held);
+        crate::tmux::vt::unregister_for_test(pane.name());
     }
 
     #[test]

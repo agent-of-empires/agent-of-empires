@@ -78,13 +78,15 @@ base.describe("session rename via sidebar context menu (#1220)", () => {
     try {
       await page.goto(`${serve.baseUrl}/`);
 
-      // Spy on every PATCH-shaped request to the sessions endpoint.
-      let patchSeen = false;
-      await page.route("**/api/sessions/*", (route) => {
-        if (route.request().method() === "PATCH") {
-          patchSeen = true;
-        }
-        return route.continue();
+      await page.evaluate(() => {
+        const original = window.fetch;
+        (window as unknown as { __mutationCalls: number }).__mutationCalls = 0;
+        window.fetch = (...args) => {
+          if (args[1]?.method === "PATCH") {
+            (window as unknown as { __mutationCalls: number }).__mutationCalls += 1;
+          }
+          return original(...args);
+        };
       });
 
       const row = page.locator("[data-testid='sidebar-session-row']");
@@ -100,9 +102,7 @@ base.describe("session rename via sidebar context menu (#1220)", () => {
       await expect(input).toBeHidden();
       await expect(row).toContainText(title);
 
-      // Give the browser a beat to make sure no PATCH is in flight.
-      await page.waitForTimeout(200);
-      expect(patchSeen).toBe(false);
+      expect(await page.evaluate(() => (window as unknown as { __mutationCalls: number }).__mutationCalls)).toBe(0);
     } finally {
       await serve.stop();
     }
@@ -120,12 +120,15 @@ base.describe("session rename via sidebar context menu (#1220)", () => {
     try {
       await page.goto(`${serve.baseUrl}/`);
 
-      let patchSeen = false;
-      await page.route("**/api/sessions/*", (route) => {
-        if (route.request().method() === "PATCH") {
-          patchSeen = true;
-        }
-        return route.continue();
+      await page.evaluate(() => {
+        const original = window.fetch;
+        (window as unknown as { __mutationCalls: number }).__mutationCalls = 0;
+        window.fetch = (...args) => {
+          if (args[1]?.method === "PATCH") {
+            (window as unknown as { __mutationCalls: number }).__mutationCalls += 1;
+          }
+          return original(...args);
+        };
       });
 
       const row = page.locator("[data-testid='sidebar-session-row']");
@@ -141,8 +144,7 @@ base.describe("session rename via sidebar context menu (#1220)", () => {
       // label keeps the original title and no PATCH leaves the page.
       await expect(input).toBeHidden();
       await expect(row).toContainText(title);
-      await page.waitForTimeout(200);
-      expect(patchSeen).toBe(false);
+      expect(await page.evaluate(() => (window as unknown as { __mutationCalls: number }).__mutationCalls)).toBe(0);
     } finally {
       await serve.stop();
     }

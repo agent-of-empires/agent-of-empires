@@ -23,6 +23,7 @@ use agent_of_empires::session::{DetectionState, Instance, Status};
 use chrono::TimeZone;
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn reload_state_instances_from_disk_disk_only_preserves_prior_status() {
     let probe = std::time::Instant::now();
     let mut prior = Instance::new("seed", "/tmp/seed");
@@ -69,6 +70,7 @@ async fn reload_state_instances_from_disk_disk_only_preserves_prior_status() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn reload_state_instances_from_disk_tmux_applied_takes_fresh_status() {
     let probe = std::time::Instant::now();
     let mut prior = Instance::new("seed", "/tmp/seed");
@@ -121,6 +123,7 @@ async fn reload_state_instances_from_disk_tmux_applied_takes_fresh_status() {
 /// would wipe out the just-computed `unknown_since` advancement and the
 /// detection this tick just resolved, every single tick.
 #[tokio::test]
+#[serial_test::parallel]
 async fn reload_state_instances_from_disk_tmux_applied_trusts_fresh_tick_tracking() {
     let mut prior = Instance::new("seed", "/tmp/seed");
     prior.ever_confirmed_present = false;
@@ -169,6 +172,7 @@ async fn reload_state_instances_from_disk_tmux_applied_trusts_fresh_tick_trackin
 /// raw disk load with these fields at their `#[serde(skip)]` defaults. The
 /// prior in-memory tracking must still survive this reload.
 #[tokio::test]
+#[serial_test::parallel]
 async fn reload_state_instances_from_disk_disk_only_preserves_prior_tick_tracking() {
     let confirmed_since = std::time::Instant::now();
     let mut prior = Instance::new("seed", "/tmp/seed");
@@ -209,6 +213,7 @@ async fn reload_state_instances_from_disk_disk_only_preserves_prior_tick_trackin
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn reload_state_instances_from_disk_new_ids_use_fresh() {
     let prior = Instance::new("seed", "/tmp/seed");
     let state = build_test_app_state(vec![prior]);

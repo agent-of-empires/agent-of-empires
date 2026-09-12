@@ -1723,8 +1723,8 @@ mod tests {
             .set_times(std::fs::FileTimes::new().set_modified(hour_ago))
             .unwrap();
 
-        let old_val = std::env::var("CLAUDE_CONFIG_DIR").ok();
-        std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
+        let _env =
+            crate::session::test_support::EnvGuard::set(&[("CLAUDE_CONFIG_DIR", tmp.path())]);
 
         assert!(
             !claude_host_transcript_confirmed_absent("/tmp/myproject", present, &[]),
@@ -1740,11 +1740,6 @@ mod tests {
             present,
             &[]
         ));
-
-        match old_val {
-            Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
-            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
-        }
     }
 
     #[cfg(unix)]

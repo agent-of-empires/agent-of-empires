@@ -1022,19 +1022,22 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn kill_session_if_present_kills_existing_session() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         if !tmux_available() {
             return;
         }
-        let name = "aoe_test_kill_if_present_alive";
-        let _ = crate::tmux::tmux_command()
-            .args(["kill-session", "-t", name])
-            .output();
+        let guard =
+            crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_kill_if_present_alive");
+        let name = guard.name();
         let spawn = crate::tmux::tmux_command()
-            .args(["new-session", "-d", "-s", name])
-            .status();
-        if !spawn.map(|s| s.success()).unwrap_or(false) {
-            return;
-        }
+            .args(["new-session", "-d", "-s", name, "sleep", "30"])
+            .output()
+            .expect("create tmux fixture");
+        assert!(
+            spawn.status.success(),
+            "tmux fixture: {}",
+            String::from_utf8_lossy(&spawn.stderr)
+        );
         assert!(kill_session_if_present(name).is_ok());
         let exists = crate::tmux::tmux_command()
             .args(["has-session", "-t", name])
@@ -1047,32 +1050,32 @@ mod tests {
         );
     }
 
-    /// `aoe session capture` reads the pane title through this helper, and the
-    /// only test that covers that path runs an agent with no `osc_title`
-    /// rules: a wrong target here would silently restore the empty title
-    /// #3625 was about.
     #[test]
     #[serial_test::serial]
     fn pane_title_reads_the_panes_published_title() {
         if !tmux_available() {
             return;
         }
-        let name = "aoe_test_pane_title";
-        let _ = crate::tmux::tmux_command()
-            .args(["kill-session", "-t", name])
-            .output();
-        let spawn = crate::tmux::tmux_command()
-            .args(["new-session", "-d", "-s", name, "sleep", "30"])
-            .status();
-        if !spawn.map(|s| s.success()).unwrap_or(false) {
-            return;
-        }
-        let target = format!("{name}:^.0");
-        let _ = crate::tmux::tmux_command()
+        let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_pane_title");
+        let name = guard.name();
+        // Separate argv bypasses shell startup, which could overwrite the title.
+        let mut args: Vec<String> = ["new-session", "-d", "-s", name, "sleep", "30"]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+        append_pane_base_index_args(&mut args, name);
+        assert!(crate::tmux::tmux_command()
+            .args(&args)
+            .status()
+            .expect("create title fixture")
+            .success());
+        let target = crate::tmux::test_helpers::only_pane_id(name);
+        assert!(crate::tmux::tmux_command()
             .args(["select-pane", "-t", &target, "-T", "aoe-title-probe"])
-            .output();
+            .status()
+            .expect("set pane title")
+            .success());
         let title = pane_title(name);
-        let _ = kill_session_if_present(name);
         assert_eq!(title.as_deref(), Some("aoe-title-probe"));
     }
 

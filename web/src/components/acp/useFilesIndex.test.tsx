@@ -140,17 +140,62 @@ describe("useFilesIndex hook", () => {
     expect(result.current.files).toEqual([]);
   });
 
-  it("does not update state after unmount", async () => {
-    let resolveFetch: (v: unknown) => void = () => {};
-    const pending = new Promise<unknown>((res) => {
-      resolveFetch = res;
+  it.each(["success", "failure"] as const)("ignores a superseded session's late %s", async (outcome) => {
+    let resolveFetch!: (value: Response) => void;
+    let rejectFetch!: (reason: Error) => void;
+    const pending = new Promise<Response>((resolve, reject) => {
+      resolveFetch = resolve;
+      rejectFetch = reject;
     });
-    fetchSpy.mockReturnValueOnce(pending);
-    const { result, unmount } = renderHook(() => useFilesIndex("s-1"));
-    unmount();
+    fetchSpy.mockReturnValueOnce(pending).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ files: ["current.txt"] }),
+    });
+    const { result, rerender } = renderHook(({ id }) => useFilesIndex(id), {
+      initialProps: { id: "old-session" },
+    });
+    rerender({ id: "current-session" });
+    await waitFor(() => expect(result.current.files).toEqual(["current.txt"]));
+
     await act(async () => {
-      resolveFetch({ ok: true, json: async () => ({ files: ["x"] }) });
+      if (outcome === "success") {
+        resolveFetch(new Response(JSON.stringify({ files: ["stale.txt"] })));
+      } else {
+        rejectFetch(new Error("old session unavailable"));
+      }
     });
+    expect(result.current.files).toEqual(["current.txt"]);
+    expect(result.current.error).toBe(false);
+    expect(result.current.loading).toBe(false);
+  });
+
+  it("keeps the current session loading when a superseded request completes", async () => {
+    let resolveOld!: (value: Response) => void;
+    let resolveCurrent!: (value: Response) => void;
+    fetchSpy
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveOld = resolve;
+        }),
+      )
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveCurrent = resolve;
+        }),
+      );
+    const { result, rerender } = renderHook(({ id }) => useFilesIndex(id), {
+      initialProps: { id: "old-session" },
+    });
+    rerender({ id: "current-session" });
+    await act(async () => {
+      resolveOld(new Response(JSON.stringify({ files: ["stale.txt"] })));
+    });
+    expect(result.current.loading).toBe(true);
     expect(result.current.files).toEqual([]);
+    await act(async () => {
+      resolveCurrent(new Response(JSON.stringify({ files: ["current.txt"] })));
+    });
+    expect(result.current.loading).toBe(false);
+    expect(result.current.files).toEqual(["current.txt"]);
   });
 });

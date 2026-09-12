@@ -3061,7 +3061,7 @@ mod tests {
     fn test_codex_config_path_for_host_environment_ignores_empty_codex_home() {
         let tmp = TempDir::new().unwrap();
         let _guard = EnvGuard::unset(&["CODEX_HOME"]);
-        std::env::set_var("HOME", tmp.path());
+        let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
 
         // An empty `CODEX_HOME=` must not resolve to a bare relative
         // `config.toml`; it should fall back to the home-relative default.
@@ -3085,7 +3085,7 @@ mod tests {
         // An empty `CODEX_HOME` in AoE's own process env must fall back to the
         // home-relative default rather than a bare relative `config.toml`.
         let _guard = EnvGuard::set(&[("CODEX_HOME", Path::new(""))]);
-        std::env::set_var("HOME", tmp.path());
+        let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
 
         let path = codex_config_path().unwrap();
         assert_eq!(path, tmp.path().join(".codex").join("config.toml"));
@@ -3100,9 +3100,7 @@ mod tests {
     fn test_iter_hook_targets_includes_profile_codex_home() {
         let tmp = TempDir::new().unwrap();
         let _guard = EnvGuard::unset(&["CODEX_HOME"]);
-        std::env::set_var("HOME", tmp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
 
         let codex_home = tmp.path().join("profile-codex-home");
         let profile_dir = crate::session::get_profile_dir("codex-profile").unwrap();
@@ -3425,10 +3423,13 @@ trust_level = "trusted"
 
         disable_gemini_folder_trust(&settings_path).unwrap();
         let first = std::fs::read_to_string(&settings_path).unwrap();
-        let mtime = std::fs::metadata(&settings_path)
-            .unwrap()
-            .modified()
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&settings_path)
             .unwrap();
+        file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000))
+            .unwrap();
+        let mtime = file.metadata().unwrap().modified().unwrap();
 
         disable_gemini_folder_trust(&settings_path).unwrap();
         let second = std::fs::read_to_string(&settings_path).unwrap();
@@ -3513,7 +3514,13 @@ trust_level = "trusted"
         )
         .unwrap();
         let first = std::fs::read_to_string(&config_path).unwrap();
-        let mtime = std::fs::metadata(&config_path).unwrap().modified().unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&config_path)
+            .unwrap();
+        file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000))
+            .unwrap();
+        let mtime = file.metadata().unwrap().modified().unwrap();
 
         trust_codex_project(
             &config_path,
@@ -3644,7 +3651,13 @@ trust_level = "trusted"
 
         // Idempotent: a second call must not rewrite the file.
         let first = std::fs::read_to_string(&config_path).unwrap();
-        let mtime = std::fs::metadata(&config_path).unwrap().modified().unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&config_path)
+            .unwrap();
+        file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000))
+            .unwrap();
+        let mtime = file.metadata().unwrap().modified().unwrap();
         trust_claude_project(
             &config_path,
             "/workspace/my-worktree",

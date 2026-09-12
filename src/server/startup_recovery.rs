@@ -425,10 +425,10 @@ mod tests {
         }
 
         let ledger_dir = tempfile::tempdir().expect("tempdir");
-        std::env::set_var(
+        let _env = crate::session::test_support::EnvGuard::set(&[(
             crate::session::recovery::RECOVERY_ATTEMPT_DIR_ENV,
             ledger_dir.path(),
-        );
+        )]);
 
         let unique = format!("{:012}", std::process::id());
         let mut inst_a = crate::session::Instance::new("orphan-wire-a", "/tmp/aoe-test-2994");
@@ -513,7 +513,6 @@ mod tests {
 
         let _ = decoy.kill();
         let _ = decoy.wait();
-        std::env::remove_var(crate::session::recovery::RECOVERY_ATTEMPT_DIR_ENV);
 
         assert!(
             !candidates.iter().any(|c| c.id == id_b),

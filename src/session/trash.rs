@@ -1716,6 +1716,7 @@ mod tests {
 
     #[test]
     fn purge_removes_relocated_worktree() {
+        let _app_guard = crate::session::test_support::isolate_app_dir();
         // Acceptance criterion: purging a trashed session deletes the worktree
         // at its relocated holding path, leaving nothing behind.
         if !git_available() {
@@ -1760,6 +1761,7 @@ mod tests {
     /// entry git names for this branch and let the purge succeed.
     #[test]
     fn purge_recovers_when_project_path_diverged_and_locked_entry_survives() {
+        let _app_guard = crate::session::test_support::isolate_app_dir();
         if !git_available() {
             return;
         }

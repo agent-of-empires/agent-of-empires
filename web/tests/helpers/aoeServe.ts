@@ -1,15 +1,7 @@
-// Live-backend test harness for Playwright.
-//
-// `spawnAoeServe()` boots a real `aoe serve` subprocess against an isolated
-// filesystem root (`HOME`, the XDG bases, `TMPDIR`, `TMUX_TMPDIR`) and a
-// per-worker port range, returns a `ServeHandle`, and cleans up after the
-// test via `stop()`. Designed for fresh-process-per-test isolation: each
-// test gets its own root, its own port, its own tmux socket.
-//
-// Worker isolation: callers pass `workerIndex` and `parallelIndex` (from
-// Playwright's `testInfo`). Port and TMUX_TMPDIR are derived deterministically
-// so parallel workers never collide. tmux is contained inside the test's
-// HOME tree, so cleanup is a simple `rm -rf home`.
+// Live Playwright server: each handle owns a private HOME, tmux socket, and child.
+// Readiness requires the child's post-bind URL announcement and an HTTP response.
+// stop() waits for daemon, runner, and terminal groups before deleting the fixture.
+// Failed teardown retains HOME and registry evidence rather than reporting success.
 
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync, mkdtempSync, writeFileSync, chmodSync, mkdirSync, realpathSync, rmSync } from "node:fs";
@@ -18,7 +10,10 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
 import { expect } from "@playwright/test";
+import { setTimeout as delay } from "node:timers/promises";
+import { once } from "node:events";
 import { isolateEnv } from "./isolatedEnv";
+import { initWorkingRepo } from "./gitFixture";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -275,18 +270,7 @@ export function seedSessionViaAoeAdd(opts: {
 }): (seedEnv: { home: string; shimBin: string; env: NodeJS.ProcessEnv }) => void {
   return ({ home, env }) => {
     const projectDir = join(home, opts.subdir ?? "project");
-    mkdirSync(projectDir, { recursive: true });
-    spawnSync("git", ["init", "-q"], { cwd: projectDir });
-    spawnSync("git", ["commit", "--allow-empty", "-q", "-m", "init"], {
-      cwd: projectDir,
-      env: {
-        ...env,
-        GIT_AUTHOR_NAME: "t",
-        GIT_AUTHOR_EMAIL: "t@t",
-        GIT_COMMITTER_NAME: "t",
-        GIT_COMMITTER_EMAIL: "t@t",
-      },
-    });
+    initWorkingRepo(projectDir, env);
     const addRes = spawnSync(resolveAoeBinary(), ["add", projectDir, "-t", opts.title, "-c", opts.tool ?? "claude"], {
       env,
     });
@@ -356,47 +340,154 @@ export function appDirFor(home: string, xdg: string, binaryPath: string): string
   return xdg ? xdgDir : legacy;
 }
 
-/**
- * Last-resort teardown: group-kill any `aoe __acp-runner` still
- * recorded in the worker registry by reading its pid straight off disk.
- *
- * `aoe acp stop --all` only works while the daemon is alive; if the
- * daemon already crashed or was SIGKILLed, its runners (and their node +
- * `claude` descendants) are orphaned and would leak forever once the temp
- * HOME is deleted. Each runner is its own process-group leader (spawned via
- * setsid), so `process.kill(-pid, "SIGKILL")` reaps the whole tree. Runs
- * before the HOME is wiped. See #1921.
- */
-async function killOrphanRunners(appDir: string): Promise<void> {
-  const { readdirSync, readFileSync } = await import("node:fs");
+interface ProcessSnapshot {
+  pid: number;
+  parent: number;
+  group: number;
+  command: string;
+}
+
+function processSnapshot(env: NodeJS.ProcessEnv): ProcessSnapshot[] {
+  const result = spawnSync("ps", ["-ww", "-axo", "pid=,ppid=,pgid=,stat=,args="], {
+    env: { ...env, LC_ALL: "C" },
+    encoding: "utf8",
+    timeout: 2000,
+  });
+  if (result.status !== 0) throw new Error(`cannot inspect fixture processes: ${result.error ?? result.stderr}`);
+  return result.stdout.split("\n").flatMap((line) => {
+    const match = line.match(/^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/);
+    if (!line.trim()) return [];
+    if (!match) throw new Error(`unrecognized ps output: ${line}`);
+    if (match[4].startsWith("Z")) return [];
+    return [{ pid: Number(match[1]), parent: Number(match[2]), group: Number(match[3]), command: match[5] }];
+  });
+}
+
+/** Revoke the private lease; the runner watchdog terminates its own process group. */
+async function stopOrphanRunners(appDir: string, binary: string, env: NodeJS.ProcessEnv): Promise<void> {
+  const { readdirSync, readFileSync, renameSync } = await import("node:fs");
   const workersDir = join(appDir, "acp-workers");
-  let entries: string[];
-  try {
-    entries = readdirSync(workersDir);
-  } catch {
-    return; // no workers dir; nothing to reap
+  if (!existsSync(workersDir)) return;
+  const executable = realpathSync(binary);
+  const socketPrefix = `${executable} __acp-runner --socket ${workersDir}/`;
+  // A runner can unlink its record before exiting. Keep its observed group even
+  // when enumeration, reading, or lease revocation races that normal transition.
+  const groups = new Set(
+    processSnapshot(env)
+      .filter((p) => p.pid === p.group && p.command.startsWith(socketPrefix))
+      .map((p) => p.group),
+  );
+  const records = readdirSync(workersDir).filter((name) => name.endsWith(".json") || name.endsWith(".json.stopping"));
+  for (const name of records) {
+    const path = join(workersDir, name);
+    let raw: string;
+    try {
+      raw = readFileSync(path, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw error;
+    }
+    const { pid, session_id: sessionId, socket_path: socketPath } = JSON.parse(raw);
+    // JSON.parse rounds u64 epochs; preserve the decimal argument exactly.
+    const generation = raw.match(/"generation"\s*:\s*(\d+)/)?.[1];
+    const recordName = name.replace(/\.stopping$/, "");
+    if (
+      !Number.isSafeInteger(pid) ||
+      pid <= 1 ||
+      typeof sessionId !== "string" ||
+      !generation ||
+      recordName !== `${sessionId}.json` ||
+      socketPath !== join(workersDir, `${sessionId}.sock`)
+    ) {
+      throw new Error(`invalid runner identity in ${name}; retaining ${appDir}`);
+    }
+    const processes = processSnapshot(env);
+    const runner = processes.find((p) => p.pid === pid);
+    if (!runner) {
+      if (processes.some((p) => p.group === pid)) groups.add(pid);
+      continue;
+    }
+    const prefix = `${executable} __acp-runner --socket ${socketPath} --session-id ${sessionId} `;
+    if (
+      runner.group !== pid ||
+      !runner.command.startsWith(prefix) ||
+      !runner.command.split(" -- ")[0].endsWith(` --generation ${generation}`)
+    ) {
+      throw new Error(`runner ${pid} no longer matches ${name}; retaining ${appDir}`);
+    }
+    // Preserve recovery evidence until exit is observed. Never signal this numeric PID.
+    if (name === recordName) {
+      try {
+        renameSync(path, `${path}.stopping`);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    }
+    groups.add(pid);
   }
-  for (const name of entries) {
-    if (!name.endsWith(".json")) continue;
-    let pid: unknown;
-    try {
-      pid = JSON.parse(readFileSync(join(workersDir, name), "utf8"))?.pid;
-    } catch {
-      continue; // unparseable record; skip
+  for (const process of processSnapshot(env)) {
+    if (process.pid === process.group && process.command.startsWith(socketPrefix)) groups.add(process.group);
+  }
+  if (groups.size === 0) return;
+  // Older binaries use two 10s watchdog polls, then a bounded 2s agent shutdown.
+  const deadline = performance.now() + 25_000;
+  while (processSnapshot(env).some((p) => groups.has(p.group))) {
+    if (performance.now() >= deadline) throw new Error(`runner groups did not exit; retaining ${appDir}`);
+    await delay(50);
+  }
+}
+
+async function stopTerminalProcesses(
+  socket: string,
+  shimBin: string | undefined,
+  env: NodeJS.ProcessEnv,
+): Promise<void> {
+  if (!existsSync(socket) && shimBin === undefined) return;
+  const options = { env: { ...env, LC_ALL: "C" }, encoding: "utf8" as const, timeout: 2000 };
+  const owned = new Set<number>();
+  if (existsSync(socket)) {
+    const panes = spawnSync("tmux", ["-S", socket, "list-panes", "-a", "-F", "#{pid} #{pane_pid}"], options);
+    if (panes.status === 0) {
+      for (const value of panes.stdout.trim() ? panes.stdout.trim().split(/\s+/) : []) {
+        const pid = Number(value);
+        if (!Number.isSafeInteger(pid) || pid <= 1) throw new Error(`invalid private tmux process identity: ${value}`);
+        owned.add(pid);
+      }
+    } else if (panes.error || (existsSync(socket) && panes.stderr.trim() !== `no server running on ${socket}`)) {
+      throw new Error(`cannot inspect private tmux server: ${panes.error ?? panes.stderr}`);
     }
-    if (typeof pid !== "number" || pid <= 1) continue;
-    // Negative pid targets the process group (runner + node + claude); the
-    // positive pid is a belt-and-suspenders for a non-leader runner.
-    try {
-      process.kill(-pid, "SIGKILL");
-    } catch {
-      // group already gone
+  }
+  const processes = processSnapshot(env);
+  if (shimBin !== undefined) {
+    for (const entry of processes) {
+      if (entry.command.startsWith(`${shimBin}/`)) owned.add(entry.pid);
     }
-    try {
-      process.kill(pid, "SIGKILL");
-    } catch {
-      // leader already gone
+  }
+  let expanded = true;
+  while (expanded) {
+    expanded = false;
+    for (const entry of processes) {
+      if (owned.has(entry.parent) && !owned.has(entry.pid)) {
+        owned.add(entry.pid);
+        expanded = true;
+      }
     }
+  }
+  const groups = new Set(processes.filter((entry) => owned.has(entry.pid)).map((entry) => entry.group));
+  if (existsSync(socket)) {
+    const killed = spawnSync("tmux", ["-S", socket, "kill-server"], options);
+    if (
+      killed.error ||
+      (killed.status !== 0 && existsSync(socket) && killed.stderr.trim() !== `no server running on ${socket}`)
+    ) {
+      throw new Error(`cannot stop private tmux server: ${killed.error ?? killed.stderr}`);
+    }
+  }
+  // kill-server acknowledges the command before terminal descendants finish exiting.
+  const deadline = performance.now() + 4000;
+  while (processSnapshot(env).some((entry) => groups.has(entry.group))) {
+    if (performance.now() >= deadline) throw new Error(`terminal groups did not exit; retaining ${socket}`);
+    await delay(50);
   }
 }
 
@@ -435,25 +526,28 @@ async function waitForServer(
   deadlineMs: number,
   proc: ChildProcess,
   authMode: AuthMode,
+  bound: () => boolean,
+  spawnError: () => Error | undefined,
 ): Promise<void> {
-  const deadline = Date.now() + deadlineMs;
-  let lastErr: unknown = "no attempts made";
-  while (Date.now() < deadline) {
+  const deadline = performance.now() + deadlineMs;
+  let lastErr: unknown = "child has not announced its bound URL";
+  while (performance.now() < deadline) {
+    if (spawnError()) throw spawnError();
     if (proc.exitCode !== null || proc.signalCode !== null) {
       throw new Error(`aoe serve died before ready (exit=${proc.exitCode} signal=${proc.signalCode})`);
     }
-    try {
-      const res = await fetch(`${baseUrl}/api/about`);
-      // In `--no-auth` mode the server returns 200 outright. In passphrase
-      // mode it returns 401 BUT also sets a distinct WWW-Authenticate-ish
-      // response shape. Accepting 401 here without distinguishing makes
-      // the harness latch onto stale token-auth servers that other test
-      // runs left running on the same port. Be precise per authMode.
-      if (authMode === "none" && res.status === 200) return;
-      if ((authMode === "passphrase" || authMode === "token") && (res.status === 200 || res.status === 401)) return;
-      lastErr = `status ${res.status}`;
-    } catch (err) {
-      lastErr = err;
+    if (bound()) {
+      try {
+        const res = await fetch(`${baseUrl}/api/about`, {
+          signal: AbortSignal.timeout(Math.max(1, Math.ceil(deadline - performance.now()))),
+        });
+        await res.body?.cancel();
+        if (proc.exitCode !== null || proc.signalCode !== null) continue;
+        if (res.status === 200 || (authMode !== "none" && res.status === 401)) return;
+        lastErr = `status ${res.status}`;
+      } catch (err) {
+        lastErr = err;
+      }
     }
     await new Promise((r) => setTimeout(r, 100));
   }
@@ -526,9 +620,9 @@ function writeFakeAcpShim(
         : name === "codex-acp" || name === "codex"
           ? [...scriptLines, "export FAKE_ACP_IMPERSONATE=codex"]
           : scriptLines;
-    // The isolated home cannot initialize user-scoped Node version-manager shims.
-    const script = `#!/bin/bash\n${perName.join("\n")}\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(fakeAgentJs)} "$@"\n`;
+    // Keep orphaned agents attributable after their tmux pane disappears.
     const path = join(binDir, name);
+    const script = `#!/bin/bash\n${perName.join("\n")}\nexec -a ${JSON.stringify(path)} ${JSON.stringify(process.execPath)} ${JSON.stringify(fakeAgentJs)} "$@"\n`;
     writeFileSync(path, script);
     chmodSync(path, 0o755);
   }
@@ -628,6 +722,8 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
     // not appear within 10s` (deterministic on slower local + CI
     // machines, never on hot caches). Honored only in debug builds.
     AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS: "60000",
+    // Teardown revokes the registry lease and waits for this runner-owned watchdog.
+    AOE_ACP_WATCHDOG_POLL_MS: "100",
     // FAKE_ACP_DEBUG_LOG is *also* re-exported by the shim itself
     // (see writeFakeAcpShim) because the daemon -> runner -> node
     // spawn chain on CI Linux did not propagate this env var from
@@ -669,10 +765,6 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
     }
   }
 
-  if (opts.seedFn) {
-    await opts.seedFn({ home, shimBin, xdg, tmp, tmuxTmp, env: seedEnv });
-  }
-
   const passphrase = authMode === "passphrase" ? (opts.passphrase ?? DEFAULT_PASSPHRASE) : undefined;
 
   const spawnTimeoutMs = opts.spawnTimeoutMs ?? 10_000;
@@ -704,182 +796,158 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
       stdio: ["ignore", "pipe", "pipe"],
       env: seedEnv,
     });
-
-    if (process.env.AOE_E2E_DEBUG === "1") {
-      // Append per-worker server stdio + spawn env to a fixed path so
-      // CI runs can post-mortem failures without holding open pipes
-      // that buffer-fill and stall the harness.
-      const logPath = `/tmp/aoe-e2e-debug-${opts.workerIndex}-${opts.parallelIndex}.log`;
-      const fs = await import("node:fs");
-      const log = fs.createWriteStream(logPath, { flags: "a" });
-      log.write(`\n=== spawn ${args.join(" ")} (home=${home}) ===\n`);
-      child.stdout?.on("data", (b) => log.write(`[stdout] ${b}`));
-      child.stderr?.on("data", (b) => log.write(`[stderr] ${b}`));
-    }
-
-    let spawnFailed = false;
-    child.once("error", () => {
-      spawnFailed = true;
+    let spawnError: Error | undefined;
+    child.once("error", (error) => {
+      spawnError = error;
     });
-
-    try {
-      await waitForServer(boundBaseUrl, spawnTimeoutMs, child, authMode);
-      return child;
-    } catch (err) {
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        // ignore
+    let bound = false;
+    let line = "";
+    // startup.rs emits this URL on this child's pipe only after TcpListener::bind.
+    child.stdout?.on("data", (chunk) => {
+      line += chunk.toString();
+      let newline: number;
+      while ((newline = line.indexOf("\n")) !== -1) {
+        const message = line.slice(0, newline).trim();
+        line = line.slice(newline + 1);
+        if (message === `${boundBaseUrl}/` || message.startsWith(`${boundBaseUrl}/?token=`)) bound = true;
       }
-      const wrapped = spawnFailed ? new Error(`spawn failed before listen: ${String(err)}`) : err;
-      throw wrapped;
+      line = line.slice(-8192);
+    });
+    child.stderr?.resume();
+    if (process.env.AOE_E2E_DEBUG === "1") {
+      const { createWriteStream } = await import("node:fs");
+      const log = createWriteStream(join(home, "serve.log"), { flags: "a" });
+      child.stdout?.on("data", (b) => log.write(b));
+      child.stderr?.on("data", (b) => log.write(b));
+      child.once("close", () => log.end());
+    }
+    pendingChildren.add(child);
+    try {
+      await waitForServer(
+        boundBaseUrl,
+        spawnTimeoutMs,
+        child,
+        authMode,
+        () => bound,
+        () => spawnError,
+      );
+      return child;
+    } catch (error) {
+      await killProc(child);
+      throw error;
     }
   }
 
+  const pendingChildren = new Set<ChildProcess>();
   let proc: ChildProcess | null = null;
   let port = 0;
   let baseUrl = "";
 
-  for (let attempt = 0; attempt < 5; attempt++) {
-    port = portFor(opts.workerIndex, opts.parallelIndex, attempt);
-    baseUrl = `http://127.0.0.1:${port}`;
+  async function killProc(child: ChildProcess): Promise<void> {
+    if (child.exitCode !== null || child.signalCode !== null || child.pid === undefined) {
+      pendingChildren.delete(child);
+      return;
+    }
+    const exited = once(child, "exit", { signal: AbortSignal.timeout(4000) });
+    const escalate = setTimeout(() => child.kill("SIGKILL"), 2000);
     try {
-      proc = await spawnOnce(buildArgs(port), baseUrl);
-      break;
-    } catch (err) {
-      if (attempt === 4) {
-        rmSync(home, { recursive: true, force: true });
-        throw err;
-      }
-      // try next port
+      child.kill("SIGTERM");
+      await exited;
+      pendingChildren.delete(child);
+    } catch (error) {
+      throw new Error(`aoe child ${child.pid} did not exit; retaining ${home}`, { cause: error });
+    } finally {
+      clearTimeout(escalate);
     }
   }
 
-  if (!proc) {
-    rmSync(home, { recursive: true, force: true });
-    throw new Error("aoe serve failed to bind on every attempted port");
-  }
-
-  let authToken: string | undefined;
-  let tokenFile: string | undefined;
-  if (authMode === "token") {
-    tokenFile = join(appDirFor(home, xdg, aoeBinary), "serve.token");
-    authToken = await readTokenFile(tokenFile, spawnTimeoutMs);
-  }
-
-  async function killProc(child: ChildProcess): Promise<void> {
-    if (child.exitCode !== null || child.signalCode !== null) return;
-    child.kill("SIGTERM");
-    await new Promise<void>((resolveExit) => {
-      let resolved = false;
-      const done = () => {
-        if (resolved) return;
-        resolved = true;
-        clearTimeout(escalate);
-        clearTimeout(backstop);
-        resolveExit();
-      };
-      // 2s after SIGTERM, escalate to SIGKILL. Do NOT resolve here:
-      // restart() reuses the same port and a too-early resolve races
-      // the kernel's TCP cleanup, so spawnOnce can land on EADDRINUSE.
-      // Wait for the real exit event (or the backstop below).
-      const escalate = setTimeout(() => {
-        try {
-          child.kill("SIGKILL");
-        } catch {
-          // ignore
-        }
-      }, 2000);
-      // Hard backstop so a pathologically uncooperative child can't
-      // hang the test forever. SIGKILL is uninterruptible on POSIX
-      // outside zombie/D-state, so this should not fire in practice.
-      const backstop = setTimeout(done, 4000);
-      child.once("exit", done);
-    });
-  }
-
-  const handle: ServeHandle = {
-    baseUrl,
-    port,
-    home,
-    shimBin,
-    env: seedEnv,
-    proc,
-    authMode,
-    passphrase,
-    authToken,
-    tokenFile,
-    tmuxPrefix: tmuxPrefixFor(aoeBinary),
-    tmuxSocket: tmuxSocketPath(home),
-    async restart() {
-      if (proc) await killProc(proc);
-      const next = await spawnOnce(buildArgs(port), baseUrl);
-      proc = next;
-      handle.proc = next;
-      if (authMode === "token" && tokenFile) {
-        const refreshed = await readTokenFile(tokenFile, spawnTimeoutMs);
-        handle.authToken = refreshed;
-      }
-    },
-    async stop() {
+  async function cleanup(): Promise<void> {
+    const errors: unknown[] = [];
+    // Stop the daemon before its runners, so reconciliation cannot respawn them.
+    for (const child of pendingChildren) {
       try {
-        // Terminate acp workers BEFORE killing the daemon and deleting
-        // the temp HOME. `acp stop --all` makes the still-live daemon
-        // group-kill every per-session `aoe __acp-runner` (and its node
-        // + claude descendants). Without it they outlive the daemon, the
-        // HOME is then wiped, and the orphaned tree leaks forever. See
-        // #1921.
-        spawnSync(aoeBinary, ["acp", "stop", "--all"], {
-          env: seedEnv,
-          stdio: "ignore",
-          timeout: 10_000,
-        });
-        if (proc) await killProc(proc);
-      } finally {
-        // Direct fallback for a daemon that was already dead/wedged (so the
-        // RPC above was a no-op): group-kill any runner still recorded in
-        // the registry, reading its pid off disk. Runs before rmSync so we
-        // never orphan a tree by deleting its HOME out from under it.
-        await killOrphanRunners(appDirFor(home, xdg, aoeBinary));
-        // Best-effort: kill any tmux server bound to the isolated socket
-        // before deleting the dir. Structured view specs leave tmux child
-        // processes around that hold open file descriptors and trip
-        // ENOTEMPTY on rmSync if not cleaned up first.
-        try {
-          // aoe binds its own `-S <socket>` (#2608), not the default socket
-          // under TMUX_TMPDIR, so kill the server on that explicit socket.
-          spawnSync("tmux", ["-S", tmuxSocketPath(home), "kill-server"], {
-            env: seedEnv,
-            stdio: "ignore",
-          });
-        } catch {
-          // tmux not installed or no server running; either way we don't
-          // care.
-        }
-        // Removing the home dir wipes the isolated TMUX_TMPDIR socket too.
-        // Wrap in try/catch: stale fds, slow umount, or AFS-style retry
-        // semantics can leave non-empty dirs that don't matter for the
-        // test result.
-        try {
-          rmSync(home, { recursive: true, force: true });
-        } catch {
-          // best effort
-        }
+        await killProc(child);
+      } catch (error) {
+        errors.push(error);
       }
-    },
-  };
-
-  if (authMode === "passphrase" && passphrase && opts.preloginViaHarness) {
-    const deviceBindingSecret = randomBytes(32).toString("base64url");
-    const { cookie } = await loginWithPassphrase(baseUrl, passphrase, deviceBindingSecret);
-    handle.sessionCookie = cookie;
-    handle.deviceBindingSecret = deviceBindingSecret;
+    }
+    if (errors.length === 0) {
+      try {
+        await stopOrphanRunners(appDir, aoeBinary, seedEnv);
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    try {
+      await stopTerminalProcesses(tmuxSocketPath(home), opts.acp ? shimBin : undefined, seedEnv);
+    } catch (error) {
+      errors.push(error);
+    }
+    if (errors.length) throw new AggregateError(errors, `teardown incomplete; retaining ${home}`);
+    rmSync(home, { recursive: true, force: true });
   }
 
-  // The structured view is the default for ACP-capable agents now (the master
-  // switch was removed), so the harness no longer enables anything here.
-  // `opts.structured view` is accepted for source compatibility and ignored.
-  void opts.acp;
+  try {
+    if (opts.seedFn) await opts.seedFn({ home, shimBin, xdg, tmp, tmuxTmp, env: seedEnv });
+    for (let attempt = 0; attempt < 5; attempt++) {
+      port = portFor(opts.workerIndex, opts.parallelIndex, attempt);
+      baseUrl = `http://127.0.0.1:${port}`;
+      try {
+        proc = await spawnOnce(buildArgs(port), baseUrl);
+        break;
+      } catch (error) {
+        if (attempt === 4 || pendingChildren.size > 0) throw error;
+      }
+    }
+    if (!proc) throw new Error("aoe serve failed to bind on every attempted port");
+    let authToken: string | undefined;
+    let tokenFile: string | undefined;
+    if (authMode === "token") {
+      tokenFile = join(appDirFor(home, xdg, aoeBinary), "serve.token");
+      authToken = await readTokenFile(tokenFile, spawnTimeoutMs);
+    }
+    const handle: ServeHandle = {
+      baseUrl,
+      port,
+      home,
+      shimBin,
+      env: seedEnv,
+      proc,
+      authMode,
+      passphrase,
+      authToken,
+      tokenFile,
+      tmuxPrefix: tmuxPrefixFor(aoeBinary),
+      tmuxSocket: tmuxSocketPath(home),
+      async restart() {
+        if (proc) await killProc(proc);
+        const next = await spawnOnce(buildArgs(port), baseUrl);
+        proc = next;
+        handle.proc = next;
+        if (authMode === "token" && tokenFile) {
+          const refreshed = await readTokenFile(tokenFile, spawnTimeoutMs);
+          handle.authToken = refreshed;
+        }
+      },
+      stop: cleanup,
+    };
 
-  return handle;
+    if (authMode === "passphrase" && passphrase && opts.preloginViaHarness) {
+      const deviceBindingSecret = randomBytes(32).toString("base64url");
+      const { cookie } = await loginWithPassphrase(baseUrl, passphrase, deviceBindingSecret);
+      handle.sessionCookie = cookie;
+      handle.deviceBindingSecret = deviceBindingSecret;
+    }
+
+    return handle;
+  } catch (error) {
+    try {
+      await cleanup();
+    } catch (teardownError) {
+      throw new AggregateError([error, teardownError], `startup failed and teardown incomplete; retaining ${home}`, {
+        cause: teardownError,
+      });
+    }
+    throw error;
+  }
 }

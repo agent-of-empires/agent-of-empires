@@ -81,43 +81,15 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
-    /// Save and clear every var `browser_reachable` reads, restoring on drop so
-    /// a panicking assert cannot leak a cleared `DISPLAY` into sibling tests.
-    struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
-
-    impl EnvGuard {
-        fn clear_all() -> Self {
-            const KEYS: [&str; 6] = [
-                // Steers `open_url` away from the real path entirely, so a
-                // concurrent test setting it would mask the refusal under test.
-                OPEN_URL_TO_ENV,
-                "BROWSER",
-                "SSH_CONNECTION",
-                "SSH_TTY",
-                "DISPLAY",
-                "WAYLAND_DISPLAY",
-            ];
-            let saved = KEYS
-                .iter()
-                .map(|k| {
-                    let prev = std::env::var_os(k);
-                    std::env::remove_var(k);
-                    (*k, prev)
-                })
-                .collect();
-            Self(saved)
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (key, value) in &self.0 {
-                match value {
-                    Some(v) => std::env::set_var(key, v),
-                    None => std::env::remove_var(key),
-                }
-            }
-        }
+    fn clear_environment() -> crate::session::test_support::EnvGuard {
+        crate::session::test_support::EnvGuard::unset(&[
+            OPEN_URL_TO_ENV,
+            "BROWSER",
+            "SSH_CONNECTION",
+            "SSH_TTY",
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+        ])
     }
 
     /// `webbrowser::open` returns as soon as it can spawn a helper, so an
@@ -127,7 +99,7 @@ mod tests {
     #[test]
     #[serial]
     fn refuses_when_no_browser_could_reach_the_user() {
-        let _guard = EnvGuard::clear_all();
+        let _guard = clear_environment();
 
         // Over SSH the user is at another machine entirely.
         std::env::set_var("SSH_CONNECTION", "10.0.0.1 22 10.0.0.2 22");
@@ -158,7 +130,7 @@ mod tests {
     #[serial]
     #[cfg(target_os = "macos")]
     fn macos_ignores_env_hints_its_launcher_never_reads() {
-        let _guard = EnvGuard::clear_all();
+        let _guard = clear_environment();
         std::env::set_var("SSH_CONNECTION", "10.0.0.1 22 10.0.0.2 22");
         std::env::set_var("BROWSER", "my-forwarder");
         assert!(
@@ -177,7 +149,7 @@ mod tests {
     #[test]
     #[serial]
     fn unreachable_browser_is_an_error_not_a_silent_success() {
-        let _guard = EnvGuard::clear_all();
+        let _guard = clear_environment();
         std::env::set_var("SSH_CONNECTION", "10.0.0.1 22 10.0.0.2 22");
         // No AOE_OPEN_URL_TO, so this takes the real path; it must refuse
         // before reaching `webbrowser`, which would spawn something.
@@ -190,10 +162,9 @@ mod tests {
     fn redirect_appends_each_url_when_env_set() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("opened.txt");
-        std::env::set_var(OPEN_URL_TO_ENV, &path);
+        let _env = crate::session::test_support::EnvGuard::set(&[(OPEN_URL_TO_ENV, &path)]);
         open_url("https://example.com/pr/1").unwrap();
         open_url("https://example.com/pr/2").unwrap();
-        std::env::remove_var(OPEN_URL_TO_ENV);
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "https://example.com/pr/1\nhttps://example.com/pr/2\n"

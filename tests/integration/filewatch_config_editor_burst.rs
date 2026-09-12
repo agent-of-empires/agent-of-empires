@@ -1,23 +1,7 @@
-//! Editor burst coalescing for config live-reload.
-//!
-//! Subscribes to `<dir>/config.toml` with the same spec
-//! (`FileMatcher::Exact`, 100ms debounce) the TUI uses for the global
-//! and per-profile config consumers. Then simulates a vim-style save:
-//!
-//! 1. Write a tempfile (`config.toml.tmp~`). The primitive's tempfile
-//!    filter in `src/file_watch.rs` drops the event.
-//! 2. Rename the tempfile to `config.toml`. A Modify event for the
-//!    final path fires once content has landed.
-//! 3. `chmod` `config.toml`. A second Modify event for the final path
-//!    fires within microseconds of the rename.
-//!
-//! The 100ms debounce coalesces (2) and (3) into a single delivery.
-//! End to end, exactly ONE event reaches the consumer side per logical
-//! save, which means `refresh_from_config` runs exactly once per save.
-//!
-//! This is the primitive-level proof of the property; the e2e tests
-//! cover the integration-level proof (TUI process, real watcher, real
-//! tick loop).
+//! Native config delivery after editor writes, renames, and permission changes.
+//! Exact same-window coalescing is owned by
+//! file_watch::tests::debounce_collapses_burst_to_one_event; native operations
+//! may cross debounce windows when the producer is descheduled.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -32,7 +16,8 @@ const POST_BURST_QUIET: Duration = Duration::from_millis(800);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial(file_watch)]
-async fn vim_style_save_burst_collapses_to_a_single_delivery() {
+#[serial_test::parallel]
+async fn vim_style_save_burst_delivers_final_config() {
     let svc = FileWatchService::new().expect("init service");
     let tmp = TempDir::new().expect("tempdir");
     let dir: PathBuf = tmp
@@ -64,18 +49,18 @@ async fn vim_style_save_burst_collapses_to_a_single_delivery() {
         "the seed write should match the spec's exact matcher"
     );
 
-    while timeout(POST_BURST_QUIET, rx.recv()).await.is_ok() {}
+    loop {
+        match timeout(POST_BURST_QUIET, rx.recv()).await {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("seed event channel closed"),
+            Err(_) => break,
+        }
+    }
 
     std::fs::write(&temp_path, b"theme = { idle_decay_minutes = 7 }\n")
         .expect("write tempfile (vim writebackup pattern)");
     std::fs::rename(&temp_path, &final_path).expect("rename tempfile to final path");
-    // The chmod-burst portion of this test exercises rename + chmod
-    // coalescing. macOS FSEvents collapses sibling attribute events
-    // before they reach the dispatcher, so the second event needed to
-    // exercise the debounce path on macOS would simply not fire from
-    // chmod alone. Linux inotify delivers them as distinct events.
-    // The sibling test `vim_style_save_via_two_renames_collapses` covers
-    // the cross-platform shape using two distinct rename events.
+    // Linux emits attribute events separately; macOS may fold them into rename.
     #[cfg(all(unix, target_os = "linux"))]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -104,22 +89,21 @@ async fn vim_style_save_burst_collapses_to_a_single_delivery() {
         "burst event must target final config.toml"
     );
 
-    let trailing = timeout(POST_BURST_QUIET, rx.recv()).await;
-    assert!(
-        trailing.is_err(),
-        "100ms debounce must coalesce write + rename + chmod into a \
-         single delivery; saw extra event {trailing:?}"
+    assert_eq!(
+        std::fs::read_to_string(&final_path).unwrap(),
+        "theme = { idle_decay_minutes = 7 }\n"
     );
+    // Exact same-window coalescing is covered by the dispatcher-clock test.
+    while let Ok(event) = timeout(POST_BURST_QUIET, rx.recv()).await {
+        assert_eq!(event.expect("watch channel open").path, final_path);
+    }
 }
 
-/// Cross-platform sibling: two distinct rename events inside the
-/// debounce window must coalesce into a single delivery. Renames fire
-/// reliable events on every platform (including macOS FSEvents), so this
-/// covers the same coalescing property as the chmod-burst test without
-/// depending on platform-specific attribute-event semantics.
+/// Both native renames must leave the final config observable by the consumer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial(file_watch)]
-async fn vim_style_save_via_two_renames_collapses_to_a_single_delivery() {
+#[serial_test::parallel]
+async fn vim_style_save_via_two_renames_delivers_final_config() {
     let svc = FileWatchService::new().expect("init service");
     let tmp = TempDir::new().expect("tempdir");
     let dir: PathBuf = tmp
@@ -147,7 +131,13 @@ async fn vim_style_save_via_two_renames_collapses_to_a_single_delivery() {
         .await
         .expect("seed event arrives within 2.5s")
         .expect("seed event channel open");
-    while timeout(POST_BURST_QUIET, rx.recv()).await.is_ok() {}
+    loop {
+        match timeout(POST_BURST_QUIET, rx.recv()).await {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("seed event channel closed"),
+            Err(_) => break,
+        }
+    }
 
     std::fs::write(&temp_a, b"theme = { idle_decay_minutes = 7 }\n").expect("write temp_a");
     std::fs::rename(&temp_a, &final_path).expect("first rename onto final_path");
@@ -163,10 +153,11 @@ async fn vim_style_save_via_two_renames_collapses_to_a_single_delivery() {
         "burst event must target final config.toml"
     );
 
-    let trailing = timeout(POST_BURST_QUIET, rx.recv()).await;
-    assert!(
-        trailing.is_err(),
-        "100ms debounce must coalesce two back-to-back renames into a \
-         single delivery; saw extra event {trailing:?}"
+    assert_eq!(
+        std::fs::read_to_string(&final_path).unwrap(),
+        "theme = { idle_decay_minutes = 11 }\n"
     );
+    while let Ok(event) = timeout(POST_BURST_QUIET, rx.recv()).await {
+        assert_eq!(event.expect("watch channel open").path, final_path);
+    }
 }

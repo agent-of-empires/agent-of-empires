@@ -3758,15 +3758,13 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_user_tmux_config_found_under_xdg_config_home() {
-        let prev_home = std::env::var_os("HOME");
-        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
         let temp = tempfile::TempDir::new().unwrap();
         // An XDG root deliberately outside `$HOME/.config`, the case the
         // two-path list could not see.
         let xdg = temp.path().join("xdg-elsewhere");
         std::fs::create_dir_all(xdg.join("tmux")).unwrap();
-        std::env::set_var("HOME", temp.path().join("home"));
-        std::env::set_var("XDG_CONFIG_HOME", &xdg);
+        let _home_guard = crate::session::test_support::isolate_home(&temp.path().join("home"))
+            .and_set("XDG_CONFIG_HOME", &xdg);
 
         assert!(
             !user_has_tmux_config(),
@@ -3783,15 +3781,6 @@ mod tests {
             !user_tmux_config_sets_any(&["set-clipboard"]),
             "a file silent on clipboard must not defer clipboard too"
         );
-
-        match prev_home {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
-        match prev_xdg {
-            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
     }
 
     /// The one resolver, over every setting and mode. `Auto` is the only row
@@ -3891,9 +3880,7 @@ mod tests {
     #[serial_test::serial]
     fn test_effective_profile_falls_back_to_global_default_when_empty() {
         let temp_home = tempfile::TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         let app_dir = temp_home
@@ -3917,9 +3904,7 @@ mod tests {
     #[serial_test::serial]
     fn test_load_or_warn_returns_defaults_on_malformed_toml() {
         let temp_home = tempfile::TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         let app_dir = temp_home

@@ -1,21 +1,22 @@
-// The agent surface's live view against a real `aoe serve`: frames come from
-// the in-process VT grid, so a full-screen app that brackets its repaints in
-// DEC 2026 synchronized output is never shown half-drawn, and once the client
-// advertises `caps.patch` the stream carries row patches instead of whole
-// windows.
-//
-// Only the first of those is grid-only. Row patches are planned in the shared
-// publish path and arrive on the snapshot fallback too, so neither assertion
-// proves which transport is live. The server says so directly instead, and
-// both cases check it: a run that quietly fell back to snapshots would
-// otherwise read as a tearing bug in the grid rather than as an absent grid.
+// Real live-grid delivery: synchronized frames, resize/OSC 52, and row patches.
+// Assert the announced transport so a snapshot fallback cannot satisfy the oracle.
 import { devices, type Page } from "@playwright/test";
 import { join } from "node:path";
 import { writeFileSync, chmodSync, mkdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { test, expect } from "../helpers/liveTest";
-import { spawnAoeServe, resolveAoeBinary, type ServeHandle, type SpawnOptions } from "../helpers/aoeServe";
+import {
+  spawnAoeServe,
+  resolveAoeBinary,
+  waitForSessions,
+  type ServeHandle,
+  type SpawnOptions,
+} from "../helpers/aoeServe";
+import { gitEnv } from "../helpers/gitFixture";
 import { clickSidebarSession, openMobileSidebar } from "../helpers/sidebar";
+
+test.use({ ...devices["iPhone 13"] });
 
 /** The server announces its transport on the first frame. Fail here rather
  *  than letting a snapshot fallback masquerade as a grid that tears: the
@@ -56,17 +57,6 @@ function readPaneGeometry(serve: ServeHandle): { cols: number; rows: number } | 
   return result.status === 0 && cols && rows ? { cols, rows } : undefined;
 }
 
-/** Wait until tmux reports `cols`, so a transport reading taken afterwards
- *  describes the grid after the resize rather than the frame before it. */
-async function paneWidthSettles(serve: ServeHandle, cols: number) {
-  await expect
-    .poll(() => readPaneGeometry(serve)?.cols, {
-      timeout: 15_000,
-      message: `tmux resized the pane to ${cols} columns`,
-    })
-    .toBe(cols);
-}
-
 async function paneGeometry(serve: ServeHandle): Promise<{ cols: number; rows: number }> {
   let geometry: { cols: number; rows: number } | undefined;
   await expect
@@ -81,25 +71,54 @@ async function paneGeometry(serve: ServeHandle): Promise<{ cols: number; rows: n
   return geometry!;
 }
 
-async function holdClientResize(page: Page) {
-  await page.addInitScript(() => {
+type ResizeWindow = typeof window & {
+  __liveResize: {
+    socket?: WebSocket;
+    send: WebSocket["send"];
+    connections: number;
+    events: Array<{ type: "transport"; grid: boolean } | { type: "close"; code: number }>;
+  };
+};
+
+async function holdClientResize(page: Page, socketUrl: string) {
+  await page.addInitScript((socketUrl) => {
     const original = WebSocket.prototype.send;
-    (window as Window & { __pinLiveResize?: boolean }).__pinLiveResize = true;
-    WebSocket.prototype.send = function (data: string | ArrayBufferLike | Blob | ArrayBufferView) {
-      (window as Window & { __liveTestSocket?: WebSocket }).__liveTestSocket = this;
-      if (typeof data === "string") {
+    const state: ResizeWindow["__liveResize"] = { send: original, connections: 0, events: [] };
+    (window as ResizeWindow).__liveResize = state;
+    const sockets = new WeakSet<WebSocket>();
+    const desc = Object.getOwnPropertyDescriptor(WebSocket.prototype, "onmessage")!;
+    Object.defineProperty(WebSocket.prototype, "onmessage", {
+      configurable: true,
+      get() {
+        return desc.get!.call(this) as unknown;
+      },
+      set(this: WebSocket, handler: ((ev: MessageEvent) => void) | null) {
+        if (this.url === socketUrl && handler && !sockets.has(this)) {
+          sockets.add(this);
+          state.connections += 1;
+          state.socket ??= this;
+          this.addEventListener("close", (event) => state.events.push({ type: "close", code: event.code }));
+          this.addEventListener("message", (event) => {
+            if (typeof event.data !== "string") return;
+            const message = JSON.parse(event.data) as { type?: string; grid: boolean };
+            if (message.type === "transport") state.events.push({ type: "transport", grid: message.grid });
+          });
+        }
+        desc.set!.call(this, handler);
+      },
+    });
+    WebSocket.prototype.send = function (data: Parameters<WebSocket["send"]>[0]) {
+      if (this.url === socketUrl && typeof data === "string") {
         try {
           const message = JSON.parse(data) as { type?: string };
-          if (message.type === "resize" && (window as Window & { __pinLiveResize?: boolean }).__pinLiveResize) {
-            return;
-          }
+          if (message.type === "resize") return;
         } catch {
           // Non-control text frames pass through unchanged.
         }
       }
       return original.call(this, data);
     };
-  });
+  }, socketUrl);
 }
 
 function seedTool(title: string, script: string): SpawnOptions["seedFn"] {
@@ -109,7 +128,8 @@ function seedTool(title: string, script: string): SpawnOptions["seedFn"] {
     chmodSync(tool, 0o755);
     const pd = join(e.home, "project");
     mkdirSync(pd, { recursive: true });
-    spawnSync("git", ["init", "-q"], { cwd: pd });
+    const initialized = spawnSync("git", ["init", "-q"], { cwd: pd, env: gitEnv(e.env) });
+    if (initialized.status !== 0) throw new Error(String(initialized.stderr));
     const r = spawnSync(resolveAoeBinary(), ["add", pd, "-t", title, "-c", "claude", "--cmd-override", tool], {
       env: e.env,
     });
@@ -138,14 +158,15 @@ i=0
 while true; do i=$((i+1)); echo "patch line $i"; sleep 0.15; done
 `;
 
-const CLIPBOARD_AFTER_INPUT = `#!/bin/bash
+const clipboardAfterInput = (marker: string) => `#!/bin/bash
 printf 'CLIPBOARD_READY\\n'
 IFS= read -r -n 1 _
+printf '\\n${marker}\\n'
 printf '\\e]52;c;YWZ0ZXItcmVzaXpl\\a'
 while true; do sleep 1; done
 `;
 
-test("synchronized-output brackets publish whole frames only", async ({ browser }, testInfo) => {
+test("synchronized-output brackets publish whole frames only", async ({ page }, testInfo) => {
   test.setTimeout(90_000);
   const serve = await spawnAoeServe({
     authMode: "none",
@@ -154,17 +175,25 @@ test("synchronized-output brackets publish whole frames only", async ({ browser 
     seedFn: seedTool("sync-app", SYNC_APP),
   });
   try {
-    const ctx = await browser.newContext({ ...devices["iPhone 13"] });
-    const page = await ctx.newPage();
     await page.goto(`${serve.baseUrl}/?livedebug=1`);
     await openMobileSidebar(page);
     await clickSidebarSession(page, "sync-app");
     await page.locator("[data-live-terminal]").waitFor({ state: "visible", timeout: 15_000 });
     await expectGridTransport(page);
-    await page
-      .locator("[data-live-content]")
-      .filter({ hasText: /FRAME-B \d+/ })
-      .waitFor({ state: "attached", timeout: 30_000 });
+    await expect
+      .poll(
+        () =>
+          page
+            .locator('[data-term="agent"] [data-live-content]')
+            .textContent()
+            .then((text) => {
+              const a = /FRAME-A (\d+)/.exec(text ?? "");
+              const b = /FRAME-B (\d+)/.exec(text ?? "");
+              return Boolean(a && b && a[1] === b[1]);
+            }),
+        { timeout: 30_000 },
+      )
+      .toBe(true);
 
     // Sample the rendered grid far more often than the app repaints. A torn
     // frame shows part A of one repaint with part B of the previous one (or
@@ -176,13 +205,12 @@ test("synchronized-output brackets publish whole frames only", async ({ browser 
           const seen = new Set<string>();
           let samples = 0;
           const timer = setInterval(() => {
-            const text = document.querySelector("[data-live-content]")?.textContent ?? "";
+            const text = document.querySelector('[data-term="agent"] [data-live-content]')?.textContent ?? "";
             const a = /FRAME-A (\d+)/.exec(text);
             const b = /FRAME-B (\d+)/.exec(text);
-            if (!a) return;
             samples += 1;
-            seen.add(a[1]!);
-            if (!b || a[1] !== b[1]) torn.push(text.replace(/\s+/g, " ").trim().slice(0, 60));
+            if (!a || !b || a[1] !== b[1]) torn.push(text.replace(/\s+/g, " ").trim().slice(0, 60));
+            else seen.add(a[1]!);
             if (samples >= 150) {
               clearInterval(timer);
               resolve({ samples, torn, frames: seen.size });
@@ -198,57 +226,81 @@ test("synchronized-output brackets publish whole frames only", async ({ browser 
   }
 });
 
-test("a resize keeps the live grid and its OSC 52 forwarding", async ({ browser }, testInfo) => {
+test("a resize keeps the live grid and its OSC 52 forwarding", async ({ page, context }, testInfo) => {
   test.setTimeout(90_000);
+  const marker = `POST_RESEED_${randomUUID().slice(0, 8)}`;
   const serve = await spawnAoeServe({
     authMode: "none",
     workerIndex: testInfo.workerIndex,
     parallelIndex: testInfo.parallelIndex,
-    seedFn: seedTool("clipboard-fallback", CLIPBOARD_AFTER_INPUT),
+    seedFn: seedTool("clipboard-fallback", clipboardAfterInput(marker)),
   });
   try {
-    const ctx = await browser.newContext({ ...devices["iPhone 13"] });
-    await ctx.grantPermissions(["clipboard-read", "clipboard-write"]);
-    const page = await ctx.newPage();
-    await holdClientResize(page);
+    const sessions = await waitForSessions(serve.baseUrl);
+    const session = sessions.find((session) => session.title === "clipboard-fallback");
+    if (!session) throw new Error("clipboard fixture session was not seeded");
+    await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+    const socketUrl = new URL(`/sessions/${session.id}/live-ws`, serve.baseUrl);
+    socketUrl.protocol = socketUrl.protocol === "https:" ? "wss:" : "ws:";
+    await holdClientResize(page, socketUrl.href);
     await page.goto(`${serve.baseUrl}/?livedebug=1`);
     await openMobileSidebar(page);
     await clickSidebarSession(page, "clipboard-fallback");
-    await page.locator("[data-live-terminal]").waitFor({ state: "visible", timeout: 15_000 });
-    await expectGridTransport(page);
+    const terminal = page.locator('[data-term="agent"] [data-live-terminal]');
+    await expect(terminal.locator("[data-live-content]")).toContainText("CLIPBOARD_READY", { timeout: 30_000 });
+    await expect
+      .poll(() => page.evaluate(() => (window as ResizeWindow).__liveResize.events[0]), { timeout: 30_000 })
+      .toEqual({ type: "transport", grid: true });
+    await page.evaluate(() => navigator.clipboard.writeText(""));
     const geometry = await paneGeometry(serve);
-    await page.evaluate(() => {
-      (window as Window & { __pinLiveResize?: boolean }).__pinLiveResize = false;
-    });
-
+    const resized = { cols: geometry.cols + 1, rows: geometry.rows + 1 };
     await page.evaluate(({ cols, rows }) => {
-      const socket = (window as Window & { __liveTestSocket?: WebSocket }).__liveTestSocket;
-      if (!socket) throw new Error("live WebSocket was not captured");
-      socket.send(JSON.stringify({ type: "resize", cols: cols + 1, rows }));
-    }, geometry);
-    // Assert only once tmux has applied the resize: read before that, the
-    // overlay still reports the pre-resize frame and the check cannot fail.
-    // The reseed installs behind the drain fence, so the grid has to still be
-    // serving this viewer on the far side of it, and go on doing so.
-    await paneWidthSettles(serve, geometry.cols + 1);
-    await expectTransport(page, "grid");
-    await page.waitForTimeout(2_000);
-    await expectTransport(page, "grid");
-
-    await page.locator("[data-live-terminal]").click();
+      const { socket, send } = (window as ResizeWindow).__liveResize;
+      if (!socket || socket.readyState !== WebSocket.OPEN) throw new Error("pinned live WebSocket is not open");
+      // Bypass only this explicit resize; automatic resizes stay held through input.
+      send.call(socket, JSON.stringify({ type: "resize", cols, rows }));
+    }, resized);
+    await expect
+      .poll(() => readPaneGeometry(serve), { timeout: 15_000, message: "tmux applied both resize dimensions" })
+      .toEqual(resized);
+    // rows comes from the received frame, unlike the client's render column count.
+    await expect(terminal.locator("[data-live-debug]")).toContainText(new RegExp(`\\brows=${resized.rows}\\b`), {
+      timeout: 30_000,
+    });
+    await terminal.click();
     await page.keyboard.type("c");
+    await expect
+      .poll(
+        () =>
+          terminal.evaluate((root) => ({
+            rows: Number(/\brows=(\d+)\b/.exec(root.querySelector("[data-live-debug]")?.textContent ?? "")?.[1]),
+            output: root.querySelector("[data-live-content]")?.textContent ?? "",
+          })),
+        { timeout: 30_000, message: "the resized frame rendered output caused by the later input" },
+      )
+      .toEqual({ rows: resized.rows, output: expect.stringContaining(marker) });
     await expect
       .poll(() => page.evaluate(() => navigator.clipboard.readText()), {
         timeout: 30_000,
         message: "OSC 52 emitted after the resize reached the same viewer",
       })
       .toBe("after-resize");
+    const journal = await page.evaluate(() => {
+      const { socket, connections, events } = (window as ResizeWindow).__liveResize;
+      return { connections, events, open: socket?.readyState === WebSocket.OPEN };
+    });
+    expect(journal.connections, "no replacement viewer before the post-resize output and clipboard").toBe(1);
+    expect(journal.open, "the pinned viewer is still open").toBe(true);
+    expect(
+      journal.events.filter((event) => event.type !== "transport" || !event.grid),
+      "no close or transient fallback from the initial grid announcement through the witness",
+    ).toEqual([]);
   } finally {
     await serve.stop();
   }
 });
 
-test("a streaming agent is delivered as row patches after the first frame", async ({ browser }, testInfo) => {
+test("a streaming agent is delivered as row patches after the first frame", async ({ page }, testInfo) => {
   test.setTimeout(90_000);
   const serve = await spawnAoeServe({
     authMode: "none",
@@ -257,8 +309,6 @@ test("a streaming agent is delivered as row patches after the first frame", asyn
     seedFn: seedTool("patch-stream", STREAMER),
   });
   try {
-    const ctx = await browser.newContext({ ...devices["iPhone 13"] });
-    const page = await ctx.newPage();
     await page.goto(`${serve.baseUrl}/?livedebug=1`);
     await openMobileSidebar(page);
     await clickSidebarSession(page, "patch-stream");

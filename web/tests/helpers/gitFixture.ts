@@ -26,6 +26,15 @@ const GIT_ENV = {
   GIT_COMMITTER_EMAIL: "t@t",
 };
 
+/** Preserve the fixture environment, never the invoking shell's Git overrides. */
+export function gitEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const clean: NodeJS.ProcessEnv = {};
+  for (const [name, value] of Object.entries(env)) {
+    if (!name.startsWith("GIT_")) clean[name] = value;
+  }
+  return { ...clean, ...GIT_ENV };
+}
+
 export interface BareRepoFixture {
   /** Absolute path of the bare repo on disk. */
   path: string;
@@ -40,11 +49,11 @@ export interface BareRepoFixture {
  *
  * Returns the absolute path and the `file://` URL.
  */
-export function createBareRepo(parentDir: string, name = "bare.git"): BareRepoFixture {
+export function createBareRepo(parentDir: string, env: NodeJS.ProcessEnv, name = "bare.git"): BareRepoFixture {
   const path = join(parentDir, name);
   mkdirSync(parentDir, { recursive: true });
   const res = spawnSync("git", ["init", "--bare", "--quiet", path], {
-    env: { ...process.env, ...GIT_ENV },
+    env: gitEnv(env),
   });
   if (res.status !== 0) {
     throw new Error(`git init --bare failed: status=${res.status} stderr=${res.stderr?.toString() ?? "<none>"}`);
@@ -52,10 +61,10 @@ export function createBareRepo(parentDir: string, name = "bare.git"): BareRepoFi
   return { path, url: `file://${path}` };
 }
 
-function runGit(cwd: string, args: string[]): void {
+function runGit(cwd: string, args: string[], env: NodeJS.ProcessEnv): void {
   const res = spawnSync("git", args, {
     cwd,
-    env: { ...process.env, ...GIT_ENV },
+    env: gitEnv(env),
   });
   if (res.status !== 0) {
     throw new Error(
@@ -70,11 +79,15 @@ function runGit(cwd: string, args: string[]): void {
  * compare against. Uses `-b <branch>` so the default branch is
  * deterministic across hosts where `init.defaultBranch` may be unset.
  */
-export function initWorkingRepo(repoPath: string, opts: { defaultBranch?: string } = {}): { path: string } {
+export function initWorkingRepo(
+  repoPath: string,
+  env: NodeJS.ProcessEnv,
+  opts: { defaultBranch?: string } = {},
+): { path: string } {
   const branch = opts.defaultBranch ?? "main";
   mkdirSync(repoPath, { recursive: true });
-  runGit(repoPath, ["init", "-q", "-b", branch]);
-  runGit(repoPath, ["commit", "--allow-empty", "-q", "-m", "init"]);
+  runGit(repoPath, ["init", "-q", "-b", branch], env);
+  runGit(repoPath, ["commit", "--allow-empty", "-q", "-m", "init"], env);
   return { path: repoPath };
 }
 
@@ -89,6 +102,7 @@ export function initWorkingRepo(repoPath: string, opts: { defaultBranch?: string
  */
 export function createSeededBareRepo(
   parentDir: string,
+  env: NodeJS.ProcessEnv,
   opts: { name?: string; defaultBranch?: string } = {},
 ): BareRepoFixture {
   const name = opts.name ?? "seeded-bare.git";
@@ -96,9 +110,9 @@ export function createSeededBareRepo(
   mkdirSync(parentDir, { recursive: true });
   const path = join(parentDir, name);
   const workdir = join(parentDir, `${name}.src`);
-  initWorkingRepo(workdir, { defaultBranch: branch });
+  initWorkingRepo(workdir, env, { defaultBranch: branch });
   const res = spawnSync("git", ["clone", "--bare", "--quiet", workdir, path], {
-    env: { ...process.env, ...GIT_ENV },
+    env: gitEnv(env),
   });
   if (res.status !== 0) {
     throw new Error(`git clone --bare failed: status=${res.status} stderr=${res.stderr?.toString() ?? "<none>"}`);
@@ -131,9 +145,9 @@ export function writeBinaryFile(repoPath: string, relPath: string, bytes: Uint8A
 }
 
 /** Stage every change in the working tree and commit with `message`. */
-export function commitAll(repoPath: string, message: string): void {
-  runGit(repoPath, ["add", "-A"]);
-  runGit(repoPath, ["commit", "-q", "-m", message]);
+export function commitAll(repoPath: string, message: string, env: NodeJS.ProcessEnv): void {
+  runGit(repoPath, ["add", "-A"], env);
+  runGit(repoPath, ["commit", "-q", "-m", message], env);
 }
 
 /**

@@ -174,9 +174,8 @@ test.describe("Sidebar multi-session (#956)", () => {
     await page.mouse.down();
     await page.waitForTimeout(220);
     await page.mouse.up();
-    await page.waitForTimeout(16);
 
-    expect(await row.getAttribute("class")).toContain("ring-session-active");
+    await expect(row).toHaveClass(/(?:^|\s)ring-session-active(?:\s|$)/);
     // The frame has to resolve to the projected token, not just be requested:
     // `ring-session-active` with no matching `@theme` entry leaves
     // `--tw-ring-color` invalid at computed-value time, and `ring-2` then

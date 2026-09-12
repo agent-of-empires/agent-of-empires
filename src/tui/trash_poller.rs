@@ -32,6 +32,16 @@ impl TrashPoller {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_handler_for_test(
+        handler: impl FnMut(TrashRequest) -> TrashResult + Send + 'static,
+    ) -> Self {
+        Self {
+            worker: Worker::spawn("aoe-trash-poller-test", handler),
+            pending: HashSet::new(),
+        }
+    }
+
     pub fn request_trash(&mut self, request: TrashRequest) {
         self.pending.insert(request.session_id.clone());
         self.worker.request(request);
@@ -75,6 +85,16 @@ mod tests {
     use crate::session::Instance;
     use std::time::Duration;
 
+    struct TestPoller(Option<TrashPoller>);
+
+    impl Drop for TestPoller {
+        fn drop(&mut self) {
+            if let Some(poller) = self.0.take() {
+                let _ = poller.worker.finish_for_test();
+            }
+        }
+    }
+
     fn create_test_instance() -> (crate::session::test_support::AppDirGuard, Instance, u64) {
         let guard = crate::session::test_support::isolate_app_dir();
         let storage = crate::session::Storage::new_unwatched("default").unwrap();
@@ -100,8 +120,15 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_trash_poller_channel_communication() {
-        let mut poller = TrashPoller::new();
+        if !crate::tui::isolated_test_process(
+            "tui::trash_poller::tests::test_trash_poller_channel_communication",
+            Duration::from_secs(5),
+        ) {
+            return;
+        }
         let (_guard, instance, generation) = create_test_instance();
+        let mut fixture = TestPoller(Some(TrashPoller::new()));
+        let poller = fixture.0.as_mut().unwrap();
         let session_id = instance.id.clone();
 
         poller.request_trash(TrashRequest {
@@ -137,8 +164,15 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_trash_poller_tracks_pending_requests() {
-        let mut poller = TrashPoller::new();
+        if !crate::tui::isolated_test_process(
+            "tui::trash_poller::tests::test_trash_poller_tracks_pending_requests",
+            Duration::from_secs(5),
+        ) {
+            return;
+        }
         let (_guard, instance, generation) = create_test_instance();
+        let mut fixture = TestPoller(Some(TrashPoller::new()));
+        let poller = fixture.0.as_mut().unwrap();
         let session_id = instance.id.clone();
 
         poller.request_trash(TrashRequest {
@@ -147,7 +181,21 @@ mod tests {
             generation,
         });
 
-        assert_eq!(poller.take_pending(), vec![session_id]);
+        assert_eq!(poller.take_pending(), vec![session_id.clone()]);
         assert!(poller.take_pending().is_empty(), "take_pending drains");
+        let result = loop {
+            match poller.try_recv_result() {
+                Ok(result) => break result,
+                Err(TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(20)),
+                Err(error) => panic!("trash worker disconnected: {error}"),
+            }
+        };
+        assert_eq!(result.session_id, session_id);
+        assert!(
+            result.relocate_warning.is_none(),
+            "{:?}",
+            result.relocate_warning
+        );
+        assert!(result.relocation.is_none());
     }
 }

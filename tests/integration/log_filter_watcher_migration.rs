@@ -55,8 +55,9 @@ fn write_runtime_filter(app_dir: &std::path::Path, directive: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::parallel]
 async fn watch_runtime_filter_byte_identical_behavior() {
-    install_subscriber_once(VALID_DIRECTIVE_A);
+    install_subscriber_once("off");
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let app_dir: PathBuf = tmp.path().to_path_buf();
 
@@ -86,8 +87,20 @@ async fn watch_runtime_filter_byte_identical_behavior() {
     // Corrupt content: the function MUST NOT panic; current_filter stays
     // at the last valid value (apply_filter_file's `set_filter` rejects
     // garbage and emits a warn).
-    write_runtime_filter(&app_dir, "<<<not a valid filter directive>>>");
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    std::fs::write(app_dir.join("runtime_filter.observe"), b"observe").unwrap();
+    let invalid = "<<<not a valid filter directive>>>";
+    write_runtime_filter(&app_dir, invalid);
+    tokio::time::timeout(TIMEOUT, async {
+        while std::fs::read_to_string(app_dir.join("runtime_filter.applied"))
+            .ok()
+            .as_deref()
+            != Some(invalid)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("watcher attempted the invalid directive before replacement");
     assert_eq!(
         logging::current_filter().as_deref(),
         Some(VALID_DIRECTIVE_B),

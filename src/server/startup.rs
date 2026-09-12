@@ -1263,6 +1263,7 @@ mod tests {
     /// push subscriptions at the same moment.
     #[tokio::test(start_paused = true)]
     async fn rotation_cleanup_honors_the_configured_grace() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
         let lifetime = Duration::from_secs(60);
         let grace = Duration::from_secs(7);
         let manager = Arc::new(TokenManager::with_grace(
@@ -1288,7 +1289,7 @@ mod tests {
             .unwrap();
 
         let shutdown = CancellationToken::new();
-        tokio::spawn(remote_rotation_loop(
+        let rotation = tokio::spawn(remote_rotation_loop(
             manager.clone(),
             Some(push.clone()),
             shutdown.clone(),
@@ -1312,6 +1313,9 @@ mod tests {
         assert!(push.store.snapshot().await.is_empty());
 
         shutdown.cancel();
+        rotation
+            .await
+            .expect("rotation loop stops before app guard drops");
     }
 
     #[tokio::test]
@@ -1357,35 +1361,27 @@ mod tests {
         assert!(forced.load(Ordering::SeqCst));
     }
 
-    /// The grace window must run from the cancel, not from whenever the
-    /// watchdog task first gets polled. On this single-threaded runtime a
-    /// reap that works synchronously before yielding holds the only worker,
-    /// so a deadline built inside the task would not start until the reap
-    /// released it, stretching the window past `GRACE`.
-    #[tokio::test]
+    /// Advancing before the reap yields delays the watchdog's first poll,
+    /// but must not restart the grace window from that poll.
+    #[tokio::test(start_paused = true)]
     async fn shutdown_deadline_runs_from_the_cancel_not_the_watchdog_poll() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
         const GRACE: Duration = Duration::from_millis(100);
 
         let shutdown = CancellationToken::new();
-        let forced = Arc::new(AtomicBool::new(false));
-        let flag = forced.clone();
+        let (forced_tx, forced_rx) = tokio::sync::oneshot::channel();
         run_shutdown_sequence(
             &shutdown,
             GRACE,
-            async { std::thread::sleep(GRACE * 2) },
-            move || flag.store(true, Ordering::SeqCst),
+            async { tokio::time::advance(GRACE * 2).await },
+            move || {
+                let _ = forced_tx.send(());
+            },
         )
         .await;
-        assert!(
-            !forced.load(Ordering::SeqCst),
-            "the reap blocked the worker"
-        );
-
-        // One short park is all the watchdog needs once its deadline has
-        // already passed, and far less than another full window.
-        tokio::time::sleep(Duration::from_millis(1)).await;
-        assert!(forced.load(Ordering::SeqCst));
+        assert!(shutdown.is_cancelled());
+        tokio::time::timeout(GRACE / 2, forced_rx)
+            .await
+            .expect("watchdog must not start a fresh grace period at its first poll")
+            .expect("watchdog must force exit");
     }
 }

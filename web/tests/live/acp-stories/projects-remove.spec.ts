@@ -9,6 +9,7 @@ import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { test as base, expect } from "@playwright/test";
 import { spawnAoeServe, resolveAoeBinary } from "../../helpers/aoeServe";
+import { gitEnv } from "../../helpers/gitFixture";
 
 base("remove a project from the sidebar Projects section", async ({ page }, testInfo) => {
   let projectPath = "";
@@ -19,22 +20,13 @@ base("remove a project from the sidebar Projects section", async ({ page }, test
     seedFn: ({ home, env }) => {
       projectPath = join(home, "story-projects-remove");
       mkdirSync(projectPath, { recursive: true });
-      const initRes = spawnSync("git", ["init", "-q"], {
-        cwd: projectPath,
-        env,
-      });
+      const initRes = spawnSync("git", ["init", "-q"], { cwd: projectPath, env: gitEnv(env) });
       if (initRes.status !== 0) {
         throw new Error(`git init failed: status=${initRes.status} stderr=${initRes.stderr?.toString() ?? "<none>"}`);
       }
       const commitRes = spawnSync("git", ["commit", "--allow-empty", "-q", "-m", "init"], {
         cwd: projectPath,
-        env: {
-          ...env,
-          GIT_AUTHOR_NAME: "t",
-          GIT_AUTHOR_EMAIL: "t@t",
-          GIT_COMMITTER_NAME: "t",
-          GIT_COMMITTER_EMAIL: "t@t",
-        },
+        env: gitEnv(env),
       });
       if (commitRes.status !== 0) {
         throw new Error(

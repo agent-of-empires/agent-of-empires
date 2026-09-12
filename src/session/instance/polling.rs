@@ -882,7 +882,7 @@ mod tests {
         // A container publishes under its own bind, not the host hook dir.
         // Reading the wrong one is silent: the poller simply never observes.
         let temp = tempfile::tempdir().unwrap();
-        let _home = crate::session::test_support::EnvGuard::set(&[("HOME", temp.path())]);
+        let _home = crate::session::test_support::isolate_home(temp.path());
 
         let mut host = Instance::new("pi-host-poll", "/tmp/pi-poll");
         host.tool = "pi".to_string();
@@ -980,6 +980,7 @@ mod tests {
         std::fs::create_dir_all(inst.sandbox_capture_store_dir().unwrap()).unwrap();
         assert!(inst.repair_session_id_poller_if_needed(&live));
         assert!(inst.session_id_poller_is_running());
+        inst.stop_poller();
     }
 
     fn sandboxed_gemini(title: &str, project_path: &str, workdir: &str) -> Instance {
@@ -1204,6 +1205,7 @@ mod tests {
     #[serial_test::serial]
     #[cfg(unix)]
     fn an_aux_shaped_title_polls_its_marked_agent_pane() {
+        let _env_read = crate::session::test_support::EnvGuard::read_lock();
         use std::os::unix::fs::PermissionsExt;
 
         let _budget = crate::session::poller::test_support::IsolatedBudget::with_ceiling(1);

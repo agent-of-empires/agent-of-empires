@@ -1779,6 +1779,7 @@ mod tests {
         inst.capture_started_at = Some(std::time::SystemTime::now());
         inst.maybe_start_poller_since(None);
         assert!(inst.session_id_poller.is_some());
+        inst.stop_poller();
     }
 
     #[test]
@@ -2437,7 +2438,7 @@ process.stdout.write(JSON.stringify({ rootOnly, defaultMode }));
     #[serial_test::serial]
     fn an_unresolvable_sandbox_source_fails_closed() {
         let temp = tempfile::tempdir().unwrap();
-        let _home = crate::session::test_support::EnvGuard::set(&[("HOME", temp.path())]);
+        let _home = EnvGuard::set(&[("HOME", temp.path())]);
 
         // An id the dir guard refuses is one way the path cannot resolve.
         let mut inst = Instance::new("pi-unresolvable", "/tmp/pi-unresolvable");
@@ -2483,7 +2484,7 @@ process.stdout.write(JSON.stringify({ rootOnly, defaultMode }));
     #[serial_test::serial]
     fn reloaded_sandbox_session_still_finds_its_sidecar() {
         let temp = tempfile::tempdir().unwrap();
-        let _home = crate::session::test_support::EnvGuard::set(&[("HOME", temp.path())]);
+        let _home = crate::session::test_support::isolate_home(temp.path());
 
         let mut inst = Instance::new("pireloadsandbox01", "/tmp/pi-reload");
         inst.tool = "pi".to_string();
@@ -2544,7 +2545,7 @@ process.stdout.write(JSON.stringify({ rootOnly, defaultMode }));
         use nix::unistd::mkfifo;
 
         let temp = tempfile::tempdir().unwrap();
-        let _home = crate::session::test_support::EnvGuard::set(&[("HOME", temp.path())]);
+        let _home = crate::session::test_support::isolate_home(temp.path());
         let mut inst = Instance::new("piboundedsidecar", "/tmp/pi-bounded");
         inst.tool = "pi".to_string();
         inst.sandbox_info = Some(crate::session::SandboxInfo {
@@ -3041,7 +3042,7 @@ pi = "~/.pi-personal"
     #[serial]
     fn opencode_preassign_requires_profile_opt_in() {
         let temp = tempdir().unwrap();
-        let _home = EnvGuard::set(&[("HOME", temp.path())]);
+        let _home = crate::session::test_support::isolate_home(temp.path());
         let cases = [
             ("opencode-preassign-off", false),
             ("opencode-preassign-on", true),

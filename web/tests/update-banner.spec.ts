@@ -1,4 +1,4 @@
-import { test, expect } from "./helpers/mockedTest";
+import { test, expect, waitForResponseBody, observeFor } from "./helpers/mockedTest";
 import { Page } from "@playwright/test";
 
 interface UpdateStatusFixture {
@@ -61,7 +61,10 @@ test.describe("Update banner (#984, #1140)", () => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
     await expect(page.locator("header")).toBeVisible();
-    await expect(page.getByRole("status", { name: /Update available/i })).toHaveCount(0);
+    await waitForResponseBody(page, "/api/system/update-status");
+    await observeFor(page, 300, async () => {
+      expect(await page.getByRole("status", { name: /Update available/i }).count()).toBe(0);
+    });
   });
 
   test("hidden when update_check_mode is auto (background install)", async ({ page }) => {
@@ -76,7 +79,10 @@ test.describe("Update banner (#984, #1140)", () => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
     await expect(page.locator("header")).toBeVisible();
-    await expect(page.getByRole("status", { name: /Update available/i })).toHaveCount(0);
+    await waitForResponseBody(page, "/api/system/update-status");
+    await observeFor(page, 300, async () => {
+      expect(await page.getByRole("status", { name: /Update available/i }).count()).toBe(0);
+    });
   });
 
   test("hidden when latest matches current (no update)", async ({ page }) => {
@@ -91,7 +97,10 @@ test.describe("Update banner (#984, #1140)", () => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
     await expect(page.locator("header")).toBeVisible();
-    await expect(page.getByRole("status", { name: /Update available/i })).toHaveCount(0);
+    await waitForResponseBody(page, "/api/system/update-status");
+    await observeFor(page, 300, async () => {
+      expect(await page.getByRole("status", { name: /Update available/i }).count()).toBe(0);
+    });
   });
 
   test("dismiss persists per-version across reload (server-side, once per account)", async ({ page }) => {
@@ -127,14 +136,17 @@ test.describe("Update banner (#984, #1140)", () => {
     await expect(banner).toBeVisible();
     await page.getByRole("button", { name: /Dismiss update notice/i }).click();
     await expect(banner).toHaveCount(0);
-    expect(dismissPosted).toBe(true);
+    await expect.poll(() => dismissPosted).toBe(true);
     expect(dismissed).toBe("0.6.0");
 
     // Reload: the server now reports the version dismissed, so the banner
     // stays hidden without any per-browser state.
     await page.reload();
     await expect(page.locator("header")).toBeVisible();
-    await expect(page.getByRole("status", { name: /Update available/i })).toHaveCount(0);
+    await waitForResponseBody(page, "/api/system/update-status");
+    await observeFor(page, 300, async () => {
+      expect(await page.getByRole("status", { name: /Update available/i }).count()).toBe(0);
+    });
   });
 
   test("a version dismissed on another device is honored on first load", async ({ page }) => {
@@ -151,7 +163,10 @@ test.describe("Update banner (#984, #1140)", () => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
     await expect(page.locator("header")).toBeVisible();
-    await expect(page.getByRole("status", { name: /Update available/i })).toHaveCount(0);
+    await waitForResponseBody(page, "/api/system/update-status");
+    await observeFor(page, 300, async () => {
+      expect(await page.getByRole("status", { name: /Update available/i }).count()).toBe(0);
+    });
   });
 
   test("dismissed version no longer suppresses a newer release", async ({ page }) => {

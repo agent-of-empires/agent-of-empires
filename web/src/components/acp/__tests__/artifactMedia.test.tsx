@@ -52,14 +52,23 @@ describe("ArtifactImage", () => {
 
 describe("openArtifactInNewTab", () => {
   it("opens the tab synchronously, then points it at the blob URL", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, blob: async () => new Blob(["x"]) }));
+    let resolveFetch!: (response: Response) => void;
+    const pendingFetch = new Promise<Response>((resolve) => {
+      resolveFetch = resolve;
+    });
+    vi.stubGlobal("fetch", vi.fn().mockReturnValue(pendingFetch));
     const tab = { location: { href: "" }, close: vi.fn() };
     const open = vi.fn(() => tab);
     vi.stubGlobal("open", open);
-    await openArtifactInNewTab(URL_ANY);
-    // Tab opened synchronously (before the fetch) to keep the user gesture.
-    expect(open).toHaveBeenCalledWith("about:blank", "_blank");
-    expect(fetch).toHaveBeenCalledWith(URL_ANY);
+    const opening = openArtifactInNewTab(URL_ANY);
+    try {
+      expect(open).toHaveBeenCalledWith("about:blank", "_blank");
+      expect(fetch).toHaveBeenCalledWith(URL_ANY);
+      expect(tab.location.href).toBe("");
+    } finally {
+      resolveFetch(new Response("x"));
+      await opening;
+    }
     expect(tab.location.href).toBe("blob:mock-url");
     expect(tab.close).not.toHaveBeenCalled();
   });

@@ -15,7 +15,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::home_isolation::isolate_home;
+use crate::common::set_temp_home;
 use agent_of_empires::file_watch::{EventSource, FileMatcher, FileWatchService, WatchSpec};
 use agent_of_empires::session::{Instance, Storage};
 use serial_test::serial;
@@ -34,7 +34,7 @@ const NEG_WAIT: Duration = Duration::from_millis(300);
 #[serial]
 async fn storage_update_avoids_immediate_duplicate_delivery_after_local_notify() {
     let temp = TempDir::new().unwrap();
-    let _home = isolate_home(temp.path());
+    let _home = set_temp_home(temp.path());
     let svc: Arc<FileWatchService> =
         agent_of_empires::file_watch::test_support::new_filewatch().expect("init");
     let storage = Storage::new("propagation-test", svc.clone()).expect("storage");
@@ -110,7 +110,7 @@ async fn storage_update_avoids_immediate_duplicate_delivery_after_local_notify()
 #[serial]
 async fn cross_process_kernel_path_delivers_when_local_is_noop() {
     let temp = TempDir::new().unwrap();
-    let _home = isolate_home(temp.path());
+    let _home = set_temp_home(temp.path());
 
     let writer_storage = Storage::new_unwatched("xproc-test").expect("writer");
     writer_storage

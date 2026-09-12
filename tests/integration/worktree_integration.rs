@@ -33,6 +33,7 @@ fn setup_test_environment() -> (TempDir, git2::Repository, TempDir) {
 }
 
 #[test]
+#[serial_test::parallel]
 fn test_add_session_with_worktree_flag() {
     let (repo_dir, _repo, _config_dir) = setup_test_environment();
 
@@ -60,6 +61,7 @@ fn test_add_session_with_worktree_flag() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn test_session_has_worktree_info_after_creation() {
     let (repo_dir, _repo, _config_dir) = setup_test_environment();
 
@@ -91,7 +93,7 @@ fn test_session_has_worktree_info_after_creation() {
 #[serial]
 fn test_worktree_info_persists_across_save_load() {
     let temp_home = TempDir::new().unwrap();
-    std::env::set_var("HOME", temp_home.path());
+    let _home = crate::common::set_temp_home(temp_home.path());
 
     let storage = Storage::new_unwatched("worktree-test-profile").unwrap();
 
@@ -123,6 +125,7 @@ fn test_worktree_info_persists_across_save_load() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn test_session_without_worktree_has_none_worktree_info() {
     let instance = Instance::new("Regular Session", "/tmp/project");
 
@@ -130,6 +133,7 @@ fn test_session_without_worktree_has_none_worktree_info() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn test_manual_worktree_detection() {
     let (repo_dir, _repo, _config_dir) = setup_test_environment();
 
@@ -157,6 +161,7 @@ fn test_manual_worktree_detection() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn test_worktree_cleanup_on_session_removal() {
     let (repo_dir, _repo, _config_dir) = setup_test_environment();
     let worktree_container = TempDir::new().unwrap();
@@ -184,6 +189,7 @@ fn test_worktree_cleanup_on_session_removal() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn test_worktree_preserved_when_keep_flag_used() {
     let (repo_dir, _repo, _config_dir) = setup_test_environment();
     let worktree_container = TempDir::new().unwrap();
@@ -209,6 +215,7 @@ fn test_worktree_preserved_when_keep_flag_used() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn test_error_when_worktree_already_exists() {
     let (repo_dir, _repo, _config_dir) = setup_test_environment();
 
@@ -231,6 +238,7 @@ fn test_error_when_worktree_already_exists() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn test_error_when_branch_does_not_exist() {
     let (repo_dir, _repo, _config_dir) = setup_test_environment();
 
@@ -249,6 +257,7 @@ fn test_error_when_branch_does_not_exist() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn test_create_new_branch_with_b_flag() {
     let (repo_dir, repo, _config_dir) = setup_test_environment();
 
@@ -337,6 +346,7 @@ fn edit_workdir_moves_dir_and_optionally_renames_branch() {
 use agent_of_empires::session::worktree_edit::worktree_leaf_from_title;
 
 #[test]
+#[serial_test::parallel]
 fn tie_workdir_applies_only_for_managed_worktrees() {
     // Non-worktree session: never tied, regardless of the setting.
     let scratch = Instance::new("Scratch", "/tmp/x");

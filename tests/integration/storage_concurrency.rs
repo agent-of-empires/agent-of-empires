@@ -262,16 +262,68 @@ fn aoe_bin() -> &'static str {
     env!("CARGO_BIN_EXE_aoe")
 }
 
-fn spawn_favorite(aoe: &str, home: &std::path::Path, id: &str) -> std::process::Child {
+struct CliChild(std::process::Child);
+
+impl Drop for CliChild {
+    fn drop(&mut self) {
+        if !matches!(self.0.try_wait(), Ok(Some(_))) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+struct HeldStorageUpdate {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<Result<()>>>,
+}
+
+impl HeldStorageUpdate {
+    fn new(storage: Storage) -> Self {
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (held, ready) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            storage.update(|_, _| {
+                let _ = held.send(());
+                let _ = released.recv();
+                Ok(())
+            })
+        });
+        let guard = Self {
+            release: Some(release),
+            thread: Some(thread),
+        };
+        ready
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("parent storage lock acquired");
+        guard
+    }
+}
+
+impl Drop for HeldStorageUpdate {
+    fn drop(&mut self) {
+        self.release.take();
+        let result = self.thread.take().expect("owned storage thread").join();
+        if !std::thread::panicking() {
+            result
+                .expect("storage holder thread panicked")
+                .expect("held storage update failed");
+        }
+    }
+}
+
+fn spawn_favorite(aoe: &str, home: &std::path::Path, id: &str) -> CliChild {
     let mut cmd = std::process::Command::new(aoe);
     cmd.args(["session", "favorite", id])
         .env("HOME", home)
         .env_remove("AGENT_OF_EMPIRES_DEBUG");
     cmd.env("XDG_CONFIG_HOME", home.join(".config"));
-    cmd.stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("aoe binary failed to spawn")
+    CliChild(
+        cmd.stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("aoe binary failed to spawn"),
+    )
 }
 
 #[test]
@@ -300,7 +352,7 @@ fn test_cross_process_no_lost_updates() -> Result<()> {
         .map(|id| spawn_favorite(aoe, &home, id))
         .collect();
     for mut child in children {
-        let status = child.wait()?;
+        let status = child.0.wait()?;
         assert!(
             status.success(),
             "child `aoe session favorite` exited with {status:?}"
@@ -332,35 +384,34 @@ fn test_cross_process_blocking_acquire() -> Result<()> {
     })?;
     let id = storage.load()?[0].id.clone();
 
-    let hold = std::time::Duration::from_millis(800);
-    let parent_held = std::sync::Arc::new(std::sync::Barrier::new(2));
-    let parent_held_in_thread = parent_held.clone();
-
-    let storage_clone = Storage::new_unwatched("default")?;
-    let parent_handle = std::thread::spawn(move || {
-        storage_clone
-            .update(|_instances, _groups| {
-                parent_held_in_thread.wait();
-                std::thread::sleep(hold);
-                Ok(())
-            })
-            .unwrap();
-    });
-
-    parent_held.wait();
-    let started = std::time::Instant::now();
-    let mut child = spawn_favorite(aoe_bin(), &home, &id);
-    let status = child.wait()?;
-    let elapsed = started.elapsed();
-    parent_handle.join().unwrap();
-
-    assert!(status.success(), "child exit status: {status:?}");
-    assert!(
-        elapsed >= hold - std::time::Duration::from_millis(200),
-        "child should have blocked on the flock for ~{:?}, observed {:?}",
-        hold,
-        elapsed
+    let parent = HeldStorageUpdate::new(Storage::new_unwatched("default")?);
+    let contended = home.join("child-contended");
+    let mut child = CliChild(
+        std::process::Command::new(aoe_bin())
+            .args(["session", "favorite", &id])
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("AOE_E2E_STORAGE_LOCK_CONTENDED", &contended)
+            .spawn()?,
     );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !contended.exists() {
+        assert!(
+            child.0.try_wait()?.is_none(),
+            "child bypassed held storage lock"
+        );
+        if std::time::Instant::now() >= deadline {
+            panic!("child never observed the held storage lock");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        child.0.try_wait()?.is_none(),
+        "contending child cannot finish before release"
+    );
+    drop(parent);
+    let status = child.0.wait()?;
+    assert!(status.success(), "child exit status: {status:?}");
 
     let final_state = storage.load()?;
     assert!(
@@ -397,7 +448,7 @@ fn test_lock_released_on_panic_unwind() -> Result<()> {
 
     let started = std::time::Instant::now();
     let mut child = spawn_favorite(aoe_bin(), &home, &id);
-    let status = child.wait()?;
+    let status = child.0.wait()?;
     let elapsed = started.elapsed();
 
     assert!(status.success());
@@ -515,47 +566,30 @@ fn test_cross_process_independent_profiles_do_not_serialise() -> Result<()> {
     let id_a = s_a.load()?[0].id.clone();
     let id_b = s_b.load()?[0].id.clone();
 
-    // Debug CLI startup can exceed 500ms on loaded builders. Keep the hold
-    // long enough that startup overhead does not masquerade as lock contention.
-    let hold = std::time::Duration::from_secs(5);
-    let independent_startup_budget = std::time::Duration::from_millis(4500);
-    let storage_clone = Storage::new_unwatched("profile-a")?;
-    let parent_held = Arc::new(Barrier::new(2));
-    let parent_held_inner = parent_held.clone();
-    let parent_handle = std::thread::spawn(move || {
-        storage_clone
-            .update(|_, _| {
-                parent_held_inner.wait();
-                std::thread::sleep(hold);
-                Ok(())
-            })
-            .unwrap();
-    });
-
-    let started = std::time::Instant::now();
-    parent_held.wait();
-
-    // Cross-profile children must NOT be serialised by profile-a's flock.
-    let aoe = aoe_bin();
-    let mut cmd_b = std::process::Command::new(aoe);
-    cmd_b
-        .args(["session", "favorite", "--profile", "profile-b", &id_b])
-        .env("HOME", &home);
-    cmd_b.env("XDG_CONFIG_HOME", home.join(".config"));
-    let status = cmd_b
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()?;
-    let elapsed = started.elapsed();
-
-    parent_handle.join().unwrap();
-    assert!(status.success(), "profile-b favorite failed: {status:?}");
-    assert!(
-        elapsed < independent_startup_budget,
-        "profile-b must not block on profile-a's flock; observed {:?} >= {:?}",
-        elapsed,
-        independent_startup_budget
+    let parent = HeldStorageUpdate::new(Storage::new_unwatched("profile-a")?);
+    let mut child = CliChild(
+        std::process::Command::new(aoe_bin())
+            .args(["session", "favorite", "--profile", "profile-b", &id_b])
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .spawn()?,
     );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.0.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("profile-b did not complete while profile-a remained held");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    assert!(status.success(), "profile-b favorite failed: {status:?}");
+    assert!(s_b
+        .load()?
+        .iter()
+        .any(|i| i.id == id_b && i.favorited_at.is_some()));
+    drop(parent);
     let _ = id_a;
     Ok(())
 }

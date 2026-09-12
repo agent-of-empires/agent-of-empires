@@ -579,6 +579,11 @@ mod tests {
     }
 
     fn full_dialog() -> UnifiedDeleteDialog {
+        let _home = crate::session::test_support::isolate_app_dir();
+        std::fs::write(
+            crate::session::config::config_path().unwrap(),
+            "[worktree]\nauto_cleanup = true\ndelete_branch_on_cleanup = false\n[sandbox]\nauto_cleanup = true\n",
+        ).unwrap();
         UnifiedDeleteDialog::new(
             "Test Session".to_string(),
             DeleteDialogConfig {

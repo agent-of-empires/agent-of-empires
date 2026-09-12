@@ -39,20 +39,13 @@ pub fn shim_path() -> std::path::PathBuf {
         .join("shim.mjs")
 }
 
-/// Returns `Ok(())` if the structured view shim can be spawned (node on PATH, shim
+/// Returns `Ok(())` if the structured view shim can be spawned (Node available, shim
 /// file present, shim deps installed). Otherwise returns a short reason
 /// that callers print before skipping. CI installs deps via `npm ci` in
 /// `acp-worker/test-shim/` before running the integration leg; local
 /// runs need the same one-shot setup, which the message points at.
 pub fn shim_ready() -> Result<(), String> {
-    let node_ok = std::process::Command::new("node")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !node_ok {
-        return Err("node not on PATH".into());
-    }
+    shim_node()?;
     let shim = shim_path();
     if !shim.exists() {
         return Err(format!("shim missing at {}", shim.display()));
@@ -64,6 +57,32 @@ pub fn shim_ready() -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// Resolve the runtime behind version-manager launchers before tests isolate
+/// HOME or the product filters the child environment. Probe and spawn must use
+/// the same executable, not re-enter a launcher without its configuration.
+pub fn shim_node() -> Result<&'static Path, String> {
+    static NODE: std::sync::OnceLock<Result<PathBuf, String>> = std::sync::OnceLock::new();
+    NODE.get_or_init(|| {
+        let output = std::process::Command::new("node")
+            .args(["--print", "process.execPath"])
+            .output()
+            .map_err(|error| format!("cannot resolve Node runtime: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "cannot resolve Node runtime: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        let path = String::from_utf8(output.stdout)
+            .map_err(|error| format!("invalid Node runtime path: {error}"))?;
+        std::fs::canonicalize(path.trim())
+            .map_err(|error| format!("cannot resolve Node executable: {error}"))
+    })
+    .as_ref()
+    .map(PathBuf::as_path)
+    .map_err(Clone::clone)
 }
 
 /// True when the effective uid is 0. Root bypasses the Unix DAC permission
@@ -80,21 +99,94 @@ pub fn running_as_root() -> bool {
 ///
 /// # Safety caveat
 /// `set_var` is not thread-safe. Callers must be `#[serial]`.
-pub fn setup_temp_home() -> TempDir {
+pub fn setup_temp_home() -> TestHome {
     let temp = TempDir::new().unwrap();
-    set_temp_home(temp.path());
-    temp
+    let env = set_temp_home(temp.path());
+    TestHome { env, temp }
 }
 
-/// Variant for tests that already own a `TempDir` (e.g. ones that also seed
-/// files under the same path before returning the guard).
-pub fn set_temp_home(path: &Path) {
-    // Establish the hermetic tmux socket before any lib tmux call so aoe's
-    // once-cached socket resolution locks onto it (#2608).
+/// Restore environment before the caller drops its temporary directory.
+pub fn set_temp_home(path: &Path) -> EnvGuard {
+    let mut env = EnvGuard::new(&["HOME", "XDG_CONFIG_HOME", "AOE_TMUX_SOCKET"]);
     let _ = tmux_socket();
-    std::env::set_var("HOME", path);
+    env.set("HOME", path);
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    std::env::set_var("XDG_CONFIG_HOME", path.join(".config"));
+    env.set("XDG_CONFIG_HOME", path.join(".config"));
+    env
+}
+
+pub struct CwdGuard(PathBuf);
+
+impl CwdGuard {
+    pub fn set(path: &Path) -> Self {
+        let guard = Self(std::env::current_dir().expect("original cwd"));
+        std::env::set_current_dir(path).expect("test cwd");
+        guard
+    }
+}
+
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        std::env::set_current_dir(&self.0).expect("restore cwd");
+    }
+}
+
+#[must_use]
+pub struct EnvGuard {
+    vars: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl EnvGuard {
+    pub fn from_pairs(pairs: &[(&'static str, &'static str)]) -> Self {
+        let mut guard = Self::new(&[]);
+        for (key, value) in pairs {
+            guard.set(key, value);
+        }
+        guard
+    }
+    pub fn new(keys: &[&'static str]) -> Self {
+        Self {
+            vars: keys
+                .iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect(),
+        }
+    }
+
+    pub fn set(&mut self, key: &'static str, value: impl AsRef<std::ffi::OsStr>) {
+        if !self.vars.iter().any(|(saved, _)| *saved == key) {
+            self.vars.push((key, std::env::var_os(key)));
+        }
+        std::env::set_var(key, value);
+    }
+
+    pub fn and_set(mut self, key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        self.set(key, value);
+        self
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (key, old) in self.vars.drain(..).rev() {
+            match old {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
+#[must_use]
+pub struct TestHome {
+    pub env: EnvGuard,
+    temp: TempDir,
+}
+
+impl TestHome {
+    pub fn path(&self) -> &Path {
+        self.temp.path()
+    }
 }
 
 /// A live `aoe __acp-runner` whose agent is the Node ACP shim.
@@ -143,7 +235,7 @@ pub async fn spawn_runner_with_shim(
         "--cwd",
         home.to_str().unwrap(),
         "--",
-        "node",
+        shim_node().expect("shim prerequisite").to_str().unwrap(),
         shim_path().to_str().unwrap(),
     ])
     .env("HOME", &home)

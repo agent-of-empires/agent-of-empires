@@ -1,7 +1,7 @@
-import { test, expect } from "./helpers/mockedTest";
+import { test, expect, observeFor } from "./helpers/mockedTest";
 import { devices, type Page } from "@playwright/test";
 import { clickSidebarSession, openMobileSidebar } from "./helpers/sidebar";
-import { mockTerminalApis, seedSettings } from "./helpers/terminal-mocks";
+import { mockTerminalApis, seedSettings, type MockHandle } from "./helpers/terminal-mocks";
 
 // Use iPhone 13 profile: pointer:coarse, hasTouch, correct viewport, WebKit UA.
 test.use({ ...devices["iPhone 13"] });
@@ -63,10 +63,11 @@ async function simulateKeyboardClose(page: Page) {
   });
 }
 
-async function openSession(page: Page) {
+async function openSession(page: Page, handle: MockHandle) {
   await openMobileSidebar(page);
   await clickSidebarSession(page, "pinch-test");
   await page.locator("[data-live-terminal]").waitFor({ state: "visible", timeout: 10_000 });
+  await handle.waitForLiveReady();
 }
 
 async function getKeyboardState(page: Page) {
@@ -87,7 +88,7 @@ test.describe("Mobile keyboard detection and layout", () => {
   async function setupAndOpen(page: Page) {
     // Mocks must be set up BEFORE any navigation so the initial API
     // requests are intercepted (especially /api/sessions).
-    await mockTerminalApis(page);
+    const handle = await mockTerminalApis(page);
     // ensureSession POSTs to /api/sessions/{id}/ensure
     await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
     await page.goto("/");
@@ -99,8 +100,7 @@ test.describe("Mobile keyboard detection and layout", () => {
     // and the FAB would read "Close keyboard").
     await seedSettings(page, { mobileFontSize: 10, autoOpenKeyboard: false });
     await page.reload();
-    await page.waitForTimeout(500);
-    await openSession(page);
+    await openSession(page, handle);
   }
 
   test("mobile shell is fixed and rejects document-level scroll", async ({ page }) => {
@@ -132,8 +132,9 @@ test.describe("Mobile keyboard detection and layout", () => {
     expect(parseInt(before.rootPaddingBottom) || 0).toBe(0);
 
     await simulateKeyboardOpen(page, 300);
-    // Wait past the occlusion-commit debounce plus the rAF settle window.
-    await page.waitForTimeout(800);
+    await expect
+      .poll(async () => parseInt((await getKeyboardState(page)).rootPaddingBottom))
+      .toBeGreaterThanOrEqual(250);
 
     const after = await getKeyboardState(page);
     // The pane is padded by the live occlusion (~300) so the terminal shrinks.
@@ -150,7 +151,9 @@ test.describe("Mobile keyboard detection and layout", () => {
     // itself is not simulable here; the assertable part is that the
     // legacy occlusion machinery stays quiet.
     await simulateKeyboardOpen(page, 300, { innerHeightShrinks: true });
-    await page.waitForTimeout(600);
+    await observeFor(page, 600, async () => {
+      expect(parseInt((await getKeyboardState(page)).rootPaddingBottom) || 0).toBe(0);
+    });
 
     const state = await getKeyboardState(page);
     expect(state.rootPaddingBottom === "0" || state.rootPaddingBottom === "").toBe(true);
@@ -160,12 +163,14 @@ test.describe("Mobile keyboard detection and layout", () => {
     await setupAndOpen(page);
 
     await simulateKeyboardOpen(page, 300);
-    await page.waitForTimeout(800);
+    await expect
+      .poll(async () => parseInt((await getKeyboardState(page)).rootPaddingBottom))
+      .toBeGreaterThanOrEqual(250);
     const open = await getKeyboardState(page);
     expect(parseInt(open.rootPaddingBottom)).toBeGreaterThanOrEqual(250);
 
     await simulateKeyboardClose(page);
-    await page.waitForTimeout(800);
+    await expect.poll(async () => parseInt((await getKeyboardState(page)).rootPaddingBottom) || 0).toBe(0);
 
     const after = await getKeyboardState(page);
     // Occlusion releases to 0 when the keyboard dismisses, so the pane grows
@@ -176,9 +181,8 @@ test.describe("Mobile keyboard detection and layout", () => {
 
   test("toolbar renders on mobile with active session", async ({ page }) => {
     await setupAndOpen(page);
-    // On chromium headless, pointer:coarse may not match — toolbar only
-    // renders when isMobile is true. Check that the terminal at least loaded.
-    await expect(page.locator("[data-live-terminal]")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Arrow up", exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Ctrl+C interrupt", exact: true })).toBeVisible();
   });
 
   test("keyboard open button visible when keyboard closed", async ({ page }) => {
@@ -187,7 +191,7 @@ test.describe("Mobile keyboard detection and layout", () => {
   });
 
   test("Claude terminal selection keeps the keyboard closed", async ({ page }) => {
-    await mockTerminalApis(page);
+    const handle = await mockTerminalApis(page);
     await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
     await page.goto("/");
     // The fixture's terminal session uses tool: "claude". Its alternate-screen
@@ -195,7 +199,7 @@ test.describe("Mobile keyboard detection and layout", () => {
     // remain usable as a monitoring view until the user opens the keyboard.
     await seedSettings(page, { mobileFontSize: 10, autoOpenKeyboard: true });
     await page.reload();
-    await openSession(page);
+    await openSession(page, handle);
     await expect(page.getByRole("button", { name: "Open keyboard" })).toBeVisible();
   });
 
@@ -219,31 +223,27 @@ test.describe("Mobile keyboard detection and layout", () => {
   test("scrollToBottom fires when keyboard opens", async ({ page }) => {
     await setupAndOpen(page);
 
-    const _scrolledToBottom = await page.evaluate(() => {
-      return new Promise<boolean>((resolve) => {
-        const _orig = (
-          window as unknown as {
-            __termScrollBottom?: boolean;
-          }
-        ).__termScrollBottom;
-        // Watch for scrollTop change on the terminal container
-        const wt = document.querySelector("[data-live-terminal]");
-        if (!wt) return resolve(false);
-        // Watch for scroll events on the .xterm element
-        const onScroll = () => {
-          resolve(true);
-          wt.removeEventListener("scroll", onScroll);
-        };
-        wt.addEventListener("scroll", onScroll);
-        setTimeout(() => {
-          resolve(false);
-          wt.removeEventListener("scroll", onScroll);
-        }, 2000);
-      });
+    const scroller = page.locator("[data-live-terminal] > div").first();
+    await scroller.evaluate((el) => {
+      el.scrollTop = 0;
+      el.dispatchEvent(new Event("scroll"));
     });
-    // Trigger keyboard after setting up observer
+    await expect(page.getByRole("button", { name: "Back to live" })).toBeVisible();
+    const before = await scroller.evaluate((el) => el.scrollTop);
     await simulateKeyboardOpen(page, 300);
-    // The test is primarily that no crash occurs; scroll observation is best-effort
+    await expect.poll(() => scroller.evaluate((el) => el.scrollTop)).toBeGreaterThan(before);
+    await expect(page.getByRole("button", { name: "Back to live" })).toBeHidden();
+    await expect
+      .poll(() =>
+        scroller.evaluate((el) => {
+          const cursor = el.querySelector<HTMLElement>("[data-live-cursor]");
+          if (!cursor) return false;
+          const pane = el.getBoundingClientRect(),
+            rect = cursor.getBoundingClientRect();
+          return rect.top >= pane.top - 2 && rect.bottom <= pane.bottom + 2;
+        }),
+      )
+      .toBe(true);
   });
 
   test("small viewport delta below threshold does NOT pad the pane", async ({ page }) => {
@@ -253,7 +253,9 @@ test.describe("Mobile keyboard detection and layout", () => {
 
     // Simulate URL bar collapse: ~80px change, below the 100px threshold
     await simulateKeyboardOpen(page, 80);
-    await page.waitForTimeout(800);
+    await observeFor(page, 800, async () => {
+      expect(parseInt((await getKeyboardState(page)).rootPaddingBottom) || 0).toBe(0);
+    });
 
     const state = await getKeyboardState(page);
     // Occlusion only counts as a keyboard above 100px; an 80px delta is not
@@ -266,11 +268,13 @@ test.describe("Mobile keyboard detection and layout", () => {
 
     // Simulate landscape orientation
     await page.setViewportSize({ width: 844, height: 390 });
-    await page.waitForTimeout(600);
+    await expect
+      .poll(() => page.locator("[data-live-terminal]").evaluate((el) => el.getBoundingClientRect().height))
+      .toBeLessThan(390);
 
     // Now open keyboard in landscape
     await simulateKeyboardOpen(page, 200);
-    await page.waitForTimeout(800);
+    await expect.poll(async () => parseInt((await getKeyboardState(page)).rootPaddingBottom)).toBeGreaterThan(150);
 
     const state = await getKeyboardState(page);
     // Should detect keyboard relative to the landscape height, not portrait
@@ -279,69 +283,46 @@ test.describe("Mobile keyboard detection and layout", () => {
 });
 
 test.describe("Mobile proxy input keydown handling", () => {
-  async function setupWithWsSpy(page: Page) {
-    await page.addInitScript(() => {
-      (window as unknown as { __PTY_SENT__: string[] }).__PTY_SENT__ = [];
-      const Orig = window.WebSocket;
-      window.WebSocket = class extends Orig {
-        constructor(url: string | URL, protocols?: string | string[]) {
-          super(url, protocols);
-          const origSend = this.send.bind(this);
-          this.send = (data: string | ArrayBufferLike | Blob | ArrayBufferView) => {
-            if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
-              const bytes = new Uint8Array(data instanceof ArrayBuffer ? data : data.buffer);
-              (window as unknown as { __PTY_SENT__: string[] }).__PTY_SENT__.push(new TextDecoder().decode(bytes));
-            }
-            return origSend(data);
-          };
-        }
-      } as typeof WebSocket;
-    });
-    await mockTerminalApis(page);
+  async function setupProxySession(page: Page) {
+    const handle = await mockTerminalApis(page);
     await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
     await page.goto("/");
-    await page.waitForTimeout(300);
-    await openSession(page);
+    await openSession(page, handle);
+    return handle;
   }
 
-  async function sendKeyAndGetPtySent(page: Page, key: string, code: string) {
+  async function sendProxyKey(page: Page, key: string, code: string) {
     await page.evaluate(
       ({ key, code }) => {
-        const proxy = document.querySelector<HTMLInputElement>('input[autocapitalize="none"]');
+        const proxy = document.querySelector<HTMLTextAreaElement>("[data-keyboard-proxy]");
         if (!proxy) throw new Error("proxy input not found");
         proxy.focus();
         proxy.dispatchEvent(new KeyboardEvent("keydown", { key, code, bubbles: true }));
       },
       { key, code },
     );
-    await page.waitForTimeout(100);
-    return page.evaluate(() => (window as unknown as { __PTY_SENT__: string[] }).__PTY_SENT__);
   }
 
-  test("Enter key sends carriage return via proxy keydown", async ({ page, browserName }) => {
-    test.skip(browserName !== "webkit", "proxy input requires pointer:coarse (mobile only)");
-    await setupWithWsSpy(page);
-    const sent = await sendKeyAndGetPtySent(page, "Enter", "Enter");
-    expect(sent).toContain("\r");
+  test("Enter key sends carriage return via proxy keydown", async ({ page }) => {
+    const handle = await setupProxySession(page);
+    await sendProxyKey(page, "Enter", "Enter");
+    await expect.poll(() => handle.liveInput.map((input) => input.toString())).toContain("\r");
   });
 
-  test("Backspace key sends DEL (0x7f) via proxy keydown", async ({ page, browserName }) => {
-    test.skip(browserName !== "webkit", "proxy input requires pointer:coarse (mobile only)");
-    await setupWithWsSpy(page);
-    const sent = await sendKeyAndGetPtySent(page, "Backspace", "Backspace");
-    expect(sent).toContain("\x7f");
+  test("Backspace key sends DEL (0x7f) via proxy keydown", async ({ page }) => {
+    const handle = await setupProxySession(page);
+    await sendProxyKey(page, "Backspace", "Backspace");
+    await expect.poll(() => handle.liveInput.map((input) => input.toString())).toContain("\x7f");
   });
 
   test("reselecting the active session preserves keyboard-proxy input", async ({ page }) => {
     const terminal = await mockTerminalApis(page, { tool: "codex" });
     await page.goto("/");
-    await page.waitForTimeout(300);
-    await openSession(page);
+    await openSession(page, terminal);
 
     await openMobileSidebar(page);
     await clickSidebarSession(page, "pinch-test");
     await page.locator("[data-live-terminal]").waitFor({ state: "visible", timeout: 10_000 });
-    await page.waitForTimeout(100);
 
     const input = await page.evaluate(() => {
       const proxy = document.querySelector<HTMLTextAreaElement>("[data-keyboard-proxy]");
@@ -370,13 +351,10 @@ test.describe("Mobile keyboard hooks ordering", () => {
     const errors: string[] = [];
     page.on("pageerror", (err) => errors.push(err.message));
 
-    await mockTerminalApis(page);
+    const handle = await mockTerminalApis(page);
     await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
     await page.goto("/");
-    await page.waitForTimeout(300);
-    await openSession(page);
-
-    await page.waitForTimeout(500);
+    await openSession(page, handle);
 
     const hookErrors = errors.filter((e) => e.includes("hook") || e.includes("Hook"));
     expect(hookErrors).toEqual([]);
@@ -386,17 +364,18 @@ test.describe("Mobile keyboard hooks ordering", () => {
     const errors: string[] = [];
     page.on("pageerror", (err) => errors.push(err.message));
 
-    await mockTerminalApis(page);
+    const handle = await mockTerminalApis(page);
     await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
     await page.goto("/");
-    await page.waitForTimeout(300);
-    await openSession(page);
+    await openSession(page, handle);
 
-    // Simulate keyboard open/close cycle
+    // Observe both layout transitions before inspecting asynchronous errors.
     await simulateKeyboardOpen(page, 300);
-    await page.waitForTimeout(300);
+    await expect
+      .poll(async () => parseInt((await getKeyboardState(page)).rootPaddingBottom))
+      .toBeGreaterThanOrEqual(250);
     await simulateKeyboardClose(page);
-    await page.waitForTimeout(300);
+    await expect.poll(async () => parseInt((await getKeyboardState(page)).rootPaddingBottom) || 0).toBe(0);
 
     const hookErrors = errors.filter((e) => e.includes("hook") || e.includes("Hook") || e.includes("Rendered"));
     expect(hookErrors).toEqual([]);

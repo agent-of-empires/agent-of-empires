@@ -13,7 +13,7 @@
 //      turn that only summarizes context and never answers it.
 //
 // The fake agent reproduces the real shape: the start marker, a held
-// window, then the completion marker. `wait_ms` is its hold primitive.
+// window, then the completion marker. The test explicitly releases completion.
 
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -22,18 +22,12 @@ import { test, expect } from "@playwright/test";
 import { spawnAoeServe, listSessions, seedSessionViaAoeAdd } from "../helpers/aoeServe";
 import { enableStructuredViewAndWait, waitForReplayContains, waitForStructuredView } from "../helpers/acp";
 
-// Only has to outlast posting the prompt plus typing the follow-up,
-// which is sub-second once the composer is located by form name rather
-// than accessible name. Kept small so the spec stays near the live tier's
-// budget; the fake clamps `wait_ms` at 60s regardless.
-const COMPACTION_HOLD_MS = 6_000;
-
 const COMPACTING_SCRIPT = {
   turns: [
     {
       updates: [
         { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Compacting..." } },
-        { sessionUpdate: "wait_ms", ms: COMPACTION_HOLD_MS },
+        { sessionUpdate: "wait_for_release" },
         { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "\n\nCompacting completed." } },
       ],
       stopReason: "end_turn",
@@ -96,16 +90,11 @@ test("the spinner names the compaction phase and hides the force-end hatch", asy
     const spinner = page.getByTestId("acp-working-spinner");
     await expect(spinner).toContainText(/Compaction in progress/i, { timeout: 10_000 });
 
-    // Send the follow-up FIRST, while the phase is provably live. Any
-    // assertion that outlasts the hold would leave the follow-up landing
-    // on an idle session, which passes for the wrong reason.
+    // Queue while the compaction gate is held.
     await composer.fill("also check the tests");
     await composer.press("Enter");
     await expect(page.getByRole("button", { name: /^also check the tests$/ })).toBeVisible({ timeout: 5_000 });
-    // Still parked, not sent: the phase is live and the answer to the
-    // follow-up has not arrived. Asserting both pins the ordering, so a
-    // compaction that ended early cannot let this pass by draining
-    // before the assertion runs.
+    // The phase remains active until the explicit release below.
     await expect(spinner).toContainText(/Compaction in progress/i);
     await expect(page.getByText("answered after compaction")).toHaveCount(0);
     // The two symptoms this fixes, asserted while the phase is still
@@ -116,6 +105,7 @@ test("the spinner names the compaction phase and hides the force-end hatch", asy
 
     // Completion clears the phase, and the parked prompt drains as the
     // next turn against the compacted context.
+    writeFileSync(`${scriptPath}.release`, "release");
     await expect(page.getByText("Compacting completed.")).toBeVisible({ timeout: 15_000 });
     await expect(page.getByText("answered after compaction")).toBeVisible({ timeout: 15_000 });
 

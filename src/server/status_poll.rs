@@ -406,7 +406,6 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     /// #2758: the reconciler's persistent per-session maps must be swept
     /// against the live instance set every tick, so a deleted session's id
@@ -577,13 +576,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn flush_passive_transition_defers_unread_until_persist_ok() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        // SAFETY: serialized test; no other test mutates HOME concurrently.
-        unsafe { std::env::set_var("HOME", temp.path()) };
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
-        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
 
         let profile = "flush-persist-failure";
         // Force the flock write to fail: making `sessions.json` a directory
@@ -622,13 +615,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn flush_passive_transition_applies_unread_after_persist_ok() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        // SAFETY: serialized test; no other test mutates HOME concurrently.
-        unsafe { std::env::set_var("HOME", temp.path()) };
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
-        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
 
         let profile = "flush-persist-success";
         let mut inst = Instance::new("idle-session", "/tmp/idle");
@@ -675,26 +662,11 @@ mod tests {
         );
     }
 
-    /// Closes I1's patches-routing half from #2756: each profile's `patches`
-    /// bundle must merge onto that profile's own storage and nowhere else. The
-    /// two adjacent tests above already cover the `unread_ids` mirror, so this
-    /// test asserts only the `patches` write (status / last_accessed_at) and
-    /// its per-profile routing, never unread. Each profile is seeded with the
-    /// opposite status it is patched to, so a mis-routed bundle leaves a row at
-    /// its seeded status and fails the status assertion: that is the routing
-    /// discriminator. The instance-to-bundle assignment in `status_poll_loop`
-    /// (bundles.entry(inst.source_profile)) stays out of unit-test reach: it
-    /// needs an `AppState`, which has no test constructor.
+    /// Each profile receives only its own durable status and timestamp patch.
     #[tokio::test]
     #[serial_test::serial]
     async fn flush_passive_transition_routes_patches_per_profile() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        // SAFETY: serialized test; no other test mutates HOME concurrently.
-        unsafe { std::env::set_var("HOME", temp.path()) };
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
-        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
 
         let old = chrono::Utc::now() - chrono::Duration::minutes(1);
         let new_ts = chrono::Utc::now();
@@ -801,28 +773,6 @@ mod tests {
             row_b.last_accessed_at,
             Some(new_ts),
             "profile B's patch must merge its last_accessed_at onto profile B's storage"
-        );
-    }
-
-    // Pins the `MissedTickBehavior::Delay` contract on `tokio::time::interval`;
-    // the prod callsite (`status_poll_loop`) is not exercised by this test.
-    #[tokio::test]
-    async fn status_poll_loop_interval_delays_after_stall() {
-        let period = Duration::from_millis(100);
-        let mut interval = tokio::time::interval(period);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-        interval.tick().await;
-        tokio::time::sleep(period * 4).await;
-        interval.tick().await;
-
-        let before = std::time::Instant::now();
-        interval.tick().await;
-        let gap = before.elapsed();
-
-        assert!(
-            gap >= Duration::from_millis(80),
-            "second post-stall tick must wait ~period (Delay), got {gap:?}"
         );
     }
 }

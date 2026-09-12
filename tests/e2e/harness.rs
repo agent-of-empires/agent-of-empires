@@ -11,6 +11,7 @@
 //! convert it to a GIF via `agg`. Recordings are saved to
 //! `target/e2e-recordings/`. Both `asciinema` and `agg` must be on `$PATH`.
 
+use std::io::{Read, Seek, SeekFrom};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -278,6 +279,8 @@ pub struct TuiTestHarness {
     stub_path: PathBuf,
     socket_path: PathBuf,
     spawned: bool,
+    input_barrier: bool,
+    render_log_offset: std::cell::Cell<u64>,
     recording: bool,
     cast_path: Option<PathBuf>,
     /// Extra env vars exported on every spawned process (tmux session +
@@ -387,6 +390,8 @@ last_seen_version = "{}"
             stub_path,
             socket_path,
             spawned: false,
+            input_barrier: false,
+            render_log_offset: std::cell::Cell::new(0),
             recording,
             cast_path: None,
             // Pin the spawned aoe to the same tmux socket the harness drives
@@ -575,6 +580,13 @@ last_seen_version = "{}"
     /// When recording, wraps the command with `asciinema rec`.
     fn build_tmux_command(&mut self, args: &[&str]) -> String {
         let mut aoe_cmd = self.binary_path.display().to_string();
+        if self.input_barrier {
+            let path = self.home_dir.path().join("input-barrier");
+            aoe_cmd = format!(
+                "env -u NO_COLOR AOE_E2E_INPUT_BARRIER={} {aoe_cmd}",
+                shell_words::quote(path.to_str().expect("input barrier path"))
+            );
+        }
         for arg in args {
             aoe_cmd.push(' ');
             aoe_cmd.push_str(arg);
@@ -583,9 +595,9 @@ last_seen_version = "{}"
         if self.recording {
             let cast_path = recordings_dir().join(format!("{}.cast", self.test_name));
             let cmd = format!(
-                "asciinema rec --overwrite --cols 100 --rows 30 -c '{}' {}",
-                aoe_cmd,
-                cast_path.display()
+                "asciinema rec --overwrite --cols 100 --rows 30 -c {} {}",
+                shell_words::quote(&aoe_cmd),
+                shell_words::quote(cast_path.to_str().expect("recording path"))
             );
             self.cast_path = Some(cast_path);
             cmd
@@ -602,7 +614,19 @@ last_seen_version = "{}"
 
     /// Spawn `aoe <args>` inside a detached tmux session.
     pub fn spawn(&mut self, args: &[&str]) {
+        self.input_barrier = args.first() != Some(&"add");
         let cmd_str = self.build_tmux_command(args);
+        let start_gate = self.home_dir.path().join("tui-start");
+        let cmd_str = if self.input_barrier {
+            std::fs::File::create(self.home_dir.path().join("render.log"))
+                .expect("create render observation");
+            format!(
+                "while [ ! -e {} ]; do sleep 0.01; done; {cmd_str}",
+                shell_words::quote(start_gate.to_str().expect("start gate path"))
+            )
+        } else {
+            cmd_str
+        };
 
         let output = Command::new("tmux")
             .arg("-S")
@@ -620,6 +644,7 @@ last_seen_version = "{}"
             .env("XDG_CONFIG_HOME", self.home_dir.path().join(".config"))
             .env("PATH", self.env_path())
             .env("TERM", "xterm-256color")
+            .env_remove("NO_COLOR")
             .envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .output()
             .expect("failed to run tmux new-session");
@@ -632,10 +657,26 @@ last_seen_version = "{}"
 
         self.spawned = true;
 
-        // Brief pause for the process to initialize.
-        // Recording adds overhead so wait a bit longer.
-        let delay = if self.recording { 500 } else { 300 };
-        std::thread::sleep(Duration::from_millis(delay));
+        if self.input_barrier {
+            let path = self.home_dir.path().join("render.log");
+            let pipe = Command::new("tmux")
+                .arg("-S")
+                .arg(&self.socket_path)
+                .args(["pipe-pane", "-O", "-t", &self.session_name])
+                .arg(format!(
+                    "cat >> {}",
+                    shell_words::quote(path.to_str().expect("render log path"))
+                ))
+                .output()
+                .expect("observe terminal output");
+            assert!(
+                pipe.status.success(),
+                "pipe-pane failed: {}",
+                String::from_utf8_lossy(&pipe.stderr)
+            );
+            std::fs::write(start_gate, b"start").expect("release observed TUI startup");
+            self.wait_for_input_ack(0, Duration::from_secs(30));
+        }
     }
 
     /// Create a detached tmux session named `name` running `cmd` on the
@@ -662,6 +703,7 @@ last_seen_version = "{}"
             .env("XDG_CONFIG_HOME", self.home_dir.path().join(".config"))
             .env("PATH", self.env_path())
             .env("TERM", "xterm-256color")
+            .env_remove("NO_COLOR")
             .envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .output()
             .expect("failed to run tmux new-session");
@@ -675,6 +717,13 @@ last_seen_version = "{}"
 
     /// Send one or more tmux key names (e.g. "Enter", "Escape", "q", "C-c").
     pub fn send_keys(&self, keys: &str) {
+        self.send_keys_unfenced(keys);
+        self.synchronize_input();
+    }
+
+    /// Native terminal owners cannot receive an outer-TUI F12 fence.
+    /// Observe their lifecycle before resuming ordinary TUI input.
+    pub fn send_keys_unfenced(&self, keys: &str) {
         assert!(self.spawned, "must call spawn_tui() or spawn() first");
         let output = Command::new("tmux")
             .arg("-S")
@@ -690,8 +739,33 @@ last_seen_version = "{}"
             "send-keys failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        // Let the TUI process the keystroke.
-        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    pub fn terminal_resume_sequence(&self) -> u64 {
+        match std::fs::read_to_string(self.home_dir.path().join("input-barrier.resumed")) {
+            Ok(value) => value.parse().expect("terminal resume sequence"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => panic!("read terminal resume sequence: {error}"),
+        }
+    }
+
+    pub fn wait_for_terminal_resume(&self, previous: u64) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let resumed =
+                std::fs::read_to_string(self.home_dir.path().join("input-barrier.resumed"))
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok());
+            if resumed.is_some_and(|sequence| sequence > previous) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "outer TUI did not regain terminal ownership"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.synchronize_input();
     }
 
     /// Send a synthetic mouse event into the inner pane as an SGR
@@ -725,10 +799,10 @@ last_seen_version = "{}"
             "send_mouse_click failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        std::thread::sleep(Duration::from_millis(100));
+        self.synchronize_input();
     }
 
-    /// Deliver `text` to the TUI as a bracketed paste, the way a real
+    /// Deliver bracketed paste to the TUI.
     /// terminal does when the user hits Cmd/Ctrl+V. aoe enables bracketed
     /// paste at startup, so crossterm turns this into one `Event::Paste`
     /// rather than N key events, which is the only way to exercise the
@@ -757,7 +831,7 @@ last_seen_version = "{}"
             "send_paste failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        std::thread::sleep(Duration::from_millis(150));
+        self.synchronize_input();
     }
 
     /// Send literal text (prevents "Enter" in text from being interpreted as
@@ -779,10 +853,89 @@ last_seen_version = "{}"
             "type_text failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        std::thread::sleep(Duration::from_millis(50));
+        self.synchronize_input();
     }
 
-    /// Capture the current screen contents as plain text (no ANSI escapes).
+    fn synchronize_input(&self) {
+        if !self.input_barrier || !self.session_alive() {
+            return;
+        }
+        let current: u64 = std::fs::read_to_string(self.home_dir.path().join("input-barrier"))
+            .expect("TUI startup acknowledged")
+            .parse()
+            .expect("input sequence");
+        let output = Command::new("tmux")
+            .arg("-S")
+            .arg(&self.socket_path)
+            .args(["send-keys", "-t", &self.session_name, "F12"])
+            .output()
+            .expect("send input barrier");
+        if !output.status.success() && !self.session_alive() {
+            return;
+        }
+        assert!(output.status.success(), "input barrier send failed");
+        self.wait_for_input_ack(current + 1, Duration::from_secs(10));
+    }
+
+    fn wait_for_input_ack(&self, sequence: u64, timeout: Duration) {
+        let mut log = std::fs::File::open(self.home_dir.path().join("render.log"))
+            .expect("open terminal observation");
+        log.seek(SeekFrom::Start(self.render_log_offset.get()))
+            .expect("seek terminal observation");
+        let token = format!("\x1b]0;aoe-e2e-{sequence}\x07");
+        let mut observed = Vec::with_capacity(8192 + token.len());
+        let mut chunk = [0u8; 8192];
+        let deadline = Instant::now() + timeout;
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "TUI did not render input sequence {sequence}"
+            );
+            let count = log.read(&mut chunk).expect("read terminal observation");
+            if count > 0 {
+                self.render_log_offset
+                    .set(log.stream_position().expect("terminal observation offset"));
+                observed.extend_from_slice(&chunk[..count]);
+                if observed
+                    .windows(token.len())
+                    .any(|window| window == token.as_bytes())
+                {
+                    // tmux queues pipe output before parsing, in one callback.
+                    // A subsequent server command witnesses that callback completing.
+                    let parsed = Command::new("tmux")
+                        .arg("-S")
+                        .arg(&self.socket_path)
+                        .args([
+                            "display-message",
+                            "-p",
+                            "-t",
+                            &self.session_name,
+                            "#{pane_id}",
+                        ])
+                        .output()
+                        .expect("complete terminal parser barrier");
+                    assert!(
+                        parsed.status.success(),
+                        "terminal disappeared before render acknowledgment"
+                    );
+                    return;
+                }
+                let discard = observed.len().saturating_sub(token.len() - 1);
+                observed.drain(..discard);
+                continue;
+            }
+            if sequence > 0 && !self.session_alive() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "TUI did not render input sequence {sequence}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Capture the current screen contents as plain text.
     pub fn capture_screen(&self) -> String {
         self.capture_pane(false)
     }
@@ -830,6 +983,11 @@ last_seen_version = "{}"
             cmd.arg("-e");
         }
         let output = cmd.output().expect("failed to capture pane");
+        assert!(
+            output.status.success(),
+            "capture-pane failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         String::from_utf8_lossy(&output.stdout).to_string()
     }
 
@@ -1100,4 +1258,22 @@ impl Drop for TuiTestHarness {
             }
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::parallel]
+fn tui_input_barrier_handles_shell_metacharacters_in_home() {
+    require_tmux!();
+    let home = tempfile::Builder::new()
+        .prefix("aoe ' $ ` ")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let mut harness = TuiTestHarness::with_home("quoted_home", home);
+    harness.spawn_tui();
+    harness.wait_for("No sessions yet");
+    harness.send_keys("q");
+    harness.wait_for("Quit Agent of Empires");
+    harness.send_keys("y");
+    harness.wait_for_exit(Duration::from_secs(5));
 }

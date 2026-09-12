@@ -152,13 +152,12 @@ mod tests {
     #[cfg(unix)]
     fn write_compacting_fake_agent(
         dir: &std::path::Path,
-        prompt_delay_secs: u32,
     ) -> (std::path::PathBuf, std::path::PathBuf) {
         let capture = dir.join("capture.ndjson");
         let script_path = dir.join("fake-compacting-agent.sh");
         let script = r#"#!/bin/sh
 CAPTURE=__CAPTURE__
-DELAY=__DELAY__
+
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "$CAPTURE"
   id=$(printf '%s' "$line" | sed -En 's/.*"id":("[^"]*"|[0-9]+).*/\1/p')
@@ -174,14 +173,14 @@ while IFS= read -r line; do
       ;;
     *'"method":"session/prompt"'*)
       printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sid-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Compacting..."}}}}\n'
-      if [ "$DELAY" -gt 0 ]; then sleep "$DELAY"; fi
+      while [ -d "__DIR__" ] && [ ! -f "$CAPTURE.prompt-release" ]; do sleep 0.01; done
       printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
       ;;
   esac
 done
 "#
         .replace("__CAPTURE__", capture.to_str().expect("utf8 tmp path"))
-        .replace("__DELAY__", &prompt_delay_secs.to_string());
+        .replace("__DIR__", dir.to_str().expect("utf8 tmp path"));
         std::fs::write(&script_path, script).expect("write fake agent script");
         (script_path, capture)
     }
@@ -201,10 +200,9 @@ done
     #[cfg(unix)]
     #[tokio::test]
     async fn follow_up_during_compaction_is_rejected_instead_of_steered() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         let tmp = tempfile::TempDir::new().expect("tempdir");
-        // 3s prompt delay: long enough to land the follow-up inside the
-        // silent compaction window, short enough to keep the test snappy.
-        let (script, capture) = write_compacting_fake_agent(tmp.path(), 3);
+        let (script, capture) = write_compacting_fake_agent(tmp.path());
         let mut config = reset_fake_spawn_config(&script, tmp.path());
         config.spec.description = "scripted compacting fake".into();
         let mut client = AcpClient::spawn(config, AcpSessionId("compact-3219".into()))
@@ -251,6 +249,8 @@ done
                         "the retry pill needs the text"
                     );
                     saw_rejected = true;
+                    std::fs::write(tmp.path().join("capture.ndjson.prompt-release"), "release")
+                        .unwrap();
                 }
                 Event::Stopped { .. } => break,
                 _ => {}

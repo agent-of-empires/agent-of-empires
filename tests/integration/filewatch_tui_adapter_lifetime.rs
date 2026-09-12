@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::home_isolation::isolate_home;
+use crate::common::set_temp_home;
 use agent_of_empires::file_watch::{FileMatcher, FileWatchService, WatchSpec};
 use agent_of_empires::session::{Instance, Storage};
 use serial_test::serial;
@@ -61,7 +61,7 @@ async fn spawn_harness(svc: Arc<FileWatchService>, dir: PathBuf) -> ForwarderHar
 #[serial]
 async fn adapter_flips_disk_dirty_after_storage_update() {
     let temp = TempDir::new().unwrap();
-    let _home = isolate_home(temp.path());
+    let _home = set_temp_home(temp.path());
 
     let svc: Arc<FileWatchService> = FileWatchService::new().expect("init");
 

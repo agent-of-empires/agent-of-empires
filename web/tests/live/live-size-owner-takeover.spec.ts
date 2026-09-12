@@ -12,6 +12,7 @@ import { writeFileSync, chmodSync, mkdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { test, expect } from "../helpers/liveTest";
 import { spawnAoeServe, resolveAoeBinary } from "../helpers/aoeServe";
+import { gitEnv } from "../helpers/gitFixture";
 import { clickSidebarSession, openMobileSidebar } from "../helpers/sidebar";
 
 const PROMPT = "READY>";
@@ -90,7 +91,7 @@ while true; do sleep 1; done
   chmodSync(tool, 0o755);
   const projectDir = join(seedEnv.home, "project");
   mkdirSync(projectDir, { recursive: true });
-  spawnSync("git", ["init", "-q"], { cwd: projectDir });
+  spawnSync("git", ["init", "-q"], { cwd: projectDir, env: gitEnv(seedEnv.env) });
   const addRes = spawnSync(
     resolveAoeBinary(),
     ["add", projectDir, "-t", "takeover-test", "-c", "claude", "--cmd-override", tool],

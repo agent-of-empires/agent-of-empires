@@ -11,6 +11,7 @@
 use std::path::PathBuf;
 
 #[test]
+#[serial_test::parallel]
 fn cargo_config_does_not_commit_a_rustc_wrapper() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join(".cargo")

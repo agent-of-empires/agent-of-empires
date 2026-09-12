@@ -1292,8 +1292,41 @@ fn shutdown_osc52_source(
         channel.shutdown_with_deadline(deadline);
     }
 }
+#[cfg(test)]
+type TestCapture = Box<dyn FnMut() -> (Option<String>, Option<crate::tmux::PaneCursor>) + Send>;
+
 impl LiveCaptureWorker {
     pub(in crate::tui) fn spawn(wake: std::sync::Arc<tokio::sync::Notify>) -> Self {
+        Self::spawn_inner(
+            wake,
+            #[cfg(test)]
+            None,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    pub(in crate::tui) fn spawn_with_capture_for_test(
+        wake: std::sync::Arc<tokio::sync::Notify>,
+        capture: impl FnMut() -> (Option<String>, Option<crate::tmux::PaneCursor>) + Send + 'static,
+    ) -> (Self, std::sync::mpsc::Receiver<(u64, usize)>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        (
+            Self::spawn_inner(wake, Some(Box::new(capture)), Some(tx)),
+            rx,
+        )
+    }
+
+    fn spawn_inner(
+        wake: std::sync::Arc<tokio::sync::Notify>,
+        #[cfg(test)] mut test_capture: Option<TestCapture>,
+        #[cfg(test)] cycle_done: Option<std::sync::mpsc::Sender<(u64, usize)>>,
+    ) -> Self {
+        #[cfg(test)]
+        let scripted_capture = test_capture.is_some();
+        #[cfg(not(test))]
+        let scripted_capture = false;
         use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
         use std::sync::{Arc, Condvar, Mutex};
         let capture_lines = Arc::new(AtomicUsize::new(0));
@@ -1499,10 +1532,10 @@ impl LiveCaptureWorker {
                 // resetting the arm latch lets a later re-enable arm afresh
                 // for the same target instead of waiting for a retarget.
                 #[cfg(unix)]
-                let vt_enabled = vt_enabled_cell.load(Ordering::Relaxed);
+                let vt_enabled = !scripted_capture && vt_enabled_cell.load(Ordering::Relaxed);
                 #[cfg(unix)]
                 let clipboard_capture_enabled =
-                    clipboard_capture_enabled_cell.load(Ordering::Relaxed);
+                    !scripted_capture && clipboard_capture_enabled_cell.load(Ordering::Relaxed);
                 // The throttle resets even when no channel is armed (a failed
                 // arm attempt), so re-enabling always arms on the next cycle.
                 #[cfg(unix)]
@@ -1522,9 +1555,11 @@ impl LiveCaptureWorker {
                     // Keep a lazy count of the target window's panes so a
                     // hand-made split stops being invisible. One tiny fork
                     // every couple of seconds on the single previewed pane.
-                    if last_pane_probe.is_none_or(|t| {
-                        t.elapsed() >= std::time::Duration::from_millis(PANE_COUNT_PROBE_MS)
-                    }) {
+                    if !scripted_capture
+                        && last_pane_probe.is_none_or(|t| {
+                            t.elapsed() >= std::time::Duration::from_millis(PANE_COUNT_PROBE_MS)
+                        })
+                    {
                         last_pane_probe = Some(std::time::Instant::now());
                         let seen = probe_pane_count(&name, &command_deadline);
                         if seen != pane_count {
@@ -1596,8 +1631,17 @@ impl LiveCaptureWorker {
                     // live-send the #1501 kill switch preserves the
                     // last-good frame against transient tmux errors.
                     let forward_empty = forward_empty_policy || !live_cell.load(Ordering::Relaxed);
+                    #[cfg(test)]
+                    let capture_override = test_capture.as_mut().map(|capture| capture());
+                    #[cfg(not(test))]
+                    let capture_override: Option<(
+                        Option<String>,
+                        Option<crate::tmux::PaneCursor>,
+                    )> = None;
                     #[cfg(unix)]
-                    let (capture, cursor_now) = if vt_enabled {
+                    let (capture, cursor_now) = if let Some(capture) = capture_override {
+                        capture
+                    } else if vt_enabled {
                         if channel_arm_due(
                             arm_after,
                             vt_source.is_some() || pending_vt_arm.is_some(),
@@ -1687,7 +1731,9 @@ impl LiveCaptureWorker {
                         capture_via_tmux(&name, lines, forward_empty, &command_deadline)
                     };
                     #[cfg(not(unix))]
-                    let (capture, cursor_now) = if composite {
+                    let (capture, cursor_now) = if let Some(capture) = capture_override {
+                        capture
+                    } else if composite {
                         capture_composited(&name, lines, forward_empty, &command_deadline)
                     } else {
                         capture_via_tmux(&name, lines, forward_empty, &command_deadline)
@@ -1824,6 +1870,15 @@ impl LiveCaptureWorker {
                 // repaint hit the cap immediately and skip the debounce.
                 if defer_wait_ms.is_none() {
                     pending_since = None;
+                }
+                #[cfg(test)]
+                if let Some(done) = &cycle_done {
+                    if !name.is_empty()
+                        && generation_cell.load(Ordering::Relaxed) == generation_now
+                        && target_cell.lock().is_ok_and(|target| *target == name)
+                    {
+                        let _ = done.send((generation_now, lines));
+                    }
                 }
                 // Interruptible wait: `set_live` / `set_target` notify the
                 // condvar so a cadence or target change is picked up at once
@@ -2888,20 +2943,19 @@ mod tests {
         }
     }
 
-    fn assert_no_latest_for(
+    fn wait_for_capture_cycle(
         worker: &LiveCaptureWorker,
-        timeout: std::time::Duration,
-        message: &str,
+        done: &std::sync::mpsc::Receiver<(u64, usize)>,
+        lines: usize,
     ) {
-        let deadline = std::time::Instant::now() + timeout;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            if let Some(value) = worker.take_latest() {
-                panic!("{message}: got {value:?}");
-            }
-            if std::time::Instant::now() >= deadline {
+            let cycle = done
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .expect("capture cycle completed");
+            if cycle == (worker.current_generation_for_test(), lines) {
                 return;
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 
@@ -3579,33 +3633,49 @@ mod tests {
 
     #[test]
     fn live_capture_worker_idle_until_geometry_set() {
-        // With no line count published the worker must not capture at all,
-        // so nothing crosses the channel. (`capture_lines == 0` guard.)
-        let worker = LiveCaptureWorker::spawn(std::sync::Arc::new(tokio::sync::Notify::new()));
+        let captures = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = captures.clone();
+        let (worker, done) = LiveCaptureWorker::spawn_with_capture_for_test(
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            move || {
+                observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                (Some("geometry-ready".into()), None)
+            },
+        );
         worker.set_target("aoe_test_capture_no_geometry".into());
-        assert_no_latest_for(
-            &worker,
-            std::time::Duration::from_millis(500),
-            "worker should stay idle until set_capture_lines is called",
+        wait_for_capture_cycle(&worker, &done, 0);
+        assert_eq!(captures.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(worker.take_latest().is_none());
+        worker.set_capture_lines(40);
+        assert_eq!(
+            wait_for_latest(&worker, std::time::Duration::from_secs(5)).as_deref(),
+            Some("geometry-ready")
         );
     }
 
     #[test]
     fn live_capture_worker_skips_empty_captures() {
-        // A worker pointed at a session that doesn't exist captures empty
-        // strings. Forwarding those would blank the preview, defeating the
-        // #1501 kill switch, so the worker must drop them. Deterministic
-        // without a real tmux session: a missing pane always reads empty.
-        let worker = LiveCaptureWorker::spawn(std::sync::Arc::new(tokio::sync::Notify::new()));
-        worker.set_target("aoe_test_capture_missing_session".into());
-        // Fast cadence so the worker actually captures and drops the empty
-        // frame during the polling window.
+        let captures = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = captures.clone();
+        let (worker, done) = LiveCaptureWorker::spawn_with_capture_for_test(
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            move || {
+                observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                (Some(String::new()), None)
+            },
+        );
         worker.set_live(true);
         worker.set_capture_lines(40);
-        assert_no_latest_for(
-            &worker,
-            std::time::Duration::from_millis(500),
-            "empty captures must never be forwarded",
+        worker.set_target("aoe_test_capture_empty".into());
+        loop {
+            wait_for_capture_cycle(&worker, &done, 40);
+            if captures.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                break;
+            }
+        }
+        assert!(
+            worker.take_latest().is_none(),
+            "successful empty captures must not blank live preview"
         );
     }
 
@@ -4164,9 +4234,21 @@ mod tests {
             Some("live-test-thief".to_string()),
             "worker must not steal the lock back"
         );
-        // Give any (wrongly) dispatched resize time to land, then confirm
-        // the pane kept the thief's geometry.
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        // Keys queued after the resize are dispatched after its batch, even
+        // when ownership filtering removes the resize itself.
+        worker.send(TmuxKey::Literal("RESIZE-BATCH-COMPLETE".into()));
+        wait_until(
+            "post-resize input reached the pane",
+            std::time::Duration::from_secs(5),
+            || {
+                let output = crate::tmux::tmux_command()
+                    .args(["capture-pane", "-p", "-t", guard.name()])
+                    .output()
+                    .expect("capture ordered input");
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("RESIZE-BATCH-COMPLETE")
+            },
+        );
         assert_eq!(
             pane_width(guard.name()),
             80,
@@ -4230,10 +4312,14 @@ mod tests {
             return;
         }
         let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_livelock_late");
-        // Spawn against a name that does not exist yet: the entry steal sees
-        // no session and leaves the worker unowned.
+        // A failed resize acknowledges that the worker observed the absent session.
         let worker = LiveSendWorker::spawn(guard.name().to_string(), None);
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        worker.resize(60, 20);
+        wait_until(
+            "resize against absent session",
+            std::time::Duration::from_secs(5),
+            || worker.take_resize_failed(),
+        );
 
         let out = crate::tmux::tmux_command()
             .args([
@@ -4253,7 +4339,7 @@ mod tests {
         crate::tmux::refresh_session_cache();
         let session = crate::tmux::Session::from_name(guard.name());
 
-        // Another surface owns the pane before the worker ever retries.
+        // The new session has a live owner before the next resize.
         assert!(session.steal_size_owner("live-test-thief"));
         assert!(!worker.lock_lost());
 
@@ -4268,7 +4354,21 @@ mod tests {
             Some("live-test-thief".to_string()),
             "unowned retry must not steal from a live owner"
         );
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        // Keys queued after the resize are dispatched after its batch, even
+        // when ownership filtering removes the resize itself.
+        worker.send(TmuxKey::Literal("RESIZE-BATCH-COMPLETE".into()));
+        wait_until(
+            "post-resize input reached the pane",
+            std::time::Duration::from_secs(5),
+            || {
+                let output = crate::tmux::tmux_command()
+                    .args(["capture-pane", "-p", "-t", guard.name()])
+                    .output()
+                    .expect("capture ordered input");
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("RESIZE-BATCH-COMPLETE")
+            },
+        );
         assert_eq!(
             pane_width(guard.name()),
             80,
@@ -4287,7 +4387,12 @@ mod tests {
         }
         let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_livelock_vacant");
         let worker = LiveSendWorker::spawn(guard.name().to_string(), None);
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        worker.resize(60, 20);
+        wait_until(
+            "resize against absent session",
+            std::time::Duration::from_secs(5),
+            || worker.take_resize_failed(),
+        );
 
         let out = crate::tmux::tmux_command()
             .args([

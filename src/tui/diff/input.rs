@@ -366,10 +366,15 @@ mod tests {
 
     #[test]
     fn y_key_sets_copied_confirmation() {
-        // Exercises the message path the empty-list test skips. This goes
-        // through the best-effort clipboard helper: a no-op in CI without a
-        // clipboard tool, and a local `cargo test` briefly writes the path to
-        // the system clipboard.
+        if !crate::tui::isolated_test_process(
+            "tui::diff::input::tests::y_key_sets_copied_confirmation",
+            std::time::Duration::from_secs(5),
+        ) {
+            return;
+        }
+        let empty_bin = tempfile::tempdir().unwrap();
+        let _env = crate::session::test_support::EnvGuard::set(&[("PATH", empty_bin.path())]);
+        // Native clipboard tools cannot launch; OSC52 goes to captured output.
         let mut view = make_diff_view_no_warning();
         view.files = vec![diff_file("src/app/foo.rs")];
         view.selected_file = 0;

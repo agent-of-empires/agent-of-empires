@@ -26,20 +26,12 @@ import { mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { spawnAoeServe, type ServeHandle } from "../helpers/aoeServe";
 
-const GIT_ENV = {
-  GIT_AUTHOR_NAME: "t",
-  GIT_AUTHOR_EMAIL: "t@t",
-  GIT_COMMITTER_NAME: "t",
-  GIT_COMMITTER_EMAIL: "t@t",
-  // Quiet down init's hint about default branch + advice
-  GIT_CONFIG_GLOBAL: "/dev/null",
-  GIT_CONFIG_SYSTEM: "/dev/null",
-} as const;
+import { gitEnv } from "../helpers/gitFixture";
 
-function run(cmd: string, args: string[], cwd: string, extraEnv: Record<string, string> = {}) {
+function run(env: NodeJS.ProcessEnv, cmd: string, args: string[], cwd: string, extraEnv: Record<string, string> = {}) {
   const res = spawnSync(cmd, args, {
     cwd,
-    env: { ...process.env, ...GIT_ENV, ...extraEnv },
+    env: { ...gitEnv(env), ...extraEnv },
     encoding: "utf8",
   });
   if (res.error || res.status !== 0) {
@@ -70,7 +62,12 @@ interface ForkUpstreamLayout {
  * Returns paths and tip commit OIDs. The local clone is what the user
  * passes to `aoe add` / `extra_repo_paths`.
  */
-function seedForkUpstreamLayout(root: string, name: string, branch: string): ForkUpstreamLayout {
+function seedForkUpstreamLayout(
+  env: NodeJS.ProcessEnv,
+  root: string,
+  name: string,
+  branch: string,
+): ForkUpstreamLayout {
   const upstreamDir = join(root, `${name}-upstream`);
   const originDir = join(root, `${name}-origin`);
   const localDir = join(root, name);
@@ -78,42 +75,42 @@ function seedForkUpstreamLayout(root: string, name: string, branch: string): For
   mkdirSync(upstreamDir, { recursive: true });
   mkdirSync(originDir, { recursive: true });
 
-  run("git", ["init", "--bare", "-q", `--initial-branch=${branch}`, upstreamDir], root);
-  run("git", ["init", "--bare", "-q", `--initial-branch=${branch}`, originDir], root);
+  run(env, "git", ["init", "--bare", "-q", `--initial-branch=${branch}`, upstreamDir], root);
+  run(env, "git", ["init", "--bare", "-q", `--initial-branch=${branch}`, originDir], root);
 
   // Seed both with commit A from a scratch clone of upstream.
   const seedA = join(root, `${name}-seed-a`);
-  run("git", ["clone", "-q", upstreamDir, seedA], root);
+  run(env, "git", ["clone", "-q", upstreamDir, seedA], root);
   writeFileSync(join(seedA, "file.txt"), "hello\n");
-  run("git", ["add", "file.txt"], seedA);
-  run("git", ["commit", "-q", "-m", "commit A"], seedA, {
+  run(env, "git", ["add", "file.txt"], seedA);
+  run(env, "git", ["commit", "-q", "-m", "commit A"], seedA, {
     GIT_AUTHOR_DATE: "1700000000 +0000",
     GIT_COMMITTER_DATE: "1700000000 +0000",
   });
-  run("git", ["push", "-q", "origin", `HEAD:${branch}`], seedA);
+  run(env, "git", ["push", "-q", "origin", `HEAD:${branch}`], seedA);
   // Push the same commit to origin so origin/<branch> exists at A too.
-  run("git", ["remote", "add", "fork-origin", originDir], seedA);
-  run("git", ["push", "-q", "fork-origin", `HEAD:${branch}`], seedA);
+  run(env, "git", ["remote", "add", "fork-origin", originDir], seedA);
+  run(env, "git", ["push", "-q", "fork-origin", `HEAD:${branch}`], seedA);
 
   // Add commit B only on upstream.
   writeFileSync(join(seedA, "file2.txt"), "world\n");
-  run("git", ["add", "file2.txt"], seedA);
-  run("git", ["commit", "-q", "-m", "commit B"], seedA, {
+  run(env, "git", ["add", "file2.txt"], seedA);
+  run(env, "git", ["commit", "-q", "-m", "commit B"], seedA, {
     GIT_AUTHOR_DATE: "1700001000 +0000",
     GIT_COMMITTER_DATE: "1700001000 +0000",
   });
-  run("git", ["push", "-q", "origin", `HEAD:${branch}`], seedA);
+  run(env, "git", ["push", "-q", "origin", `HEAD:${branch}`], seedA);
 
-  const upstreamTip = run("git", ["rev-parse", `${branch}`], seedA);
-  const originTip = run("git", ["rev-parse", `fork-origin/${branch}`], seedA);
+  const upstreamTip = run(env, "git", ["rev-parse", `${branch}`], seedA);
+  const originTip = run(env, "git", ["rev-parse", `fork-origin/${branch}`], seedA);
   expect(upstreamTip).not.toBe(originTip);
 
   // Now make the local clone the user will use. Clone from origin (the
   // stale fork) and add upstream as a second remote. Mirror the typical
   // developer setup.
-  run("git", ["clone", "-q", originDir, localDir], root);
-  run("git", ["remote", "add", "upstream", upstreamDir], localDir);
-  run("git", ["fetch", "-q", "upstream"], localDir);
+  run(env, "git", ["clone", "-q", originDir, localDir], root);
+  run(env, "git", ["remote", "add", "upstream", upstreamDir], localDir);
+  run(env, "git", ["fetch", "-q", "upstream"], localDir);
 
   return { localPath: localDir, upstreamTip, originTip };
 }
@@ -151,8 +148,8 @@ async function createSession(serve: ServeHandle, body: Record<string, unknown>):
  * Resolve the commit OID currently checked out in a worktree directory.
  * Mirrors what `git rev-parse HEAD` would return.
  */
-function worktreeHead(worktreePath: string): string {
-  return run("git", ["rev-parse", "HEAD"], worktreePath);
+function worktreeHead(env: NodeJS.ProcessEnv, worktreePath: string): string {
+  return run(env, "git", ["rev-parse", "HEAD"], worktreePath);
 }
 
 /**
@@ -184,20 +181,21 @@ base("single-repo: explicit base_branch branches off fresh upstream tip, not sta
       authMode: "none",
       workerIndex: testInfo.workerIndex,
       parallelIndex: testInfo.parallelIndex,
-      seedFn: ({ home }) => {
+      seedFn: ({ home, env }) => {
         // Seed the fork+upstream layout under HOME so cleanup wipes
         // it along with the rest of the isolated tree.
-        seedForkUpstreamLayout(home, "primary", "main");
+        seedForkUpstreamLayout(env, home, "primary", "main");
       },
     });
 
+    const env = serve.env;
     // Reach into the home dir we just seeded. The harness exposes it
     // on the handle so the test can compute paths the daemon will
     // accept.
     const layout = {
       localPath: join(serve.home, "primary"),
     };
-    const upstreamTip = run("git", ["rev-parse", "upstream/main"], layout.localPath);
+    const upstreamTip = run(env, "git", ["rev-parse", "upstream/main"], layout.localPath);
 
     const created = await createSession(serve, {
       path: layout.localPath,
@@ -211,7 +209,7 @@ base("single-repo: explicit base_branch branches off fresh upstream tip, not sta
     expect(created.warnings ?? []).toEqual([]);
 
     const worktreePath = join(serve.home, "primary-worktrees", "feature-stale-base-single");
-    const head = worktreeHead(worktreePath);
+    const head = worktreeHead(env, worktreePath);
     expect(head).toBe(upstreamTip);
   } finally {
     await serve?.stop();
@@ -225,16 +223,17 @@ base("multi-repo: secondary repo with fork+upstream layout branches off upstream
       authMode: "none",
       workerIndex: testInfo.workerIndex,
       parallelIndex: testInfo.parallelIndex,
-      seedFn: ({ home }) => {
-        seedForkUpstreamLayout(home, "primary", "main");
-        seedForkUpstreamLayout(home, "secondary", "main");
+      seedFn: ({ home, env }) => {
+        seedForkUpstreamLayout(env, home, "primary", "main");
+        seedForkUpstreamLayout(env, home, "secondary", "main");
       },
     });
 
+    const env = serve.env;
     const primary = join(serve.home, "primary");
     const secondary = join(serve.home, "secondary");
-    const primaryUpstream = run("git", ["rev-parse", "upstream/main"], primary);
-    const secondaryUpstream = run("git", ["rev-parse", "upstream/main"], secondary);
+    const primaryUpstream = run(env, "git", ["rev-parse", "upstream/main"], primary);
+    const secondaryUpstream = run(env, "git", ["rev-parse", "upstream/main"], secondary);
 
     const created = await createSession(serve, {
       path: primary,
@@ -255,8 +254,8 @@ base("multi-repo: secondary repo with fork+upstream layout branches off upstream
     // `../{branch}-workspace-{session-id}` with per-repo subdirs.
     const primaryWorktree = multiRepoWorktreePath(serve.home, "feature-stale-base-multi", "primary");
     const secondaryWorktree = multiRepoWorktreePath(serve.home, "feature-stale-base-multi", "secondary");
-    expect(worktreeHead(primaryWorktree)).toBe(primaryUpstream);
-    expect(worktreeHead(secondaryWorktree)).toBe(secondaryUpstream);
+    expect(worktreeHead(env, primaryWorktree)).toBe(primaryUpstream);
+    expect(worktreeHead(env, secondaryWorktree)).toBe(secondaryUpstream);
   } finally {
     await serve?.stop();
   }
@@ -269,14 +268,14 @@ base("multi-repo: per-repo fetch failure surfaces as warning, session still crea
       authMode: "none",
       workerIndex: testInfo.workerIndex,
       parallelIndex: testInfo.parallelIndex,
-      seedFn: ({ home }) => {
+      seedFn: ({ home, env }) => {
         // Primary is a healthy repo with one commit.
         const primary = join(home, "primary");
         mkdirSync(primary, { recursive: true });
-        run("git", ["init", "-q", "--initial-branch=main", primary], home);
+        run(env, "git", ["init", "-q", "--initial-branch=main", primary], home);
         writeFileSync(join(primary, "file.txt"), "hi\n");
-        run("git", ["add", "file.txt"], primary);
-        run("git", ["commit", "-q", "-m", "init"], primary);
+        run(env, "git", ["add", "file.txt"], primary);
+        run(env, "git", ["commit", "-q", "-m", "init"], primary);
 
         // Secondary repo has a misconfigured `origin` remote pointing
         // at a non-existent path. `git fetch origin main` exits
@@ -284,14 +283,15 @@ base("multi-repo: per-repo fetch failure surfaces as warning, session still crea
         // instead of failing the session.
         const secondary = join(home, "secondary");
         mkdirSync(secondary, { recursive: true });
-        run("git", ["init", "-q", "--initial-branch=main", secondary], home);
+        run(env, "git", ["init", "-q", "--initial-branch=main", secondary], home);
         writeFileSync(join(secondary, "file.txt"), "hi\n");
-        run("git", ["add", "file.txt"], secondary);
-        run("git", ["commit", "-q", "-m", "init"], secondary);
-        run("git", ["remote", "add", "origin", join(home, "does-not-exist.git")], secondary);
+        run(env, "git", ["add", "file.txt"], secondary);
+        run(env, "git", ["commit", "-q", "-m", "init"], secondary);
+        run(env, "git", ["remote", "add", "origin", join(home, "does-not-exist.git")], secondary);
       },
     });
 
+    const env = serve.env;
     const primary = join(serve.home, "primary");
     const secondary = join(serve.home, "secondary");
 
@@ -322,8 +322,8 @@ base("multi-repo: per-repo fetch failure surfaces as warning, session still crea
     // Workspace was still created. Both worktree dirs exist.
     const primaryWorktree = multiRepoWorktreePath(serve.home, "feature-fetch-fail", "primary");
     const secondaryWorktree = multiRepoWorktreePath(serve.home, "feature-fetch-fail", "secondary");
-    expect(worktreeHead(primaryWorktree)).toBeTruthy();
-    expect(worktreeHead(secondaryWorktree)).toBeTruthy();
+    expect(worktreeHead(env, primaryWorktree)).toBeTruthy();
+    expect(worktreeHead(env, secondaryWorktree)).toBeTruthy();
   } finally {
     await serve?.stop();
   }

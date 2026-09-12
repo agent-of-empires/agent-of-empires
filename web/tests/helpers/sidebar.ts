@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync } from "node:fs";
+import { initWorkingRepo } from "./gitFixture";
 import { join } from "node:path";
 import type { Page } from "@playwright/test";
 import { resolveAoeBinary } from "./aoeServe";
@@ -104,18 +104,7 @@ export function seedSessionsInRepo(opts: {
   return ({ home, env }) => {
     const binary = resolveAoeBinary();
     const projectDir = join(home, opts.subdir ?? "repo");
-    mkdirSync(projectDir, { recursive: true });
-    spawnSync("git", ["init", "-q"], { cwd: projectDir });
-    spawnSync("git", ["commit", "--allow-empty", "-q", "-m", "init"], {
-      cwd: projectDir,
-      env: {
-        ...env,
-        GIT_AUTHOR_NAME: "t",
-        GIT_AUTHOR_EMAIL: "t@t",
-        GIT_COMMITTER_NAME: "t",
-        GIT_COMMITTER_EMAIL: "t@t",
-      },
-    });
+    initWorkingRepo(projectDir, env);
     for (const title of opts.titles) {
       const res = spawnSync(binary, ["add", projectDir, "-t", title, "-c", opts.tool ?? "claude"], { env });
       if (res.status !== 0) {

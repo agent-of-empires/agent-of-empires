@@ -66,6 +66,16 @@ mod tests {
     use crate::session::Instance;
     use std::time::Duration;
 
+    struct TestPoller(Option<StopPoller>);
+
+    impl Drop for TestPoller {
+        fn drop(&mut self) {
+            if let Some(poller) = self.0.take() {
+                let _ = poller.worker.finish_for_test();
+            }
+        }
+    }
+
     fn create_test_instance() -> Instance {
         Instance::new("Test Session", "/tmp/test-project")
     }
@@ -73,11 +83,18 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_stop_poller_channel_communication() {
+        if !crate::tui::isolated_test_process(
+            "tui::stop_poller::tests::test_stop_poller_channel_communication",
+            Duration::from_secs(5),
+        ) {
+            return;
+        }
         let temp = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
         let profile = "stop-poller-channel";
         let storage = crate::session::Storage::new_unwatched(profile).unwrap();
-        let mut poller = StopPoller::new();
+        let mut fixture = TestPoller(Some(StopPoller::new()));
+        let poller = fixture.0.as_mut().unwrap();
         let mut instance = create_test_instance();
         instance.source_profile = profile.to_string();
         let session_id = instance.id.clone();
@@ -117,8 +134,24 @@ mod tests {
 
     #[test]
     fn test_stop_poller_tracks_pending_requests() {
-        let mut poller = StopPoller::new();
-        let instance = create_test_instance();
+        if !crate::tui::isolated_test_process(
+            "tui::stop_poller::tests::test_stop_poller_tracks_pending_requests",
+            Duration::from_secs(5),
+        ) {
+            return;
+        }
+        let _home = crate::session::test_support::isolate_app_dir();
+        let storage = crate::session::Storage::new_unwatched("default").unwrap();
+        let mut instance = create_test_instance();
+        instance.source_profile = "default".to_string();
+        storage
+            .update(|instances, _| {
+                instances.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let mut fixture = TestPoller(Some(StopPoller::new()));
+        let poller = fixture.0.as_mut().unwrap();
         let session_id = instance.id.clone();
 
         poller.request_stop(StopRequest {
@@ -126,7 +159,20 @@ mod tests {
             instance,
         });
 
-        assert_eq!(poller.take_pending(), vec![session_id]);
+        assert_eq!(poller.take_pending(), vec![session_id.clone()]);
         assert!(poller.take_pending().is_empty(), "take_pending drains");
+        let result = loop {
+            match poller.try_recv_result() {
+                Ok(result) => break result,
+                Err(TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(20)),
+                Err(error) => panic!("stop worker disconnected: {error}"),
+            }
+        };
+        assert_eq!(result.session_id, session_id);
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            storage.load().unwrap()[0].status,
+            crate::session::Status::Stopped
+        );
     }
 }

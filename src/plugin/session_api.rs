@@ -1059,6 +1059,7 @@ mod tests {
     async fn turn_send_refuses_a_turn_another_submission_already_started() {
         use std::time::Duration;
 
+        let _home = crate::session::test_support::isolate_app_dir();
         let mut inst = Instance::new("plugin-3649", "/tmp/aoe-3649-plugin");
         inst.id = "sess-3649".to_string();
         inst.view = crate::session::View::Structured;
@@ -1072,23 +1073,16 @@ mod tests {
             .await;
 
         let winner = deps.session_service.prompt_submission("sess-3649").await;
-        let send = tokio::spawn({
-            let deps = Arc::clone(&deps);
-            async move {
-                dispatch(
-                    &deps,
-                    &ctx_with(&["session.prompt"]),
-                    "sessions.turn.send",
-                    &serde_json::json!({ "session_id": "sess-3649", "text": "hi" }),
-                )
-                .await
-            }
-        });
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut claims = deps.session_service.watch_submission_claims();
+        let context = ctx_with(&["session.prompt"]);
+        let params = serde_json::json!({ "session_id": "sess-3649", "text": "hi" });
+        let send = dispatch(&deps, &context, "sessions.turn.send", &params);
+        tokio::pin!(send);
         assert!(
-            !send.is_finished(),
-            "a plugin turn must not decide its disposition while another submission owns the session"
+            futures_util::poll!(&mut send).is_pending(),
+            "the contender must reach the held submission lock before deciding"
         );
+        assert_eq!(claims.try_recv().unwrap(), "sess-3649");
 
         // What the winner does before releasing: publishing is the choke point
         // that flips the control fold to `turn_active`.
@@ -1101,7 +1095,6 @@ mod tests {
         let err = tokio::time::timeout(Duration::from_secs(10), send)
             .await
             .expect("the RPC must finish once the winner releases the session")
-            .expect("dispatch task must not panic")
             .expect_err("a turn that cannot start must not report success");
         assert_eq!(err.code, codes::SERVICE_UNAVAILABLE);
         assert_eq!(kind(&err), "agent_busy");
@@ -1221,6 +1214,7 @@ mod tests {
     /// worker error, never `session_not_found`.
     #[tokio::test]
     async fn turn_send_wakes_a_parked_session() {
+        let _home = crate::session::test_support::isolate_app_dir();
         type Park = (&'static str, fn(&mut Instance));
         let parks: Vec<Park> = vec![
             ("idle-dormant", |i| i.mark_idle_dormant()),

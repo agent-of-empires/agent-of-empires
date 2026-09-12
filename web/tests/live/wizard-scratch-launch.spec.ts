@@ -40,18 +40,13 @@ base("scratch happy path: launch creates a scratch-dir session", async ({ page }
     const projectPath = session.project_path as string;
     expect(basename(dirname(projectPath))).toBe("scratch");
 
-    // The row must STAY listed, not merely show up once. A `status_poll_loop`
-    // tick whose disk read started before the create persisted carries a
-    // snapshot without the new session, and the reload rebuilds the list
-    // wholesale from that snapshot, so the row used to vanish for a tick and
-    // a second read returned []. The server drops such a reload now
-    // (`mutation_epoch`). Span more than one 2s tick so a regression here is
-    // caught rather than merely made invisible by reading only once.
-    const deadline = Date.now() + 3_000;
-    while (Date.now() < deadline) {
-      await page.waitForTimeout(250);
-      expect(await listSessions(serve.baseUrl)).toHaveLength(1);
-    }
+    // Exercise durable creation across a fresh server load. The deterministic
+    // stale-read/create interleaving is covered in session_spawn.rs.
+    await serve.restart();
+    const reloaded = await listSessions(serve.baseUrl);
+    expect(reloaded.map((row) => row.id)).toEqual([session.id]);
+    expect(reloaded[0]!.scratch).toBe(true);
+    expect(reloaded[0]!.project_path).toBe(projectPath);
   } finally {
     await serve.stop();
   }

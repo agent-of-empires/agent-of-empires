@@ -26,7 +26,7 @@ base("right panel diff viewer: 1000-line file scrolls, binary file shows placeho
     parallelIndex: testInfo.parallelIndex,
     seedFn: ({ home, env }) => {
       const projectDir = join(home, "project");
-      initWorkingRepo(projectDir);
+      initWorkingRepo(projectDir, env);
       // Baseline on main: same large file content the modified version
       // will diverge from. Committing first means the diff lands on
       // the "modified" path with hunks of changes, not "added" with
@@ -34,7 +34,7 @@ base("right panel diff viewer: 1000-line file scrolls, binary file shows placeho
       writeFiles(projectDir, {
         "big.txt": generateLargeFileContent(1000, "base"),
       });
-      commitAll(projectDir, "baseline");
+      commitAll(projectDir, "baseline", env);
       // Now replace with a deterministic prefix swap so every line
       // shows in the diff. `generateLargeFileContent(1000, "edit")`
       // produces 1000 lines all distinct from the baseline.

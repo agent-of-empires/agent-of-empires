@@ -790,6 +790,7 @@ mod tests {
     #[test]
     #[serial]
     fn release_tarball_url_format() {
+        let _env = crate::session::test_support::EnvGuard::unset(&["AOE_UPDATE_BASE_URL"]);
         let url = release_tarball_url("0.5.0", "linux-amd64");
         assert_eq!(
             url,
@@ -800,23 +801,15 @@ mod tests {
     #[test]
     #[serial]
     fn release_tarball_url_respects_env_override() {
-        let key = "AOE_UPDATE_BASE_URL";
-        let prev = std::env::var(key).ok();
-        // SAFETY: single-threaded test context; serial_test ensures no concurrent mutation.
-        unsafe {
-            std::env::set_var(key, "http://127.0.0.1:9999/releases");
-        }
+        let _env = crate::session::test_support::EnvGuard::set(&[(
+            "AOE_UPDATE_BASE_URL",
+            "http://127.0.0.1:9999/releases",
+        )]);
         let url = release_tarball_url("0.5.0", "linux-amd64");
         assert_eq!(
             url,
             "http://127.0.0.1:9999/releases/v0.5.0/aoe-linux-amd64.tar.gz"
         );
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var(key, v),
-                None => std::env::remove_var(key),
-            }
-        }
     }
 
     #[test]

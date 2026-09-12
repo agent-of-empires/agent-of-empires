@@ -1695,13 +1695,12 @@ mod tests {
     /// `ENV_LOCK`, which closes the window from the writer side. See #3449.
     #[must_use = "bind it to `_shell`; dropped immediately, it unpins SHELL again"]
     fn pin_host_shell() -> Option<crate::session::test_support::EnvGuard> {
+        let guard = crate::session::test_support::EnvGuard::read_lock();
         let Ok(sh) = which::which("sh") else {
             eprintln!("not pinning SHELL: sh not found on PATH");
             return None;
         };
-        Some(crate::session::test_support::EnvGuard::set(&[(
-            "SHELL", &sh,
-        )]))
+        Some(guard.and_set("SHELL", &sh))
     }
 
     #[test]

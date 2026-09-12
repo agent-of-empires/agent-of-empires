@@ -19,9 +19,7 @@ async function openSession(page: Page, handle: MockHandle) {
   await openMobileSidebar(page);
   await clickSidebarSession(page, "pinch-test");
   await page.locator("[data-live-terminal]").waitFor({ state: "visible", timeout: 10_000 });
-  await expect.poll(() => handle.liveMessages.length, { timeout: 5_000 }).toBeGreaterThan(0);
-  // Let the first frame land + the sizing effect settle.
-  await page.waitForTimeout(400);
+  await handle.waitForLiveReady();
 }
 
 function scroller(page: Page) {
@@ -128,7 +126,17 @@ test.describe("Mobile live-view scrollback", () => {
     await scroller(page).evaluate((el) => {
       el.scrollTop = el.scrollHeight * 0.5;
     });
-    await page.waitForTimeout(300);
+    await expect
+      .poll(() =>
+        scroller(page).evaluate((el) => {
+          const pane = el.getBoundingClientRect();
+          return Array.from(el.querySelectorAll("[data-live-content] > div")).some((row) => {
+            const rect = row.getBoundingClientRect();
+            return rect.bottom > pane.top && rect.top < pane.bottom && row.textContent?.includes("history line");
+          });
+        }),
+      )
+      .toBe(true);
     const m = await scroller(page).evaluate((el) => ({
       mounted: el.querySelectorAll("[data-live-content] > div").length,
       scrollHeight: el.scrollHeight,
@@ -155,7 +163,7 @@ test.describe("Mobile live-view scrollback", () => {
     // Let React render the deep-history viewport. The live tail should still be
     // mounted when the final bottom scroll event flips the pane back to live, so
     // that transition has real rows instead of a spacer-only frame.
-    await page.waitForTimeout(300);
+    await expect(page.locator("[data-live-content]")).toContainText("history line");
     const visibleText = await scroller(page).evaluate((el) => {
       el.scrollTop = el.scrollHeight - el.clientHeight;
       el.dispatchEvent(new Event("scroll"));
@@ -243,11 +251,12 @@ test.describe("Mobile live-view scrollback", () => {
     });
     for (let i = 0; i < 4; i++) {
       await page.waitForTimeout(120);
-      handle.pushLiveFrame({
+      await handle.pushLiveFrame({
         content: Array.from({ length: 24 }, (_, n) => `streamed ${i}-${n}`).join("\n") + "\n",
         rows: 24,
         history: 130 + i,
       });
+      expect(Math.abs((await scroller(page).evaluate((el) => el.scrollTop)) - target)).toBeLessThan(20);
     }
     await page.waitForTimeout(300);
     const after = await scroller(page).evaluate((el) => el.scrollTop);
@@ -288,7 +297,7 @@ test.describe("Mobile live-view scrollback", () => {
       },
       Math.ceil(lineH * 3),
     );
-    handle.pushLiveFrame({
+    await handle.pushLiveFrame({
       content: Array.from({ length: 24 }, (_, n) => `busy ${n}`).join("\n") + "\n",
       rows: 24,
       history: 130,
@@ -298,7 +307,7 @@ test.describe("Mobile live-view scrollback", () => {
     await scroller(page).evaluate((el, step) => {
       el.scrollTop -= step;
     }, Math.ceil(lineH));
-    handle.pushLiveFrame({
+    await handle.pushLiveFrame({
       content: Array.from({ length: 24 }, (_, n) => `busy2 ${n}`).join("\n") + "\n",
       rows: 24,
       history: 131,
@@ -332,11 +341,12 @@ test.describe("Mobile live-view scrollback", () => {
 
     // Agent keeps streaming while the user reads.
     for (let i = 0; i < 4; i++) {
-      handle.pushLiveFrame({
+      await handle.pushLiveFrame({
         content: Array.from({ length: 24 }, (_, n) => `streamed ${i}-${n}`).join("\n") + "\n",
         rows: 24,
         history: 130 + i,
       });
+      expect(await scroller(page).evaluate((el) => el.scrollTop)).toBeLessThanOrEqual(afterFlick + 2);
       await page.waitForTimeout(120);
     }
 
@@ -376,7 +386,8 @@ test.describe("Mobile live-view scrollback", () => {
     // zone. Only the prompt text varies, to force a re-render+pin. With the old
     // pin this snapped scrollTop back to the bottom on the second such frame.
     for (let i = 0; i < 4; i++) {
-      handle.pushLiveFrame({ content: `$ ready ${i}\n` + "\n".repeat(23), rows: 24, history: 120 });
+      await handle.pushLiveFrame({ content: `$ ready ${i}\n` + "\n".repeat(23), rows: 24, history: 120 });
+      expect(await scroller(page).evaluate((el) => el.scrollTop)).toBeLessThanOrEqual(placed + 2);
       await page.waitForTimeout(120);
     }
 
@@ -408,7 +419,7 @@ test.describe("Mobile live-view scrollback", () => {
         el.scrollTop = el.scrollTop - 1;
         el.dispatchEvent(new Event("scroll"));
       });
-      handle.pushLiveFrame({ content: `$ ready ${i}\n` + "\n".repeat(23), rows: 24, history: 120 });
+      await handle.pushLiveFrame({ content: `$ ready ${i}\n` + "\n".repeat(23), rows: 24, history: 120 });
       await page.waitForTimeout(40);
     }
     const dist = await scroller(page).evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight);
@@ -476,7 +487,7 @@ test.describe("Mobile live-view scrollback", () => {
     // are virtualized, so the new content must land WHERE the reader is looking
     // (top of a fully-fetched frame, no spacer) to be in the mounted window
     // rather than off-screen at the live tail.
-    handle.pushLiveFrame({
+    await handle.pushLiveFrame({
       content: Array.from({ length: 74 }, (_, n) => `still streaming ${n}`).join("\n") + "\n",
       rows: 24,
       history: 50,

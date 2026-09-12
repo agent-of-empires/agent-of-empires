@@ -738,22 +738,20 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
-    // `#[serial]` (the default global group) serializes these env-mutating
-    // tests against every other telemetry test that reads `DO_NOT_TRACK` /
-    // `AOE_TELEMETRY_ENDPOINT`, including the consent-dialog tests in another
-    // module, so none of them race on the shared process env.
+    use crate::session::test_support::EnvGuard;
+
     #[test]
     #[serial]
     fn do_not_track_recognises_affirmative_values() {
+        let _env = EnvGuard::unset(&["DO_NOT_TRACK"]);
         for v in ["1", "true", "TRUE", "yes", "Yes"] {
-            unsafe { std::env::set_var("DO_NOT_TRACK", v) };
+            let _value = EnvGuard::set(&[("DO_NOT_TRACK", v)]);
             assert!(do_not_track(), "{v} should suppress");
         }
         for v in ["0", "false", "no", ""] {
-            unsafe { std::env::set_var("DO_NOT_TRACK", v) };
+            let _value = EnvGuard::set(&[("DO_NOT_TRACK", v)]);
             assert!(!do_not_track(), "{v} should not suppress");
         }
-        unsafe { std::env::remove_var("DO_NOT_TRACK") };
         assert!(!do_not_track());
     }
 
@@ -761,14 +759,13 @@ mod tests {
     #[serial]
     fn endpoint_falls_back_to_default_and_env_overrides() {
         // Unset or blank => the compiled-in default gateway.
-        unsafe { std::env::remove_var("AOE_TELEMETRY_ENDPOINT") };
+        let _env = EnvGuard::unset(&["AOE_TELEMETRY_ENDPOINT"]);
         assert_eq!(endpoint(), DEFAULT_ENDPOINT);
-        unsafe { std::env::set_var("AOE_TELEMETRY_ENDPOINT", "   ") };
+        let _blank = EnvGuard::set(&[("AOE_TELEMETRY_ENDPOINT", "   ")]);
         assert_eq!(endpoint(), DEFAULT_ENDPOINT);
         // A non-empty value overrides (trimmed).
-        unsafe { std::env::set_var("AOE_TELEMETRY_ENDPOINT", " https://x/y ") };
+        let _override = EnvGuard::set(&[("AOE_TELEMETRY_ENDPOINT", " https://x/y ")]);
         assert_eq!(endpoint(), "https://x/y");
-        unsafe { std::env::remove_var("AOE_TELEMETRY_ENDPOINT") };
     }
 
     fn sample_snapshot() -> UsageSnapshot {
@@ -910,7 +907,7 @@ mod tests {
     #[test]
     #[serial]
     fn opted_out_build_returns_none() {
-        unsafe { std::env::set_var("DO_NOT_TRACK", "1") };
+        let _env = EnvGuard::set(&[("DO_NOT_TRACK", "1")]);
         let mut pinned = Instance::new("pin", "/tmp/p");
         pinned.pin();
         assert!(
@@ -926,7 +923,6 @@ mod tests {
             .is_none(),
             "opted-out install must not build a snapshot"
         );
-        unsafe { std::env::remove_var("DO_NOT_TRACK") };
     }
 
     // The serve deployment-mode fields are part of the content fingerprint, so a

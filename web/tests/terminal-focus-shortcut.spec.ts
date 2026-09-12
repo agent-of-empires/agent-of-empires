@@ -1,3 +1,4 @@
+import { makePatch } from "./helpers/patch";
 import { test, expect } from "./helpers/mockedTest";
 import type { Page } from "@playwright/test";
 import { clickSidebarSession } from "./helpers/sidebar";
@@ -112,78 +113,79 @@ test.describe("Cmd/Ctrl+` desktop", () => {
 
   test("paired latch fires once ensureTerminal resolves (slow paired)", async ({ page }) => {
     await mockTerminalApis(page);
-    // Override the host-shell ensure with a 1500ms delay BEFORE goto.
-    // Routes are matched in reverse registration order, so this wins over
-    // the wildcard inside mockTerminalApis.
-    await page.route("**/api/sessions/*/terminal", async (r) => {
-      await new Promise((res) => setTimeout(res, 1500));
-      await r.fulfill({ status: 200, body: "" });
+    let releaseTerminal!: () => void;
+    const terminalPending = new Promise<void>((resolve) => {
+      releaseTerminal = resolve;
+    });
+    let requested = false;
+    await page.route("**/api/sessions/*/terminal*", async (route) => {
+      if (route.request().method() !== "POST") return route.fallback();
+      requested = true;
+      await terminalPending;
+      await route.fulfill({ status: 200, body: "" });
     });
 
-    await page.goto("/");
-    await clickSidebarSession(page, "pinch-test");
-    await expect(page.locator('[data-term="agent"]')).toHaveCount(1);
-
-    // Press Cmd+` immediately while paired is still in its "Starting…"
-    // state. focusSelf in PairedTerminal can't find a textarea, so the
-    // listener calls setPendingTerminalFocus("paired").
-    await focusKind(page, "agent");
-    await page.keyboard.press("ControlOrMeta+`");
-
-    // Within 3s the ensureTerminal mock returns, ready flips true,
-    // the consume-on-ready effect fires, focus lands in paired.
-    await expect.poll(() => focusedKind(page), { timeout: 3000 }).toBe("paired");
+    try {
+      await page.goto("/");
+      await openSession(page);
+      await page.locator('[data-testid^="pane-tab-terminal:"]').first().click();
+      await expect.poll(() => requested).toBe(true);
+      await focusKind(page, "agent");
+      await expect.poll(() => focusedKind(page)).toBe("agent");
+      await expect(page.locator('[data-term="paired"] textarea')).toHaveCount(0);
+      await page.keyboard.press("ControlOrMeta+`");
+    } finally {
+      releaseTerminal();
+    }
+    await expect.poll(() => focusedKind(page)).toBe("paired");
   });
 
   test("agent latch fires once ensureSession resolves (slow agent)", async ({ page }) => {
     await mockTerminalApis(page);
-    await page.route("**/api/sessions/*/ensure", async (r) => {
-      await new Promise((res) => setTimeout(res, 1500));
-      await r.fulfill({ json: { ok: true } });
+    let releaseSession!: () => void;
+    const sessionPending = new Promise<void>((resolve) => {
+      releaseSession = resolve;
+    });
+    let requested = false;
+    await page.route("**/api/sessions/*/ensure", async (route) => {
+      requested = true;
+      await sessionPending;
+      await route.fulfill({ json: { ok: true } });
     });
 
-    await page.goto("/");
-    await clickSidebarSession(page, "pinch-test");
-
-    // Wait for paired to be ready (its ensureTerminal isn't delayed); use
-    // it as the focus source so target=agent. Activate its tab first so the
-    // paired shell mounts (tabbed docks #2437).
-    await page.locator('[data-testid^="pane-tab-terminal:"]').first().click();
-    const paired = page.locator('[data-term="paired"]:visible').first();
-    await expect(paired.locator("[data-live-terminal]")).toBeVisible();
-    await paired.locator("textarea").focus();
-    await expect.poll(() => focusedKind(page)).toBe("paired");
-
-    // Agent terminal still mounted as "Starting session..." so its xterm
-    // textarea doesn't exist yet. Press Cmd+` → target=agent → listener
-    // sets the pending latch.
-    await page.keyboard.press("ControlOrMeta+`");
-
-    // ensureSession resolves, ensureState flips to ready, consume effect
-    // fires, focus lands on agent.
-    await expect.poll(() => focusedKind(page), { timeout: 3000 }).toBe("agent");
+    try {
+      // A sidebar click would already arm the agent-focus latch.
+      await page.goto("/session/pinch-test");
+      await expect.poll(() => requested).toBe(true);
+      await focusKind(page, "paired");
+      await expect.poll(() => focusedKind(page)).toBe("paired");
+      await expect(page.locator('[data-term="agent"] textarea')).toHaveCount(0);
+      await page.keyboard.press("ControlOrMeta+`");
+    } finally {
+      releaseSession();
+    }
+    await expect.poll(() => focusedKind(page)).toBe("agent");
   });
 
   test("with diff viewer open, Cmd+` to agent closes the diff", async ({ page }, _testInfo) => {
     await mockTerminalApis(page);
-    // Provide one file in the diff list. Don't mock the file content
-    // endpoint — DiffFileViewer can render an error state and the test
-    // only cares about selectedFilePath being set (which hides the agent
-    // wrapper).
-    await page.route("**/api/sessions/*/diff/files", (r) =>
-      r.fulfill({
+    const file = { path: "src/foo.ts", old_path: null, status: "modified", additions: 1, deletions: 1 };
+    const oldContent = "export const value = 1;\n";
+    const newContent = "export const value = 2;\n";
+    await page.route("**/api/sessions/*/diff/files", (route) =>
+      route.fulfill({
+        json: { files: [file], per_repo_bases: [{ base_branch: "main" }], warning: null },
+      }),
+    );
+    await page.route(/\/api\/sessions\/[^/]+\/diff\/file\?/, (route) =>
+      route.fulfill({
         json: {
-          files: [
-            {
-              path: "src/foo.ts",
-              old_path: null,
-              status: "modified",
-              additions: 3,
-              deletions: 1,
-            },
-          ],
-          per_repo_bases: [{ base_branch: "main" }],
-          warning: null,
+          file,
+          old_content: oldContent,
+          new_content: newContent,
+          is_binary: false,
+          truncated: false,
+          patch: makePatch(file.path, oldContent, newContent),
         },
       }),
     );
@@ -193,16 +195,23 @@ test.describe("Cmd/Ctrl+` desktop", () => {
 
     // Click the file in the diff list.
     await page.locator('button:has-text("foo.ts")').first().click();
-    // The agent terminal wrapper is now className="hidden". The
-    // [data-term="agent"] node still exists but inside a hidden parent.
+    const agent = page.locator('[data-term="agent"]');
+    const backToTerminal = page.getByRole("button", { name: "Back to terminal" });
+    await expect(backToTerminal).toBeVisible();
+    await expect(agent).toHaveCount(1);
+    await expect(agent).toBeHidden();
     await shot(page, "06-diff-open.png");
 
     await focusKind(page, "paired");
     await expect.poll(() => focusedKind(page)).toBe("paired");
+    await expect(backToTerminal).toBeVisible();
+    await expect(agent).toBeHidden();
 
     // Press Cmd+` → handler clears selectedFilePath, then rAF-dispatches.
     await page.keyboard.press("ControlOrMeta+`");
     await expect.poll(() => focusedKind(page)).toBe("agent");
+    await expect(agent).toBeVisible();
+    await expect(backToTerminal).toBeHidden();
     await shot(page, "07-after-toggle-agent.png");
   });
 

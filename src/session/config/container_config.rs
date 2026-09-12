@@ -2846,9 +2846,7 @@ mod tests {
     fn sandboxed_pi_config_mount_backs_the_sidecar_and_extension() {
         let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         let project_dir = TempDir::new().unwrap();
         git2::Repository::init(project_dir.path()).unwrap();
@@ -4700,9 +4698,7 @@ mod tests {
     fn claude_sandboxes_share_one_credential_mount() {
         let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
         let host = temp_home.path().join(".claude");
         fs::create_dir_all(&host).unwrap();
         // Beats any real credential the macOS Keychain contributes while
@@ -4847,9 +4843,7 @@ mod tests {
         let (_hg, _, _tmp_base) = BaseGuard::ready();
         // Isolate HOME so global/profile config doesn't interfere
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         // Create a project directory with repo config
         let project_dir = TempDir::new().unwrap();
@@ -4959,9 +4953,7 @@ mount_ssh = true
     fn test_build_container_config_run_policy() {
         let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         // Global config carries run policy; repo config overrides are ignored.
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -5043,9 +5035,7 @@ extra_run_args = ["--privileged"]
     fn test_build_container_config_drops_repo_network_escape_and_relabel() {
         let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         for network in ["container:victim", "ns:/var/run/netns/x"] {
             let project_dir = TempDir::new().unwrap();
@@ -5113,9 +5103,7 @@ extra_run_args = ["--privileged"]
     #[serial_test::serial]
     fn test_volume_ignores_expands_glob_entries() {
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         let project_dir = TempDir::new().unwrap();
         // Nested generated dirs the .NET-style globs should find.
@@ -5191,9 +5179,7 @@ volume_ignores = ["**/bin", "**/obj", "target"]
     #[serial_test::serial]
     fn named_ignore_volumes_authoritative_tracks_the_mount_resolve() {
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         let (_dir, repo_path) = setup_regular_repo();
         let worktree_path = repo_path.parent().unwrap().join("my-worktree");
@@ -5333,9 +5319,7 @@ volume_ignores_strategy = "named"
     fn test_build_container_config_sibling_worktree_loads_main_repo_sandbox_settings() {
         let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         // Main repo with repo config under .agent-of-empires/
         let parent = TempDir::new().unwrap();
@@ -5417,9 +5401,7 @@ volume_ignores = ["node_modules"]
         std::os::unix::fs::symlink(&real_parent, &link_parent).unwrap();
         let _hg = BaseGuard::with_base(link_parent.join("aoe-hooks"));
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         let project_dir = TempDir::new().unwrap();
         git2::Repository::init(project_dir.path()).unwrap();
@@ -5493,9 +5475,7 @@ volume_ignores = ["node_modules"]
     fn test_build_container_config_isolates_codex_home_per_instance() {
         let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         let project_dir = TempDir::new().unwrap();
         git2::Repository::init(project_dir.path()).unwrap();
@@ -5570,9 +5550,7 @@ volume_ignores = ["node_modules"]
     fn test_build_container_config_yolo_trusts_codex_project_only_in_yolo() {
         let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         let project_dir = TempDir::new().unwrap();
         git2::Repository::init(project_dir.path()).unwrap();
@@ -5632,9 +5610,7 @@ volume_ignores = ["node_modules"]
         for is_yolo in [false, true] {
             let (_hg, _, _tmp_base) = BaseGuard::ready();
             let temp_home = TempDir::new().unwrap();
-            std::env::set_var("HOME", temp_home.path());
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+            let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
             let project_dir = TempDir::new().unwrap();
             git2::Repository::init(project_dir.path()).unwrap();
@@ -5696,9 +5672,7 @@ volume_ignores = ["node_modules"]
     fn test_build_container_config_seeds_declared_agent_config_dir() {
         let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         let declared = temp_home.path().join(".claude-personal");
         let app_dir = crate::session::get_app_dir().unwrap();
@@ -5787,9 +5761,7 @@ claude-personal = "~/.claude-personal"
     fn test_declared_codex_config_dir_trusts_at_the_mounted_level() {
         let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         let declared = temp_home.path().join(".codex-work");
         let app_dir = crate::session::get_app_dir().unwrap();
@@ -5901,9 +5873,7 @@ codex-work = "{}"
     fn test_build_container_config_yolo_disables_gemini_folder_trust() {
         let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         let project_dir = TempDir::new().unwrap();
         git2::Repository::init(project_dir.path()).unwrap();
@@ -5954,9 +5924,7 @@ codex-work = "{}"
     fn test_ensure_folder_trust_config_restores_codex_after_refresh() {
         let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         let codex_dir = temp_home.path().join(".codex");
         let instance_id = "codex-yolo-refresh-test";
@@ -6007,9 +5975,7 @@ trust_level = "trusted"
     fn test_ensure_folder_trust_config_restores_gemini_after_refresh() {
         let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         let gemini_dir = temp_home.path().join(".gemini");
         let gemini_sandbox = gemini_dir
@@ -6061,9 +6027,7 @@ trust_level = "trusted"
     fn user_volume_shadowing_hook_config_disables_publisher_evidence() {
         let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
         let shadow = temp_home.path().join("shadow-cursor");
         fs::create_dir_all(&shadow).unwrap();
         crate::session::config::update_config(|config| {
@@ -6178,9 +6142,7 @@ trust_level = "trusted"
     fn test_build_container_config_installs_sidecar_hooks_files() {
         let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         let project_dir = TempDir::new().unwrap();
         git2::Repository::init(project_dir.path()).unwrap();
@@ -6282,9 +6244,7 @@ trust_level = "trusted"
     fn sandbox_identity_hooks_remain_when_status_hooks_are_disabled() {
         let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
         let profile = "sandbox-identity-only-hooks";
         let profile_dir = crate::session::get_profile_dir(profile).unwrap();
         fs::write(
@@ -6346,9 +6306,7 @@ trust_level = "trusted"
     fn test_build_container_config_installs_hooks_into_selected_kiro_agent() {
         let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         let project_dir = TempDir::new().unwrap();
         git2::Repository::init(project_dir.path()).unwrap();
@@ -6411,9 +6369,7 @@ trust_level = "trusted"
         // be resolved by its `name` field there, mirroring the host path.
         let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         let host_agents = temp_home.path().join(".kiro/agents");
         std::fs::create_dir_all(&host_agents).unwrap();
@@ -6486,9 +6442,7 @@ trust_level = "trusted"
     #[serial_test::serial]
     fn test_build_container_config_refuses_unsafe_instance_id() {
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         let project_dir = TempDir::new().unwrap();
         git2::Repository::init(project_dir.path()).unwrap();
@@ -6529,9 +6483,7 @@ trust_level = "trusted"
     #[serial_test::serial]
     fn test_build_container_config_respects_profile_hooks_disabled() {
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         let profile_dir = crate::session::get_profile_dir("sandbox-hooks-disabled").unwrap();
         fs::write(
@@ -6591,9 +6543,7 @@ trust_level = "trusted"
     fn test_build_container_config_uses_detected_codex_for_custom_wrapper_hooks() {
         let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         crate::session::config::update_config(|global| {
             global.session.agent_status_hooks = false;
@@ -6675,9 +6625,7 @@ agent_detect_as = { "wrapped-codex" = "codex" }
     #[serial_test::serial]
     fn test_refresh_agent_configs_preserves_codex_hooks_and_trust_state() {
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         let codex_dir = temp_home.path().join(".codex");
         fs::create_dir_all(&codex_dir).unwrap();
@@ -6780,9 +6728,7 @@ trusted_hash = "keep"
     #[serial_test::serial]
     fn test_refresh_agent_configs_uses_profile_status_map_for_codex_hooks() {
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         let codex_dir = temp_home.path().join(".codex");
         fs::create_dir_all(&codex_dir).unwrap();
@@ -6877,9 +6823,7 @@ trusted_hash = "keep"
     fn test_build_container_config_mounts_codex_home_from_extra_env() {
         let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         let project_dir = TempDir::new().unwrap();
         git2::Repository::init(project_dir.path()).unwrap();
@@ -6927,9 +6871,7 @@ trusted_hash = "keep"
     fn test_build_container_config_mounts_codex_home_from_sandbox_environment() {
         let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         let project_dir = TempDir::new().unwrap();
         let config_dir = project_dir.path().join(".agent-of-empires");
@@ -6992,9 +6934,7 @@ environment = ["CODEX_HOME=/root/profile-codex"]
     fn test_build_container_config_uses_passed_profile_not_global_default() {
         let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         let app_dir = temp_home
@@ -7142,9 +7082,7 @@ extra_volumes = ["/host/personal-only:/container/personal-only:ro"]
     #[serial_test::serial]
     fn test_volume_ignores_applied_to_parent_repo_mount() {
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         let (_dir, repo_path) = setup_regular_repo();
 
@@ -7261,9 +7199,7 @@ volume_ignores = ["target", "node_modules"]
     #[serial_test::serial]
     fn test_volume_ignores_applied_to_bare_repo_worktree() {
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         let (_dir, main_repo_path, worktree_path) = setup_bare_repo_with_worktree();
 
@@ -7483,9 +7419,7 @@ volume_ignores = ["target"]
     #[serial_test::serial]
     fn test_vertex_mounts_default_adc_when_flag_set_and_tool_is_claude() {
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
         std::env::set_var("CLAUDE_CODE_USE_VERTEX", "1");
         std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
         let adc_path = write_adc_at(temp_home.path());
@@ -7509,9 +7443,7 @@ volume_ignores = ["target"]
     #[serial_test::serial]
     fn test_vertex_mounts_custom_path_from_google_application_credentials() {
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
         std::env::set_var("CLAUDE_CODE_USE_VERTEX", "1");
 
         let cred_dir = TempDir::new().unwrap();
@@ -7539,9 +7471,7 @@ volume_ignores = ["target"]
     #[serial_test::serial]
     fn test_vertex_skips_mount_when_flag_unset() {
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
         std::env::remove_var("CLAUDE_CODE_USE_VERTEX");
         std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
         let _ = write_adc_at(temp_home.path());
@@ -7560,9 +7490,7 @@ volume_ignores = ["target"]
     #[serial_test::serial]
     fn test_vertex_skips_mount_when_tool_is_not_claude() {
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
         std::env::set_var("CLAUDE_CODE_USE_VERTEX", "1");
         std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
         let _ = write_adc_at(temp_home.path());
@@ -7583,9 +7511,7 @@ volume_ignores = ["target"]
     #[serial_test::serial]
     fn test_vertex_skips_mount_when_flag_is_empty_string() {
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
         std::env::set_var("CLAUDE_CODE_USE_VERTEX", "");
         std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
         let _ = write_adc_at(temp_home.path());
@@ -7606,9 +7532,7 @@ volume_ignores = ["target"]
     #[serial_test::serial]
     fn test_vertex_skips_mount_when_adc_file_missing() {
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
         std::env::set_var("CLAUDE_CODE_USE_VERTEX", "1");
         std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
         // Note: no ADC file written
@@ -7944,9 +7868,7 @@ volume_ignores = ["target"]
     fn sandbox_empty_desired_hooks_remove_stale_aoe_entries() {
         let (_hook_guard, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
         let profile = "sandbox-empty-hook-cleanup";
         let profile_dir = crate::session::get_profile_dir(profile).unwrap();
         fs::write(

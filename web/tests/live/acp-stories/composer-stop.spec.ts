@@ -6,7 +6,7 @@
 // the idle "Send a message…" placeholder.
 //
 // One spec, four turns, because the four cases only ever differed in the
-// single `session/update` the fake emits before an identical `wait_ms` hold:
+// single `session/update` the fake emits before an identical release gate:
 // a message chunk, a thought chunk, a pending tool call, and a sub-agent Task
 // with a child tool call. Everything after the click was byte-identical, so
 // they always failed together, and four copies meant four `aoe serve` boots,
@@ -15,11 +15,6 @@
 // `_meta.claudeCode.parentToolUseId` and render grouped under a parent, so a
 // refactor of that grouping must not take the parent Stop path with it.
 //
-// The post-hold chunk in case 1 is deliberately NOT asserted absent: the fake
-// is single-threaded JS and does not abort its in-flight session/prompt loop
-// when session/cancel arrives, so it may still land after Stop. The server's
-// cancel semantics belong to the REST-level acp-cancel spec.
-
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -27,10 +22,8 @@ import { test as base, expect } from "@playwright/test";
 import { spawnAoeServe, listSessions, seedSessionViaAoeAdd } from "../../helpers/aoeServe";
 import { waitForStructuredView, enableStructuredViewAndWait, attachServeDiagnostics } from "../../helpers/acp";
 
-// 30s holds each turn open longer than the assertions below will ever wait,
-// so the Stop affordance stays mounted even on a heavily loaded runner where
-// the first update and the click can be tens of seconds apart.
-const HOLD = { sessionUpdate: "wait_ms", ms: 30_000 };
+// Only cancellation ends these turns.
+const HOLD = { sessionUpdate: "wait_for_release" };
 
 const CASES = [
   {
@@ -41,8 +34,6 @@ const CASES = [
       HOLD,
       { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Should never appear." } },
     ],
-    // The only case with a distinct pre-Stop signal worth asserting; the
-    // others surface as the Stop affordance itself.
     marker: "Thinking...",
   },
   {
@@ -52,7 +43,7 @@ const CASES = [
       { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Reasoning about the problem..." } },
       HOLD,
     ],
-    marker: null,
+    marker: "ThinkingStarted",
   },
   {
     name: "running a tool",
@@ -127,16 +118,30 @@ base("Stop cancels the turn whatever the agent is doing", async ({ page }, testI
 
     for (const c of CASES) {
       await base.step(`Stop while ${c.name}`, async () => {
+        const cancelledTurns = async () => {
+          const replay = await fetch(`${serve!.baseUrl}/api/sessions/${seeded.id}/acp/replay?since=0`).then((r) =>
+            r.json(),
+          );
+          return (JSON.stringify(replay).match(/"reason":"cancelled"/g) ?? []).length;
+        };
+        const cancelledBefore = await cancelledTurns();
         await idleComposer.fill(c.prompt);
         await idleComposer.press("Enter");
-        if (c.marker) {
-          await expect(page.getByText(c.marker).first()).toBeVisible({ timeout: 15_000 });
-        }
+        await expect
+          .poll(async () => {
+            const replay = await fetch(`${serve!.baseUrl}/api/sessions/${seeded.id}/acp/replay?since=0`).then((r) =>
+              r.json(),
+            );
+            return JSON.stringify(replay);
+          })
+          .toContain(c.marker);
         await expect(stopButton).toBeVisible({ timeout: 15_000 });
         await stopButton.click();
         // The turn ended: the composer is editable again and Stop is gone.
         await expect(idleComposer).toBeVisible({ timeout: 15_000 });
         await expect(stopButton).toBeHidden({ timeout: 15_000 });
+        await expect.poll(cancelledTurns).toBe(cancelledBefore + 1);
+        await expect(page.getByText("Should never appear.")).toHaveCount(0);
       });
     }
   } finally {
