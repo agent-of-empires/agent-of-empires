@@ -580,13 +580,11 @@ pub(crate) fn apply_status_intent(
             }
             s
         }
-        // A background sub-agent's own progress does not speak to whatever
-        // the main turn is blocked on; leave a pending approval/elicitation
-        // showing Waiting until the main turn's own event resolves it. The
-        // same holds for Error: the tailer runs on a cloned sender and keeps
-        // draining while the supervisor evaluates a respawn, so its events
-        // must not clear the main connection's error banner; only HealError
-        // from a fresh worker attach resolves that.
+        // Background sub-agent events must not speak for the main turn: they
+        // preserve its Waiting (a pending approval/elicitation) and Error (a
+        // dead connection the supervisor is still respawning). The main
+        // turn's own events (plain `Set`) resolve both; Error also heals on
+        // a fresh worker attach.
         StatusIntent::SetUnlessWaiting(s) => {
             if matches!(
                 inst.status,
@@ -778,14 +776,13 @@ pub(super) async fn recover_structured_unread_after_lag(
         let Some(event) = event_store.latest_seed_status_event(&id) else {
             continue;
         };
-        // Unlike boot's `seed_acp_statuses` (a cold cache, where `false,
-        // false` is the documented conservative verdict), this runs while the
-        // daemon is live: the control cache folded every persisted event, so
-        // its turn/background activity is authoritative even though
-        // `latest_seed_status_event` itself excludes background events. A
-        // `Stopped` under a still-running background sub-agent must not
-        // resolve Idle here, or the Running->Idle edge marks an unfinished
-        // turn unread. See #3900.
+        // Unlike boot's cold `(false, false)` seeding, this reads the live
+        // control cache (the boot-vs-lag contrast above): hydrated, it is
+        // at-or-ahead of this event's fold, so its activity flags are the
+        // best available verdict; a miss (never opened, evicted, or
+        // forgotten) degrades to boot's conservative verdict. The seed query
+        // excludes background events, so a `Stopped` under a still-running
+        // sub-agent needs this (#3900).
         let turn_active_after = control_cache.turn_active(&id);
         let background_agent_active_after = control_cache.has_active_background_agent(&id);
         let Some(intent) =
@@ -966,25 +963,25 @@ pub(super) fn derive_acp_session_change(event: &crate::acp::Event) -> Option<Acp
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum StatusIntent {
     Set(Status),
-    /// Like `Set`, but a no-op while the sidebar is currently `Waiting`: a
-    /// background sub-agent's own progress does not speak to whatever the
-    /// main turn is blocked on (an approval or elicitation), so it must not
-    /// clobber that yellow dot. Used only for `BackgroundAgentLaunched` /
-    /// `BackgroundAgentProgress`, which otherwise arrive every ~1.5s for the
-    /// life of the sub-agent (#3900).
+    /// Like `Set`, but a no-op while the sidebar sits on a status only the
+    /// main turn may resolve: `Waiting` (a pending approval/elicitation),
+    /// `Stopped` (a deliberate stop), or `Error` (a dead connection awaiting
+    /// respawn). Background sub-agent lifecycle events must not speak for
+    /// the main turn; its own events (plain `Set`) and `HealError` resolve
+    /// those. Used only by the `BackgroundAgent*` arms (#3900).
     SetUnlessWaiting(Status),
     HealError,
 }
 
-/// `turn_active_after` and `background_agent_active_after` are read from the
-/// session's folded control state right after this event was applied to it
-/// (`AcpState::turn_active` / `has_active_background_agent()`). `turn_active`
-/// itself still gates prompt dispatch and the queue drain and tracks only the
-/// main turn, but a `BackgroundAgentCompleted` can land while the main turn is
-/// still going (it was launched mid-turn), so that arm needs both inputs to
-/// avoid resolving Idle under a live turn. `Stopped` only needs
-/// `background_agent_active_after`: post-`Stopped`, `turn_active_after` is
-/// definitionally false. See #3900.
+/// `turn_active_after` and `background_agent_active_after` are the session's
+/// post-event activity flags from the folded control state (`AcpState::
+/// turn_active` / `has_active_background_agent()`); misses read `false` and
+/// degrade to boot's conservative verdict. `turn_active` itself still gates
+/// prompt dispatch and the queue drain and tracks only the main turn. Both
+/// `Stopped` and `BackgroundAgentCompleted` resolve Idle only once neither
+/// flag is set; the former needs the flags because the cache can be ahead of
+/// a lagged frame (a newer turn already opened), the latter because a
+/// sub-agent can outlive its own completion event's ordering. See #3900.
 pub(crate) fn derive_acp_status(
     event: &crate::acp::Event,
     turn_active_after: bool,
@@ -1027,20 +1024,23 @@ pub(crate) fn derive_acp_status(
         // dedicated RateLimit banner carries the reset time, so the
         // sidebar pill staying grey is the right signal. See #1281.
         //
-        // Unless a background sub-agent the main turn spawned is still
-        // running: it keeps working past its parent's `Stopped`, and the
-        // sidebar dot must stay lit until that agent's own
-        // `BackgroundAgentCompleted` clears it (#3900).
-        Event::Stopped { .. } => Some(StatusIntent::Set(if background_agent_active_after {
-            Status::Running
-        } else {
-            Status::Idle
-        })),
+        // Unless something is still busy after this `Stopped`: a background
+        // sub-agent keeps working past its parent (#3900), and the cache can
+        // be ahead of a lagged frame (a newer turn already opened), so the
+        // arm consults both activity flags. Live, the event itself folds
+        // `turn_active` false, so ahead-ness is the only source of `true`.
+        Event::Stopped { .. } => Some(StatusIntent::Set(
+            if turn_active_after || background_agent_active_after {
+                Status::Running
+            } else {
+                Status::Idle
+            },
+        )),
         // The last outstanding background agent finished. Only drops to Idle
         // once neither the main turn nor a sibling agent is still active
         // (`turn_active_after` covers a sub-agent launched mid-turn that
-        // outlives its own completion event's ordering; `Stopped` already
-        // resolved the main-turn edge on its own arm). `SetUnlessWaiting`
+        // outlives its own completion event's ordering; the `Stopped` arm
+        // consults the same flags). `SetUnlessWaiting`
         // because a sibling agent finishing must not clobber a pending
         // approval/elicitation on the main turn (#3900).
         Event::BackgroundAgentCompleted { .. } => Some(StatusIntent::SetUnlessWaiting(
@@ -1402,9 +1402,9 @@ mod tests {
                 )
                 .expect("record stopped");
         }
-        // The live daemon's control cache for these sessions: nothing folded
-        // beyond the recorded `Stopped`, so no turn or background sub-agent is
-        // active and the pre-#3900 Idle+unread verdict must hold.
+        // A cold control cache for these sessions: never hydrated, so the
+        // reads miss and degrade to boot's conservative `(false, false)`
+        // verdict — the pre-#3900 Idle+unread behavior this test pins.
         let control_cache = crate::acp::control_cache::ControlStateCache::new();
 
         let instances = RwLock::new(rows);
@@ -1559,6 +1559,115 @@ mod tests {
             inst.status,
             Status::Running,
             "the Stopped must not resolve Idle under the still-running sub-agent"
+        );
+        assert!(!inst.unread, "an unfinished turn must not be marked unread");
+    }
+
+    /// #3900: a `UserDiffCommentsPrompt` opens a turn in the control state
+    /// but is absent from the seed query, so during such a turn the latest
+    /// seed event is the previous turn's `Stopped`. Lag recovery must let
+    /// the cache's `turn_active` override that stale seed instead of
+    /// resolving Idle under the live turn and marking it unread.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn recover_structured_unread_after_lag_keeps_running_for_a_newer_turn_past_the_seed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: serialized test; no other test mutates HOME concurrently.
+        unsafe { std::env::set_var("HOME", temp.path()) };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        }
+        crate::session::set_unread_enabled(true);
+
+        let profile = "acp-unread-lag-newer-turn";
+
+        let mut live = Instance::new("acp-live-newer-turn", "/tmp/acp");
+        live.view = crate::session::View::Structured;
+        live.source_profile = profile.to_string();
+        live.status = Status::Running;
+        let live_id = live.id.clone();
+        let rows = vec![live];
+        seed_profile_store(profile, rows.clone());
+
+        let db = temp.path().join("acp-events.db");
+        let store = crate::acp::event_store::EventStore::open(&db, 1000).expect("event store");
+        store
+            .record(
+                &live_id,
+                1,
+                &crate::acp::Event::UserPromptSent {
+                    text: "first turn".into(),
+                    attachments: Vec::new(),
+                    prompt_id: None,
+                },
+            )
+            .expect("record prompt");
+        store
+            .record(
+                &live_id,
+                2,
+                &crate::acp::Event::Stopped {
+                    reason: "prompt_complete".into(),
+                },
+            )
+            .expect("record stop");
+        // The newer turn the seed query cannot see.
+        store
+            .record(
+                &live_id,
+                3,
+                &crate::acp::Event::UserDiffCommentsPrompt {
+                    intro: "intro".into(),
+                    outro: "outro".into(),
+                    is_multi_repo: false,
+                    comments: Vec::new(),
+                    assembled_markdown: "diff".into(),
+                },
+            )
+            .expect("record diff prompt");
+
+        let control_cache = crate::acp::control_cache::ControlStateCache::new();
+        control_cache.get_or_hydrate(&live_id, || {
+            let mut reduced = crate::acp::state::AcpState::new(
+                crate::acp::state::AcpSessionId(live_id.clone()),
+                crate::acp::state::AgentName("claude".into()),
+                None,
+            );
+            let mut last_seq = 0;
+            for (seq, event) in store.replay_from(&live_id, 0) {
+                let _ = reduced.apply_event(event);
+                last_seq = seq;
+            }
+            (reduced, last_seq)
+        });
+        assert!(
+            control_cache.turn_active(&live_id),
+            "precondition: the folded cache sees the newer turn"
+        );
+
+        let instances = RwLock::new(rows);
+        let locks = RwLock::new(std::collections::HashMap::new());
+        let (status_tx, _rx) = broadcast::channel(16);
+
+        let marked = recover_structured_unread_after_lag(
+            &instances,
+            &store,
+            &locks,
+            &control_cache,
+            crate::file_watch::FileWatchService::noop(),
+            &status_tx,
+        )
+        .await;
+
+        assert_eq!(marked, 0, "a live newer turn is not a turn end");
+
+        let guard = instances.read().await;
+        let inst = guard.iter().find(|i| i.id == live_id).expect("row");
+        assert_eq!(
+            inst.status,
+            Status::Running,
+            "the stale seed Stopped must not resolve Idle under the newer turn"
         );
         assert!(!inst.unread, "an unfinished turn must not be marked unread");
     }

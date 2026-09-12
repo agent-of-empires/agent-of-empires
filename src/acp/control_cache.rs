@@ -100,14 +100,15 @@ impl ControlStateCache {
     }
 
     /// Whether the session's cached state has an outstanding background
-    /// sub-agent, or `false` if nothing has hydrated it yet. Used right
-    /// after `apply_if_cached` folds a `Stopped` or `BackgroundAgentCompleted`
+    /// sub-agent, or `false` if nothing is cached. Used right after
+    /// `apply_if_cached` folds a `Stopped` or `BackgroundAgentCompleted`
     /// event, to tell the sidebar status derivation whether a background
-    /// sub-agent is still keeping the session busy (#3900). Deliberately
-    /// does not hydrate on a miss: the caller only asks this for a session
-    /// whose own event was just folded in, so a miss means the fold was
-    /// dropped (a failed persist), and Idle is the same conservative answer
-    /// `derive_acp_status` fell back to before this existed.
+    /// sub-agent is still keeping the session busy (#3900), and by live lag
+    /// recovery to override a stale seed event. Deliberately does not
+    /// hydrate on a miss: for the live caller a miss means the fold was
+    /// dropped (a failed persist), for recovery it may just mean the session
+    /// was never opened; either way `false` is the same conservative verdict
+    /// the derivation fell back to before this existed.
     pub fn has_active_background_agent(&self, session_id: &str) -> bool {
         let slot = self.slot(session_id);
         let guard = lock(&slot);
@@ -116,10 +117,11 @@ impl ControlStateCache {
             .is_some_and(|c| c.state.has_active_background_agent())
     }
 
-    /// Whether the session's cached state has an active main turn, or `false`
-    /// if nothing has hydrated it yet. Same conservative-miss rationale as
-    /// `has_active_background_agent`: the caller only asks this right after
-    /// folding the session's own event, so a miss means the fold was dropped.
+    /// Whether the session's cached state has an active main turn, or
+    /// `false` if nothing is cached. Same conservative-miss rationale as
+    /// `has_active_background_agent`: the live listener asks right after
+    /// folding the session's own event, lag recovery asks arbitrary
+    /// sessions, and a miss reads as the same quiet-session verdict as boot.
     pub fn turn_active(&self, session_id: &str) -> bool {
         let slot = self.slot(session_id);
         let guard = lock(&slot);
