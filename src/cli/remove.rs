@@ -38,7 +38,9 @@ pub struct RemoveArgs {
     /// the session to the trash (when `session.delete_to_trash` is enabled,
     /// the default) so it can be restored; `--purge` forces the irreversible
     /// teardown (worktree/branch/container cleanup per the other flags, plus
-    /// transcript removal).
+    /// the session's structured-view transcript and its own agent store, which
+    /// for a sandboxed session is that agent's config home). A host agent's
+    /// conversation history outside those is not removed.
     #[arg(long)]
     purge: bool,
 }
