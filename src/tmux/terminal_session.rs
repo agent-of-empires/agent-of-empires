@@ -765,6 +765,7 @@ mod tests {
     fn test_terminal_session_is_pane_dead_after_command_exits() {
         use crate::tmux::test_helpers::{only_pane_id, wait_for_pane_dead};
 
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         if !tmux_available() {
             eprintln!("Skipping test: tmux not available");
             return;

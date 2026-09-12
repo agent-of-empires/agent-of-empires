@@ -488,6 +488,21 @@ async function handlePrompt(params, client) {
   });
   if (slow) await sleep(800);
 
+  // Usage on either side of completion exercises native turn observation.
+  if (userText.includes("USAGE_BEFORE_")) {
+    await client.notify("session/update", {
+      sessionId: params.sessionId,
+      update: {
+        sessionUpdate: "usage_update",
+        used: 120,
+        size: 200000,
+        ...(userText.includes("USAGE_BEFORE_COST")
+          ? { cost: { amount: 0.01, currency: "USD" } }
+          : {}),
+      },
+    });
+  }
+
   await client.notify("session/update", {
     sessionId: params.sessionId,
     update: {
@@ -512,6 +527,20 @@ async function handlePrompt(params, client) {
     },
   });
   if (slow) await sleep(800);
+
+  if (userText.includes("USAGE_AFTER_NO_COST")) {
+    await client.notify("session/update", {
+      sessionId: params.sessionId,
+      update: { sessionUpdate: "usage_update", used: 300, size: 200000 },
+    });
+  }
+
+  if (userText.includes("USAGE_OBSERVATION")) {
+    await new Promise((resolve) => {
+      parkedPromptResolve = resolve;
+    });
+    return { stopReason: "cancelled" };
+  }
 
   // Optional fs round-trip exercised by tests via prompt keywords.
   if (userText.includes("FS_READ_WRITE")) {

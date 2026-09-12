@@ -403,11 +403,12 @@ async function stopOrphanRunners(appDir: string, binary: string, env: NodeJS.Pro
     }
     const processes = processSnapshot(env);
     const runner = processes.find((p) => p.pid === pid);
-    const members = processes.filter((p) => p.group === pid);
-    if (!runner && members.length === 0) continue;
+    if (!runner) {
+      if (processes.some((p) => p.group === pid)) groups.add(pid);
+      continue;
+    }
     const prefix = `${executable} __acp-runner --socket ${socketPath} --session-id ${sessionId} `;
     if (
-      !runner ||
       runner.group !== pid ||
       !runner.command.startsWith(prefix) ||
       !runner.command.split(" -- ")[0].endsWith(` --generation ${generation}`)

@@ -9,10 +9,9 @@
 
 import { test, expect } from "@playwright/test";
 import { spawnSync } from "node:child_process";
-import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { spawnAoeServe } from "../helpers/aoeServe";
-import { gitEnv } from "../helpers/gitFixture";
+import { gitEnv, initWorkingRepo } from "../helpers/gitFixture";
 
 const CIVILIZATION_NAMES = [
   "Armenians",
@@ -73,10 +72,7 @@ test("duplicate worktree branch returns the real collision error, not a generic 
     workerIndex: testInfo.workerIndex,
     parallelIndex: testInfo.parallelIndex,
     seedFn: ({ home, env }) => {
-      const projectDir = join(home, "project");
-      mkdirSync(projectDir, { recursive: true });
-      spawnSync("git", ["init", "-q"], { cwd: projectDir, env: gitEnv(env) });
-      spawnSync("git", ["commit", "--allow-empty", "-q", "-m", "init"], { cwd: projectDir, env: gitEnv(env) });
+      initWorkingRepo(join(home, "project"), env);
     },
   });
 
@@ -117,10 +113,7 @@ test("auto-generated worktree branch avoids civilization branch collisions", asy
     workerIndex: testInfo.workerIndex,
     parallelIndex: testInfo.parallelIndex,
     seedFn: ({ home, env }) => {
-      const projectDir = join(home, "project");
-      mkdirSync(projectDir, { recursive: true });
-      spawnSync("git", ["init", "-q"], { cwd: projectDir, env: gitEnv(env) });
-      spawnSync("git", ["commit", "--allow-empty", "-q", "-m", "init"], { cwd: projectDir, env: gitEnv(env) });
+      const { path: projectDir } = initWorkingRepo(join(home, "project"), env);
       for (const civ of CIVILIZATION_NAMES) {
         spawnSync("git", ["branch", civ], { cwd: projectDir, env: gitEnv(env) });
       }

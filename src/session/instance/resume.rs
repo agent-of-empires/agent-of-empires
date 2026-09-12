@@ -1130,8 +1130,6 @@ mod tests {
         let observed = std::rc::Rc::new(std::cell::Cell::new(false));
         let observed_in_probe = observed.clone();
         let probe_name = tmux_name.clone();
-        let death = std::rc::Rc::new(std::cell::RefCell::new(None));
-        let death_in_probe = death.clone();
         POST_SHELL_OBSERVER.with(|slot| {
             *slot.borrow_mut() = Some(Box::new(move |session| {
                 assert!(session.exists());
@@ -1141,15 +1139,8 @@ mod tests {
                 let pane = crate::tmux::test_helpers::only_pane_id(&probe_name);
                 let mut kill = crate::tmux::tmux_command();
                 kill.args(["send-keys", "-t", &pane, "C-c"]);
-                let sleep = which::which("sleep").unwrap();
-                *death_in_probe.borrow_mut() = Some(std::thread::spawn(move || {
-                    assert!(std::process::Command::new(sleep)
-                        .arg("1.2")
-                        .status()
-                        .unwrap()
-                        .success());
-                    assert!(kill.output().unwrap().status.success());
-                }));
+                assert!(kill.output().unwrap().status.success());
+                crate::tmux::test_helpers::wait_for_pane_dead(&pane);
             }))
         });
         let _observer = PostShellObserver;
@@ -1158,12 +1149,6 @@ mod tests {
             observed.get(),
             "the observer must enter the post-shell grace branch before death"
         );
-        death
-            .borrow_mut()
-            .take()
-            .expect("scheduled pane death")
-            .join()
-            .unwrap();
 
         let _ = crate::tmux::tmux_command()
             .args(["kill-session", "-t", &tmux_name])
