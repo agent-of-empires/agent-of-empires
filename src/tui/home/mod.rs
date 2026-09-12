@@ -764,6 +764,10 @@ pub struct HomeView {
     // confirmation first (guards against accidental exits, #1569).
     pub(super) confirm_before_quit: bool,
 
+    /// Cached `session.host_tab_title`. The App loop reads this to emit
+    /// OSC 0; refreshed from config at construction and on reload.
+    pub(super) host_tab_title: bool,
+
     // Number of live `aoe` TUI processes (including this one), refreshed on a
     // throttle from the app loop. The footer surfaces it when >1 so the user
     // knows another instance is attached (the two clash over agent pane sizes

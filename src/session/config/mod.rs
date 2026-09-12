@@ -1124,6 +1124,12 @@ pub struct SessionConfig {
     #[setting(label = "Mouse Capture", widget = "toggle", category = "Interaction")]
     pub mouse_capture: bool,
 
+    /// Set the host terminal tab to `aoe: {session}` from the TUI
+    /// selection via OSC 0. Disable to keep the terminal's own naming.
+    #[serde(default = "default_true")]
+    #[setting(label = "Host Tab Title", widget = "toggle", category = "Interaction")]
+    pub host_tab_title: bool,
+
     /// User-defined agents: name=command (e.g. lenovo-claude=ssh -t lenovo
     /// claude). Custom agent names appear in the TUI agent picker alongside
     /// built-in agents.
@@ -1738,6 +1744,7 @@ impl Default for SessionConfig {
             auto_resume_on_restart: true,
             opencode_preassign_session_id: false,
             mouse_capture: true,
+            host_tab_title: true,
             custom_agents: HashMap::new(),
             agent_detect_as: HashMap::new(),
             agent_config_dir: HashMap::new(),
@@ -5039,6 +5046,7 @@ mod tests {
         let session: SessionConfig = toml::from_str("").unwrap();
         assert!(session.confirm_before_quit, "confirm_before_quit (#1569)");
         assert!(session.confirm_delete, "confirm_delete (#3364)");
+        assert!(session.host_tab_title, "host_tab_title (#3444)");
     }
 
     #[test]

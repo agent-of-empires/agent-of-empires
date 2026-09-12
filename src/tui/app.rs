@@ -185,6 +185,9 @@ pub struct App {
     /// effect without a restart. When false, `sync_mouse_capture` keeps xterm
     /// tracking off entirely.
     mouse_capture_allowed: bool,
+    /// Last OSC 0 host-tab title written. Dedups unchanged selections and
+    /// is invalidated after `tmux attach` so the dashboard title is restored.
+    host_title: super::host_title::HostTitleTracker,
     /// True when running under Mosh (`MOSH_CONNECTION` set). Mosh mangles
     /// xterm mouse-tracking escapes, so `tui::run` skips the startup
     /// `EnableMouseCapture` and `sync_mouse_capture` must not re-enable
@@ -514,6 +517,7 @@ impl App {
             // `mouse_capture_allowed` is permission only and ignores Mosh.
             mouse_captured: crate::tui::mouse_capture_requested(&config.session) && !mosh_active,
             mouse_capture_allowed: crate::tui::mouse_capture_requested(&config.session),
+            host_title: super::host_title::HostTitleTracker::default(),
             mosh_active,
             pending_structured_view_open: None,
             pending_daemon_start_open: None,
@@ -553,6 +557,24 @@ impl App {
             crossterm::execute!(terminal.backend_mut(), DisableMouseCapture)?;
         }
         self.mouse_captured = desired;
+        Ok(())
+    }
+
+    /// Write OSC 0 when the dashboard selection (or its title) changes.
+    ///
+    /// Emitted after the frame so it does not interleave with OSC 8 runs
+    /// inside `HyperlinkBackend::draw`. No-ops when the setting is off
+    /// and we have never written, so opt-out users keep the terminal's
+    /// own naming.
+    fn sync_host_title(&mut self, terminal: &mut Terminal<TuiBackend>) -> Result<()> {
+        let Some(title) = self
+            .host_title
+            .sync(self.home.host_tab_title, self.home.selected_session_title())
+        else {
+            return Ok(());
+        };
+        crossterm::execute!(terminal.backend_mut(), crossterm::terminal::SetTitle(title))?;
+        super::host_title::note_emitted();
         Ok(())
     }
 
@@ -612,6 +634,7 @@ impl App {
         );
         draw_result?;
         end_result?;
+        self.sync_host_title(terminal)?;
         Ok(())
     }
 
@@ -684,6 +707,9 @@ impl App {
         // to the serve view. sync_mouse_capture itself respects the Mouse
         // Capture setting and the AOE_MOUSE_CAPTURE opt-out.
         self.sync_mouse_capture(terminal)?;
+        // Attach may have overwritten the host tab via the pane's OSC 0.
+        self.host_title.invalidate();
+        self.sync_host_title(terminal)?;
         std::io::Write::flush(terminal.backend_mut())?;
 
         // Recreate the event stream with a fresh reader before re-entering the

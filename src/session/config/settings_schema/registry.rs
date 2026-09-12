@@ -119,6 +119,16 @@ mod tests {
     }
 
     #[test]
+    fn session_host_tab_title_is_an_interaction_toggle() {
+        let d = descriptor("session", "host_tab_title").expect("host_tab_title");
+        assert_eq!(d.category, "Interaction");
+        assert_eq!(d.widget, WidgetKind::Toggle);
+        assert!(d.profile_overridable);
+        assert!(!d.advanced);
+        assert!(matches!(d.web_write, WebWritePolicy::Allow));
+    }
+
+    #[test]
     fn session_row_tag_is_select_with_options() {
         let d = descriptor("session", "row_tag").expect("row_tag");
         match &d.widget {
