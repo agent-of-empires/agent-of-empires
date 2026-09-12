@@ -840,14 +840,19 @@ mod tests {
             .unwrap()
             .replace('/', "-");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !output.exists() {
+        loop {
+            match std::fs::read_to_string(&output) {
+                Ok(content) if content == "launched" => break,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("cannot read launch output: {error}"),
+            }
             assert!(
                 std::time::Instant::now() < deadline,
                 "wrapper did not execute the agent command"
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert_eq!(std::fs::read_to_string(&output).unwrap(), "launched");
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "unchanged");
         if let Some((_, kind)) = collision {
             let target =

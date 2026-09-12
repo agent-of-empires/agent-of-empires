@@ -68,6 +68,8 @@ test.describe("Top bar", () => {
     await mockTerminalApis(page);
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/session/pinch-test");
+    await expect(page).toHaveURL((url) => url.pathname === "/session/pinch-test");
+    await expect(page.locator("[data-live-terminal]").first()).toBeVisible();
 
     await page.getByRole("button", { name: "Go to dashboard" }).click();
     await expect(page).toHaveURL("/");

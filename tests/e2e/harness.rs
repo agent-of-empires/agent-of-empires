@@ -584,7 +584,7 @@ last_seen_version = "{}"
             let path = self.home_dir.path().join("input-barrier");
             aoe_cmd = format!(
                 "env -u NO_COLOR AOE_E2E_INPUT_BARRIER={} {aoe_cmd}",
-                path.display()
+                shell_words::quote(path.to_str().expect("input barrier path"))
             );
         }
         for arg in args {
@@ -595,9 +595,9 @@ last_seen_version = "{}"
         if self.recording {
             let cast_path = recordings_dir().join(format!("{}.cast", self.test_name));
             let cmd = format!(
-                "asciinema rec --overwrite --cols 100 --rows 30 -c '{}' {}",
-                aoe_cmd,
-                cast_path.display()
+                "asciinema rec --overwrite --cols 100 --rows 30 -c {} {}",
+                shell_words::quote(&aoe_cmd),
+                shell_words::quote(cast_path.to_str().expect("recording path"))
             );
             self.cast_path = Some(cast_path);
             cmd
@@ -1258,4 +1258,22 @@ impl Drop for TuiTestHarness {
             }
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::parallel]
+fn tui_input_barrier_handles_shell_metacharacters_in_home() {
+    require_tmux!();
+    let home = tempfile::Builder::new()
+        .prefix("aoe ' $ ` ")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let mut harness = TuiTestHarness::with_home("quoted_home", home);
+    harness.spawn_tui();
+    harness.wait_for("No sessions yet");
+    harness.send_keys("q");
+    harness.wait_for("Quit Agent of Empires");
+    harness.send_keys("y");
+    harness.wait_for_exit(Duration::from_secs(5));
 }
