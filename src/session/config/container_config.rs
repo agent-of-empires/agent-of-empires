@@ -68,8 +68,6 @@ struct AgentConfigMount {
     clean_files: &'static [&'static str],
 }
 
-/// Agent config definitions. Each entry describes one agent CLI's config directory.
-/// To add a new agent, add an entry here -- no code changes needed.
 const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
     AgentConfigMount {
         tool_name: "claude",

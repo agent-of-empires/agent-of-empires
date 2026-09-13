@@ -834,40 +834,20 @@ fn find_by_idempotency_key_matches_trashed_but_not_missing() {
 }
 
 #[test]
-fn fork_from_builds_terminal_seed_for_claude() {
-    // A non-structured (terminal) fork resolves through the shared
-    // `terminal_fork_seed` helper; a claude parent id yields a Terminal
-    // seed whose child id is a fresh, valid session id.
-    let seed = resolve_create_fork_seed("claude", "parent-uuid", false)
-        .expect("claude terminal fork allowed");
-    match seed {
-        crate::session::ForkSeed::Terminal {
-            parent_agent_session_id,
-            child_session_id,
-        } => {
-            assert_eq!(parent_agent_session_id, "parent-uuid");
-            assert!(crate::session::capture::is_valid_session_id(
-                &child_session_id
-            ));
-        }
-        _ => panic!("expected Terminal seed"),
+fn fork_from_rejects_unproven_terminal_ids_without_blocking_acp() {
+    let mut parent = Instance::new("parent", "/tmp/repo");
+    parent.tool = "claude".into();
+    parent.agent_session_id = Some("parent-uuid".into());
+    for parents in [&[][..], std::slice::from_ref(&parent)] {
+        assert_eq!(
+            resolve_create_fork_seed("parent-uuid", false, parents),
+            Err(crate::session::ForkDenied::NoParentSession),
+        );
+        assert!(matches!(
+            resolve_create_fork_seed("parent-uuid", true, parents),
+            Ok(crate::session::ForkSeed::Structured { .. }),
+        ));
     }
-}
-
-#[test]
-fn fork_from_builds_structured_seed_when_view_is_structured() {
-    // A structured fork carries the parent's acp_session_id straight onto a
-    // Structured seed; the builder turns that into the one-shot
-    // fork_pending marker and the live session/fork handshake mints the
-    // child id. The terminal forkability check is intentionally skipped.
-    let seed = resolve_create_fork_seed("claude", "parent-acp-id", true)
-        .expect("structured fork seed is always allowed at create time");
-    assert_eq!(
-        seed,
-        crate::session::ForkSeed::Structured {
-            parent_acp_session_id: "parent-acp-id".into(),
-        }
-    );
 }
 
 fn create_body_from_json(value: serde_json::Value) -> CreateSessionBody {
@@ -2139,7 +2119,7 @@ fn apply_post_restart_sync_propagates_agent_session_id() {
         live.omp_capture_generation.as_deref(),
         Some("omp-generation-restart")
     );
-    assert!(live.session_id_poller.is_some());
+    assert!(live.session_id_poller_is_running());
     assert_eq!(live.last_start_time, started.last_start_time);
 
     let mut generation_converged = before.clone();
@@ -2166,6 +2146,11 @@ fn apply_post_restart_sync_propagates_agent_session_id() {
             .expect("running restart poller"),
         &restarted_poller,
     ));
+    let mut peer = before.clone();
+    peer.pi_session_path = Some("/peer/transcript.jsonl".into());
+    let expected = peer.conversation_state();
+    apply_post_restart_identity_sync(&mut peer, &before, &started);
+    assert_eq!(peer.conversation_state(), expected);
     restarted_poller
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())

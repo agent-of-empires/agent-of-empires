@@ -705,23 +705,6 @@ pub(crate) fn resolved_sandbox_config(
     super::config::repo_config::resolve_config_with_repo_or_warn(&resolved, project_path).sandbox
 }
 
-/// Resolve the complete environment inherited by an in-container agent.
-///
-/// Capture resolution needs this transiently because Bun dotenv values may
-/// expand arbitrary launcher variables into one of OMP's routing keys. Callers
-/// must discard unrelated values after resolution.
-pub(crate) fn resolved_sandbox_environment(
-    profile: &str,
-    sandbox: &SandboxInfo,
-    project_path: &std::path::Path,
-) -> Vec<(String, String)> {
-    let sandbox_config = resolved_sandbox_config(profile, project_path);
-    collect_environment(&sandbox_config, sandbox)
-        .into_iter()
-        .map(|entry| (entry.key().to_string(), entry.value().to_string()))
-        .collect()
-}
-
 /// Environment transport for a sandboxed `docker exec` pane.
 ///
 /// Target values are written to a protected env-file opened by the pane
@@ -1045,11 +1028,6 @@ environment = ["GH_TOKEN=write_token"]
         assert!(result_personal
             .env
             .contains(&("GH_TOKEN".to_string(), "write_token".to_string())));
-        assert!(
-            resolved_sandbox_environment("personal", &sandbox, &project_path)
-                .contains(&("GH_TOKEN".to_string(), "write_token".to_string())),
-            "capture metadata must see the exact exec-only sandbox value"
-        );
 
         let result_default = build_docker_env_args("default", &sandbox, &project_path);
         assert_eq!(result_default.docker_args, "--env-file /dev/fd/9");

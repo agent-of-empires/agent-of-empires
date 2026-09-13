@@ -135,9 +135,10 @@ impl Instance {
         let hook_result = self.run_pre_launch_hooks(skip_on_launch, &profile);
         let (_title_lock, _lifecycle_lock) =
             self.reacquire_launch_locks_after_hooks(&storage, hook_result)?;
-        self.apply_fresh_launch_intent();
+        self.reconcile_sidecar_into_disk();
+        let expected = self.apply_fresh_launch_intent();
 
-        let prepared = match self.prepare_launch_command() {
+        let mut prepared = match self.prepare_launch_command(expected) {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.fail_reserved_launch(&storage, &error, false);
@@ -147,6 +148,7 @@ impl Instance {
         let result = (|| {
             if corpse_pane {
                 self.kill_clean_locked()?;
+                prepared = self.refresh_prepared_prime_launch_after_pane_stop(prepared)?;
             }
             let outcome = self.spawn_prepared_launch(size, &profile, prepared)?;
             self.commit_lifecycle_launch(&storage, false)?;
@@ -159,11 +161,12 @@ impl Instance {
         result
     }
 
-    pub(super) fn apply_fresh_launch_intent(&mut self) {
+    pub(super) fn apply_fresh_launch_intent(&mut self) -> ConversationState {
+        let expected = self.conversation_state();
         if std::mem::take(&mut self.force_fresh_next_launch) {
             self.resume_intent = ResumeIntent::Cleared;
         }
-        self.reconcile_sidecar_into_disk();
+        expected
     }
 
     pub(super) fn spawn_prepared_launch(
@@ -189,10 +192,9 @@ impl Instance {
             None
         };
         // Read before `finalize_launch`, which may replace `agent_session_id`.
-        let pinned_prior_sid = self
-            .agent_session_id
-            .clone()
-            .filter(|sid| prepared.expected_prior_sid.as_deref() == Some(sid.as_str()));
+        let pinned_prior_sid = self.agent_session_id.clone().filter(|sid| {
+            prepared.expected_conversation.session_id.as_deref() == Some(sid.as_str())
+        });
 
         tracing::debug!(
             target: "session.store",
@@ -202,7 +204,7 @@ impl Instance {
         );
 
         if !prepared.is_existing {
-            if let Some(prior_sid) = prepared.expected_prior_sid.as_ref() {
+            if let Some(prior_sid) = prepared.expected_conversation.session_id.as_ref() {
                 self.retroactive_capture_excludes.insert(prior_sid.clone());
             }
         }
@@ -273,11 +275,51 @@ impl Instance {
             }
         }
 
+        if let Some(execution) = prepared.execution.take() {
+            self.active_execution = Some(ActiveExecution {
+                launch_id: execution.inputs.launch_id,
+                binding: execution.binding.clone(),
+                capture: execution
+                    .capture
+                    .or_else(|| omp_capture_metadata.clone().map(CaptureContext::Omp)),
+                container: execution.inputs.container,
+            });
+            let native_mints_child = matches!(
+                prepared.expected_conversation.intent,
+                ResumeIntent::Fork { .. }
+            ) && !matches!(
+                execution.agent.fork_strategy,
+                crate::agents::ForkStrategy::ClaudeFork
+            );
+            if native_mints_child {
+                self.set_agent_conversation(None, None, None);
+            } else if let Some(sid) = self.agent_session_id.clone() {
+                let existing = self.agent_session_binding.as_ref().filter(|binding| {
+                    binding.session_id == sid
+                        && binding.execution.as_ref() == Some(&execution.binding)
+                });
+                let binding =
+                    if matches!(prepared.expected_conversation.intent, ResumeIntent::Use(_)) {
+                        self.resume_binding.clone()
+                    } else {
+                        existing.cloned()
+                    }
+                    .unwrap_or(ConversationBinding {
+                        session_id: sid.clone(),
+                        execution: Some(execution.binding.clone()),
+                        provenance: ConversationProvenance::Preallocated,
+                        transcript_path: None,
+                    });
+                self.set_agent_conversation(Some(sid), Some(binding), self.pi_session_path.clone());
+            }
+        } else {
+            self.active_execution = None;
+            self.agent_session_binding = None;
+        }
         self.finalize_launch(
             session.name(),
             profile,
-            prepared.expected_prior_sid.as_deref(),
-            prepared.expected_prior_intent,
+            &prepared.expected_conversation,
             omp_capture_metadata,
         );
 
@@ -292,8 +334,7 @@ impl Instance {
         &mut self,
         session_name: &str,
         profile: &str,
-        expected_prior_sid: Option<&str>,
-        expected_prior_intent: ResumeIntent,
+        expected: &ConversationState,
         mut omp_capture_metadata: Option<OmpCaptureMetadata>,
     ) {
         if let Some(metadata) = omp_capture_metadata.as_ref() {
@@ -317,7 +358,7 @@ impl Instance {
             }
         }
 
-        let outcome = self.persist_session_id(profile, expected_prior_sid, expected_prior_intent);
+        let outcome = self.persist_session_id(profile, expected);
 
         // Skip outcomes leave AOE_CAPTURED_SESSION_ID untouched: this path
         // runs before any poller publish, so env is empty for fresh sessions.
@@ -343,7 +384,7 @@ impl Instance {
         if let Err(e) = crate::tmux::env::set_hidden_env_batch(&entries) {
             let keys: Vec<&str> = entries.iter().map(|(_, k, _)| *k).collect();
             tracing::warn!(target: "session.store",
-                "Failed to set tmux env keys [{}] at finalize_launch: {}", keys.join(", "), e);
+            "Failed to set tmux env keys [{}] at finalize_launch: {}", keys.join(", "), e);
         }
 
         if publish_sid && self.agent_session_id.is_none() {
@@ -352,8 +393,8 @@ impl Instance {
                 crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
             ) {
                 tracing::warn!(target: "session.store",
-                    instance = %self.id,
-                    "Failed to clear captured sid in tmux env: {}", e);
+                instance = %self.id,
+                "Failed to clear captured sid in tmux env: {}", e);
             }
         }
 
@@ -371,29 +412,29 @@ impl Instance {
         let sandbox = self.sandbox_display();
         let options_profile = profile.to_string();
         match std::thread::Builder::new()
-            .name(format!("finalize-tmux-{}", instance_id_for_log))
-            .spawn(move || {
-                if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    crate::tmux::status_bar::apply_all_tmux_options(
-                        &session_name,
-                        &title,
-                        branch.as_deref(),
-                        sandbox.as_ref(),
-                        &options_profile,
-                    );
-                })) {
-                    tracing::error!(target: "session.store", "finalize-tmux thread panicked: {:?}", panic);
-                }
-            }) {
-            Ok(_handle) => {}
-            Err(e) => {
-                tracing::error!(target: "session.store",
-                    session = %instance_id_for_log,
-                    error = %e,
-                    "Failed to spawn finalize-tmux thread"
+        .name(format!("finalize-tmux-{}", instance_id_for_log))
+        .spawn(move || {
+            if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::tmux::status_bar::apply_all_tmux_options(
+                    &session_name,
+                    &title,
+                    branch.as_deref(),
+                    sandbox.as_ref(),
+                    &options_profile,
                 );
+            })) {
+                tracing::error!(target: "session.store", "finalize-tmux thread panicked: {:?}", panic);
             }
+        }) {
+        Ok(_handle) => {}
+        Err(e) => {
+            tracing::error!(target: "session.store",
+                session = %instance_id_for_log,
+                error = %e,
+                "Failed to spawn finalize-tmux thread"
+            );
         }
+    }
     }
 }
 

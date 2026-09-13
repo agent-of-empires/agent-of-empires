@@ -13,8 +13,10 @@ impl Instance {
         )
     }
 
-    pub(crate) fn try_retroactive_capture(&self) -> Option<String> {
-        let (capture, context) = self.resolved_session_support()?;
+    pub(crate) fn try_retroactive_capture(
+        &self,
+    ) -> Option<crate::session::poller::SessionIdObservation> {
+        let (capture, context) = self.source_session_support()?;
         let backend = capture.backend;
         if matches!(
             context,
@@ -27,30 +29,65 @@ impl Instance {
         let result = match backend {
             crate::agents::SessionCaptureBackend::Claude
             | crate::agents::SessionCaptureBackend::HookSidecar => {
-                crate::hooks::read_hook_session_id_any_age(&self.id)
+                return super::execution::hook_session_observation(
+                    &self.id,
+                    self.active_execution.as_ref(),
+                    None,
+                )
+                .filter(|observation| !exclusion.contains(&observation.sid));
             }
-            crate::agents::SessionCaptureBackend::Pi => self.pi_published_session_id(true),
+            crate::agents::SessionCaptureBackend::Pi => {
+                return self
+                    .pi_published_conversation(true)
+                    .filter(|observation| !exclusion.contains(&observation.sid))
+            }
             crate::agents::SessionCaptureBackend::Omp => {
-                let options = self.omp_capture_options()?;
                 let tmux_session_name = self.tmux_env_session_name().or_else(|| {
                     self.tmux_session()
                         .ok()
                         .map(|session| session.name().to_string())
                 })?;
-                let metadata = self.omp_capture_metadata(&tmux_session_name, &options, None)?;
-                if self.is_sandboxed() {
-                    let container_name = self.sandbox_info.as_ref()?.container_name.clone();
-                    let marker = omp_sandbox_launch_marker(&self.id);
+                let metadata = if let Some(active) = &self.active_execution {
+                    let Some(CaptureContext::Omp(metadata)) = &active.capture else {
+                        return None;
+                    };
+                    metadata.clone()
+                } else {
+                    self.omp_capture_metadata(
+                        &tmux_session_name,
+                        &self.omp_capture_options()?,
+                        None,
+                    )?
+                };
+                let container_name = match &self.active_execution {
+                    Some(active) => active
+                        .container
+                        .as_ref()
+                        .map(|container| container.name.as_str()),
+                    None => self
+                        .sandbox_info
+                        .as_ref()
+                        .filter(|sandbox| sandbox.enabled)
+                        .map(|sandbox| sandbox.container_name.as_str()),
+                };
+                return if let Some(container_name) = container_name {
                     try_capture_omp_session_id_in_container(
-                        &container_name,
+                        container_name,
                         &metadata,
                         &exclusion,
-                        Some(&marker),
+                        Some(&metadata.launch_marker),
+                        self.active_execution.as_ref(),
                     )
                     .ok()
                 } else {
-                    capture_omp_session_id(&metadata, &exclusion, &tmux_session_name).ok()
-                }
+                    capture_omp_session_id(
+                        &metadata,
+                        &exclusion,
+                        &tmux_session_name,
+                        self.active_execution.as_ref(),
+                    )
+                    .ok()
+                };
             }
             crate::agents::SessionCaptureBackend::Codex
             | crate::agents::SessionCaptureBackend::Gemini
@@ -59,7 +96,9 @@ impl Instance {
             | crate::agents::SessionCaptureBackend::PrimeAgent
             | crate::agents::SessionCaptureBackend::OpenCode => None,
         };
-        result.and_then(validated_session_id)
+        result
+            .and_then(validated_session_id)
+            .map(crate::session::poller::SessionIdObservation::instance_sidecar)
     }
 
     /// Canonical `(tool, project_path)` keys shared by two or more id-less

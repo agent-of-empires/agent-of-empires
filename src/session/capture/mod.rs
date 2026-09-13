@@ -37,7 +37,7 @@ fn resolve_agent_home(env_var: Option<&str>, default_subdir: &str) -> Result<Pat
 /// Precedence mirrors [`crate::hooks::agent_settings_path_in`]: the session's
 /// host environment first, then AoE's own env (a var exported in the shell that
 /// launched `aoe` is inherited by the agent too), then `~/.claude`.
-fn claude_home_for_host_environment(host_env: &[String]) -> Result<PathBuf> {
+pub(crate) fn claude_home_for_host_environment(host_env: &[String]) -> Result<PathBuf> {
     match claude_config_dir_override(host_env) {
         Some(dir) => Ok(PathBuf::from(dir)),
         None => resolve_agent_home(None, ".claude"),
@@ -127,18 +127,15 @@ pub(crate) fn encode_claude_project_path(project_path: &str) -> String {
 pub(crate) fn claude_host_transcript_confirmed_absent(
     project_path: &str,
     session_id: &str,
-    host_env: &[String],
+    claude_home: &Path,
 ) -> bool {
-    let Ok(claude_home) = claude_home_for_host_environment(host_env) else {
-        return false;
-    };
     let canonical = canonicalize_or_raw(project_path);
     let dir_name = encode_claude_project_path(&canonical.to_string_lossy());
     let transcript = claude_home
         .join("projects")
         .join(dir_name)
         .join(format!("{session_id}.jsonl"));
-    !transcript.is_file()
+    transcript.try_exists().is_ok_and(|exists| !exists)
 }
 
 /// Number of leading lines and bytes scanned when locating a pi-family
@@ -147,7 +144,7 @@ pub(crate) fn claude_host_transcript_confirmed_absent(
 const PI_HEADER_SCAN_LINES: usize = 8;
 const PI_HEADER_SCAN_BYTES: usize = 64 * 1024;
 
-fn extract_pi_header_fields(path: &Path) -> Option<(Option<String>, Option<String>)> {
+pub(crate) fn extract_pi_header_fields(path: &Path) -> Option<(Option<String>, Option<String>)> {
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -220,43 +217,118 @@ pub(crate) fn extract_pi_cwd_from_header(path: &Path) -> Option<String> {
     extract_pi_header_fields(path).and_then(|(_, cwd)| cwd)
 }
 
-/// Polling closure over the sidecar Pi's AoE extension writes: the pane's own
-/// conversation, `/new` included, with no store scan involved.
-///
-/// The source says where the pane publishes: a container's bind-backed
-/// directory or the per-instance hook dir. Getting it wrong is silent, the
-/// poller simply never observing anything, so it is passed in rather than
-/// re-derived here.
+pub(crate) fn read_pi_session_observation(
+    instance_id: &str,
+    source: &crate::session::instance::SessionSidecarSource,
+    active: Option<&crate::session::instance::ActiveExecution>,
+    any_age: bool,
+) -> Option<crate::session::poller::SessionIdObservation> {
+    use crate::session::instance::{CaptureContext, SessionSidecarSource};
+    crate::session::validate_instance_id(instance_id).ok()?;
+    let (sid_leaf, path_leaf) = if let Some(active) = active {
+        let Some(CaptureContext::Pi {
+            source: expected, ..
+        }) = &active.capture
+        else {
+            return None;
+        };
+        if expected != source || active.binding.agent != "pi" {
+            return None;
+        }
+        (
+            crate::hooks::session_id_leaf(Some(&active.launch_id)).ok()?,
+            std::borrow::Cow::Owned(format!("session_path.{}", active.launch_id)),
+        )
+    } else {
+        (
+            std::borrow::Cow::Borrowed("session_id"),
+            std::borrow::Cow::Borrowed("session_path"),
+        )
+    };
+    let read = |leaf: &str, fresh: bool| {
+        source.read_file(
+            instance_id,
+            leaf,
+            4096,
+            fresh.then_some(crate::hooks::SESSION_ID_SIDECAR_MAX_AGE),
+        )
+    };
+    let id_bytes = read(&sid_leaf, !any_age)?;
+    let sid = std::str::from_utf8(&id_bytes).ok()?.trim();
+    Uuid::parse_str(sid).ok()?;
+    let path_bytes = read(&path_leaf, false)?;
+    let path = Path::new(std::str::from_utf8(&path_bytes).ok()?.trim());
+    if !path.is_absolute() || crate::git::template::lexical_normalize(path) != path {
+        return None;
+    }
+    let native = match active.and_then(|active| active.container.as_ref()) {
+        Some(container) => container
+            .runtime
+            .canonical_path(&container.name, path)
+            .ok()?,
+        None if matches!(source, SessionSidecarSource::HostHooks(_)) => {
+            canonicalize_or_raw(path.to_str()?)
+        }
+        None => path.to_path_buf(),
+    };
+    let physical = if let Some(active) = active {
+        let Some(CaptureContext::Pi { root, .. }) = &active.capture else {
+            return None;
+        };
+        if !native.starts_with(root) || native == *root {
+            return None;
+        }
+        match &active.container {
+            Some(container) => container.host_path(&native, true)?,
+            None => native.clone(),
+        }
+    } else {
+        match source {
+            SessionSidecarSource::HostHooks(_) => native.clone(),
+            SessionSidecarSource::SandboxDir(directory) => directory
+                .parent()?
+                .parent()?
+                .join(native.strip_prefix("/root/.pi").ok()?),
+        }
+    };
+    let parent = physical.parent()?;
+    let root = crate::session::AnchoredDir::open(parent).ok()?;
+    let leaf = Path::new(physical.file_name()?);
+    match root.regular_lookup(leaf).ok()? {
+        Some(true) => {
+            if extract_pi_header_fields(&physical)?.0.as_deref() != Some(sid) {
+                return None;
+            }
+        }
+        None => {
+            if leaf.to_str()?.rsplit_once('_')?.1.strip_suffix(".jsonl")? != sid {
+                return None;
+            }
+        }
+        Some(false) => return None,
+    }
+    if read(&sid_leaf, !any_age)? != id_bytes {
+        return None;
+    }
+    let mut observation =
+        crate::session::poller::SessionIdObservation::instance_sidecar(sid.to_owned());
+    observation.pi_session_path = Some(native.to_str()?.to_owned());
+    if let Some(active) = active {
+        let mut binding = active.binding.clone();
+        binding.stores = vec![parent.to_path_buf()];
+        observation.execution = Some(active.clone());
+        observation.source = Some(binding);
+        observation.transcript_path = Some(physical);
+    }
+    Some(observation)
+}
+
 pub(crate) fn pi_sidecar_poll_fn(
     instance_id: String,
     source: crate::session::instance::SessionSidecarSource,
+    active: Option<crate::session::instance::ActiveExecution>,
 ) -> impl Fn() -> Option<crate::session::poller::SessionIdObservation> + Send + 'static {
-    move || {
-        use crate::session::instance::SessionSidecarSource;
-        let id = match source {
-            SessionSidecarSource::SandboxDir(ref dir) => dir
-                .parent()
-                .and_then(Path::parent)
-                .filter(|root| root.join("aoe-session").join(&instance_id) == *dir)
-                .and_then(|root| crate::session::AnchoredDir::open(root).ok())
-                .and_then(|root| {
-                    root.read_regular(
-                        &Path::new("aoe-session")
-                            .join(&instance_id)
-                            .join("session_id"),
-                        4096,
-                    )
-                    .ok()
-                    .flatten()
-                })
-                .and_then(|raw| String::from_utf8(raw).ok())
-                .map(|raw| raw.trim().to_string())
-                .filter(|id| Uuid::parse_str(id).is_ok()),
-            SessionSidecarSource::HostHooks => crate::hooks::read_hook_session_id(&instance_id),
-        };
-        id.and_then(validated_session_id)
-            .map(crate::session::poller::SessionIdObservation::instance_sidecar)
-    }
+    move || read_pi_session_observation(&instance_id, &source, active.as_ref(), false)
 }
 
 pub(crate) const MAX_SESSION_ID_LEN: usize = 256;
@@ -562,9 +634,9 @@ fn kill_serve_group(pid: u32) {
 /// session unowned; AoE never guesses from the shared SQLite store.
 pub(crate) fn preassign_opencode_session_id(
     project_path: &str,
-    environment: &[String],
+    command: std::process::Command,
 ) -> Option<String> {
-    preassign_opencode_session_id_impl(project_path, environment)
+    preassign_opencode_session_id_impl(project_path, command)
         .map_err(|e| {
             tracing::warn!(
                 target: "session.capture",
@@ -577,7 +649,7 @@ pub(crate) fn preassign_opencode_session_id(
 
 fn preassign_opencode_session_id_impl(
     project_path: &str,
-    environment: &[String],
+    mut cmd: std::process::Command,
 ) -> Result<String> {
     // Reserve a free loopback port from the OS, then release it so the spawned
     // server can bind it. The tiny bind/drop/bind race is covered by the
@@ -590,10 +662,6 @@ fn preassign_opencode_session_id_impl(
 
     let id = format!("ses_{}", Uuid::new_v4().simple());
 
-    let mut cmd = std::process::Command::new("opencode");
-    cmd.envs(crate::session::environment::resolve_host_environment_pairs(
-        environment,
-    ));
     cmd.args([
         "serve",
         "--hostname",
@@ -1550,6 +1618,89 @@ pub(crate) fn hermes_poll_fn_sandboxed_store(
 mod tests {
     use super::*;
 
+    #[test]
+    fn pi_publication_rejects_retired_sources_and_torn_paths() {
+        use crate::session::instance::{
+            ActiveExecution, CaptureContext, ExecutionBinding, SessionSidecarSource,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let instance_id = "pi-source-test";
+        let directory = base.join(instance_id);
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = base.join("store");
+        std::fs::create_dir(&store).unwrap();
+        let source = SessionSidecarSource::HostHooks(directory.clone());
+        let mut active = ActiveExecution {
+            launch_id: "11111111-1111-4111-8111-111111111111".into(),
+            binding: ExecutionBinding {
+                agent: "pi".into(),
+                stores: vec![store.clone()],
+                configuration: Vec::new(),
+                cwd: base.clone(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+            },
+            capture: Some(CaptureContext::Pi {
+                source: source.clone(),
+                root: store.clone(),
+            }),
+            container: None,
+        };
+        let sid = "22222222-2222-4222-8222-222222222222";
+        let transcript = store.join(format!("time_{sid}.jsonl"));
+        std::fs::write(
+            &transcript,
+            format!("{{\"type\":\"session\",\"id\":\"{sid}\"}}\n"),
+        )
+        .unwrap();
+        let publish = |active: &ActiveExecution, path: &Path| {
+            std::fs::write(
+                directory.join(format!("session_id.{}", active.launch_id)),
+                sid,
+            )
+            .unwrap();
+            std::fs::write(
+                directory.join(format!("session_path.{}", active.launch_id)),
+                path.to_str().unwrap(),
+            )
+            .unwrap();
+        };
+        publish(&active, &transcript);
+        let observation =
+            read_pi_session_observation(instance_id, &source, Some(&active), true).unwrap();
+        assert_eq!(observation.sid, sid);
+        assert_eq!(observation.pi_session_path.as_deref(), transcript.to_str());
+        assert_eq!(observation.transcript_path.as_ref(), Some(&transcript));
+        assert_eq!(
+            observation.source.as_ref().unwrap().stores,
+            vec![store.clone()]
+        );
+        active.launch_id = "33333333-3333-4333-8333-333333333333".into();
+        std::fs::write(directory.join("session_id"), sid).unwrap();
+        std::fs::write(directory.join("session_path"), transcript.to_str().unwrap()).unwrap();
+        assert!(read_pi_session_observation(instance_id, &source, Some(&active), true).is_none());
+        let foreign = base.join(format!("other_{sid}.jsonl"));
+        std::fs::copy(&transcript, &foreign).unwrap();
+        publish(&active, &foreign);
+        assert!(read_pi_session_observation(instance_id, &source, Some(&active), true).is_none());
+        publish(&active, &transcript);
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"session\",\"id\":\"44444444-4444-4444-8444-444444444444\"}\n",
+        )
+        .unwrap();
+        assert!(read_pi_session_observation(instance_id, &source, Some(&active), true).is_none());
+        std::fs::remove_file(&transcript).unwrap();
+        let pending =
+            read_pi_session_observation(instance_id, &source, Some(&active), true).unwrap();
+        assert_eq!(pending.pi_session_path.as_deref(), transcript.to_str());
+        assert_eq!(pending.source.unwrap().stores, vec![store]);
+    }
+
     #[cfg(unix)]
     fn open_fifo_guard(path: &Path) -> std::fs::File {
         use std::os::unix::fs::OpenOptionsExt;
@@ -1621,6 +1772,8 @@ mod tests {
             "claude-personal".to_string(),
             crate::session::instance::PriorToolSession {
                 agent_session_id: Some(parked_sid.to_string()),
+                agent_session_binding: None,
+                pi_session_path: None,
                 acp_session_id: None,
             },
         );
@@ -1723,28 +1876,20 @@ mod tests {
             .set_times(std::fs::FileTimes::new().set_modified(hour_ago))
             .unwrap();
 
-        let old_val = std::env::var("CLAUDE_CONFIG_DIR").ok();
-        std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
-
         assert!(
-            !claude_host_transcript_confirmed_absent("/tmp/myproject", present, &[]),
+            !claude_host_transcript_confirmed_absent("/tmp/myproject", present, tmp.path()),
             "a transcript on disk (even stale) must not be reported absent"
         );
         assert!(
-            claude_host_transcript_confirmed_absent("/tmp/myproject", missing, &[]),
+            claude_host_transcript_confirmed_absent("/tmp/myproject", missing, tmp.path()),
             "an unwritten sid must be reported confirmed-absent"
         );
         // A project dir that was never created is also confirmed-absent.
         assert!(claude_host_transcript_confirmed_absent(
             "/tmp/never-opened-project",
             present,
-            &[]
+            tmp.path()
         ));
-
-        match old_val {
-            Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
-            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
-        }
     }
 
     #[cfg(unix)]

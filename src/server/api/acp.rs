@@ -2135,11 +2135,17 @@ pub async fn acp_enable(
             .agent_session_id
             .as_deref()
             .map(|sid| {
-                !crate::session::capture::claude_host_transcript_confirmed_absent(
-                    &instance.project_path,
-                    sid,
+                crate::session::capture::claude_home_for_host_environment(
                     &instance.resolved_host_environment(),
                 )
+                .map(|home| {
+                    !crate::session::capture::claude_host_transcript_confirmed_absent(
+                        &instance.project_path,
+                        sid,
+                        &home,
+                    )
+                })
+                .unwrap_or(true)
             })
             .unwrap_or(false);
     let seed = resolve_structured_seed(
@@ -2333,11 +2339,8 @@ pub async fn acp_disable(
     // The idempotent already-terminal case returned above; commit the real
     // ACP-to-terminal transition before worker teardown.
 
-    // Decide whether this swap can preserve context. Resolve the ACTIVE
-    // structured-view adapter (switch_acp_agent can point agent_name away
-    // from the tool's default) and keep context only when it shares a
-    // CLI-resumable transcript with the terminal `<tool> --resume`, and an
-    // acp_session_id was actually captured. See #2252.
+    let expected_conversation = instance.conversation_state();
+    // Only adapters sharing a native transcript can request a terminal handoff.
     let acp_agent = state
         .acp_supervisor
         .pick_agent_for_tool(
@@ -2356,7 +2359,9 @@ pub async fn acp_disable(
             session = %id,
             "keeping context on disable: carrying acp_session_id into agent_session_id for claude --resume"
         );
-        instance.switch_to_terminal_keep_context();
+        if let Err(error) = instance.switch_to_terminal_keep_context() {
+            return (StatusCode::CONFLICT, error.to_string()).into_response();
+        }
     } else {
         instance.view = crate::session::View::Terminal;
         instance.acp_load_session_capable = None;
@@ -2385,12 +2390,11 @@ pub async fn acp_disable(
     // snapshot predates this view transition.
     let persist_acp_session_id = instance.acp_session_id.clone();
     let persist_import_pending = instance.import_pending;
-    let persist_agent_session_id = instance.agent_session_id.clone();
-    let persist_resume_intent = instance.resume_intent.clone();
+    let persist_conversation = instance.conversation_state();
     let disk_acp_session_id = persist_acp_session_id.clone();
     let disk_import_pending = persist_import_pending;
-    let disk_agent_session_id = persist_agent_session_id.clone();
-    let disk_resume_intent = persist_resume_intent.clone();
+    let disk_conversation = persist_conversation.clone();
+    let disk_expected = expected_conversation.clone();
     let id_for_save = id.clone();
     let profile_for_save = profile.clone();
     let file_watch_for_save = state.file_watch.clone();
@@ -2398,12 +2402,15 @@ pub async fn acp_disable(
         let storage = crate::session::Storage::new(&profile_for_save, file_watch_for_save)?;
         storage.update(|all, _groups| {
             if let Some(slot) = all.iter_mut().find(|candidate| candidate.id == id_for_save) {
+                anyhow::ensure!(
+                    !keep_context || disk_expected.matches(slot),
+                    "conversation changed during terminal handoff; retry"
+                );
                 slot.view = crate::session::View::Terminal;
                 slot.acp_session_id = disk_acp_session_id.clone();
                 slot.import_pending = disk_import_pending;
                 if keep_context {
-                    slot.agent_session_id = disk_agent_session_id.clone();
-                    slot.resume_intent = disk_resume_intent.clone();
+                    slot.adopt_conversation_state(disk_conversation.clone());
                 }
             }
             Ok(())
@@ -2414,22 +2421,36 @@ pub async fn acp_disable(
     match save_result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
-            tracing::error!(target: "acp.switch", "save after disable: {e}");
+            return (
+                StatusCode::CONFLICT,
+                format!("terminal handoff was not saved: {e}"),
+            )
+                .into_response();
         }
         Err(join_err) => {
-            tracing::error!(target: "acp.switch", "save task panicked after disable: {join_err}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("terminal handoff save failed: {join_err}"),
+            )
+                .into_response();
         }
     }
     {
         let mut instances = state.instances.write().await;
         if let Some(slot) = instances.iter_mut().find(|i| i.id == id) {
+            if keep_context && !expected_conversation.matches(slot) {
+                return (
+                    StatusCode::CONFLICT,
+                    "conversation changed during terminal handoff; reload before retrying",
+                )
+                    .into_response();
+            }
             slot.view = crate::session::View::Terminal;
             slot.acp_load_session_capable = None;
             slot.acp_session_id = persist_acp_session_id;
             slot.import_pending = persist_import_pending;
             if keep_context {
-                slot.agent_session_id = persist_agent_session_id;
-                slot.resume_intent = persist_resume_intent;
+                slot.adopt_conversation_state(persist_conversation);
             }
             state
                 .mutation_epoch

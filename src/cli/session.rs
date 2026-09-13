@@ -281,10 +281,11 @@ struct CaptureOutput {
 pub struct SetSessionIdArgs {
     /// Session ID or title
     identifier: String,
-    /// Resume target: for resume-enabled agents, a UUID/sid pins subsequent
-    /// launches to that conversation; agents with resume disabled in AoE store
-    /// but do not use it. An empty string forces a one-shot fresh start.
+    /// Conversation to resume. An empty string requests a one-shot fresh start.
     session_id: String,
+    /// Assert the primary native store root, for example CLAUDE_CONFIG_DIR or CODEX_HOME.
+    #[arg(long)]
+    store: Option<std::path::PathBuf>,
 }
 
 #[derive(Args)]
@@ -963,6 +964,19 @@ fn apply_import_mode(
         inst.import_pending = Some(true);
     } else {
         inst.resume_intent = ResumeIntent::Use(s.session_id.clone());
+        inst.resume_binding = Some(crate::session::ConversationBinding {
+            session_id: s.session_id.clone(),
+            execution: Some(crate::session::ExecutionBinding {
+                agent: "claude".into(),
+                stores: vec![s.config_dir.clone()],
+                configuration: Vec::new(),
+                cwd: crate::session::capture::canonicalize_or_raw(&s.cwd),
+                filesystem: "host".into(),
+                cwd_filesystem: "host".into(),
+            }),
+            provenance: crate::session::ConversationProvenance::Imported,
+            transcript_path: None,
+        });
     }
 }
 
@@ -2753,17 +2767,22 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
     let lifecycle_lock = storage
         .acquire_instance_lifecycle_lock(&target_id)
         .context("failed to acquire instance resume-target lock")?;
-    let (title, tool) = storage.update(|instances, _groups| {
+    let title = storage.update(|instances, _groups| {
         super::patch_instance(instances, &target_id, |inst| {
             if inst.is_structured() {
-                anyhow::bail!(
-                    "cannot set resume target on structured view-mode session '{}'; structured view manages its own conversation lifecycle via ACP",
-                    inst.title
-                );
+                anyhow::ensure!(args.store.is_some() && matches!((&new_intent, inst.acp_session_id.as_deref()), (crate::session::ResumeIntent::Use(sid), Some(acp_sid)) if sid == acp_sid),
+                    "ACP manages its own conversation; a native handoff assertion requires its current ID and an explicit --store");
             }
+            let binding = match &new_intent {
+                crate::session::ResumeIntent::Use(sid) => Some(inst.asserted_resume_binding(sid, args.store.as_deref())?),
+                _ => None,
+            };
+            anyhow::ensure!(!inst.is_structured() || binding.as_ref().and_then(|binding| binding.execution.as_ref()).is_some_and(|execution| execution.agent == "claude"),
+                "ACP terminal handoff is supported only for an explicitly bound Claude conversation");
+            inst.resume_binding = binding;
             inst.resume_intent = new_intent.clone();
             inst.resume_probe_failed_sid = None;
-            Ok((inst.title.clone(), inst.tool.clone()))
+            Ok(inst.title.clone())
         })
     })?;
     drop(lifecycle_lock);
@@ -2771,13 +2790,6 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
     match &new_intent {
         crate::session::ResumeIntent::Use(id) => {
             println!("✓ Set resume target for '{}': {}", title, id);
-            if let Some(agent) = crate::agents::get_agent(&tool) {
-                if agent.session_support.is_none() {
-                    eprintln!(
-                        "Warning: {tool} does not support exact native session resume; this ID will be stored but not used."
-                    );
-                }
-            }
         }
         crate::session::ResumeIntent::Cleared => {
             println!(
@@ -3064,7 +3076,7 @@ mod restart_args_tests {
                 live.session_id_poller_is_running(),
                 "capture must be supervised before the blocking attach call"
             );
-            crate::hooks::write_session_id_via_guard(&live.id, first).unwrap();
+            crate::session::publish_host_pi_transcript(&live.id, first, home.path());
             Ok(())
         })
         .unwrap();
@@ -3076,7 +3088,7 @@ mod restart_args_tests {
 
         let second = "01a053b6-c470-78de-9d8f-bc00ef05332b";
         let result = supervise_attach_capture(&mut inst, |live| {
-            crate::hooks::write_session_id_via_guard(&live.id, second).unwrap();
+            crate::session::publish_host_pi_transcript(&live.id, second, home.path());
             Err(anyhow::anyhow!("fake attach failure"))
         });
 
@@ -3365,6 +3377,7 @@ mod set_session_id_tests {
             SetSessionIdArgs {
                 identifier: id.clone(),
                 session_id: "22222222-2222-2222-2222-222222222222".to_string(),
+                store: None,
             },
         )
         .await
@@ -3530,17 +3543,12 @@ mod acp_reject_tests {
             SetSessionIdArgs {
                 identifier: id.clone(),
                 session_id: "11111111-1111-1111-1111-111111111111".to_string(),
+                store: None,
             },
         )
         .await;
 
-        let err = result.expect_err("set-session-id must reject structured view-mode sessions");
-        let msg = format!("{:#}", err);
-        assert!(
-            msg.contains("acp"),
-            "error must mention structured view: {}",
-            msg
-        );
+        assert!(result.is_err());
 
         let loaded = storage.load().unwrap();
         let inst_disk = loaded.iter().find(|i| i.id == id).unwrap();
@@ -3564,6 +3572,7 @@ mod import_tests {
     fn summary(id: &str, cwd: &str, title: Option<&str>) -> ClaudeSessionSummary {
         ClaudeSessionSummary {
             session_id: id.to_string(),
+            config_dir: std::path::PathBuf::from("/claude-import-store"),
             cwd: cwd.to_string(),
             title: title.map(str::to_string),
             last_modified_ms: 0,

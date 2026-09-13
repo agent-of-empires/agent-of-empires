@@ -3,28 +3,10 @@
 use super::*;
 
 impl Instance {
-    /// Persist the conversation Pi's extension last published, before the
-    /// sidecar is cleaned up with the rest of the instance dir.
-    ///
-    /// Without this a CLI-only lifecycle loses a `/new`: no poller is running
-    /// to observe it, and by the next launch the sidecar is gone.
-    /// Record the transcript path for a conversation whose id has not moved,
-    /// which is the common case: the pane published a path this launch and the
-    /// row was already on that conversation.
-    fn persist_pi_session_path(&self, storage: &crate::session::storage::Storage) {
-        let Some(path) = self.pi_published_session_path() else {
-            return;
-        };
-        if self.pi_session_path.as_deref() == Some(path.as_str()) {
-            return;
-        }
-        self.store_pi_session_path(storage, &path);
-    }
-
     /// [`flush_pi_sidecar_conversation`] against this session's own storage,
     /// for teardown paths that hold no handle.
     pub(super) fn flush_pi_sidecar_if_published(&mut self) {
-        if self.resolved_capture_backend() != Some(crate::agents::SessionCaptureBackend::Pi) {
+        if self.source_capture_backend() != Some(crate::agents::SessionCaptureBackend::Pi) {
             return;
         }
         let profile = self.effective_profile();
@@ -37,8 +19,7 @@ impl Instance {
         // Keep the in-memory row with disk: a restart reads it moments later.
         if let Ok(instances) = storage.load() {
             if let Some(row) = instances.iter().find(|i| i.id == self.id) {
-                self.agent_session_id = row.agent_session_id.clone();
-                self.pi_session_path = row.pi_session_path.clone();
+                self.adopt_conversation_state(row.conversation_state());
             }
         }
     }
@@ -47,30 +28,18 @@ impl Instance {
         if !self.uses_pi_session_sidecar() {
             return;
         }
-        // No freshness window here: this is the last read before the sidecar
-        // is deleted, and an idle pane's `/new` can be hours old.
-        let Some(published) = self.pi_published_session_id(true) else {
+        let Some(observation) = self.pi_published_conversation(true) else {
             return;
         };
-        if self.agent_session_id.as_deref() == Some(published.as_str()) {
-            self.persist_pi_session_path(storage);
-            return;
-        }
-        let published_path = self.pi_published_session_path();
-        if let Err(error) = storage.update(|instances, _| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == self.id) {
-                inst.agent_session_id = Some(published.clone());
-                if published_path.is_some() {
-                    inst.pi_session_path = published_path.clone();
-                }
-            }
-            Ok(())
-        }) {
-            tracing::warn!(
-                target: "session.store",
-                instance = %self.id,
-                "could not persist the Pi conversation published at stop: {error}",
-            );
+        let expected = self.conversation_state();
+        if super::sid_persist::persist_session_with_storage(
+            storage,
+            &self.id,
+            &observation,
+            &expected,
+        ) == SidWrite::Failed
+        {
+            tracing::warn!(target: "session.store", instance = %self.id, "could not persist Pi conversation at stop");
         }
     }
 
@@ -388,7 +357,7 @@ mod tests {
             .unwrap();
 
         let published = "01a0538e-5868-7c22-84bc-40cfd7a09ab1";
-        crate::hooks::write_session_id_via_guard(&inst.id, published).unwrap();
+        super::super::test_helpers::publish_host_pi_transcript(&inst.id, published, home.path());
         let sidecar = crate::hooks::ensure_instance_dir_path(&inst.id)
             .unwrap()
             .join("session_id");
@@ -441,7 +410,7 @@ mod tests {
             .unwrap();
 
         let published = "01a05234-8889-72e2-a7c9-7ebc27b25b78";
-        crate::hooks::write_session_id_via_guard(&inst.id, published).unwrap();
+        super::super::test_helpers::publish_host_pi_transcript(&inst.id, published, home.path());
 
         inst.flush_pi_sidecar_conversation(&storage);
 
@@ -473,13 +442,14 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        crate::hooks::write_session_id_via_guard(&inst.id, "published-id").unwrap();
+        let published = "11111111-1111-4111-8111-111111111111";
+        super::super::test_helpers::publish_host_pi_transcript(&inst.id, published, home.path());
 
         inst.flush_pi_sidecar_if_published();
 
         assert_eq!(
             storage.load().unwrap()[0].agent_session_id.as_deref(),
-            Some("published-id")
+            Some(published)
         );
     }
 

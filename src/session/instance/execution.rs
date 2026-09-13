@@ -1,0 +1,1383 @@
+//! Conversation identity is independent of status detection and command spelling.
+
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationProvenance {
+    #[default]
+    Unknown,
+    Preallocated,
+    Observed,
+    Asserted,
+    Imported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ExecutionLocation {
+    pub filesystem: String,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ExecutionBinding {
+    pub agent: String,
+    pub stores: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub configuration: Vec<ExecutionLocation>,
+    pub cwd: PathBuf,
+    pub cwd_filesystem: String,
+    pub filesystem: String,
+}
+
+impl ExecutionBinding {
+    pub(crate) fn key<'a>(&'a self, sid: &'a str) -> ConversationKey<'a> {
+        ConversationKey {
+            session_id: sid,
+            agent: &self.agent,
+            stores: &self.stores,
+            filesystem: &self.filesystem,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationBinding {
+    pub session_id: String,
+    pub execution: Option<ExecutionBinding>,
+    #[serde(default)]
+    pub provenance: ConversationProvenance,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<PathBuf>,
+}
+
+impl ConversationBinding {
+    pub fn unknown(session_id: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            execution: None,
+            provenance: ConversationProvenance::Unknown,
+            transcript_path: None,
+        }
+    }
+
+    pub fn is_known(&self) -> bool {
+        self.execution.is_some()
+            && matches!(
+                self.provenance,
+                ConversationProvenance::Observed
+                    | ConversationProvenance::Asserted
+                    | ConversationProvenance::Imported
+            )
+    }
+
+    pub(crate) fn key(&self) -> Option<ConversationKey<'_>> {
+        let execution = self.execution.as_ref()?;
+        Some(ConversationKey {
+            session_id: &self.session_id,
+            agent: &execution.agent,
+            stores: &execution.stores,
+            filesystem: &execution.filesystem,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ConversationKey<'a> {
+    session_id: &'a str,
+    agent: &'a str,
+    stores: &'a [PathBuf],
+    filesystem: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ActiveExecution {
+    pub(crate) launch_id: String,
+    pub(crate) binding: ExecutionBinding,
+    pub(crate) capture: Option<CaptureContext>,
+    pub(crate) container: Option<crate::containers::ContainerExecutionSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum CaptureContext {
+    Hooks(PathBuf),
+    Store {
+        root: PathBuf,
+        cwd: String,
+    },
+    Pi {
+        source: super::SessionSidecarSource,
+        root: PathBuf,
+    },
+    Omp(super::OmpCaptureMetadata),
+    Prime {
+        plan: super::PrimeAgentCapturePlan,
+        sidecar: Option<super::SessionSidecarSource>,
+    },
+}
+
+use super::{Instance, ResumeIntent};
+use crate::agents::{AgentDef, AGENTS};
+use anyhow::{bail, Context, Result};
+
+pub(super) struct NativeExecution {
+    pub(super) agent: &'static AgentDef,
+    pub(super) binding: ExecutionBinding,
+    pub(super) routing: Vec<(String, Option<String>)>,
+    pub(super) omp: Option<crate::session::capture::OmpResolvedContext>,
+    pub(super) inputs: NativeLaunchInputs,
+    pub(super) program: PathBuf,
+    pub(super) capture: Option<CaptureContext>,
+    pub(super) pi_transcript_path: Option<String>,
+    pub(super) namespace_arguments: Vec<String>,
+    pub(super) target_session_id: Option<String>,
+    pub(super) pi_pinnable: bool,
+    pub(super) opencode_preassign: bool,
+}
+pub(super) struct NativeLaunchInputs {
+    pub(super) launch_id: String,
+    pub(super) environment: std::collections::HashMap<String, String>,
+    pub(super) cwd: PathBuf,
+    pub(super) profile: String,
+    pub(super) container: Option<crate::containers::ContainerExecutionSnapshot>,
+    pub(super) docker_env: Option<crate::session::environment::DockerExecEnv>,
+    pub(super) pane_env: Vec<crate::tmux::PaneEnvMutation>,
+    pub(super) identity_extension: Option<(String, String)>,
+}
+impl NativeLaunchInputs {
+    fn read_native_file(&self, path: &std::path::Path) -> Result<Option<Vec<u8>>> {
+        let native = self.canonical_path(path)?;
+        let location = self.physical_location(&native);
+        anyhow::ensure!(
+            location.filesystem == "host",
+            "native configuration requires a local filesystem projection"
+        );
+        match std::fs::symlink_metadata(&location.path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+        let parent = location
+            .path
+            .parent()
+            .context("native configuration has no parent")?;
+        let leaf = location
+            .path
+            .file_name()
+            .context("native configuration has no filename")?;
+        let directory = crate::session::AnchoredDir::open(parent)?;
+        directory
+            .read_regular(std::path::Path::new(leaf), 65536)?
+            .map(Some)
+            .context("native configuration is not a bounded regular file")
+    }
+
+    fn canonical_path(&self, path: &std::path::Path) -> Result<PathBuf> {
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.cwd.join(path)
+        };
+        match &self.container {
+            Some(container) => container.runtime.canonical_path(&container.name, &path),
+            None => Ok(path
+                .canonicalize()
+                .unwrap_or_else(|_| crate::git::template::lexical_normalize(&path))),
+        }
+    }
+
+    fn physical_location(&self, canonical_path: &std::path::Path) -> ExecutionLocation {
+        match &self.container {
+            Some(container) => {
+                let (filesystem, path) = container.physical_path(canonical_path);
+                ExecutionLocation { filesystem, path }
+            }
+            None => ExecutionLocation {
+                filesystem: "host".into(),
+                path: canonical_path.to_path_buf(),
+            },
+        }
+    }
+
+    fn native_transcript_path(
+        &self,
+        file: &std::path::Path,
+        root: &std::path::Path,
+    ) -> Result<PathBuf> {
+        let path = match &self.container {
+            None => file.to_path_buf(),
+            Some(container) => container
+                .mounts
+                .iter()
+                .filter(|mount| !mount.read_only)
+                .find_map(|mount| {
+                    let source = crate::session::capture::canonicalize_or_raw(&mount.host_path);
+                    let path =
+                        PathBuf::from(&mount.container_path).join(file.strip_prefix(source).ok()?);
+                    (path.starts_with(root)
+                        && container.host_path(&path, true).as_deref() == Some(file))
+                    .then_some(path)
+                })
+                .context("transcript no longer belongs to the inspected writable native store")?,
+        };
+        self.canonical_path(&path)
+    }
+
+    fn resolve_program(&self, program: &str) -> Result<PathBuf> {
+        let path = self.environment.get("PATH").map(String::as_str);
+        let Some(container) = &self.container else {
+            return which::which_in(program, path, &self.cwd)
+                .context("native program is unavailable in the prepared PATH");
+        };
+        let args = [
+            "/bin/sh",
+            "-c",
+            r#"PATH=$1; export PATH; case "$2" in -*) exit 1;; esac; command -v "$2""#,
+            "aoe-native-program",
+            path.unwrap_or(""),
+            program,
+        ]
+        .map(str::to_owned);
+        let output = crate::session::capture::run_with_timeout_limit(
+            container.runtime.exec(
+                &container.name,
+                self.cwd.to_str().context("native cwd is not UTF-8")?,
+                &args,
+            ),
+            std::time::Duration::from_secs(5),
+            "native executable lookup",
+            8192,
+        )?;
+        let output = String::from_utf8(output).context("native executable path is not UTF-8")?;
+        let output = output.strip_suffix('\n').unwrap_or(&output);
+        anyhow::ensure!(
+            !output.is_empty() && !output.contains('\n'),
+            "native executable lookup is ambiguous"
+        );
+        self.canonical_path(std::path::Path::new(output))
+    }
+
+    fn hook_capture_context(&self, instance_id: &str) -> Result<Option<CaptureContext>> {
+        let leaf = crate::hooks::session_id_leaf(Some(&self.launch_id))?;
+        let directory = if self.container.is_some() {
+            PathBuf::from(crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER).join(instance_id)
+        } else {
+            crate::hooks::hook_base_path().join(instance_id)
+        };
+        let path = self.canonical_path(&directory.join(leaf.as_ref()))?;
+        let location = self.physical_location(&path);
+        Ok((location.filesystem == "host").then_some(CaptureContext::Hooks(location.path)))
+    }
+}
+
+pub(super) fn hook_session_observation(
+    instance_id: &str,
+    active_execution: Option<&ActiveExecution>,
+    max_age: Option<std::time::Duration>,
+) -> Option<crate::session::poller::SessionIdObservation> {
+    let Some(active) = active_execution else {
+        return crate::hooks::read_hook_session_id_within(instance_id, "session_id", max_age)
+            .map(crate::session::poller::SessionIdObservation::instance_sidecar);
+    };
+    let CaptureContext::Hooks(source) = active.capture.as_ref()? else {
+        return None;
+    };
+    let leaf = crate::hooks::session_id_leaf(Some(&active.launch_id)).ok()?;
+    if source.file_name()? != std::ffi::OsStr::new(leaf.as_ref()) {
+        return None;
+    }
+    let bytes = crate::hooks::read_hook_sidecar_at(
+        instance_id,
+        source.parent()?,
+        &leaf,
+        crate::session::capture::MAX_SESSION_ID_LEN + 1,
+        max_age,
+    )?;
+    let sid = std::str::from_utf8(&bytes).ok()?.trim().to_owned();
+    if !crate::session::capture::is_valid_session_id(&sid) {
+        return None;
+    }
+    let mut observation = crate::session::poller::SessionIdObservation::instance_sidecar(sid);
+    observation.execution = Some(active.clone());
+    observation.source = Some(active.binding.clone());
+    Some(observation)
+}
+
+impl Instance {
+    pub(super) fn sandbox_launch_environment(
+        &self,
+        agent: Option<&AgentDef>,
+        identity_extension: Option<&(String, String)>,
+        profile: &str,
+        source: Option<&str>,
+    ) -> Result<crate::session::environment::DockerExecEnv> {
+        let sandbox = self
+            .sandbox_info
+            .as_ref()
+            .filter(|sandbox| sandbox.enabled)
+            .context("sandbox launch has no container")?;
+        let managed_codex_home = crate::session::config::container_config::managed_codex_home(
+            &self.tool,
+            agent.map(|agent| agent.name),
+            &self.source_profile,
+            &self.id,
+        )?;
+        let mut environment =
+            crate::session::environment::build_docker_env_args_with_managed_codex_home(
+                &self.source_profile,
+                sandbox,
+                std::path::Path::new(&self.project_path),
+                managed_codex_home.as_deref(),
+            );
+        environment
+            .env
+            .push(("AOE_PROFILE".into(), profile.to_owned()));
+        environment
+            .env
+            .push(("AOE_INSTANCE_ID".into(), self.id.clone()));
+        if let Some(source) = source {
+            environment
+                .env
+                .push((crate::hooks::SESSION_SOURCE_ENV.into(), source.to_owned()));
+        }
+        if let Some((key, value)) = agent.and_then(|agent| {
+            agent
+                .container_env
+                .iter()
+                .find(|(key, _)| *key == "PRIME_AGENT_CODING_AGENT_DIR")
+        }) {
+            environment
+                .env
+                .push(((*key).to_owned(), (*value).to_owned()));
+        }
+        if let Some((_, values)) = identity_extension {
+            for entry in shell_words::split(values)? {
+                let (key, value) = entry
+                    .split_once('=')
+                    .context("invalid identity publisher environment")?;
+                environment.env.push((key.to_owned(), value.to_owned()));
+            }
+            let root_only = matches!(
+                agent
+                    .and_then(|agent| agent.session_support.as_ref())
+                    .and_then(|support| support.capture.as_ref())
+                    .and_then(|capture| capture.backend.identity_publisher()),
+                Some(crate::agents::SessionIdentityPublisher::Extension { root_only: true })
+            );
+            environment.env.push((
+                "AOE_SESSION_ROOT_ONLY".into(),
+                if root_only { "1" } else { "0" }.into(),
+            ));
+        }
+        environment.docker_args = format!(
+            "--env-file {}",
+            crate::session::environment::CONTAINER_EXEC_ENV_PATH
+        );
+        Ok(environment)
+    }
+
+    pub(super) fn native_launch_inputs(&self, agent: &AgentDef) -> Result<NativeLaunchInputs> {
+        let launch_id = uuid::Uuid::new_v4().to_string();
+        let profile = self.effective_profile();
+        let identity_extension = self.identity_extension_launch();
+        if let Some(sandbox) = self.sandbox_info.as_ref().filter(|sandbox| sandbox.enabled) {
+            let docker_env = self.sandbox_launch_environment(
+                Some(agent),
+                identity_extension.as_ref(),
+                &profile,
+                Some(&launch_id),
+            )?;
+            let runtime = crate::containers::RuntimeExecutionSnapshot::capture(
+                &crate::containers::get_container_runtime(),
+            )?;
+            let container = crate::containers::ContainerExecutionSnapshot::capture(
+                runtime,
+                &sandbox.container_name,
+            )?;
+            let cwd = container.runtime.canonical_path(
+                &container.name,
+                std::path::Path::new(&self.container_workdir()),
+            )?;
+            let mut environment = crate::session::capture::read_container_environment(
+                &container.runtime,
+                &container.name,
+            )?;
+            environment.extend(docker_env.env.iter().cloned());
+            Ok(NativeLaunchInputs {
+                launch_id,
+                environment,
+                cwd,
+                container: Some(container),
+                docker_env: Some(docker_env),
+                pane_env: Vec::new(),
+                identity_extension,
+                profile,
+            })
+        } else {
+            let entries = self.resolved_host_environment();
+            let mut environment = crate::session::capture::host_launcher_environment(&entries);
+            environment.insert(crate::hooks::SESSION_SOURCE_ENV.into(), launch_id.clone());
+            if let Some((_, values)) = &identity_extension {
+                for entry in shell_words::split(values)? {
+                    let (key, value) = entry
+                        .split_once('=')
+                        .context("invalid identity publisher environment")?;
+                    environment.insert(key.to_owned(), value.to_owned());
+                }
+            }
+            let pane_env = crate::session::environment::resolve_host_environment_pairs(&entries)
+                .into_iter()
+                .map(|(key, value)| crate::tmux::PaneEnvMutation::set(key, value))
+                .collect();
+            Ok(NativeLaunchInputs {
+                launch_id,
+                environment,
+                cwd: crate::session::capture::canonicalize_or_raw(&self.project_path),
+                container: None,
+                docker_env: None,
+                pane_env,
+                identity_extension,
+                profile,
+            })
+        }
+    }
+}
+
+impl Instance {
+    pub(crate) fn fork_parent_binding(&self) -> Option<&ConversationBinding> {
+        let (sid, binding) = match &self.resume_intent {
+            ResumeIntent::Fork { .. } => return None,
+            ResumeIntent::Use(sid) => (Some(sid), self.resume_binding.as_ref()),
+            _ => (
+                self.agent_session_id.as_ref(),
+                self.agent_session_binding.as_ref(),
+            ),
+        };
+        binding.filter(|binding| Some(&binding.session_id) == sid && binding.is_known())
+    }
+
+    pub(super) fn execution_agent(&self) -> Result<&'static AgentDef> {
+        let command = self.get_tool_command();
+        anyhow::ensure!(!Self::contains_active_shell_syntax(command),
+            "managed conversation requires a direct native command or an explicitly declared wrapper");
+        let words = shell_words::split(command)?;
+        let program = words.first().context("empty agent command")?;
+        let direct = AGENTS.iter().find(|agent| agent.binary == program);
+        let config = crate::session::config::profile_config::resolve_config_or_warn(
+            &self.effective_profile(),
+        );
+        let declared = config
+            .session
+            .agent_execution_as
+            .get(&self.tool)
+            .map(|name| {
+                crate::agents::get_agent(name)
+                    .context("agent_execution_as names an unknown builtin")
+            })
+            .transpose()?;
+        let logical = crate::agents::get_agent(&self.tool);
+        let actual = direct.or(declared).context(
+            "wrapper execution identity is unknown: set session.agent_execution_as and session.agent_config_dir; agent_detect_as is only status detection")?;
+        anyhow::ensure!(
+            logical.is_none_or(|logical| logical.name == actual.name)
+                && declared.is_none_or(|declared| declared.name == actual.name),
+            "agent command contradicts the selected native execution identity"
+        );
+        if direct.is_none() {
+            let basename = std::path::Path::new(program)
+                .file_name()
+                .and_then(|name| name.to_str());
+            anyhow::ensure!(
+                !AGENTS
+                    .iter()
+                    .any(|agent| Some(agent.binary) == basename && agent.name != actual.name),
+                "wrapper command names a different native agent"
+            );
+            anyhow::ensure!(
+                config.session.agent_config_dir.contains_key(&self.tool),
+                "wrapper requires an explicit session.agent_config_dir namespace"
+            );
+        }
+        Ok(actual)
+    }
+
+    pub(super) fn managed_user_argv(&self, agent: &AgentDef) -> Result<Option<String>> {
+        let extra = if self.command.is_empty() {
+            crate::session::config::quote_model_value_in_args(&self.extra_args)
+        } else {
+            self.extra_args.clone()
+        };
+        anyhow::ensure!(
+            !Self::contains_active_shell_syntax(&extra),
+            "managed conversation cannot use active shell syntax in arguments"
+        );
+        let mut words = shell_words::split(self.get_tool_command())?;
+        words.extend(shell_words::split(&extra)?);
+        validate_managed_arguments(agent, &words[1..])
+    }
+
+    pub(super) fn resolve_native_execution(
+        &self,
+        target: Option<(&str, Option<&ConversationBinding>, bool)>,
+    ) -> Result<NativeExecution> {
+        let agent = self.execution_agent()?;
+        let session_dir = self.managed_user_argv(agent)?;
+        let target_session_id = target.map(|(sid, _, _)| sid.to_owned());
+        let mut inputs = self.native_launch_inputs(agent)?;
+        let words = shell_words::split(self.get_tool_command())?;
+        let program =
+            inputs.resolve_program(words.first().context("native program is missing")?)?;
+        anyhow::ensure!(
+            program.is_absolute() && program.to_str().is_some(),
+            "native program must have an absolute UTF-8 path"
+        );
+        let mut prime = (agent.name == "prime-agent" && inputs.container.is_some())
+            .then(|| self.prime_agent_capture_plan_from_inputs(&inputs))
+            .transpose()?;
+        let value = |key: &str| inputs.environment.get(key).cloned();
+        let home = value("HOME")
+            .filter(|home| !home.is_empty())
+            .map(PathBuf::from)
+            .context("native HOME is unavailable")?;
+        let absolute = |path: PathBuf| {
+            crate::git::template::lexical_normalize(&if path.is_absolute() {
+                path
+            } else {
+                inputs.cwd.join(path)
+            })
+        };
+        let config = crate::session::config::profile_config::resolve_config_or_warn(
+            &self.effective_profile(),
+        );
+        let declared = config
+            .session
+            .agent_config_dir_for(&self.tool, &home)
+            .filter(|_| inputs.container.is_none())
+            .map(absolute);
+        let config_home = absolute(
+            value("XDG_CONFIG_HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".config")),
+        );
+        let data_home = absolute(
+            value("XDG_DATA_HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".local/share")),
+        );
+        let mut routing = Vec::new();
+        let mut configuration = Vec::new();
+        let mut pi_root = None;
+        let mut pi_transcript_path = None;
+        let mut namespace_arguments = Vec::new();
+        let mut roots = match agent.name {
+            "claude" => {
+                let root = absolute(declared.clone().or_else(|| value("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty()).map(PathBuf::from))
+                    .unwrap_or_else(|| home.join(".claude")));
+                routing.push(("CLAUDE_CONFIG_DIR".into(), Some(root.to_str().context("native store is not UTF-8")?.to_owned())));
+                vec![root]
+            }
+            "codex" => {
+                anyhow::ensure!(inputs.container.is_some() || !crate::process::HAS_CODEX_MANAGED_PREFERENCES, "Codex managed preferences cannot be attested by the local file contract");
+                for key in ["CODEX_EXEC_SERVER_URL", "OPENAI_FEDERATION_RULE_ID", "OPENAI_IDENTITY_TOKEN_FILE", "OPENAI_WORKLOAD_IDENTITY_CONTEXT"] {
+                    anyhow::ensure!(value(key).is_none(), "managed Codex does not support {key}");
+                    routing.push((key.into(), None));
+                }
+                let root = inputs.canonical_path(&absolute(declared.clone().or_else(|| value("CODEX_HOME").filter(|value| !value.is_empty()).map(PathBuf::from))
+                    .unwrap_or_else(|| home.join(".codex"))))?;
+                let location = inputs.physical_location(&root);
+                anyhow::ensure!(location.filesystem == "host" && location.path.is_dir(), "managed Codex requires an existing local CODEX_HOME");
+                for file in [PathBuf::from("/etc/codex/requirements.toml"), PathBuf::from("/etc/codex/managed_config.toml")] {
+                    anyhow::ensure!(inputs.read_native_file(&file)?.is_none(), "Codex managed requirements require an independently attested namespace");
+                    configuration.push(file);
+                }
+                let mut sqlite = value("CODEX_SQLITE_HOME").filter(|value| !value.trim().is_empty()).map(|value| absolute(PathBuf::from(value.trim()))).unwrap_or_else(|| root.clone());
+                let user_config = root.join("config.toml");
+                for file in [PathBuf::from("/etc/codex/config.toml"), user_config.clone()] {
+                    if let Some(bytes) = inputs.read_native_file(&file)? {
+                        let settings: toml::Table = toml::from_str(std::str::from_utf8(&bytes)?)?;
+                        anyhow::ensure!(!settings.contains_key("profile"), "managed Codex does not support a selected configuration profile");
+                        anyhow::ensure!(settings.get("cli_auth_credentials_store").is_none_or(|mode| mode.as_str() == Some("file")), "Codex keyring and external authentication do not attest a local namespace");
+                        anyhow::ensure!(settings.get("experimental_thread_store").is_none_or(|store| store.get("type").and_then(toml::Value::as_str) == Some("local")), "managed Codex requires its durable local thread store");
+                        if let Some(path) = settings.get("sqlite_home") {
+                            let path = PathBuf::from(path.as_str().context("Codex sqlite_home must be a path")?);
+                            sqlite = if path.is_absolute() { path } else { file.parent().unwrap().join(path) };
+                        }
+                    }
+                    configuration.push(file);
+                }
+                for directory in inputs.cwd.ancestors() {
+                    let file = directory.join(".codex/config.toml");
+                    if file == user_config { continue; }
+                    if let Some(bytes) = inputs.read_native_file(&file)? {
+                        let settings: toml::Table = toml::from_str(std::str::from_utf8(&bytes)?)?;
+                        anyhow::ensure!(["sqlite_home", "experimental_thread_store", "cli_auth_credentials_store", "profile"].iter().all(|key| !settings.contains_key(*key)), "Codex project routing requires its native trust and profile resolution");
+                    }
+                    configuration.push(file);
+                }
+                let auth_file = root.join("auth.json");
+                let bytes = inputs.read_native_file(&auth_file)?.context("Codex login may select cloud-managed requirements; a local API-key authentication contract is required")?;
+                let auth: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&bytes)?;
+                anyhow::ensure!(["tokens", "agent_identity", "personal_access_token"].iter().all(|key| auth.get(*key).is_none_or(serde_json::Value::is_null))
+                    && auth.get("auth_mode").is_none_or(|mode| mode.is_null() || mode.as_str() == Some("apikey"))
+                    && auth.get("OPENAI_API_KEY").and_then(serde_json::Value::as_str).is_some_and(|key| !key.trim().is_empty()), "Codex authentication may select cloud-managed requirements; its namespace is unproven");
+                configuration.push(auth_file);
+                let sqlite = inputs.canonical_path(&sqlite)?;
+                routing.push(("CODEX_HOME".into(), Some(root.to_str().context("Codex home is not UTF-8")?.into())));
+                routing.push(("CODEX_SQLITE_HOME".into(), Some(sqlite.to_str().context("Codex SQLite home is not UTF-8")?.into())));
+                namespace_arguments.extend(["-c".into(), format!("sqlite_home={}", toml::Value::String(sqlite.to_str().unwrap().into())), "-c".into(), "experimental_thread_store={type=\"local\"}".into(), "-c".into(), "cli_auth_credentials_store=\"file\"".into()]);
+                vec![root, sqlite]
+            }
+            "opencode" => {
+                anyhow::ensure!(value("OPENCODE_CONFIG_CONTENT").is_none(), "managed OpenCode does not support OPENCODE_CONFIG_CONTENT");
+                let data = data_home.join("opencode");
+                let config = absolute(declared.clone().or_else(|| value("OPENCODE_CONFIG_DIR").filter(|value| !value.is_empty()).map(PathBuf::from))
+                    .unwrap_or_else(|| config_home.join("opencode")));
+                routing.push(("OPENCODE_CONFIG_DIR".into(), Some(config.to_str().context("OpenCode configuration path is not UTF-8")?.to_owned())));
+                configuration.push(config);
+                let database = if let Some(raw) = value("OPENCODE_DB").filter(|value| !value.is_empty()) {
+                    anyhow::ensure!(raw != ":memory:", "managed OpenCode requires a durable database");
+                    let path = PathBuf::from(raw);
+                    if path.is_absolute() { path } else { data.join(path) }
+                } else {
+                    anyhow::ensure!(matches!(value("OPENCODE_DISABLE_CHANNEL_DB").as_deref(), Some("1" | "true")),
+                        "OpenCode build channel does not prove its database filename; configure OPENCODE_DB with the path reported by opencode db path");
+                    data.join("opencode.db")
+                };
+                let database = inputs.canonical_path(&database)?;
+                anyhow::ensure!(value("OPENCODE_WORKSPACE_ID").is_none_or(|value| value.is_empty()), "managed OpenCode does not support workspace routing");
+                if let Some((sid, _, _)) = target {
+                    let location = inputs.physical_location(&database);
+                    anyhow::ensure!(location.filesystem == "host", "OpenCode routing requires a local database projection");
+                    let connection = rusqlite::Connection::open_with_flags(location.path.canonicalize()?,
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW)?;
+                    connection.busy_timeout(std::time::Duration::from_millis(100))?;
+                    let (workspace, directory): (bool, String) = connection.query_row(
+                        "SELECT workspace_id IS NOT NULL, directory FROM session WHERE id = ?1 AND length(CAST(directory AS BLOB)) <= 65536", [sid], |row| Ok((row.get(0)?, row.get(1)?)))
+                        .context("OpenCode target or its native routing schema is unavailable")?;
+                    anyhow::ensure!(!workspace, "OpenCode target may forward to another workspace; managed resume and fork are refused");
+                    for (offset, byte) in directory.bytes().enumerate() {
+                        if byte == b'%' {
+                            anyhow::ensure!(directory.as_bytes().get(offset + 1..offset + 3).is_some_and(|escape| escape.iter().all(u8::is_ascii_hexdigit)), "OpenCode working directory has invalid URI encoding");
+                        }
+                    }
+                    let directory = percent_encoding::percent_decode_str(&directory).decode_utf8().context("OpenCode working directory is not UTF-8")?;
+                    anyhow::ensure!(std::path::Path::new(directory.as_ref()).is_absolute()
+                        && inputs.canonical_path(std::path::Path::new(directory.as_ref()))? == inputs.cwd, "OpenCode target routes to a different working directory");
+                }
+                routing.push(("OPENCODE_DB".into(), Some(database.to_str().context("OpenCode database path is not UTF-8")?.into())));
+                if let Some(path) = value("OPENCODE_CONFIG").filter(|value| !value.is_empty()).map(PathBuf::from).map(absolute) {
+                    routing.push(("OPENCODE_CONFIG".into(), Some(path.to_str().context("OpenCode config path is not UTF-8")?.into())));
+                    configuration.push(path);
+                }
+                routing.push(("OPENCODE_CONFIG_CONTENT".into(), None));
+                routing.push(("OPENCODE_WORKSPACE_ID".into(), None));
+                vec![database]
+            }
+            "pi" => {
+                let expand = |raw: &str| absolute(if raw == "~" { home.clone() }
+                    else if let Some(relative) = raw.strip_prefix("~/") { home.join(relative) }
+                    else { PathBuf::from(raw) });
+                let agent_dir = inputs.canonical_path(&declared.clone().or_else(|| value("PI_CODING_AGENT_DIR").filter(|value| !value.is_empty()).map(|value| expand(&value)))
+                    .unwrap_or_else(|| home.join(".pi/agent")))?;
+                routing.push(("PI_CODING_AGENT_DIR".into(), Some(agent_dir.to_str().context("Pi agent directory is not UTF-8")?.into())));
+                routing.push(("PI_CODING_AGENT_SESSION_DIR".into(), value("PI_CODING_AGENT_SESSION_DIR")));
+                configuration.push(agent_dir.clone());
+                let mut selected = session_dir.clone().or_else(|| value("PI_CODING_AGENT_SESSION_DIR"));
+                if selected.is_none() {
+                    for file in [inputs.cwd.join(".pi/settings.json"), agent_dir.join("settings.json")] {
+                        let file = inputs.canonical_path(&file)?;
+                        let location = inputs.physical_location(&file);
+                        anyhow::ensure!(location.filesystem == "host", "Pi settings require a supported local filesystem projection");
+                        configuration.push(file);
+                        if let Some(mut settings) = super::session_id::read_session_settings(&location.path)? {
+                            if let Some(value) = settings.remove("sessionDir") {
+                                selected = Some(value.as_str().context("Pi sessionDir must be a string")?.to_owned());
+                                break;
+                            }
+                        }
+                    }
+                }
+                let custom = selected.is_some();
+                let root = inputs.canonical_path(&match selected {
+                    Some(ref path) => { anyhow::ensure!(!path.is_empty(), "Pi session directory is empty"); expand(path) },
+                    None => agent_dir.join("sessions"),
+                })?;
+                let mut store = root.clone();
+                if let Some((sid, binding, explicit)) = target {
+                    if let Some(binding) = binding.filter(|binding| binding.session_id == sid) {
+                        if let Some(file) = &binding.transcript_path {
+                            anyhow::ensure!(binding.execution.as_ref().is_some_and(|source| source.filesystem == "host"), "Pi transcript filesystem is unsupported");
+                            let native = inputs.native_transcript_path(file, &root)?;
+                            let parent = native.parent().context("Pi transcript has no parent directory")?;
+                            anyhow::ensure!(native.starts_with(&root) && (!custom || parent == root), "Pi transcript does not belong to the configured session directory");
+                            let directory = crate::session::AnchoredDir::open(file.parent().context("Pi transcript has no parent")?)?;
+                            match directory.regular_lookup(std::path::Path::new(file.file_name().context("Pi transcript has no filename")?))? {
+                                Some(true) => {
+                                    let (header_sid, _) = crate::session::capture::extract_pi_header_fields(file).context("Pi transcript has no readable session header")?;
+                                    anyhow::ensure!(header_sid.as_deref() == Some(sid), "Pi transcript names a different conversation");
+                                    pi_transcript_path = Some(native.to_str().context("Pi transcript path is not UTF-8")?.to_owned());
+                                }
+                                None => anyhow::ensure!(!explicit && file.file_name().and_then(|name| name.to_str()).and_then(|name| name.rsplit_once('_')).and_then(|(_, tail)| tail.strip_suffix(".jsonl")) == Some(sid), "explicit Pi resume requires a materialized transcript"),
+                                Some(false) => anyhow::bail!("Pi transcript is not a regular file"),
+                            }
+                            store = parent.to_path_buf();
+                            if session_dir.is_none() {
+                                namespace_arguments.extend(["--session-dir".into(), store.to_str().context("Pi store path is not UTF-8")?.into()]);
+                            }
+                        } else {
+                            anyhow::ensure!(!explicit && binding.provenance == ConversationProvenance::Preallocated,
+                                "Pi resume requires its exact transcript path; rebind with aoe session set-session-id and --store pointing to the transcript");
+                        }
+                    }
+                }
+                pi_root = Some(if namespace_arguments.is_empty() { root } else { store.clone() });
+                vec![store]
+            }
+            "prime-agent" if prime.is_some() => {
+                configuration.push(PathBuf::from(crate::session::config::container_config::PRIME_AGENT_DIR_IN_CONTAINER));
+                vec![prime.as_ref().unwrap().container_session_dir.clone()]
+            }
+            "omp" => Vec::new(),
+            "kimi" | "copilot" => {
+                let (key, suffix) = if agent.name == "kimi" { ("KIMI_SHARE_DIR", ".kimi") } else { ("COPILOT_HOME", ".copilot") };
+                let root = absolute(declared.clone().or_else(|| value(key).filter(|value| !value.is_empty()).map(PathBuf::from)).unwrap_or_else(|| home.join(suffix)));
+                routing.push((key.into(), Some(root.to_str().context("native store is not UTF-8")?.into())));
+                vec![root]
+            }
+            "cursor" => {
+                let root = absolute(declared.clone().or_else(|| value("CURSOR_CONFIG_DIR").filter(|value| !value.trim().is_empty()).map(PathBuf::from))
+                    .unwrap_or_else(|| if value("XDG_CONFIG_HOME").is_some_and(|value| !value.is_empty()) { config_home.join("cursor") } else { home.join(".cursor") }));
+                routing.push(("CURSOR_CONFIG_DIR".into(), Some(root.to_str().context("Cursor store is not UTF-8")?.into())));
+                vec![root]
+            }
+            "gemini" => {
+                let configured = value("GEMINI_CLI_HOME").filter(|value| !value.is_empty()).map(PathBuf::from);
+                if declared.is_none() && configured.is_none() {
+                    for directory in inputs.cwd.ancestors().chain(std::iter::once(home.as_path())) {
+                        for file in [directory.join(".env"), directory.join(".gemini/.env")] {
+                            anyhow::ensure!(inputs.read_native_file(&file)?.is_none(), "Gemini dotenv may select another home; configure GEMINI_CLI_HOME explicitly for managed conversations");
+                            configuration.push(file);
+                        }
+                    }
+                }
+                let base = if let Some(root) = declared.as_ref() {
+                    anyhow::ensure!(root.file_name().is_some_and(|name| name == ".gemini"), "Gemini configuration directory must be named .gemini");
+                    root.parent().context("Gemini home is missing")?.to_path_buf()
+                } else { absolute(configured.unwrap_or_else(|| home.clone())) };
+                routing.push(("GEMINI_CLI_HOME".into(), Some(base.to_str().context("Gemini home is not UTF-8")?.into())));
+                vec![base.join(".gemini")]
+            }
+            _ => bail!("the effective {} conversation namespace is not attested; managed resume and fork are refused", agent.name),
+        };
+        if agent.name != "omp" {
+            for (key, path) in [
+                ("HOME", home),
+                ("XDG_CONFIG_HOME", config_home),
+                ("XDG_DATA_HOME", data_home),
+            ] {
+                routing.push((
+                    key.into(),
+                    Some(
+                        absolute(path)
+                            .into_os_string()
+                            .into_string()
+                            .map_err(|_| anyhow::anyhow!("native routing path is not UTF-8"))?,
+                    ),
+                ));
+            }
+            routing.push(("XDG_STATE_HOME".into(), value("XDG_STATE_HOME")));
+        }
+        let path = value("PATH");
+        let omp = if agent.name == "omp" {
+            let args = if self.command.is_empty() {
+                crate::session::config::quote_model_value_in_args(&self.extra_args)
+            } else {
+                self.selected_agent_args()
+            };
+            let options = super::OmpCliCaptureOptions::parse(&args)?;
+            if let Some(declared) = &declared {
+                let directory = inputs.canonical_path(declared)?;
+                inputs.environment.insert(
+                    "PI_CODING_AGENT_DIR".into(),
+                    directory
+                        .to_str()
+                        .context("declared OMP directory is not UTF-8")?
+                        .into(),
+                );
+            }
+            let environment = std::mem::take(&mut inputs.environment);
+            let cwd = inputs.cwd.to_str().context("native cwd is not UTF-8")?;
+            let mut context = if let Some(container) = &inputs.container {
+                crate::session::capture::resolve_omp_store_layout_in_container_with_environment(
+                    &container.runtime,
+                    &container.name,
+                    cwd,
+                    environment,
+                    &options,
+                )?
+            } else {
+                crate::session::capture::resolve_omp_store_layout_with_environment(
+                    environment,
+                    cwd,
+                    &options,
+                )?
+            };
+            if let Some(declared) = &declared {
+                anyhow::ensure!(
+                    inputs.canonical_path(&context.agent_dir)?
+                        == inputs.canonical_path(declared)?,
+                    "OMP profile or dotenv overrides the declared wrapper namespace"
+                );
+            }
+            context.layout.sessions = inputs.canonical_path(&context.layout.sessions)?;
+            if let Some((sid, binding, _)) = target {
+                let binding = binding.context("OMP resume requires a bound transcript")?;
+                let file = binding.transcript_path.as_ref().context(
+                    "OMP resume requires its exact transcript; rebind using --store with that file",
+                )?;
+                anyhow::ensure!(
+                    binding
+                        .execution
+                        .as_ref()
+                        .is_some_and(|source| source.filesystem == "host"),
+                    "OMP transcript filesystem is unsupported"
+                );
+                let native = inputs.native_transcript_path(file, &context.layout.sessions)?;
+                let parent = native.parent().context("OMP transcript has no parent")?;
+                anyhow::ensure!(
+                    native.starts_with(&context.layout.sessions)
+                        && (context.layout.kind == crate::session::capture::OmpStoreKind::Managed
+                            || parent == context.layout.sessions),
+                    "OMP transcript is outside the configured namespace"
+                );
+                let (header_sid, header_cwd) =
+                    crate::session::capture::extract_pi_header_fields(file)
+                        .context("OMP transcript has no readable session header")?;
+                anyhow::ensure!(
+                    header_sid.as_deref() == Some(sid),
+                    "OMP transcript names a different conversation"
+                );
+                let header_cwd = header_cwd.context("OMP transcript has no working directory")?;
+                anyhow::ensure!(
+                    inputs.canonical_path(std::path::Path::new(&header_cwd))?
+                        == inputs.canonical_path(&context.cwd)?,
+                    "OMP transcript restores a different working directory"
+                );
+                context.layout.sessions = parent.to_path_buf();
+                context.layout.kind = crate::session::capture::OmpStoreKind::Custom;
+            }
+            if context.layout.kind == crate::session::capture::OmpStoreKind::Custom {
+                namespace_arguments.extend([
+                    "--session-dir".into(),
+                    context
+                        .layout
+                        .sessions
+                        .to_str()
+                        .context("OMP session directory is not UTF-8")?
+                        .into(),
+                ]);
+            }
+            namespace_arguments.extend([
+                "--profile".into(),
+                context.profile.as_deref().unwrap_or("default").into(),
+            ]);
+            roots = vec![context.layout.sessions.clone()];
+            configuration.push(context.agent_dir.clone());
+            routing = context.launcher_routing.clone();
+            Some(context)
+        } else {
+            None
+        };
+        routing.push(("PATH".into(), path));
+        routing.push((
+            crate::hooks::SESSION_SOURCE_ENV.into(),
+            Some(inputs.launch_id.clone()),
+        ));
+        let mut stores = Vec::with_capacity(roots.len());
+        let mut filesystem = None;
+        for root in roots {
+            let root = inputs.canonical_path(&root)?;
+            let location = inputs.physical_location(&root);
+            anyhow::ensure!(
+                filesystem
+                    .as_ref()
+                    .is_none_or(|domain| domain == &location.filesystem),
+                "native stores span incompatible filesystems"
+            );
+            filesystem.get_or_insert(location.filesystem);
+            stores.push(location.path);
+        }
+        let configuration = configuration
+            .into_iter()
+            .map(|path| {
+                inputs
+                    .canonical_path(&path)
+                    .map(|path| inputs.physical_location(&path))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let cwd = if let Some(context) = &omp {
+            inputs.canonical_path(&context.cwd)?
+        } else if let Some(plan) = &prime {
+            inputs.canonical_path(std::path::Path::new(&plan.container_cwd))?
+        } else {
+            inputs.cwd.clone()
+        };
+        let cwd = inputs.physical_location(&cwd);
+        let capture = if matches!(
+            agent
+                .session_support
+                .as_ref()
+                .and_then(|support| support.capture.as_ref())
+                .map(|capture| capture.backend),
+            Some(
+                crate::agents::SessionCaptureBackend::Claude
+                    | crate::agents::SessionCaptureBackend::HookSidecar
+            )
+        ) {
+            inputs.hook_capture_context(&self.id)?
+        } else if let Some(plan) = prime.take() {
+            let sidecar = inputs.identity_extension.as_ref().map(|_| {
+                super::SessionSidecarSource::SandboxDir(
+                    plan.store.join("aoe-session").join(&self.id),
+                )
+            });
+            Some(CaptureContext::Prime { plan, sidecar })
+        } else if let Some(root) = pi_root {
+            if let Some(path) = inputs
+                .environment
+                .get("AOE_SESSION_ID_FILE")
+                .filter(|_| inputs.identity_extension.is_some())
+            {
+                let path = inputs.canonical_path(
+                    PathBuf::from(path)
+                        .parent()
+                        .context("Pi publication has no directory")?,
+                )?;
+                let source = match &inputs.container {
+                    Some(container) => super::SessionSidecarSource::SandboxDir(
+                        container
+                            .host_path(&path, true)
+                            .context("Pi publication is not in a writable local mount")?,
+                    ),
+                    None => super::SessionSidecarSource::HostHooks(path),
+                };
+                Some(CaptureContext::Pi { source, root })
+            } else {
+                None
+            }
+        } else if matches!(agent.name, "codex" | "gemini" | "kimi")
+            && inputs.container.is_some()
+            && filesystem.as_deref() == Some("host")
+        {
+            Some(CaptureContext::Store {
+                root: stores
+                    .first()
+                    .context("native capture store is missing")?
+                    .clone(),
+                cwd: inputs
+                    .cwd
+                    .to_str()
+                    .context("native capture cwd is not UTF-8")?
+                    .into(),
+            })
+        } else {
+            None
+        };
+        let pi_pinnable = agent.name == "pi" && inputs.container.is_none()
+            && !inputs.pane_env.iter().any(|entry| matches!(entry, crate::tmux::PaneEnvMutation::Set { key, .. } | crate::tmux::PaneEnvMutation::Unset { key } if key == "PATH"))
+            && inputs.environment.get("PATH") == std::env::var("PATH").ok().as_ref()
+            && which::which("pi").ok().as_deref() == Some(program.as_path())
+            && crate::agents::pi_supports_session_id_flag();
+        let opencode_preassign = agent.name == "opencode"
+            && inputs.container.is_none()
+            && config.session.opencode_preassign_session_id
+            && words.first().is_some_and(|word| word == agent.binary);
+        Ok(NativeExecution {
+            agent,
+            binding: ExecutionBinding {
+                agent: agent.name.into(),
+                stores,
+                configuration,
+                cwd: cwd.path,
+                cwd_filesystem: cwd.filesystem,
+                filesystem: filesystem.context("native conversation store is unavailable")?,
+            },
+            routing,
+            omp,
+            inputs,
+            program,
+            capture,
+            pi_transcript_path,
+            namespace_arguments,
+            target_session_id,
+            pi_pinnable,
+            opencode_preassign,
+        })
+    }
+
+    pub(super) fn conversation_target(&self) -> Option<(&str, Option<&ConversationBinding>, bool)> {
+        Some(match &self.resume_intent {
+            ResumeIntent::Cleared => return None,
+            ResumeIntent::Use(sid) => (sid.as_str(), self.resume_binding.as_ref(), true),
+            ResumeIntent::Fork { from } => (from.as_str(), self.resume_binding.as_ref(), true),
+            ResumeIntent::Default => (
+                self.agent_session_id.as_deref()?,
+                self.agent_session_binding.as_ref(),
+                false,
+            ),
+        })
+    }
+
+    pub(super) fn validate_conversation_target(
+        &self,
+        execution: &ExecutionBinding,
+        target_session_id: Option<&str>,
+    ) -> Result<()> {
+        let Some((sid, binding, explicit)) = self.conversation_target() else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            Some(sid) == target_session_id,
+            "conversation changed during launch preparation; retry with its latest publication"
+        );
+        let binding = binding.filter(|binding| binding.session_id == sid)
+            .context("conversation provenance is unknown; use aoe session set-session-id with an explicitly configured execution identity and store before resuming or forking")?;
+        anyhow::ensure!(binding.is_known() || (!explicit && binding.provenance == ConversationProvenance::Preallocated),
+            "conversation has not been observed or explicitly asserted; a preallocated ID is not a forkable conversation");
+        anyhow::ensure!(binding.execution.as_ref() == Some(execution),
+            "conversation execution identity, store or working directory differs from this launch; restore its context or explicitly rebind the intended conversation");
+        Ok(())
+    }
+}
+
+pub(super) fn validate_managed_arguments(
+    agent: &AgentDef,
+    words: &[String],
+) -> Result<Option<String>> {
+    let mut index = 0;
+    let mut session_dir = None;
+    while index < words.len() {
+        let word = &words[index];
+        let (key, inline) = word
+            .split_once('=')
+            .map_or((word.as_str(), None), |(key, value)| (key, Some(value)));
+        let (values, switches): (&[&str], &[&str]) = match agent.name {
+            "claude" => (
+                &[
+                    "--model",
+                    "--fallback-model",
+                    "--effort",
+                    "--permission-mode",
+                    "--append-system-prompt",
+                    "--system-prompt",
+                ],
+                &[
+                    "--dangerously-skip-permissions",
+                    "--allow-dangerously-skip-permissions",
+                ],
+            ),
+            "codex" => (
+                &[
+                    "--model",
+                    "-m",
+                    "--sandbox",
+                    "-s",
+                    "--ask-for-approval",
+                    "-a",
+                    "--config",
+                    "-c",
+                ],
+                &[
+                    "--full-auto",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    "--yolo",
+                    "--search",
+                    "--no-alt-screen",
+                ],
+            ),
+            "opencode" => (
+                &["--model", "-m", "--agent", "--prompt"],
+                &["--auto", "--yolo", "--dangerously-skip-permissions"],
+            ),
+            "omp" => (
+                &[
+                    "--model",
+                    "-m",
+                    "--system-prompt",
+                    "--append-system-prompt",
+                    "--agent",
+                    "--session-dir",
+                    "--profile",
+                    "--cwd",
+                ],
+                &["--yolo", "--dangerously-skip-permissions"],
+            ),
+            _ => (
+                &[
+                    "--model",
+                    "-m",
+                    "--system-prompt",
+                    "--append-system-prompt",
+                    "--agent",
+                    "--session-dir",
+                ],
+                &[
+                    "--yolo",
+                    "--dangerously-skip-permissions",
+                    "--allow-all-tools",
+                    "--trust-all-tools",
+                ],
+            ),
+        };
+        if values.contains(&key) {
+            let value = if let Some(value) = inline {
+                value
+            } else {
+                index += 1;
+                words
+                    .get(index)
+                    .context("managed command option is missing its value")?
+            };
+            if key == "--session-dir" {
+                anyhow::ensure!(
+                    matches!(agent.name, "pi" | "omp" | "prime-agent"),
+                    "this agent does not support a managed session directory"
+                );
+                session_dir = Some(value.to_owned());
+            }
+            if agent.name == "codex" && matches!(key, "--config" | "-c") {
+                let (setting, _) = value
+                    .split_once('=')
+                    .context("Codex config requires key=value")?;
+                anyhow::ensure!(
+                    [
+                        "developer_instructions",
+                        "model",
+                        "model_reasoning_effort",
+                        "model_reasoning_summary",
+                        "model_verbosity",
+                        "service_tier"
+                    ]
+                    .contains(&setting),
+                    "Codex configuration key {setting} is not supported for a managed conversation"
+                );
+            }
+        } else if (switches.contains(&key) && inline.is_none())
+            || (index == 0 && agent.launch_subcommand == Some(word.as_str()))
+        {
+        } else if !word.starts_with('-')
+            && index + 1 == words.len()
+            && matches!(agent.name, "claude" | "codex")
+        {
+            anyhow::ensure!(
+                ![
+                    "resume",
+                    "fork",
+                    "exec",
+                    "cloud",
+                    "app-server",
+                    "login",
+                    "logout",
+                    "mcp",
+                    "mcp-server",
+                    "completion",
+                    "debug",
+                    "apply",
+                    "sandbox",
+                    "review"
+                ]
+                .contains(&word.as_str()),
+                "native subcommand {word} is not supported for a managed conversation"
+            );
+        } else {
+            bail!("argument {key} is not supported for a managed {} conversation; remove native selectors and unsupported context overrides", agent.name);
+        }
+        index += 1;
+    }
+    Ok(session_dir)
+}
+
+impl Instance {
+    pub(super) fn freeze_native_invocation(
+        &self,
+        command: String,
+        execution: Option<&super::execution::NativeExecution>,
+    ) -> Result<String> {
+        let Some(execution) = execution else {
+            return Ok(command);
+        };
+        let mut words = shell_words::split(&command)?;
+        *words.first_mut().context("native program is missing")? = execution
+            .program
+            .to_str()
+            .context("native executable path is not UTF-8")?
+            .to_owned();
+        Ok(shell_words::join(words))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConversationState {
+    pub(crate) session_id: Option<String>,
+    pub(crate) binding: Option<ConversationBinding>,
+    pub(crate) intent: ResumeIntent,
+    pub(crate) resume_binding: Option<ConversationBinding>,
+    pub(crate) active: Option<ActiveExecution>,
+    pub(crate) pi_session_path: Option<String>,
+}
+
+impl ConversationState {
+    pub(crate) fn matches(&self, instance: &Instance) -> bool {
+        self.session_id == instance.agent_session_id
+            && self.binding == instance.agent_session_binding
+            && self.intent == instance.resume_intent
+            && self.resume_binding == instance.resume_binding
+            && self.active == instance.active_execution
+            && self.pi_session_path == instance.pi_session_path
+    }
+}
+
+impl Instance {
+    pub(crate) fn conversation_state(&self) -> ConversationState {
+        ConversationState {
+            session_id: self.agent_session_id.clone(),
+            binding: self.agent_session_binding.clone(),
+            intent: self.resume_intent.clone(),
+            resume_binding: self.resume_binding.clone(),
+            active: self.active_execution.clone(),
+            pi_session_path: self.pi_session_path.clone(),
+        }
+    }
+
+    pub(crate) fn set_agent_conversation(
+        &mut self,
+        sid: Option<String>,
+        binding: Option<ConversationBinding>,
+        pi_session_path: Option<String>,
+    ) {
+        self.agent_session_binding =
+            binding.filter(|binding| Some(&binding.session_id) == sid.as_ref());
+        self.pi_session_path = pi_session_path.filter(|_| sid.is_some());
+        self.agent_session_id = sid;
+    }
+    pub(crate) fn apply_conversation_observation(
+        &mut self,
+        observation: &crate::session::poller::SessionIdObservation,
+    ) {
+        self.set_agent_conversation(
+            Some(observation.sid.clone()),
+            observation.conversation_binding(),
+            observation.pi_session_path.clone(),
+        );
+    }
+
+    pub(crate) fn asserted_resume_binding(
+        &self,
+        sid: &str,
+        store: Option<&std::path::Path>,
+    ) -> Result<ConversationBinding> {
+        anyhow::ensure!(
+            crate::session::capture::is_valid_session_id(sid),
+            "invalid conversation ID"
+        );
+        let mut execution = if store.is_none() {
+            self.active_execution
+                .as_ref()
+                .map(|active| active.binding.clone())
+        } else {
+            None
+        }
+        .map(Ok)
+        .unwrap_or_else(|| {
+            self.resolve_native_execution(None)
+                .map(|execution| execution.binding)
+        })?;
+        anyhow::ensure!(
+            crate::agents::get_agent(&execution.agent)
+                .is_some_and(|agent| agent.session_support.is_some()),
+            "agent does not support exact native resume"
+        );
+        let mut transcript_path = None;
+        if matches!(execution.agent.as_str(), "pi" | "omp") {
+            let file = store.context("recovery requires --store with the exact transcript file")?;
+            anyhow::ensure!(
+                !self.is_sandboxed() && file.is_absolute(),
+                "recovery requires an absolute host transcript path"
+            );
+            let file = file.canonicalize().context("transcript is unavailable")?;
+            let primary = execution
+                .stores
+                .first_mut()
+                .context("native store is unavailable")?;
+            anyhow::ensure!(
+                file.starts_with(&*primary),
+                "transcript is outside the configured store"
+            );
+            let (header_sid, _) = crate::session::capture::extract_pi_header_fields(&file)
+                .context("transcript has no readable session header")?;
+            anyhow::ensure!(
+                header_sid.as_deref() == Some(sid),
+                "transcript names a different conversation"
+            );
+            *primary = file
+                .parent()
+                .context("transcript has no parent")?
+                .to_path_buf();
+            transcript_path = Some(file);
+        } else if let Some(store) = store {
+            anyhow::ensure!(
+                !self.is_sandboxed(),
+                "sandbox recovery must use its managed mounted store"
+            );
+            let primary = execution
+                .stores
+                .first_mut()
+                .context("native store is unavailable")?;
+            anyhow::ensure!(
+                store.is_absolute(),
+                "--store must be an absolute native store path"
+            );
+            *primary = crate::session::capture::canonicalize_or_raw(
+                store.to_str().context("store path must be UTF-8")?,
+            );
+        }
+        Ok(ConversationBinding {
+            session_id: sid.into(),
+            execution: Some(execution),
+            provenance: ConversationProvenance::Asserted,
+            transcript_path,
+        })
+    }
+
+    pub(crate) fn adopt_conversation_state(&mut self, state: ConversationState) {
+        if self.active_execution != state.active {
+            self.stop_poller();
+            self.session_id_poller = None;
+        }
+        self.set_agent_conversation(state.session_id, state.binding, state.pi_session_path);
+        self.resume_intent = state.intent;
+        self.resume_binding = state.resume_binding;
+        self.active_execution = state.active;
+    }
+
+    pub(super) fn capture_store_dir(&self) -> Option<PathBuf> {
+        if let Some(active) = self.active_execution.as_ref() {
+            return match &active.capture {
+                Some(super::CaptureContext::Store { root, .. }) => Some(root.clone()),
+                Some(super::CaptureContext::Pi { root, .. }) => {
+                    active.container.as_ref().map_or_else(
+                        || Some(root.clone()),
+                        |container| container.host_path(root, false),
+                    )
+                }
+                Some(super::CaptureContext::Prime { plan, .. }) => Some(plan.store.clone()),
+                _ => None,
+            };
+        }
+        self.sandbox_capture_store_dir()
+    }
+}

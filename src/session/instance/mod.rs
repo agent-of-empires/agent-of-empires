@@ -17,8 +17,7 @@ use uuid::Uuid;
 use crate::containers::{self, DockerContainer};
 use crate::session::config::container_config;
 use crate::session::environment::{
-    build_docker_env_args_with_managed_codex_home, resolved_sandbox_environment, shell_escape,
-    shell_escape_script_word,
+    build_docker_env_args_with_managed_codex_home, shell_escape, shell_escape_script_word,
 };
 use crate::session::poller::SessionPoller;
 use crate::tmux;
@@ -26,15 +25,18 @@ use crate::tmux;
 use crate::session::capture::{
     capture_omp_session_id, codex_poll_fn_sandboxed_store, gemini_poll_fn_sandboxed_store,
     generate_session_uuid, hermes_poll_fn_sandboxed_store, is_valid_session_id,
-    kimi_poll_fn_sandboxed_store, omp_host_routing_environment, omp_poll_fn, omp_poll_fn_sandboxed,
-    omp_sandbox_launch_marker, prime_agent_poll_fn_sandboxed, reject_omp_secret_args,
-    resolve_omp_store_layout, resolve_omp_store_layout_in_container_with_environment,
-    resolve_omp_store_layout_with_environment, try_capture_omp_session_id_in_container,
-    validate_omp_capture_metadata, validated_session_id, OmpCaptureMetadata, OmpCapturePlan,
-    OmpCliCaptureOptions, OmpStoreKind, PrimeRootPublication,
+    kimi_poll_fn_sandboxed_store, omp_poll_fn, omp_poll_fn_sandboxed, omp_sandbox_launch_marker,
+    prime_agent_poll_fn_sandboxed, reject_omp_secret_args, resolve_omp_store_layout,
+    try_capture_omp_session_id_in_container, validate_omp_capture_metadata, validated_session_id,
+    OmpCaptureMetadata, OmpCapturePlan, OmpCliCaptureOptions, OmpStoreKind, PrimeRootPublication,
 };
 mod accessors;
 mod container;
+mod execution;
+pub(crate) use execution::{ActiveExecution, CaptureContext, ConversationKey, ConversationState};
+pub use execution::{
+    ConversationBinding, ConversationProvenance, ExecutionBinding, ExecutionLocation,
+};
 mod flags;
 mod hooks;
 mod kill;
@@ -68,7 +70,7 @@ mod types;
 pub use flags::{is_valid_session_color, SessionBucket, SESSION_COLORS};
 pub(crate) use lifecycle::NEWER_GENERATION_BUSY_REASON;
 pub use lifecycle::{LifecycleOperation, LifecycleReservation, LifecycleReservationError};
-pub(crate) use omp::persist_omp_session_to_storage;
+
 pub use polling::PollerStart;
 pub use ready::{EnsureReadyError, EnsureReadyOutcome};
 pub(crate) use resume::ResumeAttemptPolicy;
@@ -122,7 +124,6 @@ use launch_command::{
 };
 use omp::{gate_omp_launch, wrap_omp_host_launch, wrap_omp_launch};
 use pane_status::{resolve_detected_status, summarize_error_from_pane};
-use sid_persist::{override_if_distinct, persist_session_to_storage_guarded};
 use status::{UNKNOWN_ERROR_WINDOW_CONFIRMED_PRESENT, UNKNOWN_ERROR_WINDOW_NEVER_PRESENT};
 use tmux_session::tmux_env_session_name_for_instance_id;
 use types::{deserialize_session_id, is_zero_u64, is_zero_u8};
@@ -430,6 +431,12 @@ pub struct Instance {
         deserialize_with = "deserialize_session_id"
     )]
     pub agent_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session_binding: Option<ConversationBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) resume_binding: Option<ConversationBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) active_execution: Option<ActiveExecution>,
     /// Active OMP launch generation. Poller observations must carry this
     /// value through the storage CAS before they may update the durable sid.
     #[serde(default, skip_serializing_if = "Option::is_none")]

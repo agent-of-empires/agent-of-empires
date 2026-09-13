@@ -88,8 +88,24 @@ pub(crate) struct OmpStoreLayout {
     pub kind: OmpStoreKind,
 }
 
-/// Transient launch snapshot. Routing values are used only to resolve the
-/// capture layout; only their one-way fingerprint survives into pane metadata.
+#[derive(Debug)]
+pub(crate) struct OmpResolvedContext {
+    pub(crate) layout: OmpStoreLayout,
+    pub(crate) routing_fingerprint: String,
+    pub(crate) launcher_routing: Vec<(String, Option<String>)>,
+    pub(crate) profile: Option<String>,
+    pub(crate) cwd: PathBuf,
+    pub(crate) agent_dir: PathBuf,
+}
+
+fn omp_routing_values(environment: &HashMap<String, String>) -> Vec<(String, Option<String>)> {
+    OMP_STORE_ENV_KEYS
+        .iter()
+        .map(|key| ((*key).to_owned(), environment.get(*key).cloned()))
+        .collect()
+}
+
+/// Capture instrumentation derived from the checked native context.
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct OmpCapturePlan {
     pub layout: OmpStoreLayout,
@@ -436,22 +452,23 @@ pub(crate) fn resolve_omp_store_layout(
     launch_cwd: &str,
     options: &OmpCliCaptureOptions,
 ) -> Result<OmpStoreLayout> {
-    resolve_omp_store_layout_with_environment(environment, launch_cwd, options)
-        .map(|(layout, _)| layout)
+    resolve_omp_store_layout_with_environment(
+        host_launcher_environment(environment),
+        launch_cwd,
+        options,
+    )
+    .map(|context| context.layout)
 }
 
-/// Resolve the store and fingerprint the pre-dotenv launcher routing. The
-/// fingerprint lets the pane reject capture if login startup files change
-/// routing after this snapshot, without carrying any routing value through
-/// argv or tmux metadata.
+/// Resolve routing once; launcher values remain transient and are replayed after login.
 pub(crate) fn resolve_omp_store_layout_with_environment(
-    environment: &[String],
+    launcher_env: HashMap<String, String>,
     launch_cwd: &str,
     options: &OmpCliCaptureOptions,
-) -> Result<(OmpStoreLayout, String)> {
+) -> Result<OmpResolvedContext> {
     let cwd = absolute_launch_cwd(launch_cwd)?;
-    let launcher_env = host_launcher_environment(environment);
     let routing_fingerprint = routing_fingerprint(&launcher_env);
+    let launcher_routing = omp_routing_values(&launcher_env);
     let auto_env = autoload_bun_dotenv(launcher_env, &cwd, read_dotenv_content)?;
     let profile = resolve_profile(options.profile.as_deref(), &auto_env)?;
     let locations = dotenv_locations(&auto_env, &cwd, profile.as_deref())?;
@@ -460,35 +477,40 @@ pub(crate) fn resolve_omp_store_layout_with_environment(
         .map(|path| read_dotenv_file(path))
         .collect::<Result<Vec<_>>>()?;
     let merged = merge_omp_environment(auto_env, &files);
-    let layout = resolve_layout(&merged, &cwd, profile.as_deref(), options, |path| {
+    let (layout, agent_dir) = resolve_layout(&merged, &cwd, profile.as_deref(), options, |path| {
         path.exists()
     })?;
-    Ok((layout, routing_fingerprint))
+    Ok(OmpResolvedContext {
+        layout,
+        routing_fingerprint,
+        launcher_routing,
+        profile,
+        cwd: omp_session_cwd(&cwd, options),
+        agent_dir,
+    })
 }
 
 pub(crate) fn resolve_omp_store_layout_in_container_with_environment(
+    runtime: &crate::containers::RuntimeExecutionSnapshot,
     container_name: &str,
     container_cwd: &str,
-    launch_environment: &[(String, String)],
+    launcher_env: HashMap<String, String>,
     options: &OmpCliCaptureOptions,
-) -> Result<(OmpStoreLayout, String)> {
+) -> Result<OmpResolvedContext> {
     let cwd = absolute_launch_cwd(container_cwd)?;
-    let mut launcher_env = read_container_environment(container_name)?;
-    for (key, value) in launch_environment {
-        launcher_env.insert(key.clone(), value.clone());
-    }
     let routing_fingerprint = routing_fingerprint(&launcher_env);
+    let launcher_routing = omp_routing_values(&launcher_env);
     if nonempty(&launcher_env, "HOME").is_none() {
         anyhow::bail!("OMP container has no HOME");
     }
     let auto_env = autoload_bun_dotenv(launcher_env, &cwd, |path| {
-        read_container_dotenv_content(container_name, path)
+        read_container_dotenv_content(runtime, container_name, path)
     })?;
     let profile = resolve_profile(options.profile.as_deref(), &auto_env)?;
     let locations = dotenv_locations(&auto_env, &cwd, profile.as_deref())?;
     let files = locations
         .iter()
-        .map(|path| read_container_dotenv(container_name, path))
+        .map(|path| read_container_dotenv(runtime, container_name, path))
         .collect::<Result<Vec<_>>>()?;
     let merged = merge_omp_environment(auto_env, &files);
 
@@ -496,13 +518,14 @@ pub(crate) fn resolve_omp_store_layout_in_container_with_environment(
     let data_candidate = xdg_candidate(&merged, &cwd, "XDG_DATA_HOME", profile.as_deref());
     let state_candidate = xdg_candidate(&merged, &cwd, "XDG_STATE_HOME", profile.as_deref());
     let existence = probe_container_paths(
+        runtime,
         container_name,
         [data_candidate.as_deref(), state_candidate.as_deref()],
     )?;
-    let managed_sessions = existence[0]
-        .then_some(data_candidate)
-        .flatten()
-        .unwrap_or_else(|| agent_dir.clone())
+    let managed_sessions = data_candidate
+        .as_ref()
+        .filter(|_| existence[0])
+        .unwrap_or(&agent_dir)
         .join("sessions");
     let session_cwd = omp_session_cwd(&cwd, options);
     let custom = options
@@ -515,10 +538,10 @@ pub(crate) fn resolve_omp_store_layout_in_container_with_environment(
             |path| absolute_path(&session_cwd, path),
         ),
         managed_sessions,
-        terminal_sessions: existence[1]
-            .then_some(state_candidate)
-            .flatten()
-            .unwrap_or(agent_dir)
+        terminal_sessions: state_candidate
+            .as_ref()
+            .filter(|_| existence[1])
+            .unwrap_or(&agent_dir)
             .join("terminal-sessions"),
         kind: if custom.is_some() {
             OmpStoreKind::Custom
@@ -526,7 +549,14 @@ pub(crate) fn resolve_omp_store_layout_in_container_with_environment(
             OmpStoreKind::Managed
         },
     };
-    Ok((layout, routing_fingerprint))
+    Ok(OmpResolvedContext {
+        layout,
+        routing_fingerprint,
+        launcher_routing,
+        profile,
+        cwd: session_cwd,
+        agent_dir,
+    })
 }
 
 fn resolve_layout(
@@ -535,34 +565,41 @@ fn resolve_layout(
     profile: Option<&str>,
     options: &OmpCliCaptureOptions,
     mut exists: impl FnMut(&Path) -> bool,
-) -> Result<OmpStoreLayout> {
+) -> Result<(OmpStoreLayout, PathBuf)> {
     let session_cwd = omp_session_cwd(cwd, options);
     let agent_dir = managed_agent_dir(env, cwd, profile)?;
-    let managed_sessions = xdg_candidate(env, cwd, "XDG_DATA_HOME", profile)
+    let data_candidate = xdg_candidate(env, cwd, "XDG_DATA_HOME", profile);
+    let state_candidate = xdg_candidate(env, cwd, "XDG_STATE_HOME", profile);
+    let managed_sessions = data_candidate
+        .as_ref()
         .filter(|path| exists(path))
-        .unwrap_or_else(|| agent_dir.clone())
+        .unwrap_or(&agent_dir)
         .join("sessions");
-    let terminal_sessions = xdg_candidate(env, cwd, "XDG_STATE_HOME", profile)
+    let terminal_sessions = state_candidate
+        .as_ref()
         .filter(|path| exists(path))
-        .unwrap_or(agent_dir)
+        .unwrap_or(&agent_dir)
         .join("terminal-sessions");
     let custom = options
         .session_dir
         .as_deref()
         .or_else(|| nonempty(env, "PI_CODING_AGENT_SESSION_DIR").map(Path::new));
-    Ok(OmpStoreLayout {
-        sessions: custom.map_or_else(
-            || managed_sessions.clone(),
-            |path| absolute_path(&session_cwd, path),
-        ),
-        managed_sessions,
-        terminal_sessions,
-        kind: if custom.is_some() {
-            OmpStoreKind::Custom
-        } else {
-            OmpStoreKind::Managed
+    Ok((
+        OmpStoreLayout {
+            sessions: custom.map_or_else(
+                || managed_sessions.clone(),
+                |path| absolute_path(&session_cwd, path),
+            ),
+            managed_sessions,
+            terminal_sessions,
+            kind: if custom.is_some() {
+                OmpStoreKind::Custom
+            } else {
+                OmpStoreKind::Managed
+            },
         },
-    })
+        agent_dir,
+    ))
 }
 
 fn resolve_profile(
@@ -623,7 +660,7 @@ fn dotenv_locations(
     ])
 }
 
-fn host_launcher_environment(entries: &[String]) -> HashMap<String, String> {
+pub(crate) fn host_launcher_environment(entries: &[String]) -> HashMap<String, String> {
     let mut values = std::env::vars_os()
         .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
         .collect::<HashMap<_, _>>();
@@ -642,23 +679,6 @@ fn host_launcher_environment(entries: &[String]) -> HashMap<String, String> {
     // only falls back to PI_PROFILE when it is absent, while an empty value
     // explicitly selects the default profile.
     values
-}
-
-/// Routing mutations that must be applied in a host pane so the resolver and
-/// launched OMP process start from the same environment snapshot. An explicit
-/// unset prevents tmux's long-lived server environment from reviving a stale
-/// routing value.
-pub(crate) fn omp_host_routing_environment(
-    entries: &[String],
-) -> Vec<crate::tmux::PaneEnvMutation> {
-    let values = host_launcher_environment(entries);
-    OMP_STORE_ENV_KEYS
-        .iter()
-        .map(|key| match values.get(*key) {
-            Some(value) => crate::tmux::PaneEnvMutation::set((*key).to_string(), value.clone()),
-            None => crate::tmux::PaneEnvMutation::unset((*key).to_string()),
-        })
-        .collect()
 }
 
 fn autoload_bun_dotenv(
@@ -1107,10 +1127,17 @@ fn absolute_path(cwd: &Path, path: &Path) -> PathBuf {
 fn container_exec_command(
     container_name: &str,
     runtime_name: Option<crate::session::config::ContainerRuntimeName>,
+    snapshot: Option<&crate::containers::RuntimeExecutionSnapshot>,
     argv: &[&str],
 ) -> std::process::Command {
     use crate::session::config::ContainerRuntimeName;
-
+    let command_argv = argv
+        .iter()
+        .map(|value| (*value).to_owned())
+        .collect::<Vec<_>>();
+    if let Some(snapshot) = snapshot {
+        return snapshot.exec(container_name, "", &command_argv);
+    }
     let runtime = match runtime_name {
         Some(ContainerRuntimeName::AppleContainer) => {
             crate::containers::ContainerRuntime::apple_container()
@@ -1119,27 +1146,26 @@ fn container_exec_command(
         Some(ContainerRuntimeName::Podman) => crate::containers::ContainerRuntime::podman(),
         None => crate::containers::get_container_runtime(),
     };
-    let command_argv = argv
-        .iter()
-        .map(|value| (*value).to_string())
-        .collect::<Vec<_>>();
     let exec_argv = runtime.build_exec_argv(container_name, "", &command_argv);
     let mut command = std::process::Command::new(&exec_argv[0]);
     command.args(&exec_argv[1..]);
     command
 }
 
-fn read_container_environment(container_name: &str) -> Result<HashMap<String, String>> {
-    let command = container_exec_command(container_name, None, &["env"]);
+pub(crate) fn read_container_environment(
+    runtime: &crate::containers::RuntimeExecutionSnapshot,
+    container_name: &str,
+) -> Result<HashMap<String, String>> {
+    let command = container_exec_command(container_name, None, Some(runtime), &["env", "-0"]);
     let output = super::run_with_timeout_limit(
         command,
         COMMAND_TIMEOUT,
-        "container exec (OMP env probe)",
+        "container exec (native environment probe)",
         MAX_CONTAINER_ENV_BYTES,
     )?;
-    let text = String::from_utf8_lossy(&output);
+    let text = String::from_utf8(output).context("Container environment is not UTF-8")?;
     let mut values = HashMap::new();
-    for line in text.lines() {
+    for line in text.split('\0') {
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
@@ -1150,14 +1176,12 @@ fn read_container_environment(container_name: &str) -> Result<HashMap<String, St
     Ok(values)
 }
 
-fn read_container_dotenv_content(container_name: &str, path: &Path) -> Result<Option<String>> {
-    // TOCTOU accepted, not hardened: a POSIX shell cannot open with O_NOFOLLOW,
-    // so the `[ -L ]`/`[ -f ]` pre-checks cannot be made atomic with the `dd`
-    // read. The probe runs inside a container the user already fully controls,
-    // the output is size-capped and parsed only for routing env keys, and no
-    // host privilege boundary is crossed; the worst case is routing-key
-    // confusion within that same container. The host reader uses O_NOFOLLOW
-    // because it can.
+fn read_container_dotenv_content(
+    runtime: &crate::containers::RuntimeExecutionSnapshot,
+    container_name: &str,
+    path: &Path,
+) -> Result<Option<String>> {
+    // Container-controlled paths permit a check/read race; bounded reads confer no host privileges.
     const SCRIPT: &str = r#"if [ -L "$1" ]; then
   printf 'unsafe\n'
 elif [ ! -e "$1" ]; then
@@ -1174,6 +1198,7 @@ fi"#;
     let command = container_exec_command(
         container_name,
         None,
+        Some(runtime),
         &["sh", "-c", SCRIPT, "aoe-omp-dotenv", path],
     );
     let output = super::run_with_timeout_limit(
@@ -1210,13 +1235,23 @@ fi"#;
     }
 }
 
-fn read_container_dotenv(container_name: &str, path: &Path) -> Result<HashMap<String, String>> {
-    Ok(read_container_dotenv_content(container_name, path)?
-        .map(|content| parse_dotenv(&content))
-        .unwrap_or_default())
+fn read_container_dotenv(
+    runtime: &crate::containers::RuntimeExecutionSnapshot,
+    container_name: &str,
+    path: &Path,
+) -> Result<HashMap<String, String>> {
+    Ok(
+        read_container_dotenv_content(runtime, container_name, path)?
+            .map(|content| parse_dotenv(&content))
+            .unwrap_or_default(),
+    )
 }
 
-fn probe_container_paths(container_name: &str, paths: [Option<&Path>; 2]) -> Result<[bool; 2]> {
+fn probe_container_paths(
+    runtime: &crate::containers::RuntimeExecutionSnapshot,
+    container_name: &str,
+    paths: [Option<&Path>; 2],
+) -> Result<[bool; 2]> {
     const SCRIPT: &str = r#"for path do
   if [ -n "$path" ] && [ -e "$path" ]; then printf '1\n'; else printf '0\n'; fi
 done"#;
@@ -1224,6 +1259,7 @@ done"#;
     let command = container_exec_command(
         container_name,
         None,
+        Some(runtime),
         &[
             "sh",
             "-c",
@@ -1442,7 +1478,7 @@ fn lexical_store_session_path(
 /// O_NOFOLLOW read to an out-of-store target; the in-container script performs
 /// the equivalent realpath check before its own header read, so both engines
 /// validate the canonical store before reading.
-fn ensure_canonical_store(layout: &OmpStoreLayout, session_path: &Path) -> Result<()> {
+fn ensure_canonical_store(layout: &OmpStoreLayout, session_path: &Path) -> Result<PathBuf> {
     let active_components = match layout.kind {
         OmpStoreKind::Managed => 2,
         OmpStoreKind::Custom => 1,
@@ -1464,7 +1500,7 @@ fn ensure_canonical_store(layout: &OmpStoreLayout, session_path: &Path) -> Resul
         canonical_store,
         "OMP breadcrumb resolves outside its allowed session store"
     );
-    Ok(())
+    Ok(canonical_path)
 }
 
 /// Validate an already-resolved breadcrumb target: reject an excluded id and
@@ -1629,12 +1665,66 @@ fn read_host_breadcrumb(root: &Path, terminal_id: &str) -> Result<(String, u64)>
     );
     Ok((content, modified_at_ms))
 }
+fn omp_source_observation(
+    metadata: &OmpCaptureMetadata,
+    sid: String,
+    session_path: &Path,
+    cwd: &str,
+    active: Option<&crate::session::instance::ActiveExecution>,
+) -> Result<crate::session::poller::SessionIdObservation> {
+    let mut observation = metadata.session_observation(sid);
+    let Some(active) = active else {
+        return Ok(observation);
+    };
+    anyhow::ensure!(
+        matches!(&active.capture,
+        Some(crate::session::instance::CaptureContext::Omp(expected)) if expected == metadata),
+        "OMP source metadata differs from the recorded launch"
+    );
+    anyhow::ensure!(
+        active.binding.agent == "omp",
+        "OMP source has a different native identity"
+    );
+    let (filesystem, path, cwd_filesystem, cwd) = if let Some(container) = &active.container {
+        let path = container
+            .runtime
+            .canonical_path(&container.name, session_path)?;
+        let cwd = container
+            .runtime
+            .canonical_path(&container.name, Path::new(cwd))?;
+        let (filesystem, path) = container.physical_path(&path);
+        let (cwd_filesystem, cwd) = container.physical_path(&cwd);
+        (filesystem, path, cwd_filesystem, cwd)
+    } else {
+        (
+            "host".to_owned(),
+            ensure_canonical_store(&metadata.layout, session_path)?,
+            "host".to_owned(),
+            super::canonicalize_or_raw(cwd),
+        )
+    };
+    anyhow::ensure!(
+        cwd == active.binding.cwd && cwd_filesystem == active.binding.cwd_filesystem,
+        "OMP transcript belongs to another working directory or filesystem"
+    );
+    let mut source = active.binding.clone();
+    source.stores = vec![path
+        .parent()
+        .context("OMP transcript has no store directory")?
+        .to_path_buf()];
+    source.filesystem = filesystem;
+    observation.execution = Some(active.clone());
+    observation.source = Some(source);
+    observation.transcript_path = Some(path);
+    Ok(observation)
+}
 
 fn capture_omp_session_id_from_terminal(
     metadata: &OmpCaptureMetadata,
     exclusion: &HashSet<String>,
     terminal_id: &str,
-) -> Result<String> {
+    active: Option<&crate::session::instance::ActiveExecution>,
+) -> Result<crate::session::poller::SessionIdObservation> {
     validate_layout(&metadata.layout)?;
     if !valid_omp_terminal_id(terminal_id) {
         anyhow::bail!("Invalid OMP terminal id");
@@ -1668,8 +1758,9 @@ fn capture_omp_session_id_from_terminal(
     } else {
         None
     };
+    let cwd = breadcrumb.cwd;
     let session_id = validate_breadcrumb(breadcrumb, &session_path, header, exclusion)?;
-    Ok(session_id)
+    omp_source_observation(metadata, session_id, &session_path, cwd, active)
 }
 
 /// Capture the OMP session owned by one exact host tmux pane.
@@ -1677,9 +1768,10 @@ pub(crate) fn capture_omp_session_id(
     metadata: &OmpCaptureMetadata,
     exclusion: &HashSet<String>,
     tmux_session_name: &str,
-) -> Result<String> {
+    active: Option<&crate::session::instance::ActiveExecution>,
+) -> Result<crate::session::poller::SessionIdObservation> {
     let (_, terminal_id) = tty_and_terminal_id_for_tmux(tmux_session_name)?;
-    capture_omp_session_id_from_terminal(metadata, exclusion, &terminal_id)
+    capture_omp_session_id_from_terminal(metadata, exclusion, &terminal_id, active)
 }
 
 /// Pane identity resolved on each host poll tick. `tty` is compared only by the
@@ -1710,6 +1802,7 @@ fn resolve_omp_poll_identity(tmux_session_name: &str) -> Result<OmpPollIdentity>
 pub(crate) fn omp_poll_fn(
     instance_id: String,
     extra_excludes: HashSet<String>,
+    active: Option<crate::session::instance::ActiveExecution>,
 ) -> impl Fn(&str) -> Option<crate::session::poller::SessionIdObservation> + Send + 'static {
     move |tmux_session_name| {
         let identity = resolve_omp_poll_identity(tmux_session_name)
@@ -1722,17 +1815,17 @@ pub(crate) fn omp_poll_fn(
             &identity.metadata,
             &exclusion,
             &identity.terminal_id,
+            active.as_ref(),
         )
         .map_err(|error| {
             tracing::debug!(target: "session.capture", "OMP poll capture failed: {}", error)
         })
-        .ok()
-        .and_then(super::validated_session_id);
+        .ok();
         let refreshed = resolve_omp_poll_identity(tmux_session_name).ok()?;
         if refreshed != identity {
             return None;
         }
-        captured.map(|sid| identity.metadata.session_observation(sid))
+        captured
     }
 }
 
@@ -1844,7 +1937,8 @@ fn select_omp_session_in_container(
     stdout: &[u8],
     metadata: &OmpCaptureMetadata,
     exclusion: &HashSet<String>,
-) -> Result<String> {
+    active: Option<&crate::session::instance::ActiveExecution>,
+) -> Result<crate::session::poller::SessionIdObservation> {
     let text = std::str::from_utf8(stdout).context("OMP container capture is not UTF-8")?;
     let body = text
         .strip_prefix("===OMP===\n")
@@ -1894,7 +1988,7 @@ fn select_omp_session_in_container(
     };
     let session_path = lexical_store_session_path(&metadata.layout, &breadcrumb)?;
     let id = validate_breadcrumb(breadcrumb, &session_path, parsed_header, exclusion)?;
-    Ok(id)
+    omp_source_observation(metadata, id, &session_path, cwd, active)
 }
 
 fn capture_omp_session_in_container(
@@ -1902,7 +1996,8 @@ fn capture_omp_session_in_container(
     metadata: &OmpCaptureMetadata,
     exclusion: &HashSet<String>,
     launch_marker: &str,
-) -> Result<String> {
+    active_execution: Option<&crate::session::instance::ActiveExecution>,
+) -> Result<crate::session::poller::SessionIdObservation> {
     validate_omp_capture_metadata(metadata)?;
     let terminals = metadata
         .layout
@@ -1929,6 +2024,9 @@ fn capture_omp_session_in_container(
     let command = container_exec_command(
         container_name,
         metadata.container_runtime,
+        active_execution
+            .and_then(|active| active.container.as_ref())
+            .map(|container| &container.runtime),
         &[
             "sh",
             "-c",
@@ -1949,7 +2047,7 @@ fn capture_omp_session_in_container(
         "container exec (OMP breadcrumb capture)",
         MAX_CONTAINER_CAPTURE_BYTES,
     )?;
-    select_omp_session_in_container(&output, metadata, exclusion)
+    select_omp_session_in_container(&output, metadata, exclusion, active_execution)
 }
 
 /// One-shot sandbox capture bound exclusively by the launch marker.
@@ -1958,12 +2056,14 @@ pub(crate) fn try_capture_omp_session_id_in_container(
     metadata: &OmpCaptureMetadata,
     exclusion: &HashSet<String>,
     launch_marker: Option<&str>,
-) -> Result<String> {
+    active: Option<&crate::session::instance::ActiveExecution>,
+) -> Result<crate::session::poller::SessionIdObservation> {
     capture_omp_session_in_container(
         container_name,
         metadata,
         exclusion,
         launch_marker.context("OMP sandbox launch marker is unavailable")?,
+        active,
     )
 }
 
@@ -1975,6 +2075,7 @@ pub(crate) fn omp_poll_fn_sandboxed(
     instance_id: String,
     launch_marker: Option<String>,
     extra_excludes: HashSet<String>,
+    active: Option<crate::session::instance::ActiveExecution>,
 ) -> impl Fn(&str) -> Option<crate::session::poller::SessionIdObservation> + Send + 'static {
     move |tmux_session_name| {
         let metadata = load_omp_capture_metadata(tmux_session_name)
@@ -1985,7 +2086,7 @@ pub(crate) fn omp_poll_fn_sandboxed(
         let marker = launch_marker.as_deref()?;
         let exclusion = super::compose_exclusion(&instance_id, &extra_excludes);
         let captured =
-            capture_omp_session_in_container(&container_name, &metadata, &exclusion, marker)
+            capture_omp_session_in_container(&container_name, &metadata, &exclusion, marker, active.as_ref())
                 .map_err(|error| {
                     tracing::debug!(target: "session.capture", "OMP container poll capture failed: {}", error)
                 })
@@ -1994,7 +2095,7 @@ pub(crate) fn omp_poll_fn_sandboxed(
         if refreshed != metadata {
             return None;
         }
-        super::validated_session_id(captured).map(|sid| metadata.session_observation(sid))
+        Some(captured)
     }
 }
 
@@ -2030,7 +2131,7 @@ mod tests {
             (ContainerRuntimeName::AppleContainer, "container"),
         ];
         for (runtime, expected_binary) in cases {
-            let command = container_exec_command("aoe-test", Some(runtime), &["env"]);
+            let command = container_exec_command("aoe-test", Some(runtime), None, &["env"]);
             assert_eq!(command.get_program(), expected_binary, "{runtime:?}");
         }
     }
@@ -2279,8 +2380,12 @@ mod tests {
             format!("HOME={}", home.display()),
             "PI_PROFILE=work".to_string(),
         ];
-        let (pi_layout, absent_fingerprint) = resolve_omp_store_layout_with_environment(
-            &pi_only,
+        let OmpResolvedContext {
+            layout: pi_layout,
+            routing_fingerprint: absent_fingerprint,
+            ..
+        } = resolve_omp_store_layout_with_environment(
+            host_launcher_environment(&pi_only),
             routing_project.to_str().unwrap(),
             &OmpCliCaptureOptions::default(),
         )
@@ -2289,19 +2394,15 @@ mod tests {
             pi_layout.sessions,
             home.join(".omp/profiles/work/agent/sessions")
         );
-        let mutations = omp_host_routing_environment(&pi_only);
-        assert!(mutations.contains(&crate::tmux::PaneEnvMutation::unset(
-            "OMP_PROFILE".to_string()
-        )));
-        assert!(mutations.contains(&crate::tmux::PaneEnvMutation::set(
-            "PI_PROFILE".to_string(),
-            "work".to_string()
-        )));
 
         let mut explicit_default = pi_only;
         explicit_default.push("OMP_PROFILE=".to_string());
-        let (default_layout, empty_fingerprint) = resolve_omp_store_layout_with_environment(
-            &explicit_default,
+        let OmpResolvedContext {
+            layout: default_layout,
+            routing_fingerprint: empty_fingerprint,
+            ..
+        } = resolve_omp_store_layout_with_environment(
+            host_launcher_environment(&explicit_default),
             routing_project.to_str().unwrap(),
             &OmpCliCaptureOptions::default(),
         )
@@ -2323,11 +2424,14 @@ mod tests {
         std::fs::write(project.join(".env"), "OMP_PROFILE=base\n").unwrap();
         std::fs::write(project.join(".env.testing"), "OMP_PROFILE=mode\n").unwrap();
         let _env = EnvGuard::unset(&OMP_STORE_ENV_KEYS);
-        let (mode_layout, _) = resolve_omp_store_layout_with_environment(
-            &[
+        let OmpResolvedContext {
+            layout: mode_layout,
+            ..
+        } = resolve_omp_store_layout_with_environment(
+            host_launcher_environment(&[
                 format!("HOME={}", home.display()),
                 "NODE_ENV=testing".to_string(),
-            ],
+            ]),
             project.to_str().unwrap(),
             &OmpCliCaptureOptions::default(),
         )
@@ -2338,11 +2442,15 @@ mod tests {
         );
 
         std::fs::write(project.join(".env.local"), "OMP_PROFILE=local\n").unwrap();
-        let (layout, fingerprint) = resolve_omp_store_layout_with_environment(
-            &[
+        let OmpResolvedContext {
+            layout,
+            routing_fingerprint: fingerprint,
+            ..
+        } = resolve_omp_store_layout_with_environment(
+            host_launcher_environment(&[
                 format!("HOME={}", home.display()),
                 "NODE_ENV=testing".to_string(),
-            ],
+            ]),
             project.to_str().unwrap(),
             &OmpCliCaptureOptions::default(),
         )
@@ -2417,11 +2525,15 @@ mod tests {
         )
         .unwrap();
         let _env = EnvGuard::unset(&OMP_STORE_ENV_KEYS);
-        let (layout, fingerprint) = resolve_omp_store_layout_with_environment(
-            &[
+        let OmpResolvedContext {
+            layout,
+            routing_fingerprint: fingerprint,
+            ..
+        } = resolve_omp_store_layout_with_environment(
+            host_launcher_environment(&[
                 format!("HOME={}", home.display()),
                 "PI_PROFILE=expanded".to_string(),
-            ],
+            ]),
             project.to_str().unwrap(),
             &OmpCliCaptureOptions::default(),
         )
@@ -2436,10 +2548,10 @@ mod tests {
             )
             .unwrap();
             let error = resolve_omp_store_layout_with_environment(
-                &[
+                host_launcher_environment(&[
                     format!("HOME={}", home.display()),
                     "AWS_SECRET_ACCESS_KEY=must-not-persist".to_string(),
-                ],
+                ]),
                 project.to_str().unwrap(),
                 &OmpCliCaptureOptions::default(),
             )
@@ -2503,10 +2615,11 @@ mod tests {
             ("XDG_DATA_HOME".to_string(), "/data".to_string()),
             ("XDG_STATE_HOME".to_string(), "/state".to_string()),
         ]);
-        let data_only = resolve_layout(&env, cwd, None, &OmpCliCaptureOptions::default(), |path| {
-            path == Path::new("/data/omp")
-        })
-        .unwrap();
+        let (data_only, _) =
+            resolve_layout(&env, cwd, None, &OmpCliCaptureOptions::default(), |path| {
+                path == Path::new("/data/omp")
+            })
+            .unwrap();
         assert_eq!(data_only.sessions, Path::new("/data/omp/sessions"));
         assert_eq!(
             data_only.terminal_sessions,
@@ -2517,7 +2630,7 @@ mod tests {
             "PI_CODING_AGENT_DIR".to_string(),
             "/ignored-for-profile".to_string(),
         );
-        let profile = resolve_layout(
+        let (profile, _) = resolve_layout(
             &env,
             cwd,
             Some("work"),
@@ -2541,7 +2654,7 @@ mod tests {
             "/home/test/.omp/profiles/work/agent".to_string(),
         );
         assert_eq!(resolve_profile(None, &env).unwrap(), None);
-        let restored_default =
+        let (restored_default, _) =
             resolve_layout(&env, cwd, None, &OmpCliCaptureOptions::default(), |_| false).unwrap();
         assert_eq!(
             restored_default.sessions,
@@ -2554,7 +2667,7 @@ mod tests {
             cwd: Some(PathBuf::from("../other")),
         };
         env.remove("PI_CODING_AGENT_DIR");
-        let custom = resolve_layout(&env, cwd, None, &custom_options, |path| {
+        let (custom, _) = resolve_layout(&env, cwd, None, &custom_options, |path| {
             path == Path::new("/state/omp")
         })
         .unwrap();
@@ -2607,7 +2720,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path().join("project");
         let home = tmp.path().join("home");
-        let layout = resolve_layout(
+        let (layout, _) = resolve_layout(
             &HashMap::from([("HOME".to_string(), home.display().to_string())]),
             &cwd,
             None,
@@ -2748,13 +2861,15 @@ mod tests {
         let crumb = write_breadcrumb(&meta, "pts-7", &old_project, &session, false);
         set_mtime_ms(&crumb, meta.launched_at_ms - 1);
         assert!(
-            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-7").is_err(),
+            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-7", None).is_err(),
             "a stale pre-launch breadcrumb must not be accepted merely because it \
-             differs from the marker's pending sentinel"
+         differs from the marker's pending sentinel"
         );
         set_mtime_ms(&crumb, meta.launched_at_ms + 1);
         assert_eq!(
-            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-7").unwrap(),
+            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-7", None)
+                .unwrap()
+                .sid,
             id,
             "a genuine post-launch rewrite of the same target is still accepted"
         );
@@ -2783,17 +2898,21 @@ mod tests {
         .unwrap();
         let breadcrumb = write_breadcrumb(&meta, "pts-1", &historical, &session, false);
         assert_eq!(
-            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1").unwrap(),
+            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1", None)
+                .unwrap()
+                .sid,
             id
         );
         set_mtime_ms(&breadcrumb, meta.launched_at_ms);
         assert!(
-            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1").is_err(),
+            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1", None).is_err(),
             "a same-watermark legacy breadcrumb may belong to a previous pane"
         );
         set_mtime_ms(&breadcrumb, meta.launched_at_ms + 1);
         assert_eq!(
-            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1").unwrap(),
+            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1", None)
+                .unwrap()
+                .sid,
             id
         );
         std::fs::write(
@@ -2801,7 +2920,9 @@ mod tests {
             format!("{{\"type\":\"session\",\"id\":\"{id}\",\"cwd\":\"/wrong\"}}\n"),
         )
         .unwrap();
-        assert!(capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1").is_err());
+        assert!(
+            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1", None).is_err()
+        );
     }
 
     #[test]
@@ -2839,20 +2960,22 @@ mod tests {
         set_mtime_ms(&marker, 100_000);
         set_mtime_ms(&crumb, 100_000);
         assert!(
-            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1").is_err(),
+            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1", None).is_err(),
             "the installed fresh sentinel is still the marker's pending path"
         );
 
         write_breadcrumb(&meta, "pts-1", &cwd, &session, false);
         set_mtime_ms(&crumb, 100_000);
         assert!(
-            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1").is_err(),
+            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1", None).is_err(),
             "even a marker-proven rewrite must be a post-launch write; otherwise a stale \
-             pre-launch breadcrumb that merely differs from the sentinel is adopted (#3230)"
+         pre-launch breadcrumb that merely differs from the sentinel is adopted (#3230)"
         );
         set_mtime_ms(&crumb, meta.launched_at_ms + 1);
         assert_eq!(
-            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1").unwrap(),
+            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1", None)
+                .unwrap()
+                .sid,
             id,
             "a fresh marker-proven rewrite is accepted"
         );
@@ -2860,7 +2983,7 @@ mod tests {
         std::fs::write(&marker, launch_marker(&meta, "pts-1", "")).unwrap();
         set_mtime_ms(&crumb, meta.launched_at_ms + 1);
         assert!(
-            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1").is_err(),
+            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1", None).is_err(),
             "a modern marker with an empty pending path must not fall back to mtime"
         );
         set_mtime_ms(&crumb, 100_000);
@@ -2880,7 +3003,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1").is_err(),
+            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1", None).is_err(),
             "a marker from a different routing snapshot must be rejected"
         );
         std::fs::write(
@@ -2893,7 +3016,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1").is_err(),
+            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1", None).is_err(),
             "a marker from a superseded launch generation (reused path) must be rejected"
         );
         std::fs::write(
@@ -2901,7 +3024,9 @@ mod tests {
             launch_marker(&meta, "pts-1", &session.to_string_lossy()),
         )
         .unwrap();
-        assert!(capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1").is_err());
+        assert!(
+            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1", None).is_err()
+        );
     }
 
     #[test]
@@ -2915,9 +3040,14 @@ mod tests {
         let id = "019fc9a0-f688-7000-ae45-d9e51e5e1b8a";
         let session = bucket.join(format!("2026-01-01T00-00-00-000Z_{id}.jsonl"));
         write_breadcrumb(&meta, "fresh", &cwd, &session, true);
-        assert!(capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "fresh").is_err());
+        assert!(
+            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "fresh", None).is_err()
+        );
         write_breadcrumb(&meta, "not-fresh", &cwd, &session, false);
-        assert!(capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "not-fresh").is_err());
+        assert!(
+            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "not-fresh", None)
+                .is_err()
+        );
     }
     #[cfg(unix)]
     #[test]
@@ -2977,7 +3107,9 @@ mod tests {
         let output = run(&marker);
         assert!(output.status.success());
         let captured =
-            select_omp_session_in_container(&output.stdout, &meta, &HashSet::new()).unwrap();
+            select_omp_session_in_container(&output.stdout, &meta, &HashSet::new(), None)
+                .unwrap()
+                .sid;
         assert_eq!(captured, id);
         std::fs::write(&marker, launch_marker(&meta, "pts-9", "")).unwrap();
         assert!(
@@ -3086,7 +3218,7 @@ mod tests {
             set_mtime_ms(&marker, 100_000);
             meta.launch_marker = marker.to_string_lossy().into_owned();
 
-            let host = capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-7");
+            let host = capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-7", None);
             let output = std::process::Command::new("sh")
                 .args([
                     "-c",
@@ -3102,7 +3234,8 @@ mod tests {
                 ])
                 .output()
                 .unwrap();
-            let container = select_omp_session_in_container(&output.stdout, &meta, &HashSet::new());
+            let container =
+                select_omp_session_in_container(&output.stdout, &meta, &HashSet::new(), None);
             assert_eq!(
                 host.is_ok(),
                 container.is_ok(),
@@ -3110,8 +3243,8 @@ mod tests {
             );
             assert_eq!(host.is_ok(), accepted, "{label}");
             if accepted {
-                assert_eq!(host.unwrap(), id, "{label}");
-                assert_eq!(container.unwrap(), id, "{label}");
+                assert_eq!(host.unwrap().sid, id, "{label}");
+                assert_eq!(container.unwrap().sid, id, "{label}");
             }
         }
     }
@@ -3174,7 +3307,9 @@ mod tests {
         )
         .expect("a header within the host scan window must not exceed the container cap");
         assert_eq!(
-            select_omp_session_in_container(&output, &meta, &HashSet::new()).unwrap(),
+            select_omp_session_in_container(&output, &meta, &HashSet::new(), None)
+                .unwrap()
+                .sid,
             id
         );
     }
@@ -3232,14 +3367,16 @@ mod tests {
         // Stale: breadcrumb older than the marker -> script emits no record.
         set_mtime_ms(&breadcrumb, 1_000);
         assert!(
-            select_omp_session_in_container(&run(), &meta, &HashSet::new()).is_err(),
+            select_omp_session_in_container(&run(), &meta, &HashSet::new(), None).is_err(),
             "a breadcrumb predating the launch marker must not be captured in-container"
         );
 
         // Fresh: breadcrumb written after the marker -> captured.
         set_mtime_ms(&breadcrumb, 200_000);
         assert_eq!(
-            select_omp_session_in_container(&run(), &meta, &HashSet::new()).unwrap(),
+            select_omp_session_in_container(&run(), &meta, &HashSet::new(), None)
+                .unwrap()
+                .sid,
             id
         );
     }
@@ -3274,7 +3411,8 @@ mod tests {
         let id = "019fc9a0-f688-7000-ae45-d9e51e5e1b8a";
         let output = sandbox_record(&meta, "pts-9", "launch-b", id);
         assert!(
-            select_omp_session_in_container(output.as_bytes(), &meta, &HashSet::new()).is_err()
+            select_omp_session_in_container(output.as_bytes(), &meta, &HashSet::new(), None)
+                .is_err()
         );
     }
 
@@ -3284,7 +3422,9 @@ mod tests {
         let id = "019fc9a0-f688-7000-ae45-d9e51e5e1b8a";
         let output = sandbox_materialized_record(&meta, "pts-9", id);
         let selected =
-            select_omp_session_in_container(output.as_bytes(), &meta, &HashSet::new()).unwrap();
+            select_omp_session_in_container(output.as_bytes(), &meta, &HashSet::new(), None)
+                .unwrap()
+                .sid;
         assert_eq!(selected, id);
 
         let other = "019fc9df-34e1-7000-949e-43ecb1b5c08d";
@@ -3296,7 +3436,8 @@ mod tests {
         assert!(select_omp_session_in_container(
             global_scan_shape.as_bytes(),
             &meta,
-            &HashSet::new()
+            &HashSet::new(),
+            None
         )
         .is_err());
     }
@@ -3307,7 +3448,9 @@ mod tests {
         let id = "019fc9a0-f688-7000-ae45-d9e51e5e1b8a";
         let output = sandbox_materialized_record(&meta, "pts-9", id);
         let captured =
-            select_omp_session_in_container(output.as_bytes(), &meta, &HashSet::new()).unwrap();
+            select_omp_session_in_container(output.as_bytes(), &meta, &HashSet::new(), None)
+                .unwrap()
+                .sid;
         assert_eq!(captured, id);
     }
 
@@ -3320,14 +3463,18 @@ mod tests {
             sandbox_materialized_record(&meta, "pts-9", first).as_bytes(),
             &meta,
             &HashSet::new(),
+            None,
         )
-        .unwrap();
+        .unwrap()
+        .sid;
         let resumed = select_omp_session_in_container(
             sandbox_materialized_record(&meta, "pts-9", historical).as_bytes(),
             &meta,
             &HashSet::new(),
+            None,
         )
-        .unwrap();
+        .unwrap()
+        .sid;
         assert_eq!(initial, first);
         assert_eq!(resumed, historical);
     }

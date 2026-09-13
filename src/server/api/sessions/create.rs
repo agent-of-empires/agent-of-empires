@@ -151,18 +151,27 @@ pub(super) fn create_body_combines_scratch_and_worktree(body: &CreateSessionBody
 /// structured request is already rejected by the caller's
 /// `agent_is_structured_fork_capable` guard before it reaches here.
 pub(super) fn resolve_create_fork_seed(
-    tool: &str,
     parent_id: &str,
     structured: bool,
+    parents: &[crate::session::Instance],
 ) -> Result<crate::session::ForkSeed, crate::session::ForkDenied> {
     if structured {
         return Ok(crate::session::ForkSeed::Structured {
             parent_acp_session_id: parent_id.to_string(),
         });
     }
+    let mut candidates = parents
+        .iter()
+        .filter_map(|parent| parent.fork_parent_binding())
+        .filter(|binding| binding.session_id == parent_id);
+    let parent = candidates
+        .next()
+        .ok_or(crate::session::ForkDenied::NoParentSession)?;
+    if candidates.any(|candidate| candidate.key() != parent.key()) {
+        return Err(crate::session::ForkDenied::NoParentSession);
+    }
     crate::session::fork::terminal_fork_seed(
-        tool,
-        Some(parent_id),
+        Some(parent),
         crate::session::capture::generate_session_uuid(),
     )
 }
@@ -982,7 +991,27 @@ pub async fn create_session(
                 )
                     .into_response();
             }
-            match resolve_create_fork_seed(&body.tool, parent_id, structured) {
+            let parents = if structured {
+                Vec::new()
+            } else {
+                let profile = validation_profile.to_string();
+                let file_watch = state.file_watch.clone();
+                match tokio::task::spawn_blocking(move || {
+                    crate::session::Storage::new(&profile, file_watch)?.load()
+                })
+                .await
+                {
+                    Ok(Ok(parents)) => parents,
+                    _ => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Cannot load conversation provenance",
+                        )
+                            .into_response()
+                    }
+                }
+            };
+            match resolve_create_fork_seed(parent_id, structured, &parents) {
                 Ok(seed) => Some(seed),
                 Err(_) => {
                     return (
@@ -1223,20 +1252,17 @@ pub(super) fn apply_post_restart_identity_sync(
     if started.lifecycle_generation < live.lifecycle_generation {
         return;
     }
-    // Treat the pre-restart snapshot as a CAS baseline for peer-writable
-    // identity fields. If a poller/CLI/TUI peer changed the sid while the
-    // restart clone was blocking, that newer sid and its marker stay
-    // authoritative.
+    // A same-SID publication can still replace the native store or transcript.
     let generation_can_merge = live.omp_capture_generation == before.omp_capture_generation
         || live.omp_capture_generation == started.omp_capture_generation;
-    let sid_unchanged = live.agent_session_id == before.agent_session_id;
+    let conversation_unchanged = before.conversation_state().matches(live);
     let marker_unchanged = live.resume_probe_failed_sid == before.resume_probe_failed_sid;
     if generation_can_merge {
         live.omp_capture_generation = started.omp_capture_generation.clone();
-        live.session_id_poller = started.session_id_poller.clone();
-        if sid_unchanged {
-            live.agent_session_id = started.agent_session_id.clone();
+        if conversation_unchanged {
+            live.adopt_conversation_state(started.conversation_state());
         }
+        live.session_id_poller = started.session_id_poller.clone();
     } else if started.session_id_poller_is_running() {
         // The worker follows the pane name and will rebind itself to the
         // concurrently published generation on its next metadata refresh.

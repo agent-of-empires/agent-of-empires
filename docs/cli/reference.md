@@ -572,12 +572,16 @@ Attach another repo to an existing session, so an agent that turns out to need a
 
 Set the resume target for a session; agents with resume disabled in AoE store the ID but do not use it
 
-**Usage:** `aoe session set-session-id <IDENTIFIER> <SESSION_ID>`
+**Usage:** `aoe session set-session-id [OPTIONS] <IDENTIFIER> <SESSION_ID>`
 
 ###### **Arguments:**
 
 * `<IDENTIFIER>` — Session ID or title
-* `<SESSION_ID>` — Resume target: for resume-enabled agents, a UUID/sid pins subsequent launches to that conversation; agents with resume disabled in AoE store but do not use it. An empty string forces a one-shot fresh start
+* `<SESSION_ID>` — Conversation to resume. An empty string requests a one-shot fresh start
+
+###### **Options:**
+
+* `--store <STORE>` — Assert the primary native store root, for example CLAUDE_CONFIG_DIR or CODEX_HOME
 
 
 

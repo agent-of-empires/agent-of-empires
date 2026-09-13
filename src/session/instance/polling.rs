@@ -141,7 +141,7 @@ impl Instance {
     }
 
     pub fn supports_session_poller(&self) -> bool {
-        let Some((capture, context)) = self.resolved_session_support() else {
+        let Some((capture, context)) = self.source_session_support() else {
             return false;
         };
         match capture.backend {
@@ -158,7 +158,7 @@ impl Instance {
         if !self.is_sandboxed() {
             return false;
         }
-        let Some(current_store) = self.sandbox_capture_store_dir() else {
+        let Some(current_store) = self.capture_store_dir() else {
             return false;
         };
         let Ok(current_store) = std::fs::canonicalize(current_store) else {
@@ -248,14 +248,16 @@ impl Instance {
             return PollerStart::Started;
         }
         self.session_id_poller = None;
-        let Some((capture, context)) = self.resolved_session_support() else {
+        let Some((capture, context)) = self.source_session_support() else {
             return PollerStart::NotApplicable;
         };
         let backend = capture.backend;
         if !self.supports_session_poller() {
             return PollerStart::NotApplicable;
         }
-        let prime_options = if backend == crate::agents::SessionCaptureBackend::PrimeAgent {
+        let prime_options = if self.active_execution.is_none()
+            && backend == crate::agents::SessionCaptureBackend::PrimeAgent
+        {
             self.prime_agent_capture_options()
         } else {
             None
@@ -265,11 +267,19 @@ impl Instance {
             crate::agents::SessionCaptureBackend::Codex
             | crate::agents::SessionCaptureBackend::Gemini
             | crate::agents::SessionCaptureBackend::Hermes
-            | crate::agents::SessionCaptureBackend::Kimi => {
-                self.sandbox_capture_store_dir().is_some()
+            | crate::agents::SessionCaptureBackend::Kimi => self.capture_store_dir().is_some(),
+            crate::agents::SessionCaptureBackend::PrimeAgent => self
+                .active_execution
+                .as_ref()
+                .map_or(prime_options.is_some(), |active| {
+                    matches!(active.capture, Some(CaptureContext::Prime { .. }))
+                }),
+            crate::agents::SessionCaptureBackend::Omp => {
+                self.active_execution.as_ref().map_or_else(
+                    || self.omp_capture_options().is_some(),
+                    |active| matches!(active.capture, Some(CaptureContext::Omp(_))),
+                )
             }
-            crate::agents::SessionCaptureBackend::PrimeAgent => prime_options.is_some(),
-            crate::agents::SessionCaptureBackend::Omp => self.omp_capture_options().is_some(),
             crate::agents::SessionCaptureBackend::Pi => self.pi_sidecar_source().is_some(),
             crate::agents::SessionCaptureBackend::Claude
             | crate::agents::SessionCaptureBackend::HookSidecar => true,
@@ -282,7 +292,12 @@ impl Instance {
         if !crate::session::poller::session_id_poller_budget_available() {
             return PollerStart::BudgetExhausted;
         }
-        let prime_plan = if let Some(options) = prime_options {
+        let prime_plan = if let Some(active) = &self.active_execution {
+            match &active.capture {
+                Some(CaptureContext::Prime { plan, .. }) => Some(plan.clone()),
+                _ => None,
+            }
+        } else if let Some(options) = prime_options {
             match self.prime_agent_capture_plan(options) {
                 Ok(plan) => Some(plan),
                 Err(error) => {
@@ -303,7 +318,7 @@ impl Instance {
             let Some(store) = prime_plan
                 .as_ref()
                 .map(|plan| plan.store.clone())
-                .or_else(|| self.sandbox_capture_store_dir())
+                .or_else(|| self.capture_store_dir())
             else {
                 return PollerStart::NotApplicable;
             };
@@ -357,36 +372,62 @@ impl Instance {
             return PollerStart::NotApplicable;
         };
         let omp_metadata = if backend == crate::agents::SessionCaptureBackend::Omp {
-            let Some(options) = self.omp_capture_options() else {
-                return PollerStart::NotApplicable;
-            };
-            omp_metadata.or_else(|| self.omp_capture_metadata(&tmux_session_name, &options, None))
+            if let Some(active) = &self.active_execution {
+                match &active.capture {
+                    Some(CaptureContext::Omp(metadata)) => Some(metadata.clone()),
+                    _ => None,
+                }
+            } else {
+                let Some(options) = self.omp_capture_options() else {
+                    return PollerStart::NotApplicable;
+                };
+                omp_metadata
+                    .or_else(|| self.omp_capture_metadata(&tmux_session_name, &options, None))
+            }
         } else {
             None
         };
 
         let mut poller = SessionPoller::new(tmux_session_name);
         let instance_id = self.id.clone();
-        let initial_known = self.agent_session_id.clone();
+        let initial_known = self.agent_session_id.clone().filter(|_| {
+            self.agent_session_binding
+                .as_ref()
+                .is_some_and(ConversationBinding::is_known)
+        });
         let extra_excludes = self.retroactive_capture_exclusion_set();
 
         if backend == crate::agents::SessionCaptureBackend::Omp {
             let Some(metadata) = omp_metadata.as_ref() else {
                 return PollerStart::NotApplicable;
             };
-            let poll_fn: crate::session::poller::SessionIdPollFn = if self.is_sandboxed() {
-                let Some(sandbox) = self.sandbox_info.as_ref() else {
-                    return PollerStart::NotApplicable;
-                };
-                Box::new(omp_poll_fn_sandboxed(
-                    sandbox.container_name.clone(),
-                    self.id.clone(),
-                    Some(metadata.launch_marker.clone()),
-                    extra_excludes,
-                ))
-            } else {
-                Box::new(omp_poll_fn(self.id.clone(), extra_excludes))
+            let container_name = match &self.active_execution {
+                Some(active) => active
+                    .container
+                    .as_ref()
+                    .map(|container| container.name.clone()),
+                None => self
+                    .sandbox_info
+                    .as_ref()
+                    .filter(|sandbox| sandbox.enabled)
+                    .map(|sandbox| sandbox.container_name.clone()),
             };
+            let poll_fn: crate::session::poller::SessionIdPollFn =
+                if let Some(container_name) = container_name {
+                    Box::new(omp_poll_fn_sandboxed(
+                        container_name,
+                        self.id.clone(),
+                        Some(metadata.launch_marker.clone()),
+                        extra_excludes,
+                        self.active_execution.clone(),
+                    ))
+                } else {
+                    Box::new(omp_poll_fn(
+                        self.id.clone(),
+                        extra_excludes,
+                        self.active_execution.clone(),
+                    ))
+                };
             let log_id = self.id.clone();
             let on_change: Box<dyn Fn(&str) + Send + 'static> = Box::new(move |new_id| {
                 tracing::info!(target: "session.store", "Session ID observed for {}: {}", log_id, new_id);
@@ -400,8 +441,36 @@ impl Instance {
             let Some(source) = self.pi_sidecar_source() else {
                 return PollerStart::NotApplicable;
             };
-            let inner = crate::session::capture::pi_sidecar_poll_fn(self.id.clone(), source);
+            let inner = crate::session::capture::pi_sidecar_poll_fn(
+                self.id.clone(),
+                source,
+                self.active_execution.clone(),
+            );
             let poll_fn: crate::session::poller::SessionIdPollFn = Box::new(move |_| inner());
+            let log_id = self.id.clone();
+            let on_change: Box<dyn Fn(&str) + Send + 'static> = Box::new(move |new_id| {
+                tracing::info!(target: "session.store", "Session ID observed for {}: {}", log_id, new_id);
+            });
+            let initial =
+                initial_known.map(crate::session::poller::SessionIdObservation::instance_sidecar);
+            let spawn = poller.start_observations(instance_id, poll_fn, on_change, initial);
+            return self.install_poller(poller, spawn);
+        }
+
+        if matches!(
+            backend,
+            crate::agents::SessionCaptureBackend::Claude
+                | crate::agents::SessionCaptureBackend::HookSidecar
+        ) {
+            let sidecar_id = self.id.clone();
+            let active = self.active_execution.clone();
+            let poll_fn: crate::session::poller::SessionIdPollFn = Box::new(move |_| {
+                super::execution::hook_session_observation(
+                    &sidecar_id,
+                    active.as_ref(),
+                    Some(std::time::Duration::from_secs(300)),
+                )
+            });
             let log_id = self.id.clone();
             let on_change: Box<dyn Fn(&str) + Send + 'static> = Box::new(move |new_id| {
                 tracing::info!(target: "session.store", "Session ID observed for {}: {}", log_id, new_id);
@@ -419,55 +488,57 @@ impl Instance {
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .map(|duration| duration.as_secs_f64() * 1000.0)
             .unwrap_or(f64::MAX);
+        let store_cwd = self
+            .active_execution
+            .as_ref()
+            .and_then(|active| match &active.capture {
+                Some(CaptureContext::Store { cwd, .. }) => Some(cwd.clone()),
+                _ => None,
+            });
         let poll_fn: Box<dyn Fn() -> Option<String> + Send + 'static> = match backend {
-            crate::agents::SessionCaptureBackend::Claude
-            | crate::agents::SessionCaptureBackend::HookSidecar => {
-                let sidecar_id = self.id.clone();
-                Box::new(move || crate::hooks::read_hook_session_id(&sidecar_id))
-            }
             crate::agents::SessionCaptureBackend::Codex => {
-                let Some(store) = self.sandbox_capture_store_dir() else {
+                let Some(store) = self.capture_store_dir() else {
                     return PollerStart::NotApplicable;
                 };
                 Box::new(codex_poll_fn_sandboxed_store(
                     store,
-                    self.container_workdir(),
+                    store_cwd.unwrap_or_else(|| self.container_workdir()),
                     self.id.clone(),
                     capture_floor,
                     extra_excludes,
                 ))
             }
             crate::agents::SessionCaptureBackend::Gemini => {
-                let Some(store) = self.sandbox_capture_store_dir() else {
+                let Some(store) = self.capture_store_dir() else {
                     return PollerStart::NotApplicable;
                 };
                 Box::new(gemini_poll_fn_sandboxed_store(
                     store,
-                    self.container_workdir(),
+                    store_cwd.unwrap_or_else(|| self.container_workdir()),
                     self.id.clone(),
                     capture_floor,
                     extra_excludes,
                 ))
             }
             crate::agents::SessionCaptureBackend::Hermes => {
-                let Some(store) = self.sandbox_capture_store_dir() else {
+                let Some(store) = self.capture_store_dir() else {
                     return PollerStart::NotApplicable;
                 };
                 Box::new(hermes_poll_fn_sandboxed_store(
                     store,
-                    self.container_workdir(),
+                    store_cwd.unwrap_or_else(|| self.container_workdir()),
                     self.id.clone(),
                     capture_floor,
                     extra_excludes,
                 ))
             }
             crate::agents::SessionCaptureBackend::Kimi => {
-                let Some(store) = self.sandbox_capture_store_dir() else {
+                let Some(store) = self.capture_store_dir() else {
                     return PollerStart::NotApplicable;
                 };
                 Box::new(kimi_poll_fn_sandboxed_store(
                     store,
-                    self.container_workdir(),
+                    store_cwd.unwrap_or_else(|| self.container_workdir()),
                     self.id.clone(),
                     capture_floor_ms,
                     extra_excludes,
@@ -488,7 +559,9 @@ impl Instance {
                     extra_excludes,
                 ))
             }
-            crate::agents::SessionCaptureBackend::OpenCode
+            crate::agents::SessionCaptureBackend::Claude
+            | crate::agents::SessionCaptureBackend::HookSidecar
+            | crate::agents::SessionCaptureBackend::OpenCode
             | crate::agents::SessionCaptureBackend::Pi
             | crate::agents::SessionCaptureBackend::Omp => return PollerStart::NotApplicable,
         };
@@ -506,7 +579,24 @@ impl Instance {
         let on_change: Box<dyn Fn(&str) + Send + 'static> = Box::new(move |new_id| {
             tracing::info!(target: "session.store", "Session ID observed for {}: {}", log_id, new_id);
         });
-        let spawn = poller.start(instance_id, poll_fn, on_change, initial_known);
+        let active = self.active_execution.clone().filter(|active| {
+            matches!(
+                active.capture,
+                Some(CaptureContext::Store { .. } | CaptureContext::Prime { .. })
+            )
+        });
+        let poll_fn: crate::session::poller::SessionIdPollFn = Box::new(move |_| {
+            let mut observation =
+                crate::session::poller::SessionIdObservation::instance_sidecar(poll_fn()?);
+            if let Some(active) = &active {
+                observation.source = Some(active.binding.clone());
+                observation.execution = Some(active.clone());
+            }
+            Some(observation)
+        });
+        let initial =
+            initial_known.map(crate::session::poller::SessionIdObservation::instance_sidecar);
+        let spawn = poller.start_observations(instance_id, poll_fn, on_change, initial);
         self.install_poller(poller, spawn)
     }
 
@@ -860,7 +950,7 @@ mod tests {
             .unwrap();
 
         let published = "01a053b6-c470-78de-9d8f-bc00ef05332a";
-        crate::hooks::write_session_id_via_guard(&inst.id, published).unwrap();
+        super::super::test_helpers::publish_host_pi_transcript(&inst.id, published, home.path());
 
         inst.stop_and_flush_poller_lifecycle_locked();
 
@@ -923,11 +1013,30 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let published = "99999999-9999-4999-8999-999999999999";
         std::fs::write(dir.join("session_id"), format!("{published}\n")).unwrap();
+        let transcript = dir
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("agent/sessions")
+            .join(format!("time_{published}.jsonl"));
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(
+            &transcript,
+            format!("{{\"type\":\"session\",\"id\":\"{published}\"}}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("session_path"),
+            format!("/root/.pi/agent/sessions/time_{published}.jsonl"),
+        )
+        .unwrap();
         let poll = crate::session::capture::pi_sidecar_poll_fn(
             sandboxed.id.clone(),
             sandboxed
                 .pi_sidecar_source()
                 .expect("a resolvable sandbox source"),
+            None,
         );
         assert_eq!(poll().map(|o| o.sid).as_deref(), Some(published));
     }

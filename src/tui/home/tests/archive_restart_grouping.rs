@@ -545,7 +545,8 @@ fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
     inst.source_profile = profile.to_string();
     inst.tool = "claude".to_string();
     inst.command = "claude".to_string();
-    inst.agent_session_id = Some(stale_sid.to_string());
+    let binding = inst.asserted_resume_binding(stale_sid, None).unwrap();
+    inst.set_agent_conversation(Some(stale_sid.to_string()), Some(binding), None);
     let id = inst.id.clone();
     let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
     let _ = crate::tmux::tmux_command()

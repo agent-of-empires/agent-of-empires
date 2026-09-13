@@ -762,18 +762,24 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_custom_codex_detected_agent_uses_codex_hook_installer() {
+    fn declared_codex_wrapper_uses_codex_hook_installer() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let _isolation = crate::session::test_support::isolate_app_dir_at(tmp.path());
         let _codex_home_guard = EnvGuard::unset(&["CODEX_HOME"]);
-        std::env::set_var("HOME", tmp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        let profile = "declared-codex-hooks";
+        crate::session::instance::test_helpers::declare_execution_aliases(
+            profile,
+            &[("my-codex-wrapper", "codex")],
+            tmp.path(),
+        );
 
         acknowledge_hooks();
         let mut inst = Instance::new("wrapped", "/tmp/test");
-        inst.tool = "my-codex-wrapper".to_string();
-        inst.detect_as = "codex".to_string();
-        inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as));
+        inst.source_profile = profile.into();
+        inst.tool = "my-codex-wrapper".into();
+        inst.command = "my-codex-wrapper".into();
+        inst.detect_as = "codex".into();
+        inst.install_agent_status_hooks(inst.resolved_agent());
 
         let hooks_path = tmp.path().join(".codex").join("hooks.json");
         let hooks = std::fs::read_to_string(hooks_path).unwrap();

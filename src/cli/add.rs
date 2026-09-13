@@ -385,29 +385,11 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         // The child must fork the SAME agent as the parent: a captured id is
         // agent-shaped (a Claude UUID resumes only under Claude, etc.), so
         // handing it to a different agent's `--resume` fails or resumes garbage.
-        // When the user did not explicitly choose a tool (`--tool`/`--cmd`),
-        // inherit the parent's; when they did and it differs, reject rather than
-        // launch a cross-agent fork.
         let user_chose_tool = args.tool.is_some() || args.command.is_some();
-        if user_chose_tool && resolved_tool != source.tool {
-            bail!(
-                "Cannot fork session '{}' (agent '{}') as agent '{}': a fork must use the parent's \
-                 agent. Drop --tool/--cmd to inherit it, or fork a session created with '{}'.",
-                source.title,
-                source.tool,
-                resolved_tool,
-                resolved_tool
-            );
-        }
         if !user_chose_tool {
             resolved_tool = source.tool.clone();
         }
-        let parent_agent_session_id = source.agent_session_id.clone();
-        let seed = crate::session::fork::terminal_fork_seed(
-            &resolved_tool,
-            parent_agent_session_id.as_deref(),
-            crate::session::capture::generate_session_uuid(),
-        )
+        let seed = crate::session::fork::terminal_fork_seed(source.fork_parent_binding(), crate::session::capture::generate_session_uuid())
         .map_err(|denied| match denied {
             crate::session::ForkDenied::AgentCannotFork => anyhow::anyhow!(
                 "Agent '{}' does not support forking. Forkable agents: claude, codex, opencode.",
@@ -893,20 +875,17 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         .0;
     }
 
-    // Apply the fork seed validated earlier (before worktree/scratch creation):
-    // pre-pin the child agent id and set the one-shot Fork intent, mirroring the
-    // builder's Terminal arm. Validating up front and mutating here keeps the
-    // eligibility error from orphaning a worktree or scratch dir.
     if let Some(seed) = fork_seed {
         match seed {
             crate::session::ForkSeed::Terminal {
-                parent_agent_session_id,
+                parent,
                 child_session_id,
             } => {
                 instance.agent_session_id = Some(child_session_id);
                 instance.resume_intent = crate::session::ResumeIntent::Fork {
-                    from: parent_agent_session_id,
+                    from: parent.session_id.clone(),
                 };
+                instance.resume_binding = Some(parent);
             }
             crate::session::ForkSeed::Structured { .. } => {
                 // Terminal fork only from the CLI; nothing to apply.

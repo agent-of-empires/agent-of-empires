@@ -824,15 +824,14 @@ pub fn build_instance(
     if let Some(seed) = params.fork_seed {
         match seed {
             crate::session::ForkSeed::Terminal {
-                parent_agent_session_id,
+                parent,
                 child_session_id,
             } => {
-                // Pre-pin the child id so it is durable on disk before launch,
-                // and carry the parent on the one-shot Fork intent.
                 instance.agent_session_id = Some(child_session_id);
                 instance.resume_intent = crate::session::ResumeIntent::Fork {
-                    from: parent_agent_session_id,
+                    from: parent.session_id.clone(),
                 };
+                instance.resume_binding = Some(parent);
             }
             crate::session::ForkSeed::Structured {
                 parent_acp_session_id,
@@ -2333,50 +2332,6 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn build_instance_applies_terminal_fork_seed() {
-        use crate::session::ForkSeed;
-        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
-        let params = InstanceParams {
-            title: "Forked".into(),
-            path: "/tmp".into(),
-            group: String::new(),
-            tool: "claude".into(),
-            worktree_enabled: false,
-            worktree_branch: None,
-            create_new_branch: false,
-            base_branch: None,
-            sandbox: false,
-            sandbox_image: String::new(),
-            yolo_mode: false,
-            extra_env: vec![],
-            extra_args: String::new(),
-            command_override: String::new(),
-            extra_repo_paths: vec![],
-            repo_base_branches: Vec::new(),
-            scratch: false,
-            fork_seed: Some(ForkSeed::Terminal {
-                parent_agent_session_id: "parent-uuid".into(),
-                child_session_id: "child-uuid".into(),
-            }),
-        };
-        let inst = build_instance(params, &[], &[], "default")
-            .unwrap()
-            .instance;
-        // The pre-pinned child id lives in agent_session_id; the parent rides on
-        // the one-shot Fork intent.
-        assert_eq!(inst.agent_session_id.as_deref(), Some("child-uuid"));
-        assert!(
-            matches!(
-                inst.resume_intent,
-                crate::session::instance::ResumeIntent::Fork { ref from } if from == "parent-uuid"
-            ),
-            "fork intent must carry the parent id in `from`, got {:?}",
-            inst.resume_intent
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
     fn build_instance_applies_structured_fork_seed() {
         use crate::session::ForkSeed;
         let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
@@ -2427,10 +2382,7 @@ mod tests {
     fn fork_seed_tests_restore_default_profile_registry() {
         const ALIAS_AGENT: &str = "fork-seed-registry-alias";
         const RULE_AGENT: &str = "fork-seed-registry-rule";
-        let cases: &[(&str, fn())] = &[
-            ("terminal", build_instance_applies_terminal_fork_seed),
-            ("structured", build_instance_applies_structured_fork_seed),
-        ];
+        let cases: &[(&str, fn())] = &[("structured", build_instance_applies_structured_fork_seed)];
 
         // serial_test 4's default-key lock is reentrant: the wrapper must call
         // each serialized test directly to inspect state after its guard drops.

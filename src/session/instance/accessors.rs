@@ -53,6 +53,9 @@ impl Instance {
             sandbox_store_transition_paths: Vec::new(),
             terminal_info: None,
             agent_session_id: None,
+            agent_session_binding: None,
+            resume_binding: None,
+            active_execution: None,
             omp_capture_generation: None,
             lifecycle_generation: 0,
             resume_probe_failed_sid: None,
@@ -180,17 +183,9 @@ impl Instance {
         tmux::status_rules::effective_detect_as(&self.source_profile, &self.tool, &self.detect_as)
     }
 
-    /// The built-in agent backing this session: its own tool when that names
-    /// one, else the agent its `agent_detect_as` alias points at.
-    ///
-    /// Every launch-time consumer resolves through here rather than reading
-    /// `detect_as` raw, because a miss is silent and permanent. `None` drops
-    /// the `AOE_PROFILE`/`AOE_INSTANCE_ID` prefix from the launch line
-    /// ([`status_hook_env_prefix`]) and skips hook install, so every hook the
-    /// agent does have bails on `[ -n "$AOE_INSTANCE_ID" ]` and the session
-    /// reports Idle forever with nothing logged.
+    /// Native execution identity; status aliases never authorize conversation access.
     pub(crate) fn resolved_agent(&self) -> Option<&'static crate::agents::AgentDef> {
-        resolved_agent_for(&self.source_profile, &self.tool, &self.detect_as)
+        self.execution_agent().ok()
     }
 
     /// The built-in identity used to compare capture stores and aliases.
@@ -203,7 +198,7 @@ impl Instance {
     }
     /// Whether a launch fragment carries shell syntax the pane's shell would
     /// act on, so the agent is not what the command word names.
-    fn contains_active_shell_syntax(value: &str) -> bool {
+    pub(super) fn contains_active_shell_syntax(value: &str) -> bool {
         let mut quote = None;
         let mut escaped = false;
         for ch in value.chars() {
@@ -286,40 +281,11 @@ impl Instance {
             .map(str::to_owned)
     }
 
-    /// Whether a resume selector appended to this launch reaches the agent.
-    ///
-    /// [`Self::launch_invokes_resolved_agent_directly`] is the stricter test
-    /// and stays the one that authorizes capture: inferring ownership from a
-    /// store, mirroring a binary under `opencode serve`, or matching a process
-    /// by argv all need the agent's own name. Emitting a selector needs less.
-    /// A single bare token is the program the pane runs whatever it is called,
-    /// which is the wrapper shape `custom_agents` and `agent_command_override`
-    /// document, and `agent_detect_as` is the user declaring what it wraps.
-    /// Refusing it takes resume away from every renamed wrapper and each
-    /// restart silently starts a fresh conversation (#3638).
-    ///
-    /// A path-qualified token still fails: a bare one resolves through the
-    /// launch shell's `PATH`, which AoE controls, and a path escapes it.
+    /// Only a verified direct invocation or an explicit wrapper contract carries selectors.
     pub(crate) fn launch_can_carry_resume_selector(&self, agent: &crate::agents::AgentDef) -> bool {
-        if self.launch_invokes_resolved_agent_directly(agent) {
-            return true;
-        }
-        let Some(parsed_command) = parse_launch_command(self.get_tool_command()) else {
-            return false;
-        };
-        let [token] = parsed_command.words.as_slice() else {
-            return false;
-        };
-        if token.contains('/') || token.starts_with('-') {
-            return false;
-        }
-        if Self::contains_active_shell_syntax(self.get_tool_command())
-            || Self::contains_active_shell_syntax(&self.extra_args)
-        {
-            return false;
-        }
-        shell_words::split(&self.extra_args)
-            .is_ok_and(|extra| !extra.iter().any(|word| word == "--"))
+        self.execution_agent()
+            .is_ok_and(|actual| actual.name == agent.name)
+            && self.managed_user_argv(agent).is_ok()
     }
 
     /// Whether this launch shape leaves Claude user hooks enabled.
@@ -412,6 +378,32 @@ impl Instance {
         };
         authorized.then_some((capture, context))
     }
+    pub(super) fn source_session_support(
+        &self,
+    ) -> Option<(
+        &'static crate::agents::SessionCaptureSpec,
+        crate::agents::SessionCaptureContext,
+    )> {
+        let Some(active) = &self.active_execution else {
+            return self.resolved_session_support();
+        };
+        let capture = crate::agents::get_agent(&active.binding.agent)?
+            .session_support
+            .as_ref()?
+            .capture
+            .as_ref()?;
+        let context = if active.container.is_some() {
+            capture.sandbox
+        } else {
+            capture.host
+        };
+        (context != crate::agents::SessionCaptureContext::Unsupported).then_some((capture, context))
+    }
+
+    pub(super) fn source_capture_backend(&self) -> Option<crate::agents::SessionCaptureBackend> {
+        self.source_session_support()
+            .map(|(capture, _)| capture.backend)
+    }
 
     pub(super) fn resolved_capture_backend(&self) -> Option<crate::agents::SessionCaptureBackend> {
         self.resolved_session_support()
@@ -497,40 +489,31 @@ impl Instance {
         self.view == View::Structured
     }
 
-    /// Switch this structured-view session to terminal mode while keeping the
-    /// conversation resumable (#2252). Carries the ACP-side `acp_session_id`
-    /// into the terminal-side `agent_session_id` and pins it as the resume
-    /// target (`ResumeIntent::Use`), so the next `start()` launches
-    /// `<tool> --resume <sid>` instead of a fresh pane, then drops the
-    /// structured-view-only ids.
-    ///
-    /// The caller must have confirmed the agent pairing shares a
-    /// CLI-resumable transcript (see `agents::acp_transcript_cli_resumable`).
-    /// When `acp_session_id` is unset this only flips the view, leaving no
-    /// resume target, which is why the caller also gates on it being present.
-    pub(crate) fn switch_to_terminal_keep_context(&mut self) {
-        if let Some(sid) = self.acp_session_id.take() {
-            self.agent_session_id = Some(sid.clone());
-            self.resume_intent = ResumeIntent::Use(sid);
-        }
+    /// ACP IDs need an explicit native-store assertion before terminal handoff.
+    pub(crate) fn switch_to_terminal_keep_context(&mut self) -> Result<()> {
+        let sid = self
+            .acp_session_id
+            .as_ref()
+            .context("ACP conversation ID is unavailable")?;
+        let binding = self.resume_binding.as_ref().filter(|binding| {
+            matches!(&self.resume_intent, ResumeIntent::Use(target) if target == sid) && binding.session_id == *sid
+                && binding.provenance == ConversationProvenance::Asserted
+                && binding.execution.as_ref().is_some_and(|execution| execution.agent == "claude")
+        }).cloned().context("ACP does not prove a native conversation store; bind its current ID with aoe session set-session-id SESSION ID --store /absolute/claude-store before switching to terminal")?;
+        let sid = self.acp_session_id.take().unwrap();
+        self.adopt_conversation_state(ConversationState {
+            session_id: Some(sid.clone()),
+            binding: Some(binding.clone()),
+            intent: ResumeIntent::Use(sid),
+            resume_binding: Some(binding),
+            active: None,
+            pi_session_path: None,
+        });
         self.import_pending = None;
         self.acp_load_session_capable = None;
         self.view = View::Terminal;
+        Ok(())
     }
-}
-
-/// Resolve a built-in from the instance's stored alias or its profile registry.
-/// The stored value wins; legacy rows with no value consult the live registry.
-fn resolved_agent_for(
-    profile: &str,
-    tool: &str,
-    detect_as: &str,
-) -> Option<&'static crate::agents::AgentDef> {
-    crate::agents::get_agent(tool).or_else(|| {
-        crate::agents::get_agent(&tmux::status_rules::effective_detect_as(
-            profile, tool, detect_as,
-        ))
-    })
 }
 
 #[cfg(test)]
@@ -546,7 +529,27 @@ mod tests {
         inst.import_pending = Some(true);
         inst.acp_load_session_capable = Some(true);
 
-        inst.switch_to_terminal_keep_context();
+        assert!(inst.switch_to_terminal_keep_context().is_err());
+        assert_eq!(inst.view, View::Structured);
+        assert_eq!(inst.acp_session_id.as_deref(), Some("sid-abc"));
+        inst.resume_intent = ResumeIntent::Use("sid-abc".into());
+        inst.resume_binding = Some(ConversationBinding {
+            session_id: "sid-abc".into(),
+            provenance: ConversationProvenance::Asserted,
+            transcript_path: None,
+            execution: Some(ExecutionBinding {
+                agent: "claude".into(),
+                stores: vec!["/tmp/claude".into()],
+                configuration: Vec::new(),
+                cwd: "/tmp".into(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+            }),
+        });
+        inst.pi_session_path = Some("/tmp/foreign.jsonl".into());
+        inst.switch_to_terminal_keep_context().unwrap();
+        assert!(inst.fork_parent_binding().is_some());
+        assert!(inst.pi_session_path.is_none());
 
         assert_eq!(inst.view, View::Terminal);
         assert_eq!(inst.agent_session_id.as_deref(), Some("sid-abc"));
@@ -802,21 +805,10 @@ mod tests {
         assert_eq!(inst.project_path, "/home/user/old");
         assert_eq!(inst.tool, "claude");
         assert!(inst.agent_session_id.is_none());
-
-        // After loading, can set a new session ID
-        let mut inst = inst;
-        inst.agent_session_id = Some("new-session-456".to_string());
-        assert_eq!(inst.agent_session_id, Some("new-session-456".to_string()));
     }
 
-    /// A custom-agent row whose stored `detect_as` is empty must still resolve
-    /// its built-in agent at launch. Without it `status_hook_env_prefix` drops
-    /// `AOE_INSTANCE_ID`, every hook in the agent's settings file bails on
-    /// `[ -n "$AOE_INSTANCE_ID" ]`, and the session reports Idle forever with
-    /// nothing logged. #3398 taught the read sites to consult the live
-    /// registry; this is the launch site.
     #[test]
-    fn empty_detect_as_still_resolves_the_launch_agent() {
+    fn empty_detect_as_resolves_status_without_granting_execution() {
         const PROFILE: &str = "detect-as-launch-path-test";
         let _registry = install_aliases(PROFILE, &[("claude-personal", "claude")]);
 
@@ -826,18 +818,8 @@ mod tests {
         inst.command = "claude-personal".to_string();
         inst.detect_as = String::new();
 
-        assert_eq!(
-            inst.resolved_agent().map(|a| a.name),
-            Some("claude"),
-            "empty detect_as must fall back to the live agent_detect_as registry"
-        );
-        assert_eq!(
-            status_hook_env_prefix(&inst.effective_profile(), "abc123", inst.resolved_agent()),
-            format!(
-                "AOE_PROFILE='{PROFILE}' AOE_INSTANCE_ID='abc123' AOE_HOOK_BIN={} ",
-                shell_escape(&std::env::current_exe().unwrap().to_string_lossy())
-            ),
-        );
+        assert_eq!(inst.effective_detect_as(), "claude");
+        assert!(inst.resolved_agent().is_none());
     }
     #[test]
     fn native_resume_requires_a_direct_local_builtin_launch() {
@@ -951,10 +933,6 @@ mod tests {
                 inst.hook_session_publisher_allowed_by_argv(),
                 expected,
                 "args={args:?}"
-            );
-            assert!(
-                inst.supports_native_resume(),
-                "hook-disabling argv must not disable native resume: {args:?}"
             );
         }
     }

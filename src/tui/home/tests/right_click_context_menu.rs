@@ -180,33 +180,6 @@ fn right_click_unarchive_action_restores_session() {
     render_geometry(&mut env.view);
     let row = shelf_row_for_idx(&env.view, idx);
     assert!(env.view.handle_right_click(5, row));
-    let labels: Vec<&str> = env
-        .view
-        .context_menu
-        .as_ref()
-        .unwrap()
-        .items_for_test()
-        .iter()
-        .map(|(_, l)| *l)
-        .collect();
-    // Default sort here is Newest, where Snooze is gated out. The unread
-    // toggle is always-on (any sort) and defaults on. The default session
-    // tool is claude (a forkable terminal agent), so the Fork row shows;
-    // `right_click_session_menu_hides_fork_for_unforkable_agent` covers the
-    // gated-off case. Menu is New Session / Rename / Unarchive / Mark unread
-    // / Add project / Delete / Fork.
-    assert_eq!(
-        labels,
-        vec![
-            "New Session",
-            "Rename",
-            "Unarchive",
-            "Mark unread",
-            "Add project",
-            "Delete",
-            "Fork session"
-        ]
-    );
 
     env.view.handle_key(key(KeyCode::Down), None); // New Session -> Rename
     env.view.handle_key(key(KeyCode::Down), None); // Rename -> Unarchive
@@ -217,13 +190,32 @@ fn right_click_unarchive_action_restores_session() {
     );
 }
 
-/// A forkable agent (claude, the default test tool) shows the "Fork
-/// session" row so the mouse path matches the palette action.
 #[test]
 #[serial]
-fn right_click_session_menu_shows_fork_for_forkable_agent() {
-    let mut env = create_test_env_with_sessions(1);
+fn right_click_fork_requires_provenance_not_a_tool_label() {
+    let mut env = create_test_env_empty();
+    let mut parent = observed_fork_parent("claude");
+    let id = parent.id.clone();
+    let binding = parent.agent_session_binding.take();
+    env.view.add_instance(parent);
+    env.view.flat_items = env.view.build_flat_items();
     setup_inner(&mut env);
+    assert!(env.view.handle_right_click(5, 1));
+    assert!(!env
+        .view
+        .context_menu
+        .as_ref()
+        .unwrap()
+        .items_for_test()
+        .iter()
+        .any(|(action, _)| *action == ContextMenuAction::Fork));
+    env.view.context_menu = None;
+    env.view
+        .apply_user_action(&id, |instance| {
+            instance.agent_session_binding = binding;
+            instance.tool = "status-alias".into();
+        })
+        .unwrap();
     assert!(env.view.handle_right_click(5, 1));
     let actions: Vec<ContextMenuAction> = env
         .view
@@ -236,26 +228,18 @@ fn right_click_session_menu_shows_fork_for_forkable_agent() {
         .collect();
     assert!(
         actions.contains(&ContextMenuAction::Fork),
-        "a forkable agent (claude) must show the Fork row"
+        "a proven native parent remains forkable independently of its tool label"
     );
 }
 
-/// A resume-only agent (gemini declares `ForkStrategy::Unsupported`) cannot
-/// fork, so the menu must omit the "Fork session" row rather than offer an
-/// action the palette would refuse.
+/// An observed conversation is insufficient when its native agent cannot fork.
 #[test]
 #[serial]
 fn right_click_session_menu_hides_fork_for_unforkable_agent() {
-    let mut env = create_test_env_with_sessions(1);
-    setup_inner(&mut env);
-    let id = match &env.view.flat_items[0] {
-        Item::Session { id, .. } => id.clone(),
-        _ => panic!("expected a session row"),
-    };
-    env.view
-        .apply_user_action(&id, |inst| inst.tool = "gemini".to_string())
-        .unwrap();
+    let mut env = create_test_env_empty();
+    env.view.add_instance(observed_fork_parent("gemini"));
     env.view.flat_items = env.view.build_flat_items();
+    setup_inner(&mut env);
     assert!(env.view.handle_right_click(5, 1));
     let actions: Vec<ContextMenuAction> = env
         .view
@@ -312,16 +296,13 @@ fn right_click_session_menu_gates_snooze_to_attention_sort() {
     );
 }
 
-/// For a forkable agent the Fork row is sort-independent: unlike Snooze
-/// (gated to Attention sort) it appears in every sort. Whether the row shows
-/// at all is gated on fork capability, covered by the
-/// `..._shows_fork_for_forkable_agent` / `..._hides_fork_for_unforkable_agent`
-/// pair; this test pins that the capability gate does not accidentally
-/// couple to sort order. The default test tool is claude (forkable).
+/// Sorting must not change eligibility of the captured parent.
 #[test]
 #[serial]
 fn right_click_session_menu_offers_fork_in_every_sort_for_forkable_agent() {
-    let mut env = create_test_env_with_sessions(2);
+    let mut env = create_test_env_empty();
+    env.view.add_instance(observed_fork_parent("claude"));
+    env.view.add_instance(observed_fork_parent("claude"));
     setup_inner(&mut env);
 
     let has_fork = |env: &TestEnv| -> bool {

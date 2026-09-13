@@ -223,6 +223,19 @@ fn restart_surfaces_a_pinned_fresh_launch_that_dies() {
     inst.tool = "claude".to_string();
     inst.command = "claude".to_string();
     inst.agent_session_id = Some(VALID_CLAUDE_UUID.to_string());
+    inst.agent_session_binding = Some(agent_of_empires::session::ConversationBinding {
+        session_id: VALID_CLAUDE_UUID.into(),
+        provenance: agent_of_empires::session::ConversationProvenance::Preallocated,
+        execution: Some(agent_of_empires::session::ExecutionBinding {
+            agent: "claude".into(),
+            stores: vec![temp.path().join(".claude")],
+            configuration: Vec::new(),
+            cwd: workdir.clone(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+        }),
+        transcript_path: None,
+    });
     let session_name = tmux::Session::generate_name(&inst.id, &inst.title);
     let _cleanup = TmuxCleanup(&session_name);
 

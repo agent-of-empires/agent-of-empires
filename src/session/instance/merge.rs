@@ -48,16 +48,16 @@ impl Instance {
         let generation_can_merge = self.omp_capture_generation == before.omp_capture_generation
             || self.omp_capture_generation == src.omp_capture_generation;
         self.lifecycle_generation = src.lifecycle_generation;
-        let sid_unchanged = self.agent_session_id == before.agent_session_id;
+        let conversation_unchanged = before.conversation_state().matches(self);
         let marker_unchanged = self.resume_probe_failed_sid == before.resume_probe_failed_sid;
 
         if generation_can_merge {
             self.omp_capture_generation = src.omp_capture_generation.clone();
+            if conversation_unchanged {
+                self.adopt_conversation_state(src.conversation_state());
+            }
             self.session_id_poller = src.session_id_poller.clone();
             self.session_id_poller_retry_after = src.session_id_poller_retry_after;
-            if sid_unchanged {
-                self.agent_session_id = src.agent_session_id.clone();
-            }
         } else if src.session_id_poller_is_running() {
             // A concurrent launch already published a third generation. The
             // restarted poller reloads tmux metadata on every tick, so keep
@@ -203,6 +203,8 @@ impl Instance {
         // back to it resumes there instead of starting a third conversation.
         let outgoing = PriorToolSession {
             agent_session_id: self.agent_session_id.take(),
+            agent_session_binding: self.agent_session_binding.take(),
+            pi_session_path: self.pi_session_path.take(),
             acp_session_id: self.acp_session_id.take(),
         };
         if !outgoing.is_empty() {
@@ -229,13 +231,19 @@ impl Instance {
             .prior_tool_session_ids
             .remove(new_tool)
             .unwrap_or_default();
-        self.agent_session_id = restored.agent_session_id;
+        self.set_agent_conversation(
+            restored.agent_session_id,
+            restored.agent_session_binding,
+            restored.pi_session_path,
+        );
         self.acp_session_id = restored.acp_session_id;
         self.acp_load_session_capable = None;
         self.resume_probe_failed_sid = None;
         // A pin/clear/fork directive names an id in the old agent's namespace,
         // so it cannot survive the swap either.
         self.resume_intent = ResumeIntent::Default;
+        self.resume_binding = None;
+        self.active_execution = None;
         // Effort vocabularies are adapter-specific, so the old agent's pick is
         // meaningless to the new one; it falls back to the new agent's default.
         self.acp_effort = None;
@@ -784,6 +792,19 @@ mod tests {
         before.omp_capture_generation = Some("generation-a".to_string());
         let mut restarted = before.clone();
         restarted.omp_capture_generation = Some("generation-b".to_string());
+        restarted.active_execution = Some(ActiveExecution {
+            launch_id: "11111111-1111-4111-8111-111111111111".into(),
+            binding: ExecutionBinding {
+                agent: "omp".into(),
+                stores: vec!["/tmp/omp".into()],
+                configuration: Vec::new(),
+                cwd: "/tmp/test".into(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+            },
+            capture: None,
+            container: None,
+        });
         let mut poller = crate::session::poller::SessionPoller::new("omp-restarted".to_string());
         assert_eq!(
             poller.start(before.id.clone(), Box::new(|| None), Box::new(|_| {}), None,),
@@ -794,7 +815,16 @@ mod tests {
         let mut live = before.clone();
         live.merge_post_restart_with_baseline(&before, &restarted);
         assert_eq!(live.omp_capture_generation.as_deref(), Some("generation-b"));
-        assert!(live.session_id_poller.is_some());
+        assert!(live.session_id_poller_is_running());
+
+        let mut peer_metadata = before.clone();
+        peer_metadata.agent_session_binding = Some(ConversationBinding::unknown("old-sid"));
+        let expected = peer_metadata.conversation_state();
+        peer_metadata.merge_post_restart_with_baseline(&before, &restarted);
+        assert!(
+            expected.matches(&peer_metadata),
+            "same-SID metadata writes must survive restart"
+        );
 
         let mut generation_converged = before.clone();
         generation_converged.agent_session_id = Some("peer-sid".to_string());

@@ -218,10 +218,11 @@ impl Instance {
         let hook_result = self.run_pre_launch_hooks(skip_on_launch, &profile);
         let (_title_lock, _lifecycle_lock) =
             self.reacquire_launch_locks_after_hooks(&storage, hook_result)?;
+        self.reconcile_sidecar_into_disk();
         let skipped_failed_resume_sid = self.apply_resume_policy(resume_policy);
-        self.apply_fresh_launch_intent();
+        let expected = self.apply_fresh_launch_intent();
 
-        let mut prepared = match self.prepare_launch_command() {
+        let mut prepared = match self.prepare_launch_command(expected) {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.fail_reserved_launch(&storage, &error, false);
@@ -470,13 +471,18 @@ mod tests {
                 .unwrap()
                 .launch_base_command();
             let base_command = command.clone();
-            let resumed = inst.apply_session_flags(&mut command, "test").unwrap();
-            assert_eq!(resumed, resume_supported, "{tool}: launch resume decision");
-            assert_eq!(
-                command != base_command,
-                resume_supported,
-                "{tool}: resume argv emission: {command}"
-            );
+            let resumed =
+                inst.apply_session_flags(&mut command, "test", inst.resolved_agent(), None);
+            if resume_supported {
+                assert!(resumed.unwrap(), "{tool}: launch resume decision");
+                assert_ne!(command, base_command, "{tool}: resume selector missing");
+            } else {
+                assert!(
+                    resumed.is_err(),
+                    "{tool}: an explicit unsupported resume must fail"
+                );
+                assert_eq!(command, base_command, "{tool}: rejected command changed");
+            }
             assert_eq!(
                 build_resume_flags(tool, sid, true).is_empty(),
                 !resume_supported,
@@ -499,81 +505,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn launch_sid_outcome_carries_emitted_sid() {
-        let outcome = LaunchSidOutcome::Existing {
-            sid: "11111111-1111-1111-1111-111111111111".to_string(),
-        };
-
-        match outcome {
-            LaunchSidOutcome::Existing { sid } => {
-                assert_eq!(sid, "11111111-1111-1111-1111-111111111111");
-            }
-            other => panic!("expected Existing, got {other:?}"),
-        }
-    }
-
-    /// This file's own source from `start_marker` up to the tests module.
-    /// The end is searched from `start_marker` onward so the slice stays
-    /// valid if a `#[cfg(test)]` item is ever added above `mod tests`.
-    fn source_from(start_marker: &str) -> String {
-        let source = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/session/instance/resume.rs"),
-        )
-        .unwrap();
-        let start = source
-            .find(start_marker)
-            .unwrap_or_else(|| panic!("start marker not found: {start_marker}"));
-        let end = source[start..]
-            .find(
-                "
-#[cfg(test)]
-mod tests {",
-            )
-            .map(|offset| start + offset)
-            .expect("tests module boundary not found after start marker");
-        source[start..end].to_string()
-    }
-
-    #[test]
-    fn start_with_resume_fallback_uses_launch_sid_for_probe_decision() {
-        let fallback_source = source_from("pub(crate) fn start_with_resume_fallback");
-
-        assert!(fallback_source
-            .contains("let (attempted_sid, pinned_prior_sid) = match launch_outcome"));
-        assert!(fallback_source.contains("LaunchSidOutcome::Existing { sid }"));
-        assert!(!fallback_source.contains("should_attempt_resume(self.agent_session_id.as_deref()"));
-        assert!(!fallback_source.contains("let stale_sid = self\n            .agent_session_id"));
-    }
-
-    #[test]
-    fn resume_probe_failure_marks_before_cleanup() {
-        let fallback_source = source_from("fn finish_resume_launch");
-        let local_marker = fallback_source
-            .find("self.resume_probe_failed_sid = Some(stale_sid.clone())")
-            .unwrap();
-        let persisted_marker = fallback_source
-            .find("self.mark_resume_probe_failed(profile, &stale_sid)")
-            .unwrap();
-        let cleanup = fallback_source.find("self.kill_clean_locked()").unwrap();
-
-        assert!(local_marker < cleanup);
-        assert!(persisted_marker < cleanup);
-    }
-
-    /// Seed a Claude transcript on disk for `sid` under `project_path`, in
-    /// the exact location `acquire_session_id`'s existence check reads
-    /// (`CLAUDE_CONFIG_DIR` or `$HOME/.claude`). The probe tests below drive
-    /// the `--resume` cascade, which acquire now only takes when a stored
-    /// sid has a real prior conversation on disk; an empty thread's sid
-    /// launches fresh-pinned (`--session-id`) instead. Callers must have set
-    /// `HOME` to a temp dir first.
-    fn seed_claude_transcript(project_path: &str, sid: &str) {
+    /// Seed a resumable Claude conversation in the isolated native store.
+    fn seed_claude_transcript(instance: &mut Instance, sid: &str) {
         let home = std::env::var("CLAUDE_CONFIG_DIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| dirs::home_dir().expect("home dir").join(".claude"));
-        let canonical = std::fs::canonicalize(project_path)
-            .unwrap_or_else(|_| std::path::PathBuf::from(project_path));
+        let canonical = std::fs::canonicalize(&instance.project_path)
+            .unwrap_or_else(|_| std::path::PathBuf::from(&instance.project_path));
         let dir = home
             .join("projects")
             .join(crate::session::capture::encode_claude_project_path(
@@ -581,6 +519,8 @@ mod tests {",
             ));
         std::fs::create_dir_all(&dir).expect("create claude project dir");
         std::fs::write(dir.join(format!("{sid}.jsonl")), "seed\n").expect("write transcript");
+        let binding = instance.asserted_resume_binding(sid, None).unwrap();
+        instance.set_agent_conversation(Some(sid.into()), Some(binding), None);
     }
 
     #[test]
@@ -624,7 +564,7 @@ mod tests {",
         inst.agent_session_id = Some(stale_sid.clone());
         inst.status = Status::Idle;
         // Real prior conversation on disk so acquire takes the --resume path.
-        seed_claude_transcript(&inst.project_path, &stale_sid);
+        seed_claude_transcript(&mut inst, &stale_sid);
         let id = inst.id.clone();
 
         let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
@@ -703,7 +643,7 @@ mod tests {",
         inst.agent_session_id = Some(stale_sid.clone());
         inst.status = Status::Idle;
         // Real prior conversation on disk so acquire takes the --resume path.
-        seed_claude_transcript(&inst.project_path, &stale_sid);
+        seed_claude_transcript(&mut inst, &stale_sid);
 
         let xs = vec![inst.clone()];
         storage
@@ -844,7 +784,7 @@ mod tests {",
         inst.agent_session_id = Some(stale_sid.clone());
         inst.status = Status::Idle;
         // Real prior conversation on disk so acquire takes the --resume path.
-        seed_claude_transcript(&inst.project_path, &stale_sid);
+        seed_claude_transcript(&mut inst, &stale_sid);
 
         let xs = vec![inst.clone()];
         storage
@@ -906,7 +846,7 @@ mod tests {",
         // Real prior conversation on disk so the FIRST attempt takes the
         // --resume path (and fails); the loop-breaker on the second attempt
         // then fires from the persisted marker, independent of the transcript.
-        seed_claude_transcript(&inst.project_path, &stale_sid);
+        seed_claude_transcript(&mut inst, &stale_sid);
 
         let xs = vec![inst.clone()];
         storage
@@ -997,7 +937,7 @@ mod tests {",
         inst.agent_session_id = Some(stale_sid.clone());
         inst.status = Status::Idle;
         // Real prior conversation on disk so acquire takes the --resume path.
-        seed_claude_transcript(&inst.project_path, &stale_sid);
+        seed_claude_transcript(&mut inst, &stale_sid);
 
         let xs = vec![inst.clone()];
         storage

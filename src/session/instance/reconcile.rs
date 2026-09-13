@@ -46,6 +46,10 @@ impl Instance {
             disk.last_error_check = self.last_error_check;
             disk.last_error = self.last_error.take();
         }
+        if self.active_execution != disk.active_execution {
+            self.stop_poller();
+            self.session_id_poller = None;
+        }
         disk.last_start_time = self.last_start_time;
         disk.session_id_poller = self.session_id_poller.take();
         disk.session_id_poller_retry_after = self.session_id_poller_retry_after;
@@ -74,16 +78,14 @@ impl Instance {
         *self = disk;
     }
 
-    /// Closes the data-loss window where `/clear` writes the sidecar but
-    /// the daemon crashes before the next poll tick persists it: without
-    /// this step, the next launch's wipe destroys the fresh sid.
-    ///
-    /// Claude-only (sole sidecar tool); `Default` intent only (`Use(X)`
-    /// and `Cleared` override); excluded sids skipped (cascade re-poison
-    /// guard).
+    /// Flush the previous pane’s publication before its source is retired.
     pub(super) fn reconcile_sidecar_into_disk(&mut self) {
+        if self.source_capture_backend() == Some(crate::agents::SessionCaptureBackend::Pi) {
+            self.absorb_published_pi_session();
+            return;
+        }
         if !matches!(
-            self.resolved_capture_backend(),
+            self.source_capture_backend(),
             Some(
                 crate::agents::SessionCaptureBackend::Claude
                     | crate::agents::SessionCaptureBackend::HookSidecar
@@ -94,26 +96,34 @@ impl Instance {
         if !matches!(self.resume_intent, ResumeIntent::Default) {
             return;
         }
-        let Some(fresh) = crate::hooks::read_hook_session_id_any_age(&self.id) else {
+        let Some(observation) = super::execution::hook_session_observation(
+            &self.id,
+            self.active_execution.as_ref(),
+            None,
+        ) else {
             return;
         };
-        if Some(&fresh) == self.agent_session_id.as_ref() {
+        let fresh = &observation.sid;
+        if Some(fresh) == self.agent_session_id.as_ref()
+            && self.agent_session_binding == observation.conversation_binding()
+        {
             return;
         }
-        if self.retroactive_capture_excludes.contains(&fresh) {
+        if self.retroactive_capture_excludes.contains(fresh) {
             return;
         }
         let profile = self.effective_profile();
-        let baseline = self.agent_session_id.as_deref();
+        let baseline = self.conversation_state();
         match persist_session_to_storage(
             &profile,
             &self.id,
-            &fresh,
-            baseline,
+            &observation,
+            &baseline,
             &self.resolve_file_watch(),
         ) {
             SidWrite::Applied => {
-                self.agent_session_id = Some(fresh);
+                let binding = observation.conversation_binding();
+                self.set_agent_conversation(Some(observation.sid), binding, None);
             }
             SidWrite::Skipped => {
                 // Peer wrote between reconcile and CAS; reload to converge.
@@ -136,9 +146,7 @@ mod tests {
     #[serial]
     fn reconcile_from_disk_picks_up_peer_persist() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
 
         let storage = crate::session::storage::Storage::new_unwatched("reconcile-test").unwrap();
         let mut inst = Instance::new("title", "/tmp/x");
@@ -156,12 +164,12 @@ mod tests {
             })
             .unwrap();
 
-        // Simulate a peer CLI `set-session-id` write to disk.
+        // A peer capture commits a complete conversation state.
         let _ = super::persist_session_to_storage(
             "reconcile-test",
             &id,
-            "new-sid",
-            Some("old-sid"),
+            &crate::session::poller::SessionIdObservation::unguarded("new-sid".into()),
+            &inst.conversation_state(),
             &crate::file_watch::FileWatchService::noop(),
         );
 
