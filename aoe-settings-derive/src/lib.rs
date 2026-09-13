@@ -27,9 +27,9 @@
 //! `web` ("allow" | "elevation:reason" | "local_only:reason"),
 //! `repo` ("allow" | "deny": repo-config override policy; defaults to the
 //!   section's `repo_default`),
-//! `validate` ("none" | "range:min[:max]" | "nonempty" | "memory_limit" |
-//!   "volume_list" | "env_list" | "port_mapping_list" | "capability_list" |
-//!   "security_opt_list" | "network"),
+//! `validate` (`"none"` | `"range:min[:max]"` | `"nonempty"` | `"memory_limit"` |
+//!   `"volume_list"` | `"env_list"` | `"port_mapping_list"` | `"capability_list"` |
+//!   `"security_opt_list"` | `"network"`),
 //! `global_only` (flag: field is shown but not profile-overridable),
 //! `skip` (flag: exclude the field from the schema entirely).
 //! When `desc` is omitted, the field's doc comment is used.

@@ -217,7 +217,7 @@ pub enum ServeViewState {
     Confirm {
         /// Which transport card is currently highlighted.
         selected: TunnelTransport,
-        /// Readiness evaluated when the screen opened; refreshable via [R].
+        /// Readiness when opened; refreshable via `[R]`.
         tailscale: TransportStatus,
         cloudflare: TransportStatus,
         /// Transient message (e.g. "opened admin console").
@@ -264,9 +264,9 @@ pub enum ServeViewState {
 /// A destructive action awaiting confirmation (press the key again).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingConfirm {
-    /// [G] pressed once: will generate a new random passphrase + restart.
+    /// Awaiting a second `[G]` press to generate a new passphrase and restart.
     NewPassphrase,
-    /// [R] pressed once: will restart the server (clears all sessions).
+    /// Awaiting a second `[R]` press to restart, clearing tunnel sessions.
     Restart,
 }
 
@@ -377,9 +377,8 @@ impl ServeView {
         }
     }
 
-    /// Probe installed tunnel backends and return their readiness for
-    /// the Confirm screen. Called when entering Confirm and when the
-    /// user presses [R] to refresh after fixing an ACL.
+    /// Probe tunnel readiness on entering Confirm or pressing `[R]`
+    /// after fixing an ACL.
     fn assess_transports() -> (TransportStatus, TransportStatus) {
         let tailscale = if !crate::server::tunnel::tailscale_available_sync() {
             TransportStatus::NotInstalled
@@ -2440,9 +2439,7 @@ fn render_error(frame: &mut Frame, area: Rect, theme: &Theme, msg: &str) {
     );
 }
 
-/// Heuristic: does this error message relate to a tailscale/funnel issue
-/// that `tailscale funnel reset` could plausibly unstick? Used to decide
-/// whether to offer the [R] reset keybind on the Error dialog.
+/// Whether to offer the `[R]` reset keybind for a Tailscale/funnel error.
 fn error_mentions_tailscale(msg: &str) -> bool {
     let lower = msg.to_ascii_lowercase();
     lower.contains("tailscale") || lower.contains("funnel")

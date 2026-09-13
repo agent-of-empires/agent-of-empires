@@ -1,8 +1,7 @@
 //! Owned state for an open structured view: the focus, the reducer-
 //! produced transcript, the composer text, and the websocket handle.
-//! All side-effects (HTTP requests, browser opens, focus changes)
-//! happen from [`super::mod`]'s async loop; this struct stays a plain
-//! POD so the render layer can borrow it freely.
+//! Side effects run in the [`structured_view`](super) async loop;
+//! this state stays freely borrowable by the render layer.
 
 use std::collections::VecDeque;
 
@@ -385,7 +384,7 @@ impl StructuredViewState {
     }
 
     /// Replace the composer contents with `text`, caret at the end.
-    /// Mirrors [`take_composer_text`]'s fresh-textarea swap since
+    /// Mirrors [`Self::take_composer_text`] since
     /// ratatui-textarea has no public clear.
     pub(crate) fn set_composer_text(&mut self, text: &str) {
         self.composer = new_composer_textarea();

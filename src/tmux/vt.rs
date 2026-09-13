@@ -2350,8 +2350,8 @@ fn pack_size(cols: u16, rows: u16) -> u64 {
     ((cols as u64) << 16) | rows as u64
 }
 
-/// One cached [`VtChannel::sample`] assembly, valid while the grid
-/// generation, requested window, and grid size all match.
+/// Cached [`VtChannel::sample_with_deadline`] output, keyed by grid generation,
+/// requested window, and grid size.
 struct SampleCache {
     grid_gen: u64,
     max_lines: usize,
@@ -2361,7 +2361,7 @@ struct SampleCache {
     cursor: PaneCursor,
 }
 
-/// One [`VtChannel::sample`] result and whether it may be published.
+/// [`VtChannel::sample_with_deadline`] output and its publishability.
 pub(crate) struct VtSample {
     pub(crate) content: String,
     pub(crate) cursor: Option<PaneCursor>,

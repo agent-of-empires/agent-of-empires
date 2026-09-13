@@ -52,11 +52,9 @@ impl PaneGeom {
 
     /// Whether two pane rectangles share any cell.
     ///
-    /// Panes in a normal window tile the grid, but a zoomed pane (`C-b z`) is
-    /// reported at the window's full rectangle while its neighbours keep their
-    /// own, so they overlap. [`composite_window`]'s walk assumes a tiling, so
-    /// [`crate::tmux::Session::capture_window_layout`] uses this to drop panes it
-    /// cannot lay out rather than painting a scrambled frame.
+    /// Zoomed panes (`C-b z`) overlap their neighbours, but [`composite_window`]
+    /// requires a tiling. [`crate::tmux::Session::capture_window_layout_with_deadline`]
+    /// drops overlapping panes to avoid a scrambled frame.
     pub(crate) fn overlaps(&self, other: &Self) -> bool {
         let x_overlap = self.left < other.left.saturating_add(other.width)
             && other.left < self.left.saturating_add(self.width);

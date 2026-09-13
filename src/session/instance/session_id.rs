@@ -1093,8 +1093,7 @@ impl Instance {
             && crate::agents::pi_supports_session_id_flag()
     }
 
-    /// Whether a launch emits the `existing` arm of the agent's
-    /// [`ResumeStrategy`].
+    /// Whether to emit the `existing` arm of [`crate::agents::ResumeStrategy`].
     ///
     /// It tracks `is_existing` except for Pi on a pinnable binary, where the
     /// pinning arm serves both: pi writes its session file on the first

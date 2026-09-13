@@ -1,9 +1,7 @@
 //! Migration v005: Seed cockpit settings on upgrade.
 //!
-//! 1.5.0 introduces the cockpit feature. Older configs do not have a
-//! [cockpit] section. This migration writes a [cockpit] section to the
-//! global config with the documented defaults so users can flip the
-//! flag on without first running a settings TUI.
+//! Seed the global `[cockpit]` section with defaults when absent, so users
+//! can enable the feature without first running the settings TUI.
 //!
 //! Per-profile configs are left alone; the merge logic in
 //! `profile_config.rs` falls back to the global value when a profile

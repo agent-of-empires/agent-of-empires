@@ -171,9 +171,8 @@ impl EmbeddedView {
         }
     }
 
-    /// Apply one event from [`next_event`]. May perform HTTP work
-    /// (replay, drain, reconnect); the caller must not race this
-    /// against other futures.
+    /// Apply an event from [`Self::next_event`]. May perform HTTP work
+    /// (replay, drain, reconnect); do not race this against other futures.
     pub async fn apply_event(&mut self, event: EmbeddedEvent) {
         match event {
             EmbeddedEvent::Ws(Some(msg)) => {

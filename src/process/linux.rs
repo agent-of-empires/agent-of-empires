@@ -327,8 +327,7 @@ fn find_process_in_group(pgrp: u32) -> Option<u32> {
     None
 }
 
-/// Parse a specific field from /proc/[pid]/stat
-/// Fields are space-separated but comm (field 2) can contain spaces and is in parens
+/// Parse a field from `/proc/[pid]/stat`; `comm` (field 2) may contain spaces.
 fn parse_stat_field(content: &str, field_idx: usize) -> Option<i64> {
     // Find the closing paren of comm field, then parse from there
     let close_paren = content.rfind(')')?;

@@ -97,10 +97,9 @@ pub fn codex_config_path() -> Result<PathBuf> {
     Ok(codex_config_path_in(&home, &[]))
 }
 
-/// Home-injectable variant of [`codex_config_path_for_host_environment`]:
-/// resolves the Codex config under the given `home` directory, honoring an
-/// explicit `CODEX_HOME` in `host_env` (or the AoE process env), then
-/// falling back to `<home>/.codex/config.toml`.
+/// [`codex_config_path`] with an injected home and host environment.
+/// Uses `CODEX_HOME` from `host_env` or the process environment, then
+/// falls back to `<home>/.codex/config.toml`.
 pub(crate) fn codex_config_path_in(home: &Path, host_env: &[String]) -> PathBuf {
     if let Some(codex_home) =
         crate::session::environment::resolve_host_environment_value(host_env, "CODEX_HOME")
@@ -182,10 +181,9 @@ pub(crate) fn agent_settings_path_for_host_environment(
     Ok(agent_settings_path_in(&home, hook_cfg, host_env))
 }
 
-/// Home-injectable variant of [`agent_settings_path_for_host_environment`].
-/// Resolves to `<config_dir_env>/<basename>` when the agent's config-dir env
-/// var is set in `host_env` (or the AoE process env), otherwise to
-/// `<home>/<settings_rel_path>`.
+/// Resolve agent settings under an injected home and host environment.
+/// Uses `<config_dir_env>/<basename>` when the config-dir variable is set
+/// in `host_env` or the process environment, else `<home>/<settings_rel_path>`.
 pub(crate) fn agent_settings_path_in(
     home: &Path,
     hook_cfg: &crate::agents::AgentHookConfig,

@@ -103,8 +103,8 @@ enum Pending {
     Preview(oneshot::Receiver<Result<UpdatePreview, String>>),
     /// Applying an approved update; the Ok string is the final report line.
     Apply(oneshot::Receiver<Result<String, String>>),
-    /// An enable/disable running through [`set_enabled_live`] (a running
-    /// daemon reconciles its workers); the Ok string reports where it landed.
+    /// An enable/disable via [`crate::plugin::install::set_enabled_live`];
+    /// the Ok string reports whether the daemon reconciled its workers.
     Toggle(oneshot::Receiver<Result<String, String>>),
     /// Fetching the install consent disclosure for a discovery result.
     InstallPreview(oneshot::Receiver<Result<InstallConsent, String>>),
@@ -122,10 +122,8 @@ pub struct PluginManagerDialog {
     selected: usize,
     error: Option<String>,
     info: Option<String>,
-    /// Set whenever the on-disk plugin config changed (enable/disable,
-    /// install, update, uninstall, re-approve). An embedding surface drains it
-    /// via [`take_mutated`] to re-sync its own config view; the standalone
-    /// modal ignores it.
+    /// Set when on-disk plugin config changes. An embedding surface calls
+    /// [`Self::take_mutated`] to refresh its config view; the modal ignores it.
     mutated: bool,
     /// True when hosted inside the settings screen (vs the command-palette
     /// modal). Only changes the footer hint: Esc returns to the category list.
@@ -728,9 +726,8 @@ impl PluginManagerDialog {
         }
     }
 
-    /// Toggle the selected plugin through [`set_enabled_live`], which routes
-    /// the write through a running daemon (so its workers reconcile) and falls
-    /// back to a local config write. Async because the daemon round-trip is.
+    /// Toggle via [`crate::plugin::install::set_enabled_live`], reconciling daemon
+    /// workers asynchronously or falling back to a local config write.
     fn start_toggle(&mut self) {
         if self.pending.is_some() {
             return;

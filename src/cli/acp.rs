@@ -489,10 +489,8 @@ async fn run_doctor_fix_action(binary: &str) {
     }
 }
 
-/// Which adapters `--fix` installs: everything with `--all-adapters`, the
-/// explicit `--adapter` list when given, else just [`DEFAULT_ADAPTER`].
-/// Unknown names are returned so the caller can report them instead of
-/// silently installing nothing.
+/// Adapters `--fix` installs: all with `--all-adapters`, the `--adapter` list,
+/// or [`crate::acp::adapters::DEFAULT_ADAPTER`]. Returns unknown names for reporting.
 fn adapters_to_install(requested: &[String], all: bool) -> Result<Vec<&'static str>, Vec<String>> {
     use crate::acp::adapters;
     if all {

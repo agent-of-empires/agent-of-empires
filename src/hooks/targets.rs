@@ -52,10 +52,8 @@ pub(crate) struct HookTarget {
 /// (CLAUDE_CONFIG_DIR / CODEX_HOME / etc.) from the global config and each
 /// profile's `environment` list. Deduplicated by `(kind discriminant, path)`.
 ///
-/// Used by [`uninstall_all_hooks`] (read-modify-write removal) and the v015
-/// migration (read-modify-write rewrite). Both share this enumerator so a
-/// future agent added to `crate::agents::AGENTS` automatically appears in
-/// both flows.
+/// Shared by [`super::uninstall_all_hooks`] and the v015 migration so new
+/// agents in [`crate::agents::AGENTS`] appear in both flows.
 pub(crate) fn iter_hook_targets() -> Vec<HookTarget> {
     let home = match dirs::home_dir() {
         Some(h) => h,
@@ -153,16 +151,12 @@ pub(super) fn collect_env_lists_from_session() -> Vec<Vec<String>> {
 
 /// Marker-presence gate for the v015 hook-rewrite migration.
 ///
-/// Returns `true` iff the target's on-disk file already contains at least one
-/// AoE-managed hook command (i.e. one whose `command` string contains
-/// [`AOE_HOOK_MARKER`]). Fails closed on every I/O / parse / wrong-shape
-/// error: a file we cannot identify is a file we must not rewrite.
+/// Returns `true` if the target file contains a command recognized by
+/// [`is_aoe_hook_command`]. Unreadable, invalid, or unrecognized files
+/// return `false`.
 ///
-/// Why this exists: the install functions (`install_hooks`,
-/// `install_codex_hooks_with_preserved_state`, sidecar installers) create
-/// the file when absent. Calling them unconditionally on every reachable
-/// target would resurrect hooks for users who explicitly uninstalled. The
-/// migration must only touch files it already owns.
+/// Installers create missing files, so migrations must check ownership first
+/// to avoid restoring hooks that users uninstalled.
 pub(crate) fn has_aoe_marker(target: &HookTarget) -> bool {
     if !target.path.exists() {
         return false;

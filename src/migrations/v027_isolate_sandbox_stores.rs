@@ -290,7 +290,7 @@ pub fn run() -> Result<()> {
 
 /// Retry cohorts that were live during the schema migration. This is called on
 /// every startup until no pre-v2 row remains, then becomes a cheap read.
-/// `announce` narrates pending rows (see [`ANNOUNCE`]).
+/// `announce` narrates pending rows.
 pub(crate) fn reconcile_pending(announce: bool) -> Result<()> {
     reconcile_scoped(
         announce,

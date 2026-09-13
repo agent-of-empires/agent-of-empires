@@ -40,10 +40,9 @@ pub struct PluginManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon_asset: Option<String>,
 
-    /// Resource/effect capabilities the plugin requests. Static contributions
-    /// below are NOT listed here; only runtime resource access is. The user
-    /// grants these once at install (community plugins); builtins are
-    /// auto-granted. See [`crate::capability`].
+    /// Runtime resource/effect capabilities, not static contributions.
+    /// Users grant these at install; builtins are auto-granted.
+    /// See [`crate::KNOWN_CAPABILITIES`] for recognized names.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<CapabilityId>,
 
@@ -908,13 +907,9 @@ impl PluginManifest {
         out
     }
 
-    /// Check the running host (aoe app) version against the manifest's declared
-    /// `aoe_version` range. `host` is a semver version string (the host's
-    /// `CARGO_PKG_VERSION`). No declared range means no constraint. Returns an
-    /// actionable message when the host is outside the range, so install can
-    /// refuse and load can skip with a reason. The range is re-parsed here
-    /// rather than cached because [`validate`] already gated its syntax, so a
-    /// loaded manifest's range is known-valid.
+    /// Check the host semver version against `aoe_version`, if declared.
+    /// Returns a reason for install to refuse or load to skip an incompatible
+    /// plugin. [`Self::validate`] checks the range syntax before this call.
     pub fn host_compat(&self, host: &str) -> Result<(), String> {
         let Some(req) = &self.aoe_version else {
             return Ok(());

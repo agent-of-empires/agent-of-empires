@@ -99,10 +99,8 @@ where
     run_timed(cwd, args, timeout, false)
 }
 
-/// [`run_git_with_timeout`] for callers that have already classified a
-/// non-zero exit as an expected, no-op outcome, mirroring the
-/// [`run_git`] / [`run_git_quiet`] pair. The timeout itself still logs at
-/// WARN: a killed child is never routine.
+/// [`run_git_with_timeout`] with DEBUG logging for expected non-zero exits.
+/// Timeouts still log at WARN.
 pub fn run_git_quiet_with_timeout<I, S>(
     cwd: &Path,
     args: I,

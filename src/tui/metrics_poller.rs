@@ -1,9 +1,8 @@
 //! Background sampler for the diagnostics strip.
 //!
-//! Reading memory and counting agent process trees forks `ps` / walks `/proc`,
-//! so it must not run on the render loop. This mirrors [`StatusPoller`]: a
-//! [`Worker`] on a named thread samples on request and the main loop drains the
-//! result each frame.
+//! Memory and process sampling forks `ps` or walks `/proc`, so it stays off
+//! the render loop. Like [`StatusPoller`](super::status_poller::StatusPoller),
+//! a [`Worker`] samples on request; the main loop drains results each frame.
 
 use crate::process::metrics::{MetricsSampler, MetricsSnapshot};
 use crate::session::Instance;

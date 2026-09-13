@@ -1274,12 +1274,8 @@ impl HomeView {
         );
     }
 
-    /// Discard unsaved Settings changes: force-close the view, clear the
-    /// confirm state, and revert any live theme preview back to the saved
-    /// config theme. Shared by the keyboard (Esc/q -> confirm) and mouse
-    /// (click [Yes]) discard paths so the two can't drift. The mouse path
-    /// previously skipped the theme revert, so discarding via a click left a
-    /// previewed theme applied until the next restart.
+    /// Discard unsaved Settings changes and restore the saved config theme.
+    /// Both keyboard confirmation and clicking `[Yes]` must undo live previews.
     pub(super) fn discard_settings_changes(&mut self) -> Action {
         if let Some(ref mut settings) = self.settings_view {
             settings.force_close();
