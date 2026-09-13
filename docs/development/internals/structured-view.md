@@ -58,7 +58,23 @@ Transcripts persist in a SQLite event log. The web client mirrors each session's
 
 On a cold open (cache miss) the client loads recent-first instead of folding the whole transcript from seq 0 before first paint (#2236). The replay endpoint takes a `before` cursor (`GET /api/sessions/{id}/acp/replay?before=<seq>&limit=N`): it returns the `limit` events sitting closest below `before` in ascending order, aligned to a user-turn boundary when more history remains so a page never seams a split turn. The client fetches the tail (`before` = max), renders it immediately, and on a long session also pulls a small `since=0` prefix to project the pinned handshake snapshot (capabilities, slash palette, agent/model) without which the composer would be crippled. Scrolling to the top (or the "Load earlier messages" button) first reveals rows the client already holds, then pages older history via `before` (lowest loaded seq), prepending it with the scroll position frozen. Each page is fetched twice, once for frames and once for `view=rows`; a failure on either leg abandons the page rather than advancing the cursor past rows that never arrived. The render window grows as rows arrive so live turns never fold earlier messages back behind the control. The forward `since`/`limit` contract (WS catch-up, cached-reload seq-delta) is unchanged.
 
-If context restoration fails (the agent's stored session is gone), the view falls back to a fresh session, renders a "Conversation context reset" callout, and offers a one-shot "Resume with prior context" banner. That calls `GET /api/sessions/{id}/acp/context-primer?before_seq=<reset-seq>`, which walks the event log and returns a compact markdown recap of the last ~20 turns (capped ~24k chars, bulky tool I/O elided). The primer is pre-filled into the composer and never auto-sent. `aoe-agent` ships as sources inside `aoe` and is installed into the data dir on demand; a digest over its lockfile and sources decides whether an installed copy is current, so a local edit that skips the release build is invisible to it. `aoe-agent` restores context across a restart (#1005): it advertises `loadSession` and appends each completed text exchange to `${AOE_ARTIFACT_DIR}/transcript.jsonl`, then reseeds the model's message history on `session/load`. Tool calls are not carried across turns (they never were in its in-memory history), so a resumed model sees prior user/assistant text only.
+If context restoration fails (the agent's stored session is gone), the view falls back to a fresh session, renders a "Conversation context reset" callout, and offers a one-shot "Resume with prior context" banner. That calls `GET /api/sessions/{id}/acp/context-primer?before_seq=<reset-seq>`, which walks the event log and returns a compact markdown recap of the last ~20 turns (capped ~24k chars, bulky tool I/O elided). The primer is pre-filled into the composer and never auto-sent. `aoe-agent` ships as sources inside `aoe` and is installed into the data dir on demand; a digest over its lockfile and sources decides whether an installed copy is current, so a local edit that skips the release build is invisible to it.
+
+`aoe-agent` persists each native conversation in
+`${AOE_ARTIFACT_DIR}/aoe-agent-<native-session-id>.jsonl`. A driven `/clear`
+creates and flushes the new empty transcript before acknowledging the new ID.
+Late turns from the old ID stay in its own file, and `session/load` reads only
+the requested ID. Missing or unreadable transcripts fail explicitly rather
+than reporting an empty successful resume. Without an artifact directory
+(for example, capability probes), sessions are ephemeral and load is unavailable.
+Only completed user/assistant text exchanges are persisted, not tool calls.
+
+On upgrade, legacy `transcript.jsonl` files remain unchanged and are copied to
+`transcript.pre-native-id.jsonl` beside the original, without replacing an
+existing backup. The old format recorded neither native IDs nor `/clear`
+boundaries, so it cannot safely seed a resumed conversation. The first ordinary
+resume of such an ID reports context reset and starts fresh. Inspect the saved
+files to recover wanted text manually; it is never sent to the model automatically.
 
 ## Permission modes and model channels
 
