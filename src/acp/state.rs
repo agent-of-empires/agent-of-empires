@@ -1059,16 +1059,16 @@ pub enum Event {
     /// Server-side listener catches this and persists the id on
     /// `Instance.acp_session_id` so the next spawn can call
     /// `session/load` and the model retains context across `aoe serve`
-    /// restarts. Not emitted on `session/load` success (id unchanged).
+    /// restarts. Also emitted after successful load or live reattachment.
     AcpSessionAssigned {
         acp_session_id: String,
     },
-    /// `session/load` failed and we fell back to `session/new`. The
-    /// agent's stored transcript is gone (or the id was never valid),
-    /// so the model starts with no context. UI uses this to render a
-    /// muted notice and clear the now-stale token-usage hint; the
-    /// server-side listener clears `Instance.acp_session_id`
-    /// before the new id arrives via `AcpSessionAssigned`.
+    /// Native context continuity was lost or a fork could not be established.
+    /// Unavailable/failed loading emits this after successful replacement;
+    /// rejected stored sessions and failed forks also use this boundary.
+    /// The UI retains prior turns, shows a notice, and clears stale usage.
+    /// Listeners clear the stored identity before any replacement arrives
+    /// through `AcpSessionAssigned`.
     SessionContextReset {
         reason: String,
     },

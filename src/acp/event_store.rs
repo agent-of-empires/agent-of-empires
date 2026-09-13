@@ -24,18 +24,16 @@
 //!
 //! ## How it relates to agent-side memory
 //!
-//! This store only persists the *UI transcript*. The model's
-//! conversation context across `aoe serve` restarts is a separate
-//! mechanism in `supervisor.rs`: when the agent advertises
-//! `agent_capabilities.load_session = true` on the ACP `initialize`
-//! response, the supervisor stores the agent-assigned `session_id` on
-//! `Instance.acp_session_id` and uses `session/load` on
-//! subsequent spawns instead of `session/new`. If the agent no longer
-//! holds that session (`session/load` fails, or it rejects the first
-//! prompt on a resumed id), the stored id is cleared and a
-//! `SessionContextReset` event is published; the UI renders an amber
-//! callout in the transcript so the user knows prior turns are no longer
-//! in the model's context.
+//! This store only persists the *UI transcript*, not model context.
+//! The agent-assigned identity is stored on `Instance.acp_session_id`;
+//! a fresh worker tries `session/load` for that stored identity when supported.
+//! If resuming is unavailable or fails, a successful `session/new` emits
+//! `SessionContextReset` before assigning the replacement identity.
+//! This fallback emits no reset if replacement fails. Reattaching to a live
+//! worker reuses its context without load/new or a reset; rejection of
+//! that stored identity during a prompt still reports context loss.
+//! The UI keeps earlier turns and adds a notice: replaying this journal
+//! does not restore those turns to the model.
 //!
 //! ## Lifecycle
 //!
