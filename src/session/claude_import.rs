@@ -20,7 +20,9 @@ use serde::Serialize;
 
 /// Cap how many lines we read per file when extracting metadata. The `cwd`
 /// and first user message live at the head of the transcript; a few hundred
-/// lines is plenty without reading a multi-MB file fully.
+/// lines is plenty without reading a multi-MB file fully. A `custom-title`
+/// rename can land anywhere in the file, so the title record scan is NOT
+/// bounded by this cap — only the fallback first-prompt scan is.
 const MAX_SCAN_LINES: usize = 400;
 
 /// Cap how many sessions the picker shows. Newest first, so older sessions
@@ -37,8 +39,9 @@ pub struct ClaudeSessionSummary {
     /// The working directory recorded in the transcript. The structured
     /// session must run here for `claude --resume` to resolve the file.
     pub cwd: String,
-    /// First human-authored prompt, truncated, for display. `None` when the
-    /// transcript has no readable user message yet.
+    /// Latest `custom-title` / `ai-title` record when the transcript carries
+    /// one (custom wins), else the first human-authored prompt, truncated.
+    /// `None` when the transcript has neither.
     pub title: Option<String>,
     /// File modification time as a unix epoch millisecond stamp, for
     /// recent-first sorting and "last used" display.
@@ -225,9 +228,14 @@ fn summarize_file(path: &Path) -> Option<ClaudeSessionSummary> {
     let reader = BufReader::new(file);
 
     let mut cwd: Option<String> = None;
-    let mut title: Option<String> = None;
+    // Latest `custom-title` / `ai-title` seen while streaming the whole file.
+    // Custom wins over ai when both exist, matching Claude Code's own display
+    // (an explicit `/rename` beats the auto name regardless of position).
+    let mut custom_title: Option<String> = None;
+    let mut ai_title: Option<String> = None;
+    let mut first_prompt: Option<String> = None;
 
-    for line in reader.lines().take(MAX_SCAN_LINES).map_while(Result::ok) {
+    for (line_index, line) in reader.lines().map_while(Result::ok).enumerate() {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -242,13 +250,28 @@ fn summarize_file(path: &Path) -> Option<ClaudeSessionSummary> {
                 }
             }
         }
-        if title.is_none() {
-            title = extract_user_title(&record);
+        if custom_title.is_none() {
+            if let Some(t) = extract_named_title(&record, "custom-title") {
+                custom_title = Some(t);
+            }
         }
-        if cwd.is_some() && title.is_some() {
+        // ai-title records update over time; keep the latest so a re-named
+        // auto title wins over an early one.
+        if let Some(t) = extract_named_title(&record, "ai-title") {
+            ai_title = Some(t);
+        }
+        // The first-prompt fallback is only scanned inside the head-of-file
+        // window; past it the fallback would cost a full-file read for a
+        // title the named records have almost always already provided.
+        if first_prompt.is_none() && line_index < MAX_SCAN_LINES {
+            first_prompt = extract_user_title(&record);
+        }
+        if cwd.is_some() && custom_title.is_some() && first_prompt.is_some() {
             break;
         }
     }
+
+    let title = custom_title.or(ai_title).or(first_prompt);
 
     let cwd = cwd?;
     let cwd_exists = Path::new(&cwd).is_dir();
@@ -259,6 +282,26 @@ fn summarize_file(path: &Path) -> Option<ClaudeSessionSummary> {
         last_modified_ms,
         cwd_exists,
     })
+}
+
+/// Pull the display title from a Claude Code title record (`custom-title`
+/// carries `customTitle`, `ai-title` carries `aiTitle`). Returns `None` for
+/// any other record shape or an empty/absent field.
+fn extract_named_title(record: &serde_json::Value, ty: &str) -> Option<String> {
+    if record.get("type").and_then(|v| v.as_str()) != Some(ty) {
+        return None;
+    }
+    let field = if ty == "custom-title" {
+        "customTitle"
+    } else {
+        "aiTitle"
+    };
+    let text = record.get(field)?.as_str()?.trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(truncate(text, 120))
+    }
 }
 
 /// Pull a human-readable title from a `user` record. Skips command wrappers
@@ -317,6 +360,72 @@ mod tests {
             writeln!(f, "{l}").unwrap();
         }
         path
+    }
+
+    #[test]
+    fn custom_title_beats_first_prompt_anywhere_in_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_cwd = tmp.path().join("work");
+        fs::create_dir(&real_cwd).unwrap();
+        let cwd_str = real_cwd.to_str().unwrap();
+        let path = write_jsonl(
+            tmp.path(),
+            "title-e9a1",
+            &[
+                &format!(
+                    r#"{{"type":"user","cwd":"{cwd_str}","message":{{"role":"user","content":"first prompt text"}}}}"#
+                ),
+                r#"{"type":"ai-title","aiTitle":"Auto named"}"#,
+                // A rename can land thousands of lines later; the scanner
+                // must still find it (it streams the whole file).
+                &format!(
+                    r#"{{"type":"custom-title","customTitle":"Renamed by user","sessionId":"title-e9a1"}}"#
+                ),
+            ],
+        );
+
+        let s = summarize_file(&path).unwrap();
+        assert_eq!(s.title.as_deref(), Some("Renamed by user"));
+    }
+
+    #[test]
+    fn ai_title_beats_first_prompt_and_latest_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_cwd = tmp.path().join("work");
+        fs::create_dir(&real_cwd).unwrap();
+        let cwd_str = real_cwd.to_str().unwrap();
+        let path = write_jsonl(
+            tmp.path(),
+            "title-ai2",
+            &[
+                &format!(
+                    r#"{{"type":"user","cwd":"{cwd_str}","message":{{"role":"user","content":"prompt one"}}}}"#
+                ),
+                r#"{"type":"ai-title","aiTitle":"Early auto name"}"#,
+                r#"{"type":"ai-title","aiTitle":"Updated auto name"}"#,
+            ],
+        );
+
+        let s = summarize_file(&path).unwrap();
+        assert_eq!(s.title.as_deref(), Some("Updated auto name"));
+    }
+
+    #[test]
+    fn falls_back_to_first_prompt_without_title_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_cwd = tmp.path().join("work");
+        fs::create_dir(&real_cwd).unwrap();
+        let cwd_str = real_cwd.to_str().unwrap();
+        let path = write_jsonl(
+            tmp.path(),
+            "title-fb3",
+            &[&format!(
+                r#"{{"type":"user","cwd":"{cwd_str}","message":{{"role":"user","content":"plain prompt"}}}}"#
+            )],
+        );
+
+        let s = summarize_file(&path).unwrap();
+        assert_eq!(s.title.as_deref(), Some("plain prompt"));
     }
 
     #[test]
