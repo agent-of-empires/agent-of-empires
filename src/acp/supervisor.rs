@@ -1925,6 +1925,29 @@ impl<S: BroadcastSink> Supervisor<S> {
                 host_environment.retain(|(k, _)| k != &key);
                 host_environment.push((key, value));
             }
+            // Adapter-facing model env (claude-agent-acp reads
+            // ANTHROPIC_MODEL / CLAUDE_MODEL_CONFIG, not AOE_AGENT_MODEL):
+            // route the pinned model through the gateway's own catalogue.
+            // The catalogue comes from the daemon's last successful
+            // discovery (`GET /api/acp/models` publishes it); with no cache
+            // yet the pin still applies via ANTHROPIC_MODEL, and only the
+            // catalogue-derived pieces ([1m]/autocompact, picker seed,
+            // subagent routing) degrade — a guess is never emitted.
+            if crate::acp::model_gateway::GatewayAgent::from_agent_id(&gw_agent).is_some() {
+                let catalog = crate::acp::model_gateway::cached_model_catalog(
+                    &gw_settings.base_url,
+                    &gw_settings.api_key,
+                    gw_settings.discovery_path.as_deref(),
+                );
+                let adapter_pairs = crate::acp::model_gateway::claude_adapter_model_env(
+                    gw_model.as_deref(),
+                    catalog.as_deref(),
+                );
+                for (key, value) in adapter_pairs {
+                    host_environment.retain(|(k, _)| k != &key);
+                    host_environment.push((key, value));
+                }
+            }
         }
 
         let mut env = provider_env;

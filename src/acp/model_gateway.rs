@@ -19,6 +19,7 @@
 
 use serde::Deserialize;
 use serde::Serialize;
+use std::sync::Mutex;
 
 /// One model gateway configured once for every supported agent harness.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -507,6 +508,82 @@ fn is_gpt5(model_id: &str) -> bool {
     lower == "gpt-5" || lower.starts_with("gpt-5.") || lower.starts_with("gpt-5-")
 }
 
+/// Adapter-facing model env for a gateway-backed claude session.
+///
+/// AOE's own built-in agent reads `AOE_AGENT_MODEL`, but the structured-view
+/// adapters do not: claude-agent-acp reads `ANTHROPIC_MODEL` for the initial
+/// model and `CLAUDE_MODEL_CONFIG` (JSON with `availableModels`) to seed its
+/// model picker. This function emits BOTH, sourced from the gateway config
+/// and (where a catalogue is available) discovery results — never guessed.
+///
+/// - `ANTHROPIC_MODEL` carries the possibly-`[1m]`-suffixed id when the
+///   catalogue confirms a large window, so the CLI's own meter and the
+///   autocompact env below describe the same session.
+/// - `CLAUDE_CODE_AUTO_COMPACT_WINDOW` + `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`
+///   ride along whenever the `[1m]` suffix does (the pairing invariant
+///   `claude_autocompact_for` pins).
+/// - `CLAUDE_MODEL_CONFIG.availableModels` lists every gateway-served id
+///   (plus the current pin) so the chat picker can switch between them
+///   without the adapter's hardcoded alias list — which points at
+///   api.anthropic.com models a gateway route would not serve.
+/// - Subagent routing (`CLAUDE_CODE_SUBAGENT_MODEL` + FORCE + default
+///   effort) applies when a catalogue is available, mirroring nodeterm.
+///
+/// Fail-open contract: an unresolvable credential or no catalogue degrades to
+/// `ANTHROPIC_MODEL` alone (the pin still applies — `setModel` works over any
+/// backend the session's env points at); only the catalogue-derived pieces
+/// drop. A wrong guess is never emitted.
+pub fn claude_adapter_model_env(
+    model: Option<&str>,
+    models: Option<&[GatewayModel]>,
+) -> Vec<(String, String)> {
+    let Some(id) = model.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Vec::new();
+    };
+    // Autocompact suffix + env, only when a catalogue confirms the window.
+    let autocompact = models.map(|m| claude_autocompact_for("claude", Some(id), m));
+    let suffixed = autocompact
+        .as_ref()
+        .and_then(|a| a.model_id.clone())
+        .unwrap_or_else(|| id.to_string());
+    let mut env: Vec<(String, String)> = Vec::new();
+    env.push(("ANTHROPIC_MODEL".to_string(), suffixed.clone()));
+    if let Some(a) = autocompact {
+        env.extend(a.env);
+    }
+    // Picker seed: every discovered id plus the pin itself. Without this the
+    // adapter advertises only its hardcoded alias list (sonnet/opus/haiku),
+    // none of which a gateway route necessarily serves. Only ids the gateway
+    // reported — never inferred rows.
+    if let Some(models) = models {
+        if !models.is_empty() {
+            let mut ids: Vec<String> = models
+                .iter()
+                .map(|m| m.id.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !ids.contains(&suffixed) {
+                ids.insert(0, suffixed.clone());
+            }
+            ids.sort();
+            ids.dedup();
+            if let Ok(json) = serde_json::to_string(&serde_json::json!({
+                "availableModels": ids,
+            })) {
+                env.push(("CLAUDE_MODEL_CONFIG".to_string(), json));
+            }
+        }
+    }
+    // Subagent routing: default subagent model + effort clamp, catalogue-gated.
+    if let Some(models) = models {
+        if !models.is_empty() {
+            let pin = suffixed.strip_suffix("[1m]").unwrap_or(&suffixed);
+            env.extend(claude_subagent_env_for("claude", models, Some(pin)));
+        }
+    }
+    env
+}
+
 /// Re-validate a hand-editable/discovered model id at the point it reaches a
 /// launch command.
 pub fn normalized_agent_model(_agent_id: &str, model: Option<&str>) -> Option<String> {
@@ -727,6 +804,72 @@ pub fn claude_subagent_env_for(
             ("CLAUDE_CODE_EFFORT_LEVEL".to_string(), "medium".to_string()),
         ],
         None => Vec::new(),
+    }
+}
+
+// --- Discovery results cache ---
+//
+// The spawn path derives adapter model env from the gateway catalogue
+// (`claude_adapter_model_env`), but discovery is a network request and a
+// spawn must never block on one (or fork its correctness on whether a
+// request happened to complete). nodeterm solves the same problem by
+// publishing discovery results from the settings request; here the daemon
+// caches the last successful catalogue keyed by the gateway config digest —
+// the same "scope" digest nodeterm keys its catalogue on. A settings change
+// (different base_url, key reference, or discovery path) immediately
+// invalidates the cache; a resolved key change clears it via the digest
+// input.
+
+/// The in-memory catalogue: `Some(models)` from the last successful
+/// discovery whose config digest matched, `None` when discovery has not run
+/// or the config changed since.
+static MODEL_CATALOG: Mutex<Option<(u64, Vec<GatewayModel>)>> = Mutex::new(None);
+
+/// Stable digest of everything that scopes a catalogue: the saved base_url,
+/// the key REFERENCE (config.toml text, not the resolved secret), and the
+/// discovery path. The resolved key deliberately does NOT enter the digest —
+/// re-resolving `${env:VAR}` on every spawn re-reads the environment, and a
+/// value change there does not change WHICH models the gateway serves.
+/// (nodeterm keys on the resolved value to immediately drop stale context
+/// metadata; here a key rotation without a URL change simply keeps working,
+/// which is the correct behavior for env that rides every spawn.)
+fn catalog_scope(base_url: &str, api_key_ref: &str, discovery_path: Option<&str>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    base_url.trim().hash(&mut hasher);
+    api_key_ref.trim().hash(&mut hasher);
+    discovery_path.unwrap_or("").trim().hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Publish a successful discovery result. Called by the `/api/acp/models`
+/// endpoint after `parse_gateway_models` returns a non-empty list; the next
+/// spawn picks it up without a network request.
+pub fn publish_model_catalog(base_url: &str, api_key_ref: &str, models: &[GatewayModel]) {
+    if models.is_empty() {
+        return;
+    }
+    let scope = catalog_scope(base_url, api_key_ref, None);
+    if let Ok(mut guard) = MODEL_CATALOG.lock() {
+        *guard = Some((scope, models.to_vec()));
+    }
+}
+
+/// The last published catalogue, only when its config digest still matches
+/// the given gateway settings. `discovery_path` participates in the caller's
+/// scoping by re-deriving the digest here, so a settings edit that changed
+/// the path invalidates stale entries immediately.
+pub fn cached_model_catalog(
+    base_url: &str,
+    api_key_ref: &str,
+    discovery_path: Option<&str>,
+) -> Option<Vec<GatewayModel>> {
+    let guard = MODEL_CATALOG.lock().ok()?;
+    let (scope, models) = guard.as_ref()?;
+    if *scope == catalog_scope(base_url, api_key_ref, discovery_path) && !models.is_empty() {
+        Some(models.clone())
+    } else {
+        None
     }
 }
 
@@ -1277,5 +1420,125 @@ mod tests {
         assert_eq!(model_context_window(Some("small"), &models), Some(100_000));
         assert_eq!(model_context_window(Some("nope"), &models), None);
         assert_eq!(model_context_window(None, &models), None);
+    }
+
+    // --- claude_adapter_model_env ---
+
+    #[test]
+    fn adapter_env_no_model_yields_nothing() {
+        assert!(claude_adapter_model_env(None, Some(&catalog())).is_empty());
+        assert!(claude_adapter_model_env(Some("  "), Some(&catalog())).is_empty());
+        assert!(claude_adapter_model_env(None, None).is_empty());
+    }
+
+    #[test]
+    fn adapter_env_without_catalogue_emits_bare_pin_only() {
+        let env = claude_adapter_model_env(Some("small"), None);
+        assert_eq!(
+            env,
+            vec![("ANTHROPIC_MODEL".to_string(), "small".to_string())]
+        );
+        // No CLAUDE_MODEL_CONFIG, no autocompact, no subagent routing.
+        assert!(env.iter().all(|(k, _)| k == "ANTHROPIC_MODEL"));
+    }
+
+    #[test]
+    fn adapter_env_small_window_no_suffix_no_autocompact() {
+        let env = claude_adapter_model_env(Some("small"), Some(&catalog()));
+        let model = env.iter().find(|(k, _)| k == "ANTHROPIC_MODEL").unwrap();
+        assert_eq!(model.1, "small");
+        assert!(env
+            .iter()
+            .all(|(k, _)| k != "CLAUDE_CODE_AUTO_COMPACT_WINDOW"));
+        assert!(env.iter().all(|(k, _)| k != "CLAUDE_MODEL_CONFIG" || {
+            // availableModels still seeds the picker for small models.
+            true
+        }));
+    }
+
+    #[test]
+    fn adapter_env_large_window_pairs_suffix_with_autocompact() {
+        let env = claude_adapter_model_env(Some("big"), Some(&catalog()));
+        let model = env.iter().find(|(k, _)| k == "ANTHROPIC_MODEL").unwrap();
+        assert_eq!(model.1, "big[1m]");
+        let window = env
+            .iter()
+            .find(|(k, _)| k == "CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+            .unwrap();
+        assert_eq!(window.1, "1000000");
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" && v == "80"));
+    }
+
+    #[test]
+    fn adapter_env_seeds_picker_with_catalogue_ids() {
+        let env = claude_adapter_model_env(Some("small"), Some(&catalog()));
+        let config = env
+            .iter()
+            .find(|(k, _)| k == "CLAUDE_MODEL_CONFIG")
+            .expect("picker seed must be present with a catalogue");
+        let parsed: serde_json::Value = serde_json::from_str(&config.1).unwrap();
+        let ids: Vec<&str> = parsed["availableModels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        // Both catalogue ids, deduped/sorted; the pin included.
+        assert!(ids.contains(&"small"));
+        assert!(ids.contains(&"big[1m]"));
+        // Sorted order with the pin present exactly once.
+        let mut expected: Vec<String> = vec!["big[1m]".to_string(), "small".to_string()];
+        expected.sort();
+        let expected: Vec<&str> = expected.iter().map(|s| s.as_str()).collect();
+        assert_eq!(ids, expected);
+    }
+
+    #[test]
+    fn adapter_env_subagent_routing_present_with_catalogue() {
+        let env = claude_adapter_model_env(Some("small"), Some(&catalog()));
+        let sub = env
+            .iter()
+            .find(|(k, _)| k == "CLAUDE_CODE_SUBAGENT_MODEL")
+            .expect("subagent routing with a catalogue");
+        // The configured default (the pin) is served by the catalogue, so it
+        // wins over the first sorted id (`claude_subagent_model_for`).
+        assert_eq!(sub.1, "small");
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "CLAUDE_CODE_SUBAGENT_MODEL_FORCE" && v == "1"));
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "CLAUDE_CODE_EFFORT_LEVEL" && v == "medium"));
+    }
+
+    // --- discovery cache ---
+
+    #[test]
+    fn catalog_cache_publish_and_scope_invalidation() {
+        // Publish under one scope...
+        publish_model_catalog("https://gw.example", "${env:K}", &catalog());
+        let hit = cached_model_catalog("https://gw.example", "${env:K}", None).unwrap();
+        assert_eq!(hit.len(), 2);
+        // A different base_url or key reference sees nothing...
+        assert!(cached_model_catalog("https://other.example", "${env:K}", None).is_none());
+        assert!(cached_model_catalog("https://gw.example", "${env:OTHER}", None).is_none());
+        // ...and a discovery-path change also invalidates.
+        assert!(
+            cached_model_catalog("https://gw.example", "${env:K}", Some("/openai/v1/models"))
+                .is_none()
+        );
+        // Re-publish and confirm the scoped read (path included).
+        publish_model_catalog("https://gw.example", "${env:K}", &catalog());
+        assert!(
+            cached_model_catalog("https://gw.example", "${env:K}", Some("/openai/v1/models"))
+                .is_none(),
+            "publish_model_catalog scopes to the default discovery path"
+        );
+        // Cleanup so parallel tests reading the global cache are unaffected.
+        if let Ok(mut guard) = MODEL_CATALOG.lock() {
+            *guard = None;
+        }
     }
 }

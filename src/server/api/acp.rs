@@ -1139,6 +1139,14 @@ pub async fn discover_gateway_models(
         )
             .into_response();
     }
+    // Publish for the spawn path: a later structured-view spawn reads this
+    // cache (config-digest-scoped) to derive the adapter's model env without
+    // blocking on discovery. See `model_gateway::publish_model_catalog`.
+    crate::acp::model_gateway::publish_model_catalog(
+        &settings.base_url,
+        &settings.api_key,
+        &models,
+    );
     Json(serde_json::json!({ "models": models })).into_response()
 }
 

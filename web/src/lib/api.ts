@@ -2872,3 +2872,30 @@ export async function syncSkills(options?: {
     };
   }
 }
+
+// --- Model gateway ---
+
+/** One model the configured gateway serves (GET /api/acp/models). */
+export interface GatewayModelInfo {
+  id: string;
+  name?: string | null;
+  provider?: string | null;
+  context_window?: number | null;
+  max_output_tokens?: number | null;
+}
+
+export interface GatewayModelsResponse {
+  models: GatewayModelInfo[];
+  error?: string;
+}
+
+/**
+ * Run model discovery against the configured gateway. Runs on the daemon
+ * (browser CORS + credential isolation), so this is a plain fetch of the
+ * daemon's own endpoint: the credential never crosses to the frontend.
+ * Returns `null` on transport failure; `{ models: [], error }` on a
+ * daemon-side refusal (gateway unconfigured, discovery failed, ...).
+ */
+export async function fetchGatewayModels(): Promise<GatewayModelsResponse | null> {
+  return fetchJson<GatewayModelsResponse>("/api/acp/models");
+}
