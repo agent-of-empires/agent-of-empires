@@ -559,7 +559,10 @@ impl Instance {
         };
 
         let has_command_override = self.has_command_override();
-        let shell_stale = candidate == Status::Idle
+        // A `waiting` hook write outlives an agent that exits from an open
+        // prompt, so an inferred Waiting gets the same shell check as Idle.
+        let shell_stale = (candidate == Status::Idle
+            || (candidate == Status::Waiting && !detection.visible))
             && !has_command_override
             && !is_dead
             && self.pane_is_stale_shell(metadata, session);

@@ -1294,6 +1294,35 @@ What should Claude do instead?\n❯\n  ? for shortcuts";
     }
 
     #[test]
+    fn test_waiting_hook_claude_survives_question_scrolled_out_of_window() {
+        // #3441: output landing below a still-open question pushes it past the
+        // recent window. Absence of the menu is not a cancellation; only the
+        // input box coming back, or live work, releases the wait.
+        let question = "  Which approach do you prefer?\n\
+❯ 1. First\n    2. Second\n\n\
+  Enter to select · ↑/↓ to navigate · Esc to cancel\n";
+        let noise: String = (0..31).map(|i| format!("notification {i}\n")).collect();
+        let fresh = Some(hook_at(
+            Status::Waiting,
+            Some(std::time::Duration::from_secs(1)),
+        ));
+        for hook in [fresh, stale_wait()] {
+            assert_eq!(
+                detect_claude(&format!("{question}{noise}"), "", hook),
+                Status::Waiting
+            );
+            assert_eq!(
+                detect_claude(&format!("{question}{noise}"), "\u{2733} Claude Code", hook),
+                Status::Waiting
+            );
+            assert_eq!(
+                detect_claude(&format!("{noise}❯ half-typed follow-up"), "", hook),
+                Status::Idle
+            );
+        }
+    }
+
+    #[test]
     fn test_stale_waiting_hook_claude_keeps_waiting_while_approval_on_screen() {
         let pane = "\x1b[1m  Do you want to proceed?\x1b[0m\n\
   ❯ 1. Yes\n    2. No\n\n  Esc to cancel · Tab to amend";
