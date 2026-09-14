@@ -3218,7 +3218,11 @@ impl HomeView {
         };
         let tool = parent.tool.clone();
         let parent_binding = parent.fork_parent_binding().cloned();
-        let repo_path = parent.repo_path().to_string();
+        let repo_path = if parent.is_structured() {
+            parent.repo_path().to_string()
+        } else {
+            parent.project_path.clone()
+        };
         let group_path = parent.group_path.clone();
         let title = parent.title.clone();
         let parent_is_structured = parent.is_structured();
