@@ -363,9 +363,8 @@ fn reconcile_scoped(
 }
 
 /// Whether a pass has anything to do. A bare start copies, publishes and
-/// retires nothing, so a journal and a parked row, which only a launch or
-/// `aoe migrate` can act on, are not work for it; counting them re-ran a
-/// no-op pass on every start for as long as any session stayed archived.
+/// retires nothing, so the journal and a parked row, even one planned before
+/// it was parked, are work only for a launch or `aoe migrate`.
 fn transition_may_be_pending(app_dir: &Path, bare_start: bool) -> Result<bool> {
     if !bare_start && app_dir.join(JOURNAL).exists() {
         return Ok(true);
@@ -375,8 +374,11 @@ fn transition_may_be_pending(app_dir: &Path, bare_start: bool) -> Result<bool> {
             continue;
         };
         if rows.iter().any(|row| {
-            (on_shared_store(row) && !(bare_start && row_is_parked(row)))
-                || (is_sandboxed(row) && transition_paths(row).ok().flatten().is_some())
+            if on_shared_store(row) {
+                !(bare_start && row_is_parked(row))
+            } else {
+                is_sandboxed(row) && transition_paths(row).ok().flatten().is_some()
+            }
         }) {
             return Ok(true);
         }
@@ -2403,6 +2405,15 @@ mod tests {
             "a bare start has nothing to do for a parked row and a journal"
         );
         assert!(!transition_in_flight(&app).unwrap());
+
+        // Planned by an earlier pass, then archived.
+        fs::write(
+            app.join("sessions.json"),
+            r#"[{"id":"1111111111111111","sandbox_info":{"enabled":true},"archived_at":"2026-01-01T00:00:00Z","sandbox_store_generation":1,"sandbox_store_transition_paths":[{"source":"/a","destination":"/b"}]}]"#,
+        )
+        .unwrap();
+        assert!(transition_may_be_pending(&app, false).unwrap());
+        assert!(!transition_may_be_pending(&app, true).unwrap());
 
         fs::write(
             app.join("sessions.json"),
