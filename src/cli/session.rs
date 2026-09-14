@@ -2724,6 +2724,7 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
         .context("failed to acquire instance resume-target lock")?;
     let title = storage.update(|instances, _groups| {
         super::patch_instance(instances, &target_id, |inst| {
+            inst.source_profile = storage.profile().to_string();
             if inst.is_structured() {
                 anyhow::ensure!(args.store.is_some() && matches!((&new_intent, inst.acp_session_id.as_deref()), (crate::session::ResumeIntent::Use(sid), Some(acp_sid)) if sid == acp_sid),
                     "ACP manages its own conversation; a native handoff assertion requires its current ID and an explicit --store");
@@ -3307,12 +3308,21 @@ mod set_session_id_tests {
     #[serial]
     async fn set_session_id_clears_resume_probe_failed_marker() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
-
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _path = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "my-claude",
+            "#!/bin/sh\nexit 0\n",
+        );
+        Storage::new_unwatched("default").unwrap();
+        let config_path =
+            crate::session::config::profile_config::get_profile_config_path("set-sid-clear-marker")
+                .unwrap();
+        std::fs::write(config_path, format!("[session.agent_execution_as]\nmy-claude = 'claude'\n[session.agent_config_dir]\nmy-claude = {}\n", toml::Value::String(temp.path().join(".claude").to_str().unwrap().into()))).unwrap();
         let storage = Storage::new_unwatched("set-sid-clear-marker").unwrap();
-        let mut inst = Instance::new("marked_session", "/tmp/x");
+        let mut inst = Instance::new("marked_session", temp.path().to_str().unwrap());
+        inst.tool = "my-claude".into();
+        inst.command = "my-claude".into();
         inst.agent_session_id = Some("11111111-1111-1111-1111-111111111111".to_string());
         inst.resume_probe_failed_sid = Some("11111111-1111-1111-1111-111111111111".to_string());
         let id = inst.id.clone();
@@ -3345,6 +3355,17 @@ mod set_session_id_tests {
             ResumeIntent::Use("22222222-2222-2222-2222-222222222222".to_string())
         );
         assert_eq!(inst_disk.resume_probe_failed_sid, None);
+        assert_eq!(
+            inst_disk
+                .resume_binding
+                .as_ref()
+                .unwrap()
+                .execution
+                .as_ref()
+                .unwrap()
+                .stores,
+            vec![temp.path().join(".claude")]
+        );
     }
 }
 
