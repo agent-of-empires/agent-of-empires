@@ -35,9 +35,7 @@ function warnUnknownTheme(name: string): void {
 
 /** Validate a `shiki_theme` value against Shiki's real theme registry,
  *  returning the appearance-appropriate fallback for a name it doesn't
- *  recognise. Unlike the old `ensureThemeLoaded`, this doesn't load
- *  anything itself; `getSnippetHighlighter` passes the result straight
- *  into `getSharedHighlighter`'s `themes` option. */
+ *  recognise. */
 export function resolveSnippetTheme(name: string, appearance?: "dark" | "light"): string {
   if (!isBundledTheme(name)) {
     warnUnknownTheme(name);
@@ -83,6 +81,12 @@ function isBundledLanguage(id: string): id is keyof typeof bundledLanguages {
   return Object.hasOwn(bundledLanguages, id);
 }
 
+/** Own-property lookup, so a hint like `constructor` misses instead of
+ *  returning an inherited function. */
+function lookup(table: Record<string, string>, key: string): string | undefined {
+  return Object.hasOwn(table, key) ? table[key] : undefined;
+}
+
 /**
  * Resolve an extension, filename, or markdown-fence hint to a Shiki
  * language id. Returns null for a hint Shiki doesn't recognise so the
@@ -90,9 +94,10 @@ function isBundledLanguage(id: string): id is keyof typeof bundledLanguages {
  * make `getSharedHighlighter` throw.
  */
 export function langIdForHint(hint: string): string | null {
-  if (FILENAME_TO_LANG[hint]) return FILENAME_TO_LANG[hint];
+  const byFilename = lookup(FILENAME_TO_LANG, hint);
+  if (byFilename) return byFilename;
   const lower = hint.toLowerCase();
-  const canonical = FENCE_ALIASES[lower] ?? EXT_ALIASES[lower] ?? lower;
+  const canonical = lookup(FENCE_ALIASES, lower) ?? lookup(EXT_ALIASES, lower) ?? lower;
   return isBundledLanguage(canonical) ? canonical : null;
 }
 
@@ -103,8 +108,8 @@ export function langIdForHint(hint: string): string | null {
 export function langHintForPath(filePath: string): string {
   const basename = filePath.split("/").pop() ?? filePath;
   const nameNoExt = basename.split(".")[0] ?? "";
-  if (FILENAME_TO_LANG[nameNoExt]) return nameNoExt;
-  if (FILENAME_TO_LANG[basename]) return basename;
+  if (lookup(FILENAME_TO_LANG, nameNoExt)) return nameNoExt;
+  if (lookup(FILENAME_TO_LANG, basename)) return basename;
   return basename.includes(".") ? (basename.split(".").pop() ?? "") : "";
 }
 

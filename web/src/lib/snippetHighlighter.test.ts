@@ -16,26 +16,6 @@ vi.mock("@pierre/diffs", () => ({
   getSharedHighlighter: (...args: unknown[]) => getSharedHighlighterMock(...args),
 }));
 
-// `resolveSnippetTheme`/`langIdForHint` read shiki's real `bundledThemes` and
-// `bundledLanguages` registries, so these tests run against the ids shiki
-// actually ships rather than a restatement of them. Shiki's registry entries
-// are dynamic imports inside its own dist bundle, which `vi.mock` cannot
-// reach, so the failure branch swaps one registry entry for the duration of
-// a single test instead.
-async function withThemeImport(
-  id: keyof typeof bundledThemes,
-  stub: () => Promise<unknown>,
-  body: () => Promise<void>,
-): Promise<void> {
-  const real = bundledThemes[id];
-  (bundledThemes as Record<string, () => Promise<unknown>>)[id] = stub;
-  try {
-    await body();
-  } finally {
-    (bundledThemes as Record<string, () => Promise<unknown>>)[id] = real;
-  }
-}
-
 import {
   DEFAULT_SHIKI_THEME,
   DEFAULT_SHIKI_THEME_LIGHT,
@@ -106,18 +86,6 @@ describe("resolveSnippetTheme", () => {
       expect(resolveSnippetTheme(theme, "dark")).toBe(theme);
     }
   });
-
-  it("falls back when the theme was renamed out from under a cached id", async () => {
-    await withThemeImport(
-      "tokyo-night",
-      async () => ({ default: undefined }),
-      async () => {
-        // resolveSnippetTheme only checks registry membership, not import
-        // health, so a registered id still resolves to itself.
-        expect(resolveSnippetTheme("tokyo-night", "light")).toBe("tokyo-night");
-      },
-    );
-  });
 });
 
 // The Rust side asserts every builtin theme *has* a `shiki_theme`; this asserts
@@ -185,6 +153,8 @@ describe("langIdForHint", () => {
     expect(langIdForHint("notalang")).toBeNull();
     expect(langIdForHint("")).toBeNull();
     expect(langIdForHint("unknownext")).toBeNull();
+    expect(langIdForHint("constructor")).toBeNull();
+    expect(langIdForHint("toString")).toBeNull();
   });
 });
 
@@ -192,6 +162,7 @@ describe("langHintForPath", () => {
   it("resolves extensions through directory paths", () => {
     expect(langHintForPath("src/lib/highlighter.ts")).toBe("ts");
     expect(langHintForPath("/abs/path/to/main.rs")).toBe("rs");
+    expect(langHintForPath("src/constructor.ts")).toBe("ts");
   });
 
   it("resolves filename overrides without an extension", () => {
