@@ -81,6 +81,34 @@ impl AnchoredDir {
     }
 
     pub(crate) fn ensure_dir(&self, relative: &Path) -> Result<PathBuf> {
+        self.ensure_dir_fd(relative)?;
+        Ok(self.root.join(relative))
+    }
+
+    pub(crate) fn child(&self, relative: &Path) -> Result<Self> {
+        Ok(Self {
+            root: self.root.join(relative),
+            fd: self.open_dir(relative)?,
+        })
+    }
+
+    pub(crate) fn create_child(&self, relative: &Path) -> Result<Self> {
+        Ok(Self {
+            root: self.root.join(relative),
+            fd: self.ensure_dir_fd(relative)?,
+        })
+    }
+
+    pub(crate) fn identity(&self) -> Result<(libc::dev_t, libc::ino_t)> {
+        let stat = fstat(&self.fd)?;
+        Ok((stat.st_dev, stat.st_ino))
+    }
+
+    pub(crate) fn sync(&self) -> Result<()> {
+        nix::unistd::fsync(&self.fd).context("syncing anchored directory")
+    }
+
+    fn ensure_dir_fd(&self, relative: &Path) -> Result<OwnedFd> {
         let components = normal_components(relative)?;
         let mut current = openat(
             &self.fd,
@@ -101,7 +129,7 @@ impl AnchoredDir {
             )
             .context("opening anchored directory component")?;
         }
-        Ok(self.root.join(relative))
+        Ok(current)
     }
 
     pub(crate) fn open_regular(&self, relative: &Path, max_bytes: usize) -> Result<Option<File>> {
@@ -208,6 +236,116 @@ impl AnchoredDir {
             Ok(()) | Err(Errno::ENOENT) => Ok(()),
             Err(error) => Err(error).context("removing anchored file"),
         }
+    }
+
+    /// Publish a complete regular file. A seed never replaces any existing
+    /// entry; refresh replaces the leaf, never follows a link at that leaf.
+    /// Parent directories must already exist beneath this retained anchor.
+    pub(crate) fn publish_file(
+        &self,
+        relative: &Path,
+        reader: &mut impl Read,
+        permissions: std::fs::Permissions,
+        replace: bool,
+    ) -> Result<bool> {
+        let (parent, leaf) = self.open_parent(relative)?;
+        let temporary = format!(".aoe-copy-{}", uuid::Uuid::new_v4());
+        let fd = openat(
+            &parent,
+            temporary.as_str(),
+            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::S_IRUSR | Mode::S_IWUSR,
+        )
+        .context("creating anchored file stage")?;
+        let mut file = File::from(fd);
+        let result = (|| -> Result<bool> {
+            std::io::copy(reader, &mut file).context("copying anchored file stage")?;
+            file.set_permissions(permissions)?;
+            file.sync_all()?;
+            if replace {
+                nix::fcntl::renameat(&parent, temporary.as_str(), &parent, leaf.as_os_str())?;
+            } else {
+                match crate::process::rename_exclusive(
+                    &parent,
+                    temporary.as_ref(),
+                    &parent,
+                    leaf.as_os_str(),
+                ) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        return Ok(false);
+                    }
+                    Err(error) => return Err(error).context("publishing anchored file seed"),
+                }
+            }
+            nix::unistd::fsync(&parent)?;
+            Ok(true)
+        })();
+        if !matches!(result, Ok(true)) {
+            let _ = unlinkat(&parent, temporary.as_str(), UnlinkatFlags::NoRemoveDir);
+        }
+        result
+    }
+
+    /// The fully built stage remains available when another writer wins.
+    pub(crate) fn publish_directory(&self, stage: &Path, destination: &Path) -> Result<bool> {
+        let (source_parent, source_leaf) = self.open_parent(stage)?;
+        let (target_parent, target_leaf) = self.open_parent(destination)?;
+        match crate::process::rename_exclusive(
+            &source_parent,
+            source_leaf.as_os_str(),
+            &target_parent,
+            target_leaf.as_os_str(),
+        ) {
+            Ok(()) => {
+                nix::unistd::fsync(&source_parent)?;
+                nix::unistd::fsync(&target_parent)?;
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(error) => Err(error).context("publishing anchored directory stage"),
+        }
+    }
+
+    pub(crate) fn create_symlink(&self, relative: &Path, target: &Path) -> Result<bool> {
+        let (parent, leaf) = self.open_parent(relative)?;
+        match nix::unistd::symlinkat(target, &parent, leaf.as_os_str()) {
+            Ok(()) => {
+                nix::unistd::fsync(&parent)?;
+                Ok(true)
+            }
+            Err(Errno::EEXIST) => Ok(false),
+            Err(error) => Err(error).context("creating anchored seed link"),
+        }
+    }
+
+    pub(crate) fn read_link(&self, relative: &Path) -> Result<Option<PathBuf>> {
+        let (parent, leaf) = self.open_parent(relative)?;
+        match nix::fcntl::readlinkat(&parent, leaf.as_os_str()) {
+            Ok(target) => Ok(Some(target.into())),
+            Err(Errno::ENOENT | Errno::EINVAL) => Ok(None),
+            Err(error) => Err(error).context("reading anchored link"),
+        }
+    }
+
+    /// Remove only a caller-owned staging tree, without following its links.
+    pub(crate) fn remove_staged_dir(&self, relative: &Path) -> Result<()> {
+        let (parent, leaf) = self.open_parent(relative)?;
+        let child = match self.child(relative) {
+            Ok(child) => child,
+            Err(error) if missing_or_hostile(&error) => return self.remove_file(relative),
+            Err(error) => return Err(error),
+        };
+        for name in child.read_dir(Path::new(""), usize::MAX)? {
+            let path = Path::new(&name);
+            match child.child(path) {
+                Ok(_) => child.remove_staged_dir(path)?,
+                Err(error) if missing_or_hostile(&error) => child.remove_file(path)?,
+                Err(error) => return Err(error),
+            }
+        }
+        unlinkat(&parent, leaf.as_os_str(), UnlinkatFlags::RemoveDir)
+            .context("removing anchored staging directory")
     }
 
     fn modified(&self, relative: &Path, directory: bool) -> Result<Option<std::time::SystemTime>> {

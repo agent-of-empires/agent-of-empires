@@ -223,7 +223,7 @@ pub(crate) fn runtime_cannot_answer(error: &crate::containers::error::DockerErro
 /// pending for a later pass. A `remove` that fails for any other reason still
 /// aborts: `force=false` is what makes a container that became live after the
 /// probe fail the transition rather than be stopped underneath its agent.
-fn reap_migrated_container(id: &str) -> Result<bool> {
+pub(super) fn reap_migrated_container(id: &str) -> Result<bool> {
     let container = crate::containers::DockerContainer::from_session_id(id);
     match container.exists() {
         Ok(true) => {
@@ -511,7 +511,10 @@ fn cohort_lock_name(root: &Path) -> String {
     format!(".v027-cohort-{hex}.lock")
 }
 
-fn acquire_cohort_lock(app_dir: &Path, root: &Path) -> Result<crate::session::StorageFlock> {
+pub(super) fn acquire_cohort_lock(
+    app_dir: &Path,
+    root: &Path,
+) -> Result<crate::session::StorageFlock> {
     crate::session::acquire_storage_flock(app_dir, &cohort_lock_name(root))
 }
 
@@ -1236,22 +1239,7 @@ fn run_pass(
             });
         if !defer_source_retirement && !blocked_roots.contains(root) && all_ready {
             progress::step(format!("retiring shared agent store {}", root.display()));
-            if private_roots.contains(root) {
-                let replicated = excluded_by_root
-                    .get(root)
-                    .context("missing cleanup-root exclusions")?;
-                if let Some(kept) = retire_legacy_children(root, replicated)? {
-                    progress::notice(format!(
-                        "Kept {}: it holds shared agent state (other sessions' history, caches, \
-                         logs) that belongs to no one session, so it was not copied into every \
-                         private store. Everything removed from it is in those stores; what is \
-                         left has no other copy. Remove it yourself once you no longer want it.",
-                        kept.display()
-                    ));
-                }
-            } else {
-                retire_legacy(root)?;
-            }
+            retire_legacy(root)?;
         } else {
             pending.push(root.to_string_lossy().into_owned());
         }
@@ -1335,7 +1323,7 @@ fn registry_dirs_of(paths: &[PathBuf]) -> Vec<PathBuf> {
     dirs
 }
 
-fn lock_registry_dirs(dirs: &[PathBuf]) -> Result<Vec<crate::session::StorageFlock>> {
+pub(super) fn lock_registry_dirs(dirs: &[PathBuf]) -> Result<Vec<crate::session::StorageFlock>> {
     dirs.iter()
         .map(|dir| {
             crate::session::acquire_storage_flock(dir, crate::session::STORAGE_LOCK_FILENAME)
@@ -1538,7 +1526,7 @@ fn set_generation(row: &mut Value, generation: u8) {
     }
 }
 
-fn registry_paths(app_dir: &Path) -> Result<Vec<PathBuf>> {
+pub(super) fn registry_paths(app_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     let profiles = app_dir.join("profiles");
     match fs::read_dir(&profiles) {
@@ -1662,8 +1650,8 @@ fn publish_store(
         // conversation history belonging to other sessions, caches, logs and
         // plugin trees, none of them the single-instance lock this migration
         // exists to unshare, and each replicated once per session (#3819).
-        // What is not folded in is not deleted either: `retire_legacy_children`
-        // leaves the shared root holding it.
+        // The full shared original, including these directories, is retained
+        // outside managed mounts when its stopped cohort is retired.
         copy_tree_no_links(
             overlay,
             stage,
@@ -1699,7 +1687,10 @@ fn publish_store(
     }
     fs::rename(stage, destination)?;
     fs::File::open(parent)?.sync_all()?;
-    remove_tree_no_links(&publication.quarantine)?;
+    super::v030_isolate_sandbox_content::retain_legacy_original(
+        &publication.quarantine,
+        parent.parent().context("private layout has no parent")?,
+    )?;
     fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
@@ -1736,7 +1727,7 @@ impl Publication {
             .path()
             .join(format!(".v027-quarantine-{leaf}"));
         remove_tree_no_links(&stage)?;
-        remove_tree_no_links(&quarantine)?;
+        super::v030_isolate_sandbox_content::retain_legacy_original(&quarantine, layout_root)?;
         Ok(Self {
             anchored_parent,
             stage,
@@ -1792,7 +1783,10 @@ fn relocate_store(source: &Path, destination: &Path) -> Result<()> {
         return publish_store(source, destination, &BTreeSet::new(), None, false);
     }
     fs::File::open(parent)?.sync_all()?;
-    remove_tree_no_links(&publication.quarantine)?;
+    super::v030_isolate_sandbox_content::retain_legacy_original(
+        &publication.quarantine,
+        parent.parent().context("private layout has no parent")?,
+    )?;
     fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
@@ -2065,10 +2059,8 @@ fn copy_tree_no_links(
                 Ok(existing) if overwrite_newer && existing.is_file() => {
                     metadata.modified()? > existing.modified()?
                 }
-                // Fails closed as the Unix path does. Skipping instead would
-                // leave the overlay's file out of the private store while
-                // `retire_legacy_children` still counted it as replicated and
-                // removed the only other copy.
+                // Conflicting types are not evidence that the required
+                // configuration reached the destination. Fail closed.
                 Ok(_) => bail!(
                     "v027 copy destination has conflicting type: {}",
                     target.display()
@@ -2102,102 +2094,23 @@ fn sync_tree(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Retire a legacy root by removing only what the private stores received.
-///
-/// Every per-instance child moved into the private layout, and every
-/// top-level regular file was folded into each of them, so both go. What is
-/// left is what [`publish_store`]'s overlay deliberately did not replicate:
-/// other sessions' conversation history, caches, logs and plugin trees. This
-/// root is now the only copy of them, so deleting them to reclaim space would
-/// destroy state that belongs to no single session. Returns the root when
-/// this pass both kept something and removed something, which is what the
-/// caller says out loud; a later pass over a root it already stripped has
-/// nothing to report.
-///
-/// Stores go before files, and everything is renamed aside before it is
-/// removed. This runs before the generation commit, so an interrupted
-/// retirement leaves rows still pending, and a pending row re-copies its
-/// legacy store over the one it already published. Either that store is
-/// wholly gone, and the row keeps what it published, or it is wholly there
-/// and so is every file the overlay folds in beside it. Removing a file
-/// first is what would let a pass re-publish a store without the credentials
-/// the root no longer has.
-fn retire_legacy_children(
-    root: &Path,
-    replicated: &BTreeSet<std::ffi::OsString>,
-) -> Result<Option<PathBuf>> {
-    let quarantine = root.join(".v027-retired.v027-quarantine");
-    remove_tree_no_links(&quarantine)?;
-    let entries = match fs::read_dir(root) {
-        Ok(entries) => entries,
-        // A root an earlier pass already emptied and removed. Every later row
-        // under it plans against it and arrives here, so treating its absence
-        // as a failure would fail `aoe migrate`, and every command that runs
-        // migrations, from then on. [`retire_legacy`] is the no-op that also
-        // clears what a killed pass left beside it.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            retire_legacy(root)?;
-            return Ok(None);
-        }
-        Err(error) => return Err(error).with_context(|| format!("reading {}", root.display())),
-    };
-    let mut kept = false;
-    let mut stores = Vec::new();
-    let mut files = Vec::new();
-    for entry in entries {
-        let name = entry?.file_name();
-        if replicated.contains(name.as_os_str()) {
-            stores.push(name);
-        } else if fs::symlink_metadata(root.join(&name))?.is_file() {
-            files.push(name);
-        } else {
-            kept = true;
-        }
-    }
-    let removed = !stores.is_empty() || !files.is_empty();
-    fs::create_dir(&quarantine)?;
-    for name in stores {
-        fs::rename(root.join(&name), quarantine.join(&name))?;
-    }
-    // The barrier is the ordering, not the syncs around it: without it the
-    // drive is free to commit a file's removal before a store's.
-    super::store_fs::sync_to_drive(&fs::File::open(root)?)?;
-    super::store_fs::barrier(&fs::File::open(root)?)?;
-    for name in files {
-        fs::rename(root.join(&name), quarantine.join(&name))?;
-    }
-    super::store_fs::sync_to_drive(&fs::File::open(root)?)?;
-    remove_tree_no_links(&quarantine)?;
-    fs::File::open(root)?.sync_all()?;
-    if !kept {
-        retire_legacy(root)?;
-        return Ok(None);
-    }
-    Ok(removed.then(|| root.to_path_buf()))
-}
-
 fn retire_legacy(source: &Path) -> Result<()> {
     let parent = source.parent().context("legacy store has no parent")?;
     let quarantine = parent.join(format!(
         ".{}.v027-quarantine",
         source.file_name().unwrap_or_default().to_string_lossy()
     ));
-    match fs::symlink_metadata(source) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            bail!("v027 legacy source became a symlink: {}", source.display())
-        }
-        Ok(_) => {
-            remove_tree_no_links(&quarantine)?;
-            fs::rename(source, &quarantine)?;
-            fs::File::open(parent)?.sync_all()?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(error).with_context(|| format!("inspecting {}", source.display()))
-        }
-    }
-    remove_tree_no_links(&quarantine)?;
-    fs::File::open(parent)?.sync_all()?;
+    let host = if parent.file_name().is_some_and(|name| name == "sandbox") {
+        parent
+            .parent()
+            .context("legacy layout has no native home")?
+    } else {
+        parent
+    };
+    // A killed old migration may already have renamed the original aside.
+    // Preserve that whole original too; never clear a recovery candidate.
+    super::v030_isolate_sandbox_content::retain_legacy_original(&quarantine, host)?;
+    super::v030_isolate_sandbox_content::retain_legacy_original(source, host)?;
     if parent.file_name().is_some_and(|name| name == "sandbox") {
         let _ = fs::remove_dir(parent);
         if let Some(grandparent) = parent.parent() {
@@ -3736,39 +3649,35 @@ gemini = "{}"
         );
     }
 
-    /// What no private store received is kept, whatever its type; what every
-    /// private store did receive is removed.
     #[test]
-    fn retiring_a_root_keeps_only_what_no_store_received() {
+    #[serial_test::serial]
+    fn retiring_a_root_retains_its_complete_original() {
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("sandbox");
+        let _environment = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let host = temp.path().join(".claude");
+        let root = host.join("sandbox");
         fs::create_dir_all(root.join("one")).unwrap();
         fs::create_dir_all(root.join("sessions")).unwrap();
-        fs::write(root.join("one").join("own"), b"own").unwrap();
-        fs::write(root.join("sessions").join("other"), b"other").unwrap();
+        fs::write(root.join("one/own"), b"own").unwrap();
+        fs::write(root.join("sessions/other"), b"other").unwrap();
         fs::write(root.join("auth.json"), b"secret").unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink("sessions", root.join("latest")).unwrap();
-        let replicated: BTreeSet<std::ffi::OsString> = [std::ffi::OsString::from("one")].into();
-
-        let kept = retire_legacy_children(&root, &replicated).unwrap();
-
-        assert_eq!(kept.as_deref(), Some(root.as_path()));
-        assert!(!root.join("one").exists(), "a replicated store is removed");
-        assert!(
-            !root.join("auth.json").exists(),
-            "a top-level file reached every private store, so it is removed"
-        );
+        std::os::unix::fs::symlink("/outside-do-not-follow", root.join("latest")).unwrap();
+        let kept = super::super::v030_isolate_sandbox_content::retain_legacy_original(&root, &host)
+            .unwrap()
+            .unwrap();
+        assert!(!root.exists());
+        assert_eq!(fs::read(kept.join("one/own")).unwrap(), b"own");
+        assert_eq!(fs::read(kept.join("sessions/other")).unwrap(), b"other");
+        assert_eq!(fs::read(kept.join("auth.json")).unwrap(), b"secret");
         assert_eq!(
-            fs::read(root.join("sessions").join("other")).unwrap(),
-            b"other"
+            fs::read_link(kept.join("latest")).unwrap(),
+            Path::new("/outside-do-not-follow")
         );
-        #[cfg(unix)]
         assert!(
-            fs::symlink_metadata(root.join("latest")).is_ok(),
-            "a symlink the overlay refused to carry has no other copy"
+            super::super::v030_isolate_sandbox_content::retain_legacy_original(&root, &host)
+                .unwrap()
+                .is_none()
         );
-        assert!(!root.join(".v027-retired.v027-quarantine").exists());
     }
 
     /// Retiring a fully replicated root deletes it, so every later row that

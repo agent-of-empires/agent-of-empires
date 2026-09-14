@@ -20,6 +20,7 @@ pub(super) struct PreparedLaunch {
     pub(super) omp_capture_plan: Option<OmpCapturePlan>,
     pub(super) launch_env: LaunchEnvironment,
     pub(super) expected_prior_sid: Option<String>,
+    pub(super) sandbox_context_reset: Option<(String, Vec<String>)>,
     pub(super) expected_prior_intent: ResumeIntent,
     pub(super) expected_prior_omp_generation: Option<String>,
 }
@@ -366,6 +367,14 @@ impl Instance {
     }
 
     pub(super) fn prepare_launch_command(&mut self) -> Result<PreparedLaunch> {
+        let sandbox_context_reset = match self.resolved_agent() {
+            Some(agent) => {
+                crate::migrations::v030_isolate_sandbox_content::prepare_terminal_launch_context(
+                    self, agent.name,
+                )?
+            }
+            None => None,
+        };
         let expected_prior_sid = self.agent_session_id.clone();
         let expected_prior_intent = self.resume_intent.clone();
         let expected_prior_omp_generation = self.omp_capture_generation.clone();
@@ -378,6 +387,7 @@ impl Instance {
             expected_prior_sid,
             expected_prior_intent,
             expected_prior_omp_generation,
+            sandbox_context_reset,
         })
     }
 

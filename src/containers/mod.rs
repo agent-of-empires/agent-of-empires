@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::cli::truncate_id;
 use crate::session::{Config, ContainerRuntimeName};
+pub(crate) use container_interface::InspectedContainer;
 pub use container_interface::{
     ContainerConfig, EnvEntry, NamedVolumeMount, RunPolicy, VolumeMount,
 };
@@ -189,6 +190,10 @@ impl DockerContainer {
 
     pub fn sandbox_store_generation_matches(&self) -> Result<Option<bool>> {
         self.runtime.sandbox_store_generation_matches(&self.name)
+    }
+
+    pub(crate) fn inspect(&self) -> Result<Option<InspectedContainer>> {
+        self.runtime.inspect_container(&self.name)
     }
 
     pub fn shared_credential_mounts_match(&self, config: &ContainerConfig) -> Result<Option<bool>> {

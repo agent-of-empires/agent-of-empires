@@ -325,7 +325,16 @@ enum WorkerKind {
     Stdio,
 }
 
+#[derive(Clone)]
+struct PendingContextReset {
+    profile: String,
+    reason: String,
+    transactions: Vec<String>,
+}
+
 struct WorkerHandle {
+    /// Shared by fresh spawns and attached runners; never consumed by another epoch.
+    context_reset: Option<PendingContextReset>,
     /// Shared with all callers that need to issue an ACP request to
     /// this worker. Stored as `Arc<AcpClient>` (no surrounding Mutex)
     /// because every method on `AcpClient` takes `&self` and forwards
@@ -1937,6 +1946,56 @@ impl<S: BroadcastSink> Supervisor<S> {
             Vec::new()
         });
 
+        let (
+            stored_acp_session_id,
+            fork_from,
+            seed_history_replay,
+            sandbox_context_reset,
+            source_profile,
+        ) = if sandbox_info.as_ref().is_some_and(|info| info.enabled) {
+            let native_key = wrapper_substitution
+                .as_ref()
+                .map(|(_, base)| base.as_str())
+                .unwrap_or(&agent);
+            let native_agent = super::agent_profiles::resolve(native_key).native_config_agent;
+            let profile = source_profile.clone().unwrap_or_default();
+            let id = session_id.clone();
+            let generation = lease.epoch();
+            let context = tokio::task::spawn_blocking(move || {
+                crate::migrations::v030_isolate_sandbox_content::prepare_acp_context(
+                    &profile,
+                    &id,
+                    native_agent,
+                    generation,
+                    crate::migrations::v030_isolate_sandbox_content::AcpContextUse::Launch,
+                )
+            })
+            .await
+            .map_err(|error| {
+                SupervisorError::Acp(AcpError::Spawn(format!(
+                    "sandbox context handoff task: {error}"
+                )))
+            })?
+            .map_err(|error| {
+                SupervisorError::Acp(AcpError::Spawn(format!("sandbox context handoff: {error}")))
+            })?;
+            (
+                context.stored_session_id,
+                context.fork_from,
+                context.seed_history_replay,
+                context.notice,
+                Some(context.profile),
+            )
+        } else {
+            (
+                stored_acp_session_id,
+                fork_from,
+                seed_history_replay,
+                None,
+                source_profile,
+            )
+        };
+
         let config = SpawnConfig {
             agent_key: agent.clone(),
             tool: tool.clone(),
@@ -2036,6 +2095,13 @@ impl<S: BroadcastSink> Supervisor<S> {
         workers.insert(
             session_id.clone(),
             WorkerHandle {
+                context_reset: sandbox_context_reset.map(|(reason, transactions)| {
+                    PendingContextReset {
+                        profile: config.source_profile.clone().unwrap_or_default(),
+                        reason,
+                        transactions,
+                    }
+                }),
                 client,
                 drain_task,
                 // Empty: the initial spawn doesn't count toward the
@@ -2270,6 +2336,74 @@ impl<S: BroadcastSink> Supervisor<S> {
                     let mut established = false;
                     let mut startup_failed = false;
                     while let Some(event) = inbound.recv().await {
+                        if let Event::AcpSessionAssigned { acp_session_id } = &event {
+                            let pending = {
+                                let guard = workers.lock().await;
+                                guard
+                                    .get(&session_id)
+                                    .filter(|handle| handle.lease.epoch() == lease.epoch())
+                                    .and_then(|handle| handle.context_reset.clone())
+                            };
+                            if let Some(pending) = pending {
+                                let reset_event = Event::SessionContextReset {
+                                    reason: pending.reason.clone(),
+                                };
+                                let seq = next_seq(&next_seqs, &session_id);
+                                sink.publish_from_worker(
+                                    &session_id,
+                                    seq,
+                                    &reset_event,
+                                    lease.epoch(),
+                                );
+                                let id = session_id.clone();
+                                let assigned = acp_session_id.clone();
+                                let generation = lease.epoch();
+                                let acknowledged = tokio::task::spawn_blocking(move ||
+                                    crate::migrations::v030_isolate_sandbox_content::acknowledge_context_reset(
+                                        &pending.profile, &id,
+                                        crate::migrations::v030_isolate_sandbox_content::NativeContextView::Structured,
+                                        generation, &pending.transactions, Some(&assigned),
+                                    )
+                                ).await;
+                                let failure = match acknowledged {
+                                    Ok(Ok(())) => None,
+                                    Ok(Err(error)) => Some(error.to_string()),
+                                    Err(error) => Some(error.to_string()),
+                                };
+                                if let Some(error) = failure {
+                                    startup_failed = true;
+                                    let event = Event::AgentStartupError {
+                                        message: format!(
+                                            "Could not commit the isolated native context: {error}"
+                                        ),
+                                    };
+                                    sink.publish_from_worker(
+                                        &session_id,
+                                        next_seq(&next_seqs, &session_id),
+                                        &event,
+                                        lease.epoch(),
+                                    );
+                                    let client = workers
+                                        .lock()
+                                        .await
+                                        .get(&session_id)
+                                        .filter(|handle| handle.lease.epoch() == lease.epoch())
+                                        .map(|handle| Arc::clone(&handle.client));
+                                    if let Some(client) = client {
+                                        let _ = client.shutdown().await;
+                                    }
+                                    continue;
+                                }
+                                let mut guard = workers.lock().await;
+                                if let Some(handle) = guard
+                                    .get_mut(&session_id)
+                                    .filter(|handle| handle.lease.epoch() == lease.epoch())
+                                {
+                                    handle.context_reset = None;
+                                }
+                                notify.notify_waiters();
+                            }
+                        }
                         if let Event::Stopped { reason } = &event {
                             if reason == "agent_unresponsive"
                                 || reason == "prompt_orphaned"
@@ -2823,12 +2957,19 @@ impl<S: BroadcastSink> Supervisor<S> {
             let notified = self.worker_notify.notified();
             tokio::pin!(notified);
 
-            if self.workers.lock().await.contains_key(session_id) {
-                return true;
-            }
-            // No worker yet. If a resume (spawn or attach) is in flight,
-            // wait for it; otherwise fail fast rather than burn the deadline.
-            if lock_recover(&self.lifecycle).phase(session_id) != WorkerPhase::Resuming {
+            let waiting_for_context = {
+                let workers = self.workers.lock().await;
+                match workers.get(session_id) {
+                    Some(handle) if handle.context_reset.is_none() => return true,
+                    Some(_) => true,
+                    None => false,
+                }
+            };
+            // A native identity must be durably owned before accepting a
+            // prompt; approvals during initialization still use the raw client.
+            if !waiting_for_context
+                && lock_recover(&self.lifecycle).phase(session_id) != WorkerPhase::Resuming
+            {
                 return false;
             }
             let remaining = deadline.saturating_sub(started.elapsed());
@@ -2868,7 +3009,17 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// honest `UnknownSession` into a misleading `UnknownNonce`.
     async fn ready_client(&self, session_id: &str) -> Result<Arc<AcpClient>, SupervisorError> {
         self.wait_for_worker(session_id, WORKER_READY_TIMEOUT).await;
-        self.client_for_session(session_id).await
+        let workers = self.workers.lock().await;
+        let handle = workers
+            .get(session_id)
+            .ok_or_else(|| SupervisorError::UnknownSession(session_id.into()))?;
+        if handle.context_reset.is_some() {
+            return Err(AcpError::Spawn(
+                "isolated native context initialization is not complete".into(),
+            )
+            .into());
+        }
+        Ok(Arc::clone(&handle.client))
     }
 
     /// Await worker readiness without resolving a client, so a caller can
@@ -3407,6 +3558,34 @@ impl<S: BroadcastSink> Supervisor<S> {
             )));
         };
 
+        let context_reset = if sandbox.as_ref().is_some_and(|info| info.enabled) {
+            let profile = record.source_profile.clone().unwrap_or_default();
+            let id = session_id.clone();
+            let native_agent =
+                super::agent_profiles::resolve(&attach_agent_key).native_config_agent;
+            let generation = lease.epoch();
+            let context = tokio::task::spawn_blocking(move || {
+                crate::migrations::v030_isolate_sandbox_content::prepare_acp_context(
+                    &profile,
+                    &id,
+                    native_agent,
+                    generation,
+                    crate::migrations::v030_isolate_sandbox_content::AcpContextUse::Attach,
+                )
+            })
+            .await
+            .map_err(|error| AcpError::Spawn(format!("sandbox attach context task: {error}")))?
+            .map_err(|error| AcpError::Spawn(format!("sandbox attach context: {error}")))?;
+            context
+                .notice
+                .map(|(reason, transactions)| PendingContextReset {
+                    profile: context.profile,
+                    reason,
+                    transactions,
+                })
+        } else {
+            None
+        };
         let acp_session_id = AcpSessionId(session_id.clone());
         // Reattach: read the original profile from the persisted
         // `WorkerRecord` so `terminal/create` env resolution stays on the
@@ -3470,6 +3649,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         workers.insert(
             session_id.clone(),
             WorkerHandle {
+                context_reset,
                 client,
                 drain_task,
                 restart_history: vec![],
@@ -3650,6 +3830,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         workers.insert(
             session_id.to_string(),
             WorkerHandle {
+                context_reset: None,
                 client: Arc::new(client),
                 drain_task: tokio::spawn(async {}),
                 restart_history: vec![],

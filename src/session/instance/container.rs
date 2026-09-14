@@ -86,7 +86,8 @@ impl Instance {
     /// container launch first copies that store; see [`Self::move_sandbox_store`].
     pub fn sandbox_store_move_pending(&self) -> bool {
         self.is_sandboxed()
-            && self.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION
+            && !crate::migrations::v030_isolate_sandbox_content::instance_ready(self)
+                .unwrap_or(false)
     }
 
     /// Move this session's sandbox store into the private layout, narrating
@@ -124,30 +125,19 @@ impl Instance {
         // structured sessions and a bare container terminal all arrive here.
         // The TUI runs it ahead of time on a worker so this is a no-op there;
         // see `tui::store_move_poller`. It must stay above the shared flock
-        // below, which the move takes exclusively to plan and publish. A
-        // failure leaves the row on its shared store for a later attempt
-        // rather than blocking the launch.
+        // below. Failure is not permission to launch on unproven native state.
         if self.sandbox_store_move_pending() {
-            match self.move_sandbox_store(Some(crate::migrations::progress::tracing_reporter())) {
-                Ok(true) => self.reconcile_from_disk(),
-                Ok(false) => {}
-                Err(error) => tracing::warn!(
-                    session_id = %self.id,
-                    %error,
-                    "sandbox store move deferred; session continues on its shared store"
-                ),
+            if !self.move_sandbox_store(Some(crate::migrations::progress::tracing_reporter()))? {
+                anyhow::bail!(
+                    "sandbox {} must be stopped before native history can be isolated",
+                    self.id
+                );
             }
+            self.reconcile_from_disk();
         }
         self.warn_legacy_agent_config_mounts();
         let _transition_lock =
-            if self.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION {
-                Some(crate::session::acquire_storage_shared_flock(
-                    &crate::session::get_app_dir()?,
-                    crate::migrations::v027_isolate_sandbox_stores::LOCK,
-                )?)
-            } else {
-                None
-            };
+            crate::migrations::v030_isolate_sandbox_content::admit_fresh_instance(self)?;
 
         // Direct is_running()? / exists()? here rather than probe_running():
         // this function already returns Result, so `?` correctly propagates
@@ -166,10 +156,6 @@ impl Instance {
             // Already up: not a come-up, so don't re-mint. Fill lazily only if a
             // fresh process attached to a running container with no values yet.
             self.ensure_before_start_env(false)?;
-            if self.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION {
-                self.backfill_container_workdir(&container);
-                return Ok(container);
-            }
             // Still rotating the copy in its store. The refresh below would
             // fold that copy into the shared file and log every sandbox on
             // it out at the copy's next rotation, so refuse first.
@@ -188,6 +174,7 @@ impl Instance {
                 &self.tool,
                 Some(detect_as.as_str()),
                 fold,
+                std::path::Path::new(&self.container_workdir()),
             );
             let config = self.build_container_config_with(fold)?;
             self.identity_publisher_launched = config.identity_publisher_installed
@@ -227,6 +214,7 @@ impl Instance {
                     &self.tool,
                     Some(detect_as.as_str()),
                     container_config::CredentialFold::Freshest,
+                    std::path::Path::new(&self.container_workdir()),
                 );
                 let config = self.build_container_config()?;
                 // Built before its agent shared a credential file, so it

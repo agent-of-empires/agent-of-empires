@@ -38,12 +38,13 @@ mod v025_reenable_confirm_delete;
 mod v026_repoint_acp_default_agent;
 pub(crate) mod v027_isolate_sandbox_stores;
 mod v028_clear_archived_live_status;
+pub(crate) mod v030_isolate_sandbox_content;
 
 use anyhow::Result;
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 28;
+const CURRENT_VERSION: u32 = 30;
 const VERSION_FILE: &str = ".schema_version";
 
 struct Migration {
@@ -193,6 +194,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "clear_archived_live_status",
         run: v028_clear_archived_live_status::run,
     },
+    Migration {
+        version: 30,
+        name: "isolate_sandbox_content",
+        run: v030_isolate_sandbox_content::run,
+    },
 ];
 
 /// The data-schema version this build targets, i.e. the version every install
@@ -217,8 +223,8 @@ pub fn has_pending_migrations() -> bool {
 /// forwards it to its status line from a worker thread. Callers without one
 /// pass [`progress::tracing_reporter`], which leaves a trail in the log.
 ///
-/// A failure here is reported by the caller and does not block the launch:
-/// a row that did not move stays on its shared store and is retried.
+/// Unproven native content is never a launch fallback: errors leave the store
+/// pending, and admission refuses it until a stopped-store transition succeeds.
 pub fn migrate_sandbox_store_for_with(
     id: &str,
     reporter: Option<progress::Reporter>,
@@ -227,7 +233,8 @@ pub fn migrate_sandbox_store_for_with(
         return Ok(());
     }
     let _installed = progress::install(reporter);
-    v027_isolate_sandbox_stores::migrate_instance(id)
+    v027_isolate_sandbox_stores::migrate_instance(id)?;
+    v030_isolate_sandbox_content::migrate_instance(id)
 }
 
 /// [`migrate_sandbox_store_for_with`] with the container probes injected, for
@@ -275,7 +282,8 @@ fn run_migrations_inner(reporter: Option<progress::Reporter>, announce: bool) ->
         );
     }
     if current == CURRENT_VERSION {
-        return v027_isolate_sandbox_stores::reconcile_pending(announce);
+        v027_isolate_sandbox_stores::reconcile_pending(announce)?;
+        return v030_isolate_sandbox_content::reconcile_pending(announce);
     }
 
     let pending: Vec<&Migration> = MIGRATIONS

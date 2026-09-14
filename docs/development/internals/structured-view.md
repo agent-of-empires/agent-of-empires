@@ -62,7 +62,8 @@ If context restoration fails (the agent's stored session is gone), the view fall
 
 `aoe-agent` persists each native conversation in
 `${AOE_ARTIFACT_DIR}/aoe-agent-<native-session-id>.jsonl`. A driven `/clear`
-creates and flushes the new empty transcript before acknowledging the new ID.
+attempts to create and flush the new empty transcript before acknowledging
+the new ID. If creation fails, the fresh session remains usable in memory.
 Late turns from the old ID stay in its own file, and `session/load` reads only
 the requested ID. Missing or unreadable transcripts fail explicitly rather
 than reporting an empty successful resume. Without an artifact directory

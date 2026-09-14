@@ -54,6 +54,29 @@ pub mod runner;
 
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const PROCESS_GROUP_TERMINATION_GRACE: Duration = Duration::from_millis(250);
+/// Atomically publish a directory entry without replacing an existing entry.
+/// Both names are relative to retained directory descriptors; there is no
+/// check-then-rename fallback on platforms without an exclusive rename syscall.
+#[cfg(unix)]
+pub(crate) fn rename_exclusive(
+    source_dir: &std::os::fd::OwnedFd,
+    source: &std::ffi::OsStr,
+    destination_dir: &std::os::fd::OwnedFd,
+    destination: &std::ffi::OsStr,
+) -> std::io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        platform::rename_exclusive(source_dir, source, destination_dir, destination)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (source_dir, source, destination_dir, destination);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "exclusive directory publication is unsupported on this platform",
+        ))
+    }
+}
 
 /// Wait for `child` to exit, killing and reaping it if it outlives `timeout`.
 /// Returns `Ok(None)` when the timeout fired and the child was killed.
