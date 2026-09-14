@@ -72,7 +72,7 @@ def self_test():
     ok = job("success", ("Set up Cachix", "success"), (step, "success"))
     build_failed = job("failure", ("Set up Cachix", "success"), (step, "failure"))
     # Observed on 2026-09-14: the Nix install failed on macOS, skipping the build.
-    install_failed = job("failure", ("Install Nix", "failure"), (step, "skipped"))
+    install_failed = job("failure", ("Run ./.github/actions/install-nix", "failure"), (step, "skipped"))
     push_failed = job("failure", (step, "success"), ("Push to Cachix", "failure"))
     timed_out = job("failure", (step, "cancelled"))
     renamed = job("failure", ("Build aoe", "failure"))
