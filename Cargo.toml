@@ -157,7 +157,7 @@ mime_guess = "2.0"
 # QR of the dashboard URL (TUI serve dialog, tunnel startup). Behind `web`:
 # scanning it is only useful when there is a dashboard to open.
 qrcode = { version = "0.14", optional = true }
-argon2 = "0.5"
+argon2 = "0.6"
 subtle = "2"
 
 # TUI OSC 52 clipboard writes and Web Push payload encoding.
