@@ -34,9 +34,11 @@ pub struct RemoveArgs {
     #[arg(long = "keep-scratch")]
     keep_scratch: bool,
 
-    /// Permanently delete instead of moving to trash. By default `rm` moves
-    /// the session to the trash (when `session.delete_to_trash` is enabled,
-    /// the default) so it can be restored; `--purge` forces the irreversible
+    /// Permanently delete instead of moving to trash.
+    ///
+    /// By default `rm` moves the session to the trash (when
+    /// `session.delete_to_trash` is enabled, the default) so it can be
+    /// restored; `--purge` forces the irreversible
     /// teardown (worktree/branch/container cleanup per the other flags) and
     /// removes the session's structured-view transcript. Removing the sandbox
     /// container also attempts to remove its private agent stores, including
