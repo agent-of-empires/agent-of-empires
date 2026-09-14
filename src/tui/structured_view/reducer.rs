@@ -681,8 +681,7 @@ mod tests {
         assert_eq!(t.pending_approvals.len(), 1, "the filter must not latch");
     }
 
-    /// The notice survives a reconnect and lasts until a later prompt,
-    /// without claiming that the prompt restored the lost context.
+    /// A retained reset shows a notice until a later prompt dismisses it.
     #[test]
     fn context_primer_pending_tracks_the_newest_reset_or_prompt() {
         let prompt = || Event::UserPromptSent {
@@ -698,7 +697,7 @@ mod tests {
             ("reset with nothing after", vec![prompt(), reset()], true),
             (
                 "prompt dismisses the notice",
-                vec![reset(), prompt()],
+                vec![prompt(), reset(), prompt()],
                 false,
             ),
             (
