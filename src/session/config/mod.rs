@@ -609,8 +609,8 @@ pub struct AcpConfig {
     #[serde(default)]
     #[setting(
         label = "Model gateway URL",
-        widget = "text",
-        web = "local_only:the daemon resolves the gateway credential against its own environment"
+        widget = "custom:model-gateway",
+        web = "elevation:routes every agent subprocess's API traffic at an external endpoint"
     )]
     pub gateway_base_url: String,
     /// The gateway credential: a literal key, one exact `${env:VAR}`
@@ -623,7 +623,7 @@ pub struct AcpConfig {
     #[setting(
         label = "Model gateway API key",
         widget = "text",
-        web = "local_only:credential references resolve only on the daemon host"
+        web = "elevation:sets the credential agent subprocesses send to the gateway; prefer a ${env:VAR} or ${secret:model-gateway-api-key} reference over a literal"
     )]
     pub gateway_api_key: String,
     /// Optional path appended to `gateway_base_url` for model discovery
@@ -635,7 +635,7 @@ pub struct AcpConfig {
     #[setting(
         label = "Model gateway discovery path",
         widget = "text",
-        web = "local_only:appended to the daemon-side discovery fetch"
+        web = "elevation:changes where the daemon-side model discovery fetch lands"
     )]
     pub gateway_discovery_path: String,
 

@@ -365,6 +365,34 @@ mod tests {
     }
 
     #[test]
+    fn model_gateway_fields_are_elevation_writable() {
+        // The three gateway fields are web-visible AND web-writable, but
+        // elevation-gated: they route agent subprocess traffic at an external
+        // endpoint and set the credential it is sent, the same class of knob
+        // as the agent allowlist and the sandbox privileges. Nothing here is
+        // `local_only`, so `strip_local_only` must leave all three in a
+        // bundled patch, and a non-elevated PATCH must be refused with
+        // NeedsElevation naming the field.
+        let mut body = json!({"acp": {
+            "gateway_base_url": "https://bifrost.example",
+            "gateway_api_key": "${env:BIFROST_VK}",
+            "gateway_discovery_path": "",
+            "node_path": "/tmp/evil-node",
+        }});
+        strip_local_only(&mut body);
+        assert!(body["acp"].get("node_path").is_none());
+        assert_eq!(
+            body["acp"]["gateway_base_url"],
+            json!("https://bifrost.example")
+        );
+        assert_eq!(body["acp"]["gateway_api_key"], json!("${env:BIFROST_VK}"));
+        assert_eq!(body["acp"]["gateway_discovery_path"], json!(""));
+        assert!(validate_patch(&body, Scope::Global, true).is_ok());
+        let err = validate_patch(&body, Scope::Global, false).unwrap_err();
+        assert!(matches!(err, PatchRejection::NeedsElevation { .. }));
+    }
+
+    #[test]
     fn malformed_section_value_rejected() {
         let err =
             validate_patch(&json!({"theme": "not-an-object"}), Scope::Global, true).unwrap_err();
