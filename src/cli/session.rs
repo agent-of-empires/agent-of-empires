@@ -2524,6 +2524,118 @@ mod rename_tests {
         assert_eq!(active.project_path, "/tmp/worktrees/main-branch");
     }
 
+    /// #3739: the live-status gate must consult the command's profile rules;
+    /// storage-loaded rows carry no `source_profile`, so without it a
+    /// profile-local rule is skipped and a running agent reads as Idle.
+    #[tokio::test]
+    #[serial]
+    async fn worktree_edit_consults_profile_status_rules() {
+        if crate::tmux::tmux_command().arg("-V").output().is_err() {
+            eprintln!("Skipping: tmux not available");
+            return;
+        }
+        const PROFILE: &str = "worktree-edit-profile-rules";
+        const AGENT: &str = "worktree-edit-rules-agent";
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let _tie_guard = crate::session::test_support::TieWorkdirToNameGuard::set(false);
+        // Otherwise an empty `source_profile` resolves to the only profile,
+        // which is this one, and the rule matches anyway.
+        crate::session::config::update_config(|config| {
+            config.default_profile = "main".to_string();
+        })
+        .unwrap();
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(PROFILE);
+        let profile_config =
+            crate::session::config::profile_config::get_profile_config_path(PROFILE).unwrap();
+        std::fs::create_dir_all(profile_config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &profile_config,
+            format!(
+                "[[agents.{AGENT}.status_rules]]\nstatus = \"running\"\ncontains = \"agent-busy\"\n"
+            ),
+        )
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join("agent-old");
+        std::fs::create_dir(&worktree).unwrap();
+        let mut target = Instance::new("Busy", worktree.to_str().unwrap());
+        target.tool = AGENT.to_string();
+        target.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "agent-old".into(),
+            main_repo_path: dir.path().join("repo").to_str().unwrap().into(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        });
+        let id = target.id.clone();
+        let tmux_name = crate::tmux::Session::generate_name(&target.id, &target.title);
+        let storage = Storage::new_unwatched(PROFILE).unwrap();
+        storage
+            .update(|instances, _| {
+                instances.push(target);
+                Ok(())
+            })
+            .unwrap();
+
+        struct KillOnDrop<'a>(&'a str);
+        impl Drop for KillOnDrop<'_> {
+            fn drop(&mut self) {
+                let _ = crate::tmux::tmux_command()
+                    .args(["kill-session", "-t", self.0])
+                    .output();
+            }
+        }
+        let created = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &tmux_name,
+                "printf 'agent-busy\\n'; sleep 300",
+            ])
+            .output()
+            .unwrap();
+        let _kill = KillOnDrop(&tmux_name);
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let captured = crate::tmux::tmux_command()
+                .args(["capture-pane", "-p", "-t", &tmux_name])
+                .output()
+                .unwrap();
+            if String::from_utf8_lossy(&captured.stdout).contains("agent-busy") {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "pane never painted");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let error = super::set_worktree_name(
+            PROFILE,
+            super::SetWorktreeNameArgs {
+                identifier: Some(id),
+                name: "agent-new".into(),
+                rename_branch: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("while the session is active"),
+            "{error}"
+        );
+        assert!(worktree.is_dir());
+        assert_eq!(
+            storage.load().unwrap()[0].project_path,
+            worktree.to_str().unwrap()
+        );
+    }
+
     #[test]
     fn group_only_success_uses_authoritative_committed_title() {
         assert_eq!(
@@ -2612,6 +2724,7 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
     // enforcing the guard. The holding entry point, for the reason
     // `rename_session` gives: an ambiguous frame must refuse the move.
     let mut live = inst.clone();
+    live.source_profile = profile.to_string();
     crate::tmux::refresh_session_cache();
     live.update_status_with_metadata(None, None);
     // A sandbox container keeps the worktree dir mounted even while the agent
