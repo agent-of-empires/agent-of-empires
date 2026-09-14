@@ -16,14 +16,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/react";
 import type { ReactNode } from "react";
 
-vi.mock("../../lib/highlighter", () => ({
-  ensureThemeLoaded: vi.fn().mockResolvedValue("dark-plus"),
-  getHighlighter: vi.fn().mockResolvedValue({
-    codeToHtml: (code: string) => `<pre>${code}</pre>`,
-  }),
-  langKeyForExt: (s: string) => s,
-  langImportForPath: () => null,
-  loadLanguage: vi.fn().mockResolvedValue(undefined),
+vi.mock("../../lib/snippetHighlighter", () => ({
+  highlightSnippet: vi.fn().mockResolvedValue(null),
+  getSnippetHighlighter: vi.fn().mockResolvedValue(null),
+  langHintForPath: () => "",
 }));
 
 vi.mock("../../hooks/useShikiTheme", () => ({

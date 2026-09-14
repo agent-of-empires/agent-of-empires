@@ -23,11 +23,8 @@ vi.mock("../acp/useFilesIndex", () => ({
 vi.mock("../../hooks/useShikiTheme", () => ({
   useShikiTheme: () => ({ theme: "github-dark", appearance: "dark" }),
 }));
-vi.mock("../../lib/highlighter", () => ({
-  ensureThemeLoaded: vi.fn().mockResolvedValue("github-dark"),
-  getHighlighter: vi.fn().mockResolvedValue({ codeToHtml: (c: string) => `<pre>${c}</pre>` }),
-  langKeyForExt: (s: string) => s,
-  loadLanguage: vi.fn().mockResolvedValue(undefined),
+vi.mock("../../lib/snippetHighlighter", () => ({
+  highlightSnippet: vi.fn().mockResolvedValue(null),
 }));
 
 beforeEach(() => {

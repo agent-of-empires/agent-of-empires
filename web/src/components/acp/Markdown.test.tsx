@@ -23,13 +23,8 @@ vi.mock("../../hooks/useShikiTheme", () => ({
   useShikiTheme: () => ({ theme: "vitesse-dark", appearance: "dark" }),
 }));
 
-vi.mock("../../lib/highlighter", () => ({
-  ensureThemeLoaded: vi.fn().mockResolvedValue("vitesse-dark"),
-  getHighlighter: vi.fn().mockResolvedValue({
-    codeToHtml: () => "<pre><code>highlighted</code></pre>",
-  }),
-  langKeyForExt: (s: string) => s,
-  loadLanguage: vi.fn().mockResolvedValue(undefined),
+vi.mock("../../lib/snippetHighlighter", () => ({
+  highlightSnippet: vi.fn().mockResolvedValue("<pre><code>highlighted</code></pre>"),
 }));
 
 interface PrimitiveCall {

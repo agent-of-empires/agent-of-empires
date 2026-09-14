@@ -15,22 +15,16 @@ import { DiffCommentsUserCard } from "../../comments/DiffCommentsUserCard";
 import type { DiffCommentsCardPayload } from "../../comments/buildPrompt";
 import type { DiffComment } from "../../comments/types";
 
-// Test-controlled highlighter behavior. By default the highlighter reports no
-// loaded languages, so HighlightedSnippet bails before setHtml and renders the
-// plain <pre> fallback branch. Flipping `highlighterMock.loaded` on exercises
-// the resolved-HTML (dangerouslySetInnerHTML) branch for one test. No network
-// or real Shiki involvement, so the suite stays deterministic.
+// Test-controlled highlighter behavior. By default `highlightSnippet`
+// resolves to null, so HighlightedSnippet bails before setHtml and renders
+// the plain <pre> fallback branch. Flipping `highlighterMock.loaded` on
+// exercises the resolved-HTML (dangerouslySetInnerHTML) branch for one test.
+// No network or real Shiki involvement, so the suite stays deterministic.
 const highlighterMock = { loaded: false };
 
-vi.mock("../../../../lib/highlighter", () => ({
-  langKeyForExt: () => "typescript",
-  loadLanguage: () => Promise.resolve(),
-  ensureThemeLoaded: () => Promise.resolve("github-dark"),
-  getHighlighter: () =>
-    Promise.resolve({
-      getLoadedLanguages: () => (highlighterMock.loaded ? ["typescript"] : []),
-      codeToHtml: (code: string) => `<pre class="shiki"><code>${code}</code></pre>`,
-    }),
+vi.mock("../../../../lib/snippetHighlighter", () => ({
+  highlightSnippet: (code: string) =>
+    Promise.resolve(highlighterMock.loaded ? `<pre class="shiki"><code>${code}</code></pre>` : null),
   DEFAULT_SHIKI_THEME: "github-dark",
 }));
 

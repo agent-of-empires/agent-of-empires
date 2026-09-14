@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { readCachedResolvedTheme, THEME_CHANGED_EVENT, type ResolvedTheme } from "../lib/theme";
-import { DEFAULT_SHIKI_THEME } from "../lib/highlighter";
+import { DEFAULT_SHIKI_THEME } from "../lib/snippetHighlighter";
 
 export interface ShikiThemeState {
   /** Bundled Shiki theme name to pass to ensureThemeLoaded. */
