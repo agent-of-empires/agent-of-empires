@@ -96,10 +96,11 @@ jobs:
         run: echo "::warning::The Nix build did not fail; a setup or Cachix step did. Not opening an issue unless the next run on main fails too."
 
       - name: Open or update the tracking issue
-        if: steps.classify.outputs.alert == 'true'
+        # Also runs when classification itself failed, so an API error still alerts.
+        if: ${{ !cancelled() && steps.classify.outputs.alert != 'false' }}
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
-          KIND: ${{ steps.classify.outputs.kind }}
+          KIND: ${{ steps.classify.outputs.kind || 'unknown' }}
         with:
           script: |
             const label = 'nix-build';
@@ -107,7 +108,7 @@ jobs:
             const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
             const cause = {
               build: '`nix build .#aoe-with-web` failed, so main does not build under Nix.',
-              infra: 'A setup or Cachix step failed on two consecutive runs; check the `CACHIX_*` secrets and Cachix status.',
+              infra: 'A setup or Cachix step failed, and the previous run on main also failed; check that run, the `CACHIX_*` secrets and Cachix status.',
               unknown: 'The failing step could not be identified; read the run log.',
             }[process.env.KIND];
             const summary = `${cause}\n\nRun: ${runUrl}\nCommit: ${context.sha}`;
