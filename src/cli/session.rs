@@ -2578,14 +2578,7 @@ mod rename_tests {
             })
             .unwrap();
 
-        struct KillOnDrop<'a>(&'a str);
-        impl Drop for KillOnDrop<'_> {
-            fn drop(&mut self) {
-                let _ = crate::tmux::tmux_command()
-                    .args(["kill-session", "-t", self.0])
-                    .output();
-            }
-        }
+        let _kill = crate::tmux::test_helpers::TmuxTestSession::from_name(tmux_name.clone());
         let created = crate::tmux::tmux_command()
             .args([
                 "new-session",
@@ -2596,7 +2589,6 @@ mod rename_tests {
             ])
             .output()
             .unwrap();
-        let _kill = KillOnDrop(&tmux_name);
         assert!(
             created.status.success(),
             "{}",
