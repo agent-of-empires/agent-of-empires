@@ -598,10 +598,6 @@ impl Instance {
             Err(error) => {
                 if is_read_only_filesystem(&error) {
                     match first_read_only_report(&settings_path) {
-                        // The memo is keyed on the resolved target, so name it
-                        // whenever it differs: two settings paths can share one
-                        // target, and only saying the first would silence the
-                        // second without ever telling the user which file it is.
                         Some(target) if target != settings_path => {
                             tracing::warn!(target: "session.store",
                                 "Agent settings at {} resolve to {}, which is on a read-only filesystem, so AoE status hooks cannot be installed there; not reported again for that target while this process runs.",
@@ -627,12 +623,9 @@ impl Instance {
     }
 }
 
-/// Settings files already reported as unwritable because they sit on a
-/// read-only filesystem. Externally managed settings (a Nix store symlink, a
-/// read-only mount) never become writable, so the identical warning would
-/// otherwise repeat for every session this process touches. Process-local by
-/// design: a one-shot `aoe add` still warns once, which is the first time that
-/// invocation says anything about it.
+/// Resolved settings targets already warned about as read-only. Entries live
+/// for the process, so a target that turns writable and later read-only again
+/// is only logged at debug.
 static READ_ONLY_SETTINGS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
@@ -645,12 +638,16 @@ fn is_read_only_filesystem(error: &anyhow::Error) -> bool {
 }
 
 /// The resolved target to report, or `None` when it has already been reported.
-/// Keyed on the target rather than the path, so a replaced symlink (a Nix
-/// profile switch points it at a new store path) is reported once for the new
-/// file. The install itself still runs, so a path that becomes writable
-/// installs with no special case.
+/// Keyed on the target, so a replaced symlink reports once for its new file. A
+/// missing file resolves through its parent directory.
 fn first_read_only_report(path: &std::path::Path) -> Option<std::path::PathBuf> {
-    let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let key = std::fs::canonicalize(path).unwrap_or_else(|_| {
+        path.parent()
+            .and_then(|parent| std::fs::canonicalize(parent).ok())
+            .zip(path.file_name())
+            .map(|(parent, file_name)| parent.join(file_name))
+            .unwrap_or_else(|| path.to_path_buf())
+    });
     READ_ONLY_SETTINGS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -681,7 +678,7 @@ mod tests {
     }
 
     #[test]
-    fn read_only_settings_are_reported_once_per_path() {
+    fn read_only_settings_are_reported_once_per_target() {
         let cases = [
             (
                 anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::ReadOnlyFilesystem)),
@@ -719,6 +716,21 @@ mod tests {
             assert!(
                 first_read_only_report(&link).is_none(),
                 "a symlink onto an already-reported target must not report again"
+            );
+
+            let real = dir.path().join("real");
+            std::fs::create_dir(&real).unwrap();
+            let alias = dir.path().join("alias");
+            std::os::unix::fs::symlink(&real, &alias).unwrap();
+            let reported = first_read_only_report(&real.join("absent.json"))
+                .expect("first report for a missing file");
+            assert_eq!(
+                reported,
+                std::fs::canonicalize(&real).unwrap().join("absent.json")
+            );
+            assert!(
+                first_read_only_report(&alias.join("absent.json")).is_none(),
+                "a missing file reached through a symlinked parent shares its target"
             );
         }
     }
