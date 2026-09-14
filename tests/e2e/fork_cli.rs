@@ -48,6 +48,8 @@ fn fork_from_seeds_child_with_fork_intent() {
         "ForkChild",
         "--fork-from",
         "ForkParent",
+        "--extra-args",
+        "--append-system-prompt resume",
     ]);
     assert!(
         child.status.success(),
@@ -101,19 +103,56 @@ fn seed_claude_parent(h: &TuiTestHarness, project: &std::path::Path, title: &str
     parent_agent_id.to_string()
 }
 
-/// Forking a claude parent while explicitly selecting a DIFFERENT agent is
-/// refused: a captured id is agent-specific, so handing a Claude id to another
-/// agent's resume would fail or resume garbage. With no `--tool`/`--cmd`, the
-/// fork inherits the parent's agent and succeeds.
+fn install_dispatch_marker(h: &mut TuiTestHarness, agent: &str) {
+    let bin = h.install_path_command(agent);
+    let marker = h.home_path().join("native-spawn");
+    std::fs::write(
+        bin.join(agent),
+        format!(
+            "#!/bin/sh\n[ \"$1\" = --version ] && exit 0\nprintf dispatched > {}\n",
+            shell_words::quote(&marker.to_string_lossy()),
+        ),
+    )
+    .unwrap();
+}
+
+fn assert_launch_refused(h: &TuiTestHarness, title: &str) {
+    let before = read_sessions(h);
+    let output = h.run_cli(&["session", "start", title]);
+    assert!(
+        !output.status.success(),
+        "invalid native fork must not launch"
+    );
+    assert!(
+        !h.home_path().join("native-spawn").exists(),
+        "native dispatch must not occur"
+    );
+    let after = read_sessions(h);
+    for field in [
+        "agent_session_id",
+        "agent_session_binding",
+        "resume_intent",
+        "resume_binding",
+        "active_execution",
+        "pi_session_path",
+    ] {
+        assert_eq!(
+            session_by_title(&before, title)[field],
+            session_by_title(&after, title)[field],
+            "refusal changed {field}"
+        );
+    }
+}
+
+/// A mismatched agent is refused at launch without discarding the fork target.
 #[test]
 #[parallel]
-fn fork_from_mismatched_tool_is_refused_but_inherits_when_unset() {
+fn fork_from_mismatched_tool_is_refused_at_launch_but_inherits_when_unset() {
     let mut h = TuiTestHarness::new("fork_cli_tool_match");
     let project = h.project_path();
-    h.install_path_command("gemini");
+    install_dispatch_marker(&mut h, "gemini");
     seed_claude_parent(&h, &project, "MatchParent");
 
-    // Explicit mismatched --tool: rejected.
     let mismatched = h.run_cli(&[
         "add",
         project.to_str().unwrap(),
@@ -125,9 +164,10 @@ fn fork_from_mismatched_tool_is_refused_but_inherits_when_unset() {
         "MatchParent",
     ]);
     assert!(
-        !mismatched.status.success(),
-        "forking a claude parent as gemini must be refused"
+        mismatched.status.success(),
+        "a valid parent seed can be queued"
     );
+    assert_launch_refused(&h, "MismatchChild");
     // No --tool/--cmd: inherits the parent's agent (claude) and succeeds.
     let inherited = h.run_cli(&[
         "add",
@@ -150,14 +190,12 @@ fn fork_from_mismatched_tool_is_refused_but_inherits_when_unset() {
     );
 }
 
-/// `--fork-from` is fenced against flags that change the working directory or
-/// filesystem view, or that carry their own resume/fork flags: a fork must run
-/// in the parent's directory to resume the conversation. Each combination is
-/// rejected up front.
+/// Filesystem conflicts fail before provisioning; native selectors fail before dispatch.
 #[test]
 #[parallel]
 fn fork_from_rejects_conflicting_flags() {
-    let h = TuiTestHarness::new("fork_cli_flag_mutex");
+    let mut h = TuiTestHarness::new("fork_cli_flag_mutex");
+    install_dispatch_marker(&mut h, "claude");
     let project = h.project_path();
     seed_claude_parent(&h, &project, "FenceParent");
 
@@ -182,25 +220,18 @@ fn fork_from_rejects_conflicting_flags() {
         );
     }
 
-    // A launch command carrying its own resume/fork flags collides with the
-    // fork's appended flags; rejected. Covers claude's --resume flag and codex's
-    // bare `fork` subcommand (word-level match, not just claude's --flags).
-    for cmd in ["claude --resume abc", "codex fork abc"] {
-        let out = h.run_cli(&[
-            "add",
-            project.to_str().unwrap(),
-            "--cmd",
-            cmd,
-            "-t",
-            "R",
-            "--fork-from",
-            "FenceParent",
-        ]);
-        assert!(
-            !out.status.success(),
-            "`--fork-from` with a --cmd carrying a resume/fork flag ({cmd}) must be refused"
-        );
-    }
+    let child = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "--cmd",
+        "claude --resume abc",
+        "-t",
+        "SelectorChild",
+        "--fork-from",
+        "FenceParent",
+    ]);
+    assert!(child.status.success(), "a valid parent seed can be queued");
+    assert_launch_refused(&h, "SelectorChild");
 
     // --cmd-override swaps the binary out from under the tool, decoupling it
     // from the parent's agent and its fork flags; rejected.

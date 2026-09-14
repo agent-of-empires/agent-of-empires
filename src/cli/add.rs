@@ -293,14 +293,8 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         );
     }
 
-    // A terminal fork resumes the parent's captured conversation in place: the
-    // agent finds that conversation by session id under the SAME working
-    // directory and filesystem view. Flags that move the cwd (`--worktree` /
-    // `--new-branch` / `--scratch`) or swap the filesystem (`--sandbox` /
-    // `--sandbox-image`) silently break that lookup, and a user-supplied launch
-    // command carrying its own resume/fork flags collides with the ones the
-    // Fork intent appends. Reject these up front (before any resource creation)
-    // rather than launch a fork that can't find its parent. See PR review.
+    // Reject filesystem-changing options before provisioning. Native argv is
+    // validated against the prepared execution at launch.
     if args.fork_from.is_some() {
         if explicit_worktree_branch(&args).is_some() || args.create_branch {
             bail!(
@@ -320,52 +314,15 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                  changes the agent's filesystem view and breaks the resumed conversation."
             );
         }
-        // --cmd-override swaps the launched binary out from under the tool: the
-        // Fork intent builds its resume+fork flags for `instance.tool`, but the
-        // override binary may be a different agent that rejects them (or, worse,
-        // a different agent handed the parent's agent-shaped id). Reject the
-        // pair rather than launch a cross-agent fork the tool check can't see.
         if args.cmd_override.is_some() {
             bail!(
                 "`--fork-from` cannot be combined with --cmd-override: overriding the agent binary \
                  decouples it from the parent's agent, so the fork's resume flags may not apply."
             );
         }
-        // The Fork intent appends the agent's own resume+fork flags: claude
-        // `--resume`/`--session-id`/`--fork-session`, opencode `--session`/
-        // `--fork`, codex `resume`/`fork` subcommands. A launch command that
-        // already carries any of them produces a duplicate/conflicting
-        // invocation. Match at WORD granularity (not raw substring) so a path
-        // or unrelated arg containing "fork"/"resume" (e.g. `--model resume-v2`
-        // or `/src/fork-utils`) doesn't false-trip, while `--session=ID` and the
-        // codex `fork`/`resume` subcommands still do.
-        let collides_with_fork_flags = |cmd: &str| {
-            cmd.split_whitespace().any(|w| {
-                w == "resume"
-                    || w == "fork"
-                    || w.starts_with("--resume")
-                    || w.starts_with("--session")
-                    || w.starts_with("--fork")
-            })
-        };
-        for input in [args.command.as_deref(), args.extra_args.as_deref()]
-            .into_iter()
-            .flatten()
-        {
-            if collides_with_fork_flags(input) {
-                bail!(
-                    "`--fork-from` cannot be combined with a launch command (--cmd or --extra-args) \
-                     that already contains a resume or fork flag/subcommand: the fork appends its \
-                     own resume flags, which would collide."
-                );
-            }
-        }
     }
 
-    // Validate fork eligibility eagerly and produce the one-shot seed. This is
-    // a pure decision (source-session lookup over the already-loaded
-    // `instances`, plus `terminal_fork_seed`, which only consults the agent's
-    // static fork strategy), so it is safe to run before resource creation.
+    // Resolve the parent conversation before provisioning.
     let fork_seed: Option<crate::session::ForkSeed> = if let Some(fork_ref) = &args.fork_from {
         let source = super::resolve_session(fork_ref, &instances)?;
         // A source that was itself created as a fork and has not launched yet
