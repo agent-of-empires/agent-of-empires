@@ -44,7 +44,7 @@ updates:
 
   # github-actions
   - package-ecosystem: "github-actions"
-    directory: "/"
+    directories: ["/", "/.github/actions/*"]
     schedule:
       interval: "weekly"
       day: "monday"

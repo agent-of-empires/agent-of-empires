@@ -195,7 +195,7 @@ jobs:
           set -euo pipefail
           python3 scripts/check-nix-embedded-assets.py --self-test
           python3 scripts/check-nix-embedded-assets.py
-      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
+      - uses: ./.github/actions/install-nix
       - name: Evaluate flake outputs (all systems)
         run: |
           set -euo pipefail
@@ -301,7 +301,7 @@ jobs:
             echo "relevant=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
+      - uses: ./.github/actions/install-nix
         if: steps.changes.outputs.relevant == 'true'
 
       - name: Build default package
@@ -349,7 +349,7 @@ jobs:
             echo "relevant=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
+      - uses: ./.github/actions/install-nix
         if: steps.changes.outputs.relevant == 'true'
 
       - name: Build aoe-web-frontend

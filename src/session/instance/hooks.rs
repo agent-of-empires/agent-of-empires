@@ -596,11 +596,63 @@ impl Instance {
         ) {
             Ok(()) => true,
             Err(error) => {
-                tracing::warn!(target: "session.store", "Failed to install agent hooks: {}", error);
+                if is_read_only_filesystem(&error) {
+                    match first_read_only_report(&settings_path) {
+                        Some(target) if target != settings_path => {
+                            tracing::warn!(target: "session.store",
+                                "Agent settings at {} resolve to {}, which is on a read-only filesystem, so AoE status hooks cannot be installed there; not reported again for that target while this process runs.",
+                                settings_path.display(), target.display());
+                        }
+                        Some(_) => {
+                            tracing::warn!(target: "session.store",
+                                "Agent settings at {} are on a read-only filesystem, so AoE status hooks cannot be installed there; not reported again for that file while this process runs.",
+                                settings_path.display());
+                        }
+                        None => {
+                            tracing::debug!(target: "session.store",
+                                "Agent settings at {} are still read-only; hook install skipped again.",
+                                settings_path.display());
+                        }
+                    }
+                } else {
+                    tracing::warn!(target: "session.store", "Failed to install agent hooks: {}", error);
+                }
                 false
             }
         }
     }
+}
+
+/// Resolved settings targets already warned about as read-only. Entries live
+/// for the process, so a target that turns writable and later read-only again
+/// is only logged at debug.
+static READ_ONLY_SETTINGS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+fn is_read_only_filesystem(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|io| io.kind() == std::io::ErrorKind::ReadOnlyFilesystem)
+}
+
+/// The resolved target to report, or `None` when it has already been reported.
+/// Keyed on the target, so a replaced symlink reports once for its new file. A
+/// missing file resolves through its parent directory.
+fn first_read_only_report(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let key = std::fs::canonicalize(path).unwrap_or_else(|_| {
+        path.parent()
+            .and_then(|parent| std::fs::canonicalize(parent).ok())
+            .zip(path.file_name())
+            .map(|(parent, file_name)| parent.join(file_name))
+            .unwrap_or_else(|| path.to_path_buf())
+    });
+    READ_ONLY_SETTINGS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key.clone())
+        .then_some(key)
 }
 
 #[cfg(test)]
@@ -623,6 +675,93 @@ mod tests {
             state.has_acknowledged_agent_hooks = true;
         })
         .unwrap();
+    }
+
+    #[test]
+    fn read_only_settings_are_reported_once_per_target() {
+        let cases = [
+            (
+                anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::ReadOnlyFilesystem)),
+                true,
+            ),
+            (
+                anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                false,
+            ),
+            (anyhow::anyhow!("hooks key is not a JSON object"), false),
+        ];
+        for (error, want) in &cases {
+            assert_eq!(is_read_only_filesystem(error), *want, "{error}");
+        }
+
+        // Per target, so one unwritable settings file does not silence the
+        // report for another, and two paths onto one target report once.
+        let dir = tempfile::tempdir().unwrap();
+        let one = dir.path().join("one.json");
+        let two = dir.path().join("two.json");
+        std::fs::write(&one, "{}").unwrap();
+        std::fs::write(&two, "{}").unwrap();
+        assert!(first_read_only_report(&one).is_some());
+        assert!(first_read_only_report(&one).is_none());
+        assert!(first_read_only_report(&two).is_some());
+
+        #[cfg(unix)]
+        {
+            let target = dir.path().join("shared.json");
+            std::fs::write(&target, "{}").unwrap();
+            let link = dir.path().join("link.json");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let reported = first_read_only_report(&target).expect("first report names the target");
+            assert_eq!(reported, std::fs::canonicalize(&target).unwrap());
+            assert!(
+                first_read_only_report(&link).is_none(),
+                "a symlink onto an already-reported target must not report again"
+            );
+
+            let real = dir.path().join("real");
+            std::fs::create_dir(&real).unwrap();
+            let alias = dir.path().join("alias");
+            std::os::unix::fs::symlink(&real, &alias).unwrap();
+            let reported = first_read_only_report(&real.join("absent.json"))
+                .expect("first report for a missing file");
+            assert_eq!(
+                reported,
+                std::fs::canonicalize(&real).unwrap().join("absent.json")
+            );
+            assert!(
+                first_read_only_report(&alias.join("absent.json")).is_none(),
+                "a missing file reached through a symlinked parent shares its target"
+            );
+        }
+    }
+
+    /// The cases above build their own errors, so they cannot show that a real
+    /// `install_hooks` failure carries a downcastable `io::Error` at all, which
+    /// is what the classification rests on. A genuinely read-only filesystem is
+    /// not portable to make, so this drives a failure any machine can produce
+    /// and asserts the chain is reachable and classified as not read-only.
+    #[test]
+    fn a_real_install_hooks_error_keeps_its_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings.json");
+        // A directory where the settings file belongs: `install_hooks` reads it
+        // before writing, so the error comes from the real path.
+        std::fs::create_dir(&settings).unwrap();
+
+        let error = crate::hooks::install_hooks(
+            &settings,
+            &[] as &[crate::agents::ResolvedHookEvent],
+            crate::hooks::HookInstallTarget::Host,
+        )
+        .expect_err("reading a directory as settings must fail");
+
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.downcast_ref::<std::io::Error>().is_some()),
+            "install_hooks must keep an io::Error in its chain: {error:?}"
+        );
+        assert!(!is_read_only_filesystem(&error), "{error:?}");
     }
 
     #[test]

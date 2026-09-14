@@ -109,12 +109,10 @@ impl SessionSandbox {
     }
 }
 
-/// Result of constructing the `docker exec` argv for a sandboxed structured view
-/// spawn. `docker_binary` is argv[0] (the docker/podman runtime);
-/// `docker_args` is everything after it (including the container name
-/// and the in-container agent argv). `inherit_env` is the set of
-/// (key, value) pairs the parent process must export so docker can
-/// forward them via the matching `-e KEY` flags already in `docker_args`.
+/// `docker exec` arguments for a sandboxed structured view spawn.
+/// `docker_binary` is `argv[0]` (docker/podman); `docker_args` contains the
+/// remaining arguments. Export `inherit_env` so the `-e KEY` flags in
+/// `docker_args` forward those values into the container.
 pub(super) struct SandboxArgv {
     pub(super) docker_binary: String,
     pub(super) docker_args: Vec<String>,
@@ -319,7 +317,7 @@ mod tests {
     /// Sandboxed structured view spawn must wrap the agent command in
     /// `docker exec` argv with `-i`, the container workdir, an `-e`
     /// flag per env entry, then the container name, then the agent
-    /// argv. The docker binary must be argv[0]. Mirrors the tmux
+    /// argv. The docker binary must be `argv[0]`. Mirrors the tmux
     /// view's wrap so the same `claude-agent-acp` invocation
     /// goes inside the container instead of running on the host.
     #[test]

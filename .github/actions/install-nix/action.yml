@@ -1,0 +1,44 @@
+name: Install Nix
+description: >
+  Runs nix-quick-install-action from an archive downloaded with `curl --fail`
+  and checked against its release digest. The action itself pipes `curl -sL`
+  into unzstd, so an HTTP error body surfaces as "zstd: unsupported format".
+
+runs:
+  using: composite
+  steps:
+    - name: Fetch and verify Nix archive
+      id: archive
+      shell: bash
+      env:
+        # Bump RELEASE, NIX_VERSION and the digests together with the action pin below.
+        RELEASE: v35
+        NIX_VERSION: 2.34.7
+      run: |
+        set -euo pipefail
+        case "$RUNNER_OS-$RUNNER_ARCH" in
+          Linux-X64) sys=x86_64-linux; sha=f1e5d42c9cf1494a2bd020e42bf5345cc25168f9ec3ced3ed77e6b688c66054a ;;
+          Linux-ARM64) sys=aarch64-linux; sha=fdaf238ebde0336f24f892c0bf9730e7d92dfa4e91b589ddeb62955715d9a112 ;;
+          macOS-X64) sys=x86_64-darwin; sha=cca9f25575473c09a30fc6d763700f598f5d833ede00152ca15787a5bd6ff723 ;;
+          macOS-ARM64) sys=aarch64-darwin; sha=6fb35fca1628a455f835bf65a3b5ef7999c9e4094494307ca15da649fb6aa264 ;;
+          *) echo "::error::No Nix archive for $RUNNER_OS-$RUNNER_ARCH"; exit 1 ;;
+        esac
+        dir="$RUNNER_TEMP/nix-archives"
+        file="$dir/nix-$NIX_VERSION-$sys.tar.zstd"
+        mkdir -p "$dir"
+        curl --fail --silent --show-error --location --retry 5 --retry-all-errors \
+          --output "$file" \
+          "https://github.com/nixbuild/nix-quick-install-action/releases/download/$RELEASE/nix-$NIX_VERSION-$sys.tar.zstd"
+        if ! echo "$sha  $file" | shasum -a 256 --check --status; then
+          echo "::error::Checksum mismatch for $file"
+          exit 1
+        fi
+        {
+          echo "url=file://$dir"
+          echo "version=$NIX_VERSION"
+        } >> "$GITHUB_OUTPUT"
+
+    - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
+      with:
+        nix_version: ${{ steps.archive.outputs.version }}
+        nix_archives_url: ${{ steps.archive.outputs.url }}

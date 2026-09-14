@@ -152,29 +152,20 @@ pub struct LoginManager {
 /// a passphrase change across restarts even though two hashes of the
 /// same passphrase never compare byte-equal. See #1235.
 fn hash_passphrase(passphrase: &str) -> String {
-    use argon2::password_hash::SaltString;
     use argon2::{Argon2, PasswordHasher};
-    use rand::RngExt;
 
-    let mut salt_bytes = [0u8; 16];
-    rand::rng().fill(&mut salt_bytes);
-    let salt = SaltString::encode_b64(&salt_bytes).expect("salt encoding must succeed");
     Argon2::default()
-        .hash_password(passphrase.as_bytes(), &salt)
+        .hash_password(passphrase.as_bytes())
         .expect("argon2 hashing must not fail")
         .to_string()
 }
 
 /// Verify a passphrase against a stored argon2 PHC hash string.
 fn argon2_verify(passphrase: &str, hash: &str) -> bool {
-    use argon2::password_hash::PasswordHash;
     use argon2::{Argon2, PasswordVerifier};
 
-    let Ok(parsed) = PasswordHash::new(hash) else {
-        return false;
-    };
     Argon2::default()
-        .verify_password(passphrase.as_bytes(), &parsed)
+        .verify_password(passphrase.as_bytes(), hash)
         .is_ok()
 }
 
@@ -1484,6 +1475,14 @@ mod tests {
     fn verify_empty_passphrase() {
         let mgr = LoginManager::new(Some("my_secret"));
         assert!(!mgr.verify_passphrase(""));
+    }
+
+    #[test]
+    fn verify_accepts_hash_from_argon2_0_5() {
+        // Produced by argon2 0.5.3; persisted session stores hold hashes in this form.
+        let hash = "$argon2id$v=19$m=19456,t=2,p=1$YW9lLWZpeGVkLXNhbHQxNg$DsLn90oHo6VdenuubImBcuPgEWcMMEPqYxc8jPxJZcY";
+        assert!(argon2_verify("hunter2", hash));
+        assert!(!argon2_verify("hunter3", hash));
     }
 
     #[test]

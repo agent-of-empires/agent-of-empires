@@ -1,8 +1,8 @@
-//! Migration v004: Merge environment_values into environment
+//! Migration v004: Merge `environment_values` into `environment`.
 //!
-//! Previously: [sandbox] environment = ["TERM", ...] (pass-through keys)
-//!             [sandbox] environment_values = { GH_TOKEN = "$GH_TOKEN" } (explicit KEY=VALUE)
-//! After:      [sandbox] environment = ["TERM", ..., "GH_TOKEN=$GH_TOKEN"] (unified list)
+//! In `[sandbox]`, combine pass-through `environment = ["TERM", ...]` keys
+//! and explicit `environment_values = { GH_TOKEN = "$GH_TOKEN" }` entries
+//! into `environment = ["TERM", ..., "GH_TOKEN=$GH_TOKEN"]`.
 //!
 //! Entries in the unified list follow the convention:
 //! - `KEY` (no `=`) = pass through host value

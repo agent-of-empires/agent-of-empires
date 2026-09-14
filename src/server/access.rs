@@ -316,14 +316,11 @@ pub(super) async fn access_policy(
 }
 
 /// Mutating routes (POST/PUT/PATCH/DELETE) reachable in CityHall client mode.
-/// Entries are `(method, matched-path template)`. `cityhall_gate` refuses any
-/// mutating request whose `(method, template)` is not listed here, BEFORE the
-/// handler runs, so reachability is default-deny: a new mutating route is closed
-/// until deliberately classified (in this table or [`CITYHALL_MUTATION_DENY`]).
-/// This replaces the previous per-handler deny-list as the enforcement boundary;
-/// the handlers keep their `cityhall_block*` calls as defense in depth. Reads
-/// (GET/HEAD) pass the gate; the few sensitive ones keep their per-handler
-/// guard. See #7.
+/// Entries are `(method, matched-path template)`. `cityhall_gate` denies unlisted
+/// mutations before handlers run. Tests require classification here or in the
+/// test-only `CITYHALL_MUTATION_DENY` table. Handlers retain their `cityhall_block*`
+/// guards as defense in depth. Reads (GET/HEAD) pass the gate but retain guards
+/// where sensitive. See #7.
 pub(super) const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
     // Session creation (server-derived) + lifecycle / metadata on the structured
     // sessions this mode owns; each handler re-checks the target is structured.

@@ -3,8 +3,7 @@
 use super::*;
 
 impl Instance {
-    /// [`flush_pi_sidecar_conversation`] against this session's own storage,
-    /// for teardown paths that hold no handle.
+    /// Call [`Self::flush_pi_sidecar_conversation`] using this session's storage.
     pub(super) fn flush_pi_sidecar_if_published(&mut self) {
         if self.source_capture_backend() != Some(crate::agents::SessionCaptureBackend::Pi) {
             return;

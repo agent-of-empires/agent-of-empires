@@ -1,11 +1,6 @@
-//! Migration v003: Move yolo_mode_default from [sandbox] to [session]
+//! Migration v003: Move `yolo_mode_default` from `[sandbox]` to `[session]`.
 //!
-//! Previously: [sandbox] yolo_mode_default = true
-//! After:      [session] yolo_mode_default = true
-//!
-//! This migration reads all config files (global + profiles) and moves
-//! the yolo_mode_default setting from the sandbox section to the session section.
-//! Without this, users who had yolo_mode_default enabled would silently lose the setting.
+//! Applies to global and profile configs, preserving the existing value.
 
 use anyhow::Result;
 use std::fs;

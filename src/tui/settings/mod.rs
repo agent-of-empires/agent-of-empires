@@ -209,9 +209,8 @@ pub struct SettingsView {
     /// next frame will actually paint.
     pub(super) fields_content_width: u16,
 
-    /// Whether there are unsaved changes. Recomputed on every edit by diffing
-    /// the live configs against [`Self::baseline_*`], so reverting a field back
-    /// to its saved value clears the flag rather than latching it (issue #2083).
+    /// Unsaved changes, recomputed against the saved `baseline_*` snapshots
+    /// so reverting an edit clears the flag instead of latching it.
     pub(super) has_changes: bool,
 
     /// Serialized snapshots of the editable configs as of the last load or
