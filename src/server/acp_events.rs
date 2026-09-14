@@ -782,17 +782,12 @@ pub(super) fn apply_acp_session_change(
     session_id: &str,
     change: Option<&AcpSessionChange>,
 ) -> Option<String> {
+    if !inst.is_structured() {
+        return None;
+    }
     match change? {
         AcpSessionChange::Assigned(new_id) => {
-            // A worker just initialized (session/new or session/load), so the
-            // session is by definition no longer idle-dormant. Clear any
-            // marker now: a stale one left by a non-user respawn (e.g. the
-            // build-stale respawn #1754, which brings the worker back without
-            // a user wake) otherwise makes the reconciler's
-            // `!is_idle_dormant()` resume filter refuse to bring the session
-            // back after this worker later dies, deadlocking a queued prompt
-            // that the client parked waiting for a worker that never returns.
-            // See #2237.
+            // A live worker must not retain an idle-dormant marker.
             let cleared_stale_dormant = inst.idle_dormant_since.take().is_some();
             let same_acp_session = inst.acp_session_id.as_deref() == Some(new_id.as_str());
             // #2276: clear import_pending only when the assigned id matches the
@@ -1581,14 +1576,27 @@ mod tests {
         assert_eq!(row.status, Status::Idle, "the Stopped applied");
     }
 
-    // #2237: a worker coming live (AcpSessionAssigned) must clear a stale
-    // idle-dormant marker, even when the acp_session_id is unchanged (a
-    // session/load reattach reuses it). Without this, a stale marker left by a
-    // non-user respawn keeps the reconciler's resume filter skipping the
-    // session forever once the worker dies, deadlocking a queued prompt.
+    #[test]
+    fn acp_session_changes_do_not_resurrect_terminal_state() {
+        let mut inst = Instance::new("terminal", "/tmp/terminal");
+        inst.view = crate::session::View::Terminal;
+        inst.resume_intent = crate::session::ResumeIntent::Use("native-id".into());
+        let expected = inst.conversation_state();
+        for change in [
+            AcpSessionChange::Assigned("late-id".into()),
+            AcpSessionChange::Reset("late reset".into()),
+            AcpSessionChange::Cleared,
+        ] {
+            assert!(apply_acp_session_change(&mut inst, "terminal", Some(&change)).is_none());
+            assert_eq!(inst.acp_session_id, None);
+            assert!(expected.matches(&inst));
+        }
+    }
+
     #[test]
     fn acp_session_assigned_clears_stale_dormant_marker_on_same_id() {
         let mut inst = Instance::new("seed", "/tmp/seed");
+        inst.view = crate::session::View::Structured;
         inst.acp_session_id = Some("sid-1".to_string());
         inst.idle_dormant_since = Some(chrono::Utc::now());
 
@@ -1650,6 +1658,7 @@ mod tests {
     #[test]
     fn non_fork_assignment_preserves_import_pending() {
         let mut inst = Instance::new("seed", "/tmp/seed");
+        inst.view = crate::session::View::Structured;
         inst.acp_session_id = None;
         inst.fork_pending = None;
         inst.import_pending = Some(true);
@@ -1710,6 +1719,7 @@ mod tests {
     #[test]
     fn reset_without_fork_pending_preserves_import_pending() {
         let mut inst = Instance::new("seed", "/tmp/seed");
+        inst.view = crate::session::View::Structured;
         inst.acp_session_id = Some("dead-id".into());
         inst.fork_pending = None;
         inst.import_pending = Some(true);
@@ -1732,6 +1742,7 @@ mod tests {
     #[test]
     fn acp_session_assigned_same_id_no_marker_is_noop() {
         let mut inst = Instance::new("seed", "/tmp/seed");
+        inst.view = crate::session::View::Structured;
         inst.acp_session_id = Some("sid-1".to_string());
         inst.idle_dormant_since = None;
         // Same id, nothing stale to clear: must stay a no-op (no rewrite).

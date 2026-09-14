@@ -2285,7 +2285,11 @@ pub async fn acp_disable(
         let profile = inst.source_profile.clone();
         (inst, profile)
     };
-
+    let memory_expected = (
+        instance.view,
+        instance.acp_session_id.clone(),
+        instance.conversation_state(),
+    );
     if !instance.is_structured() {
         // A reload may have installed a pre-enable terminal snapshot in the
         // cache. Confirm the durable row before taking the idempotent path, or
@@ -2339,7 +2343,11 @@ pub async fn acp_disable(
     // The idempotent already-terminal case returned above; commit the real
     // ACP-to-terminal transition before worker teardown.
 
-    let expected_conversation = instance.conversation_state();
+    let disk_expected = (
+        instance.view,
+        instance.acp_session_id.clone(),
+        instance.conversation_state(),
+    );
     // Only adapters sharing a native transcript can request a terminal handoff.
     let acp_agent = state
         .acp_supervisor
@@ -2381,30 +2389,39 @@ pub async fn acp_disable(
         }
     }
 
-    // Persist + start tmux. start() now no longer short-circuits for
-    // structured_view, so it will create a fresh tmux session and run
-    // the agent CLI in the pane.
-    //
-    // Persist the fields this handler owns before mirroring them into memory.
-    // The epoch bump under the instances lock rejects any reload whose disk
-    // snapshot predates this view transition.
+    // Serialize durable handoff and cache publication against ACP identity events.
     let persist_acp_session_id = instance.acp_session_id.clone();
     let persist_import_pending = instance.import_pending;
     let persist_conversation = instance.conversation_state();
     let disk_acp_session_id = persist_acp_session_id.clone();
     let disk_import_pending = persist_import_pending;
     let disk_conversation = persist_conversation.clone();
-    let disk_expected = expected_conversation.clone();
     let id_for_save = id.clone();
     let profile_for_save = profile.clone();
     let file_watch_for_save = state.file_watch.clone();
+    let mut instances = state.instances.write().await;
+    let Some(slot) = instances.iter_mut().find(|row| row.id == id) else {
+        return (StatusCode::NOT_FOUND, "session not found").into_response();
+    };
+    if slot.view != memory_expected.0
+        || slot.acp_session_id != memory_expected.1
+        || (keep_context && !memory_expected.2.matches(slot))
+    {
+        return (
+            StatusCode::CONFLICT,
+            "ACP identity changed during terminal handoff; retry",
+        )
+            .into_response();
+    }
     let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let storage = crate::session::Storage::new(&profile_for_save, file_watch_for_save)?;
         storage.update(|all, _groups| {
             if let Some(slot) = all.iter_mut().find(|candidate| candidate.id == id_for_save) {
                 anyhow::ensure!(
-                    !keep_context || disk_expected.matches(slot),
-                    "conversation changed during terminal handoff; retry"
+                    slot.view == disk_expected.0
+                        && slot.acp_session_id == disk_expected.1
+                        && (!keep_context || disk_expected.2.matches(slot)),
+                    "ACP identity changed during terminal handoff; retry"
                 );
                 slot.view = crate::session::View::Terminal;
                 slot.acp_session_id = disk_acp_session_id.clone();
@@ -2412,6 +2429,8 @@ pub async fn acp_disable(
                 if keep_context {
                     slot.adopt_conversation_state(disk_conversation.clone());
                 }
+            } else {
+                anyhow::bail!("session disappeared during terminal handoff");
             }
             Ok(())
         })?;
@@ -2435,34 +2454,18 @@ pub async fn acp_disable(
                 .into_response();
         }
     }
-    {
-        let mut instances = state.instances.write().await;
-        if let Some(slot) = instances.iter_mut().find(|i| i.id == id) {
-            if keep_context && !expected_conversation.matches(slot) {
-                return (
-                    StatusCode::CONFLICT,
-                    "conversation changed during terminal handoff; reload before retrying",
-                )
-                    .into_response();
-            }
-            slot.view = crate::session::View::Terminal;
-            slot.acp_load_session_capable = None;
-            slot.acp_session_id = persist_acp_session_id;
-            slot.import_pending = persist_import_pending;
-            if keep_context {
-                slot.adopt_conversation_state(persist_conversation);
-            }
-            state
-                .mutation_epoch
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
+    slot.view = crate::session::View::Terminal;
+    slot.acp_load_session_capable = None;
+    slot.acp_session_id = persist_acp_session_id;
+    slot.import_pending = persist_import_pending;
+    if keep_context {
+        slot.adopt_conversation_state(persist_conversation);
     }
-
-    // Commit the desired view before removing the worker. Supervisor shutdown
-    // removes its worker entry before transport teardown completes; leaving the
-    // row structured in that window lets the reconciler spawn a replacement.
-    // `shutdown` preserves the transcript for the resumable path, while
-    // `shutdown_and_delete` releases it for the destructive path.
+    state
+        .mutation_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    drop(instances);
+    // Publish the terminal view before worker removal so reconciliation cannot respawn ACP.
     let shutdown_result = if keep_context {
         state.acp_supervisor.shutdown(&id).await
     } else {
@@ -4058,16 +4061,14 @@ mod tests {
         );
     }
 
-    /// The ACP-side half of the #3650 worker-stopping barrier. `shutdown_acp`,
-    /// `switch_acp_agent` and `acp_disable` all tear the worker down, so a
-    /// queue drain mid-delivery must finish first: `send_turn` respawns a
-    /// worker it finds gone, which would undo the shutdown and, for the
-    /// switch, deliver the prompt to the agent the user just switched away
-    /// from.
+    /// Worker teardown must wait until the in-flight submission releases ownership.
     #[tokio::test]
+    #[serial_test::serial]
     async fn worker_stopping_acp_endpoints_wait_for_an_in_flight_submission() {
         use std::time::Duration;
-
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let storage = crate::session::Storage::new_unwatched("acp-barrier").unwrap();
         async fn call(which: &str, state: Arc<AppState>, id: String) -> axum::response::Response {
             match which {
                 "shutdown" => shutdown_acp(State(state), Path(id)).await.into_response(),
@@ -4088,12 +4089,24 @@ mod tests {
         }
 
         for which in ["shutdown", "switch", "disable"] {
-            let mut inst = crate::session::Instance::new("acp-3650", "/tmp/aoe-3650-acp");
+            let mut inst = crate::session::Instance::new(
+                "acp-3650",
+                temp.path().join("missing-project").to_str().unwrap(),
+            );
+            inst.source_profile = "acp-barrier".into();
             inst.id = format!("sess-3650-acp-{which}");
             inst.view = crate::session::View::Structured;
             inst.status = crate::session::Status::Idle;
             inst.acp_load_session_capable = Some(true);
             let id = inst.id.clone();
+            if which == "disable" {
+                storage
+                    .update(|rows, _| {
+                        rows.push(inst.clone());
+                        Ok(())
+                    })
+                    .unwrap();
+            }
             let state = crate::server::test_support::build_test_app_state(vec![inst]);
 
             let delivering = state.session_service.prompt_submission(&id).await;
@@ -4110,11 +4123,12 @@ mod tests {
             );
 
             drop(delivering);
-            tokio::time::timeout(Duration::from_secs(10), handler)
+            let response = tokio::time::timeout(Duration::from_secs(10), handler)
                 .await
                 .unwrap_or_else(|_| panic!("{which} must finish once the submission releases"))
                 .unwrap_or_else(|e| panic!("{which} task must not panic: {e}"));
             if which == "disable" {
+                assert_eq!(response.status(), StatusCode::OK);
                 assert_eq!(
                     state
                         .instances
@@ -4154,6 +4168,57 @@ mod tests {
         let adopted = adopt_persisted_structured_instance(cached, persisted, "work");
 
         assert_eq!(adopted.effective_profile(), "work");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn terminal_handoff_rejects_an_acp_identity_changed_on_disk() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
+        let _path = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "claude",
+            "#!/bin/sh\nexit 1\n",
+        );
+        let _home = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path().to_path_buf()),
+            ("CLAUDE_CONFIG_DIR", temp.path().join(".claude")),
+        ]);
+        let profile = "handoff-cas";
+        let sid = "11111111-1111-4111-8111-111111111111";
+        let storage = crate::session::Storage::new_unwatched(profile).unwrap();
+        for changed in [Some("22222222-2222-4222-8222-222222222222"), None] {
+            let mut inst = crate::session::Instance::new("handoff", temp.path().to_str().unwrap());
+            inst.source_profile = profile.into();
+            inst.tool = "claude".into();
+            inst.command = "claude".into();
+            inst.agent_name = Some("claude-agent-acp".into());
+            inst.resume_binding = Some(inst.asserted_resume_binding(sid, None).unwrap());
+            inst.resume_intent = crate::session::ResumeIntent::Use(sid.into());
+            inst.view = crate::session::View::Structured;
+            inst.acp_session_id = Some(sid.into());
+            let id = inst.id.clone();
+            let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
+            inst.acp_session_id = changed.map(str::to_owned);
+            storage
+                .update(|rows, _| {
+                    *rows = vec![inst.clone()];
+                    Ok(())
+                })
+                .unwrap();
+            let response = acp_disable(State(state.clone()), Path(id.clone()))
+                .await
+                .into_response();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let rows = storage.load().unwrap();
+            let row = rows.iter().find(|row| row.id == id).unwrap();
+            assert_eq!(row.view, crate::session::View::Structured);
+            assert_eq!(row.acp_session_id.as_deref(), changed);
+            assert_eq!(
+                state.instances.read().await[0].view,
+                crate::session::View::Structured
+            );
+        }
     }
 
     #[tokio::test]
