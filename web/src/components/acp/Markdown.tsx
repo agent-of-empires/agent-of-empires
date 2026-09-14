@@ -239,9 +239,10 @@ function ShikiSyntaxHighlighter({ language, code }: SyntaxHighlighterProps) {
           appearance: shiki.appearance,
         });
         if (cancelled) return;
-        if (out) setHtml(out);
+        setHtml(out);
       } catch {
         // Unknown lang → fall through to plain rendering.
+        if (!cancelled) setHtml(null);
       }
     })();
     return () => {

@@ -681,9 +681,10 @@ function HighlightedBlock({ text, language, maxLines = 20 }: { text: string; lan
           appearance: shiki.appearance,
         });
         if (cancelled) return;
-        if (out) setHtml(out);
+        setHtml(out);
       } catch {
         // unknown language; fall back to plain
+        if (!cancelled) setHtml(null);
       }
     })();
     return () => {
