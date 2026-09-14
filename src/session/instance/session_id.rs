@@ -232,6 +232,10 @@ impl Instance {
         if !self.launch_invokes_resolved_agent_directly(agent) {
             return None;
         }
+        self.prime_agent_launch_options()
+    }
+
+    fn prime_agent_launch_options(&self) -> Option<PrimeAgentLaunchOptions> {
         let parsed = super::launch_command::parse_launch_command(self.get_tool_command())?;
         let mut words = parsed.words;
         words.extend(shell_words::split(&self.extra_args).ok()?);
@@ -305,8 +309,8 @@ impl Instance {
             .host_path(&root, true)
             .context("Prime store is not mounted from a writable local filesystem")?;
         let mut options = self
-            .prime_agent_capture_options()
-            .context("Prime launch options do not support managed conversation capture")?;
+            .prime_agent_launch_options()
+            .context("Prime launch options do not support a managed conversation")?;
         if let Some(cwd) = options.cwd.as_deref() {
             let cwd = resolve_prime_agent_path(cwd, &inputs.cwd);
             options.cwd = Some(
@@ -2206,6 +2210,71 @@ mod tests {
         });
         assert!(inst.prime_agent_capture_plan_with(&config, store).is_none());
     }
+    #[test]
+    #[serial_test::serial]
+    fn prime_explicit_resume_separates_namespace_from_capture() {
+        if which::which("node").is_err() {
+            return;
+        }
+        let mut failures = Vec::new();
+        for (command, args, suffix) in [
+            ("prime-agent", "--cwd /workspace/project/sub", "sub"),
+            ("my-prime", "", ""),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
+            let project = tmp.path().join("project");
+            std::fs::create_dir_all(project.join("sub")).unwrap();
+            let profile = "prime-wrapper-resume";
+            declare_execution_aliases(profile, &[("prime-agent", "prime-agent")], tmp.path());
+            let mut inst = Instance::new("prime-wrapper", project.to_str().unwrap());
+            inst.source_profile = profile.into();
+            inst.tool = "prime-agent".into();
+            inst.command = command.into();
+            inst.extra_args = args.into();
+            inst.sandbox_info = Some(SandboxInfo {
+                enabled: true,
+                container_id: None,
+                image: "test-image".into(),
+                container_name: "prime-wrapper".into(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                container_workdir: Some("/workspace/project".into()),
+            });
+            let _transport = install_container_transport(
+                tmp.path(),
+                "prime-wrapper",
+                &inst.build_container_config().unwrap().volumes,
+            );
+            std::fs::copy(
+                tmp.path().join("native-bin/prime-agent"),
+                tmp.path().join("native-bin/my-prime"),
+            )
+            .unwrap();
+            let sid = "018f47a6-7b80-7cc3-98a2-37b5f486b2a1";
+            let binding = match inst.asserted_resume_binding(sid, None) {
+                Ok(binding) => binding,
+                Err(error) => {
+                    failures.push(format!("{command} {args}: {error:#}"));
+                    continue;
+                }
+            };
+            assert_eq!(
+                binding.execution.as_ref().unwrap().cwd,
+                project.join(suffix).canonicalize().unwrap()
+            );
+            inst.resume_intent = ResumeIntent::Use(sid.into());
+            inst.resume_binding = Some(binding);
+            let prepared = inst
+                .prepare_launch_command(inst.conversation_state())
+                .unwrap();
+            let command = prepared.command.unwrap();
+            assert!(command.contains(&format!("--resume {sid}")), "{command}");
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
     #[test]
     #[serial_test::serial]
     fn prime_unmaterialized_root_never_resumes_previous_history() {

@@ -945,7 +945,7 @@ impl Instance {
             roots = vec![context.layout.sessions.clone()];
             configuration.push(context.agent_dir.clone());
             routing = context.launcher_routing.clone();
-            direct_capture.then_some(context)
+            Some(context)
         } else {
             None
         };
@@ -1065,7 +1065,7 @@ impl Instance {
                 filesystem: filesystem.context("native conversation store is unavailable")?,
             },
             routing,
-            omp,
+            omp: omp.filter(|_| direct_capture),
             inputs,
             program,
             capture,
@@ -1175,6 +1175,23 @@ pub(super) fn validate_managed_arguments(
                 ],
                 &["--yolo", "--dangerously-skip-permissions"],
             ),
+            "prime-agent" => (
+                &[
+                    "--model",
+                    "-m",
+                    "--system-prompt",
+                    "--append-system-prompt",
+                    "--agent",
+                    "--session-dir",
+                    "--cwd",
+                ],
+                &[
+                    "--yolo",
+                    "--dangerously-skip-permissions",
+                    "--allow-all-tools",
+                    "--trust-all-tools",
+                ],
+            ),
             _ => (
                 &[
                     "--model",
@@ -1193,6 +1210,12 @@ pub(super) fn validate_managed_arguments(
             ),
         };
         if values.contains(&key) {
+            anyhow::ensure!(
+                agent.name != "prime-agent"
+                    || !matches!(key, "--cwd" | "--session-dir")
+                    || inline.is_none(),
+                "Prime namespace options require a separate value"
+            );
             let value = if let Some(value) = inline {
                 value
             } else {

@@ -554,9 +554,11 @@ fn declared_omp_wrapper_can_resume_without_gaining_automatic_capture() {
     require_tmux!();
     let mut h = new_harness("omp_wrapper_capture_boundary");
     let project = h.project_path();
+    let effective = h.home_path().join("effective");
+    fs::create_dir_all(&effective).unwrap();
     let store = h.home_path().join("wrapper-store");
     fs::create_dir_all(&store).unwrap();
-    let control = install_toggling_fake_omp(&mut h, &project, &store);
+    let control = install_toggling_fake_omp(&mut h, &effective, &store);
     let bin = h.install_path_command("my-omp");
     let recorded = control.join("argv");
     fs::write(
@@ -573,7 +575,8 @@ fn declared_omp_wrapper_can_resume_without_gaining_automatic_capture() {
         .unwrap_or_default()
         .parse::<toml_edit::DocumentMut>()
         .unwrap();
-    doc["session"]["custom_agents"]["my-omp"] = toml_edit::value("my-omp");
+    doc["session"]["custom_agents"]["my-omp"] =
+        toml_edit::value(format!("my-omp --cwd {}", sh_quote(&effective)));
     doc["session"]["agent_execution_as"]["my-omp"] = toml_edit::value("omp");
     doc["session"]["agent_config_dir"]["my-omp"] = toml_edit::value(store.to_str().unwrap());
     fs::write(config, doc.to_string()).unwrap();
@@ -629,6 +632,18 @@ fn declared_omp_wrapper_can_resume_without_gaining_automatic_capture() {
         asserted.status.success(),
         "{}",
         String::from_utf8_lossy(&asserted.stderr)
+    );
+    let rows: Value =
+        serde_json::from_str(&fs::read_to_string(sessions_path(&h)).unwrap()).unwrap();
+    let row = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["title"] == parent)
+        .unwrap();
+    assert_eq!(
+        row["resume_binding"]["execution"]["cwd"].as_str(),
+        effective.to_str()
     );
     let restart = h.run_cli(&["session", "restart", parent]);
     assert!(
