@@ -100,8 +100,8 @@ fn discard_stale_sandbox_container(instance: &Instance, discard: bool) -> Result
         Teardown::AlreadyGone => Ok(()),
         Teardown::Failed(e) => Err(format!(
             "failed to remove sandbox container {} built for the previous tool; remove it \
-             (`docker rm -f {}`) before restarting, or the new tool reuses its config: {e}",
-            container.name, container.name
+             before restarting, or the new tool reuses its config: {e}",
+            container.name
         )),
     }
 }

@@ -535,7 +535,7 @@ fn restart_selected_session_tool_swap_discards_sandbox_container() {
             .clone()
             .unwrap_or_default();
         assert_eq!(
-            error.contains(&format!("docker rm -f {container}")),
+            error.contains(&format!("{container} built for the previous tool")),
             removal_fails,
             "{case}: {error}"
         );
