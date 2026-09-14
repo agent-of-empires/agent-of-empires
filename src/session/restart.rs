@@ -80,12 +80,15 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
 }
 
 /// A failure fails the restart: relaunching into the old container would run
-/// the new tool against the previous tool's config store.
+/// the new tool against the previous tool's config store. The swap is already
+/// persisted, so later restarts do not retry the removal; the error names the
+/// container to remove by hand.
 fn discard_stale_sandbox_container(instance: &Instance, discard: bool) -> Result<(), String> {
     if !discard || !instance.is_sandboxed() {
         return Ok(());
     }
-    match DockerContainer::from_session_id(&instance.id).discard() {
+    let container = DockerContainer::from_session_id(&instance.id);
+    match container.discard() {
         Teardown::Removed => {
             tracing::info!(
                 target: "containers.runtime",
@@ -96,7 +99,9 @@ fn discard_stale_sandbox_container(instance: &Instance, discard: bool) -> Result
         }
         Teardown::AlreadyGone => Ok(()),
         Teardown::Failed(e) => Err(format!(
-            "failed to remove the sandbox container built for the previous tool: {e}"
+            "failed to remove sandbox container {} built for the previous tool; remove it \
+             (`docker rm -f {}`) before restarting, or the new tool reuses its config: {e}",
+            container.name, container.name
         )),
     }
 }

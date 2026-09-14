@@ -408,10 +408,7 @@ fn restart_selected_session_tool_swap_clears_old_agent_session_state() {
     assert_eq!(parked.acp_session_id.as_deref(), Some("acp-sess-1"));
 }
 
-/// A tool swap must drop the sandbox container: its agent config mounts are
-/// picked per tool at create time, and a restart reuses the container, so the
-/// new tool would run against the previous tool's store. A plain restart keeps
-/// the container (#3959).
+/// Only a tool swap removes the sandbox container, and a failed removal fails the restart (#3959).
 #[cfg(unix)]
 #[test]
 #[serial]
@@ -426,15 +423,20 @@ fn restart_selected_session_tool_swap_discards_sandbox_container() {
     let bin = env._temp.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
     let calls = env._temp.path().join("runtime-calls");
-    // Record every runtime call and fail all but removal, so the relaunch
-    // stops at the container probe instead of reaching tmux.
+    let fail_removal = env._temp.path().join("fail-removal");
+    // Record every runtime call and fail all but removal (unless the
+    // `fail_removal` file exists), so the relaunch stops at the container probe
+    // instead of reaching tmux.
     for binary in ["docker", "podman", "container"] {
         let script = bin.join(binary);
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n[ \"$1\" = rm ]\n",
-                calls.display()
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n\
+                 if [ \"$1\" = rm ] && [ ! -e '{}' ]; then exit 0; fi\n\
+                 echo 'permission denied' >&2\nexit 1\n",
+                calls.display(),
+                fail_removal.display()
             ),
         )
         .unwrap();
@@ -495,15 +497,30 @@ fn restart_selected_session_tool_swap_discards_sandbox_container() {
         }
     };
 
-    for (tool, expected_removals, case) in [
-        (None, 0, "a plain restart must reuse the container"),
+    for (tool, removal_fails, expected_removals, case) in [
+        (None, false, 0, "a plain restart must reuse the container"),
         (
             Some("claude"),
+            false,
             0,
             "restarting on the same tool is not a swap",
         ),
-        (Some("codex"), 1, "a tool swap must remove the container"),
+        (
+            Some("codex"),
+            false,
+            1,
+            "a tool swap must remove the container",
+        ),
+        (
+            Some("claude"),
+            true,
+            2,
+            "a failed removal must fail the restart",
+        ),
     ] {
+        if removal_fails {
+            std::fs::write(&fail_removal, "").unwrap();
+        }
         let calls_before = runtime_calls().len();
         restart(&mut env, tool);
         assert!(
@@ -511,6 +528,17 @@ fn restart_selected_session_tool_swap_discards_sandbox_container() {
             "{case}: the relaunch never reached the container runtime"
         );
         assert_eq!(removals(), expected_removals, "{case}");
+        let error = env
+            .view
+            .instance_at(0)
+            .last_error
+            .clone()
+            .unwrap_or_default();
+        assert_eq!(
+            error.contains(&format!("docker rm -f {container}")),
+            removal_fails,
+            "{case}: {error}"
+        );
     }
 }
 
