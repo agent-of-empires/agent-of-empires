@@ -188,8 +188,318 @@ impl NativeLaunchInputs {
             .map(Some)
             .context("native configuration is not a bounded regular file")
     }
+    fn read_native_dotenv(&self, path: &std::path::Path) -> Result<dotenv_ng_core::EnvMap> {
+        let Some(bytes) = self.read_native_file(path)? else {
+            return Ok(Default::default());
+        };
+        let contents = std::str::from_utf8(&bytes).context("native dotenv is not UTF-8")?;
+        dotenv_ng_core::EnvLoader::with_reader(contents.trim_start_matches('\u{feff}').as_bytes())
+            .sequence(dotenv_ng_core::EnvSequence::InputOnly)
+            .substitution(false)
+            .multiline(true)
+            .load()
+            .map_err(|_| anyhow::anyhow!("native dotenv cannot be resolved: {}", path.display()))
+    }
 
-    fn canonical_path(&self, path: &std::path::Path) -> Result<PathBuf> {
+    fn validate_hermes_workdir(&self, value: &str) -> Result<()> {
+        if matches!(value, "" | "." | "auto" | "cwd") {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            !value.contains('$'),
+            "Hermes terminal cwd contains unresolved interpolation"
+        );
+        let path = if value == "~" || value.starts_with("~/") {
+            let home = self
+                .environment
+                .get("HOME")
+                .context("Hermes HOME is unavailable")?;
+            std::path::Path::new(home).join(value.strip_prefix("~/").unwrap_or(""))
+        } else {
+            PathBuf::from(value)
+        };
+        anyhow::ensure!(
+            self.canonical_path(&path)? == self.cwd,
+            "Hermes terminal cwd differs from the declared launch context"
+        );
+        Ok(())
+    }
+    fn validate_vibe_namespace(
+        &self,
+        root: &std::path::Path,
+        arguments: &str,
+        yolo: bool,
+    ) -> Result<PathBuf> {
+        let store = self.canonical_path(&root.join("logs/session"))?;
+        let validate_logging = |logging: &serde_json::Value| -> Result<()> {
+            let logging = logging
+                .as_object()
+                .context("Vibe session_logging is not an object")?;
+            if let Some(path) = logging.get("save_dir") {
+                let path = path.as_str().context("Vibe save_dir is not a string")?;
+                let home = self
+                    .environment
+                    .get("HOME")
+                    .context("Vibe HOME is unavailable")?;
+                let path = if path == "~" {
+                    PathBuf::from(home)
+                } else if let Some(path) = path.strip_prefix("~/") {
+                    std::path::Path::new(home).join(path)
+                } else {
+                    PathBuf::from(path)
+                };
+                anyhow::ensure!(
+                    self.canonical_path(&path)? == store,
+                    "Vibe logging redirects the declared session store"
+                );
+            }
+            anyhow::ensure!(
+                logging
+                    .get("session_prefix")
+                    .is_none_or(|prefix| prefix.as_str() == Some("session")),
+                "Vibe session prefix differs from the declared layout"
+            );
+            Ok(())
+        };
+        let routes_namespace = |key: &str| {
+            matches!(
+                key,
+                "save_dir"
+                    | "session_prefix"
+                    | "vibe_agent_paths"
+                    | "vibe_default_agent"
+                    | "vibe_session_logging"
+                    | "vibe_session_logging__save_dir"
+                    | "vibe_session_logging__session_prefix"
+            )
+        };
+        for key in self.read_native_dotenv(&root.join(".env"))?.keys() {
+            if self
+                .environment
+                .get(key)
+                .is_some_and(|value| !value.is_empty())
+            {
+                continue;
+            }
+            anyhow::ensure!(
+                !routes_namespace(&key.to_ascii_lowercase()),
+                "Vibe dotenv routing is not represented by the declared context"
+            );
+        }
+        let mut environments = std::collections::BTreeMap::new();
+        for (key, value) in &self.environment {
+            if value.is_empty() {
+                continue;
+            }
+            let key = key.to_ascii_lowercase();
+            if routes_namespace(&key) {
+                if let Some(previous) = environments.insert(key, value) {
+                    anyhow::ensure!(
+                        previous == value,
+                        "Vibe environment has conflicting case-insensitive settings"
+                    );
+                }
+            }
+        }
+        let mut selected_profile = None;
+        let words = shell_words::split(arguments)?;
+        for (index, word) in words.iter().enumerate() {
+            if let Some(name) = word.strip_prefix("--agent=").or_else(|| {
+                (word == "--agent")
+                    .then(|| words.get(index + 1).map(String::as_str))
+                    .flatten()
+            }) {
+                selected_profile = Some(name.to_owned());
+            }
+        }
+        if yolo {
+            selected_profile = Some("auto-approve".into());
+        }
+        let use_defaults = selected_profile.is_none();
+        let mut profiles = selected_profile.into_iter().collect::<Vec<_>>();
+        if use_defaults {
+            profiles.extend(["accept-edits".into(), "smart-approve".into()]);
+            if let Some(name) = environments.get("vibe_default_agent") {
+                profiles.push((*name).clone());
+            }
+        }
+        let mut directories = vec![root.join("agents"), self.cwd.join(".vibe/agents")];
+        let mut configs = vec![root.join("config.toml")];
+        for directory in self
+            .cwd
+            .ancestors()
+            .take_while(|directory| Some(*directory) != root.parent())
+        {
+            let path = directory.join(".vibe/config.toml");
+            if self.read_native_file(&path)?.is_some() {
+                configs.push(path);
+                break;
+            }
+        }
+        for path in configs {
+            let Some(bytes) = self.read_native_file(&path)? else {
+                continue;
+            };
+            let config: toml::Value = toml::from_str(std::str::from_utf8(&bytes)?)
+                .context("Vibe configuration cannot be resolved")?;
+            if let Some(logging) = config.get("session_logging") {
+                validate_logging(&serde_json::to_value(logging)?)?;
+            }
+            if let Some(name) = config.get("default_agent").filter(|_| use_defaults) {
+                profiles.push(
+                    name.as_str()
+                        .context("Vibe default_agent is not a string")?
+                        .to_owned(),
+                );
+            }
+            if let Some(paths) = config.get("agent_paths") {
+                for path in paths
+                    .as_array()
+                    .context("Vibe agent_paths is not an array")?
+                {
+                    directories.push(PathBuf::from(
+                        path.as_str().context("Vibe agent path is not a string")?,
+                    ));
+                }
+            }
+        }
+        if let Some(paths) = environments.get("vibe_agent_paths") {
+            directories.extend(
+                serde_json::from_str::<Vec<PathBuf>>(paths)
+                    .context("Vibe agent_paths cannot be resolved")?,
+            );
+        }
+        for (key, value) in environments {
+            match key.as_str() {
+                "vibe_session_logging" => validate_logging(
+                    &serde_json::from_str(value)
+                        .context("Vibe session_logging cannot be resolved")?,
+                )?,
+                "save_dir" | "vibe_session_logging__save_dir" => {
+                    validate_logging(&serde_json::json!({"save_dir": value}))?
+                }
+                "session_prefix" | "vibe_session_logging__session_prefix" => {
+                    validate_logging(&serde_json::json!({"session_prefix": value}))?
+                }
+                _ => {}
+            }
+        }
+        let home = self
+            .environment
+            .get("HOME")
+            .context("Vibe HOME is unavailable")?;
+        for directory in &mut directories {
+            let expanded = match directory.to_str() {
+                Some("~") => PathBuf::from(home),
+                Some(path) if path.starts_with("~/") => std::path::Path::new(home).join(&path[2..]),
+                _ => std::mem::take(directory),
+            };
+            *directory = self.canonical_path(&expanded)?;
+        }
+        directories.sort_unstable();
+        directories.dedup();
+        profiles.sort_unstable();
+        profiles.dedup();
+        for name in profiles {
+            anyhow::ensure!(
+                !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\']),
+                "Vibe agent profile name is not a file stem"
+            );
+            let filename = format!("{name}.toml");
+            for directory in &directories {
+                let path = directory.join(&filename);
+                let Some(bytes) = self.read_native_file(&path)? else {
+                    continue;
+                };
+                let profile: toml::Value = toml::from_str(std::str::from_utf8(&bytes)?)
+                    .context("Vibe agent profile cannot be resolved")?;
+                if let Some(logging) = profile.get("session_logging") {
+                    validate_logging(&serde_json::to_value(logging)?)?;
+                }
+            }
+        }
+        Ok(store)
+    }
+
+    fn validate_hermes_namespace(&self, root: &std::path::Path) -> Result<()> {
+        anyhow::ensure!(
+            self.read_native_file(&root.join(".container-mode"))?
+                .is_none(),
+            "Hermes container delegation is not the declared execution context"
+        );
+        let managed = self
+            .environment
+            .get("HERMES_MANAGED_DIR")
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/etc/hermes"));
+        anyhow::ensure!(
+            managed.is_absolute(),
+            "Hermes managed directory must be absolute"
+        );
+        for name in [".env", "config.yaml"] {
+            anyhow::ensure!(
+                self.read_native_file(&managed.join(name))?.is_none(),
+                "Hermes managed configuration is not represented by the declared store"
+            );
+        }
+        for (key, value) in self
+            .environment
+            .iter()
+            .filter(|(key, _)| matches!(key.as_str(), "TERMINAL_ENV" | "TERMINAL_CWD"))
+        {
+            if key == "TERMINAL_CWD" {
+                self.validate_hermes_workdir(value)?;
+            } else {
+                anyhow::ensure!(
+                    matches!(value.as_str(), "" | "local"),
+                    "Hermes terminal backend is not local to the declared execution"
+                );
+            }
+        }
+        for name in [".env", ".op.env"] {
+            for key in self.read_native_dotenv(&root.join(name))?.keys() {
+                anyhow::ensure!(!matches!(key.as_str(), "HERMES_HOME" | "HERMES_MANAGED_DIR" | "HOME" | "TERMINAL_CWD" | "TERMINAL_ENV"),
+                    "Hermes dotenv routing override {key} is not represented by the declared context");
+            }
+        }
+        if let Some(bytes) = self.read_native_file(&root.join("config.yaml"))? {
+            let mut config: serde_yaml::Value =
+                serde_yaml::from_slice(&bytes).context("Hermes config.yaml cannot be resolved")?;
+            config
+                .apply_merge()
+                .context("Hermes YAML merges cannot be resolved")?;
+            if let Some(terminal) = config.get("terminal") {
+                if let Some(backend) = terminal.get("backend") {
+                    anyhow::ensure!(
+                        backend.as_str() == Some("local"),
+                        "Hermes terminal backend differs from the declared execution"
+                    );
+                }
+                if let Some(cwd) = terminal.get("cwd") {
+                    self.validate_hermes_workdir(
+                        cwd.as_str()
+                            .context("Hermes terminal cwd is not a string")?,
+                    )?;
+                }
+            }
+            if let Some(secrets) = config
+                .get("secrets")
+                .and_then(serde_yaml::Value::as_mapping)
+            {
+                anyhow::ensure!(
+                    !secrets.values().any(|value| value
+                        .get("enabled")
+                        .and_then(serde_yaml::Value::as_bool)
+                        == Some(true)),
+                    "Hermes external secret sources can redirect the declared namespace"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn canonical_path(&self, path: &std::path::Path) -> Result<PathBuf> {
         let path = if path.is_absolute() {
             path.to_path_buf()
         } else {
@@ -356,25 +666,25 @@ impl Instance {
         identity_extension: Option<&(String, String)>,
         profile: &str,
         source: Option<&str>,
+        config: &crate::session::config::Config,
     ) -> Result<crate::session::environment::DockerExecEnv> {
         let sandbox = self
             .sandbox_info
             .as_ref()
             .filter(|sandbox| sandbox.enabled)
             .context("sandbox launch has no container")?;
-        let managed_codex_home = crate::session::config::container_config::managed_codex_home(
-            &self.tool,
-            Some(self.get_tool_command()),
-            &self.source_profile,
-            &self.id,
-        )?;
-        let mut environment =
-            crate::session::environment::build_docker_env_args_with_managed_codex_home(
-                &self.source_profile,
-                sandbox,
-                std::path::Path::new(&self.project_path),
-                managed_codex_home.as_deref(),
-            );
+        let managed_codex_home =
+            crate::session::config::container_config::managed_codex_home_from_config(
+                &self.tool,
+                Some(self.get_tool_command()),
+                &config.session,
+                &self.id,
+            )?;
+        let mut environment = crate::session::environment::docker_exec_environment(
+            sandbox,
+            &config.sandbox,
+            managed_codex_home.as_deref(),
+        );
         environment
             .env
             .push(("AOE_PROFILE".into(), profile.to_owned()));
@@ -422,7 +732,11 @@ impl Instance {
         Ok(environment)
     }
 
-    pub(super) fn native_launch_inputs(&self, agent: &AgentDef) -> Result<NativeLaunchInputs> {
+    fn native_launch_inputs(
+        &self,
+        agent: &AgentDef,
+        config: &crate::session::config::Config,
+    ) -> Result<NativeLaunchInputs> {
         let launch_id = uuid::Uuid::new_v4().to_string();
         let profile = self.effective_profile();
         let identity_extension = self.identity_extension_launch();
@@ -432,6 +746,7 @@ impl Instance {
                 identity_extension.as_ref(),
                 &profile,
                 Some(&launch_id),
+                config,
             )?;
             let runtime = crate::containers::RuntimeExecutionSnapshot::capture(
                 &crate::containers::get_container_runtime(),
@@ -460,7 +775,7 @@ impl Instance {
                 profile,
             })
         } else {
-            let entries = self.resolved_host_environment();
+            let entries = self.resolved_host_environment_from(config.environment.clone());
             let mut environment = crate::session::capture::host_launcher_environment(&entries);
             environment.insert(crate::hooks::SESSION_SOURCE_ENV.into(), launch_id.clone());
             if let Some((_, values)) = &identity_extension {
@@ -503,9 +818,8 @@ impl Instance {
     }
 
     pub(super) fn execution_agent(&self) -> Result<&'static AgentDef> {
-        let config = crate::session::config::profile_config::resolve_config_or_warn(
-            &self.effective_profile(),
-        );
+        let config =
+            crate::session::config::profile_config::resolve_config(&self.effective_profile())?;
         Self::execution_agent_for(&self.tool, self.get_tool_command(), &config.session)
     }
 
@@ -572,11 +886,16 @@ impl Instance {
         &self,
         target: Option<(&str, Option<&ConversationBinding>, bool)>,
     ) -> Result<NativeExecution> {
-        let agent = self.execution_agent()?;
+        let config = crate::session::config::repo_config::resolve_config_with_repo(
+            &self.effective_profile(),
+            std::path::Path::new(&self.project_path),
+        )?;
+        let agent =
+            Self::execution_agent_for(&self.tool, self.get_tool_command(), &config.session)?;
         let session_dir = self.managed_user_argv(agent)?;
         let direct_capture = self.launch_invokes_resolved_agent_directly(agent);
         let target_session_id = target.map(|(sid, _, _)| sid.to_owned());
-        let mut inputs = self.native_launch_inputs(agent)?;
+        let mut inputs = self.native_launch_inputs(agent, &config)?;
         anyhow::ensure!(
             inputs.container.as_ref().is_none_or(|container| {
                 container.runtime.kind != crate::session::ContainerRuntimeName::AppleContainer
@@ -590,9 +909,7 @@ impl Instance {
             program.is_absolute() && program.to_str().is_some(),
             "native program must have an absolute UTF-8 path"
         );
-        let mut prime = (agent.name == "prime-agent" && inputs.container.is_some())
-            .then(|| self.prime_agent_capture_plan_from_inputs(&inputs))
-            .transpose()?;
+        let mut prime = None;
         let value = |key: &str| inputs.environment.get(key).cloned();
         let home = value("HOME")
             .filter(|home| !home.is_empty())
@@ -605,9 +922,6 @@ impl Instance {
                 inputs.cwd.join(path)
             })
         };
-        let config = crate::session::config::profile_config::resolve_config_or_warn(
-            &self.effective_profile(),
-        );
         let declared = config
             .session
             .agent_config_dir_for(&self.tool, &home)
@@ -794,9 +1108,47 @@ impl Instance {
                 pi_root = Some(if namespace_arguments.is_empty() { root } else { store.clone() });
                 vec![store]
             }
-            "prime-agent" if prime.is_some() => {
-                configuration.push(PathBuf::from(crate::session::config::container_config::PRIME_AGENT_DIR_IN_CONTAINER));
-                vec![prime.as_ref().unwrap().container_session_dir.clone()]
+            "prime-agent" => {
+                let root = absolute(declared.clone()
+                    .or_else(|| value("PRIME_AGENT_CODING_AGENT_DIR").filter(|value| !value.is_empty()).map(PathBuf::from))
+                    .unwrap_or_else(|| home.join(".prime/agent")));
+                let root = inputs.canonical_path(&root)?;
+                routing.push(("PRIME_AGENT_CODING_AGENT_DIR".into(), Some(root.to_str().context("Prime store is not UTF-8")?.into())));
+                let plan = self.prime_agent_launch_plan_from_inputs(&inputs, &root, &home)?;
+                configuration.push(root);
+                namespace_arguments.extend([
+                    "--cwd".into(), plan.container_cwd.clone(),
+                    "--session-dir".into(), plan.container_session_dir.to_str().context("Prime session directory is not UTF-8")?.into(),
+                ]);
+                let stores = vec![plan.container_session_dir.clone()];
+                prime = Some(plan);
+                stores
+            }
+            "hermes" => {
+                let root = match declared.clone() {
+                    Some(root) => root,
+                    None if inputs.container.is_some() && config.session.agent_config_dir_for(&self.tool, &home).is_some() => home.join(".hermes"),
+                    None => bail!("Hermes managed resume requires an explicit configuration-directory declaration"),
+                };
+                inputs.validate_hermes_namespace(&root)?;
+                routing.push(("HERMES_HOME".into(), Some(root.to_str().context("Hermes home is not UTF-8")?.into())));
+                if !root.parent().and_then(std::path::Path::file_name).is_some_and(|name| name == "profiles") {
+                    namespace_arguments.extend(["--profile".into(), "default".into()]);
+                }
+                configuration.push(root.clone());
+                vec![root.join("state.db")]
+            }
+            "vibe" => {
+                let root = match declared.clone() {
+                    Some(root) => root,
+                    None if inputs.container.is_some() && config.session.agent_config_dir_for(&self.tool, &home).is_some() => home.join(".vibe"),
+                    None => bail!("Vibe managed resume requires an explicit configuration-directory declaration"),
+                };
+                let root = inputs.canonical_path(&root)?;
+                let store = inputs.validate_vibe_namespace(&root, &self.selected_agent_args(), self.is_yolo_mode())?;
+                routing.push(("VIBE_HOME".into(), Some(root.to_str().context("Vibe home is not UTF-8")?.into())));
+                configuration.push(root);
+                vec![store]
             }
             "omp" => Vec::new(),
             "kimi" | "copilot" => {
@@ -996,7 +1348,10 @@ impl Instance {
             )
         ) {
             inputs.hook_capture_context(&self.id)?
-        } else if let Some(plan) = prime.take().filter(|_| direct_capture) {
+        } else if let Some(plan) = prime
+            .take()
+            .filter(|_| direct_capture && inputs.container.is_some())
+        {
             let sidecar = inputs.identity_extension.as_ref().map(|_| {
                 super::SessionSidecarSource::SandboxDir(
                     plan.store.join("aoe-session").join(&self.id),

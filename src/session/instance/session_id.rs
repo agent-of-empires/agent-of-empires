@@ -77,11 +77,11 @@ fn parse_prime_agent_launch_options(words: &[String]) -> Option<PrimeAgentLaunch
     Some(options)
 }
 
-fn resolve_prime_agent_path(value: &str, cwd: &Path) -> PathBuf {
+fn resolve_prime_agent_path(value: &str, cwd: &Path, home: &Path) -> PathBuf {
     let expanded = if value == "~" {
-        PathBuf::from("/root")
+        home.to_path_buf()
     } else if let Some(relative) = value.strip_prefix("~/") {
-        Path::new("/root").join(relative)
+        home.join(relative)
     } else {
         PathBuf::from(value)
     };
@@ -283,40 +283,47 @@ impl Instance {
                 .find(|entry| entry.key() == key)
                 .map(|entry| entry.value())
         };
+        anyhow::ensure!(
+            config.uses_default_container_home(),
+            "Prime capture requires the default container HOME"
+        );
         Self::resolve_prime_agent_layout(
             store,
             options,
             Path::new(&self.container_workdir()),
-            config.uses_default_container_home(),
+            (Path::new("/root"), Path::new(PRIME_AGENT_DIR_IN_CONTAINER)),
             environment_value("PRIME_AGENT_SESSION_DIR")
                 .or_else(|| environment_value("PRIME_AGENT_CODING_AGENT_SESSION_DIR")),
             |path, writable| config.host_path_for_container_path(path, writable),
         )
     }
 
-    pub(super) fn prime_agent_capture_plan_from_inputs(
+    pub(super) fn prime_agent_launch_plan_from_inputs(
         &self,
         inputs: &super::execution::NativeLaunchInputs,
+        agent_dir: &Path,
+        home: &Path,
     ) -> anyhow::Result<PrimeAgentCapturePlan> {
-        let container = inputs
-            .container
-            .as_ref()
-            .context("Prime capture requires a managed container")?;
-        let root = container
-            .runtime
-            .canonical_path(&container.id, Path::new(PRIME_AGENT_DIR_IN_CONTAINER))?;
-        let store = container
-            .host_path(&root, true)
-            .context("Prime store is not mounted from a writable local filesystem")?;
+        let root = inputs.canonical_path(agent_dir)?;
+        let store = if let Some(container) = &inputs.container {
+            anyhow::ensure!(
+                home == Path::new("/root"),
+                "Prime capture requires the default container HOME"
+            );
+            container
+                .host_path(&root, true)
+                .context("Prime store is not mounted from a writable local filesystem")?
+        } else {
+            root.clone()
+        };
         let mut options = self
             .prime_agent_launch_options()
             .context("Prime launch options do not support a managed conversation")?;
         if let Some(cwd) = options.cwd.as_deref() {
-            let cwd = resolve_prime_agent_path(cwd, &inputs.cwd);
+            let cwd = resolve_prime_agent_path(cwd, &inputs.cwd, home);
             options.cwd = Some(
-                container
-                    .runtime
-                    .canonical_path(&container.id, &cwd)?
+                inputs
+                    .canonical_path(&cwd)?
                     .to_str()
                     .context("Prime working directory is not UTF-8")?
                     .to_owned(),
@@ -326,10 +333,7 @@ impl Instance {
             store,
             options,
             &inputs.cwd,
-            inputs
-                .environment
-                .get("HOME")
-                .is_some_and(|home| home == "/root"),
+            (home, &root),
             inputs
                 .environment
                 .get("PRIME_AGENT_SESSION_DIR")
@@ -340,8 +344,11 @@ impl Instance {
                 })
                 .map(String::as_str),
             |path, writable| {
-                let path = container.runtime.canonical_path(&container.id, path).ok()?;
-                container.host_path(&path, writable)
+                let path = inputs.canonical_path(path).ok()?;
+                match &inputs.container {
+                    Some(container) => container.host_path(&path, writable),
+                    None => Some(path),
+                }
             },
         )
     }
@@ -350,17 +357,13 @@ impl Instance {
         store: PathBuf,
         options: PrimeAgentLaunchOptions,
         launch_cwd: &Path,
-        default_home: bool,
+        (home, agent_dir): (&Path, &Path),
         environment_session_dir: Option<&str>,
         host_path_for: impl Fn(&Path, bool) -> Option<PathBuf>,
     ) -> anyhow::Result<PrimeAgentCapturePlan> {
-        anyhow::ensure!(
-            default_home,
-            "Prime capture requires the default container HOME"
-        );
         let container_cwd = options.cwd.as_deref().map_or_else(
             || launch_cwd.to_path_buf(),
-            |cwd| resolve_prime_agent_path(cwd, launch_cwd),
+            |cwd| resolve_prime_agent_path(cwd, launch_cwd, home),
         );
         anyhow::ensure!(
             container_cwd.is_absolute(),
@@ -378,8 +381,7 @@ impl Instance {
         let session_dir_value = if let Some(value) = configured_session_dir {
             value
         } else {
-            let global_container_path =
-                Path::new(PRIME_AGENT_DIR_IN_CONTAINER).join("settings.json");
+            let global_container_path = agent_dir.join("settings.json");
             let project_container_path = container_cwd.join(".prime/agent/settings.json");
             let global_host_path = host_path_for(&global_container_path, false)
                 .context("global Prime settings are not mapped to a readable host path")?;
@@ -407,15 +409,19 @@ impl Instance {
                 }) {
                 Some(serde_json::Value::String(value)) => value.clone(),
                 Some(serde_json::Value::Null) | None => {
-                    format!("{PRIME_AGENT_DIR_IN_CONTAINER}/sessions")
+                    format!(
+                        "{}/sessions",
+                        agent_dir.to_str().context("Prime store is not UTF-8")?
+                    )
                 }
                 Some(_) => anyhow::bail!("Prime sessionDir setting is neither a string nor null"),
             }
         };
 
-        let container_session_dir = resolve_prime_agent_path(&session_dir_value, &container_cwd);
+        let container_session_dir =
+            resolve_prime_agent_path(&session_dir_value, &container_cwd, home);
         let session_dir = container_session_dir
-            .strip_prefix(Path::new(PRIME_AGENT_DIR_IN_CONTAINER))
+            .strip_prefix(agent_dir)
             .context("Prime session directory is outside the managed store")?
             .to_path_buf();
         let mapped = host_path_for(&container_session_dir, true)
@@ -2217,9 +2223,11 @@ mod tests {
             return;
         }
         let mut failures = Vec::new();
-        for (command, args, suffix) in [
-            ("prime-agent", "--cwd /workspace/project/sub", "sub"),
-            ("my-prime", "", ""),
+        for (command, args, suffix, sandboxed) in [
+            ("prime-agent", "--cwd /workspace/project/sub", "sub", true),
+            ("my-prime", "", "", true),
+            ("my-prime", "--cwd sub", "sub", false),
+            ("prime-agent", "--cwd sub", "sub", false),
         ] {
             let tmp = tempfile::tempdir().unwrap();
             let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
@@ -2252,6 +2260,20 @@ mod tests {
                 tmp.path().join("native-bin/my-prime"),
             )
             .unwrap();
+            if !sandboxed {
+                inst.sandbox_info = None;
+                inst.pending_host_env = vec![
+                    ("HOME".into(), tmp.path().to_str().unwrap().into()),
+                    (
+                        "PATH".into(),
+                        format!(
+                            "{}:{}",
+                            tmp.path().join("native-bin").display(),
+                            std::env::var("PATH").unwrap()
+                        ),
+                    ),
+                ];
+            }
             let sid = "018f47a6-7b80-7cc3-98a2-37b5f486b2a1";
             let binding = match inst.asserted_resume_binding(sid, None) {
                 Ok(binding) => binding,
@@ -2269,6 +2291,12 @@ mod tests {
             let prepared = inst
                 .prepare_launch_command(inst.conversation_state())
                 .unwrap();
+            if !sandboxed || command == "my-prime" {
+                assert!(
+                    prepared.execution.as_ref().unwrap().capture.is_none(),
+                    "explicit resume must not grant this invocation automatic capture"
+                );
+            }
             let command = prepared.command.unwrap();
             assert!(command.contains(&format!("--resume {sid}")), "{command}");
         }

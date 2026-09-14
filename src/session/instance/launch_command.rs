@@ -600,6 +600,10 @@ impl Instance {
                     identity_extension,
                     &self.effective_profile(),
                     None,
+                    &crate::session::config::repo_config::resolve_config_with_repo(
+                        &self.effective_profile(),
+                        std::path::Path::new(&self.project_path),
+                    )?,
                 )?)
             } else {
                 None
@@ -999,6 +1003,7 @@ mod tests {
             .prepare_launch_command(aliased.conversation_state())
             .unwrap();
         assert!(aliased.command.unwrap().contains("--fork-session"));
+        let mut unresolved_config = child.clone();
         let compatible = child
             .prepare_launch_command(child.conversation_state())
             .unwrap();
@@ -1009,6 +1014,125 @@ mod tests {
                 .is_err(),
             "a Claude conversation must not dispatch Claude selectors to Codex"
         );
+        std::fs::write(
+            crate::session::config::profile_config::get_profile_config_path(profile).unwrap(),
+            "[broken",
+        )
+        .unwrap();
+        assert!(
+            unresolved_config
+                .prepare_launch_command(unresolved_config.conversation_state())
+                .is_err(),
+            "a managed fork must not substitute defaults for an unreadable execution configuration"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn declared_resume_only_wrappers_keep_their_native_namespace() {
+        let mut failures = Vec::new();
+        for (agent, sid, suffix, redirect) in [
+            (
+                "vibe",
+                "11111111-1111-4111-8111-111111111111",
+                "logs/session",
+                "VIBE_SESSION_LOGGING__SAVE_DIR=/foreign",
+            ),
+            (
+                "hermes",
+                "20260914_164000_a1b2c3",
+                "state.db",
+                "export HERMES_HOME=/foreign",
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+            let wrapper = format!("my-{agent}");
+            let _path = crate::session::test_support::install_login_shell_path_command(
+                temp.path(),
+                &wrapper,
+                "#!/bin/sh\nexit 0\n",
+            );
+            let profile = "declared-native-resume";
+            crate::session::instance::test_helpers::declare_execution_aliases(
+                profile,
+                &[(&wrapper, agent)],
+                temp.path(),
+            );
+            let root = temp.path().join(format!(".{agent}"));
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(
+                root.join(".env"),
+                "API_KEY='local fixture'\nPRIVATE_KEY=\"first\nsecond\"\nVIBE_SESSION_LOGGING__GENERATE_TITLES=false\n",
+            )
+            .unwrap();
+            let mut inst = Instance::new("declared-native", temp.path().to_str().unwrap());
+            inst.tool = wrapper.clone();
+            inst.command = wrapper;
+            inst.source_profile = profile.into();
+            inst.pending_host_env = vec![
+                ("HOME".into(), temp.path().to_str().unwrap().into()),
+                (
+                    "HERMES_MANAGED_DIR".into(),
+                    temp.path().join("managed").to_str().unwrap().into(),
+                ),
+                ("TERMINAL_ENV".into(), "local".into()),
+                ("TERMINAL_CWD".into(), temp.path().to_str().unwrap().into()),
+            ];
+            let binding = match inst.asserted_resume_binding(sid, None) {
+                Ok(binding) => binding,
+                Err(error) => {
+                    failures.push(format!("{agent}: {error:#}"));
+                    continue;
+                }
+            };
+            assert_eq!(
+                binding.execution.as_ref().unwrap().stores,
+                vec![root.join(suffix)]
+            );
+            inst.resume_intent = ResumeIntent::Use(sid.into());
+            inst.resume_binding = Some(binding);
+            let mut redirected = inst.clone();
+            let prepared = inst
+                .prepare_launch_command(inst.conversation_state())
+                .unwrap();
+            assert!(prepared.execution.as_ref().unwrap().capture.is_none());
+            let command = prepared.command.unwrap();
+            assert!(command.contains(&format!("--resume {sid}")), "{command}");
+            if agent == "hermes" {
+                assert!(command.contains("--profile default"), "{command}");
+                std::fs::write(
+                    root.join("config.yaml"),
+                    "secrets:\n  sources: [command]\n  command:\n    enabled: false\n",
+                )
+                .unwrap();
+                redirected
+                    .prepare_launch_command(redirected.conversation_state())
+                    .unwrap();
+                std::fs::write(
+                    root.join("config.yaml"),
+                    "secrets:\n  command:\n    enabled: true\n",
+                )
+                .unwrap();
+                assert!(redirected
+                    .prepare_launch_command(redirected.conversation_state())
+                    .is_err());
+                std::fs::remove_file(root.join("config.yaml")).unwrap();
+            } else {
+                let profile = root.join("agents/accept-edits.toml");
+                std::fs::create_dir_all(profile.parent().unwrap()).unwrap();
+                std::fs::write(&profile, "[session_logging]\nsave_dir = '/foreign'\n").unwrap();
+                assert!(redirected
+                    .prepare_launch_command(redirected.conversation_state())
+                    .is_err());
+                std::fs::remove_file(profile).unwrap();
+            }
+            std::fs::write(root.join(".env"), redirect).unwrap();
+            let expected = redirected.conversation_state();
+            assert!(redirected.prepare_launch_command(expected.clone()).is_err());
+            assert!(expected.matches(&redirected));
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[test]

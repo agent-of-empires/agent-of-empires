@@ -741,15 +741,21 @@ pub(crate) fn build_docker_env_args_with_managed_codex_home(
     managed_codex_home: Option<&str>,
 ) -> DockerExecEnv {
     let sandbox_config = resolved_sandbox_config(profile, project_path);
+    docker_exec_environment(sandbox, &sandbox_config, managed_codex_home)
+}
 
+pub(crate) fn docker_exec_environment(
+    sandbox: &SandboxInfo,
+    sandbox_config: &SandboxConfig,
+    managed_codex_home: Option<&str>,
+) -> DockerExecEnv {
     tracing::debug!(target: "session.create",
-        "build_docker_env_args: profile={:?}, configured_entries={}, extra_entries={}",
-        profile,
+        "build_docker_env_args: configured_entries={}, extra_entries={}",
         sandbox_config.environment.len(),
         sandbox.extra_env.as_ref().map_or(0, Vec::len)
     );
 
-    let mut env_entries = collect_environment(&sandbox_config, sandbox);
+    let mut env_entries = collect_environment(sandbox_config, sandbox);
     if let Some(codex_home) = managed_codex_home {
         if !env_entries.iter().any(|entry| entry.key() == "CODEX_HOME") {
             env_entries.push(EnvEntry::Literal {

@@ -1866,12 +1866,21 @@ pub(crate) fn managed_codex_home(
     profile: &str,
     instance_id: &str,
 ) -> Result<Option<String>> {
+    let resolved_profile = super::effective_profile(profile);
+    let session_config = super::profile_config::resolve_config_or_warn(&resolved_profile).session;
+    managed_codex_home_from_config(tool, command, &session_config, instance_id)
+}
+
+pub(crate) fn managed_codex_home_from_config(
+    tool: &str,
+    command: Option<&str>,
+    session_config: &super::SessionConfig,
+    instance_id: &str,
+) -> Result<Option<String>> {
     crate::session::validate_instance_id(instance_id).map_err(|e| {
         anyhow::anyhow!("refusing to build Codex home for unsafe AOE_INSTANCE_ID: {e}")
     })?;
-    let resolved_profile = super::effective_profile(profile);
-    let session_config = super::profile_config::resolve_config_or_warn(&resolved_profile).session;
-    let config_tool = resolve_active_agent(tool, command, &session_config).map_or(tool, |a| a.name);
+    let config_tool = resolve_active_agent(tool, command, session_config).map_or(tool, |a| a.name);
     Ok((config_tool == "codex").then(|| format!("/root/.codex/{instance_id}")))
 }
 

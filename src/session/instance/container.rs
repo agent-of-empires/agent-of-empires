@@ -66,8 +66,15 @@ impl Instance {
     /// the profile list. That is the best available answer: the minted values
     /// are deliberately not persisted because they may be short-lived secrets.
     pub(crate) fn resolved_host_environment(&self) -> Vec<String> {
+        self.resolved_host_environment_from(self.profile_host_environment())
+    }
+
+    pub(super) fn resolved_host_environment_from(
+        &self,
+        profile_environment: Vec<String>,
+    ) -> Vec<String> {
         let mut environment = crate::session::environment::drop_shadowed_host_entries(
-            self.profile_host_environment(),
+            profile_environment,
             &self.pending_host_env,
         );
         environment.extend(self.pending_host_env.iter().map(|(key, value)| {
