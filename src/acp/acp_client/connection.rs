@@ -994,7 +994,7 @@ pub(super) async fn run_connection_task<W, R>(
                     let fork_requested = fork_from.as_deref().is_some_and(|s| !s.is_empty());
                     let mut context_reset_reason =
                         if stored_acp_session_id.is_some() && !load_session_capable && !fork_requested {
-                            Some("Conversation context reset: session/load is unavailable; started a new session with empty context.".to_string())
+                            Some("session/load unavailable; started a new session with empty context".to_string())
                         } else {
                             None
                         };
