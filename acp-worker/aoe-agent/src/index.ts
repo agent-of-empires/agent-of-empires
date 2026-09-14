@@ -327,7 +327,18 @@ function main() {
     .onRequest("session/new", async () => {
       const sessionId = randomHexId();
       const artifactDir = process.env.AOE_ARTIFACT_DIR;
-      if (artifactDir) await createTranscript(artifactDir, sessionId);
+      // Best-effort: a non-writable artifact dir must not block the clear.
+      // The session runs ephemerally; a later load of a missing transcript
+      // resets context rather than replaying another session's history.
+      if (artifactDir) {
+        try {
+          await createTranscript(artifactDir, sessionId);
+        } catch (err) {
+          process.stderr.write(
+            `[aoe-agent] transcript create failed: ${err}\n`,
+          );
+        }
+      }
       const modelId = process.env.AOE_AGENT_MODEL ?? DEFAULT_MODEL;
       sessions.set(sessionId, {
         pendingPrompt: null,

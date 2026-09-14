@@ -69,12 +69,12 @@ than reporting an empty successful resume. Without an artifact directory
 (for example, capability probes), sessions are ephemeral and load is unavailable.
 Only completed user/assistant text exchanges are persisted, not tool calls.
 
-On upgrade, legacy `transcript.jsonl` files remain unchanged and are copied to
-`transcript.pre-native-id.jsonl` beside the original, without replacing an
-existing backup. The old format recorded neither native IDs nor `/clear`
-boundaries, so it cannot safely seed a resumed conversation. The first ordinary
-resume of such an ID reports context reset and starts fresh. Inspect the saved
-files to recover wanted text manually; it is never sent to the model automatically.
+Legacy `transcript.jsonl` files from before native-ID scoping are left
+untouched on disk. The old format recorded neither native IDs nor `/clear`
+boundaries, so it cannot safely seed a resumed conversation: the first resume
+of such a session reports context reset and starts fresh. The saved file is
+never sent to the model automatically; inspect it to recover wanted text
+manually.
 
 ## Permission modes and model channels
 

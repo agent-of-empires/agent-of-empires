@@ -38,13 +38,12 @@ mod v025_reenable_confirm_delete;
 mod v026_repoint_acp_default_agent;
 pub(crate) mod v027_isolate_sandbox_stores;
 mod v028_clear_archived_live_status;
-mod v029_aoe_agent_native_transcripts;
 
 use anyhow::Result;
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 29;
+const CURRENT_VERSION: u32 = 28;
 const VERSION_FILE: &str = ".schema_version";
 
 struct Migration {
@@ -193,11 +192,6 @@ const MIGRATIONS: &[Migration] = &[
         version: 28,
         name: "clear_archived_live_status",
         run: v028_clear_archived_live_status::run,
-    },
-    Migration {
-        version: 29,
-        name: "aoe_agent_native_transcripts",
-        run: v029_aoe_agent_native_transcripts::run,
     },
 ];
 

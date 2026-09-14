@@ -195,7 +195,6 @@ test(
       await w.init();
       await w.load(b);
       await w.prompt(b, "resume-B");
-      console.log("resumed provider messages:", providerText());
       assert.equal(
         providerText().includes("A-private"),
         false,
@@ -218,18 +217,28 @@ test(
       ]);
       await assert.rejects(w.load("f".repeat(32)), /ENOENT/);
       await assert.rejects(w.load("../escape"), /session ID/);
+      // A clear onto a non-writable artifact dir is best-effort: session/new
+      // still returns a usable, ephemeral session and does not disturb the one
+      // already loaded. A later load of the ephemeral id misses its file and
+      // resets context, so nothing leaks.
       await rename(dir, `${dir}-held`);
+      let blockedClear = "";
       try {
         await writeFile(dir, "blocked");
-        await assert.rejects(w.new(), /ENOTDIR|EEXIST/);
+        blockedClear = await w.new();
       } finally {
         await rm(dir, { force: true });
         await rename(`${dir}-held`, dir);
       }
-      await w.prompt(empty, "after-failed-clear");
+      await w.prompt(blockedClear, "started-despite-blocked");
       assert.ok(
-        providerText().includes("first-after-empty-clear"),
-        "failed reset keeps the prior session usable",
+        providerText().includes("started-despite-blocked"),
+        "a clear onto a non-writable artifact dir still starts a session",
+      );
+      await w.prompt(empty, "after-blocked-clear");
+      assert.ok(
+        providerText().includes("after-blocked-clear"),
+        "the previously loaded session stays usable",
       );
       await w.stop();
 
@@ -250,10 +259,6 @@ test(
       const legacyBytes =
         '{"role":"user","content":"legacy-secret"}\n{"role":"assistant","content":"old-reply"}\n';
       await writeFile(join(legacy, "transcript.jsonl"), legacyBytes);
-      await writeFile(
-        join(legacy, "transcript.pre-native-id.jsonl"),
-        legacyBytes,
-      );
       w = worker(legacy);
       await w.init();
       await assert.rejects(w.load("a".repeat(32)), /ENOENT/);
@@ -268,17 +273,17 @@ test(
         await readFile(join(legacy, "transcript.jsonl"), "utf8"),
         legacyBytes,
       );
-      assert.equal(
-        await readFile(join(legacy, "transcript.pre-native-id.jsonl"), "utf8"),
-        legacyBytes,
-      );
       await w.stop();
 
       const blocked = join(dir, "not-a-directory");
       await writeFile(blocked, "blocked");
       w = worker(blocked);
       await w.init();
-      await assert.rejects(w.new(), /ENOTDIR|EEXIST/);
+      // A non-directory artifact path cannot hold a transcript, but the
+      // best-effort create still lets the session start and run ephemerally.
+      const startedOnFile = await w.new();
+      await w.prompt(startedOnFile, "runs-without-usable-artifact-dir");
+      assert.ok(providerText().includes("runs-without-usable-artifact-dir"));
       await w.stop();
 
       const probe = join(dir, "probe");
