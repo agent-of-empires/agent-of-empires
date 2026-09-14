@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-use super::container_interface::ContainerConfig;
+use super::container_interface::{ContainerConfig, InspectedContainer, VolumeMount};
 use super::error::{DockerError, Result};
 use super::runtime_base::RuntimeBase;
 
@@ -294,6 +294,180 @@ impl ContainerRuntime {
                 Ok(Self::apple_container_inspect_label(&payload, key)?.map(str::to_owned))
             }
         }
+    }
+
+    /// Read actual runtime configuration, not desired create arguments. Mount
+    /// source spellings alone do not prove which physical object is mounted.
+    pub(crate) fn inspect_container(&self, name_or_id: &str) -> Result<Option<InspectedContainer>> {
+        self.inspect_container_with_command(name_or_id, &mut self.base.command())
+    }
+
+    /// Inspect using the actual launcher runtime program, environment and cwd.
+    /// The caller owns that context; this method never adds ambient env values.
+    pub(crate) fn inspect_container_with_command(
+        &self,
+        name_or_id: &str,
+        command: &mut std::process::Command,
+    ) -> Result<Option<InspectedContainer>> {
+        match self.kind {
+            RuntimeKind::Docker | RuntimeKind::Podman => {
+                command.args(["container", "inspect", name_or_id]);
+            }
+            RuntimeKind::AppleContainer => {
+                command.args(["inspect", name_or_id]);
+            }
+        }
+        let output = self.base.probe_output(command)?;
+        if !output.status.success() {
+            return Err(DockerError::InspectFailed(
+                String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            ));
+        }
+        let value: Value = serde_json::from_slice(&output.stdout)
+            .map_err(|error| DockerError::InspectFailed(error.to_string()))?;
+        match self.kind {
+            RuntimeKind::Docker | RuntimeKind::Podman => Self::parse_inspected_container(&value),
+            RuntimeKind::AppleContainer => Self::parse_apple_inspected_container(&value),
+        }
+        .map(Some)
+    }
+
+    fn parse_inspected_container(value: &Value) -> Result<InspectedContainer> {
+        let malformed = || {
+            DockerError::InspectFailed(
+                "container inspect returned malformed identity, state or mounts".into(),
+            )
+        };
+        let entries = value
+            .as_array()
+            .filter(|entries| entries.len() == 1)
+            .ok_or_else(malformed)?;
+        let container = &entries[0];
+        let id = container
+            .get("Id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(malformed)?
+            .to_owned();
+        let running = container
+            .pointer("/State/Running")
+            .and_then(Value::as_bool)
+            .ok_or_else(malformed)?;
+        let mounts = container
+            .get("Mounts")
+            .and_then(Value::as_array)
+            .ok_or_else(malformed)?;
+        let mut bind_mounts = Vec::new();
+        let mut opaque_mounts = Vec::new();
+        for mount in mounts {
+            let kind = mount
+                .get("Type")
+                .and_then(Value::as_str)
+                .filter(|kind| !kind.is_empty())
+                .ok_or_else(malformed)?;
+            let target = mount
+                .get("Destination")
+                .and_then(Value::as_str)
+                .filter(|path| std::path::Path::new(path).is_absolute())
+                .ok_or_else(malformed)?;
+            if kind == "bind" {
+                let source = mount
+                    .get("Source")
+                    .and_then(Value::as_str)
+                    .filter(|path| std::path::Path::new(path).is_absolute())
+                    .ok_or_else(malformed)?;
+                let writable = mount
+                    .get("RW")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(malformed)?;
+                bind_mounts.push(VolumeMount {
+                    host_path: source.to_owned(),
+                    container_path: target.to_owned(),
+                    read_only: !writable,
+                });
+            } else {
+                opaque_mounts.push(std::path::PathBuf::from(target));
+            }
+        }
+        Ok(InspectedContainer {
+            id,
+            running,
+            bind_mounts,
+            opaque_mounts,
+            runtime_handler: None,
+        })
+    }
+
+    fn parse_apple_inspected_container(value: &Value) -> Result<InspectedContainer> {
+        // apple/container 1.0.0 ContainerConfiguration, Filesystem and
+        // ProcessConfiguration Codable fields. FSType encodes as one enum key.
+        let malformed = || {
+            DockerError::InspectFailed("Apple container inspect returned malformed mounts".into())
+        };
+        let entries = value
+            .as_array()
+            .filter(|entries| entries.len() == 1)
+            .ok_or_else(malformed)?;
+        let configuration = entries[0]
+            .get("configuration")
+            .and_then(Value::as_object)
+            .ok_or_else(malformed)?;
+        let id = Self::apple_container_inspect_id(value)?.to_owned();
+        let running = Self::apple_container_inspect_state(value)? == "running";
+        let mounts = configuration
+            .get("mounts")
+            .and_then(Value::as_array)
+            .ok_or_else(malformed)?;
+        let mut bind_mounts = Vec::new();
+        let mut opaque_mounts = Vec::new();
+        for mount in mounts {
+            let kind = mount
+                .get("type")
+                .and_then(Value::as_object)
+                .filter(|kind| kind.len() == 1)
+                .ok_or_else(malformed)?;
+            let target = mount
+                .get("destination")
+                .and_then(Value::as_str)
+                .filter(|path| std::path::Path::new(path).is_absolute())
+                .ok_or_else(malformed)?;
+            let options = mount
+                .get("options")
+                .and_then(Value::as_array)
+                .ok_or_else(malformed)?;
+            if options.iter().any(|option| !option.is_string()) {
+                return Err(malformed());
+            }
+            if let Some(variant) = kind.get("virtiofs") {
+                if !variant.as_object().is_some_and(|object| object.is_empty()) {
+                    return Err(malformed());
+                }
+                let source = mount
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .filter(|path| std::path::Path::new(path).is_absolute())
+                    .ok_or_else(malformed)?;
+                bind_mounts.push(VolumeMount {
+                    host_path: source.to_owned(),
+                    container_path: target.to_owned(),
+                    read_only: options.iter().any(|option| option.as_str() == Some("ro")),
+                });
+            } else {
+                opaque_mounts.push(std::path::PathBuf::from(target));
+            }
+        }
+        let runtime_handler = match configuration.get("runtimeHandler") {
+            None | Some(Value::Null) => "container-runtime-linux",
+            Some(Value::String(handler)) if !handler.is_empty() => handler,
+            _ => return Err(malformed()),
+        };
+        Ok(InspectedContainer {
+            id,
+            running,
+            bind_mounts,
+            opaque_mounts,
+            runtime_handler: Some(runtime_handler.to_owned()),
+        })
     }
 
     pub fn container_working_dir(&self, name: &str) -> Option<String> {

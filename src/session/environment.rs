@@ -158,6 +158,25 @@ pub(crate) fn shell_escape_script_word(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// A pane-visible context notice. Data cannot inject terminal controls or shell
+/// syntax, and printf treats percent signs and backslashes as literal content.
+pub(crate) fn native_context_notice_command(message: &str) -> String {
+    let safe: std::borrow::Cow<'_, str> = if message.chars().any(char::is_control) {
+        let mut escaped = String::with_capacity(message.len());
+        for character in message.chars() {
+            if character.is_control() {
+                escaped.extend(character.escape_default());
+            } else {
+                escaped.push(character);
+            }
+        }
+        std::borrow::Cow::Owned(escaped)
+    } else {
+        std::borrow::Cow::Borrowed(message)
+    };
+    format!("printf '%s\\n' {}", shell_escape(&safe))
+}
+
 /// Resolve a session's sandbox environment entries to concrete `(KEY, VALUE)` pairs on the host,
 /// for feeding into a host-side hook's process environment (so a `before_start` hook can read a
 /// per-session `$TEST_VAR`).

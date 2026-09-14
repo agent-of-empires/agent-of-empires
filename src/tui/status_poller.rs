@@ -182,6 +182,7 @@ pub(super) fn poll_statuses_once(
                 &instance.tool,
                 Some(&instance.detect_as),
                 crate::session::config::container_config::CredentialFold::SeedOnly,
+                std::path::Path::new(&instance.container_workdir()),
             );
         }
     }

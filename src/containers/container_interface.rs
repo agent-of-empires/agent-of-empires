@@ -5,6 +5,17 @@ pub struct VolumeMount {
     pub read_only: bool,
 }
 
+/// Actual runtime state, never inferred from the desired create configuration.
+#[derive(Clone, Debug)]
+pub(crate) struct InspectedContainer {
+    pub(crate) id: String,
+    pub(crate) running: bool,
+    pub(crate) bind_mounts: Vec<VolumeMount>,
+    pub(crate) opaque_mounts: Vec<std::path::PathBuf>,
+    /// Apple runtime plugin name; absence on Docker/Podman is not a plugin guess.
+    pub(crate) runtime_handler: Option<String>,
+}
+
 pub struct NamedVolumeMount {
     pub volume_name: String,
     pub container_path: String,

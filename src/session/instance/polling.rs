@@ -225,6 +225,10 @@ impl Instance {
         &mut self,
         omp_metadata: Option<OmpCaptureMetadata>,
     ) -> PollerStart {
+        if !crate::migrations::v030_isolate_sandbox_content::instance_ready(self).unwrap_or(false) {
+            self.session_id_poller = None;
+            return PollerStart::NotApplicable;
+        }
         if self.session_id_poller_is_running() {
             return PollerStart::Started;
         }
