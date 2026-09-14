@@ -280,10 +280,26 @@ fn fork_child_publication_confirms_preallocated_identity() {
     std::fs::create_dir_all(&bin).unwrap();
     let aoe = env!("CARGO_BIN_EXE_aoe");
     let claude = bin.join("claude");
-    std::fs::write(&claude, format!(
-        "#!/bin/sh\nsid=\nwhile [ \"$#\" -gt 0 ]; do if [ \"$1\" = --session-id ]; then shift; sid=$1; fi; shift; done\nprintf '{{\"session_id\":\"%s\"}}\\n' \"$sid\" | {} __extract-session-id\nsleep 60\n",
-        shell_words::quote(aoe),
-    )).unwrap();
+    let publish = temp.path().join("publish");
+    let published = temp.path().join("published");
+    std::fs::write(
+        &claude,
+        format!(
+            r#"#!/bin/sh
+sid=
+while [ "$#" -gt 0 ]; do if [ "$1" = --session-id ]; then shift; sid=$1; fi; shift; done
+[ -n "$sid" ] || exit 1
+while [ ! -e {} ]; do sleep 0.05; done
+printf '{{"session_id":"%s"}}\n' "$sid" | {} __extract-session-id || exit 1
+: > {}
+sleep 60
+"#,
+            shell_words::quote(publish.to_str().unwrap()),
+            shell_words::quote(aoe),
+            shell_words::quote(published.to_str().unwrap()),
+        ),
+    )
+    .unwrap();
     std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
     let path = format!(
         "{}:{}",
@@ -329,15 +345,21 @@ fn fork_child_publication_confirms_preallocated_identity() {
     let _cleanup = TmuxCleanup(&session_name);
     let child_sid = child.agent_session_id.clone();
     cli(&["session", "start", "child"]);
+    std::fs::write(&publish, "").unwrap();
     assert!(
-        wait_until(|| storage.load().unwrap().iter().any(|row| {
+        wait_until(|| published.is_file()),
+        "native publication did not complete"
+    );
+    cli(&["session", "stop", "child"]);
+    assert!(
+        storage.load().unwrap().iter().any(|row| {
             row.id == child.id
                 && row.agent_session_id == child_sid
                 && row.agent_session_binding.as_ref().is_some_and(|binding| {
                     binding.provenance
                         == agent_of_empires::session::ConversationProvenance::Observed
                 })
-        })),
+        }),
         "qualified same-SID publication must confirm the fork child"
     );
     cli(&["add", "--fork-from", "child", "-t", "grandchild"]);
