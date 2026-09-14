@@ -19,7 +19,7 @@ use super::{AgentConfigMount, AGENT_CONFIG_MOUNTS, SANDBOX_PRIVATE_SUBDIR, SANDB
 pub(super) struct NativeStateBoundary {
     source_root: PathBuf,
     stopped_original: Option<PathBuf>,
-    paths: Vec<PathBuf>,
+    paths: Vec<(PathBuf, bool)>,
     patterns: Vec<(PathBuf, glob::Pattern)>,
 }
 
@@ -56,16 +56,15 @@ impl NativeStateBoundary {
     }
 
     pub(super) fn for_stopped_original(mut self, host: &Path) -> Self {
-        // The old copier could have placed every configured role here. Carry
-        // their known host-state boundaries into the private original too,
-        // including roles declared by another profile.
+        // Carry every old role's state boundaries into the stopped original,
+        // but only storage ancestors may be traversed under this capability.
         let mapped_paths: Vec<_> = self
             .paths
             .iter()
-            .filter_map(|path| {
+            .filter_map(|(path, storage)| {
                 path.strip_prefix(host)
                     .ok()
-                    .map(|relative| self.source_root.join(relative))
+                    .map(|relative| (self.source_root.join(relative), *storage))
             })
             .collect();
         let mapped_patterns: Vec<_> = self
@@ -77,8 +76,8 @@ impl NativeStateBoundary {
                     .map(|relative| (self.source_root.join(relative), pattern.clone()))
             })
             .collect();
-        for path in mapped_paths {
-            self.add_path(path);
+        for (path, storage) in mapped_paths {
+            self.add_classified_path(path, storage);
         }
         self.patterns.extend(mapped_patterns);
         self.stopped_original = Some(self.source_root.clone());
@@ -103,9 +102,12 @@ impl NativeStateBoundary {
         Ok(())
     }
     fn add_root(&mut self, root: &Path, mount: &AgentConfigMount) -> Result<()> {
-        let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| lexical_normalize(root));
+        let canonical_root = canonical_expected_path(root)?;
         if let Some(parent) = canonical_root.parent() {
-            self.add_path(parent.join(crate::migrations::v030_isolate_sandbox_content::RECOVERY));
+            self.add_classified_path(
+                parent.join(crate::migrations::v030_isolate_sandbox_content::RECOVERY),
+                true,
+            );
         }
         for name in [SANDBOX_SUBDIR, SANDBOX_PRIVATE_SUBDIR]
             .into_iter()
@@ -116,45 +118,74 @@ impl NativeStateBoundary {
                     .push((canonical_root.clone(), glob::Pattern::new(name)?));
                 let spelling = root.join(name);
                 for entry in glob::glob(&spelling.to_string_lossy())? {
-                    match entry {
-                        Ok(path) => self.add_path(path),
-                        Err(error) => tracing::warn!(target: "session.profile", %error,
-                            "Cannot inspect a native-state alias while seeding config"),
-                    }
+                    self.add_path(
+                        entry.context("inspecting a native-state alias before config seeding")?,
+                    );
                 }
             } else {
-                self.add_path(root.join(name));
-                self.add_path(canonical_root.join(name));
+                let storage = matches!(name, SANDBOX_SUBDIR | SANDBOX_PRIVATE_SUBDIR);
+                self.add_classified_path(root.join(name), storage);
+                self.add_classified_path(canonical_root.join(name), storage);
             }
         }
         Ok(())
     }
 
     fn add_path(&mut self, path: PathBuf) {
-        if let Ok(canonical) = fs::canonicalize(&path) {
-            self.paths.push(canonical);
+        self.add_classified_path(path, false);
+    }
+
+    fn add_classified_path(&mut self, path: PathBuf, storage: bool) {
+        if let Ok(canonical) = canonical_expected_path(&path) {
+            self.paths.push((canonical, storage));
         }
-        self.paths.push(lexical_normalize(&path));
+        self.paths.push((lexical_normalize(&path), storage));
     }
 
     fn rejects(&self, candidate: &Path, directory: bool) -> bool {
-        self.paths.iter().any(|state| {
-            let admitted_ancestor = self.stopped_original.as_ref().is_some_and(|original| {
-                candidate.starts_with(original) && original.starts_with(state) && original != state
-            });
+        self.paths.iter().any(|(state, storage)| {
+            let admitted_ancestor = *storage
+                && self.stopped_original.as_ref().is_some_and(|original| {
+                    candidate.starts_with(original)
+                        && original.starts_with(state)
+                        && original != state
+                });
             !admitted_ancestor
                 && (candidate.starts_with(state) || (directory && state.starts_with(candidate)))
         }) || self.patterns.iter().any(|(root, pattern)| {
-            candidate
-                .strip_prefix(root)
-                .is_ok_and(|relative| pattern.matches_path(relative))
-                || (directory && root.starts_with(candidate))
+            candidate.strip_prefix(root).is_ok_and(|relative| {
+                relative.ancestors().any(|ancestor| {
+                    pattern.matches_path_with(
+                        ancestor,
+                        glob::MatchOptions {
+                            require_literal_separator: true,
+                            ..glob::MatchOptions::new()
+                        },
+                    )
+                })
+            }) || (directory && root.starts_with(candidate))
         })
     }
 }
 
-/// Canonical spelling has already resolved intentional /tmp, dotfile and Nix
-/// links. Walk that spelling without following any later component swap.
+fn canonical_expected_path(path: &Path) -> std::io::Result<PathBuf> {
+    match fs::canonicalize(path) {
+        Ok(canonical) => Ok(canonical),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let Some(parent) = path.parent() else {
+                return Err(error);
+            };
+            let Some(leaf) = path.file_name() else {
+                return Err(error);
+            };
+            Ok(canonical_expected_path(parent)?.join(leaf))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Resolve intentional /tmp, dotfile and Nix links, then pin the spelling
+/// without following any subsequent component replacement.
 fn open_canonical_dir(path: &Path) -> Result<AnchoredDir> {
     let filesystem = AnchoredDir::open(Path::new("/"))?;
     filesystem.child(
@@ -231,6 +262,7 @@ pub(super) fn sync_agent_config(
             &mut content.as_bytes(),
             Permissions::from_mode(0o600),
             false,
+            None,
         )?;
     }
     for &name in copy_files {
@@ -249,7 +281,7 @@ pub(super) fn sync_agent_config(
             continue;
         };
         let permissions = source.metadata()?.permissions();
-        parent.publish_file(leaf, &mut source, permissions, !preserve)?;
+        parent.publish_file(leaf, &mut source, permissions, !preserve, None)?;
     }
     for &name in copy_dirs {
         let relative = Path::new(name);
@@ -309,7 +341,7 @@ fn seed_directory(
         discovery_links,
     )
     .and_then(|()| stage.sync())
-    .and_then(|()| destination.publish_directory(&stage_name, leaf));
+    .and_then(|()| destination.publish_directory(destination, &stage_name, leaf));
     if !matches!(result, Ok(true)) {
         destination.remove_staged_dir(&stage_name)?;
     }
@@ -347,7 +379,7 @@ fn copy_entries(
         match source.open_regular(within, usize::MAX) {
             Ok(Some(mut file)) => {
                 let permissions = file.metadata()?.permissions();
-                destination.publish_file(Path::new(&name), &mut file, permissions, false)?;
+                destination.publish_file(Path::new(&name), &mut file, permissions, false, None)?;
                 continue;
             }
             Ok(None) => {}
@@ -401,7 +433,7 @@ fn copy_discovered_entry(
 ) -> Result<()> {
     if let Some(mut file) = open_source_file(canonical, boundary)? {
         let permissions = file.metadata()?.permissions();
-        destination.publish_file(leaf, &mut file, permissions, false)?;
+        destination.publish_file(leaf, &mut file, permissions, false, None)?;
     } else {
         seed_directory(canonical, destination, leaf, boundary, false)?;
     }
@@ -462,12 +494,14 @@ pub(super) fn seed_credential_pairs(
                 &mut data,
                 Permissions::from_mode(0o600),
                 false,
+                None,
             )?;
             stage.publish_file(
                 Path::new("key"),
                 &mut key,
                 Permissions::from_mode(0o600),
                 false,
+                None,
             )?;
             stage.sync()?;
             for (path, target) in paths {
@@ -479,7 +513,7 @@ pub(super) fn seed_credential_pairs(
                     return Ok(false);
                 }
             }
-            units.publish_directory(&stage_name, final_name)
+            units.publish_directory(&units, &stage_name, final_name)
         })();
         if !matches!(result, Ok(true)) {
             units.remove_staged_dir(&stage_name)?;
@@ -523,6 +557,7 @@ pub(super) fn seed_sqlite_files(
                     &mut file,
                     Permissions::from_mode(0o600),
                     false,
+                    None,
                 )?;
             }
             scratch_path.join("source.db")
@@ -541,7 +576,13 @@ pub(super) fn seed_sqlite_files(
         let mut snapshot = scratch_anchor
             .open_regular(Path::new("snapshot.db"), usize::MAX)?
             .context("SQLite did not produce a regular config snapshot")?;
-        parent.publish_file(leaf, &mut snapshot, Permissions::from_mode(0o600), false)?;
+        parent.publish_file(
+            leaf,
+            &mut snapshot,
+            Permissions::from_mode(0o600),
+            false,
+            None,
+        )?;
     }
     Ok(())
 }
@@ -799,7 +840,7 @@ impl ResourceSeed<'_> {
         let input = self.source.join(relative);
         if let Some(mut file) = open_source_file(&input, self.boundary)? {
             let permissions = file.metadata()?.permissions();
-            parent.publish_file(leaf, &mut file, permissions, false)?;
+            parent.publish_file(leaf, &mut file, permissions, false, None)?;
         } else if directory_allowed {
             seed_directory(&input, &parent, leaf, self.boundary, false)?;
         }

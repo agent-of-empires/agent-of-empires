@@ -469,6 +469,7 @@ fn write_receipt(path: &Path, receipt: &impl Serialize) -> Result<()> {
         &mut bytes.as_slice(),
         fs::Permissions::from_mode(0o600),
         true,
+        None,
     )?;
     fs::File::open(parent.parent().context("receipt directory has no parent")?)?.sync_all()?;
     Ok(())
@@ -512,8 +513,8 @@ fn certificate_path(app: &Path, instance: &str, root: &Path) -> Result<PathBuf> 
     Ok(app.join(RECEIPTS).join(format!("root-{key}.json")))
 }
 
-fn owned_root(app: &Path, instance: &str, root: &ContentRoot) -> Result<Option<RootCertificate>> {
-    let bytes = match fs::read(certificate_path(app, instance, &root.path)?) {
+fn owned_root(app: &Path, instance: &str, path: &Path) -> Result<Option<RootCertificate>> {
+    let bytes = match fs::read(certificate_path(app, instance, path)?) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
@@ -521,20 +522,80 @@ fn owned_root(app: &Path, instance: &str, root: &ContentRoot) -> Result<Option<R
     let certificate: RootCertificate = serde_json::from_slice(&bytes)?;
     if certificate.policy != CONTENT_POLICY
         || certificate.instance != instance
-        || certificate.root.path != root.path
-        || identity(&root.path)?.as_ref() != Some(&certificate.identity)
+        || certificate.root.path != path
+        || identity(path)?.as_ref() != Some(&certificate.identity)
     {
         return Ok(None);
     }
     Ok(Some(certificate))
 }
 
+/// Prove ownership of the pinned directory, independently of role readiness.
+pub(crate) fn owns_content_root(app: &Path, instance: &str, root: &AnchoredDir) -> Result<bool> {
+    let path = canonical_expected_path(root.path())?;
+    let Some(certificate) = owned_root(app, instance, &path)? else {
+        return Ok(false);
+    };
+    let (device, inode) = root.identity()?;
+    #[cfg(target_os = "macos")]
+    let device = device as u64;
+    Ok(certificate.identity == Identity { device, inode })
+}
+
+pub(crate) fn has_pending_content(app: &Path, instance: &str) -> Result<bool> {
+    let entries = match fs::read_dir(app.join(RECEIPTS).join(instance)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        if Path::new(&entry?.file_name())
+            .extension()
+            .is_some_and(|extension| extension == "json")
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Revoke durable authority before deleting its directory: inode reuse must
+/// not make a later unrelated root look owned. A failed deletion stays retained.
+pub(crate) fn revoke_content_root(app: &Path, instance: &str, root: &AnchoredDir) -> Result<bool> {
+    if !owns_content_root(app, instance, root)? {
+        return Ok(false);
+    }
+    let path = certificate_path(app, instance, &canonical_expected_path(root.path())?)?;
+    fs::remove_file(&path)?;
+    fs::File::open(path.parent().context("certificate has no parent")?)?.sync_all()?;
+    Ok(true)
+}
+
+#[cfg(test)]
+pub(crate) fn certify_owned_test_root(app: &Path, instance: &str, path: &Path) -> Result<()> {
+    let path = canonical_expected_path(path)?;
+    let certificate = RootCertificate {
+        policy: CONTENT_POLICY,
+        instance: instance.to_owned(),
+        root: ContentRoot {
+            path: path.clone(),
+            host: PathBuf::new(),
+            roles: Vec::new(),
+        },
+        identity: identity(&path)?.context("test fixture has no directory")?,
+        transaction: uuid::Uuid::new_v4().to_string(),
+    };
+    write_receipt(&certificate_path(app, instance, &path)?, &certificate)
+}
+
 fn root_ready(app: &Path, instance: &str, root: &ContentRoot) -> Result<bool> {
-    Ok(owned_root(app, instance, root)?.is_some_and(|certificate| {
-        root.roles
-            .iter()
-            .all(|role| certificate.root.roles.contains(role))
-    }))
+    Ok(
+        owned_root(app, instance, &root.path)?.is_some_and(|certificate| {
+            root.roles
+                .iter()
+                .all(|role| certificate.root.roles.contains(role))
+        }),
+    )
 }
 
 pub(crate) fn roots_ready(
@@ -560,7 +621,7 @@ fn certify_receipt(app: &Path, receipt: &Receipt) -> Result<()> {
     }
     for part in &receipt.roots {
         let mut root = part.root.clone();
-        if let Some(previous) = owned_root(app, &receipt.instance, &root)? {
+        if let Some(previous) = owned_root(app, &receipt.instance, &root.path)? {
             root.roles.extend(previous.root.roles);
             root.roles.sort();
             root.roles.dedup();
@@ -585,6 +646,7 @@ fn certify_receipt(app: &Path, receipt: &Receipt) -> Result<()> {
 fn rename_directory(source: &Path, destination: &Path) -> Result<()> {
     let filesystem = AnchoredDir::open(Path::new("/"))?;
     if !filesystem.publish_directory(
+        &filesystem,
         source
             .strip_prefix("/")
             .context("source must be absolute")?,
@@ -930,7 +992,7 @@ fn new_receipt(app: &Path, row: &Value, tool: &str, roots: &[ContentRoot]) -> Re
         .to_owned();
     let mut parts = Vec::new();
     for (index, root) in roots.iter().enumerate() {
-        let owned = owned_root(app, &instance, root)?.map(|certificate| certificate.identity);
+        let owned = owned_root(app, &instance, &root.path)?.map(|certificate| certificate.identity);
         let physical = identity(&root.path)?;
         if owned.is_some() && owned != physical {
             bail!("owned native content root changed before planning");
@@ -977,7 +1039,7 @@ fn stage_receipt(
     }
     for part in &mut receipt.roots {
         if let Some(published) = &part.published {
-            let certificate = owned_root(app, &receipt.instance, &part.root)?.context(
+            let certificate = owned_root(app, &receipt.instance, &part.root.path)?.context(
                 "owned native content lost its physical certificate before role preparation",
             )?;
             if &certificate.identity != published {
@@ -1551,7 +1613,7 @@ pub(crate) fn ensure_fresh_content(
             let transition = crate::session::acquire_storage_flock(app, layout::LOCK)?;
             if !pending_receipt(app, instance, tool)? {
                 for root in &planned {
-                    if owned_root(app, instance, root)?.is_none()
+                    if owned_root(app, instance, &root.path)?.is_none()
                         && (identity(&root.path)?.is_some()
                             || certificate_path(app, instance, &root.path)?.exists())
                     {

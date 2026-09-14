@@ -1273,6 +1273,7 @@ fn seed_content_roles(
                 &mut content.as_bytes(),
                 std::fs::Permissions::from_mode(0o600),
                 false,
+                None,
             )?;
         }
     }

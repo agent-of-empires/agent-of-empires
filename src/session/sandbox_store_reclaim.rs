@@ -1,12 +1,11 @@
 //! Reclaim per-instance agent stores whose session is gone.
 //!
 //! A sandboxed session mounts `<agent config>/sandbox-v2/<instance id>` as the
-//! agent's config directory, so the store holds that agent's credentials.
-//! Purging a session removes its own stores; this pass covers the ones already
-//! stranded, including stores left by versions that removed nothing.
+//! agent's config directory. Session removal and this orphan pass reclaim
+//! only physically certified isolated content, never an unproven original.
+//! Old or interrupted-transition data remains in place for explicit recovery.
 //!
-//! Both are deliberately narrow, because the thing being deleted is a copy of a
-//! live credential:
+//! Both paths are deliberately narrow:
 //!
 //! - A store is an orphan only when its id resolves in no profile of either
 //!   build namespace. A registry that cannot be read is never "a profile with
@@ -28,9 +27,13 @@
 //!   is mid-flight. It cannot see a half-copied store either way: v027 copies
 //!   into `.v027-stage-<id>` and renames, and only a bare 16-hex name is ever a
 //!   candidate here, so a store appears to this pass whole or not at all.
+//!   Active content journals also defer removal; ownership is durably revoked
+//!   before deletion and traversal uses the retained certified directory FD.
 //!   Widening that name filter would break the guarantee.
 
 use crate::migrations::v027_isolate_sandbox_stores as v027;
+use crate::migrations::v030_isolate_sandbox_content as content;
+use crate::session::anchored_fs::AnchoredDir;
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -48,6 +51,10 @@ pub enum Preserved {
     /// Written to moments ago, so it may be a store being seeded for a session
     /// whose row is not inserted yet.
     Recent,
+    /// No physical content certificate proves this is an isolated owned store.
+    UnprovenContent,
+    /// An interrupted content transaction must settle before its store is removed.
+    Transitioning,
 }
 
 impl Preserved {
@@ -56,6 +63,8 @@ impl Preserved {
             Self::Retained => "a container for it still exists, or a runtime could not be asked",
             Self::Ambiguous => "not a plain directory",
             Self::Recent => "written to too recently to rule out a session being created",
+            Self::UnprovenContent => "native content ownership is unproven; original preserved",
+            Self::Transitioning => "native content transition is pending",
         }
     }
 }
@@ -429,7 +438,7 @@ fn plan_in(
                 continue;
             }
             let path = root.join(&child);
-            match classify(&path, &id, grace, container_exists)? {
+            match classify(app_dir, also_owned, &path, &id, grace, container_exists)? {
                 Some(reason) => plan.preserved.push((path, reason)),
                 None => {
                     let bytes = directory_bytes(&path);
@@ -445,6 +454,8 @@ fn plan_in(
 /// that is not a plain directory says nothing about what it holds, and a
 /// running container is still writing to it.
 fn classify(
+    app: &Path,
+    also_owned: &[PathBuf],
     path: &Path,
     id: &str,
     grace: std::time::Duration,
@@ -455,6 +466,13 @@ fn classify(
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Ok(Some(Preserved::Ambiguous));
     }
+    if content_transition_pending(app, also_owned, id)? {
+        return Ok(Some(Preserved::Transitioning));
+    }
+    let root = AnchoredDir::open(path)?;
+    if !has_content_owner(app, also_owned, id, &root)? {
+        return Ok(Some(Preserved::UnprovenContent));
+    }
     if written_within(&metadata, grace) {
         return Ok(Some(Preserved::Recent));
     }
@@ -462,6 +480,49 @@ fn classify(
         return Ok(Some(Preserved::Retained));
     }
     Ok(None)
+}
+
+fn has_content_owner(
+    app: &Path,
+    also_owned: &[PathBuf],
+    id: &str,
+    root: &AnchoredDir,
+) -> Result<bool> {
+    for namespace in std::iter::once(app).chain(also_owned.iter().map(PathBuf::as_path)) {
+        if content::owns_content_root(namespace, id, root)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn content_transition_pending(app: &Path, also_owned: &[PathBuf], id: &str) -> Result<bool> {
+    for namespace in std::iter::once(app).chain(also_owned.iter().map(PathBuf::as_path)) {
+        if content::has_pending_content(namespace, id)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn remove_owned_store(app: &Path, also_owned: &[PathBuf], id: &str, path: &Path) -> Result<()> {
+    if content_transition_pending(app, also_owned, id)? {
+        bail!("native content transition is pending");
+    }
+    let root = AnchoredDir::open(path)?;
+    let mut owned = false;
+    for namespace in std::iter::once(app).chain(also_owned.iter().map(PathBuf::as_path)) {
+        owned |= content::revoke_content_root(namespace, id, &root)?;
+    }
+    if !owned {
+        bail!(
+            "native content ownership changed; original preserved at {}",
+            path.display()
+        );
+    }
+    root.remove_contents()?;
+    // rmdir never traverses a replacement root or removes its nonempty data.
+    fs::remove_dir(path).with_context(|| format!("removing empty owned store {}", path.display()))
 }
 
 /// Whether `metadata` was modified inside `window`. An unreadable or
@@ -508,8 +569,15 @@ fn reclaim_in(
         }
         // Re-classified against the path as it is now, with fresh container
         // evidence: the last thing standing between a swapped store, or one
-        // whose container reappeared, and `remove_dir_all`.
-        match classify(&orphan.path, &orphan.id, grace, container_exists) {
+        // whose container reappeared, and the pinned ownership-checked deletion.
+        match classify(
+            app_dir,
+            also_owned,
+            &orphan.path,
+            &orphan.id,
+            grace,
+            container_exists,
+        ) {
             Ok(None) => {}
             Ok(Some(reason)) => {
                 outcome
@@ -524,7 +592,7 @@ fn reclaim_in(
                 continue;
             }
         }
-        match fs::remove_dir_all(&orphan.path) {
+        match remove_owned_store(app_dir, also_owned, &orphan.id, &orphan.path) {
             Ok(()) => {
                 tracing::info!(target: "session.store",
                     "reclaimed orphan agent store {}", orphan.path.display());
@@ -587,6 +655,8 @@ pub(crate) fn remove_stores_for(
         &instance.effective_profile(),
     );
     let declared = config.session.agent_config_dir_for(&instance.tool, &home);
+    let app = crate::session::get_app_dir()?;
+    let other_namespaces = also_owned(&app);
     let mut removed = Vec::new();
     let mut freed = 0;
     for path in crate::session::config::container_config::sandbox_store_dirs(
@@ -607,8 +677,13 @@ pub(crate) fn remove_stores_for(
                 return Err(error).with_context(|| format!("inspecting {}", path.display()))
             }
         }
+        let root = AnchoredDir::open(&path)?;
+        if !has_content_owner(&app, &other_namespaces, &instance.id, &root)? {
+            tracing::warn!(target: "session.store", path = %path.display(), "preserving sandbox original with unproven native content ownership");
+            continue;
+        }
         let bytes = directory_bytes(&path);
-        fs::remove_dir_all(&path).with_context(|| format!("removing {}", path.display()))?;
+        remove_owned_store(&app, &other_namespaces, &instance.id, &path)?;
         freed += bytes;
         removed.push(path);
     }
@@ -627,10 +702,16 @@ mod tests {
         fs::write(app.join("sessions.json"), format!("[{}]", ids.join(","))).unwrap();
     }
 
-    fn store(home: &Path, id: &str, bytes: usize) -> PathBuf {
+    fn unproven_store(home: &Path, id: &str, bytes: usize) -> PathBuf {
         let path = home.join(".claude").join("sandbox-v2").join(id);
         fs::create_dir_all(&path).unwrap();
         fs::write(path.join(".credentials.json"), vec![b'x'; bytes]).unwrap();
+        path
+    }
+
+    fn owned_store(app: &Path, home: &Path, id: &str, bytes: usize) -> PathBuf {
+        let path = unproven_store(home, id, bytes);
+        content::certify_owned_test_root(app, id, &path).unwrap();
         path
     }
 
@@ -655,8 +736,8 @@ mod tests {
         let home = dir.path().join("home");
         fs::create_dir_all(&app).unwrap();
         app_with_rows(&app, &["1111111111111111"]);
-        store(&home, "1111111111111111", 10);
-        let orphan = store(&home, "2222222222222222", 40);
+        owned_store(&app, &home, "1111111111111111", 10);
+        let orphan = owned_store(&app, &home, "2222222222222222", 40);
 
         let plan = plan_in(&app, &[], &home, NO_GRACE, &gone).unwrap();
 
@@ -681,7 +762,7 @@ mod tests {
             r#"[{"id":"2222222222222222"}]"#,
         )
         .unwrap();
-        store(&home, "2222222222222222", 40);
+        owned_store(&app, &home, "2222222222222222", 40);
 
         let plan = plan_in(&app, &[], &home, NO_GRACE, &gone).unwrap();
 
@@ -697,7 +778,7 @@ mod tests {
         let broken = app.join("profiles").join("work");
         fs::create_dir_all(&broken).unwrap();
         app_with_rows(&app, &[]);
-        store(&home, "2222222222222222", 40);
+        owned_store(&app, &home, "2222222222222222", 40);
 
         for content in [r#"{"not":"an array"}"#, "{", r#"[{"title":"no id"}]"#] {
             fs::write(broken.join("sessions.json"), content).unwrap();
@@ -718,7 +799,7 @@ mod tests {
         let app = dir.path().join("app");
         let home = dir.path().join("home");
         fs::create_dir_all(&app).unwrap();
-        store(&home, "2222222222222222", 40);
+        owned_store(&app, &home, "2222222222222222", 40);
 
         let error = plan_in(&app, &[], &home, NO_GRACE, &gone).unwrap_err();
 
@@ -732,7 +813,7 @@ mod tests {
         let home = dir.path().join("home");
         fs::create_dir_all(&app).unwrap();
         app_with_rows(&app, &[]);
-        let path = store(&home, "2222222222222222", 40);
+        let path = owned_store(&app, &home, "2222222222222222", 40);
 
         let outcome = reclaim_in(&app, &[], &home, NO_GRACE, &retained).unwrap();
 
@@ -776,8 +857,8 @@ mod tests {
         let home = dir.path().join("home");
         fs::create_dir_all(&app).unwrap();
         app_with_rows(&app, &["1111111111111111"]);
-        let kept = store(&home, "1111111111111111", 10);
-        let orphan = store(&home, "2222222222222222", 40);
+        let kept = owned_store(&app, &home, "1111111111111111", 10);
+        let orphan = owned_store(&app, &home, "2222222222222222", 40);
 
         let outcome = reclaim_in(&app, &[], &home, NO_GRACE, &gone).unwrap();
 
@@ -828,7 +909,7 @@ mod tests {
             r#"[{"id":"2222222222222222"}]"#,
         )
         .unwrap();
-        let store = store(&home, "2222222222222222", 40);
+        let store = owned_store(&app, &home, "2222222222222222", 40);
 
         let outcome = reclaim_in(&app, &[sibling], &home, NO_GRACE, &gone).unwrap();
 
@@ -846,7 +927,7 @@ mod tests {
         let home = dir.path().join("home");
         fs::create_dir_all(&app).unwrap();
         app_with_rows(&app, &[]);
-        let seeding = store(&home, "2222222222222222", 40);
+        let seeding = owned_store(&app, &home, "2222222222222222", 40);
 
         let outcome =
             reclaim_in(&app, &[], &home, std::time::Duration::from_secs(600), &gone).unwrap();
@@ -869,7 +950,7 @@ mod tests {
         let home = dir.path().join("home");
         fs::create_dir_all(&app).unwrap();
         app_with_rows(&app, &[]);
-        let path = store(&home, "2222222222222222", 40);
+        let path = owned_store(&app, &home, "2222222222222222", 40);
 
         // The probe runs between planning and deletion, which is where a
         // concurrent `aoe add` would publish its row.
@@ -972,7 +1053,7 @@ mod tests {
         let home = dir.path().join("home");
         fs::create_dir_all(&app).unwrap();
         app_with_rows(&app, &[]);
-        let path = store(&home, "2222222222222222", 40);
+        let path = owned_store(&app, &home, "2222222222222222", 40);
         let probes: Vec<Box<v027::RunningProbe<'_>>> =
             vec![Box::new(|_| Ok(false)), Box::new(|_| Ok(true))];
         let any = move |id: &str| any_retained(&probes, id);
@@ -1044,7 +1125,7 @@ mod tests {
             let home = dir.path().join("home");
             fs::create_dir_all(app.join("profiles")).unwrap();
             app_with_rows(&app, &[]);
-            let orphan = store(&home, "2222222222222222", 40);
+            let orphan = owned_store(&app, &home, "2222222222222222", 40);
             plant(&app);
 
             let outcome = reclaim_in(&app, &[], &home, NO_GRACE, &gone);
@@ -1071,8 +1152,8 @@ mod tests {
         let home = dir.path().join("home");
         fs::create_dir_all(&app).unwrap();
         app_with_rows(&app, &[]);
-        let first = store(&home, "2222222222222222", 40);
-        let second = store(&home, "3333333333333333", 40);
+        let first = owned_store(&app, &home, "2222222222222222", 40);
+        let second = owned_store(&app, &home, "3333333333333333", 40);
 
         // Stands in for a container coming up during the first removal: both
         // stores are unattached while the plan is made, and the second gains a
@@ -1112,5 +1193,104 @@ mod tests {
 
         assert!(staging.exists());
         assert!(outcome.plan.orphans.is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn session_removal_preserves_uncertified_original() {
+        let directory = tempfile::tempdir().unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(directory.path());
+        let home = dirs::home_dir().unwrap();
+        let mut instance =
+            crate::session::Instance::new("original", directory.path().to_str().unwrap());
+        instance.tool = "claude".into();
+        instance.detect_as = "claude".into();
+        instance.sandbox_store_generation = 2;
+        let root = unproven_store(&home, &instance.id, 0);
+        fs::create_dir_all(root.join("projects")).unwrap();
+        fs::write(
+            root.join("projects/original.jsonl"),
+            b"UNCERTIFIED_ORIGINAL_CONTEXT",
+        )
+        .unwrap();
+        remove_stores_for(&instance).unwrap();
+        assert_eq!(
+            fs::read(root.join("projects/original.jsonl")).unwrap(),
+            b"UNCERTIFIED_ORIGINAL_CONTEXT"
+        );
+    }
+
+    #[test]
+    fn orphan_cleanup_preserves_uncertified_original() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = directory.path().join("app");
+        let home = directory.path().join("home");
+        fs::create_dir_all(&app).unwrap();
+        app_with_rows(&app, &[]);
+        let root = unproven_store(&home, "4444444444444444", 0);
+        fs::create_dir_all(root.join("projects")).unwrap();
+        fs::write(
+            root.join("projects/original.jsonl"),
+            b"UNCERTIFIED_ORIGINAL_CONTEXT",
+        )
+        .unwrap();
+        reclaim_in(&app, &[], &home, NO_GRACE, &gone).unwrap();
+        assert_eq!(
+            fs::read(root.join("projects/original.jsonl")).unwrap(),
+            b"UNCERTIFIED_ORIGINAL_CONTEXT"
+        );
+    }
+
+    #[test]
+    fn replacement_after_the_final_probe_preserves_the_new_original() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = directory.path().join("app");
+        let home = directory.path().join("home");
+        fs::create_dir_all(&app).unwrap();
+        app_with_rows(&app, &[]);
+        let root = owned_store(&app, &home, "5555555555555555", 0);
+        let retired = directory.path().join("retired");
+        let calls = std::cell::Cell::new(0);
+        let probe = |_: &str| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 2 {
+                fs::rename(&root, &retired)?;
+                fs::create_dir_all(root.join("projects"))?;
+                fs::write(
+                    root.join("projects/original.jsonl"),
+                    b"REPLACEMENT_ORIGINAL",
+                )?;
+            }
+            Ok(false)
+        };
+        let outcome = reclaim_in(&app, &[], &home, NO_GRACE, &probe).unwrap();
+        assert_eq!(
+            fs::read(root.join("projects/original.jsonl")).unwrap(),
+            b"REPLACEMENT_ORIGINAL"
+        );
+        assert!(outcome.removed.is_empty());
+    }
+
+    #[test]
+    fn interrupted_deletion_does_not_reuse_revoked_ownership() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = directory.path().join("app");
+        let home = directory.path().join("home");
+        fs::create_dir_all(&app).unwrap();
+        app_with_rows(&app, &[]);
+        let id = "6666666666666666";
+        let root = owned_store(&app, &home, id, 0);
+        let anchor = AnchoredDir::open(&root).unwrap();
+        content::revoke_content_root(&app, id, &anchor).unwrap();
+        fs::write(
+            root.join("new-native-context"),
+            b"UNPROVEN_AFTER_INTERRUPTION",
+        )
+        .unwrap();
+        reclaim_in(&app, &[], &home, NO_GRACE, &gone).unwrap();
+        assert_eq!(
+            fs::read(root.join("new-native-context")).unwrap(),
+            b"UNPROVEN_AFTER_INTERRUPTION"
+        );
     }
 }
