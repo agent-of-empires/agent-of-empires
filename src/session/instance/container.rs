@@ -111,7 +111,7 @@ impl Instance {
     }
 
     pub fn get_container_for_instance(&mut self) -> Result<containers::DockerContainer> {
-        let detect_as = self.effective_detect_as().into_owned();
+        let command = self.get_tool_command().to_owned();
         let image = self
             .sandbox_info
             .as_ref()
@@ -173,7 +173,7 @@ impl Instance {
             // Still rotating the copy in its store. The refresh below would
             // fold that copy into the shared file and log every sandbox on
             // it out at the copy's next rotation, so refuse first.
-            if self.predates_shared_credential(&container, &detect_as)? {
+            if self.predates_shared_credential(&container, &command)? {
                 anyhow::bail!(
                     "running sandbox {} predates the shared credential file; stop it, then relaunch to rebuild it",
                     self.id
@@ -186,7 +186,7 @@ impl Instance {
                 &self.effective_profile(),
                 &self.id,
                 &self.tool,
-                Some(detect_as.as_str()),
+                Some(command.as_str()),
                 fold,
             );
             let config = self.build_container_config_with(fold)?;
@@ -197,7 +197,7 @@ impl Instance {
             self.backfill_container_workdir(&container);
             container_config::ensure_folder_trust_config_for_active_agent(
                 &self.tool,
-                Some(detect_as.as_str()),
+                Some(command.as_str()),
                 &self.source_profile,
                 &self.id,
                 &self.container_workdir(),
@@ -225,7 +225,7 @@ impl Instance {
                     &self.effective_profile(),
                     &self.id,
                     &self.tool,
-                    Some(detect_as.as_str()),
+                    Some(command.as_str()),
                     container_config::CredentialFold::Freshest,
                 );
                 let config = self.build_container_config()?;
@@ -245,7 +245,7 @@ impl Instance {
                     self.backfill_container_workdir(&container);
                     container_config::ensure_folder_trust_config_for_active_agent(
                         &self.tool,
-                        Some(detect_as.as_str()),
+                        Some(command.as_str()),
                         &self.source_profile,
                         &self.id,
                         &self.container_workdir(),
@@ -300,12 +300,12 @@ impl Instance {
     pub(crate) fn predates_shared_credential(
         &self,
         container: &DockerContainer,
-        detect_as: &str,
+        command: &str,
     ) -> Result<bool> {
         if !container_config::agent_shares_credential_file(
             &self.effective_profile(),
             &self.tool,
-            Some(detect_as),
+            Some(command),
         ) {
             return Ok(false);
         }
@@ -416,7 +416,6 @@ impl Instance {
         fold: container_config::CredentialFold,
     ) -> Result<crate::containers::ContainerConfig> {
         self.ensure_container_hook_mount_source();
-        let detect_as = self.effective_detect_as();
         let sandbox = self
             .sandbox_info
             .as_ref()
@@ -431,10 +430,7 @@ impl Instance {
         .session
         .merge_hooks_into_selected_agent;
         let selected_agent = if merge_selected {
-            // Mirror the host path's agent resolution (a custom wrapper detected
-            // as kiro carries kiro's sidecar via detect_as), and the sandbox's
-            // own `resolve_active_agent`, which also falls back to detect_as.
-            self.resolved_agent()
+            self.status_agent()
                 .and_then(|a| a.sidecar_hooks.as_ref())
                 .and_then(|s| s.selected_agent_hooks.as_ref())
                 .and_then(|sel| {
@@ -446,9 +442,12 @@ impl Instance {
         container_config::build_container_config(
             &self.project_path,
             sandbox,
-            container_config::ContainerAgentSelection::new(&self.tool, Some(&detect_as))
-                .with_selected_agent(selected_agent.as_deref())
-                .with_credential_fold(fold),
+            container_config::ContainerAgentSelection::new(
+                &self.tool,
+                Some(self.get_tool_command()),
+            )
+            .with_selected_agent(selected_agent.as_deref())
+            .with_credential_fold(fold),
             self.is_yolo_mode(),
             &self.id,
             self.workspace_info.as_ref(),

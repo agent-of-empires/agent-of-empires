@@ -10,6 +10,7 @@ impl Instance {
             &self.project_path,
             &self.effective_profile(),
             &self.retroactive_capture_excludes,
+            self.active_execution.as_ref().map(|active| &active.binding),
         )
     }
 
@@ -63,7 +64,7 @@ impl Instance {
                     Some(active) => active
                         .container
                         .as_ref()
-                        .map(|container| container.name.as_str()),
+                        .map(|container| container.id.as_str()),
                     None => self
                         .sandbox_info
                         .as_ref()

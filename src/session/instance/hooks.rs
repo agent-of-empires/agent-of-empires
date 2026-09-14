@@ -90,7 +90,7 @@ impl Instance {
                 &self.extra_args,
             ))?;
         }
-        let agent = self.resolved_agent();
+        let agent = self.status_agent();
         self.ensure_disclosed_host_hook_path(agent)?;
         self.install_agent_status_hooks(agent);
         self.ensure_host_folder_trust(agent);
@@ -469,7 +469,7 @@ impl Instance {
                 if let Some(name) =
                     crate::agents::parse_selected_agent(&self.selected_agent_args(), selected.flag)
                 {
-                    let Some(agent) = self.resolved_agent() else {
+                    let Some(agent) = self.status_agent() else {
                         return false;
                     };
                     let config_path = sidecar_host_config_path_for(
@@ -502,7 +502,7 @@ impl Instance {
             }
         }
 
-        let Some(agent) = self.resolved_agent() else {
+        let Some(agent) = self.status_agent() else {
             return false;
         };
         let config_path = sidecar_host_config_path_for(
@@ -549,7 +549,7 @@ impl Instance {
         let Some(home) = home else {
             return false;
         };
-        let Some(agent) = self.resolved_agent() else {
+        let Some(agent) = self.status_agent() else {
             return false;
         };
         let Some(hook_cfg) = agent.hook_config.as_ref() else {

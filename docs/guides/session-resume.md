@@ -53,7 +53,7 @@ Only existing capture capabilities are used. A wrapper declaration does not add 
 - **Gemini:** the resolved `.gemini` store. When a dotenv file could select another root, configure `GEMINI_CLI_HOME` explicitly. **Cursor**, **Kimi**, and **Copilot** use their native config/share/home store inputs, not a union of unrelated environment variables.
 - **Prime:** the existing verified root-only managed-container contract. Prime still cannot fork. Native Hermes/Vibe namespace routing and host Prime are not proven by this resolver, so managed resume is refused in those contexts, even if an existing reader discovers a raw ID.
 
-Sandboxed managed operations additionally require a supported runtime endpoint and the actual inspected filesystem/mount mapping. An unavailable or unsupported projection is not treated as a local host path. These refusals leave the requested resume/fork and transcript intact; they do not silently launch fresh.
+Sandboxed managed operations additionally require a supported runtime endpoint, an immutable container execution identity, and the actual inspected filesystem/mount mapping. Docker and Podman dispatch to the inspected container ID, not its replaceable name. Apple Container execution identity is not currently proven for managed conversation access. An unavailable or unsupported projection is not treated as a local host path. These refusals leave the requested resume/fork and transcript intact; they do not silently launch fresh.
 
 Disabling `agent_status_hooks` removes status writers only. Any authoritative identity hooks declared for native resume remain installed.
 

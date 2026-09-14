@@ -1688,10 +1688,10 @@ fn omp_source_observation(
     let (filesystem, path, cwd_filesystem, cwd) = if let Some(container) = &active.container {
         let path = container
             .runtime
-            .canonical_path(&container.name, session_path)?;
+            .canonical_path(&container.id, session_path)?;
         let cwd = container
             .runtime
-            .canonical_path(&container.name, Path::new(cwd))?;
+            .canonical_path(&container.id, Path::new(cwd))?;
         let (filesystem, path) = container.physical_path(&path);
         let (cwd_filesystem, cwd) = container.physical_path(&cwd);
         (filesystem, path, cwd_filesystem, cwd)
@@ -1810,7 +1810,11 @@ pub(crate) fn omp_poll_fn(
                 tracing::debug!(target: "session.capture", "OMP poll identity refresh failed: {}", error)
             })
             .ok()?;
-        let exclusion = super::compose_exclusion(&instance_id, &extra_excludes);
+        let exclusion = super::compose_exclusion(
+            &instance_id,
+            &extra_excludes,
+            active.as_ref().map(|active| &active.binding),
+        );
         let captured = capture_omp_session_id_from_terminal(
             &identity.metadata,
             &exclusion,
@@ -2084,7 +2088,11 @@ pub(crate) fn omp_poll_fn_sandboxed(
             })
             .ok()?;
         let marker = launch_marker.as_deref()?;
-        let exclusion = super::compose_exclusion(&instance_id, &extra_excludes);
+        let exclusion = super::compose_exclusion(
+            &instance_id,
+            &extra_excludes,
+            active.as_ref().map(|active| &active.binding),
+        );
         let captured =
             capture_omp_session_in_container(&container_name, &metadata, &exclusion, marker, active.as_ref())
                 .map_err(|error| {

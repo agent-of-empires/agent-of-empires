@@ -138,7 +138,7 @@ if (args[0] === "container" && args[1] === "inspect" && args.at(-1) === fixture.
     if (args[0] === "-w") { args.shift(); cwd = args.shift(); }
     else throw Error("unexpected exec option: " + args[0]);
   }
-  if (args.shift() !== fixture.name) throw Error("unknown container");
+  if (args.shift() !== "fixture:" + fixture.name) throw Error("unknown container generation");
   if (args.join(" ") === "env -0") {
     process.stdout.write("HOME=/root\0PATH=/usr/local/bin:/usr/bin:/bin\0");
   } else if (args[0] === "/bin/sh" && args[1] === "-c" && args[3] === "aoe-path") {

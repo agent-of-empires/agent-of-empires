@@ -181,7 +181,7 @@ impl NativeLaunchInputs {
             self.cwd.join(path)
         };
         match &self.container {
-            Some(container) => container.runtime.canonical_path(&container.name, &path),
+            Some(container) => container.runtime.canonical_path(&container.id, &path),
             None => Ok(path
                 .canonicalize()
                 .unwrap_or_else(|_| crate::git::template::lexical_normalize(&path))),
@@ -242,7 +242,7 @@ impl NativeLaunchInputs {
         .map(str::to_owned);
         let output = crate::session::capture::run_with_timeout_limit(
             container.runtime.exec(
-                &container.name,
+                &container.id,
                 self.cwd.to_str().context("native cwd is not UTF-8")?,
                 &args,
             ),
@@ -320,7 +320,7 @@ impl Instance {
             .context("sandbox launch has no container")?;
         let managed_codex_home = crate::session::config::container_config::managed_codex_home(
             &self.tool,
-            agent.map(|agent| agent.name),
+            Some(self.get_tool_command()),
             &self.source_profile,
             &self.id,
         )?;
@@ -397,12 +397,12 @@ impl Instance {
                 &sandbox.container_name,
             )?;
             let cwd = container.runtime.canonical_path(
-                &container.name,
+                &container.id,
                 std::path::Path::new(&self.container_workdir()),
             )?;
             let mut environment = crate::session::capture::read_container_environment(
                 &container.runtime,
-                &container.name,
+                &container.id,
             )?;
             environment.extend(docker_env.env.iter().cloned());
             Ok(NativeLaunchInputs {
@@ -459,25 +459,31 @@ impl Instance {
     }
 
     pub(super) fn execution_agent(&self) -> Result<&'static AgentDef> {
-        let command = self.get_tool_command();
+        let config = crate::session::config::profile_config::resolve_config_or_warn(
+            &self.effective_profile(),
+        );
+        Self::execution_agent_for(&self.tool, self.get_tool_command(), &config.session)
+    }
+
+    pub(crate) fn execution_agent_for(
+        tool: &str,
+        command: &str,
+        config: &crate::session::config::SessionConfig,
+    ) -> Result<&'static AgentDef> {
         anyhow::ensure!(!Self::contains_active_shell_syntax(command),
             "managed conversation requires a direct native command or an explicitly declared wrapper");
         let words = shell_words::split(command)?;
         let program = words.first().context("empty agent command")?;
         let direct = AGENTS.iter().find(|agent| agent.binary == program);
-        let config = crate::session::config::profile_config::resolve_config_or_warn(
-            &self.effective_profile(),
-        );
         let declared = config
-            .session
             .agent_execution_as
-            .get(&self.tool)
+            .get(tool)
             .map(|name| {
                 crate::agents::get_agent(name)
                     .context("agent_execution_as names an unknown builtin")
             })
             .transpose()?;
-        let logical = crate::agents::get_agent(&self.tool);
+        let logical = crate::agents::get_agent(tool);
         let actual = direct.or(declared).context(
             "wrapper execution identity is unknown: set session.agent_execution_as and session.agent_config_dir; agent_detect_as is only status detection")?;
         anyhow::ensure!(
@@ -496,7 +502,7 @@ impl Instance {
                 "wrapper command names a different native agent"
             );
             anyhow::ensure!(
-                config.session.agent_config_dir.contains_key(&self.tool),
+                config.agent_config_dir.contains_key(tool),
                 "wrapper requires an explicit session.agent_config_dir namespace"
             );
         }
@@ -526,6 +532,12 @@ impl Instance {
         let session_dir = self.managed_user_argv(agent)?;
         let target_session_id = target.map(|(sid, _, _)| sid.to_owned());
         let mut inputs = self.native_launch_inputs(agent)?;
+        anyhow::ensure!(
+            inputs.container.as_ref().is_none_or(|container| {
+                container.runtime.kind != crate::session::ContainerRuntimeName::AppleContainer
+            }),
+            "managed conversation requires an immutable container execution identity"
+        );
         let words = shell_words::split(self.get_tool_command())?;
         let program =
             inputs.resolve_program(words.first().context("native program is missing")?)?;
@@ -814,7 +826,7 @@ impl Instance {
             let mut context = if let Some(container) = &inputs.container {
                 crate::session::capture::resolve_omp_store_layout_in_container_with_environment(
                     &container.runtime,
-                    &container.name,
+                    &container.id,
                     cwd,
                     environment,
                     &options,

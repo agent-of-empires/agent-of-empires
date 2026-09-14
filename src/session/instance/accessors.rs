@@ -188,6 +188,12 @@ impl Instance {
         self.execution_agent().ok()
     }
 
+    pub(crate) fn status_agent(&self) -> Option<&'static crate::agents::AgentDef> {
+        self.resolved_agent()
+            .or_else(|| crate::agents::get_agent(&self.tool))
+            .or_else(|| crate::agents::get_agent(&self.effective_detect_as()))
+    }
+
     /// The built-in identity used to compare capture stores and aliases.
     ///
     /// This is classification only. Capture and resume authorization still

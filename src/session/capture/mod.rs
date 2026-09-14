@@ -262,10 +262,7 @@ pub(crate) fn read_pi_session_observation(
         return None;
     }
     let native = match active.and_then(|active| active.container.as_ref()) {
-        Some(container) => container
-            .runtime
-            .canonical_path(&container.name, path)
-            .ok()?,
+        Some(container) => container.runtime.canonical_path(&container.id, path).ok()?,
         None if matches!(source, SessionSidecarSource::HostHooks(_)) => {
             canonicalize_or_raw(path.to_str()?)
         }
@@ -345,19 +342,16 @@ pub(crate) fn is_valid_session_id(id: &str) -> bool {
 /// Compose [`build_exclusion_set`] (cross-instance live tmux scan) with a
 /// per-instance set of IDs the cascade has explicitly cleared but which
 /// may still live on disk for several minutes.
-///
-/// Both `Instance::retroactive_capture_exclusion_set` and the post-launch
-/// `*_poll_fn` closures route through this helper so the resume-fallback
-/// cascade's just-crashed sid is filtered identically on the synchronous
-/// pre-launch path and on the asynchronous polling path.
 pub(crate) fn compose_exclusion(
     current_instance_id: &str,
     extra: &HashSet<String>,
+    source: Option<&crate::session::ExecutionBinding>,
 ) -> HashSet<String> {
     compose_exclusion_in(
         current_instance_id,
         extra,
         &crate::tmux::LiveSessionSnapshot::new(),
+        source,
     )
 }
 
@@ -368,44 +362,35 @@ fn compose_exclusion_in(
     current_instance_id: &str,
     extra: &HashSet<String>,
     live: &crate::tmux::LiveSessionSnapshot,
+    source: Option<&crate::session::ExecutionBinding>,
 ) -> HashSet<String> {
-    let mut set = build_exclusion_set(current_instance_id, live);
+    let mut set = build_exclusion_set(current_instance_id, live, source);
     set.extend(extra.iter().cloned());
     set
 }
 
-/// Build the capture exclusion set from live pane ownership, caller-provided
-/// exclusions, and conversation ids parked by peer engine swaps.
-///
-/// A peer still owns every parked id until it swaps back. Exclude all of
-/// them rather than re-resolving a raw alias through mutable profile config.
+/// Include parked ownership in the source namespace, retaining unknown owners conservatively.
 pub(crate) fn compose_exclusion_with_persisted_peers(
     current_instance_id: &str,
     current_project_path: &str,
     profile: &str,
     retroactive_capture_excludes: &HashSet<String>,
+    source: Option<&crate::session::ExecutionBinding>,
 ) -> HashSet<String> {
-    // One observation for the whole pass. Both halves consult tmux: the
-    // cross-instance scan needs the live session names, and the walk below
-    // visits every stored session sharing the project path, trashed ones
-    // included, so a per-instance liveness probe costs a fork each. A store of
-    // a few hundred sessions made that the dominant cost of the pass.
-    // `names() == None` (server unreachable) reads as "no live pane" here,
-    // which is what the per-item probe already did when its own
-    // `list-sessions` failed, and this pass re-runs.
     let live = crate::tmux::LiveSessionSnapshot::new();
-    let mut set = compose_exclusion_in(current_instance_id, retroactive_capture_excludes, &live);
+    let mut set = compose_exclusion_in(
+        current_instance_id,
+        retroactive_capture_excludes,
+        &live,
+        source,
+    );
     let Ok(storage) = crate::session::storage::Storage::new_unwatched(profile) else {
         return set;
     };
     let Ok(instances) = storage.load() else {
         return set;
     };
-    // Compare canonicalized paths, not raw strings: worktree sessions created
-    // from `../`-style templates historically stored an unnormalized
-    // `project_path` (e.g. `/repos/x/../x-worktrees/b`), and a raw comparison
-    // silently drops them from this exclusion even though they share the
-    // directory — re-opening the #2355 steal for exactly those peers (#2858).
+    // Deleted worktrees still need lexical path equivalence.
     let canonical_current = canonicalize_or_raw(current_project_path);
     for inst in instances {
         if inst.id == current_instance_id {
@@ -414,17 +399,16 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
         if canonicalize_or_raw(&inst.project_path) != canonical_current {
             continue;
         }
-        // A peer that swapped away still owns the conversation it parked and
-        // intends to resume it on a swap back. It is excluded regardless of the
-        // peer's current tool or liveness: its pane is running another engine,
-        // so the live tmux ownership scan cannot discover this id.
+        // Parked ownership does not depend on the peer's current engine or liveness.
         for parked in inst.prior_tool_session_ids.values() {
             if let Some(sid) = parked
                 .agent_session_id
                 .as_deref()
                 .filter(|sid| !sid.is_empty())
             {
-                set.insert(sid.to_string());
+                if owner_excludes(source, parked.agent_session_binding.as_ref(), sid) {
+                    set.insert(sid.to_string());
+                }
             }
         }
     }
@@ -446,6 +430,7 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
 fn build_exclusion_set(
     current_instance_id: &str,
     live: &crate::tmux::LiveSessionSnapshot,
+    source: Option<&crate::session::ExecutionBinding>,
 ) -> HashSet<String> {
     let Some(names) = live.names() else {
         return HashSet::new();
@@ -465,7 +450,9 @@ fn build_exclusion_set(
     let instance_ids = crate::tmux::env::get_hidden_env_batch(
         &aoe_sessions,
         crate::tmux::env::AOE_INSTANCE_ID_KEY,
-    );
+    )
+    .into_iter()
+    .collect::<std::collections::HashMap<_, _>>();
 
     let other_sessions: Vec<&str> = instance_ids
         .iter()
@@ -486,7 +473,67 @@ fn build_exclusion_set(
         crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
     );
 
-    captured_ids.into_iter().filter_map(|(_, id)| id).collect()
+    let mut owners = std::collections::HashMap::new();
+    if source.is_some() && captured_ids.iter().any(|(_, sid)| sid.is_some()) {
+        let owner_ids = instance_ids
+            .values()
+            .filter_map(Option::as_deref)
+            .collect::<HashSet<_>>();
+        let loaded = (|| -> Result<()> {
+            for profile in crate::session::list_profiles()? {
+                for instance in crate::session::Storage::open_unwatched(&profile)?.load()? {
+                    if !owner_ids.contains(instance.id.as_str()) {
+                        continue;
+                    }
+                    match owners.entry(instance.id) {
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert(instance.agent_session_binding.filter(|binding| {
+                                instance.agent_session_id.as_deref()
+                                    == Some(binding.session_id.as_str())
+                            }));
+                        }
+                        std::collections::hash_map::Entry::Occupied(mut entry) => {
+                            entry.insert(None);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if loaded.is_err() {
+            owners.clear();
+        }
+    }
+    captured_ids
+        .into_iter()
+        .filter_map(|(name, sid)| {
+            let sid = sid?;
+            let owner = instance_ids
+                .get(&name)
+                .and_then(Option::as_ref)
+                .and_then(|id| owners.get(id))
+                .and_then(Option::as_ref);
+            owner_excludes(source, owner, &sid).then_some(sid)
+        })
+        .collect()
+}
+
+fn owner_excludes(
+    source: Option<&crate::session::ExecutionBinding>,
+    owner: Option<&crate::session::ConversationBinding>,
+    sid: &str,
+) -> bool {
+    let owner = owner.filter(|binding| {
+        binding.session_id == sid
+            && binding.provenance != crate::session::ConversationProvenance::Unknown
+    });
+    match (
+        source,
+        owner.and_then(crate::session::ConversationBinding::key),
+    ) {
+        (Some(source), Some(owner)) => source.key(sid) == owner,
+        _ => true,
+    }
 }
 
 /// Spawn `cmd`, read stdout to EOF on a worker thread, and wait for the
@@ -910,6 +957,7 @@ pub(crate) fn codex_poll_fn_sandboxed_store(
     instance_id: String,
     capture_floor: std::time::SystemTime,
     extra_excludes: HashSet<String>,
+    source: Option<crate::session::ExecutionBinding>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
         let root = crate::session::AnchoredDir::open(&store).ok()?;
@@ -918,7 +966,7 @@ pub(crate) fn codex_poll_fn_sandboxed_store(
         let mut entries = Vec::new();
         collect_codex_sessions_anchored(&root, sessions, 0, &mut 0, &mut entries).ok()?;
         entries.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes, source.as_ref());
         entries.into_iter().find_map(|(relative, modified)| {
             if modified <= capture_floor {
                 return None;
@@ -1015,6 +1063,7 @@ pub(crate) fn gemini_poll_fn_sandboxed_store(
     instance_id: String,
     capture_floor: std::time::SystemTime,
     extra_excludes: HashSet<String>,
+    source: Option<crate::session::ExecutionBinding>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     use sha2::{Digest, Sha256};
 
@@ -1045,7 +1094,7 @@ pub(crate) fn gemini_poll_fn_sandboxed_store(
             })
             .collect::<Vec<_>>();
         candidates.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes, source.as_ref());
         candidates.into_iter().find_map(|(path, _)| {
             let (id, project_hash) = extract_gemini_fields_anchored(&root, &path)?;
             let id = id?;
@@ -1166,10 +1215,11 @@ pub(crate) fn kimi_poll_fn_sandboxed_store(
     instance_id: String,
     launch_time_ms: f64,
     extra_excludes: HashSet<String>,
+    source: Option<crate::session::ExecutionBinding>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
         let root = crate::session::AnchoredDir::open(&store).ok()?;
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes, source.as_ref());
         let sessions =
             read_kimi_session_index_anchored(&root, Path::new("session_index.jsonl")).ok()?;
         let canonical_match = canonicalize_or_raw(&container_workdir);
@@ -1344,22 +1394,21 @@ pub(crate) enum PrimeRootPublication {
 /// A pending root preserves an empty-conversation boundary instead of scanning older history.
 pub(crate) fn prime_agent_poll_fn_sandboxed(
     preferred_sidecar: Box<dyn Fn() -> Option<PrimeRootPublication> + Send + 'static>,
-    store: PathBuf,
-    session_dir: PathBuf,
-    container_workdir: String,
+    plan: crate::session::instance::PrimeAgentCapturePlan,
     instance_id: String,
     launch_time_ms: f64,
     extra_excludes: HashSet<String>,
+    source: Option<crate::session::ExecutionBinding>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes, source.as_ref());
         match preferred_sidecar() {
             Some(PrimeRootPublication::Ready(id)) if !exclusion.contains(&id) => Some(id),
             Some(PrimeRootPublication::Pending(id)) if !exclusion.contains(&id) => None,
             _ => prime_agent_store_session_id(
-                &store,
-                &session_dir,
-                &container_workdir,
+                &plan.store,
+                &plan.session_dir,
+                &plan.container_cwd,
                 &exclusion,
                 launch_time_ms,
             ),
@@ -1593,6 +1642,7 @@ pub(crate) fn hermes_poll_fn_sandboxed_store(
     instance_id: String,
     capture_floor: std::time::SystemTime,
     extra_excludes: HashSet<String>,
+    source: Option<crate::session::ExecutionBinding>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     let started_after = capture_floor
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -1607,7 +1657,7 @@ pub(crate) fn hermes_poll_fn_sandboxed_store(
         let scan =
             read_hermes_sessions_from_sqlite(&root.path().join(db_relative), Some(started_after))
                 .ok()?;
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes, source.as_ref());
         select_hermes_session_id(&scan, &container_cwd, &exclusion)
             .ok()
             .and_then(validated_session_id)
@@ -1791,12 +1841,69 @@ mod tests {
         // both facts rather than being reconstructed from current config.
         crate::tmux::status_rules::install_from_config(PROFILE, &crate::session::Config::default());
 
-        let exclusions =
-            compose_exclusion_with_persisted_peers("current", project, PROFILE, &HashSet::new());
-        assert!(
-            exclusions.contains(parked_sid),
-            "a conversation parked under an alias belongs to the same built-in store"
+        let exclusions = compose_exclusion_with_persisted_peers(
+            "current",
+            project,
+            PROFILE,
+            &HashSet::new(),
+            None,
         );
+        assert!(exclusions.contains(parked_sid));
+        let source = crate::session::ExecutionBinding {
+            agent: "claude".into(),
+            stores: vec![PathBuf::from("/store-a")],
+            configuration: Vec::new(),
+            cwd: project.into(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+        };
+        for (store, provenance, excluded) in [
+            (
+                "/store-a",
+                crate::session::ConversationProvenance::Observed,
+                true,
+            ),
+            (
+                "/store-b",
+                crate::session::ConversationProvenance::Observed,
+                false,
+            ),
+            (
+                "/store-b",
+                crate::session::ConversationProvenance::Unknown,
+                true,
+            ),
+        ] {
+            let mut owner = source.clone();
+            owner.stores = vec![store.into()];
+            storage
+                .update(|instances, _| {
+                    instances[0]
+                        .prior_tool_session_ids
+                        .get_mut("claude-personal")
+                        .unwrap()
+                        .agent_session_binding = Some(crate::session::ConversationBinding {
+                        session_id: parked_sid.into(),
+                        execution: Some(owner.clone()),
+                        provenance: provenance.clone(),
+                        transcript_path: None,
+                    });
+                    Ok(())
+                })
+                .unwrap();
+            let exclusions = compose_exclusion_with_persisted_peers(
+                "current",
+                project,
+                PROFILE,
+                &HashSet::new(),
+                Some(&source),
+            );
+            assert_eq!(
+                exclusions.contains(parked_sid),
+                excluded,
+                "{store} {provenance:?}"
+            );
+        }
     }
 
     #[test]
@@ -1923,6 +2030,7 @@ mod tests {
         let result = build_exclusion_set(
             "nonexistent-instance-id-12345",
             &crate::tmux::LiveSessionSnapshot::new(),
+            None,
         );
         // The exclusion set should never contain our own instance ID
         // (it collects OTHER instances' captured session IDs).
@@ -2356,6 +2464,7 @@ mod tests {
             "current".to_string(),
             capture_floor(2_000),
             HashSet::new(),
+            None,
         );
         assert_eq!(poll().as_deref(), Some(fresh_id));
     }
@@ -2439,6 +2548,7 @@ mod tests {
             "current".to_string(),
             capture_floor(100),
             HashSet::new(),
+            None,
         );
         let started = Instant::now();
         assert_eq!(poll().as_deref(), Some(good_id));
@@ -2486,6 +2596,7 @@ mod tests {
             "current".to_string(),
             capture_floor(2_000),
             HashSet::new(),
+            None,
         );
         assert_eq!(poll().as_deref(), Some(fresh_id));
     }
@@ -2537,6 +2648,7 @@ mod tests {
             "current".to_string(),
             capture_floor(100),
             HashSet::new(),
+            None,
         );
         let started = Instant::now();
         assert_eq!(poll().as_deref(), Some("gemini_good"));
@@ -2552,6 +2664,7 @@ mod tests {
             "current".to_string(),
             capture_floor(100),
             HashSet::new(),
+            None,
         );
         assert_eq!(poll(), None);
     }
@@ -2584,6 +2697,7 @@ mod tests {
             "current".to_string(),
             capture_floor(2_000),
             HashSet::new(),
+            None,
         );
         assert_eq!(poll().as_deref(), Some("hermes_fresh"));
     }
@@ -2610,6 +2724,7 @@ mod tests {
             "current".to_string(),
             capture_floor(0),
             HashSet::new(),
+            None,
         );
         assert_eq!(poll(), None);
         std::fs::remove_file(store.path().join("state.db")).unwrap();
@@ -2681,6 +2796,7 @@ mod tests {
             "current".to_string(),
             2_000_001.0,
             HashSet::new(),
+            None,
         );
         assert_eq!(poll().as_deref(), Some("kimi_fresh"));
     }
@@ -2712,6 +2828,7 @@ mod tests {
             "current".to_string(),
             0.0,
             HashSet::new(),
+            None,
         );
         assert_eq!(poll().as_deref(), Some("kimi_good"));
         std::fs::remove_dir(good).unwrap();
@@ -2760,48 +2877,49 @@ mod tests {
         child_header["rlmDepth"] = serde_json::json!(1);
         std::fs::write(&child, format!("{child_header}\n")).unwrap();
         set_mtime_seconds(&child, 5_000);
-
+        let plan = crate::session::instance::PrimeAgentCapturePlan {
+            store: tmp.path().to_path_buf(),
+            session_dir: session_dir.clone(),
+            container_session_dir: PathBuf::from("/session-fixture"),
+            container_cwd: "/workspace".into(),
+        };
         let poll = prime_agent_poll_fn_sandboxed(
             Box::new(|| None),
-            tmp.path().to_path_buf(),
-            session_dir.clone(),
-            "/workspace".to_string(),
+            plan.clone(),
             "current".to_string(),
             2_000_001.0,
             HashSet::new(),
+            None,
         );
         assert_eq!(poll().as_deref(), Some("prime_fresh"));
 
         let preferred = prime_agent_poll_fn_sandboxed(
             Box::new(|| Some(PrimeRootPublication::Ready("prime_parent".to_string()))),
-            tmp.path().to_path_buf(),
-            session_dir.clone(),
-            "/workspace".to_string(),
+            plan.clone(),
             "current".to_string(),
             2_000_001.0,
             HashSet::new(),
+            None,
         );
         assert_eq!(preferred().as_deref(), Some("prime_parent"));
 
         let excluded_preferred = prime_agent_poll_fn_sandboxed(
             Box::new(|| Some(PrimeRootPublication::Ready("prime_parent".to_string()))),
-            tmp.path().to_path_buf(),
-            session_dir.clone(),
-            "/workspace".to_string(),
+            plan.clone(),
             "current".to_string(),
             2_000_001.0,
             HashSet::from(["prime_parent".to_string()]),
+            None,
         );
         assert_eq!(excluded_preferred().as_deref(), Some("prime_fresh"));
 
         let all_excluded = prime_agent_poll_fn_sandboxed(
             Box::new(|| Some(PrimeRootPublication::Ready("prime_parent".to_string()))),
-            tmp.path().to_path_buf(),
-            session_dir,
-            "/workspace".to_string(),
+            plan,
             "current".to_string(),
             2_000_001.0,
             HashSet::from(["prime_parent".to_string(), "prime_fresh".to_string()]),
+            None,
         );
         assert_eq!(all_excluded(), None);
     }

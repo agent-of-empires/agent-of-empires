@@ -147,7 +147,7 @@ const ORPHAN_SCAN_MIN_SID_LEN: usize = 8;
 /// on the same hook presence as `status_hook_env_prefix`, so it tracks exactly
 /// the agents whose live process carries the anchored env marker.
 fn agent_injects_instance_id_env(inst: &Instance) -> bool {
-    inst.resolved_agent()
+    inst.status_agent()
         .is_some_and(|agent| agent.hook_config.is_some() || agent.sidecar_hooks.is_some())
 }
 

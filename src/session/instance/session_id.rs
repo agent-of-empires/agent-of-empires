@@ -300,7 +300,7 @@ impl Instance {
             .context("Prime capture requires a managed container")?;
         let root = container
             .runtime
-            .canonical_path(&container.name, Path::new(PRIME_AGENT_DIR_IN_CONTAINER))?;
+            .canonical_path(&container.id, Path::new(PRIME_AGENT_DIR_IN_CONTAINER))?;
         let store = container
             .host_path(&root, true)
             .context("Prime store is not mounted from a writable local filesystem")?;
@@ -312,7 +312,7 @@ impl Instance {
             options.cwd = Some(
                 container
                     .runtime
-                    .canonical_path(&container.name, &cwd)?
+                    .canonical_path(&container.id, &cwd)?
                     .to_str()
                     .context("Prime working directory is not UTF-8")?
                     .to_owned(),
@@ -336,10 +336,7 @@ impl Instance {
                 })
                 .map(String::as_str),
             |path, writable| {
-                let path = container
-                    .runtime
-                    .canonical_path(&container.name, path)
-                    .ok()?;
+                let path = container.runtime.canonical_path(&container.id, path).ok()?;
                 container.host_path(&path, writable)
             },
         )
@@ -2289,12 +2286,13 @@ await publish({}, { sessionManager: {
         );
         let poll = crate::session::capture::prime_agent_poll_fn_sandboxed(
             inst.prime_root_sidecar_poll_fn(plan.clone()),
-            plan.store.clone(),
-            plan.session_dir.clone(),
-            plan.container_cwd.clone(),
+            plan.clone(),
             inst.id.clone(),
             0.0,
             HashSet::new(),
+            inst.active_execution
+                .as_ref()
+                .map(|active| active.binding.clone()),
         );
         assert_eq!(
             poll(),

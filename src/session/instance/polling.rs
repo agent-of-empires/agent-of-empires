@@ -405,7 +405,7 @@ impl Instance {
                 Some(active) => active
                     .container
                     .as_ref()
-                    .map(|container| container.name.clone()),
+                    .map(|container| container.id.clone()),
                 None => self
                     .sandbox_info
                     .as_ref()
@@ -506,6 +506,9 @@ impl Instance {
                     self.id.clone(),
                     capture_floor,
                     extra_excludes,
+                    self.active_execution
+                        .as_ref()
+                        .map(|active| active.binding.clone()),
                 ))
             }
             crate::agents::SessionCaptureBackend::Gemini => {
@@ -518,6 +521,9 @@ impl Instance {
                     self.id.clone(),
                     capture_floor,
                     extra_excludes,
+                    self.active_execution
+                        .as_ref()
+                        .map(|active| active.binding.clone()),
                 ))
             }
             crate::agents::SessionCaptureBackend::Hermes => {
@@ -530,6 +536,9 @@ impl Instance {
                     self.id.clone(),
                     capture_floor,
                     extra_excludes,
+                    self.active_execution
+                        .as_ref()
+                        .map(|active| active.binding.clone()),
                 ))
             }
             crate::agents::SessionCaptureBackend::Kimi => {
@@ -542,6 +551,9 @@ impl Instance {
                     self.id.clone(),
                     capture_floor_ms,
                     extra_excludes,
+                    self.active_execution
+                        .as_ref()
+                        .map(|active| active.binding.clone()),
                 ))
             }
             crate::agents::SessionCaptureBackend::PrimeAgent => {
@@ -551,12 +563,13 @@ impl Instance {
                 let preferred_sidecar = self.prime_root_sidecar_poll_fn(plan.clone());
                 Box::new(prime_agent_poll_fn_sandboxed(
                     preferred_sidecar,
-                    plan.store,
-                    plan.session_dir,
-                    plan.container_cwd,
+                    plan,
                     self.id.clone(),
                     capture_floor_ms,
                     extra_excludes,
+                    self.active_execution
+                        .as_ref()
+                        .map(|active| active.binding.clone()),
                 ))
             }
             crate::agents::SessionCaptureBackend::Claude

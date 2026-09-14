@@ -203,11 +203,6 @@ impl Instance {
             "agent launch command prepared"
         );
 
-        if !prepared.is_existing {
-            if let Some(prior_sid) = prepared.expected_conversation.session_id.as_ref() {
-                self.retroactive_capture_excludes.insert(prior_sid.clone());
-            }
-        }
         self.clear_pane_identity_sidecar();
 
         let mut omp_capture_metadata = if let Some(plan) = prepared.omp_capture_plan {
@@ -315,6 +310,23 @@ impl Instance {
         } else {
             self.active_execution = None;
             self.agent_session_binding = None;
+        }
+        if !prepared.is_existing {
+            if let Some(prior_sid) = prepared.expected_conversation.session_id.as_ref() {
+                let emitted = self.agent_session_id.as_ref() == Some(prior_sid)
+                    && self.agent_session_binding.as_ref().is_some_and(|binding| {
+                        binding.session_id == *prior_sid
+                            && binding.provenance == ConversationProvenance::Preallocated
+                            && self.active_execution.as_ref().is_some_and(|execution| {
+                                binding.execution.as_ref() == Some(&execution.binding)
+                            })
+                    });
+                if emitted {
+                    self.retroactive_capture_excludes.remove(prior_sid);
+                } else {
+                    self.retroactive_capture_excludes.insert(prior_sid.clone());
+                }
+            }
         }
         self.finalize_launch(
             session.name(),

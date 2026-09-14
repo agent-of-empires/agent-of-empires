@@ -606,7 +606,7 @@ impl Instance {
                 Some(snapshot) => {
                     snapshot
                         .runtime
-                        .exec_shell_command(&snapshot.name, Some(&env_part), cmd)
+                        .exec_shell_command(&snapshot.id, Some(&env_part), cmd)
                 }
                 None => fallback_container
                     .as_ref()
@@ -706,7 +706,7 @@ impl Instance {
             fallback_profile = self.effective_profile();
             &fallback_profile
         };
-        let mut env_prefix = status_hook_env_prefix(profile, &self.id, agent);
+        let mut env_prefix = status_hook_env_prefix(profile, &self.id, self.status_agent());
         // A verified direct Pi command publishes through the same extension
         // whether it came from the built-in command or an exact alias.
         self.pi_extension_launched = false;

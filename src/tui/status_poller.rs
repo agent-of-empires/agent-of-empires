@@ -203,7 +203,7 @@ pub(super) fn poll_statuses_once(
                 .copied()
                 == Some(false);
             if !stopped {
-                match instance.predates_shared_credential(&container, &instance.detect_as) {
+                match instance.predates_shared_credential(&container, instance.get_tool_command()) {
                     Ok(false) => {}
                     Ok(true) => continue,
                     Err(error) => {
