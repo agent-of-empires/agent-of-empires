@@ -18,6 +18,11 @@ pub(crate) struct AnchoredDir {
     fd: OwnedFd,
 }
 
+pub(crate) struct FilePublication<'a> {
+    pub(crate) staging: &'a AnchoredDir,
+    pub(crate) validate: &'a dyn Fn() -> Result<()>,
+}
+
 impl AnchoredDir {
     /// Anchor at `path`, whose ancestors are resolved the way any other caller resolves them and
     /// whose own leaf may not be a symlink.
@@ -289,11 +294,15 @@ impl AnchoredDir {
         reader: &mut impl Read,
         permissions: std::fs::Permissions,
         replace: bool,
+        publication: Option<FilePublication<'_>>,
     ) -> Result<bool> {
         let (parent, leaf) = self.open_parent(relative)?;
+        let staging = publication
+            .as_ref()
+            .map_or(&parent, |publication| &publication.staging.fd);
         let temporary = format!(".aoe-copy-{}", uuid::Uuid::new_v4());
         let fd = openat(
-            &parent,
+            staging,
             temporary.as_str(),
             OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
             Mode::S_IRUSR | Mode::S_IWUSR,
@@ -304,11 +313,14 @@ impl AnchoredDir {
             std::io::copy(reader, &mut file).context("copying anchored file stage")?;
             file.set_permissions(permissions)?;
             file.sync_all()?;
+            if let Some(publication) = &publication {
+                (publication.validate)()?;
+            }
             if replace {
-                nix::fcntl::renameat(&parent, temporary.as_str(), &parent, leaf.as_os_str())?;
+                nix::fcntl::renameat(staging, temporary.as_str(), &parent, leaf.as_os_str())?;
             } else {
                 match crate::process::rename_exclusive(
-                    &parent,
+                    staging,
                     temporary.as_ref(),
                     &parent,
                     leaf.as_os_str(),
@@ -320,18 +332,26 @@ impl AnchoredDir {
                     Err(error) => return Err(error).context("publishing anchored file seed"),
                 }
             }
+            if publication.is_some() {
+                nix::unistd::fsync(staging)?;
+            }
             nix::unistd::fsync(&parent)?;
             Ok(true)
         })();
         if !matches!(result, Ok(true)) {
-            let _ = unlinkat(&parent, temporary.as_str(), UnlinkatFlags::NoRemoveDir);
+            let _ = unlinkat(staging, temporary.as_str(), UnlinkatFlags::NoRemoveDir);
         }
         result
     }
 
     /// The fully built stage remains available when another writer wins.
-    pub(crate) fn publish_directory(&self, stage: &Path, destination: &Path) -> Result<bool> {
-        let (source_parent, source_leaf) = self.open_parent(stage)?;
+    pub(crate) fn publish_directory(
+        &self,
+        source: &AnchoredDir,
+        stage: &Path,
+        destination: &Path,
+    ) -> Result<bool> {
+        let (source_parent, source_leaf) = source.open_parent(stage)?;
         let (target_parent, target_leaf) = self.open_parent(destination)?;
         match crate::process::rename_exclusive(
             &source_parent,
@@ -378,16 +398,26 @@ impl AnchoredDir {
             Err(error) if missing_or_hostile(&error) => return self.remove_file(relative),
             Err(error) => return Err(error),
         };
-        for name in child.read_dir(Path::new(""), usize::MAX)? {
+        child.remove_contents()?;
+        unlinkat(&parent, leaf.as_os_str(), UnlinkatFlags::RemoveDir)
+            .context("removing anchored staging directory")
+    }
+
+    /// Empty the pinned directory, never reopening its replaceable root path.
+    pub(crate) fn remove_contents(&self) -> Result<()> {
+        for name in self.read_dir(Path::new(""), usize::MAX)? {
             let path = Path::new(&name);
-            match child.child(path) {
-                Ok(_) => child.remove_staged_dir(path)?,
-                Err(error) if missing_or_hostile(&error) => child.remove_file(path)?,
+            match self.child(path) {
+                Ok(child) => {
+                    child.remove_contents()?;
+                    unlinkat(&self.fd, name.as_os_str(), UnlinkatFlags::RemoveDir)
+                        .context("removing emptied anchored child")?;
+                }
+                Err(error) if missing_or_hostile(&error) => self.remove_file(path)?,
                 Err(error) => return Err(error),
             }
         }
-        unlinkat(&parent, leaf.as_os_str(), UnlinkatFlags::RemoveDir)
-            .context("removing anchored staging directory")
+        Ok(())
     }
 
     fn modified(&self, relative: &Path, directory: bool) -> Result<Option<std::time::SystemTime>> {
@@ -552,5 +582,63 @@ mod tests {
         drop(pipe_guard);
         assert!(anchored.ensure_dir(Path::new("escape/child")).is_err());
         assert!(!outside.path().join("child").exists());
+    }
+
+    #[test]
+    fn rejected_file_stage_is_never_visible_in_the_active_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let active_path = directory.path().join("active");
+        let private_path = directory.path().join("private");
+        std::fs::create_dir(&active_path).unwrap();
+        std::fs::create_dir(&private_path).unwrap();
+        std::fs::write(active_path.join("config"), b"LOCAL_CONFIG").unwrap();
+        let active = AnchoredDir::open(&active_path).unwrap();
+        let private = AnchoredDir::open(&private_path).unwrap();
+        let reject = || {
+            let entries = std::fs::read_dir(&active_path)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            assert_eq!(entries, vec![std::ffi::OsString::from("config")]);
+            assert_eq!(
+                std::fs::read(active_path.join("config")).unwrap(),
+                b"LOCAL_CONFIG"
+            );
+            bail!("source changed before publication")
+        };
+        assert!(active
+            .publish_file(
+                Path::new("config"),
+                &mut &b"FOREIGN_CONTEXT"[..],
+                std::fs::Permissions::from_mode(0o600),
+                true,
+                Some(FilePublication {
+                    staging: &private,
+                    validate: &reject
+                })
+            )
+            .is_err());
+        assert_eq!(
+            std::fs::read(active_path.join("config")).unwrap(),
+            b"LOCAL_CONFIG"
+        );
+        let accept = || Ok(());
+        active
+            .publish_file(
+                Path::new("config"),
+                &mut &b"APPROVED_CONFIG"[..],
+                std::fs::Permissions::from_mode(0o600),
+                true,
+                Some(FilePublication {
+                    staging: &private,
+                    validate: &accept,
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            std::fs::read(active_path.join("config")).unwrap(),
+            b"APPROVED_CONFIG"
+        );
     }
 }
