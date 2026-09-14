@@ -177,7 +177,7 @@ fn drain_and_persist_session_ids_inner(
                 filtered_ids.insert(inst.id.clone());
                 continue;
             }
-            if inst.retroactive_capture_excludes.contains(&sid) {
+            if inst.is_capture_excluded(&sid, observation.source.as_ref()) {
                 tracing::debug!(
                     target: "session.sync",
                     instance = %inst.id,
@@ -1129,7 +1129,9 @@ mod tests {
         inst.source_profile = profile.to_string();
         inst.agent_session_id = Some("original-sid".to_string());
         inst.retroactive_capture_excludes
-            .insert(excluded.to_string());
+            .insert(crate::session::ConversationBinding::unknown(
+                excluded.to_string(),
+            ));
         seed_instance_on_disk(profile, &inst);
 
         attach_poller_with_update(&mut inst, excluded);

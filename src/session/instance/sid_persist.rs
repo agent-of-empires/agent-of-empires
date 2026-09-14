@@ -89,28 +89,37 @@ pub(super) fn persist_session_with_storage(
         if let ResumeIntent::Use(pinned) = &instance.resume_intent {
             if pinned != session_id
                 || instance.resume_binding.as_ref().is_some_and(|target| {
-                    target.execution
+                    target.execution.as_ref()
                         != binding
                             .as_ref()
-                            .and_then(|binding| binding.execution.clone())
+                            .and_then(|binding| binding.execution.as_ref())
                 })
             {
                 return Ok(SidWrite::Skipped);
             }
         }
+        if instance.is_capture_excluded(session_id, observation.source.as_ref()) {
+            return Ok(SidWrite::Skipped);
+        }
+        let owns = |sid: Option<&str>, owner: Option<&ConversationBinding>| {
+            sid == Some(session_id)
+                && crate::session::capture::owner_excludes(
+                    observation.source.as_ref(),
+                    owner,
+                    session_id,
+                )
+        };
         let conflict = instances.iter().any(|peer| {
             peer.id != instance_id
-                && peer.agent_session_id.as_deref() == Some(session_id)
-                && match (
-                    binding.as_ref().and_then(ConversationBinding::key),
-                    peer.agent_session_binding
-                        .as_ref()
-                        .filter(|binding| binding.session_id == session_id)
-                        .and_then(ConversationBinding::key),
-                ) {
-                    (Some(target), Some(peer)) => target == peer,
-                    _ => true,
-                }
+                && (owns(
+                    peer.agent_session_id.as_deref(),
+                    peer.agent_session_binding.as_ref(),
+                ) || peer.prior_tool_session_ids.values().any(|parked| {
+                    owns(
+                        parked.agent_session_id.as_deref(),
+                        parked.agent_session_binding.as_ref(),
+                    )
+                }))
         });
         if conflict {
             return Ok(SidWrite::Skipped);
@@ -215,31 +224,43 @@ impl Instance {
             }
             if let Some(sid) = new_sid_for_closure.as_deref() {
                 let binding = self.agent_session_binding.as_ref().filter(|binding| binding.session_id == sid);
-                let holders: Vec<usize> = instances.iter().enumerate()
-                    .filter(|(_, peer)| peer.id != instance_id && peer.agent_session_id.as_deref() == Some(sid))
-                    .filter(|(_, peer)| match (binding.and_then(ConversationBinding::key), peer.agent_session_binding.as_ref().filter(|binding| binding.session_id == sid).and_then(ConversationBinding::key)) {
-                        (Some(target), Some(peer)) => target == peer,
-                        _ => true,
-                    })
-                    .map(|(index, _)| index).collect();
+                let source = binding.filter(|binding| binding.provenance != ConversationProvenance::Unknown)
+                    .and_then(|binding| binding.execution.as_ref());
+                let owns = |id: Option<&str>, owner: Option<&ConversationBinding>| {
+                    id == Some(sid) && crate::session::capture::owner_excludes(source, owner, sid)
+                };
                 let consumed_pin = matches!(&expected_prior_intent_for_closure, ResumeIntent::Use(pinned) if pinned == sid)
                     && binding.is_some_and(ConversationBinding::is_known)
                     && expected.resume_binding.as_ref() == binding;
-                if !holders.is_empty() && (!consumed_pin || holders.iter().any(|index| {
-                    !instances[*index].agent_session_binding.as_ref().is_some_and(ConversationBinding::is_known)
-                })) {
+                let refuses_transfer = |id: Option<&str>, owner: Option<&ConversationBinding>| {
+                    owns(id, owner) && (!consumed_pin || !owner.filter(|binding| binding.session_id == sid).is_some_and(ConversationBinding::is_known))
+                };
+                if instances.iter().filter(|peer| peer.id != instance_id).any(|peer| {
+                    refuses_transfer(peer.agent_session_id.as_deref(), peer.agent_session_binding.as_ref())
+                        || peer.prior_tool_session_ids.values().any(|parked| refuses_transfer(parked.agent_session_id.as_deref(), parked.agent_session_binding.as_ref()))
+                }) {
                     return Ok(SidWrite::Skipped);
                 }
-                for holder in holders {
-                    let peer = &mut instances[holder];
-                    cleared_holder_ids.push(peer.id.clone());
-                    peer.set_agent_conversation(None, None, None);
-                    peer.resume_probe_failed_sid = None;
+                for peer in instances.iter_mut().filter(|peer| peer.id != instance_id) {
+                    if owns(peer.agent_session_id.as_deref(), peer.agent_session_binding.as_ref()) {
+                        cleared_holder_ids.push(peer.id.clone());
+                        peer.set_agent_conversation(None, None, None);
+                        peer.resume_probe_failed_sid = None;
+                    }
+                    peer.prior_tool_session_ids.retain(|_, parked| {
+                        if owns(parked.agent_session_id.as_deref(), parked.agent_session_binding.as_ref()) {
+                            parked.agent_session_id = None;
+                            parked.agent_session_binding = None;
+                            parked.pi_session_path = None;
+                        }
+                        !parked.is_empty()
+                    });
                 }
             }
             let instance = &mut instances[index];
             instance.set_agent_conversation(new_sid_for_closure.clone(), self.agent_session_binding.clone(), self.pi_session_path.clone());
             instance.active_execution = self.active_execution.clone();
+            instance.retroactive_capture_excludes.clone_from(&self.retroactive_capture_excludes);
             instance.resume_probe_failed_sid = None;
             if promote_one_shot {
                 instance.resume_intent = ResumeIntent::Default;
@@ -1109,6 +1130,92 @@ mod tests {
 
         #[test]
         #[serial]
+        fn capture_respects_parked_owners_and_abandoned_namespaces() {
+            use crate::session::instance::{ActiveExecution, PriorToolSession};
+            use crate::session::{ConversationBinding, ConversationProvenance, ExecutionBinding};
+            let temp = tempdir().unwrap();
+            let _guard = storage_home_guard(&temp);
+            let profile = "guards-scoped-exclusions";
+            let source = ExecutionBinding {
+                agent: "omp".into(),
+                stores: vec![temp.path().join("sessions/bucket")],
+                configuration: Vec::new(),
+                cwd: temp.path().into(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+            };
+            for own in [false, true] {
+                for namespace in ["same", "different", "unknown"] {
+                    let mut claimant = make_inst(profile, "claimant");
+                    let mut search = source.clone();
+                    search.stores = vec![temp.path().join("sessions")];
+                    claimant.active_execution = Some(ActiveExecution {
+                        launch_id: "qualified-launch".into(),
+                        binding: search,
+                        capture: None,
+                        container: None,
+                    });
+                    let mut bound = source.clone();
+                    if namespace == "different" {
+                        bound.stores = vec![temp.path().join("other-store/bucket")];
+                    }
+                    let binding = if namespace == "unknown" {
+                        ConversationBinding::unknown(SID_X)
+                    } else {
+                        ConversationBinding {
+                            session_id: SID_X.into(),
+                            execution: Some(bound),
+                            provenance: ConversationProvenance::Observed,
+                            transcript_path: None,
+                        }
+                    };
+                    let mut peer = make_inst(profile, "parked-owner");
+                    if own {
+                        seed(profile, &[&peer, &claimant]);
+                        claimant.retroactive_capture_excludes.insert(binding);
+                        let expected = claimant.conversation_state();
+                        let storage = Storage::new_unwatched(profile).unwrap();
+                        let _ = claimant.persist_session_id_with_storage(&storage, &expected);
+                    } else {
+                        peer.prior_tool_session_ids.insert(
+                            "omp".into(),
+                            PriorToolSession {
+                                agent_session_id: Some(SID_X.into()),
+                                agent_session_binding: Some(binding),
+                                ..Default::default()
+                            },
+                        );
+                        seed(profile, &[&peer, &claimant]);
+                    }
+                    let mut observed =
+                        crate::session::poller::SessionIdObservation::unguarded(SID_X.into());
+                    observed.execution = claimant.active_execution.clone();
+                    observed.source = Some(source.clone());
+                    let applied = namespace == "different";
+                    assert_eq!(
+                        persist_session_to_storage(
+                            profile,
+                            &claimant.id,
+                            &observed,
+                            &claimant.conversation_state(),
+                            &FileWatchService::noop()
+                        ),
+                        if applied {
+                            SidWrite::Applied
+                        } else {
+                            SidWrite::Skipped
+                        },
+                        "own={own}, namespace={namespace}"
+                    );
+                    let rows = load(profile);
+                    let saved = rows.iter().find(|row| row.id == claimant.id).unwrap();
+                    assert_eq!(saved.agent_session_id.as_deref(), applied.then_some(SID_X));
+                }
+            }
+        }
+
+        #[test]
+        #[serial]
         fn persist_rejects_sid_contradicting_on_disk_pin() {
             let temp = tempdir().unwrap();
             let _guard = storage_home_guard(&temp);
@@ -1215,15 +1322,28 @@ mod tests {
             stale_holder.set_agent_conversation(Some(SID_X.into()), Some(binding.clone()), None);
             let mut second_holder = make_inst(profile, "second-holder");
             second_holder.set_agent_conversation(Some(SID_X.into()), Some(binding.clone()), None);
+            let mut parked_holder = make_inst(profile, "parked-holder");
+            parked_holder.prior_tool_session_ids.insert(
+                "claude".into(),
+                crate::session::instance::PriorToolSession {
+                    agent_session_id: Some(SID_X.into()),
+                    agent_session_binding: Some(binding.clone()),
+                    acp_session_id: Some("independent-acp-history".into()),
+                    pi_session_path: None,
+                },
+            );
             let mut pinned = make_inst(profile, "pinned");
             pinned.resume_intent = ResumeIntent::Use(SID_X.into());
             pinned.resume_binding = Some(binding.clone());
             let expected = pinned.conversation_state();
-            seed(profile, &[&stale_holder, &second_holder, &pinned]);
+            seed(
+                profile,
+                &[&stale_holder, &second_holder, &parked_holder, &pinned],
+            );
 
             let storage = Storage::new_unwatched(profile).unwrap();
             let mut live = pinned.clone();
-            live.set_agent_conversation(Some(SID_X.into()), Some(binding), None);
+            live.set_agent_conversation(Some(SID_X.into()), Some(binding.clone()), None);
             live.identity_publisher_launched = true;
             let outcome = live.persist_session_id_with_storage(&storage, &expected);
 
@@ -1258,6 +1378,42 @@ mod tests {
                     .agent_session_id,
                 None,
                 "every duplicate holder must be relieved, not just the first"
+            );
+            let parked = &disk
+                .iter()
+                .find(|row| row.id == parked_holder.id)
+                .unwrap()
+                .prior_tool_session_ids["claude"];
+            assert!(parked.agent_session_id.is_none());
+            assert_eq!(
+                parked.acp_session_id.as_deref(),
+                Some("independent-acp-history")
+            );
+
+            parked_holder
+                .prior_tool_session_ids
+                .get_mut("claude")
+                .unwrap()
+                .agent_session_binding = None;
+            seed(profile, &[&parked_holder, &pinned]);
+            let mut refused = pinned.clone();
+            refused.set_agent_conversation(Some(SID_X.into()), Some(binding), None);
+            let _ = refused.persist_session_id_with_storage(&storage, &expected);
+            let disk = load(profile);
+            assert!(disk
+                .iter()
+                .find(|row| row.id == pinned.id)
+                .unwrap()
+                .agent_session_id
+                .is_none());
+            assert_eq!(
+                disk.iter()
+                    .find(|row| row.id == parked_holder.id)
+                    .unwrap()
+                    .prior_tool_session_ids["claude"]
+                    .agent_session_id
+                    .as_deref(),
+                Some(SID_X)
             );
         }
 

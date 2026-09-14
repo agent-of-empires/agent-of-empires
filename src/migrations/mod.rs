@@ -39,12 +39,13 @@ mod v026_repoint_acp_default_agent;
 pub(crate) mod v027_isolate_sandbox_stores;
 mod v028_clear_archived_live_status;
 mod v029_conversation_provenance;
+mod v030_bound_capture_exclusions;
 
 use anyhow::Result;
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 29;
+const CURRENT_VERSION: u32 = 30;
 const VERSION_FILE: &str = ".schema_version";
 
 struct Migration {
@@ -198,6 +199,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 29,
         name: "conversation_provenance",
         run: v029_conversation_provenance::run,
+    },
+    Migration {
+        version: 30,
+        name: "bound_capture_exclusions",
+        run: v030_bound_capture_exclusions::run,
     },
 ];
 

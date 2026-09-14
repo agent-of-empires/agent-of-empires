@@ -565,7 +565,10 @@ impl Instance {
 
         match self.prime_root_publication() {
             Some(PrimeRootPublication::Ready(id))
-                if !self.retroactive_capture_excludes.contains(&id) =>
+                if !self.is_capture_excluded(
+                    &id,
+                    self.active_execution.as_ref().map(|active| &active.binding),
+                ) =>
             {
                 let binding = self
                     .prime_root_observation(id.clone())
@@ -574,7 +577,10 @@ impl Instance {
                 return (Some(id), true);
             }
             Some(PrimeRootPublication::Pending(id))
-                if !self.retroactive_capture_excludes.contains(&id) =>
+                if !self.is_capture_excluded(
+                    &id,
+                    self.active_execution.as_ref().map(|active| &active.binding),
+                ) =>
             {
                 self.set_agent_conversation(None, None, None);
                 self.resume_probe_failed_sid = None;
@@ -817,7 +823,7 @@ impl Instance {
             }
             _ => self.try_retroactive_capture()?,
         };
-        if self.retroactive_capture_excludes.contains(&observation.sid) {
+        if self.is_capture_excluded(&observation.sid, observation.source.as_ref()) {
             return None;
         }
         if self.agent_session_id.as_ref() == Some(&observation.sid)
@@ -1137,12 +1143,18 @@ impl Instance {
         }
         let target = match self.prime_root_publication() {
             Some(PrimeRootPublication::Ready(id))
-                if !self.retroactive_capture_excludes.contains(&id) =>
+                if !self.is_capture_excluded(
+                    &id,
+                    self.active_execution.as_ref().map(|active| &active.binding),
+                ) =>
             {
                 Some(id)
             }
             Some(PrimeRootPublication::Pending(id))
-                if !self.retroactive_capture_excludes.contains(&id) =>
+                if !self.is_capture_excluded(
+                    &id,
+                    self.active_execution.as_ref().map(|active| &active.binding),
+                ) =>
             {
                 None
             }
@@ -2583,7 +2595,7 @@ process.stdout.write(JSON.stringify({ rootOnly, defaultMode }));
             excluded.agent_session_id = stored.clone();
             excluded
                 .retroactive_capture_excludes
-                .insert(newer_id.to_string());
+                .insert(ConversationBinding::unknown(newer_id.to_string()));
             let mut command = "prime-agent".to_string();
             excluded
                 .apply_session_flags(&mut command, "test", excluded.resolved_agent(), None)
@@ -2594,7 +2606,7 @@ process.stdout.write(JSON.stringify({ rootOnly, defaultMode }));
         let mut excluded = restarted.clone();
         excluded
             .retroactive_capture_excludes
-            .insert(newer_id.to_string());
+            .insert(ConversationBinding::unknown(newer_id.to_string()));
         let excluded_launch = excluded
             .refresh_prepared_prime_launch_after_pane_stop(excluded_prepared)
             .unwrap();

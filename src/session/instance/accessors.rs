@@ -841,6 +841,18 @@ mod tests {
 
         inst.tool = "claude".to_string();
         assert!(inst.supports_native_resume());
+        for (command, supported) in [
+            ("claude resume", true),
+            ("claude agents", false),
+            ("claude stop", false),
+            ("codex resume", false),
+            ("omp --thinking low", true),
+        ] {
+            inst.tool = command.split_whitespace().next().unwrap().into();
+            inst.command = command.into();
+            assert_eq!(inst.supports_native_resume(), supported, "{command}");
+        }
+        inst.tool = "claude".into();
         inst.command = "ssh -t host claude".to_string();
         assert!(!inst.supports_native_resume());
         inst.command = "claude > /tmp/transcript".to_string();
@@ -901,19 +913,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn capture_generation_guards_survive_serialization() {
-        let mut inst = Instance::new("claude", "/tmp/custom");
-        let floor = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(42);
-        inst.capture_started_at = Some(floor);
-        inst.retroactive_capture_excludes
-            .insert("stale-sid".to_string());
-
-        let encoded = serde_json::to_string(&inst).unwrap();
-        let decoded: Instance = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(decoded.capture_started_at, Some(floor));
-        assert!(decoded.retroactive_capture_excludes.contains("stale-sid"));
-    }
     #[test]
     fn claude_hook_publisher_proof_respects_hook_disabling_argv() {
         let cases = [

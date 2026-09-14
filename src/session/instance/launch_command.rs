@@ -475,6 +475,13 @@ impl Instance {
         &mut self,
         prepared: PreparedLaunch,
     ) -> Result<PreparedLaunch> {
+        if !prepared.is_existing {
+            self.set_agent_conversation(
+                prepared.expected_conversation.session_id.clone(),
+                prepared.expected_conversation.binding.clone(),
+                prepared.expected_conversation.pi_session_path.clone(),
+            );
+        }
         self.absorb_published_prime_session();
         let mut refreshed = self.prepare_launch_command(prepared.expected_conversation)?;
         refreshed.expected_prior_omp_generation = prepared.expected_prior_omp_generation;

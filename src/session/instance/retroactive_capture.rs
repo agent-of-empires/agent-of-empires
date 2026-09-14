@@ -3,15 +3,23 @@
 use super::*;
 
 impl Instance {
-    /// Full set of session IDs capture must skip for this instance.
-    pub(super) fn retroactive_capture_exclusion_set(&self) -> HashSet<String> {
+    pub(super) fn retroactive_capture_exclusion_set(
+        &self,
+        source: Option<&ExecutionBinding>,
+    ) -> HashSet<String> {
         crate::session::capture::compose_exclusion_with_persisted_peers(
             &self.id,
             &self.project_path,
             &self.effective_profile(),
             &self.retroactive_capture_excludes,
-            self.active_execution.as_ref().map(|active| &active.binding),
+            source,
         )
+    }
+
+    pub(crate) fn is_capture_excluded(&self, sid: &str, source: Option<&ExecutionBinding>) -> bool {
+        self.retroactive_capture_excludes
+            .iter()
+            .any(|binding| binding.excludes_capture(sid, source))
     }
 
     pub(crate) fn try_retroactive_capture(
@@ -26,21 +34,27 @@ impl Instance {
         ) {
             return None;
         }
-        let exclusion = self.retroactive_capture_exclusion_set();
-        let result = match backend {
+        let exclusion = HashSet::new();
+        match backend {
             crate::agents::SessionCaptureBackend::Claude
             | crate::agents::SessionCaptureBackend::HookSidecar => {
-                return super::execution::hook_session_observation(
+                super::execution::hook_session_observation(
                     &self.id,
                     self.active_execution.as_ref(),
                     None,
                 )
-                .filter(|observation| !exclusion.contains(&observation.sid));
+                .filter(|observation| {
+                    !self
+                        .retroactive_capture_exclusion_set(observation.source.as_ref())
+                        .contains(&observation.sid)
+                })
             }
             crate::agents::SessionCaptureBackend::Pi => {
-                return self
-                    .pi_published_conversation(true)
-                    .filter(|observation| !exclusion.contains(&observation.sid))
+                self.pi_published_conversation(true).filter(|observation| {
+                    !self
+                        .retroactive_capture_exclusion_set(observation.source.as_ref())
+                        .contains(&observation.sid)
+                })
             }
             crate::agents::SessionCaptureBackend::Omp => {
                 let tmux_session_name = self.tmux_env_session_name().or_else(|| {
@@ -71,7 +85,7 @@ impl Instance {
                         .filter(|sandbox| sandbox.enabled)
                         .map(|sandbox| sandbox.container_name.as_str()),
                 };
-                return if let Some(container_name) = container_name {
+                if let Some(container_name) = container_name {
                     try_capture_omp_session_id_in_container(
                         container_name,
                         &metadata,
@@ -88,7 +102,12 @@ impl Instance {
                         self.active_execution.as_ref(),
                     )
                     .ok()
-                };
+                }
+                .filter(|observation| {
+                    !self
+                        .retroactive_capture_exclusion_set(observation.source.as_ref())
+                        .contains(&observation.sid)
+                })
             }
             crate::agents::SessionCaptureBackend::Codex
             | crate::agents::SessionCaptureBackend::Gemini
@@ -96,10 +115,7 @@ impl Instance {
             | crate::agents::SessionCaptureBackend::Kimi
             | crate::agents::SessionCaptureBackend::PrimeAgent
             | crate::agents::SessionCaptureBackend::OpenCode => None,
-        };
-        result
-            .and_then(validated_session_id)
-            .map(crate::session::poller::SessionIdObservation::instance_sidecar)
+        }
     }
 
     /// Canonical `(tool, project_path)` keys shared by two or more id-less

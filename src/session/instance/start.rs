@@ -322,9 +322,18 @@ impl Instance {
                             })
                     });
                 if emitted {
-                    self.retroactive_capture_excludes.remove(prior_sid);
+                    let source = self.active_execution.as_ref().map(|active| &active.binding);
+                    self.retroactive_capture_excludes
+                        .retain(|binding| !binding.excludes_capture(prior_sid, source));
                 } else {
-                    self.retroactive_capture_excludes.insert(prior_sid.clone());
+                    let abandoned = prepared
+                        .expected_conversation
+                        .binding
+                        .as_ref()
+                        .filter(|binding| binding.session_id == *prior_sid)
+                        .cloned()
+                        .unwrap_or_else(|| ConversationBinding::unknown(prior_sid.clone()));
+                    self.retroactive_capture_excludes.insert(abandoned);
                 }
             }
         }

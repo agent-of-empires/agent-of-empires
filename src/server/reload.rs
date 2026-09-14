@@ -58,20 +58,19 @@ pub(super) fn load_all_instances(
 /// field on `Instance` requires extending this function or the field is
 /// silently wiped on every poll tick.
 pub(super) fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Instance {
+    if fresh.active_execution == prior.active_execution {
+        fresh.session_id_poller = prior.session_id_poller;
+        fresh.poller_repair = prior.poller_repair;
+        fresh.session_id_poller_retry_after = prior.session_id_poller_retry_after;
+    } else {
+        prior.stop_poller();
+    }
     fresh.last_error_check = prior.last_error_check;
     fresh.last_start_time = prior.last_start_time;
-    // Only preserve `last_error` while the session is still in Error. A healthy
-    // `fresh` clears it in `update_status_with_metadata_inner`; carrying the
-    // prior string over unconditionally would re-stick a stale error on a now-green
-    // session every poll tick when a healthy transition happened through a path that
-    // did not explicitly null `last_error` in-memory (issue #1271).
+    // Healthy rows must not inherit stale poller errors.
     if fresh.status == Status::Error {
         fresh.last_error = prior.last_error;
     }
-    fresh.session_id_poller = prior.session_id_poller;
-    fresh.poller_repair = prior.poller_repair;
-    fresh.session_id_poller_retry_after = prior.session_id_poller_retry_after;
-    fresh.retroactive_capture_excludes = prior.retroactive_capture_excludes;
     fresh.acp_load_session_capable = prior.acp_load_session_capable;
     fresh
 }
@@ -250,10 +249,7 @@ pub(super) fn skip_tmux_decision_for_structured(inst: &mut Instance) -> bool {
 //    invoke this helper. They differ in cadence, in what they do BEFORE
 //    calling it (tmux scrape lives only in `status_poll_loop`), and in
 //    the StatusSource they pass.
-// 2. `merge_runtime_fields` is mandatory per-id. Skipping it wipes the
-//    #[serde(skip)] runtime fields (`last_error_check`,
-//    `last_start_time`, `last_error`, `session_id_poller`,
-//    `retroactive_capture_excludes`) that disk reload zeroes by design.
+// 2. Preserve serde-skipped runtime fields per id; persisted exclusions remain authoritative.
 // 3. `merge_runtime_fields` does NOT carry `status`, `last_accessed_at`,
 //    `idle_entered_at`, or the `PriorTickTracking` fields
 //    (`ever_confirmed_present`, `unknown_since`, `detection`).
@@ -1030,14 +1026,113 @@ mod tests {
         assert_eq!(merged.last_error, None);
     }
 
-    #[test]
-    fn merge_runtime_fields_preserves_acp_load_session_capability() {
-        let mut prior = Instance::new("seed", "/tmp/seed");
-        prior.acp_load_session_capable = Some(true);
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reload_captures_publications_from_a_replaced_execution() {
+        use crate::session::{ConversationProvenance, ExecutionBinding};
+        use std::os::unix::fs::DirBuilderExt;
 
-        let fresh = Instance::new("seed", "/tmp/seed");
-        let merged = merge_runtime_fields(prior, fresh);
-
-        assert_eq!(merged.acp_load_session_capable, Some(true));
+        let app = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(app.path());
+        let file_watch = FileWatchService::new().unwrap();
+        let hook_base = app.path().join("hooks");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&hook_base)
+            .unwrap();
+        let mergers: [fn(Instance, Instance) -> Instance; 2] =
+            [merge_runtime_fields, |prior, mut fresh| {
+                fresh.merge_runtime_from_reload(&prior);
+                fresh
+            }];
+        for merge in mergers {
+            let mut prior = Instance::new("reload-capture", app.path().to_str().unwrap());
+            prior.tool = "claude".into();
+            prior.source_profile = "reload-capture".into();
+            prior.status = Status::Running;
+            let hooks = hook_base.join(&prior.id);
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&hooks)
+                .unwrap();
+            let launch = uuid::Uuid::new_v4().to_string();
+            prior.active_execution = Some(
+                serde_json::from_value(serde_json::json!({
+                    "launch_id": launch,
+                    "binding": ExecutionBinding {
+                        agent: "claude".into(),
+                        stores: vec![app.path().to_path_buf()],
+                        configuration: Vec::new(),
+                        cwd: app.path().to_path_buf(),
+                        cwd_filesystem: "host".into(),
+                        filesystem: "host".into(),
+                    },
+                    "capture": { "Hooks": hooks.join(format!("session_id.{launch}")) },
+                    "container": null,
+                }))
+                .unwrap(),
+            );
+            assert_eq!(
+                prior.maybe_start_poller(),
+                crate::session::PollerStart::Started
+            );
+            let mut fresh: Instance =
+                serde_json::from_str(&serde_json::to_string(&prior).unwrap()).unwrap();
+            fresh.source_profile = prior.source_profile.clone();
+            let launch = uuid::Uuid::new_v4().to_string();
+            let publication = hooks.join(format!("session_id.{launch}"));
+            let active = fresh.active_execution.as_mut().unwrap();
+            active.launch_id = launch;
+            active.capture =
+                Some(serde_json::from_value(serde_json::json!({ "Hooks": publication })).unwrap());
+            let storage = Storage::new_unwatched(&fresh.source_profile).unwrap();
+            storage
+                .update(|rows, _| {
+                    *rows = vec![fresh.clone()];
+                    Ok(())
+                })
+                .unwrap();
+            let mut reloaded = merge(prior, fresh);
+            let sid = uuid::Uuid::new_v4().to_string();
+            std::fs::write(&publication, &sid).unwrap();
+            assert_eq!(
+                crate::hooks::read_hook_sidecar_at(
+                    &reloaded.id,
+                    &hooks,
+                    publication.file_name().unwrap().to_str().unwrap(),
+                    128,
+                    None
+                )
+                .as_deref(),
+                Some(sid.as_bytes())
+            );
+            let snapshot = crate::tmux::LiveSessionSnapshot::from_parts(
+                Some(vec![reloaded.tmux_session().unwrap().name().to_string()]),
+                None,
+            );
+            reloaded.repair_session_id_poller_if_needed(&snapshot);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                crate::session::sync::drain_and_persist_session_ids(
+                    std::slice::from_mut(&mut reloaded),
+                    &file_watch,
+                );
+                if reloaded.agent_session_id.as_deref() == Some(&sid)
+                    || std::time::Instant::now() >= deadline
+                {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if let Some(poller) = &reloaded.session_id_poller {
+                poller.lock().unwrap().stop();
+            }
+            let stored = storage.load().unwrap().remove(0);
+            assert_eq!(stored.agent_session_id.as_deref(), Some(sid.as_str()));
+            assert_eq!(
+                stored.agent_session_binding.unwrap().provenance,
+                ConversationProvenance::Observed
+            );
+        }
     }
 }

@@ -187,11 +187,24 @@ impl Instance {
                     || peer.archived_at.is_some()
                     || peer.trashed_at.is_some()
                     || matches!(peer.status, Status::Stopped | Status::Deleting)
-                    || peer.resolved_capture_backend() != Some(backend)
                 {
                     continue;
                 }
-                let Some(peer_store) = peer.sandbox_capture_store_dir() else {
+                let Some(active) = &peer.active_execution else {
+                    return false;
+                };
+                let Some(agent) = crate::agents::get_agent(&active.binding.agent) else {
+                    return false;
+                };
+                let peer_backend = agent
+                    .session_support
+                    .as_ref()
+                    .and_then(|support| support.capture.as_ref())
+                    .map(|capture| capture.backend);
+                if peer_backend != Some(backend) {
+                    continue;
+                }
+                let Some(peer_store) = peer.capture_store_dir() else {
                     return false;
                 };
                 let Ok(peer_store) = std::fs::canonicalize(peer_store) else {
@@ -395,7 +408,7 @@ impl Instance {
                 .as_ref()
                 .is_some_and(ConversationBinding::is_known)
         });
-        let extra_excludes = self.retroactive_capture_exclusion_set();
+        let extra_excludes = self.retroactive_capture_excludes.clone();
 
         if backend == crate::agents::SessionCaptureBackend::Omp {
             let Some(metadata) = omp_metadata.as_ref() else {
@@ -623,9 +636,6 @@ impl Instance {
     }
 
     /// Replace a missing or finished poller once its tmux pane is live.
-    ///
-    /// OMP pollers reload pane metadata on every tick, so a replacement binds
-    /// to the durable generation that won any concurrent restart race.
     pub(crate) fn repair_session_id_poller_if_needed(
         &mut self,
         snapshot: &crate::tmux::LiveSessionSnapshot,
@@ -691,7 +701,7 @@ impl Instance {
         }
     }
 
-    pub(super) fn stop_poller(&self) {
+    pub(crate) fn stop_poller(&self) {
         if let Some(ref poller_arc) = self.session_id_poller {
             match poller_arc.lock() {
                 Ok(mut poller) => poller.stop(),
@@ -729,11 +739,8 @@ impl Instance {
     }
 
     pub(super) fn stop_and_flush_poller_lifecycle_locked(&mut self) {
-        // A Pi pane's last word is in its sidecar, which no poller may have
-        // read: a CLI-only pane has none, and a restart tears the pane down
-        // before the next one starts. Every teardown reaches here, so this is
-        // where the flush belongs rather than at one call site.
-        self.flush_pi_sidecar_if_published();
+        // A CLI-only pane may have a final publication but no poller to drain.
+        self.flush_published_if_present();
         // stop_poller() signals the thread but leaves the handle in place, so
         // this is_some() means "a poller existed and may have queued a final
         // observation": drain it before dropping the handle below.
@@ -1127,21 +1134,35 @@ mod tests {
         let app = tempfile::tempdir().unwrap();
         let _app_guard = crate::session::test_support::isolate_app_dir_at(app.path());
         let backend = crate::agents::SessionCaptureBackend::Gemini;
-        let current_profile = "capture-owner-a";
-        let peer_profile = "capture-owner-b";
-        let current_storage = crate::session::Storage::new_unwatched(current_profile).unwrap();
-        let peer_storage = crate::session::Storage::new_unwatched(peer_profile).unwrap();
-
+        let current_storage = crate::session::Storage::new_unwatched("capture-owner-a").unwrap();
+        let peer_storage = crate::session::Storage::new_unwatched("capture-owner-b").unwrap();
         let mut current = sandboxed_gemini("current", "/repos/current", "/workspace/current");
-        current.source_profile = current_profile.to_string();
-        current.sandbox_store_generation = 1;
+        current.source_profile = "capture-owner-a".into();
         let mut peer = sandboxed_gemini("peer", "/repos/peer", "/workspace/peer");
-        peer.source_profile = peer_profile.to_string();
-        peer.sandbox_store_generation = 1;
-        let shared_store = current.sandbox_capture_store_dir().unwrap();
-        assert_eq!(peer.sandbox_capture_store_dir().unwrap(), shared_store);
+        peer.source_profile = "capture-owner-b".into();
+        let shared_store = app.path().join("shared");
         std::fs::create_dir_all(&shared_store).unwrap();
-
+        std::fs::create_dir_all(peer.sandbox_capture_store_dir().unwrap()).unwrap();
+        let bind = |instance: &mut Instance, store: &std::path::Path| {
+            instance.active_execution = Some(super::ActiveExecution {
+                launch_id: uuid::Uuid::new_v4().to_string(),
+                binding: crate::session::ExecutionBinding {
+                    agent: "gemini".into(),
+                    stores: vec![store.to_path_buf()],
+                    configuration: Vec::new(),
+                    cwd: "/workspace".into(),
+                    cwd_filesystem: "host".into(),
+                    filesystem: "host".into(),
+                },
+                capture: Some(super::CaptureContext::Store {
+                    root: store.to_path_buf(),
+                    cwd: "/workspace".into(),
+                }),
+                container: None,
+            });
+        };
+        bind(&mut current, &shared_store);
+        bind(&mut peer, &shared_store);
         current_storage
             .update(|instances, _| {
                 *instances = vec![current.clone()];
@@ -1156,14 +1177,24 @@ mod tests {
             .unwrap();
         assert!(
             !current.managed_capture_store_is_exclusive(backend),
-            "different rows and workdirs sharing one store are not exclusive"
+            "inspected mounts override predicted private stores"
         );
 
-        peer.sandbox_store_generation =
-            crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION;
-        let peer_store = peer.sandbox_capture_store_dir().unwrap();
-        assert_ne!(peer_store, shared_store);
+        peer.tool = "claude".into();
+        peer_storage
+            .update(|instances, _| {
+                *instances = vec![peer.clone()];
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            !current.managed_capture_store_is_exclusive(backend),
+            "configuration changes do not change the running writer"
+        );
+
+        let peer_store = app.path().join("distinct");
         std::fs::create_dir_all(&peer_store).unwrap();
+        bind(&mut peer, &peer_store);
         peer_storage
             .update(|instances, _| {
                 *instances = vec![peer.clone()];
@@ -1173,6 +1204,18 @@ mod tests {
         assert!(
             current.managed_capture_store_is_exclusive(backend),
             "distinct physical stores do not conflict"
+        );
+
+        peer.active_execution = None;
+        peer_storage
+            .update(|instances, _| {
+                *instances = vec![peer.clone()];
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            !current.managed_capture_store_is_exclusive(backend),
+            "an unlocated peer cannot prove exclusivity"
         );
     }
 

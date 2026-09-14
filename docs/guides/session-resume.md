@@ -42,7 +42,7 @@ Sandbox config and conversation stores are staged under a separate directory for
 
 An opaque wrapper requires both `session.agent_execution_as` and `session.agent_config_dir` in trusted global or profile configuration. The declaration asserts that the wrapper invokes that native agent, forwards its native arguments unchanged, and uses only the declared store and working-directory/filesystem context. AoE cannot attest arbitrary wrapper internals. See the [two-account example](configuration.md#one-cli-two-accounts). Shell pipelines, remote launchers, redirections, expansion, and unrecognized context-changing arguments are not supported managed invocations.
 
-Only existing capture capabilities are used. A wrapper declaration does not add a scanner or a native fork capability. The absolute program and relevant routing values are fixed from one launch snapshot and restored after the login shell. A later AoE configuration change requires a newly validated launch.
+Only existing capture capabilities are used. Declaring a wrapper does not enable capture for backends that require direct native invocation, or add a native fork capability. The absolute program and relevant routing values are fixed from one launch snapshot and restored after the login shell. A later AoE configuration change requires a newly validated launch.
 
 ## Supported managed contexts
 
@@ -83,7 +83,7 @@ Retry after fixing the underlying issue, set a different conversation ID, or exp
 aoe session set-session-id <session-name-or-id> ""
 ```
 
-This is one-shot. The next launch starts fresh, then automatic capture takes over again when the matrix supports that environment.
+This is one-shot. The next launch starts fresh, then automatic capture takes over again when the matrix supports that environment. The abandoned conversation stays excluded in its recorded agent, store, and filesystem namespace, not in unrelated stores that happen to reuse the same ID. Legacy exclusions without a known namespace remain ID-wide.
 
 Structured-view conversations remain managed by ACP. `set-session-id` does not change their ACP ID. For a Claude terminal handoff only, it can assert the current ACP ID with an explicit `--store`; switching to terminal then consumes that native binding. Without the assertion, the handoff is refused before worker teardown, with recovery guidance. Other structured resume-target changes are rejected.
 

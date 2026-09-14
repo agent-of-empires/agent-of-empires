@@ -1262,20 +1262,19 @@ pub(super) fn apply_post_restart_identity_sync(
         if conversation_unchanged {
             live.adopt_conversation_state(started.conversation_state());
         }
+    }
+    if live.active_execution == started.active_execution {
         live.session_id_poller = started.session_id_poller.clone();
-    } else if started.session_id_poller_is_running() {
-        // The worker follows the pane name and will rebind itself to the
-        // concurrently published generation on its next metadata refresh.
-        live.session_id_poller = started.session_id_poller.clone();
+        live.session_id_poller_retry_after = started.session_id_poller_retry_after;
+        if started.session_id_poller_is_running() {
+            live.poller_repair.reset();
+        }
+    } else {
+        started.stop_poller();
     }
     if generation_can_merge && marker_unchanged && live.agent_session_id == started.agent_session_id
     {
         live.resume_probe_failed_sid = started.resume_probe_failed_sid.clone();
-    }
-    // A running restart poller means the working clone's repair schedule was
-    // cleared on start; the live row must not keep the stale backoff.
-    if started.session_id_poller_is_running() {
-        live.poller_repair.reset();
     }
     live.lifecycle_generation = started.lifecycle_generation;
 }

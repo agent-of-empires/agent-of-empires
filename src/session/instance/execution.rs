@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConversationProvenance {
     #[default]
@@ -43,7 +43,7 @@ impl ExecutionBinding {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConversationBinding {
     pub session_id: String,
     pub execution: Option<ExecutionBinding>,
@@ -71,6 +71,21 @@ impl ConversationBinding {
                     | ConversationProvenance::Asserted
                     | ConversationProvenance::Imported
             )
+    }
+
+    pub(crate) fn excludes_capture(&self, sid: &str, source: Option<&ExecutionBinding>) -> bool {
+        if self.session_id != sid {
+            return false;
+        }
+        match (
+            source,
+            self.execution
+                .as_ref()
+                .filter(|_| self.provenance != ConversationProvenance::Unknown),
+        ) {
+            (Some(source), Some(owner)) => source.key(sid) == owner.key(sid),
+            _ => true,
+        }
     }
 
     pub(crate) fn key(&self) -> Option<ConversationKey<'_>> {
@@ -182,9 +197,38 @@ impl NativeLaunchInputs {
         };
         match &self.container {
             Some(container) => container.runtime.canonical_path(&container.id, &path),
-            None => Ok(path
-                .canonicalize()
-                .unwrap_or_else(|_| crate::git::template::lexical_normalize(&path))),
+            None => {
+                let mut ancestor = path.as_path();
+                loop {
+                    match ancestor.canonicalize() {
+                        Ok(mut resolved) => {
+                            for component in path.strip_prefix(ancestor)?.components() {
+                                match component {
+                                    std::path::Component::ParentDir => {
+                                        resolved.pop();
+                                    }
+                                    std::path::Component::CurDir => {}
+                                    component => resolved.push(component.as_os_str()),
+                                }
+                            }
+                            return Ok(resolved);
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            match std::fs::symlink_metadata(ancestor) {
+                                Ok(_) => {
+                                    bail!("native path cannot be resolved: {}", ancestor.display())
+                                }
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(error) => return Err(error.into()),
+                            }
+                            ancestor = ancestor
+                                .parent()
+                                .context("native path has no existing ancestor")?;
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
         }
     }
 
@@ -530,6 +574,7 @@ impl Instance {
     ) -> Result<NativeExecution> {
         let agent = self.execution_agent()?;
         let session_dir = self.managed_user_argv(agent)?;
+        let direct_capture = self.launch_invokes_resolved_agent_directly(agent);
         let target_session_id = target.map(|(sid, _, _)| sid.to_owned());
         let mut inputs = self.native_launch_inputs(agent)?;
         anyhow::ensure!(
@@ -900,7 +945,7 @@ impl Instance {
             roots = vec![context.layout.sessions.clone()];
             configuration.push(context.agent_dir.clone());
             routing = context.launcher_routing.clone();
-            Some(context)
+            direct_capture.then_some(context)
         } else {
             None
         };
@@ -951,7 +996,7 @@ impl Instance {
             )
         ) {
             inputs.hook_capture_context(&self.id)?
-        } else if let Some(plan) = prime.take() {
+        } else if let Some(plan) = prime.take().filter(|_| direct_capture) {
             let sidecar = inputs.identity_extension.as_ref().map(|_| {
                 super::SessionSidecarSource::SandboxDir(
                     plan.store.join("aoe-session").join(&self.id),
@@ -982,6 +1027,7 @@ impl Instance {
                 None
             }
         } else if matches!(agent.name, "codex" | "gemini" | "kimi")
+            && direct_capture
             && inputs.container.is_some()
             && filesystem.as_deref() == Some("host")
         {
@@ -1007,7 +1053,7 @@ impl Instance {
         let opencode_preassign = agent.name == "opencode"
             && inputs.container.is_none()
             && config.session.opencode_preassign_session_id
-            && words.first().is_some_and(|word| word == agent.binary);
+            && direct_capture;
         Ok(NativeExecution {
             agent,
             binding: ExecutionBinding {
@@ -1118,6 +1164,7 @@ pub(super) fn validate_managed_arguments(
             "omp" => (
                 &[
                     "--model",
+                    "--thinking",
                     "-m",
                     "--system-prompt",
                     "--append-system-prompt",
@@ -1185,8 +1232,32 @@ pub(super) fn validate_managed_arguments(
             && index + 1 == words.len()
             && matches!(agent.name, "claude" | "codex")
         {
-            anyhow::ensure!(
-                ![
+            let commands: &[&str] = if agent.name == "claude" {
+                &[
+                    "agents",
+                    "attach",
+                    "auth",
+                    "auto-mode",
+                    "doctor",
+                    "gateway",
+                    "import",
+                    "install",
+                    "logs",
+                    "mcp",
+                    "plugin",
+                    "plugins",
+                    "project",
+                    "respawn",
+                    "rm",
+                    "setup-token",
+                    "stop",
+                    "kill",
+                    "ultrareview",
+                    "update",
+                    "upgrade",
+                ]
+            } else {
+                &[
                     "resume",
                     "fork",
                     "exec",
@@ -1200,9 +1271,11 @@ pub(super) fn validate_managed_arguments(
                     "debug",
                     "apply",
                     "sandbox",
-                    "review"
+                    "review",
                 ]
-                .contains(&word.as_str()),
+            };
+            anyhow::ensure!(
+                !commands.contains(&word.as_str()),
                 "native subcommand {word} is not supported for a managed conversation"
             );
         } else {
@@ -1391,5 +1464,37 @@ impl Instance {
             };
         }
         self.sandbox_capture_store_dir()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_store_keeps_physical_identity_after_creation() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let inputs = NativeLaunchInputs {
+            launch_id: uuid::Uuid::new_v4().to_string(),
+            environment: Default::default(),
+            cwd: root.path().to_path_buf(),
+            profile: "default".into(),
+            container: None,
+            docker_env: None,
+            pane_env: Vec::new(),
+            identity_extension: None,
+        };
+        let database = alias.join("new/opencode.db");
+        let before = inputs.canonical_path(&database).unwrap();
+        std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+        std::fs::write(&database, b"").unwrap();
+        assert_eq!(before, inputs.canonical_path(&database).unwrap());
+        let cycle = root.path().join("cycle");
+        std::os::unix::fs::symlink(&cycle, &cycle).unwrap();
+        assert!(inputs.canonical_path(&cycle).is_err());
     }
 }

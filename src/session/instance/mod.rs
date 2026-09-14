@@ -693,11 +693,9 @@ pub struct Instance {
     /// Runtime backoff after managed-store ownership or lease contention.
     #[serde(skip)]
     pub(crate) session_id_poller_retry_after: Option<std::time::Instant>,
-    /// Session IDs invalidated at a fresh-generation boundary. Persisting this
-    /// set prevents a process restart from resurrecting an abandoned ID from a
-    /// still-present upstream artifact.
+    /// Abandoned conversations; unknown namespaces remain SID-wide exclusions.
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
-    pub(crate) retroactive_capture_excludes: HashSet<String>,
+    pub(crate) retroactive_capture_excludes: HashSet<ConversationBinding>,
 
     /// Cached `is_pane_dead()` reading from the most recent status_poller
     /// tick. Lets the Attention comparator treat dead-pane rows as sunk

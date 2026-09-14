@@ -1801,7 +1801,7 @@ fn resolve_omp_poll_identity(tmux_session_name: &str) -> Result<OmpPollIdentity>
 /// and refreshes the metadata generation and TTY twice on that same name.
 pub(crate) fn omp_poll_fn(
     instance_id: String,
-    extra_excludes: HashSet<String>,
+    extra_excludes: HashSet<crate::session::ConversationBinding>,
     active: Option<crate::session::instance::ActiveExecution>,
 ) -> impl Fn(&str) -> Option<crate::session::poller::SessionIdObservation> + Send + 'static {
     move |tmux_session_name| {
@@ -1810,26 +1810,23 @@ pub(crate) fn omp_poll_fn(
                 tracing::debug!(target: "session.capture", "OMP poll identity refresh failed: {}", error)
             })
             .ok()?;
-        let exclusion = super::compose_exclusion(
-            &instance_id,
-            &extra_excludes,
-            active.as_ref().map(|active| &active.binding),
-        );
         let captured = capture_omp_session_id_from_terminal(
             &identity.metadata,
-            &exclusion,
+            &HashSet::new(),
             &identity.terminal_id,
             active.as_ref(),
         )
         .map_err(|error| {
             tracing::debug!(target: "session.capture", "OMP poll capture failed: {}", error)
         })
-        .ok();
+        .ok()?;
         let refreshed = resolve_omp_poll_identity(tmux_session_name).ok()?;
         if refreshed != identity {
             return None;
         }
-        captured
+        let exclusion =
+            super::compose_exclusion(&instance_id, &extra_excludes, captured.source.as_ref());
+        (!exclusion.contains(&captured.sid)).then_some(captured)
     }
 }
 
@@ -2078,7 +2075,7 @@ pub(crate) fn omp_poll_fn_sandboxed(
     container_name: String,
     instance_id: String,
     launch_marker: Option<String>,
-    extra_excludes: HashSet<String>,
+    extra_excludes: HashSet<crate::session::ConversationBinding>,
     active: Option<crate::session::instance::ActiveExecution>,
 ) -> impl Fn(&str) -> Option<crate::session::poller::SessionIdObservation> + Send + 'static {
     move |tmux_session_name| {
@@ -2088,13 +2085,8 @@ pub(crate) fn omp_poll_fn_sandboxed(
             })
             .ok()?;
         let marker = launch_marker.as_deref()?;
-        let exclusion = super::compose_exclusion(
-            &instance_id,
-            &extra_excludes,
-            active.as_ref().map(|active| &active.binding),
-        );
         let captured =
-            capture_omp_session_in_container(&container_name, &metadata, &exclusion, marker, active.as_ref())
+            capture_omp_session_in_container(&container_name, &metadata, &HashSet::new(), marker, active.as_ref())
                 .map_err(|error| {
                     tracing::debug!(target: "session.capture", "OMP container poll capture failed: {}", error)
                 })
@@ -2103,7 +2095,9 @@ pub(crate) fn omp_poll_fn_sandboxed(
         if refreshed != metadata {
             return None;
         }
-        Some(captured)
+        let exclusion =
+            super::compose_exclusion(&instance_id, &extra_excludes, captured.source.as_ref());
+        (!exclusion.contains(&captured.sid)).then_some(captured)
     }
 }
 

@@ -55,7 +55,6 @@ impl Instance {
         disk.session_id_poller_retry_after = self.session_id_poller_retry_after;
         // Preserve the serde-skipped backoff so reloads cannot trigger an early retry.
         disk.poller_repair = self.poller_repair.clone();
-        disk.retroactive_capture_excludes = std::mem::take(&mut self.retroactive_capture_excludes);
         disk.pane_dead_observed = self.pane_dead_observed;
         disk.force_fresh_next_launch = self.force_fresh_next_launch;
         disk.pending_host_env = std::mem::take(&mut self.pending_host_env);
@@ -109,7 +108,7 @@ impl Instance {
         {
             return;
         }
-        if self.retroactive_capture_excludes.contains(fresh) {
+        if self.is_capture_excluded(fresh, observation.source.as_ref()) {
             return;
         }
         let profile = self.effective_profile();
@@ -587,7 +586,9 @@ mod tests {
         inst.resume_intent = ResumeIntent::Default;
         inst.agent_session_id = Some("disk-sid".to_string());
         inst.retroactive_capture_excludes
-            .insert(SIDECAR_TEST_FRESH_UUID.to_string());
+            .insert(ConversationBinding::unknown(
+                SIDECAR_TEST_FRESH_UUID.to_string(),
+            ));
         seed_disk_for_sidecar_test(profile, &inst);
 
         let dir = write_sidecar(&inst.id, SIDECAR_TEST_FRESH_UUID);

@@ -816,24 +816,9 @@ async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let mut working = inst.clone();
     working.source_profile = profile.to_string();
 
-    // Snapshot the sid for the same reason `restart_session` does: a persisted
-    // `ResumeIntent::Cleared` (from `aoe session set-session-id <id> ""`) makes
-    // `acquire_session_id` drop it on this launch, but the abandoned rollout
-    // lingers and stays newest-by-mtime, so the fresh poller's immediate first
-    // poll can re-observe it and the drain below would silently revert the
-    // user's clear.
-    let prior_sid = working.agent_session_id.clone();
-
     // Launch orchestration owns its lifecycle locks and deliberately releases
     // them while user hooks run.
     let _ = working.start_with_size_opts(crate::terminal::get_size(), false)?;
-
-    // Cleared on this launch, so the sid we came in with is abandoned.
-    if working.agent_session_id.is_none() {
-        if let Some(sid) = prior_sid {
-            working.retroactive_capture_excludes.insert(sid);
-        }
-    }
 
     // The CLI has no long-lived loop to drain the just-started session-id
     // poller, so a capture-deferred agent would exit with agent_session_id unset
@@ -1118,17 +1103,9 @@ fn launch_imported(profile: &str, ids: &[String]) -> Result<()> {
         };
         let mut working = inst.clone();
         working.source_profile = profile.to_string();
-        // See `start_session`: a cleared sid whose rollout is still newest on
-        // disk would be re-adopted by the drain below.
-        let prior_sid = working.agent_session_id.clone();
         if let Err(e) = working.start_with_size(crate::terminal::get_size()) {
             eprintln!("Warning: failed to start {}: {e}", working.title);
             continue;
-        }
-        if working.agent_session_id.is_none() {
-            if let Some(sid) = prior_sid {
-                working.retroactive_capture_excludes.insert(sid);
-            }
         }
         // Persist the poller-observed id before exit (see start_session).
         crate::session::sync::capture_launched_session_id_blocking(
@@ -1260,21 +1237,12 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
                 .expect("semaphore not closed");
             let title = inst.title.clone();
             let res = tokio::task::spawn_blocking(move || {
-                let prior_sid = inst.agent_session_id.clone();
                 let result = inst.restart_with_size(size);
                 // Drain the fresh poller so a fresh-relaunched capture-deferred
                 // agent persists its new agent_session_id. No-op for Resumed /
                 // ResumeFailed. In spawn_blocking: off the runtime, parallel,
                 // bounded by the semaphore.
                 if result.is_ok() {
-                    if matches!(
-                        result,
-                        Ok(StartOutcome::Fresh) | Ok(StartOutcome::FreshAfterFailedResume { .. })
-                    ) {
-                        if let Some(sid) = prior_sid {
-                            inst.retroactive_capture_excludes.insert(sid);
-                        }
-                    }
                     let file_watch = crate::file_watch::FileWatchService::noop();
                     crate::session::sync::capture_launched_session_id_blocking(
                         &mut inst,
@@ -1408,11 +1376,6 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let mut working = inst.clone();
     working.source_profile = profile.to_string();
 
-    // Snapshot the sid before `restart_with_size` clears it on a forced-fresh
-    // path: the abandoned rollout lingers and stays newest-by-mtime, so the
-    // fresh poller can re-observe it. Excluded below so the drain rejects it.
-    let prior_sid = working.agent_session_id.clone();
-
     // Restart orchestration owns its lifecycle locks and releases them while
     // user hooks run, so recursive same-id commands cannot deadlock.
     let outcome = working.restart_with_resume_policy(
@@ -1461,14 +1424,6 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     // relaunches fresh mints a new agent_session_id no CLI loop would drain.
     // Same drain as `session start`; no-op for Resumed (sid kept) and
     // ResumeFailed (poller cleared). After the wake wait, so it is usually ready.
-    if matches!(
-        outcome,
-        StartOutcome::Fresh | StartOutcome::FreshAfterFailedResume { .. }
-    ) {
-        if let Some(sid) = prior_sid {
-            working.retroactive_capture_excludes.insert(sid);
-        }
-    }
     let file_watch = crate::file_watch::FileWatchService::noop();
     crate::session::sync::capture_launched_session_id_blocking(
         &mut working,

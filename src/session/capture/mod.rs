@@ -344,7 +344,7 @@ pub(crate) fn is_valid_session_id(id: &str) -> bool {
 /// may still live on disk for several minutes.
 pub(crate) fn compose_exclusion(
     current_instance_id: &str,
-    extra: &HashSet<String>,
+    extra: &HashSet<crate::session::ConversationBinding>,
     source: Option<&crate::session::ExecutionBinding>,
 ) -> HashSet<String> {
     compose_exclusion_in(
@@ -360,12 +360,17 @@ pub(crate) fn compose_exclusion(
 /// twice.
 fn compose_exclusion_in(
     current_instance_id: &str,
-    extra: &HashSet<String>,
+    extra: &HashSet<crate::session::ConversationBinding>,
     live: &crate::tmux::LiveSessionSnapshot,
     source: Option<&crate::session::ExecutionBinding>,
 ) -> HashSet<String> {
     let mut set = build_exclusion_set(current_instance_id, live, source);
-    set.extend(extra.iter().cloned());
+    set.extend(
+        extra
+            .iter()
+            .filter(|binding| binding.excludes_capture(&binding.session_id, source))
+            .map(|binding| binding.session_id.clone()),
+    );
     set
 }
 
@@ -374,7 +379,7 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
     current_instance_id: &str,
     current_project_path: &str,
     profile: &str,
-    retroactive_capture_excludes: &HashSet<String>,
+    retroactive_capture_excludes: &HashSet<crate::session::ConversationBinding>,
     source: Option<&crate::session::ExecutionBinding>,
 ) -> HashSet<String> {
     let live = crate::tmux::LiveSessionSnapshot::new();
@@ -518,22 +523,14 @@ fn build_exclusion_set(
         .collect()
 }
 
-fn owner_excludes(
+pub(crate) fn owner_excludes(
     source: Option<&crate::session::ExecutionBinding>,
     owner: Option<&crate::session::ConversationBinding>,
     sid: &str,
 ) -> bool {
-    let owner = owner.filter(|binding| {
-        binding.session_id == sid
-            && binding.provenance != crate::session::ConversationProvenance::Unknown
-    });
-    match (
-        source,
-        owner.and_then(crate::session::ConversationBinding::key),
-    ) {
-        (Some(source), Some(owner)) => source.key(sid) == owner,
-        _ => true,
-    }
+    owner
+        .filter(|binding| binding.session_id == sid)
+        .is_none_or(|binding| binding.excludes_capture(sid, source))
 }
 
 /// Spawn `cmd`, read stdout to EOF on a worker thread, and wait for the
@@ -956,7 +953,7 @@ pub(crate) fn codex_poll_fn_sandboxed_store(
     container_cwd: String,
     instance_id: String,
     capture_floor: std::time::SystemTime,
-    extra_excludes: HashSet<String>,
+    extra_excludes: HashSet<crate::session::ConversationBinding>,
     source: Option<crate::session::ExecutionBinding>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
@@ -1062,7 +1059,7 @@ pub(crate) fn gemini_poll_fn_sandboxed_store(
     container_cwd: String,
     instance_id: String,
     capture_floor: std::time::SystemTime,
-    extra_excludes: HashSet<String>,
+    extra_excludes: HashSet<crate::session::ConversationBinding>,
     source: Option<crate::session::ExecutionBinding>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     use sha2::{Digest, Sha256};
@@ -1214,7 +1211,7 @@ pub(crate) fn kimi_poll_fn_sandboxed_store(
     container_workdir: String,
     instance_id: String,
     launch_time_ms: f64,
-    extra_excludes: HashSet<String>,
+    extra_excludes: HashSet<crate::session::ConversationBinding>,
     source: Option<crate::session::ExecutionBinding>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
@@ -1397,7 +1394,7 @@ pub(crate) fn prime_agent_poll_fn_sandboxed(
     plan: crate::session::instance::PrimeAgentCapturePlan,
     instance_id: String,
     launch_time_ms: f64,
-    extra_excludes: HashSet<String>,
+    extra_excludes: HashSet<crate::session::ConversationBinding>,
     source: Option<crate::session::ExecutionBinding>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
@@ -1641,7 +1638,7 @@ pub(crate) fn hermes_poll_fn_sandboxed_store(
     container_cwd: String,
     instance_id: String,
     capture_floor: std::time::SystemTime,
-    extra_excludes: HashSet<String>,
+    extra_excludes: HashSet<crate::session::ConversationBinding>,
     source: Option<crate::session::ExecutionBinding>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     let started_after = capture_floor
@@ -2908,7 +2905,7 @@ mod tests {
             plan.clone(),
             "current".to_string(),
             2_000_001.0,
-            HashSet::from(["prime_parent".to_string()]),
+            HashSet::from([crate::session::ConversationBinding::unknown("prime_parent")]),
             None,
         );
         assert_eq!(excluded_preferred().as_deref(), Some("prime_fresh"));
@@ -2918,7 +2915,10 @@ mod tests {
             plan,
             "current".to_string(),
             2_000_001.0,
-            HashSet::from(["prime_parent".to_string(), "prime_fresh".to_string()]),
+            ["prime_parent", "prime_fresh"]
+                .into_iter()
+                .map(crate::session::ConversationBinding::unknown)
+                .collect(),
             None,
         );
         assert_eq!(all_excluded(), None);

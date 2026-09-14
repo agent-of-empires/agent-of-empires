@@ -2130,7 +2130,6 @@ fn apply_post_restart_sync_propagates_agent_session_id() {
         generation_converged.agent_session_id.as_deref(),
         Some("peer-sid")
     );
-    assert!(generation_converged.session_id_poller.is_some());
 
     let mut peer_relaunched = before.clone();
     peer_relaunched.omp_capture_generation = Some("peer-generation".to_string());
@@ -2139,13 +2138,6 @@ fn apply_post_restart_sync_propagates_agent_session_id() {
         peer_relaunched.omp_capture_generation.as_deref(),
         Some("peer-generation")
     );
-    assert!(std::sync::Arc::ptr_eq(
-        peer_relaunched
-            .session_id_poller
-            .as_ref()
-            .expect("running restart poller"),
-        &restarted_poller,
-    ));
     let mut peer = before.clone();
     peer.pi_session_path = Some("/peer/transcript.jsonl".into());
     let expected = peer.conversation_state();
@@ -2310,13 +2302,19 @@ fn restart_sync_rejects_an_older_lifecycle_generation() {
     let mut started = before.clone();
     started.status = Status::Error;
     started.agent_session_id = Some("stale-restart-sid".to_string());
-    started.retroactive_capture_excludes = ["stale-exclusion".to_string()].into();
+    started.retroactive_capture_excludes = [crate::session::ConversationBinding::unknown(
+        "stale-exclusion".to_string(),
+    )]
+    .into();
 
     let mut live = before.clone();
     live.lifecycle_generation = 5;
     live.status = Status::Running;
     live.agent_session_id = Some("newer-restart-sid".to_string());
-    live.retroactive_capture_excludes = ["newer-exclusion".to_string()].into();
+    live.retroactive_capture_excludes = [crate::session::ConversationBinding::unknown(
+        "newer-exclusion".to_string(),
+    )]
+    .into();
 
     assert!(!apply_post_restart_sync(&mut live, &before, &started));
     apply_cascade_state_sync(&mut live, &before, &started);
@@ -2326,7 +2324,10 @@ fn restart_sync_rejects_an_older_lifecycle_generation() {
     assert_eq!(live.agent_session_id.as_deref(), Some("newer-restart-sid"));
     assert_eq!(
         live.retroactive_capture_excludes,
-        ["newer-exclusion".to_string()].into()
+        [crate::session::ConversationBinding::unknown(
+            "newer-exclusion".to_string()
+        )]
+        .into()
     );
 }
 

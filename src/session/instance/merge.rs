@@ -56,23 +56,19 @@ impl Instance {
             if conversation_unchanged {
                 self.adopt_conversation_state(src.conversation_state());
             }
+        }
+        if self.active_execution == src.active_execution {
             self.session_id_poller = src.session_id_poller.clone();
             self.session_id_poller_retry_after = src.session_id_poller_retry_after;
-        } else if src.session_id_poller_is_running() {
-            // A concurrent launch already published a third generation. The
-            // restarted poller reloads tmux metadata on every tick, so keep
-            // that live worker and let it rebind to the newer generation
-            // without overwriting the newer durable identity.
-            self.session_id_poller = src.session_id_poller.clone();
+            if src.session_id_poller_is_running() {
+                self.poller_repair.reset();
+            }
+        } else {
+            src.stop_poller();
         }
         if generation_can_merge && marker_unchanged && self.agent_session_id == src.agent_session_id
         {
             self.resume_probe_failed_sid = src.resume_probe_failed_sid.clone();
-        }
-        // `install_poller` cleared the working clone's repair schedule when
-        // its poller started; the live row must not keep the stale backoff.
-        if src.session_id_poller_is_running() {
-            self.poller_repair.reset();
         }
     }
 
@@ -116,10 +112,13 @@ impl Instance {
         self.last_error = previous.last_error.clone();
         self.last_error_check = previous.last_error_check;
         self.last_start_time = previous.last_start_time;
-        self.session_id_poller = previous.session_id_poller.clone();
-        self.poller_repair = previous.poller_repair.clone();
-        self.session_id_poller_retry_after = previous.session_id_poller_retry_after;
-        self.retroactive_capture_excludes = previous.retroactive_capture_excludes.clone();
+        if self.active_execution == previous.active_execution {
+            self.session_id_poller = previous.session_id_poller.clone();
+            self.poller_repair = previous.poller_repair.clone();
+            self.session_id_poller_retry_after = previous.session_id_poller_retry_after;
+        } else {
+            previous.stop_poller();
+        }
         self.acp_load_session_capable = previous.acp_load_session_capable;
     }
 
@@ -834,7 +833,6 @@ mod tests {
             generation_converged.agent_session_id.as_deref(),
             Some("peer-sid")
         );
-        assert!(generation_converged.session_id_poller.is_some());
 
         let mut peer_relaunched = before.clone();
         peer_relaunched.omp_capture_generation = Some("peer-generation".to_string());
@@ -843,13 +841,6 @@ mod tests {
             peer_relaunched.omp_capture_generation.as_deref(),
             Some("peer-generation")
         );
-        assert!(std::sync::Arc::ptr_eq(
-            peer_relaunched
-                .session_id_poller
-                .as_ref()
-                .expect("running restart poller"),
-            &restarted_poller,
-        ));
         restarted_poller
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

@@ -103,6 +103,41 @@ fn seed_claude_parent(h: &TuiTestHarness, project: &std::path::Path, title: &str
     parent_agent_id.to_string()
 }
 
+#[test]
+#[parallel]
+fn restarting_a_never_launched_claude_session_dispatches_fresh() {
+    crate::harness::require_tmux!();
+    let mut h = TuiTestHarness::new("restart_unlaunched_claude");
+    install_dispatch_marker(&mut h, "claude");
+    let project = h.project_path();
+    let added = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "-c",
+        "claude",
+        "-t",
+        "FreshRestart",
+    ]);
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let restarted = h.run_cli(&["session", "restart", "FreshRestart"]);
+    assert!(
+        restarted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restarted.stderr)
+    );
+    let marker = h.home_path().join("native-spawn");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !marker.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(std::fs::read_to_string(marker).unwrap(), "dispatched");
+    let _ = h.run_cli(&["session", "stop", "FreshRestart"]);
+}
+
 fn install_dispatch_marker(h: &mut TuiTestHarness, agent: &str) {
     let bin = h.install_path_command(agent);
     let marker = h.home_path().join("native-spawn");
