@@ -957,7 +957,15 @@ mod tests {
         let program = home.path().join("claude");
         std::fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let profile = "fork-binding";
+        crate::session::instance::test_helpers::declare_execution_aliases(
+            profile,
+            &[("my-claude", "claude")],
+            home.path(),
+        );
+        std::fs::copy(&program, home.path().join("my-claude")).unwrap();
         let mut child = Instance::new("fork-binding", home.path().to_str().unwrap());
+        child.source_profile = profile.into();
         child.pending_host_env = vec![
             (
                 "PATH".into(),
@@ -984,6 +992,13 @@ mod tests {
         });
         let mut incompatible = child.clone();
         incompatible.command = "codex".into();
+        let mut aliased = child.clone();
+        aliased.swap_tool("my-claude");
+        aliased.command = "my-claude".into();
+        let aliased = aliased
+            .prepare_launch_command(aliased.conversation_state())
+            .unwrap();
+        assert!(aliased.command.unwrap().contains("--fork-session"));
         let compatible = child
             .prepare_launch_command(child.conversation_state())
             .unwrap();

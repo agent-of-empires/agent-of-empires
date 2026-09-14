@@ -24,7 +24,7 @@ Pass `--fork-from` with the source session's id or title:
 aoe add --fork-from <session-id-or-title>
 ```
 
-This creates a terminal session that resumes the source's conversation and then runs independently.
+This creates a terminal session that resumes the source's conversation and then runs independently. Changing an unlaunched child's tool or profile keeps its pending fork; the next launch still validates the original parent's native namespace.
 
 The fork inherits the parent tool by default. Its conversation must have a known native agent and store, established by a qualified publication, an import, or an explicit [recovery assertion](session-resume.md#pinning-or-resetting-a-conversation). A raw or preallocated ID is not enough. Status detection and matching tool labels do not authorize a fork. AoE rejects conflicting native commands and user-supplied resume/fork selectors before dispatch. `--fork-from` cannot be combined with `--worktree` / `--new-branch` or `--sandbox` / `--sandbox-image`.
 
