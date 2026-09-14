@@ -290,28 +290,57 @@ pub(super) fn shell_stdin_command(shell: &str, login: bool, script: &str, stem: 
 /// requested command. The user's POSIX login shell reads the launch script
 /// from a dedicated descriptor, keeping both large prompts and the pane TTY.
 ///
-/// `working_dir` is re-asserted with `cd` as the first statement in that
-/// script, after the login shell's profile/rc files have run. tmux's
-/// `new-session -c` only sets the shell's initial cwd, and a `-l` login
-/// shell's rc files (or an nvm/direnv hook) can `cd` away before the agent
-/// starts; re-cd-ing here wins regardless (#3265).
+/// Restore cwd and native routing after the login shell's startup files.
 pub(super) fn wrap_command_ignore_suspend(
     cmd: &str,
     working_dir: &str,
     routing: &[(String, Option<String>)],
+    case_insensitive_routing: &[&str],
 ) -> String {
     let user = crate::session::environment::user_shell();
     let posix = crate::session::environment::user_posix_shell();
-    let mut script = execution_context(working_dir, routing);
+    let mut script = execution_context(working_dir, routing, case_insensitive_routing);
     script.push_str(&format!("stty susp undef\nexec env {cmd}"));
     shell_stdin_command(&posix, user == posix, &script, "AOE_LAUNCH_BODY")
 }
 
-fn execution_context(working_dir: &str, routing: &[(String, Option<String>)]) -> String {
-    let mut script = format!("cd {} || exit 1\n", shell_escape(working_dir));
+fn execution_context(
+    working_dir: &str,
+    routing: &[(String, Option<String>)],
+    case_insensitive_routing: &[&str],
+) -> String {
+    let mut script = format!(
+        "cd {} || exit 1\n",
+        crate::session::environment::shell_escape_script_word(working_dir)
+    );
+    if !case_insensitive_routing.is_empty() {
+        script.push_str(
+            "eval \"$(set | while IFS='=' read -r aoe_key aoe_value; do\ncase \"$aoe_key\" in\n",
+        );
+        for (index, key) in case_insensitive_routing.iter().enumerate() {
+            if index != 0 {
+                script.push('|');
+            }
+            for byte in key.bytes() {
+                if byte.is_ascii_alphabetic() {
+                    script.push('[');
+                    script.push(byte.to_ascii_lowercase() as char);
+                    script.push(byte.to_ascii_uppercase() as char);
+                    script.push(']');
+                } else {
+                    script.push(byte as char);
+                }
+            }
+        }
+        // Only fixed identifier patterns can emit an unset command.
+        script.push_str(") printf 'unset %s\\n' \"$aoe_key\";;\nesac\ndone)\"\n");
+    }
     for (key, value) in routing {
         match value {
-            Some(value) => script.push_str(&format!("export {key}={}\n", shell_escape(value))),
+            Some(value) => script.push_str(&format!(
+                "export {key}={}\n",
+                crate::session::environment::shell_escape_script_word(value)
+            )),
             None => script.push_str(&format!("unset {key}\n")),
         }
     }
@@ -332,9 +361,13 @@ fn wrap_native_container_command(
             .to_str()
             .context("native cwd is not UTF-8")?,
         &execution.routing,
+        execution.case_insensitive_routing,
     );
     script.push_str(&format!("exec env {cmd}"));
-    Ok(format!("/bin/sh -c {}", shell_escape(&script)))
+    Ok(format!(
+        "/bin/sh -c {}",
+        crate::session::environment::shell_escape_script_word(&script)
+    ))
 }
 
 impl Instance {
@@ -645,7 +678,7 @@ impl Instance {
                 None => (self.project_path.as_str(), &[][..]),
             };
             let wrapped =
-                wrap_command_ignore_suspend(&launch_command, runtime_cwd, runtime_routing);
+                wrap_command_ignore_suspend(&launch_command, runtime_cwd, runtime_routing, &[]);
             (
                 Some(wrapped),
                 is_existing,
@@ -766,6 +799,7 @@ impl Instance {
                             &command,
                             &self.project_path,
                             execution.map_or(&[], |execution| execution.routing.as_slice()),
+                            execution.map_or(&[], |execution| execution.case_insensitive_routing),
                         )),
                         is_existing,
                         omp_capture_plan,
@@ -801,6 +835,7 @@ impl Instance {
                     &command,
                     &self.project_path,
                     execution.map_or(&[], |execution| execution.routing.as_slice()),
+                    execution.map_or(&[], |execution| execution.case_insensitive_routing),
                 )),
                 is_existing,
                 omp_capture_plan,
@@ -1029,30 +1064,112 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn prepared_hermes_sandbox_retains_post_launch_capture() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let profile = "hermes-capture";
+        super::super::test_helpers::declare_execution_aliases(
+            profile,
+            &[("hermes", "hermes")],
+            temp.path(),
+        );
+        let mut inst = Instance::new("hermes-capture", project.to_str().unwrap());
+        inst.tool = "hermes".into();
+        inst.command = "hermes".into();
+        inst.source_profile = profile.into();
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "fixture".into(),
+            container_name: "hermes-capture".into(),
+            extra_env: Some(vec!["HERMES_MANAGED_DIR=/root/.hermes/managed".into()]),
+            custom_instruction: None,
+            container_workdir: Some("/workspace/project".into()),
+            before_start_env: Vec::new(),
+        });
+        let config = inst.build_container_config().unwrap();
+        let _transport = super::super::test_helpers::install_container_transport(
+            temp.path(),
+            "hermes-capture",
+            &config.volumes,
+        );
+        std::fs::copy(
+            temp.path().join("native-bin/prime-agent"),
+            temp.path().join("native-bin/hermes"),
+        )
+        .unwrap();
+        let root = config
+            .volumes
+            .iter()
+            .find(|mount| mount.container_path == "/root/.hermes")
+            .unwrap()
+            .host_path
+            .clone();
+        std::fs::create_dir_all(&root).unwrap();
+        let database =
+            rusqlite::Connection::open(std::path::Path::new(&root).join("state.db")).unwrap();
+        database.execute_batch("CREATE TABLE sessions(id TEXT, source TEXT, started_at REAL, ended_at REAL, cwd TEXT, git_repo_root TEXT); INSERT INTO sessions VALUES ('stale', 'cli', 1000, NULL, '/workspace/project', NULL), ('foreign', 'cli', 4000, NULL, '/other', NULL), ('hermes_fresh', 'cli', 3000, NULL, '/workspace/project', NULL);").unwrap();
+        let execution = inst.resolve_native_execution(None).unwrap();
+        let binding = execution.binding.clone();
+        inst.active_execution = Some(ActiveExecution {
+            launch_id: execution.inputs.launch_id,
+            binding: execution.binding,
+            capture: execution.capture,
+            container: execution.inputs.container,
+        });
+        let poll = crate::session::capture::hermes_poll_fn_sandboxed_store(
+            inst.capture_store_dir()
+                .expect("prepared sandbox must retain its capture source"),
+            inst.container_workdir(),
+            inst.id.clone(),
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(2000),
+            Default::default(),
+            Some(binding),
+        );
+        assert_eq!(poll().as_deref(), Some("hermes_fresh"));
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn declared_resume_only_wrappers_keep_their_native_namespace() {
         let mut failures = Vec::new();
-        for (agent, sid, suffix, redirect) in [
+        for (agent, sid, redirect) in [
             (
                 "vibe",
                 "11111111-1111-4111-8111-111111111111",
-                "logs/session",
                 "VIBE_SESSION_LOGGING__SAVE_DIR=/foreign",
             ),
             (
                 "hermes",
                 "20260914_164000_a1b2c3",
-                "state.db",
                 "export HERMES_HOME=/foreign",
             ),
         ] {
             let temp = tempfile::tempdir().unwrap();
             let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
             let wrapper = format!("my-{agent}");
+            let payload = if agent == "hermes" {
+                "printf 'namespace:%s|%s|%s|%s\\n' \"$HERMES_HOME\" \"$HERMES_MANAGED_DIR\" \"$TERMINAL_ENV\" \"$TERMINAL_CWD\""
+            } else {
+                "printf 'namespace:%s|%s|%s|%s|%s\\n' \"$VIBE_HOME\" \"$VIBE_SESSION_LOGGING__SAVE_DIR\" \"$vIbE_sEsSiOn_LoGgInG__sAvE_dIr\" \"$VIBE_SESSION_LOGGING__SESSION_PREFIX\" \"$vibe_session_logging__session_prefix\""
+            };
             let _path = crate::session::test_support::install_login_shell_path_command(
                 temp.path(),
                 &wrapper,
-                "#!/bin/sh\nexit 0\n",
+                &format!("#!/bin/sh\nprintf '%s\\n' \"$@\"\n{payload}\n"),
             );
+            let _namespace = EnvGuard::unset(&[
+                "SAVE_DIR",
+                "SESSION_PREFIX",
+                "VIBE_AGENT_PATHS",
+                "VIBE_DEFAULT_AGENT",
+                "VIBE_SESSION_LOGGING",
+                "VIBE_SESSION_LOGGING__SAVE_DIR",
+                "VIBE_SESSION_LOGGING__SESSION_PREFIX",
+                "vibe_session_logging__session_prefix",
+            ]);
             let profile = "declared-native-resume";
             crate::session::instance::test_helpers::declare_execution_aliases(
                 profile,
@@ -1079,6 +1196,12 @@ mod tests {
                 ("TERMINAL_ENV".into(), "local".into()),
                 ("TERMINAL_CWD".into(), temp.path().to_str().unwrap().into()),
             ];
+            if agent == "vibe" {
+                inst.pending_host_env.push((
+                    "vibe_session_logging__session_prefix".into(),
+                    "session".into(),
+                ));
+            }
             let binding = match inst.asserted_resume_binding(sid, None) {
                 Ok(binding) => binding,
                 Err(error) => {
@@ -1086,21 +1209,39 @@ mod tests {
                     continue;
                 }
             };
-            assert_eq!(
-                binding.execution.as_ref().unwrap().stores,
-                vec![root.join(suffix)]
-            );
             inst.resume_intent = ResumeIntent::Use(sid.into());
             inst.resume_binding = Some(binding);
             let mut redirected = inst.clone();
             let prepared = inst
                 .prepare_launch_command(inst.conversation_state())
                 .unwrap();
-            assert!(prepared.execution.as_ref().unwrap().capture.is_none());
             let command = prepared.command.unwrap();
-            assert!(command.contains(&format!("--resume {sid}")), "{command}");
+            let login = temp.path().join(".profile");
+            let original_login = std::fs::read_to_string(&login).unwrap();
+            std::fs::write(&login, format!("{original_login}\nexport HERMES_MANAGED_DIR=/foreign TERMINAL_ENV=ssh TERMINAL_CWD=/foreign VIBE_SESSION_LOGGING__SAVE_DIR=/foreign vIbE_sEsSiOn_LoGgInG__sAvE_dIr=/foreign VIBE_SESSION_LOGGING__SESSION_PREFIX=foreign vibe_session_logging__session_prefix=foreign\n")).unwrap();
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", &command])
+                .env("vIbE_sEsSiOn_LoGgInG__sAvE_dIr", "/tmux-foreign")
+                .output()
+                .unwrap();
+            std::fs::write(&login, original_login).unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let expected = if agent == "hermes" {
+                format!(
+                    "--profile\ndefault\n--resume\n{sid}\nnamespace:{}|{}|local|{}\n",
+                    root.display(),
+                    temp.path().join("managed").display(),
+                    temp.path().display()
+                )
+            } else {
+                format!("--resume\n{sid}\nnamespace:{}||||session\n", root.display())
+            };
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
             if agent == "hermes" {
-                assert!(command.contains("--profile default"), "{command}");
                 std::fs::write(
                     root.join("config.yaml"),
                     "secrets:\n  sources: [command]\n  command:\n    enabled: false\n",
@@ -1329,117 +1470,101 @@ mod tests {
     }
 
     #[test]
-    fn test_yolo_envvar_survives_suspend_wrapper() {
-        let cmd = format_env_var_prefix("OPENCODE_PERMISSION", r#"{"*":"allow"}"#, "opencode");
-        let wrapped = wrap_command_ignore_suspend(&cmd, "/tmp/proj", &[]);
-        assert!(
-            wrapped.contains(r#"OPENCODE_PERMISSION='{"*":"allow"}' opencode"#),
-            "wrapped command should preserve the env assignment: {wrapped}",
+    #[serial_test::serial]
+    fn launch_shell_preserves_env_values_and_non_posix_login_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _path = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "probe",
+            "#!/bin/sh\nprintf '%s\\n' \"$OPENCODE_PERMISSION\" \"$AOE_TEST_LOGIN\"\n",
         );
-    }
-
-    #[test]
-    #[serial_test::serial(shell_env)]
-    fn test_wrap_command_uses_stdin_script() {
-        for shell in &["/bin/bash", "/bin/zsh", "/usr/bin/fish", "/usr/bin/nu"] {
+        for file in [".profile", ".bash_profile"] {
+            std::fs::write(temp.path().join(file), "export AOE_TEST_LOGIN=login\n").unwrap();
+        }
+        let value = r#"{"*":"allow","literal":"$HOME"}"#;
+        let command = format_env_var_prefix(
+            "OPENCODE_PERMISSION",
+            value,
+            &shell_escape(temp.path().join("bin/probe").to_str().unwrap()),
+        );
+        for (shell, login) in [
+            ("/bin/sh", "login"),
+            ("/usr/bin/fish", "parent"),
+            ("/usr/bin/nu", "parent"),
+        ] {
             let _shell = EnvGuard::set(&[("SHELL", shell)]);
-            let wrapped = wrap_command_ignore_suspend("claude", "/tmp/proj", &[]);
+            let wrapped =
+                wrap_command_ignore_suspend(&command, temp.path().to_str().unwrap(), &[], &[]);
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", &wrapped])
+                .env("AOE_TEST_LOGIN", "parent")
+                .output()
+                .unwrap();
             assert!(
-                wrapped.contains("/dev/fd/3 3<<'AOE_LAUNCH_BODY'"),
-                "{shell}: {wrapped}"
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
             );
-            assert!(wrapped.contains("\nstty susp undef\nexec env claude\n"));
-            assert!(!wrapped.contains(" -c "));
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                format!("{value}\n{login}\n")
+            );
         }
     }
-
     #[test]
-    #[serial_test::serial(shell_env)]
-    fn test_wrap_command_posix_shell_uses_login() {
-        let _shell = EnvGuard::set(&[("SHELL", "/bin/zsh")]);
-        let wrapped = wrap_command_ignore_suspend("claude", "/tmp/proj", &[]);
-        assert!(
-            wrapped.starts_with("'/bin/zsh' -l /dev/fd/3 "),
-            "POSIX shell should use a login descriptor script: {wrapped}",
-        );
-    }
-
-    #[test]
-    #[serial_test::serial(shell_env)]
-    fn test_wrap_command_fish_skips_login() {
-        let _shell = EnvGuard::set(&[("SHELL", "/usr/bin/fish")]);
-        let wrapped = wrap_command_ignore_suspend("claude", "/tmp/proj", &[]);
-        // The bash fallback must not load bash login files because the user's
-        // PATH setup belongs to fish.
-        assert!(
-            wrapped.starts_with("'bash' /dev/fd/3 "),
-            "fish should use a non-login bash descriptor script: {wrapped}",
-        );
-    }
-
-    #[test]
-    #[serial_test::serial(shell_env)]
-    fn test_wrap_command_nu_skips_login() {
-        let _shell = EnvGuard::set(&[("SHELL", "/usr/bin/nu")]);
-        let wrapped = wrap_command_ignore_suspend("claude", "/tmp/proj", &[]);
-        assert!(
-            wrapped.starts_with("'bash' /dev/fd/3 "),
-            "nu should use a non-login bash descriptor script: {wrapped}",
-        );
-    }
-
-    /// #3265: a login shell's own profile/rc files can `cd` elsewhere
-    /// (a stray line in `~/.bashrc`, or a legitimate nvm/pyenv/direnv hook)
-    /// after tmux's `-c` has already set the pane's cwd, silently landing
-    /// the agent in the wrong directory. The wrapper must re-assert
-    /// `working_dir` inside the login shell's own script, after profile
-    /// sourcing, so it wins regardless of what those files did.
-    ///
-    /// Holds `ENV_LOCK` across the `PATH` read, which is why the lock is taken
-    /// before the `which` rather than after it.
-    #[test]
+    #[serial_test::serial]
     fn test_wrap_command_reasserts_working_dir_after_login_shell() {
-        let _lock = EnvGuard::read_lock();
-        // The wrapper execs `$SHELL`, so it has to be a shell that exists here.
-        let Ok(bash) = which::which("bash") else {
-            eprintln!("skipping: bash not found on PATH");
-            return;
-        };
-        // The guard restores on unwind; the resolved path matters separately,
-        // because `wrap_command_ignore_suspend` execs `$SHELL` below. The
-        // `repo_config` hook tests used to read this override too and now pin
-        // their own (#3449).
-        let _shell = EnvGuard::set(&[("SHELL", &bash)]);
         let temp = tempfile::tempdir().unwrap();
-        let working_dir = temp.path().join("some project's dir");
-        std::fs::create_dir(&working_dir).unwrap();
-        let wrapped = wrap_command_ignore_suspend("pwd", working_dir.to_str().unwrap(), &[]);
-        // The cd is the first statement inside the login shell's stdin script,
-        // after profile sourcing, before disabling suspend and exec'ing.
-        assert!(
-            wrapped.contains("3<<'AOE_LAUNCH_BODY'\ncd "),
-            "the cd must open the login shell's stdin script: {wrapped}",
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _path = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "claude",
+            "#!/bin/sh\nexit 0\n",
         );
-        assert!(
-            wrapped.contains("|| exit 1\nstty susp undef"),
-            "the cd must exit-on-failure before disabling suspend: {wrapped}",
-        );
-        let output = std::process::Command::new(&bash)
-            .args(["-c", &wrapped])
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "wrapped command failed: {}",
-            String::from_utf8_lossy(&output.stderr),
-        );
-        // `pwd` prints the logical path on BSD and the physical one under GNU
-        // coreutils, so compare the directories rather than their spellings.
-        let printed = String::from_utf8_lossy(&output.stdout);
-        assert_eq!(
-            std::path::Path::new(printed.trim()).canonicalize().unwrap(),
-            working_dir.canonicalize().unwrap(),
-        );
+        let mut failures = Vec::new();
+        for suffix in ["plain", "line\nand\rbreak"] {
+            let cwd = temp.path().join(format!("cwd-{suffix}"));
+            let store = temp.path().join(format!("store-{suffix}"));
+            std::fs::create_dir_all(&cwd).unwrap();
+            std::fs::create_dir_all(&store).unwrap();
+            let _store = EnvGuard::set(&[("CLAUDE_CONFIG_DIR", &store)]);
+            let mut instance = Instance::new("script", cwd.to_str().unwrap());
+            instance.tool = "claude".into();
+            instance.command = "claude".into();
+            let execution = instance.resolve_native_execution(None).unwrap();
+            let payload = "printf '%s\\0%s' \"$PWD\" \"$CLAUDE_CONFIG_DIR\"";
+            for (context, wrapped) in [
+                (
+                    "host",
+                    wrap_command_ignore_suspend(
+                        payload,
+                        cwd.to_str().unwrap(),
+                        &execution.routing,
+                        execution.case_insensitive_routing,
+                    ),
+                ),
+                (
+                    "container script",
+                    wrap_native_container_command(payload, Some(&execution)).unwrap(),
+                ),
+            ] {
+                let output = std::process::Command::new("/bin/sh")
+                    .args(["-c", &wrapped])
+                    .output()
+                    .unwrap();
+                let expected = format!("{}\0{}", cwd.display(), store.display()).into_bytes();
+                if !output.status.success() || output.stdout != expected {
+                    failures.push(format!(
+                        "{context} {suffix:?}: status={} stdout={:?} stderr={:?}",
+                        output.status,
+                        output.stdout,
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     // Tests for get_tool_command

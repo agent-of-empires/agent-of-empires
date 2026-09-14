@@ -714,7 +714,7 @@ mod tests {
         );
         let large_gate = gate_omp_launch(&large_command, &large_command, &omp_test_plan());
         let large_outer =
-            wrap_command_ignore_suspend(&large_gate, temp.path().to_str().unwrap(), &[]);
+            wrap_command_ignore_suspend(&large_gate, temp.path().to_str().unwrap(), &[], &[]);
         assert!(!large_outer.lines().next().unwrap().contains("-c"));
         std::fs::write(&script, large_outer).unwrap();
         let status = std::process::Command::new("sh")

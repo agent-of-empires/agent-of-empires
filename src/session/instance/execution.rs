@@ -137,10 +137,21 @@ use super::{Instance, ResumeIntent};
 use crate::agents::{AgentDef, AGENTS};
 use anyhow::{bail, Context, Result};
 
+const VIBE_NAMESPACE_ENVIRONMENT: &[&str] = &[
+    "SAVE_DIR",
+    "SESSION_PREFIX",
+    "VIBE_AGENT_PATHS",
+    "VIBE_DEFAULT_AGENT",
+    "VIBE_SESSION_LOGGING",
+    "VIBE_SESSION_LOGGING__SAVE_DIR",
+    "VIBE_SESSION_LOGGING__SESSION_PREFIX",
+];
+
 pub(super) struct NativeExecution {
     pub(super) agent: &'static AgentDef,
     pub(super) binding: ExecutionBinding,
     pub(super) routing: Vec<(String, Option<String>)>,
+    pub(super) case_insensitive_routing: &'static [&'static str],
     pub(super) omp: Option<crate::session::capture::OmpResolvedContext>,
     pub(super) inputs: NativeLaunchInputs,
     pub(super) program: PathBuf,
@@ -262,16 +273,9 @@ impl NativeLaunchInputs {
             Ok(())
         };
         let routes_namespace = |key: &str| {
-            matches!(
-                key,
-                "save_dir"
-                    | "session_prefix"
-                    | "vibe_agent_paths"
-                    | "vibe_default_agent"
-                    | "vibe_session_logging"
-                    | "vibe_session_logging__save_dir"
-                    | "vibe_session_logging__session_prefix"
-            )
+            VIBE_NAMESPACE_ENVIRONMENT
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(key))
         };
         for key in self.read_native_dotenv(&root.join(".env"))?.keys() {
             if self
@@ -288,17 +292,18 @@ impl NativeLaunchInputs {
         }
         let mut environments = std::collections::BTreeMap::new();
         for (key, value) in &self.environment {
-            if value.is_empty() {
+            if !routes_namespace(key)
+                || (value.is_empty()
+                    && !key.eq_ignore_ascii_case("SAVE_DIR")
+                    && !key.eq_ignore_ascii_case("SESSION_PREFIX"))
+            {
                 continue;
             }
-            let key = key.to_ascii_lowercase();
-            if routes_namespace(&key) {
-                if let Some(previous) = environments.insert(key, value) {
-                    anyhow::ensure!(
-                        previous == value,
-                        "Vibe environment has conflicting case-insensitive settings"
-                    );
-                }
+            if let Some(previous) = environments.insert(key.to_ascii_lowercase(), value) {
+                anyhow::ensure!(
+                    previous == value,
+                    "Vibe environment has conflicting case-insensitive settings"
+                );
             }
         }
         let mut selected_profile = None;
@@ -940,6 +945,7 @@ impl Instance {
                 .unwrap_or_else(|| home.join(".local/share")),
         );
         let mut routing = Vec::new();
+        let mut case_insensitive_routing: &'static [&'static str] = &[];
         let mut configuration = Vec::new();
         let mut pi_root = None;
         let mut pi_transcript_path = None;
@@ -1132,6 +1138,9 @@ impl Instance {
                 };
                 inputs.validate_hermes_namespace(&root)?;
                 routing.push(("HERMES_HOME".into(), Some(root.to_str().context("Hermes home is not UTF-8")?.into())));
+                for key in ["HERMES_MANAGED_DIR", "TERMINAL_ENV", "TERMINAL_CWD"] {
+                    routing.push((key.into(), value(key)));
+                }
                 if !root.parent().and_then(std::path::Path::file_name).is_some_and(|name| name == "profiles") {
                     namespace_arguments.extend(["--profile".into(), "default".into()]);
                 }
@@ -1147,6 +1156,10 @@ impl Instance {
                 let root = inputs.canonical_path(&root)?;
                 let store = inputs.validate_vibe_namespace(&root, &self.selected_agent_args(), self.is_yolo_mode())?;
                 routing.push(("VIBE_HOME".into(), Some(root.to_str().context("Vibe home is not UTF-8")?.into())));
+                case_insensitive_routing = VIBE_NAMESPACE_ENVIRONMENT;
+                routing.extend(inputs.environment.iter().filter(|(key, _)| {
+                    VIBE_NAMESPACE_ENVIRONMENT.iter().any(|name| name.eq_ignore_ascii_case(key))
+                }).map(|(key, value)| (key.clone(), Some(value.clone()))));
                 configuration.push(root);
                 vec![store]
             }
@@ -1381,16 +1394,22 @@ impl Instance {
             } else {
                 None
             }
-        } else if matches!(agent.name, "codex" | "gemini" | "kimi")
+        } else if matches!(agent.name, "codex" | "gemini" | "kimi" | "hermes")
             && direct_capture
             && inputs.container.is_some()
             && filesystem.as_deref() == Some("host")
         {
+            let store = stores.first().context("native capture store is missing")?;
+            let root = if agent.name == "hermes" {
+                store
+                    .parent()
+                    .context("Hermes database has no directory")?
+                    .to_path_buf()
+            } else {
+                store.clone()
+            };
             Some(CaptureContext::Store {
-                root: stores
-                    .first()
-                    .context("native capture store is missing")?
-                    .clone(),
+                root,
                 cwd: inputs
                     .cwd
                     .to_str()
@@ -1420,6 +1439,7 @@ impl Instance {
                 filesystem: filesystem.context("native conversation store is unavailable")?,
             },
             routing,
+            case_insensitive_routing,
             omp: omp.filter(|_| direct_capture),
             inputs,
             program,
