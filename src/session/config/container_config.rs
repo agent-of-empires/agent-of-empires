@@ -1834,7 +1834,7 @@ pub(crate) fn ensure_folder_trust_config_for_active_agent(
     }
 }
 
-fn resolve_active_agent(
+pub(crate) fn resolve_active_agent(
     tool: &str,
     command: Option<&str>,
     session_config: &super::SessionConfig,
@@ -1850,10 +1850,10 @@ fn resolve_active_agent(
             if session_config.agent_execution_as.contains_key(tool) {
                 return None;
             }
-            session_config
-                .agent_detect_as
-                .get(tool)
-                .and_then(|name| crate::agents::get_agent(name))
+            match session_config.agent_detect_as.get(tool) {
+                Some(name) => crate::agents::get_agent(name),
+                None => crate::agents::get_agent(tool),
+            }
         })
 }
 
