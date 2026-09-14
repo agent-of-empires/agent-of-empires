@@ -326,14 +326,19 @@ impl Instance {
 mod tests {
     use super::*;
     use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
     use std::process::{Command, Stdio};
 
+    /// Writes from a child `sh` so this binary never holds the writable
+    /// descriptor: a concurrent spawn forking inside that window would make
+    /// the later execve fail with ETXTBSY (#3861).
     fn write_executable(path: &std::path::Path, contents: &str) {
-        std::fs::write(path, contents).unwrap();
-        let mut permissions = std::fs::metadata(path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(path, permissions).unwrap();
+        let status = Command::new("/bin/sh")
+            .args(["-c", r#"printf %s "$1" > "$2" && chmod 755 "$2""#, "sh"])
+            .arg(contents)
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "writing {}", path.display());
     }
 
     #[test]
