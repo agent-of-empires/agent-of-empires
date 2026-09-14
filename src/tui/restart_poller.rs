@@ -89,6 +89,7 @@ mod tests {
             instance,
             size: None,
             wake_message: String::new(),
+            discard_sandbox_container: false,
         });
 
         let result = loop {

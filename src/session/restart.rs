@@ -6,6 +6,7 @@
 //! for seconds. Running it on the TUI event loop froze the whole UI, so the TUI
 //! drives this off the UI thread via `RestartPoller`, mirroring `StopPoller`.
 
+use crate::containers::{DockerContainer, Teardown};
 use crate::session::{Instance, StartOutcome};
 
 pub struct RestartRequest {
@@ -17,6 +18,10 @@ pub struct RestartRequest {
     /// Keys to send once the pane is live again. Empty disables the wake-up
     /// (the documented opt-out via `session.restart_wake_message`).
     pub wake_message: String,
+    /// Remove the sandbox container before relaunching, so the next start
+    /// creates a fresh one. Set on a tool swap: agent config mounts are chosen
+    /// per tool at create time and a restart reuses the container (#3959).
+    pub discard_sandbox_container: bool,
 }
 
 pub struct RestartResult {
@@ -38,6 +43,7 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
         mut instance,
         size,
         wake_message,
+        discard_sandbox_container,
     } = request;
 
     let title = instance.title.clone();
@@ -53,7 +59,8 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
         let _scope = crate::session::recovery::HookTimeoutScope::new(
             crate::session::recovery::recovery_hook_timeout(),
         );
-        instance.restart_with_size(size).map_err(|e| e.to_string())
+        discard_stale_sandbox_container(&instance, discard_sandbox_container)
+            .and_then(|()| instance.restart_with_size(size).map_err(|e| e.to_string()))
     };
 
     // On a successful restart, send the wake-up keys on a detached thread so
@@ -69,6 +76,28 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
         before: Box::new(before),
         instance: Box::new(instance),
         outcome,
+    }
+}
+
+/// A failure fails the restart: relaunching into the old container would run
+/// the new tool against the previous tool's config store.
+fn discard_stale_sandbox_container(instance: &Instance, discard: bool) -> Result<(), String> {
+    if !discard || !instance.is_sandboxed() {
+        return Ok(());
+    }
+    match DockerContainer::from_session_id(&instance.id).discard() {
+        Teardown::Removed => {
+            tracing::info!(
+                target: "containers.runtime",
+                session = %instance.id,
+                "removed sandbox container built for the previous tool; it will be recreated on start"
+            );
+            Ok(())
+        }
+        Teardown::AlreadyGone => Ok(()),
+        Teardown::Failed(e) => Err(format!(
+            "failed to remove the sandbox container built for the previous tool: {e}"
+        )),
     }
 }
 
@@ -141,6 +170,7 @@ mod tests {
             instance,
             size: None,
             wake_message: String::new(),
+            discard_sandbox_container: false,
         });
         // The cascade may create a real tmux session; tear it down so the test
         // cleans up after itself.
