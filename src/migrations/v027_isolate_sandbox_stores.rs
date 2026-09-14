@@ -335,7 +335,7 @@ fn reconcile_scoped(
     reap: &ReapProbe<'_>,
 ) -> Result<()> {
     let app_dir = crate::session::get_app_dir()?;
-    if !transition_may_be_pending(&app_dir)? {
+    if !transition_may_be_pending(&app_dir, !announce && only.is_none())? {
         return Ok(());
     }
     let home = dirs::home_dir().context("home directory unavailable for sandbox migration")?;
@@ -362,8 +362,12 @@ fn reconcile_scoped(
     Ok(())
 }
 
-fn transition_may_be_pending(app_dir: &Path) -> Result<bool> {
-    if app_dir.join(JOURNAL).exists() {
+/// Whether a pass has anything to do. A bare start copies, publishes and
+/// retires nothing, so a journal and a parked row, which only a launch or
+/// `aoe migrate` can act on, are not work for it; counting them re-ran a
+/// no-op pass on every start for as long as any session stayed archived.
+fn transition_may_be_pending(app_dir: &Path, bare_start: bool) -> Result<bool> {
+    if !bare_start && app_dir.join(JOURNAL).exists() {
         return Ok(true);
     }
     for registry in load_registries(app_dir)? {
@@ -371,23 +375,40 @@ fn transition_may_be_pending(app_dir: &Path) -> Result<bool> {
             continue;
         };
         if rows.iter().any(|row| {
-            row.get("sandbox_info")
-                .and_then(|sandbox| sandbox.get("enabled"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-                && (row
-                    .get("sandbox_store_generation")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0)
-                    < u64::from(
-                        crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION,
-                    )
-                    || transition_paths(row).ok().flatten().is_some())
+            (on_shared_store(row) && !(bare_start && row_is_parked(row)))
+                || (is_sandboxed(row) && transition_paths(row).ok().flatten().is_some())
         }) {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+fn is_sandboxed(row: &Value) -> bool {
+    row.pointer("/sandbox_info/enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn on_shared_store(row: &Value) -> bool {
+    is_sandboxed(row)
+        && row
+            .get("sandbox_store_generation")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            < u64::from(crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION)
+}
+
+/// How many sandboxed sessions still use a shared agent store, so `aoe
+/// migrate` does not call a run that left some there complete.
+pub(crate) fn sessions_on_shared_store() -> Result<usize> {
+    let app_dir = crate::session::get_app_dir()?;
+    Ok(load_registries(&app_dir)?
+        .iter()
+        .filter_map(|registry| registry.value.as_array())
+        .flatten()
+        .filter(|row| on_shared_store(row))
+        .count())
 }
 
 /// Whether a row's store move is published but not yet finished, so its
@@ -1290,9 +1311,14 @@ fn run_pass(
     }
 
     let done = ready_rows.len();
-    if !affected_rows.is_empty() && (announce || done > 0) {
+    // A held-only backlog is announced too: without it `aoe migrate` reports
+    // nothing about sessions it deliberately left on the shared store.
+    if (!affected_rows.is_empty() || held_row_count > 0) && (announce || done > 0) {
         let left = affected_rows.len().saturating_sub(done);
         progress::notice(match (left, held_row_count) {
+            (0, held) if affected_rows.is_empty() => format!(
+                "{held} trashed or archived sandboxed session(s) stay on the shared agent store; each moves when it is started, or restore or unarchive it and run `aoe migrate`."
+            ),
             (0, 0) => format!("{done} sandboxed session(s) now use private agent stores."),
             (0, held) => format!(
                 "{done} sandboxed session(s) now use private agent stores. {held} trashed or archived session(s) stay on the shared agent store; each moves when it is started, or restore or unarchive it and run `aoe migrate`."
@@ -2371,8 +2397,19 @@ mod tests {
         .unwrap();
         fs::write(app.join(JOURNAL), br#"["/home/u/.claude/sandbox"]"#).unwrap();
 
-        assert!(transition_may_be_pending(&app).unwrap());
+        assert!(transition_may_be_pending(&app, false).unwrap());
+        assert!(
+            !transition_may_be_pending(&app, true).unwrap(),
+            "a bare start has nothing to do for a parked row and a journal"
+        );
         assert!(!transition_in_flight(&app).unwrap());
+
+        fs::write(
+            app.join("sessions.json"),
+            r#"[{"id":"1111111111111111","sandbox_info":{"enabled":true}}]"#,
+        )
+        .unwrap();
+        assert!(transition_may_be_pending(&app, true).unwrap());
 
         fs::write(
             app.join("sessions.json"),
@@ -2380,6 +2417,7 @@ mod tests {
         )
         .unwrap();
 
+        assert!(transition_may_be_pending(&app, true).unwrap());
         assert!(transition_in_flight(&app).unwrap());
 
         // Metadata the migration cannot parse is state it cannot validate, so
@@ -2431,7 +2469,7 @@ mod tests {
             home.join(".gemini/sandbox").is_dir(),
             "the legacy source must survive a deferred reap"
         );
-        assert!(transition_may_be_pending(&app).unwrap());
+        assert!(transition_may_be_pending(&app, false).unwrap());
 
         super::run_in(
             &app,
@@ -2451,7 +2489,7 @@ mod tests {
             b"legacy"
         );
         assert!(!home.join(".gemini/sandbox").exists());
-        assert!(!transition_may_be_pending(&app).unwrap());
+        assert!(!transition_may_be_pending(&app, false).unwrap());
     }
 
     /// `AOE_DEFER_SANDBOX_MIGRATION` must behave exactly like a live cohort: no
@@ -2561,7 +2599,7 @@ mod tests {
             super::super::CURRENT_VERSION.to_string()
         );
         assert!(!super::super::has_pending_migrations());
-        assert!(transition_may_be_pending(&app).unwrap());
+        assert!(transition_may_be_pending(&app, false).unwrap());
         assert!(home.join(".gemini/sandbox").is_dir());
         assert!(!home.join(".gemini/sandbox-v2").exists());
         let pending: Value =
@@ -3190,6 +3228,24 @@ gemini = "{}"
             legacy.exists(),
             "a parked row must protect the shared source it still reads"
         );
+
+        // Only the parked rows are left: `aoe migrate` must still say why.
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let guard = progress::install(Some(std::sync::Arc::new(move |event| {
+            sink.lock().unwrap().push(event)
+        })));
+        run_in(&app, &home, &|_| Ok(false)).unwrap();
+        drop(guard);
+        assert!(
+            events.lock().unwrap().iter().any(|event| matches!(
+                event,
+                progress::Event::Notice(line) if line.starts_with("2 trashed or archived")
+            )),
+            "{:?}",
+            events.lock().unwrap()
+        );
+        assert_eq!(sessions_on_shared_store().unwrap(), 2);
     }
 
     /// Clearing `trashed_at` makes the row eligible again, and the start that

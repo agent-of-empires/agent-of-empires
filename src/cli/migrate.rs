@@ -125,7 +125,12 @@ pub fn run() -> Result<()> {
     if std::io::stderr().is_terminal() {
         eprint!("\r\x1b[2K");
     }
-    eprintln!("{PREFIX}migrations complete");
+    match crate::migrations::v027_isolate_sandbox_stores::sessions_on_shared_store()? {
+        0 => eprintln!("{PREFIX}migrations complete"),
+        left => eprintln!(
+            "{PREFIX}migrations complete, except {left} sandboxed session(s) still on a shared agent store"
+        ),
+    }
     Ok(())
 }
 
