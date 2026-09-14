@@ -5,7 +5,7 @@
 // runs as if the wrapper were not draggable (#1419).
 
 import { devices } from "@playwright/test";
-import { test, expect } from "./helpers/mockedTest";
+import { test, expect, publishedRequests, observeFor } from "./helpers/mockedTest";
 import { installSidebarMocks, threeSessionsInOneRepo } from "./helpers/sidebarMocks";
 
 test.use({ ...devices["iPhone 13"] });
@@ -39,6 +39,9 @@ test("touch tap on a row navigates", async ({ page }) => {
   await expect(page).toHaveURL(/\/session\/s-b$/, { timeout: 5_000 });
 
   // No PUT fired; the gesture never started a drag.
-  await page.waitForTimeout(200);
+  await observeFor(page, 200, async () => {
+    expect(await publishedRequests(page, "/api/workspace-ordering", "PUT")).toEqual([]);
+    expect(handle.puts).toEqual([]);
+  });
   expect(handle.puts).toEqual([]);
 });

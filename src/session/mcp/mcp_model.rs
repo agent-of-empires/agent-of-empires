@@ -1166,12 +1166,9 @@ mod tests {
     /// otherwise read their own config instead of this one.
     fn set_tmp_home() -> (tempfile::TempDir, crate::session::test_support::EnvGuard) {
         let dir = tempfile::tempdir().unwrap();
-        let guard = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
-        // SAFETY: serialized by `#[serial]`; matches the existing pattern.
-        unsafe {
-            std::env::set_var("HOME", dir.path());
-            std::env::set_var("XDG_CONFIG_HOME", dir.path().join(".config"));
-        }
+        let guard = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"])
+            .and_set("HOME", dir.path())
+            .and_set("XDG_CONFIG_HOME", dir.path().join(".config"));
         (dir, guard)
     }
 

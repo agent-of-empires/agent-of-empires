@@ -27,7 +27,10 @@ fn spawn_config_with_shim_env(shim: PathBuf, env: Vec<(String, String)>) -> Spaw
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
-            command: "node".into(),
+            command: crate::common::shim_node()
+                .expect("shim prerequisite")
+                .to_string_lossy()
+                .into_owned(),
             args: vec![shim.to_string_lossy().to_string()],
             description: "session/delete shim".into(),
             env_allowlist: None,
@@ -80,6 +83,7 @@ async fn drive_handshake_and_capture_session_id(
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn session_delete_called_when_capability_advertised() {
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
@@ -123,6 +127,7 @@ async fn session_delete_called_when_capability_advertised() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn session_delete_unsupported_when_capability_absent() {
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
@@ -153,6 +158,7 @@ async fn session_delete_unsupported_when_capability_absent() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn session_delete_timeout_does_not_hang() {
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");

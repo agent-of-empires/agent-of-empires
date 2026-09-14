@@ -577,7 +577,7 @@ fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
     std::fs::write(claude_dir.join(format!("{stale_sid}.jsonl")), "seed\n").unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some(profile.to_string()),
         tools,
         crate::file_watch::FileWatchService::noop(),
@@ -1350,7 +1350,7 @@ fn scratch_label_pin_gate_keys_on_backing_repo_not_label() {
             .unwrap();
         }
 
-        let mut view = HomeView::new(
+        let mut view = HomeView::new_for_test(
             Some("test".to_string()),
             AvailableTools::with_tools(&["claude"]),
             crate::file_watch::FileWatchService::noop(),
@@ -1437,7 +1437,7 @@ fn synthetic_scratch_bucket_is_distinct_from_real_repo() {
         })
         .unwrap();
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         AvailableTools::with_tools(&["claude"]),
         crate::file_watch::FileWatchService::noop(),
@@ -1520,7 +1520,7 @@ fn scratch_bucket_lends_no_repo_path_for_new_session_prefill() {
         })
         .unwrap();
 
-    let view = HomeView::new(
+    let view = HomeView::new_for_test(
         Some("test".to_string()),
         AvailableTools::with_tools(&["claude"]),
         crate::file_watch::FileWatchService::noop(),
@@ -1556,7 +1556,7 @@ fn scratch_bucket_absent_from_main_flow_when_only_scratch_is_archived() {
         })
         .unwrap();
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         AvailableTools::with_tools(&["claude"]),
         crate::file_watch::FileWatchService::noop(),
@@ -1707,7 +1707,7 @@ fn stale_registry_entry_with_mismatched_archived_path_stays_pinned_and_unpinnabl
     .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         tools,
         crate::file_watch::FileWatchService::noop(),
@@ -1932,7 +1932,8 @@ fn all_profiles_view_includes_profile_scoped_pins() {
     .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    let mut view =
+        HomeView::new_for_test(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
     view.group_by = GroupByMode::Project;
     view.flat_items = view.build_flat_items();
 
@@ -1991,7 +1992,8 @@ fn unpin_profile_scoped_pin_from_all_profiles_clears_header() {
     .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    let mut view =
+        HomeView::new_for_test(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
     view.group_by = GroupByMode::Project;
     view.flat_items = view.build_flat_items();
 
@@ -2260,7 +2262,7 @@ fn profile_move_group_metadata_survives_reload() {
     let tools = AvailableTools::with_tools(&["claude"]);
 
     {
-        let mut view = HomeView::new(
+        let mut view = HomeView::new_for_test(
             None,
             tools.clone(),
             crate::file_watch::FileWatchService::noop(),
@@ -2292,7 +2294,8 @@ fn profile_move_group_metadata_survives_reload() {
             .unwrap();
     }
 
-    let reloaded = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    let reloaded =
+        HomeView::new_for_test(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
     assert!(
         reloaded.group_trees.contains_key("alpha"),
         "alpha tree must still load after the move"
@@ -3471,13 +3474,27 @@ fn startup_recovery_waits_for_the_first_reconcile_sweep() {
         "construction must arm the gate rather than recover from unrepaired paths"
     );
 
-    // An unchanged sweep still releases it: the paths are now known good.
+    // Observe completion directly, rather than mistaking gate expiry for a sweep.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let result = loop {
+        match view.reconcile_poller.try_recv_result() {
+            Ok(result) => break result,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                panic!("startup worker disconnected")
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "startup sweep did not complete"
+                );
+                std::thread::yield_now();
+            }
+        }
+    };
+    assert!(!result.changed, "empty storage needs no repair");
     view.reconcile_poller =
-        crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(false);
-    assert!(
-        !view.apply_reconcile_results(),
-        "nothing changed, so no reload"
-    );
+        crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(result.changed);
+    assert!(!view.apply_reconcile_results());
     assert!(
         view.startup_recovery_gate.is_none(),
         "the sweep landing must release the recovery gate"
@@ -3501,14 +3518,15 @@ fn startup_recovery_gate_expires_when_the_sweep_never_lands() {
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
     let _storage = Storage::new_unwatched("test").unwrap();
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         AvailableTools::with_tools(&["claude"]),
         crate::file_watch::FileWatchService::noop(),
     )
     .unwrap();
-    // A poller that never reports, standing in for a sweep blocked on a flock.
+    // No request is queued: only the gate deadline can release recovery.
     view.reconcile_poller = crate::tui::reconcile_poller::ReconcilePoller::new();
+    view.startup_recovery_gate = Some(std::time::Instant::now());
 
     assert!(!view.apply_reconcile_results());
     assert!(
@@ -3542,7 +3560,7 @@ fn a_failed_reload_backs_off_instead_of_retrying_every_tick() {
             Ok(())
         })
         .unwrap();
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         AvailableTools::with_tools(&["claude"]),
         crate::file_watch::FileWatchService::noop(),
@@ -3593,7 +3611,7 @@ fn startup_recovery_gate_expires_during_live_send() {
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
     let _storage = Storage::new_unwatched("test").unwrap();
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         AvailableTools::with_tools(&["claude"]),
         crate::file_watch::FileWatchService::noop(),
@@ -3637,7 +3655,7 @@ fn a_queued_repair_is_applied_before_the_gate_opens_at_the_deadline() {
         })
         .unwrap();
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         AvailableTools::with_tools(&["claude"]),
         crate::file_watch::FileWatchService::noop(),
@@ -3692,7 +3710,7 @@ fn a_queued_repair_keeps_the_gate_armed_while_live_send_holds_the_reload() {
         })
         .unwrap();
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         AvailableTools::with_tools(&["claude"]),
         crate::file_watch::FileWatchService::noop(),
@@ -3755,7 +3773,7 @@ fn a_failed_reload_keeps_the_repair_pending_and_the_gate_shut() {
         })
         .unwrap();
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         AvailableTools::with_tools(&["claude"]),
         crate::file_watch::FileWatchService::noop(),
@@ -3769,6 +3787,8 @@ fn a_failed_reload_keeps_the_repair_pending_and_the_gate_shut() {
         .unwrap();
     view.reconcile_poller =
         crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(true);
+
+    view.startup_recovery_gate = Some(std::time::Instant::now());
 
     // A groups.json that is a directory makes `load_with_groups` fail.
     let groups = crate::session::get_app_dir()

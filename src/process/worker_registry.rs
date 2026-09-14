@@ -694,32 +694,10 @@ mod tests {
     }
 
     fn with_temp_home<F: FnOnce()>(f: F) {
-        // Root under /tmp instead of the default $TMPDIR (which on
-        // macOS points into /var/folders/... and blows past the
-        // ~104-char sun_path limit once we tack on <app_dir>/acp-workers/
-        // <session_id>.sock inside a peer_pid test).
+        // Keep worker socket paths below macOS sun_path limits.
         let tmp = TempDir::with_prefix_in("aoe-registry-", "/tmp").unwrap();
-        let original = std::env::var_os("HOME");
-        let original_xdg = std::env::var_os("XDG_CONFIG_HOME");
-        // SAFETY: tests are serialized via `#[serial]`; the env mutation
-        // window is bounded to this closure and restored on exit.
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
-        }
+        let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
         f();
-        unsafe {
-            if let Some(v) = original {
-                std::env::set_var("HOME", v);
-            } else {
-                std::env::remove_var("HOME");
-            }
-            if let Some(v) = original_xdg {
-                std::env::set_var("XDG_CONFIG_HOME", v);
-            } else {
-                std::env::remove_var("XDG_CONFIG_HOME");
-            }
-        }
     }
 
     #[test]

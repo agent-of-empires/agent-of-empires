@@ -759,6 +759,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_merge_post_restart_preserves_peer_sid() {
         let mut stored = Instance::new("session", "/tmp/test");
         stored.agent_session_id = Some("peer-fresh-sid".to_string());

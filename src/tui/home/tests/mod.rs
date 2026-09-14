@@ -61,7 +61,7 @@ fn create_test_env_empty() -> TestEnv {
     let _guard = setup_test_home(&temp);
     let _storage = Storage::new_unwatched("test").unwrap(); // ensure profile dir exists
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         tools,
         crate::file_watch::FileWatchService::noop(),
@@ -93,7 +93,7 @@ async fn config_watch_keys_distinguish_global_from_profile_named_global() {
     std::fs::create_dir_all(&profile_dir).unwrap();
     let _storage = Storage::open_unwatched(profile_name).unwrap();
     let tools = AvailableTools::with_tools(&["claude"]);
-    let view = HomeView::new(
+    let view = HomeView::new_for_test(
         Some(profile_name.to_string()),
         tools,
         crate::file_watch::FileWatchService::new().unwrap(),
@@ -161,7 +161,7 @@ fn create_test_env_with_sessions(count: usize) -> TestEnv {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         tools,
         crate::file_watch::FileWatchService::noop(),
@@ -227,7 +227,7 @@ fn create_test_env_with_groups() -> TestEnv {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         tools,
         crate::file_watch::FileWatchService::noop(),
@@ -276,7 +276,7 @@ fn create_test_env_with_mixed_sessions() -> TestEnv {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         tools,
         crate::file_watch::FileWatchService::noop(),
@@ -355,7 +355,7 @@ fn create_test_env_with_group_sessions() -> TestEnv {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         tools,
         crate::file_watch::FileWatchService::noop(),
@@ -397,7 +397,7 @@ fn attention_env_running_then_waiting() -> (TestEnv, usize, usize) {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         tools,
         crate::file_watch::FileWatchService::noop(),
@@ -449,7 +449,7 @@ fn attention_env_running_then_idle() -> (TestEnv, usize, usize) {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         tools,
         crate::file_watch::FileWatchService::noop(),
@@ -509,7 +509,8 @@ fn rendered_single_session_text(
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    let mut view =
+        HomeView::new_for_test(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.row_tag_mode = row_tag_mode;
     view.flat_items = view.build_flat_items();
@@ -561,7 +562,7 @@ fn setup_creation_test_env() -> CreationTestEnv {
     }
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("default".to_string()),
         tools,
         crate::file_watch::FileWatchService::noop(),
@@ -685,7 +686,7 @@ fn create_test_env_two_projects_mixed_attention() -> TestEnv {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let view = HomeView::new(
+    let view = HomeView::new_for_test(
         Some("test".to_string()),
         tools,
         crate::file_watch::FileWatchService::noop(),
@@ -742,7 +743,7 @@ fn create_test_env_two_orgs() -> TestEnv {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let view = HomeView::new(
+    let view = HomeView::new_for_test(
         Some("test".to_string()),
         tools,
         crate::file_watch::FileWatchService::noop(),
@@ -793,7 +794,7 @@ fn create_test_env_same_owner_two_hosts() -> TestEnv {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let view = HomeView::new(
+    let view = HomeView::new_for_test(
         Some("test".to_string()),
         tools,
         crate::file_watch::FileWatchService::noop(),

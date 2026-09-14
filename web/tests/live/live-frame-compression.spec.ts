@@ -12,6 +12,7 @@ import { writeFileSync, chmodSync, mkdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { test, expect } from "../helpers/liveTest";
 import { spawnAoeServe, resolveAoeBinary } from "../helpers/aoeServe";
+import { gitEnv } from "../helpers/gitFixture";
 import { clickSidebarSession, openMobileSidebar } from "../helpers/sidebar";
 
 test("live frames arrive compressed (binary) and render through the inflater", async ({ browser }, testInfo) => {
@@ -33,7 +34,7 @@ while true; do i=$((i+1)); echo "compress line $i"; sleep 0.2; done
       chmodSync(tool, 0o755);
       const pd = join(e.home, "project");
       mkdirSync(pd, { recursive: true });
-      spawnSync("git", ["init", "-q"], { cwd: pd });
+      spawnSync("git", ["init", "-q"], { cwd: pd, env: gitEnv(e.env) });
       const r = spawnSync(
         resolveAoeBinary(),
         ["add", pd, "-t", "compression-test", "-c", "claude", "--cmd-override", tool],

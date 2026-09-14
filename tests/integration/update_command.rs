@@ -97,6 +97,7 @@ fn spawn_fixture(latest_version: &str) -> FixtureServer {
 }
 
 #[test]
+#[serial_test::parallel]
 fn update_check_prints_three_lines_and_exits_zero() {
     // Pick a latest version that's deliberately newer than the binary
     // under test so the "available" line reads `true`. The crate's own
@@ -125,6 +126,7 @@ fn update_check_prints_three_lines_and_exits_zero() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn update_dry_run_prints_prompt_block_and_exits_zero() {
     let fixture = spawn_fixture("999.0.0");
     let tmp = tempfile::TempDir::new().unwrap();
@@ -157,6 +159,7 @@ fn update_dry_run_prints_prompt_block_and_exits_zero() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn update_check_no_update_available_when_versions_match() {
     // Serve the same version the binary reports — `available: false`.
     let fixture = spawn_fixture(env!("CARGO_PKG_VERSION"));

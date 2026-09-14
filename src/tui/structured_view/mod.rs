@@ -429,6 +429,8 @@ pub async fn run_for_endpoint(
     auto_present_elicitation(&mut state, &mut toast_deadline);
 
     redraw(terminal, theme, &mut state)?;
+    #[cfg(feature = "e2e-tests")]
+    crate::tui::app::e2e_render_ack(true)?;
 
     let mut redraw_ticker = tokio::time::interval(REDRAW_INTERVAL);
     redraw_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -443,6 +445,13 @@ pub async fn run_for_endpoint(
                     return Ok(());
                 };
                 let evt = evt.context("read terminal event")?;
+                #[cfg(feature = "e2e-tests")]
+                if matches!(evt, CrosstermEvent::Key(key) if key.code == crossterm::event::KeyCode::F(12))
+                    && std::env::var_os("AOE_E2E_INPUT_BARRIER").is_some() {
+                    redraw(terminal, theme, &mut state)?;
+                    crate::tui::app::e2e_render_ack(false)?;
+                    continue;
+                }
                 let should_exit = handle_terminal_event(&mut state, evt, &mut toast_deadline).await?;
                 if should_exit {
                     return Ok(());

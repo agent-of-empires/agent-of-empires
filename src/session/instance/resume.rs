@@ -103,7 +103,13 @@ impl Instance {
             }
             let now = std::time::Instant::now();
             if !session.is_pane_running_shell() {
+                #[cfg(test)]
+                let entered_post_shell = first_post_shell.is_none();
                 let started = *first_post_shell.get_or_insert(now);
+                #[cfg(test)]
+                if entered_post_shell {
+                    tests::post_shell_observed(&session);
+                }
                 if now.duration_since(started) >= RESUME_PROBE_POST_SHELL_GRACE {
                     return Ok(ProbeResult::Alive);
                 }
@@ -408,6 +414,27 @@ mod tests {
     use crate::session::instance::test_helpers::install_aliases;
     use serial_test::serial;
     use tempfile::tempdir;
+    type PostShellCallback = Box<dyn FnOnce(&crate::tmux::Session)>;
+    thread_local! {
+        static POST_SHELL_OBSERVER: std::cell::RefCell<Option<PostShellCallback>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn post_shell_observed(session: &crate::tmux::Session) {
+        let observer = POST_SHELL_OBSERVER.with(|slot| slot.borrow_mut().take());
+        if let Some(observer) = observer {
+            observer(session);
+        }
+    }
+
+    struct PostShellObserver;
+    impl Drop for PostShellObserver {
+        fn drop(&mut self) {
+            POST_SHELL_OBSERVER.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+
     fn isolate_resume_environment(
         root: &std::path::Path,
     ) -> crate::session::test_support::EnvGuard {
@@ -499,66 +526,152 @@ mod tests {
         }
     }
 
-    #[test]
-    fn launch_sid_outcome_carries_emitted_sid() {
-        let outcome = LaunchSidOutcome::Existing {
-            sid: "11111111-1111-1111-1111-111111111111".to_string(),
-        };
-
-        match outcome {
-            LaunchSidOutcome::Existing { sid } => {
-                assert_eq!(sid, "11111111-1111-1111-1111-111111111111");
-            }
-            other => panic!("expected Existing, got {other:?}"),
-        }
-    }
-
-    /// This file's own source from `start_marker` up to the tests module.
-    /// The end is searched from `start_marker` onward so the slice stays
-    /// valid if a `#[cfg(test)]` item is ever added above `mod tests`.
-    fn source_from(start_marker: &str) -> String {
-        let source = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/session/instance/resume.rs"),
-        )
-        .unwrap();
-        let start = source
-            .find(start_marker)
-            .unwrap_or_else(|| panic!("start marker not found: {start_marker}"));
-        let end = source[start..]
-            .find(
-                "
-#[cfg(test)]
-mod tests {",
-            )
-            .map(|offset| start + offset)
-            .expect("tests module boundary not found after start marker");
-        source[start..end].to_string()
+    fn dead_resume_fixture(inst: &Instance) -> crate::tmux::test_helpers::TmuxTestSession {
+        use crate::tmux::test_helpers::{only_pane_id, wait_for_pane_dead, TmuxTestSession};
+        let name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+        let guard = TmuxTestSession::from_name(name.clone());
+        let output = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &name,
+                "true",
+                ";",
+                "set-option",
+                "-p",
+                "-t",
+                &name,
+                "remain-on-exit",
+                "on",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        wait_for_pane_dead(&only_pane_id(&name));
+        crate::tmux::refresh_session_cache();
+        guard
     }
 
     #[test]
+    #[serial]
     fn start_with_resume_fallback_uses_launch_sid_for_probe_decision() {
-        let fallback_source = source_from("pub(crate) fn start_with_resume_fallback");
+        use crate::session::instance::start::test_support::{FinalizeObserver, FinalizePhase};
+        const PROFILE: &str = "launch-sid-probe";
+        const LAUNCHED_SID: &str = "11111111-1111-1111-1111-111111111111";
+        const PEER_SID: &str = "22222222-2222-2222-2222-222222222222";
 
-        assert!(fallback_source
-            .contains("let (attempted_sid, pinned_prior_sid) = match launch_outcome"));
-        assert!(fallback_source.contains("LaunchSidOutcome::Existing { sid }"));
-        assert!(!fallback_source.contains("should_attempt_resume(self.agent_session_id.as_deref()"));
-        assert!(!fallback_source.contains("let stale_sid = self\n            .agent_session_id"));
+        let temp = tempdir().unwrap();
+        let _env = isolate_resume_environment(temp.path());
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let argv_path = temp.path().join("argv");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nexit 1\n",
+            shell_escape(&argv_path.to_string_lossy())
+        );
+        let _claude = install_fake_claude(temp.path(), &script);
+        let mut inst = Instance::new("launch-sid-probe", project.to_str().unwrap());
+        inst.tool = "claude".to_string();
+        inst.command = "claude".to_string();
+        inst.source_profile = PROFILE.to_string();
+        inst.agent_session_id = Some(LAUNCHED_SID.to_string());
+        seed_claude_transcript(&inst.project_path, LAUNCHED_SID);
+        let storage = crate::session::storage::Storage::new_unwatched(PROFILE).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(inst.clone());
+                Ok(())
+            })
+            .unwrap();
+        let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(tmux_name.clone());
+        let finalized = std::rc::Rc::new(std::cell::Cell::new(false));
+        let finalized_in_observer = finalized.clone();
+        let _observer = FinalizeObserver::install(inst.id.clone(), move |instance, phase| {
+            match phase {
+                FinalizePhase::Before => {
+                    let pane = crate::tmux::test_helpers::only_pane_id(&tmux_name);
+                    crate::tmux::test_helpers::wait_for_pane_dead(&pane);
+                    let argv = std::fs::read_to_string(&argv_path).unwrap();
+                    let args: Vec<_> = argv.lines().collect();
+                    assert!(
+                        args.windows(2)
+                            .any(|pair| pair == ["--resume", LAUNCHED_SID]),
+                        "actual agent argv: {args:?}"
+                    );
+                    assert_eq!(instance.agent_session_id.as_deref(), Some(LAUNCHED_SID));
+                    let peer_storage =
+                        crate::session::storage::Storage::new_unwatched(PROFILE).unwrap();
+                    peer_storage
+                        .update(|rows, _| {
+                            let row = rows.iter_mut().find(|row| row.id == instance.id).unwrap();
+                            row.agent_session_id = Some(PEER_SID.to_string());
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+                FinalizePhase::After => {
+                    assert_eq!(instance.agent_session_id.as_deref(), Some(PEER_SID), "real finalize CAS skip must reload peer identity before producing the launch outcome");
+                    finalized_in_observer.set(true);
+                }
+            }
+        });
+        let outcome = inst
+            .start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow)
+            .unwrap();
+        assert!(finalized.get(), "native launch must reach finalization");
+        assert_eq!(
+            outcome,
+            StartOutcome::ResumeFailed {
+                sid: LAUNCHED_SID.to_string()
+            }
+        );
+        let rows = storage.load().unwrap();
+        let row = rows.iter().find(|row| row.id == inst.id).unwrap();
+        assert_eq!(row.agent_session_id.as_deref(), Some(PEER_SID));
+        assert_eq!(
+            row.resume_probe_failed_sid, None,
+            "failure of A must not mark the peer's B as failed"
+        );
+        assert!(!inst.tmux_session().unwrap().exists());
     }
 
     #[test]
+    #[serial]
     fn resume_probe_failure_marks_before_cleanup() {
-        let fallback_source = source_from("fn finish_resume_launch");
-        let local_marker = fallback_source
-            .find("self.resume_probe_failed_sid = Some(stale_sid.clone())")
-            .unwrap();
-        let persisted_marker = fallback_source
-            .find("self.mark_resume_probe_failed(profile, &stale_sid)")
-            .unwrap();
-        let cleanup = fallback_source.find("self.kill_clean_locked()").unwrap();
-
-        assert!(local_marker < cleanup);
-        assert!(persisted_marker < cleanup);
+        let temp = tempdir().unwrap();
+        let _env = isolate_resume_environment(temp.path());
+        let mut inst = Instance::new("marker-before-cleanup", "/tmp/test");
+        inst.tool = "claude".to_string();
+        inst.source_profile = "marker-before-cleanup".to_string();
+        let launched_sid = "11111111-1111-1111-1111-111111111111";
+        inst.agent_session_id = Some(launched_sid.to_string());
+        let storage =
+            crate::session::storage::Storage::new_unwatched(&inst.source_profile).unwrap();
+        assert!(storage.load().unwrap().is_empty());
+        let _pane = dead_resume_fixture(&inst);
+        let result = inst.finish_resume_launch(
+            LaunchSidOutcome::Existing {
+                sid: launched_sid.to_string(),
+            },
+            None,
+            "marker-before-cleanup",
+        );
+        assert!(
+            result.is_err(),
+            "the missing durable row must reject the failure marker"
+        );
+        assert_eq!(inst.resume_probe_failed_sid.as_deref(), Some(launched_sid));
+        assert!(
+            inst.tmux_session().unwrap().exists(),
+            "failed marker persistence must not clean up the pane"
+        );
+        assert!(inst.tmux_session().unwrap().is_pane_dead());
     }
 
     /// Seed a Claude transcript on disk for `sid` under `project_path`, in
@@ -989,7 +1102,7 @@ mod tests {",
         inst.tool = "claude".to_string();
         inst.source_profile = "fb-test-grace".to_string();
         let script = format!(
-            "#!/bin/sh\ncase \"$*\" in *{stale}*) exec sleep 1.2 ;; esac\nexec sleep 30\n",
+            "#!/bin/sh\ncase \"$*\" in *{stale}*) exec sleep 30 ;; esac\nexec sleep 30\n",
             stale = stale_sid,
         );
         let _fake_claude = install_fake_claude(temp.path(), &script);
@@ -1013,24 +1126,40 @@ mod tests {",
             .args(["kill-session", "-t", &tmux_name])
             .output();
 
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(tmux_name.clone());
+        let observed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let observed_in_probe = observed.clone();
+        let probe_name = tmux_name.clone();
+        POST_SHELL_OBSERVER.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |session| {
+                assert!(session.exists());
+                assert!(!session.is_pane_dead());
+                assert!(!session.is_pane_running_shell());
+                observed_in_probe.set(true);
+                let pane = crate::tmux::test_helpers::only_pane_id(&probe_name);
+                let mut kill = crate::tmux::tmux_command();
+                kill.args(["send-keys", "-t", &pane, "C-c"]);
+                assert!(kill.output().unwrap().status.success());
+                crate::tmux::test_helpers::wait_for_pane_dead(&pane);
+            }))
+        });
+        let _observer = PostShellObserver;
         let outcome = inst.start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow);
+        assert!(
+            observed.get(),
+            "the observer must enter the post-shell grace branch before death"
+        );
 
         let _ = crate::tmux::tmux_command()
             .args(["kill-session", "-t", &tmux_name])
             .output();
 
-        match outcome {
-            Ok(StartOutcome::ResumeFailed { sid }) => assert_eq!(sid, stale_sid),
-            Ok(StartOutcome::Resumed) => panic!(
-                "Tier-1 grace shortcut returned Alive before the t=1200ms pane_dead: \
-                 RESUME_PROBE_POST_SHELL_GRACE is too short. \
-                 Real opencode crashes at ~1000ms; raise the grace constant."
-            ),
-            Ok(other) => panic!(
-                "Expected ResumeFailed or Resumed; got {other:?} (probe path is taking an unexpected branch)"
-            ),
-            Err(e) => panic!("resume failure should be a typed outcome, got: {e:#}"),
-        }
+        assert_eq!(
+            outcome.unwrap(),
+            StartOutcome::ResumeFailed {
+                sid: stale_sid.clone()
+            }
+        );
         assert_eq!(inst.agent_session_id.as_deref(), Some(stale_sid.as_str()));
         assert_eq!(
             inst.resume_probe_failed_sid.as_deref(),

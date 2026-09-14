@@ -10,7 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { applyEvent, emptyAcpState, type AcpState } from "../lib/acpTypes";
 import { acpHookReducer, clearAcpCache, useAcpSession } from "./useAcpSession";
-import { act, renderHook } from "@testing-library/react";
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 
 describe("acpHookReducer / in-flight prompt settlement", () => {
   function sent(id: string): AcpState {
@@ -68,26 +68,64 @@ describe("acpHookReducer / in-flight prompt settlement", () => {
 });
 
 describe("useAcpSession / dispatchPromptNow settles on every POST outcome", () => {
+  const sockets: FakeWebSocket[] = [];
+
+  class FakeWebSocket {
+    readyState = 0;
+    onopen: ((event: Event) => void) | null = null;
+    onclose: ((event: CloseEvent) => void) | null = null;
+    onerror: ((event: Event) => void) | null = null;
+    onmessage: ((event: MessageEvent) => void) | null = null;
+    static CONNECTING = 0;
+    static OPEN = 1;
+    static CLOSING = 2;
+    static CLOSED = 3;
+    constructor() {
+      sockets.push(this);
+    }
+    close(): void {
+      this.readyState = FakeWebSocket.CLOSED;
+    }
+    send(): void {}
+  }
+
   beforeEach(() => {
+    sockets.length = 0;
+    vi.stubGlobal("WebSocket", FakeWebSocket);
     clearAcpCache();
     window.localStorage.clear();
   });
   afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
 
   async function sendAndReadTurnActive(respond: () => Promise<Response> | never): Promise<boolean> {
+    const promptResponse = vi.fn(respond);
     vi.spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL) => {
       const url = String(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
-      if (url.includes("/acp/prompt")) return respond();
-      return new Response("[]", { status: 200, headers: { "Content-Type": "application/json" } });
+      if (url.includes("/acp/prompt")) return promptResponse();
+      const body = url.includes("/acp/replay") ? { frames: [], lost: false, highest_seq: 0 } : [];
+      return new Response(JSON.stringify(body), { status: 200 });
     }) as typeof fetch);
 
-    const { result } = renderHook(() => useAcpSession("s-1"));
-    await act(async () => {
-      await result.current.sendPrompt("hello");
-    });
-    return result.current.state.turnActive;
+    const { result, unmount } = renderHook(() => useAcpSession("s-1"));
+    try {
+      await waitFor(() => expect(sockets).toHaveLength(1));
+      act(() => {
+        sockets[0].readyState = FakeWebSocket.OPEN;
+        sockets[0].onopen?.(new Event("open"));
+      });
+      await act(async () => {
+        await result.current.sendPrompt("hello");
+      });
+      expect(promptResponse).toHaveBeenCalledTimes(1);
+      return result.current.state.turnActive;
+    } finally {
+      unmount();
+      expect(sockets.every((socket) => socket.readyState === FakeWebSocket.CLOSED)).toBe(true);
+    }
   }
 
   it("a 500 does not leave the spinner latched", async () => {

@@ -27,7 +27,7 @@ const SCRIPT = {
           kind: "read",
           status: "pending",
         },
-        { sessionUpdate: "wait_ms", ms: 30_000 },
+        { sessionUpdate: "wait_for_release" },
       ],
       stopReason: "end_turn",
     },

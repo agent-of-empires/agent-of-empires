@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import type { BrowseResponse } from "../../lib/types";
 
@@ -47,15 +47,14 @@ describe("DirectoryBrowser", () => {
 
   it("ignores stale browse responses after a newer navigation finishes", async () => {
     getHomePath.mockResolvedValue("/home/user");
-    let resolveSlow: ((value: BrowseResponse & { ok: boolean }) => void) | undefined;
-    browseFilesystem.mockImplementation((path: string) => {
-      if (path === "/home/user/slow") {
-        return new Promise<BrowseResponse & { ok: boolean }>((resolve) => {
-          resolveSlow = resolve;
-        });
-      }
-      return Promise.resolve(response([dir("slow", "/home/user/slow")]));
+    let resolveSlow!: (value: BrowseResponse & { ok: boolean }) => void;
+    const slowResponse = new Promise<BrowseResponse & { ok: boolean }>((resolve) => {
+      resolveSlow = resolve;
     });
+    browseFilesystem
+      .mockResolvedValueOnce(response([dir("slow")]))
+      .mockReturnValueOnce(slowResponse)
+      .mockResolvedValueOnce(response([dir("newer-child")]));
 
     render(<DirectoryBrowser onSelect={vi.fn()} />);
 
@@ -63,17 +62,16 @@ describe("DirectoryBrowser", () => {
     fireEvent.click(screen.getByRole("option", { name: /slow/i }));
     fireEvent.click(screen.getByRole("button", { name: "user" }));
 
-    await waitFor(() => {
-      expect(browseFilesystem).toHaveBeenCalledWith("/home/user", 100, undefined, false);
-    });
+    await screen.findByRole("option", { name: /newer-child/i });
+    expect(browseFilesystem).toHaveBeenNthCalledWith(2, "/home/user/slow", 100, undefined, false);
+    expect(browseFilesystem).toHaveBeenNthCalledWith(3, "/home/user", 100, undefined, false);
 
-    expect(resolveSlow).toBeDefined();
-    resolveSlow!(response([dir("stale-child", "/home/user/slow/stale-child")]));
-
-    await waitFor(() => {
-      expect(screen.queryByRole("option", { name: /stale-child/i })).toBeNull();
-      expect(screen.getByRole("option", { name: /slow/i })).toBeTruthy();
+    await act(async () => {
+      resolveSlow(response([dir("stale-child", "/home/user/slow/stale-child")]));
+      await slowResponse;
     });
+    expect(screen.queryByRole("option", { name: /stale-child/i })).toBeNull();
+    expect(screen.getByRole("option", { name: /newer-child/i })).toBeTruthy();
   });
 
   it("selects the current folder via 'Use this folder', even when it is not a git repo", async () => {

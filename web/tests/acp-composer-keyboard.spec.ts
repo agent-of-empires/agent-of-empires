@@ -141,11 +141,9 @@ test.describe("Structured-view composer keyboard reservation (#2011)", () => {
 
     // iOS regular Safari: visualViewport shrinks but innerHeight stays full.
     await simulateKeyboardOpen(page, 300);
-    await page.waitForTimeout(400);
-
     // The root reserves ~keyboard height so the flex-1 viewport shrinks and the
     // composer lifts above the keyboard.
-    expect(await rootPaddingBottom(page)).toBeGreaterThanOrEqual(250);
+    await expect.poll(() => rootPaddingBottom(page)).toBeGreaterThanOrEqual(250);
   });
 
   test("does NOT reserve when the layout viewport already shrinks (PWA / Android, innerHeight shrinks)", async ({
@@ -154,12 +152,16 @@ test.describe("Structured-view composer keyboard reservation (#2011)", () => {
     await setup(page);
     await openStructuredSession(page);
 
-    expect(await rootPaddingBottom(page)).toBe(0);
-
-    // innerHeight shrinks with the keyboard: keyboardHeight is 0, dvh handles it.
+    const root = await page.getByTestId("structured-view-root").elementHandle();
+    expect(root).not.toBeNull();
+    const reservation = () =>
+      root!.evaluate((element) => ({
+        connected: element.isConnected,
+        padding: parseInt(element.style.paddingBottom || "0") || 0,
+      }));
+    await simulateKeyboardOpen(page, 300);
+    await expect.poll(async () => (await reservation()).padding).toBeGreaterThanOrEqual(250);
     await simulateKeyboardOpen(page, 300, { innerHeightShrinks: true });
-    await page.waitForTimeout(400);
-
-    expect(await rootPaddingBottom(page)).toBe(0);
+    await expect.poll(reservation).toEqual({ connected: true, padding: 0 });
   });
 });

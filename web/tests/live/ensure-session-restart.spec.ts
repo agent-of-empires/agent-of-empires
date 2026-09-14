@@ -97,9 +97,18 @@ base.describe("ensure_session restart flow", () => {
       authMode: "none",
       workerIndex: testInfo.workerIndex,
       parallelIndex: testInfo.parallelIndex,
-      seedFn: seedSessionViaAoeAdd({ title }),
+      seedFn: (seed) => {
+        seedSessionViaAoeAdd({ title })(seed);
+        writeFileSync(join(seed.shimBin, "claude"), "#!/bin/sh\necho ENSURE_CONNECTED\nexec tail -f /dev/null\n", {
+          mode: 0o755,
+        });
+      },
     });
 
+    let releaseEnsure!: () => void;
+    const ensureGate = new Promise<void>((resolve) => {
+      releaseEnsure = resolve;
+    });
     try {
       const sessions = await listSessions(serve.baseUrl);
       expect(sessions.length).toBeGreaterThan(0);
@@ -108,12 +117,8 @@ base.describe("ensure_session restart flow", () => {
 
       spawnSync("tmux", ["-S", serve.tmuxSocket, "kill-session", "-t", tmuxName]);
 
-      // Delay /ensure so Playwright reliably observes the "pending"
-      // placeholder. Without this the live backend can resolve the
-      // restart before the assertion's first retry, and the placeholder
-      // mounts + unmounts inside a single frame.
       await page.route("**/api/sessions/*/ensure", async (route) => {
-        await new Promise((r) => setTimeout(r, 2000));
+        await ensureGate;
         await route.continue();
       });
 
@@ -126,10 +131,13 @@ base.describe("ensure_session restart flow", () => {
       // pane (each a LiveTerminalView), so the placeholder renders twice; only
       // the agent's /ensure is delayed above, and it is first in the DOM.
       await expect(page.getByText("Starting session...").first()).toBeVisible();
+      releaseEnsure();
+      await expect(page.locator("[data-live-content]").filter({ hasText: "ENSURE_CONNECTED" })).toBeVisible();
       await expect(page.getByText("Starting session...").first()).toBeHidden({
         timeout: 15_000,
       });
     } finally {
+      releaseEnsure();
       await serve.stop();
     }
   });

@@ -58,7 +58,7 @@ base(
       seedFn: ({ home, env }) => {
         const projectDir = join(home, "project");
         const tall = tallFile();
-        initWorkingRepo(projectDir);
+        initWorkingRepo(projectDir, env);
         // src/b.ts is committed and left untouched, so it has no diff against
         // the base and exercises the full-file fallback. See #1810.
         writeFiles(projectDir, {
@@ -66,7 +66,7 @@ base(
           "src/b.ts": "export const unchangedConst = 42;\n",
           "src/long.ts": tall.baseline,
         });
-        commitAll(projectDir, "baseline");
+        commitAll(projectDir, "baseline", env);
         writeFiles(projectDir, { "src/a.ts": "export const a = 11;\n", "src/long.ts": tall.modified });
 
         // `aoe add <dir>` makes project_path the modified working tree,

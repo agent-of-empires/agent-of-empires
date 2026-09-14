@@ -17,10 +17,8 @@ use crate::session::{Instance, Status};
 #[cfg(not(test))]
 const DEFAULT_DEBOUNCE_MS: u64 = 100;
 
-/// Test-only debounce override so unit tests can exercise the synchronous
-/// path (0) or a short debounce window without real 100ms sleeps. Tests
-/// touching it are `#[serial]` because it is process-global, like the
-/// recorded-launches buffer.
+/// Test-only override selecting synchronous dispatch or gated debounce workers.
+/// Mutating tests share the serial group with the recorded-launches buffer.
 #[cfg(test)]
 static TEST_DEBOUNCE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -276,7 +274,24 @@ fn run_debounced_transition(
     drop(state);
 
     let instance = instance.clone();
-    std::thread::spawn(move || {
+    // Tests release the real worker explicitly instead of racing its deadline.
+    #[cfg(test)]
+    let gate = DEBOUNCE_WORKERS.with(|workers| {
+        workers
+            .borrow()
+            .as_ref()
+            .map(|_| std::sync::mpsc::channel::<()>())
+    });
+    #[cfg(test)]
+    let (release, wait) = gate.map_or((None, None), |(tx, rx)| (Some(tx), Some(rx)));
+    let worker = std::thread::spawn(move || {
+        #[cfg(test)]
+        if let Some(wait) = wait {
+            let _ = wait.recv();
+        } else {
+            std::thread::sleep(Duration::from_millis(debounce_ms));
+        }
+        #[cfg(not(test))]
         std::thread::sleep(Duration::from_millis(debounce_ms));
         let mut state = debounce_state().lock().unwrap();
         let should_run = match state.get_mut(&session_id) {
@@ -293,6 +308,18 @@ fn run_debounced_transition(
             spawn_transition_commands(&instance, stable_status, new, changed_at, commands);
         }
     });
+    #[cfg(test)]
+    if let Some(release) = release {
+        DEBOUNCE_WORKERS.with(|workers| {
+            workers
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .push((release, worker));
+        });
+    }
+    #[cfg(not(test))]
+    drop(worker);
 }
 
 #[cfg(not(test))]
@@ -433,35 +460,50 @@ pub fn reset_debounce_state() {
 }
 
 #[cfg(test)]
+type DebounceWorker = (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>);
+
+#[cfg(test)]
+thread_local! {
+    static DEBOUNCE_WORKERS: std::cell::RefCell<Option<Vec<DebounceWorker>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serial_test::serial;
-    use std::time::Instant;
-
-    fn wait_for_recorded_launch_count(expected: usize) {
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while Instant::now() < deadline {
-            if recorded_launches().lock().unwrap().len() == expected {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
-
-    /// RAII guard restoring the test debounce override to 0 (the synchronous
-    /// path other tests rely on) even when an assertion panics.
-    struct DebounceOverride;
+    struct DebounceOverride(u64);
 
     impl DebounceOverride {
         fn set(ms: u64) -> Self {
-            set_test_debounce_ms(ms);
-            Self
+            let previous = TEST_DEBOUNCE_MS.swap(ms, std::sync::atomic::Ordering::SeqCst);
+            DEBOUNCE_WORKERS.with(|workers| *workers.borrow_mut() = Some(Vec::new()));
+            Self(previous)
+        }
+
+        fn finish(&self) {
+            let workers = DEBOUNCE_WORKERS
+                .with(|workers| std::mem::take(workers.borrow_mut().as_mut().unwrap()));
+            let handles: Vec<_> = workers
+                .into_iter()
+                .map(|(release, worker)| {
+                    release.send(()).unwrap();
+                    worker
+                })
+                .collect();
+            for worker in handles {
+                worker.join().expect("debounce worker panicked");
+            }
         }
     }
 
     impl Drop for DebounceOverride {
         fn drop(&mut self) {
-            set_test_debounce_ms(0);
+            let workers = DEBOUNCE_WORKERS.with(|workers| workers.borrow_mut().take().unwrap());
+            for (release, worker) in workers {
+                drop(release);
+                let _ = worker.join();
+            }
+            set_test_debounce_ms(self.0);
         }
     }
 
@@ -552,7 +594,7 @@ mod tests {
         let observed_after = Utc::now();
         assert!(take_recorded_launches().is_empty());
 
-        wait_for_recorded_launch_count(1);
+        _debounce.finish();
         let launches = take_recorded_launches();
         assert_eq!(launches.len(), 1);
         assert_eq!(launches[0].command, "notify-waiting");
@@ -580,7 +622,7 @@ mod tests {
         run_for_transition(&instance, Status::Running, Status::Waiting, &config);
         run_for_transition(&instance, Status::Waiting, Status::Running, &config);
 
-        std::thread::sleep(Duration::from_millis(30));
+        _debounce.finish();
         assert!(take_recorded_launches().is_empty());
     }
 
@@ -603,7 +645,7 @@ mod tests {
         run_for_transition(&instance, Status::Running, Status::Waiting, &config);
         run_for_transition(&instance, Status::Waiting, Status::Idle, &config);
 
-        wait_for_recorded_launch_count(1);
+        _debounce.finish();
         let launches = take_recorded_launches();
         assert_eq!(launches.len(), 1);
         assert_eq!(launches[0].command, "notify-idle");

@@ -57,13 +57,32 @@ mod tests {
     use crate::session::Instance;
     use std::time::Duration;
 
+    struct TestPoller(Option<RestartPoller>);
+
+    impl Drop for TestPoller {
+        fn drop(&mut self) {
+            if let Some(poller) = self.0.take() {
+                let _ = poller.worker.finish_for_test();
+            }
+        }
+    }
+
     #[test]
     #[serial_test::serial]
     fn restart_poller_channel_communication() {
-        let poller = RestartPoller::new();
-        let instance = Instance::new("Test Session", "/tmp/test-project");
+        if !crate::tui::isolated_test_process(
+            "tui::restart_poller::tests::restart_poller_channel_communication",
+            Duration::from_secs(5),
+        ) {
+            return;
+        }
+        let home = crate::session::test_support::isolate_app_dir();
+        let mut fixture = TestPoller(Some(RestartPoller::new()));
+        let poller = fixture.0.as_mut().unwrap();
+        let mut instance = Instance::new("Test Session", home.path().to_str().unwrap());
+        instance.tool = "bash".to_string();
+        instance.command = "true".to_string();
         let session_id = instance.id.clone();
-        let title = instance.title.clone();
 
         poller.request_restart(RestartRequest {
             session_id: session_id.clone(),
@@ -72,20 +91,13 @@ mod tests {
             wake_message: String::new(),
         });
 
-        let mut result = None;
-        for _ in 0..100 {
-            if let Ok(r) = poller.try_recv_result() {
-                result = Some(r);
-                break;
+        let result = loop {
+            match poller.try_recv_result() {
+                Ok(result) => break result,
+                Err(TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(20)),
+                Err(error) => panic!("restart worker disconnected: {error}"),
             }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        // The cascade may create a real tmux session; tear it down regardless of
-        // whether the assertions below pass.
-        if let Ok(session) = crate::tmux::Session::new(&session_id, &title) {
-            let _ = session.kill();
-        }
-        let result = result.expect("timed out waiting for restart result");
+        };
         assert_eq!(result.session_id, session_id);
         assert_eq!(result.instance.id, session_id);
     }

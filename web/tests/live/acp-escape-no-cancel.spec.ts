@@ -1,71 +1,58 @@
-// Structured view Escape does not cancel the active turn.
-//
-// Regression guard for the structured view composer's `cancelOnEscape={false}`
-// wiring on ComposerPrimitive.Input. assistant-ui's default Escape
-// binding calls runtime.cancelRun, which in the structured view funnels through
-// onCancel into POST /api/sessions/:id/acp/cancel. We disabled that
-// binding so accidental Escape presses cannot abort an in-flight turn
-// while the user is typing the next prompt.
-//
-// Skipped pending #1237: the supervisor's ACP handshake against the
-// fake agent fails with "Authentication required" before a turn can
-// start, so we cannot reach the turn-active branch of the composer
-// from the browser. Unskip alongside the sibling structured view specs
-// (acp-spawn-prompt, acp-mode-switch, acp-approval) once
-// the harness installs a working `claude-agent-acp` shim.
-
-import { test as base, expect } from "@playwright/test";
+// Escape must leave the active structured-view turn running.
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { test, expect } from "@playwright/test";
 import { spawnAoeServe, listSessions, seedSessionViaAoeAdd } from "../helpers/aoeServe";
-import { enableStructuredViewAndWait } from "../helpers/acp";
+import { enableStructuredViewAndWait, waitForStructuredView } from "../helpers/acp";
 
-base.skip("Escape inside the structured view composer does not POST /acp/cancel", async ({ page }, testInfo) => {
+test("Escape inside the structured view composer does not POST /acp/cancel", async ({ page }, testInfo) => {
+  const scriptDir = mkdtempSync(join(tmpdir(), "aoe-pw-escape-"));
+  const scriptPath = join(scriptDir, "script.json");
+  writeFileSync(
+    scriptPath,
+    JSON.stringify({
+      turns: [
+        {
+          updates: [
+            { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ESCAPE_TURN_ACTIVE" } },
+            { sessionUpdate: "wait_for_release" },
+            { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ESCAPE_TURN_COMPLETED" } },
+          ],
+          stopReason: "end_turn",
+        },
+      ],
+    }),
+  );
   const serve = await spawnAoeServe({
     authMode: "none",
     acp: true,
+    fakeAcpScript: scriptPath,
     workerIndex: testInfo.workerIndex,
     parallelIndex: testInfo.parallelIndex,
     seedFn: seedSessionViaAoeAdd({ title: "escape-no-cancel" }),
   });
-
   try {
-    const sessions = await listSessions(serve.baseUrl);
-    const sessionId: string = sessions[0]!.id;
-
+    const sessionId = (await listSessions(serve.baseUrl))[0]!.id;
     await enableStructuredViewAndWait(serve.baseUrl, sessionId);
-
-    // Send a prompt so the agent enters turn-active.
-    const promptRes = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/prompt`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: "stay in the turn" }),
-    });
-    expect(promptRes.ok).toBeTruthy();
-
-    // Track any POST to /acp/cancel emitted by the page after this
-    // point. If the regression returns, our keypress below produces
-    // exactly one such request.
     let cancelCount = 0;
     page.on("request", (req) => {
-      if (req.method() === "POST" && req.url().includes(`/api/sessions/${sessionId}/acp/cancel`)) {
-        cancelCount += 1;
-      }
+      if (req.method() === "POST" && req.url().endsWith(`/api/sessions/${sessionId}/acp/cancel`)) cancelCount++;
     });
-
-    await page.goto(`${serve.baseUrl}/sessions/${sessionId}`);
-
-    // Focus the composer textarea and press Escape. The composer
-    // mounts the assistant-ui ComposerPrimitive.Input with
-    // cancelOnEscape={false}; the keystroke should be a no-op.
-    const composer = page.getByRole("textbox", {
-      name: /Send a message|Queue a follow-up/i,
-    });
-    await composer.focus();
-    await page.keyboard.press("Escape");
-    // Hold for a tick so any cancel fetch has time to fire.
-    await page.waitForTimeout(500);
-
+    await page.goto(`${serve.baseUrl}/session/${sessionId}`);
+    await waitForStructuredView(page);
+    const composer = page.locator('textarea[name="input"]');
+    await composer.fill("stay in the turn");
+    await composer.press("Enter");
+    await expect(page.getByText("ESCAPE_TURN_ACTIVE", { exact: true })).toBeVisible();
+    await expect(page.getByTestId("composer-actions").getByRole("button", { name: "Stop" })).toBeVisible();
+    await composer.press("Escape");
+    writeFileSync(`${scriptPath}.release`, "release");
+    await expect(page.getByText(/ESCAPE_TURN_COMPLETED/)).toBeVisible();
+    await expect(page.getByRole("textbox", { name: /Send a message/i })).toBeVisible();
     expect(cancelCount).toBe(0);
   } finally {
     await serve.stop();
+    rmSync(scriptDir, { recursive: true, force: true });
   }
 });

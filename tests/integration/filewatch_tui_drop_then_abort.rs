@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::home_isolation::isolate_home;
+use crate::common::set_temp_home;
 use agent_of_empires::file_watch::{FileMatcher, FileWatchService, WatchSpec};
 use agent_of_empires::session::{Instance, Storage};
 use serial_test::serial;
@@ -28,7 +28,7 @@ use tempfile::TempDir;
 #[serial]
 async fn dropping_handle_closes_source_channel_before_forwarder_aborts() {
     let temp = TempDir::new().unwrap();
-    let _home = isolate_home(temp.path());
+    let _home = set_temp_home(temp.path());
 
     let svc: Arc<FileWatchService> = FileWatchService::new().expect("init");
 
@@ -116,6 +116,8 @@ async fn dropping_handle_closes_source_channel_before_forwarder_aborts() {
          (rx.recv() returns None because the dispatcher removes the sink)"
     );
 
+    forwarder.await.expect("forwarder exited naturally");
+    let settled_sends = send_count.load(Ordering::Acquire);
     forwarder_abort.abort();
 
     storage
@@ -125,11 +127,11 @@ async fn dropping_handle_closes_source_channel_before_forwarder_aborts() {
         })
         .expect("post-drop write");
 
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    // No task remains that can publish another notification.
 
     let post_drop_sends = send_count.load(Ordering::Acquire);
     assert_eq!(
-        post_drop_sends, pre_drop_sends,
+        post_drop_sends, settled_sends,
         "no events should reach the forwarder after the handle is dropped \
          (the dispatcher deregisters the sink synchronously inside Drop)"
     );

@@ -296,7 +296,7 @@ fn test_shift_n_prefills_main_repo_path_for_worktree_session() {
     }
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         tools,
         crate::file_watch::FileWatchService::noop(),
@@ -420,7 +420,7 @@ fn test_rename_selected_group_with_children() {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         tools,
         crate::file_watch::FileWatchService::noop(),
@@ -525,7 +525,7 @@ fn test_rename_group_removes_old_path() {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         tools,
         crate::file_watch::FileWatchService::noop(),
@@ -568,7 +568,7 @@ fn test_rename_group_empty_group() {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         tools,
         crate::file_watch::FileWatchService::noop(),
@@ -613,7 +613,8 @@ fn test_move_explicit_empty_group_between_profiles() {
         .unwrap();
     let _target = Storage::new_unwatched("beta").unwrap();
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    let mut view =
+        HomeView::new_for_test(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.group_rename_context = Some(crate::tui::home::GroupRenameContext {
         old_path: "empty".to_string(),
@@ -658,7 +659,8 @@ fn test_group_profile_move_rejects_concurrent_fresh_member_without_metadata_spli
         .unwrap();
     let _target = Storage::new_unwatched("beta").unwrap();
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    let mut view =
+        HomeView::new_for_test(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.group_rename_context = Some(crate::tui::home::GroupRenameContext {
         old_path: "team".to_string(),
@@ -718,7 +720,7 @@ fn test_rename_group_duplicate_returns_error() {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         tools,
         crate::file_watch::FileWatchService::noop(),
@@ -768,7 +770,7 @@ fn test_group_profile_move_is_all_or_nothing() {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         None,
         tools.clone(),
         crate::file_watch::FileWatchService::noop(),
@@ -823,7 +825,8 @@ fn test_group_profile_move_is_all_or_nothing() {
     assert!(target_groups
         .iter()
         .any(|group| group.path == "target-empty"));
-    let reloaded = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    let reloaded =
+        HomeView::new_for_test(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
     assert!(!reloaded.group_trees["alpha"].group_exists("work"));
     assert!(reloaded.group_trees["alpha"].group_exists("keep-empty"));
     assert!(reloaded.group_trees["beta"].group_exists("work"));
@@ -849,7 +852,8 @@ fn group_profile_move_preflights_creating_and_expired_reservations() {
         .unwrap();
     let target = Storage::new_unwatched("beta").unwrap();
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    let mut view =
+        HomeView::new_for_test(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
     view.mutate_instance(&second.id, |instance| {
         instance.status = Status::Creating;
     });
@@ -951,7 +955,7 @@ fn test_rename_group_resort_az() {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         tools,
         crate::file_watch::FileWatchService::noop(),
@@ -1375,7 +1379,7 @@ fn home_defaults_to_agent_when_config_unset() {
     let _storage = Storage::new_unwatched("test").unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let view = HomeView::new(
+    let view = HomeView::new_for_test(
         Some("test".to_string()),
         tools,
         crate::file_watch::FileWatchService::noop(),

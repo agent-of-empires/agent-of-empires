@@ -66,12 +66,12 @@ base(
       parallelIndex: testInfo.parallelIndex,
       seedFn: ({ home, env }) => {
         const projectDir = join(home, "project");
-        initWorkingRepo(projectDir);
+        initWorkingRepo(projectDir, env);
         // Commit a baseline so the modified version produces a real
         // hunk with selectable gutter line numbers (the comments UI
         // requires line numbers on at least one side).
         writeFiles(projectDir, { "notes.md": "line a\nline b\nline c\n" });
-        commitAll(projectDir, "baseline");
+        commitAll(projectDir, "baseline", env);
         writeFiles(projectDir, { "notes.md": "line A\nline B\nline C\n" });
         const addRes = spawnSync(resolveAoeBinary(), ["add", projectDir, "-t", "rp-notif", "-c", "claude"], { env });
         if (addRes.status !== 0) {

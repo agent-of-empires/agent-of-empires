@@ -460,23 +460,7 @@ pub(crate) async fn spawn_structured_session(
             } else {
                 None
             };
-            let mut instances = service.instances.write().await;
-            crate::server::api::sessions::upsert_instance(&mut instances, instance);
-            // The row is now in both `sessions.json` (persisted above) and
-            // `instances`, so any reloader still carrying a snapshot that
-            // predates the persist must drop it rather than replace
-            // `instances` with a `fresh` the new row was never in. Bump while
-            // still holding the `instances` write lock, for the same reason
-            // the delete path does: a reloader checks the epoch under that
-            // same lock, so the insert and the bump land as one step. Without
-            // this, a `status_poll_loop` tick whose disk read started before
-            // the persist drops the session from `GET /api/sessions` until the
-            // next tick re-reads disk. See invariant 8 on
-            // `reload_state_instances_from_disk`.
-            service
-                .mutation_epoch
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            drop(instances);
+            publish_created_instance(service, instance).await;
 
             // Count the create for the opt-in telemetry trend counter. Bounded
             // accumulator, read-and-decremented by the snapshot loop; no-op for
@@ -619,40 +603,126 @@ pub(crate) async fn spawn_structured_session(
     }
 }
 
+async fn publish_created_instance(service: &SessionService, instance: Instance) {
+    let mut instances = service.instances.write().await;
+    crate::server::api::sessions::upsert_instance(&mut instances, instance);
+    #[cfg(test)]
+    {
+        let gate = service.created_instance_gate.lock().unwrap().take();
+        if let Some((arrived, resume)) = gate {
+            arrived.send(()).expect("publication observer");
+            resume.await.expect("publication gate released");
+        }
+    }
+    // Reloads compare this epoch under the same lock as the published row.
+    service
+        .mutation_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
 #[cfg(test)]
 mod tests {
-    /// The create path must bump `mutation_epoch` while it still holds the
-    /// `instances` write lock. A reloader compares the epoch under that same
-    /// lock, so the insert and the bump have to land as one step; bumping
-    /// after `drop(instances)` reopens the window a reload can slip into and
-    /// silently drops the new session from `GET /api/sessions` for a tick.
-    ///
-    /// Source-level rather than behavioural: reaching the bump needs a real
-    /// spawn (tmux pane, worktree, agent subprocess), and the failure mode is
-    /// a future edit moving the bump out of the lock scope, which this
-    /// catches. The reload side is covered behaviourally in
-    /// `server::tests::a_reload_predating_a_create_does_not_drop_the_new_row`.
-    #[test]
-    fn the_create_bumps_the_mutation_epoch_under_the_instances_lock() {
-        // Whitespace-normalised so rustfmt's line wrapping cannot change the
-        // result: the point is the ordering, not how it is laid out.
-        let source = include_str!("session_spawn.rs");
-        let normalised: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    #[tokio::test]
+    async fn the_create_bumps_the_mutation_epoch_under_the_instances_lock() {
+        use axum::extract::{Query, State};
+        use axum::response::IntoResponse;
+        use axum::Json;
+        use std::time::Duration;
 
-        let lock = normalised
-            .find("let mut instances = service.instances.write().await;")
-            .expect("the create path takes the instances write lock");
-        let bump = normalised[lock..]
-            .find(".mutation_epoch .fetch_add(1, std::sync::atomic::Ordering::SeqCst);")
-            .expect("the create path bumps mutation_epoch after the upsert");
-        let unlock = normalised[lock..]
-            .find("drop(instances);")
-            .expect("the create path releases the instances write lock");
-
+        let _home = crate::session::test_support::isolate_app_dir();
+        let old = crate::session::Instance::new("old", "/tmp/old");
+        crate::server::test_support::seed_instances_on_disk_for_test("test", vec![old.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![old]);
+        // Capacity prevents an external agent launch without bypassing creation or persistence.
+        state.acp_supervisor.test_insert_worker("occupant").await;
+        let epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let stale_snapshot = crate::server::test_support::load_instances_from_disk_for_test("test");
+        let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        *state.session_service.created_instance_gate.lock().unwrap() =
+            Some((arrived_tx, resume_rx));
+        let body = serde_json::from_value(serde_json::json!({
+            "title": "created-scratch", "path": "", "tool": "claude",
+            "scratch": true, "view": "structured", "profile": "test",
+        }))
+        .unwrap();
+        let create = tokio::spawn({
+            let state = state.clone();
+            async move {
+                crate::server::api::sessions::create_session(
+                    State(state),
+                    Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
+                    Ok(Json(body)),
+                )
+                .await
+                .into_response()
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), arrived_rx)
+            .await
+            .expect("real create reaches publication")
+            .expect("publication observer");
         assert!(
-            bump < unlock,
-            "mutation_epoch must be bumped before drop(instances), so the insert \
-             and the bump are atomic against a concurrent reload"
+            state.instances.try_read().is_err(),
+            "new row remains hidden until its epoch is published"
         );
+        let created = crate::server::test_support::load_instances_from_disk_for_test("test")
+            .into_iter()
+            .find(|inst| inst.title == "created-scratch")
+            .expect("create persisted its row");
+        assert!(created.scratch);
+        assert!(std::path::Path::new(&created.project_path).is_dir());
+        let id = created.id;
+        let reload = crate::server::reload::reload_state_instances_from_disk(
+            &state,
+            stale_snapshot,
+            Vec::new(),
+            crate::server::state::StatusSource::DiskOnly,
+            epoch,
+        );
+        tokio::pin!(reload);
+        assert!(futures_util::poll!(&mut reload).is_pending());
+        resume_tx.send(()).unwrap();
+        let (response, ()) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(10), create),
+            reload,
+        );
+        let response = response.expect("creation finishes").expect("creation task");
+        assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+        let response: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(response["id"], id);
+        assert!(
+            state
+                .instances
+                .read()
+                .await
+                .iter()
+                .any(|inst| inst.id == id),
+            "a queued stale reload must not erase the session the create route published"
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if state
+                    .acp_event_store
+                    .replay_from(&id, 0)
+                    .iter()
+                    .any(|(_, event)| matches!(event, crate::acp::Event::AgentStartupError { .. }))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("capacity-rejected startup finishes before app guard drops");
+        assert!(!state.acp_supervisor.is_running(&id).await);
+        state.acp_supervisor.test_remove_worker("occupant").await;
     }
 }

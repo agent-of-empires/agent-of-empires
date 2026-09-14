@@ -128,6 +128,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn pi_never_retroactively_scans_its_store() {
+        let _env_read = crate::session::test_support::EnvGuard::read_lock();
         // Host and sandbox alike: the retroactive path carries no launch floor,
         // and both stores are shared by cwd, so a scan could only guess.
         //

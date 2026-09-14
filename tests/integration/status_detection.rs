@@ -99,11 +99,13 @@ mod opencode {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn test_running_state() {
         test_all_fixtures_in_dir("opencode", "running", Status::Running, identity, detect);
     }
 
     #[test]
+    #[serial_test::parallel]
     fn test_waiting_permission_state() {
         test_all_fixtures_in_dir(
             "opencode",
@@ -115,6 +117,7 @@ mod opencode {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn test_idle_state() {
         test_all_fixtures_in_dir("opencode", "idle", Status::Idle, identity, detect);
     }

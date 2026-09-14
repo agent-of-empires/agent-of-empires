@@ -15,6 +15,7 @@ fn docker_available() -> bool {
 }
 
 #[test]
+#[serial_test::parallel]
 fn test_sandbox_info_serialization() {
     let sandbox_info = SandboxInfo {
         enabled: true,
@@ -38,6 +39,7 @@ fn test_sandbox_info_serialization() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn test_instance_is_sandboxed() {
     let mut inst = Instance::new("test", "/tmp/test");
     assert!(!inst.is_sandboxed());
@@ -75,7 +77,7 @@ fn test_instance_is_sandboxed() {
 #[serial]
 fn test_sandbox_info_persists_across_save_load() {
     let temp = tempfile::TempDir::new().unwrap();
-    std::env::set_var("HOME", temp.path());
+    let _home = crate::common::set_temp_home(temp.path());
 
     let storage = Storage::new_unwatched("sandbox_test").unwrap();
 
@@ -114,6 +116,7 @@ fn test_sandbox_info_persists_across_save_load() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn test_container_name_generation() {
     let name1 = DockerContainer::generate_name("abcd1234");
     assert_eq!(name1, "aoe-sandbox-abcd1234");
@@ -127,6 +130,7 @@ fn test_container_name_generation() {
 
 #[test]
 #[ignore = "requires Docker daemon"]
+#[serial_test::parallel]
 fn test_container_lifecycle() {
     if !docker_available() {
         eprintln!("Skipping: Docker not available");
@@ -172,6 +176,7 @@ fn test_container_lifecycle() {
 
 #[test]
 #[ignore = "requires Docker daemon"]
+#[serial_test::parallel]
 fn test_container_force_remove() {
     if !docker_available() {
         eprintln!("Skipping: Docker not available");

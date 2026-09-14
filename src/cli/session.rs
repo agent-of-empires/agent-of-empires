@@ -3340,9 +3340,7 @@ mod set_session_id_tests {
     #[serial]
     async fn set_session_id_clears_resume_probe_failed_marker() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
 
         let storage = Storage::new_unwatched("set-sid-clear-marker").unwrap();
         let mut inst = Instance::new("marked_session", "/tmp/x");
@@ -3408,9 +3406,7 @@ mod set_color_tests {
     #[serial]
     async fn set_color_persists_palette_value_and_clears() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
 
         let (storage, id) = seed("set-color-ok").await;
 
@@ -3446,9 +3442,7 @@ mod set_color_tests {
     #[serial]
     async fn set_color_rejects_unknown_color() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
 
         let (storage, id) = seed("set-color-bad").await;
 
@@ -3506,9 +3500,7 @@ mod acp_reject_tests {
     #[serial]
     async fn set_session_id_rejects_structured_view_session() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
 
         let storage = Storage::new_unwatched("acp-reject").unwrap();
         let mut inst = Instance::new("acp_session", "/tmp/x");

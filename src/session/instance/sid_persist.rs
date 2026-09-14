@@ -504,9 +504,7 @@ mod tests {
     #[serial]
     fn persist_session_to_storage_skips_on_cas_mismatch() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let storage =
             crate::session::storage::Storage::new_unwatched("cas-persist-mismatch").unwrap();
@@ -539,9 +537,7 @@ mod tests {
     #[serial]
     fn persist_session_to_storage_writes_on_cas_match() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let storage = crate::session::storage::Storage::new_unwatched("cas-persist-match").unwrap();
         let mut inst = Instance::new("title", "/tmp/x");
@@ -578,9 +574,7 @@ mod tests {
         use tokio::time::timeout;
 
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         // Seed via a noop service so the seed write produces no Local
         // notification on the live service constructed below; the
@@ -647,9 +641,7 @@ mod tests {
     #[serial]
     fn persist_session_id_reloads_memory_on_skipped() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let storage =
             crate::session::storage::Storage::new_unwatched("persist-skipped-reload").unwrap();
@@ -683,9 +675,7 @@ mod tests {
     #[serial]
     fn persist_session_id_atomic_writes_both_fields_on_match() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let storage =
             crate::session::storage::Storage::new_unwatched("persist-atomic-match").unwrap();
@@ -763,9 +753,7 @@ mod tests {
     #[serial]
     fn fork_intent_promotes_to_default_after_launch() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let profile = "fork-promote";
         let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
@@ -810,9 +798,7 @@ mod tests {
     #[serial]
     fn use_intent_remains_sticky_after_launch() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let profile = "use-promote";
         let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
@@ -860,9 +846,7 @@ mod tests {
     #[serial]
     fn omp_pinned_launch_leaves_equal_sid_for_guarded_poller_confirmation() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let profile = "use-omp-confirm";
         let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
@@ -900,9 +884,7 @@ mod tests {
     #[serial]
     fn capture_backed_use_promotes_so_a_later_conversation_can_be_adopted() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
         let profile = "use-capture-promote";
         let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
         let pinned = "019342ab-1234-7def-8901-abcdef012345";
@@ -946,9 +928,7 @@ mod tests {
     #[serial]
     fn persist_session_id_writes_sid_only_on_default_intent() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let storage =
             crate::session::storage::Storage::new_unwatched("persist-default-intent").unwrap();
@@ -987,9 +967,7 @@ mod tests {
     #[serial]
     fn persist_session_id_clears_resume_probe_failed_marker() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let storage =
             crate::session::storage::Storage::new_unwatched("persist-clear-resume-marker").unwrap();
@@ -1028,9 +1006,7 @@ mod tests {
     #[serial]
     fn persist_session_id_persists_sid_when_intent_cas_mismatches() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let storage =
             crate::session::storage::Storage::new_unwatched("persist-intent-mismatch").unwrap();
@@ -1081,9 +1057,7 @@ mod tests {
     #[serial]
     fn persist_session_id_skipped_reloads_both_fields() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let storage =
             crate::session::storage::Storage::new_unwatched("persist-skipped-reload-both").unwrap();
@@ -1381,7 +1355,7 @@ mod tests {
         use super::super::{Instance, ResumeIntent, Status};
         use serial_test::serial;
         use std::collections::HashSet;
-        use tempfile::{tempdir, TempDir};
+        use tempfile::tempdir;
 
         const VALID_SID: &str = "019342ab-1234-7def-8901-abcdef012345";
         const PEER_SID: &str = "019342aa-2222-7eee-8fff-aaaabbbbcccc";
@@ -1447,12 +1421,6 @@ mod tests {
                 return true;
             }
             false
-        }
-
-        fn isolate_home(temp: &TempDir) {
-            std::env::set_var("HOME", temp.path());
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
         }
 
         fn captured_env(name: &str) -> Option<String> {
@@ -1603,7 +1571,7 @@ mod tests {
                 return;
             }
             let temp = tempdir().unwrap();
-            isolate_home(&temp);
+            let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
             let profile = "publish-applied";
             let mut inst = make_inst(profile, "fpaw");
@@ -1667,7 +1635,7 @@ mod tests {
                 return;
             }
             let temp = tempdir().unwrap();
-            isolate_home(&temp);
+            let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
             let mut inst = make_inst("omp-legacy-metadata", "legacy-omp");
             inst.tool = "omp".to_string();
@@ -1721,7 +1689,7 @@ mod tests {
                 return;
             }
             let temp = tempdir().unwrap();
-            isolate_home(&temp);
+            let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
             let mut inst = make_inst("omp-modern-missing-metadata", "modern-omp");
             inst.tool = "omp".to_string();
@@ -1763,7 +1731,7 @@ mod tests {
                 return;
             }
             let temp = tempdir().unwrap();
-            isolate_home(&temp);
+            let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
             let profile = "publish-applied-opencode";
             let mut inst = make_inst(profile, "fpaw-oc");
@@ -1790,7 +1758,7 @@ mod tests {
                 return;
             }
             let temp = tempdir().unwrap();
-            isolate_home(&temp);
+            let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
             let profile = "publish-skipped-some";
             let mut inst = make_inst(profile, "fpsdspd");
@@ -1819,7 +1787,7 @@ mod tests {
                 return;
             }
             let temp = tempdir().unwrap();
-            isolate_home(&temp);
+            let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
             let profile = "publish-skipped-none";
             let mut inst = make_inst(profile, "fpsdne");
@@ -1854,7 +1822,7 @@ mod tests {
                 return;
             }
             let temp = tempdir().unwrap();
-            isolate_home(&temp);
+            let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
             let profile = "publish-failed";
             let _ = crate::session::storage::Storage::new_unwatched(profile).unwrap();
@@ -1889,7 +1857,7 @@ mod tests {
                 return;
             }
             let temp = tempdir().unwrap();
-            isolate_home(&temp);
+            let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
             let profile = "publish-invalid";
             let mut inst = make_inst(profile, "fpisp");
@@ -1920,7 +1888,7 @@ mod tests {
                 return;
             }
             let temp = tempdir().unwrap();
-            isolate_home(&temp);
+            let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
             let profile = "publish-promote";
             let mut inst = make_inst(profile, "fppca");

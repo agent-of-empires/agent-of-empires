@@ -21,7 +21,7 @@ base("clone happy path: file:// URL clones into HOME and the wizard advances", a
   });
 
   try {
-    const bare = createBareRepo(serve.home);
+    const bare = createBareRepo(serve.home, serve.env);
 
     await page.goto(serve.baseUrl);
     await page.locator("body").click();
@@ -72,7 +72,7 @@ base("bare clone: creates worktree structure and returns main path", async ({ pa
   try {
     // A bare clone checks out a worktree, so the source must have a commit
     // on its default branch; an empty bare repo has no reference to resolve.
-    const bare = createSeededBareRepo(serve.home);
+    const bare = createSeededBareRepo(serve.home, serve.env);
 
     await page.goto(serve.baseUrl);
     await page.locator("body").click();

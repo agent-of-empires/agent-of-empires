@@ -415,6 +415,8 @@ pub struct Supervisor<S: BroadcastSink> {
     /// just after the spawn handshake finishes resumes within a
     /// scheduler tick instead of waiting up to 50 ms.
     worker_notify: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    worker_waits: tokio::sync::broadcast::Sender<String>,
     /// Build-stale sessions whose in-flight turn is draining before the
     /// reconciler respawns them on the current binary.
     respawn_pending: Arc<std::sync::Mutex<HashSet<String>>>,
@@ -781,6 +783,8 @@ impl<S: BroadcastSink> Supervisor<S> {
             warmed_up_agents: Arc::new(std::sync::Mutex::new(HashSet::new())),
             agent_warmup_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             worker_notify: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            worker_waits: tokio::sync::broadcast::channel(64).0,
             respawn_pending: Arc::new(std::sync::Mutex::new(HashSet::new())),
             incompatible_binaries: Arc::new(std::sync::Mutex::new(HashMap::new())),
             force_respawn: Arc::new(std::sync::Mutex::new(HashSet::new())),
@@ -2835,6 +2839,19 @@ impl<S: BroadcastSink> Supervisor<S> {
             if remaining.is_zero() {
                 return false;
             }
+            #[cfg(test)]
+            let notified = {
+                let mut reported = false;
+                std::future::poll_fn(move |cx| {
+                    let result = std::future::Future::poll(notified.as_mut(), cx);
+                    if result.is_pending() && !reported {
+                        reported = true;
+                        let _ = self.worker_waits.send(session_id.to_owned());
+                    }
+                    result
+                })
+            };
+            tokio::pin!(notified);
             if tokio::time::timeout(remaining, &mut notified)
                 .await
                 .is_err()
@@ -2842,6 +2859,20 @@ impl<S: BroadcastSink> Supervisor<S> {
                 return false;
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn watch_worker_waits(&self) -> tokio::sync::broadcast::Receiver<String> {
+        self.worker_waits.subscribe()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn test_flush_worker_commands(&self, session_id: &str) {
+        self.client_for_session(session_id)
+            .await
+            .unwrap()
+            .test_flush_commands()
+            .await;
     }
 
     /// Resolve a `session_id` to its `AcpClient`, holding `self.workers`
@@ -5056,13 +5087,7 @@ cursor-acp-bridge = "agent acp"
         // Root under /tmp, not $TMPDIR: on macOS the latter is deep enough that
         // <app_dir>/acp-workers/<id>.sock blows past the sun_path limit.
         let tmp = tempfile::TempDir::with_prefix_in("aoe-attach-policy-", "/tmp").unwrap();
-        let original_home = std::env::var_os("HOME");
-        let original_xdg = std::env::var_os("XDG_CONFIG_HOME");
-        // SAFETY: serialized via `#[serial]`; restored before returning.
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
-        }
+        let _home = crate::session::test_support::isolate_home(tmp.path());
 
         // A stand-in runner: `is_record_live` requires a live pid, and the
         // terminate path signals the pid's whole process group. `process_group(0)`
@@ -5075,7 +5100,7 @@ cursor-acp-bridge = "agent acp"
             .spawn()
             .expect("spawn stand-in runner");
 
-        let result = async {
+        async {
             let sup = Supervisor::new(VecSink::new());
             let socket = crate::process::worker_registry::socket_path_for("s-policy").unwrap();
             crate::process::worker_registry::touch_live_socket(&socket);
@@ -5166,19 +5191,7 @@ cursor-acp-bridge = "agent acp"
                 "the runner must exit from a signal, not a normal exit: {exit:?}"
             );
         }
-        .await;
-
-        unsafe {
-            match original_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-            match original_xdg {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
-        result
+        .await
     }
 
     #[tokio::test]
@@ -5268,12 +5281,7 @@ cursor-acp-bridge = "agent acp"
         // running under a wrapper that exports it would read their own config
         // instead of the temp HOME below.
         let _env = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
-        // SAFETY: serialised by `#[serial]`; subsequent serial tests reassign
-        // these env vars, which is the existing pattern in this module.
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
-        }
+        let _home = crate::session::test_support::isolate_home(tmp.path());
 
         // Native (Claude) layer: defines "native-only" and "shared".
         std::fs::write(
@@ -5347,11 +5355,7 @@ cursor-acp-bridge = "agent acp"
     #[serial_test::serial]
     async fn resolve_mcp_layers_gates_project_local_on_trust() {
         let tmp = tempfile::TempDir::new().unwrap();
-        // SAFETY: serialised by `#[serial]`; matches the sibling resolver test.
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
-        }
+        let _home = crate::session::test_support::isolate_home(tmp.path());
 
         let app_dir = crate::session::get_app_dir().unwrap();
         std::fs::create_dir_all(&app_dir).unwrap();
@@ -5429,12 +5433,7 @@ cursor-acp-bridge = "agent acp"
     #[serial_test::serial]
     async fn restart_budget_burns_after_threshold() {
         let tmp = tempfile::TempDir::new().unwrap();
-        // SAFETY: serialised by `#[serial]`; subsequent serial tests
-        // reassign these env vars, which is the existing pattern.
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
-        }
+        let _home = crate::session::test_support::isolate_home(tmp.path());
         let sink = VecSink::new();
         let sup = Supervisor::new(sink);
         // Build a worker handle with a real-looking spawn_config so the
@@ -5526,14 +5525,7 @@ cursor-acp-bridge = "agent acp"
     #[serial_test::serial]
     async fn restart_decision_returns_user_stopped_when_registry_deleted() {
         let tmp = tempfile::TempDir::new().unwrap();
-        // SAFETY: serialised by `#[serial]`; the test fixture restores
-        // env on the next serial test by reassignment. `get_app_dir`
-        // also creates the dir on first call, so an isolated HOME
-        // guarantees an isolated registry root.
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
-        }
+        let _home = crate::session::test_support::isolate_home(tmp.path());
         let sink = VecSink::new();
         let sup = Supervisor::new(sink);
         let dummy_spec = AgentSpec {
@@ -5638,13 +5630,7 @@ cursor-acp-bridge = "agent acp"
     #[serial_test::serial]
     async fn reap_user_stopped_emits_event_and_drops_handle() {
         let tmp = tempfile::TempDir::new().unwrap();
-        // SAFETY: serialised by `#[serial]`. Isolating HOME keeps this
-        // test's worker_registry lookups away from the developer's real
-        // dev-mode entries.
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
-        }
+        let _home = crate::session::test_support::isolate_home(tmp.path());
         let sink = VecSink::new();
         let sup = Supervisor::new(sink.clone());
         let dummy_spec = AgentSpec {
@@ -5720,10 +5706,7 @@ cursor-acp-bridge = "agent acp"
     #[serial_test::serial]
     async fn reap_user_stopped_reports_restart_pending_when_marker_present() {
         let tmp = tempfile::TempDir::new().unwrap();
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
-        }
+        let _home = crate::session::test_support::isolate_home(tmp.path());
         let sink = VecSink::new();
         let sup = Supervisor::new(sink.clone());
         let dummy_spec = AgentSpec {
@@ -5816,10 +5799,7 @@ cursor-acp-bridge = "agent acp"
     #[serial_test::serial]
     async fn reap_user_stopped_skips_stdio_workers() {
         let tmp = tempfile::TempDir::new().unwrap();
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
-        }
+        let _home = crate::session::test_support::isolate_home(tmp.path());
         let sink = VecSink::new();
         let sup = Supervisor::new(sink.clone());
         {
@@ -5847,10 +5827,7 @@ cursor-acp-bridge = "agent acp"
     #[serial_test::serial]
     async fn shutdown_publishes_stopped_event() {
         let tmp = tempfile::TempDir::new().unwrap();
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
-        }
+        let _home = crate::session::test_support::isolate_home(tmp.path());
         let sink = VecSink::new();
         let sup = Supervisor::new(sink.clone());
         let dummy_spec = AgentSpec {
@@ -6079,11 +6056,7 @@ cursor-acp-bridge = "agent acp"
     #[serial_test::serial]
     async fn shutdown_and_wait_degrades_when_load_errs_without_peer() {
         let tmp = tempfile::TempDir::with_prefix_in("aoe-supervisor-", "/tmp").unwrap();
-        // SAFETY: serialised by `#[serial]`.
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
-        }
+        let _home = crate::session::test_support::isolate_home(tmp.path());
         let session_id = "sw-err-2102";
         // Force load() -> Err by replacing the record file with a directory:
         // path.exists() stays true, but std::fs::read fails for every user,
@@ -6114,14 +6087,14 @@ cursor-acp-bridge = "agent acp"
         let sink = VecSink::new();
         let sup = Supervisor::new(sink);
         insert_stdio_worker(&sup, session_id).await;
-        let start = Instant::now();
-        sup.shutdown_and_wait(session_id, Duration::from_secs(2))
-            .await
-            .expect("shutdown_and_wait returns Ok on best-effort fallback");
+        let shutdown = sup.shutdown_and_wait(session_id, Duration::from_secs(2));
+        tokio::pin!(shutdown);
         assert!(
-            start.elapsed() < Duration::from_millis(100),
-            "no peer socket means pid_source_for returns None; no poll should run, elapsed={:?}",
-            start.elapsed()
+            matches!(
+                futures_util::poll!(&mut shutdown),
+                std::task::Poll::Ready(Ok(()))
+            ),
+            "without a PID source shutdown must finish without entering a poll wait"
         );
     }
 
@@ -6131,23 +6104,19 @@ cursor-acp-bridge = "agent acp"
     #[serial_test::serial]
     async fn shutdown_and_wait_returns_promptly_when_registry_missing() {
         let tmp = tempfile::TempDir::with_prefix_in("aoe-supervisor-", "/tmp").unwrap();
-        // SAFETY: serialised by `#[serial]`.
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
-        }
+        let _home = crate::session::test_support::isolate_home(tmp.path());
         let session_id = "sw-missing-2102";
         let sink = VecSink::new();
         let sup = Supervisor::new(sink);
         insert_stdio_worker(&sup, session_id).await;
-        let start = Instant::now();
-        sup.shutdown_and_wait(session_id, Duration::from_secs(2))
-            .await
-            .expect("shutdown_and_wait returns Ok");
+        let shutdown = sup.shutdown_and_wait(session_id, Duration::from_secs(2));
+        tokio::pin!(shutdown);
         assert!(
-            start.elapsed() < Duration::from_millis(100),
-            "no poll must run when registry is missing, elapsed={:?}",
-            start.elapsed()
+            matches!(
+                futures_util::poll!(&mut shutdown),
+                std::task::Poll::Ready(Ok(()))
+            ),
+            "without a PID source shutdown must finish without entering a poll wait"
         );
     }
 
@@ -6282,11 +6251,7 @@ cursor-acp-bridge = "agent acp"
     async fn shutdown_skips_session_delete_permanent_delete_fires_it() {
         use std::sync::atomic::Ordering;
         let tmp = tempfile::TempDir::new().unwrap();
-        // SAFETY: serialised by `#[serial]`; matches the existing pattern.
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
-        }
+        let _home = crate::session::test_support::isolate_home(tmp.path());
 
         // Dead pid that was never a process-group leader, so the
         // teardown's killpg/kill signal nothing (ESRCH).
@@ -6380,12 +6345,7 @@ cursor-acp-bridge = "agent acp"
     #[serial_test::serial]
     async fn publish_user_prompt_emits_session_cleared_for_clear_command() {
         let tmp = tempfile::TempDir::new().unwrap();
-        // SAFETY: serialised by `#[serial]`; subsequent serial tests
-        // reassign these env vars, which is the existing pattern.
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
-        }
+        let _home = crate::session::test_support::isolate_home(tmp.path());
         let session_id = "attached-opencode-clear-1";
         let dir = crate::process::worker_registry::workers_dir().unwrap();
         let record = crate::process::worker_registry::WorkerRecord::new(
@@ -6430,12 +6390,7 @@ cursor-acp-bridge = "agent acp"
     #[serial_test::serial]
     async fn publish_user_prompt_uses_agent_key_from_registry_for_attached_worker() {
         let tmp = tempfile::TempDir::new().unwrap();
-        // SAFETY: serialised by `#[serial]`; subsequent serial tests
-        // reassign these env vars, which is the existing pattern.
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
-        }
+        let _home = crate::session::test_support::isolate_home(tmp.path());
         let session_id = "attached-codex-1";
         let dir = crate::process::worker_registry::workers_dir().unwrap();
         let record = crate::process::worker_registry::WorkerRecord::new(
@@ -6501,12 +6456,7 @@ cursor-acp-bridge = "agent acp"
     #[serial_test::serial]
     async fn publish_user_prompt_drives_reset_for_claude_clear() {
         let tmp = tempfile::TempDir::new().unwrap();
-        // SAFETY: serialised by `#[serial]`; subsequent serial tests
-        // reassign these env vars, which is the existing pattern.
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
-        }
+        let _home = crate::session::test_support::isolate_home(tmp.path());
         let session_id = "attached-claude-clear-1";
         let dir = crate::process::worker_registry::workers_dir().unwrap();
         let record = crate::process::worker_registry::WorkerRecord::new(
@@ -6565,10 +6515,7 @@ cursor-acp-bridge = "agent acp"
     #[serial_test::serial]
     async fn publish_user_prompt_falls_back_to_claude_for_legacy_record() {
         let tmp = tempfile::TempDir::new().unwrap();
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
-        }
+        let _home = crate::session::test_support::isolate_home(tmp.path());
         let session_id = "legacy-claude-1";
         let dir = crate::process::worker_registry::workers_dir().unwrap();
         // Hand-craft a legacy record: pre-`agent_key` schema (empty
@@ -6873,14 +6820,10 @@ cursor-acp-bridge = "agent acp"
 
     use super::super::runner_lifecycle::test_support::FakeProcessControl;
 
-    fn isolate_home() -> tempfile::TempDir {
+    fn isolate_home() -> (crate::session::test_support::AppDirGuard, tempfile::TempDir) {
         let tmp = tempfile::TempDir::with_prefix_in("aoe-lease-", "/tmp").unwrap();
-        // SAFETY: serialized via `#[serial]`; every test here reassigns.
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
-        }
-        tmp
+        let home = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        (home, tmp)
     }
 
     fn spawn_request(session_id: &str) -> SpawnRequest {
@@ -6986,35 +6929,34 @@ cursor-acp-bridge = "agent acp"
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn wait_for_worker_wakes_on_reservation_drop() {
         let sup = Arc::new(Supervisor::new(VecSink::new()));
         let reservation = reserve(sup.begin_resume("s-notify", ResumeKind::Spawn).await);
-
+        let mut entered = sup.watch_worker_waits();
         let sup_clone = Arc::clone(&sup);
         let waiter = tokio::spawn(async move {
             sup_clone
-                .wait_for_worker("s-notify", std::time::Duration::from_secs(60))
+                .wait_for_worker("s-notify", Duration::from_secs(60))
                 .await
         });
-
-        tokio::task::yield_now().await;
-        let dropped_at = std::time::Instant::now();
+        assert_eq!(entered.recv().await.unwrap(), "s-notify");
+        let before = tokio::time::Instant::now();
         drop(reservation);
-
-        let result = tokio::time::timeout(std::time::Duration::from_millis(200), waiter)
+        let result = tokio::time::timeout(Duration::from_secs(5), waiter)
             .await
-            .expect("waiter must wake on notify well under the old 50 ms poll")
-            .expect("waiter task must not panic");
-        assert!(
-            !result,
-            "wait_for_worker must return false when the reservation drops without a worker landing"
+            .expect("reservation drop must notify the waiter")
+            .unwrap();
+        assert!(!result);
+        assert_eq!(
+            tokio::time::Instant::now(),
+            before,
+            "notification must not depend on a poll timer"
         );
-        assert!(dropped_at.elapsed() < std::time::Duration::from_millis(50));
         assert_eq!(sup.worker_state("s-notify").await, AcpWorkerState::Absent);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn begin_resume_reserves_so_wait_for_worker_blocks() {
         let sink = VecSink::new();
         let sup = Arc::new(Supervisor::new(sink));
@@ -7040,13 +6982,14 @@ cursor-acp-bridge = "agent acp"
             ResumeReservationOutcome::AlreadyPresent
         ));
 
+        let mut entered = sup.watch_worker_waits();
         let sup_clone = Arc::clone(&sup);
         let waiter = tokio::spawn(async move {
             sup_clone
                 .wait_for_worker("s-1748", std::time::Duration::from_secs(60))
                 .await
         });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(entered.recv().await.unwrap(), "s-1748");
         assert!(
             !waiter.is_finished(),
             "wait_for_worker must block while the reservation is held"
@@ -7089,18 +7032,15 @@ cursor-acp-bridge = "agent acp"
         };
         entered.notified().await;
 
-        let waiter = {
-            let sup = Arc::clone(&sup);
-            tokio::spawn(async move {
-                sup.shutdown_and_wait("s-wait", Duration::from_secs(5))
-                    .await
-            })
-        };
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!waiter.is_finished(), "must wait for the resume to settle");
+        let waiter = sup.shutdown_and_wait("s-wait", Duration::from_secs(5));
+        tokio::pin!(waiter);
+        assert!(
+            futures_util::poll!(&mut waiter).is_pending(),
+            "shutdown must cancel and wait for the resume to settle"
+        );
         gate.notify_one();
 
-        waiter.await.unwrap().expect("cancel is a soft success");
+        waiter.await.expect("cancel is a soft success");
         assert_eq!(sup.worker_state("s-wait").await, AcpWorkerState::Absent);
         assert!(matches!(
             spawner.await.unwrap(),
@@ -7675,10 +7615,7 @@ cursor-acp-bridge = "agent acp"
         // dev profile (or other tests) don't bleed into the spawn
         // path's combined-count check.
         let tmp = tempfile::TempDir::new().unwrap();
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
-        }
+        let _home = crate::session::test_support::isolate_home(tmp.path());
         let sink = VecSink::new();
         let sup = Supervisor::with_capacity(sink, 1);
         // Pre-load one fake worker so the cap is full.
@@ -7726,13 +7663,7 @@ cursor-acp-bridge = "agent acp"
     #[serial_test::serial]
     async fn capacity_counts_detached_registry_entries() {
         let tmp = tempfile::TempDir::new().unwrap();
-        // SAFETY: serialised by `#[serial]`; isolating HOME keeps this
-        // test's registry writes away from the developer's real
-        // dev-mode entries (and any other tests in this file).
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
-        }
+        let _home = crate::session::test_support::isolate_home(tmp.path());
         let sink = VecSink::new();
         let sup = Supervisor::with_capacity(sink, 1);
 

@@ -82,11 +82,7 @@ base("PATCH 500 does not silently change dataset.theme or dispatch picker event"
 
     await themeSelect.selectOption(next!);
 
-    // Wait long enough that the PATCH round-trip would have settled.
-    // The save() awaits the PATCH; on the 500 it returns false and
-    // never dispatches the picker event. A short fixed wait is
-    // enough here since the contract is "never fires".
-    await page.waitForTimeout(600);
+    await expect(page.getByText("Failed to save, please try again")).toBeVisible();
 
     const picker = await page.evaluate(() => (window as unknown as { __pickerFired?: number }).__pickerFired ?? 0);
     expect(picker).toBe(0);

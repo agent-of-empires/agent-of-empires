@@ -705,7 +705,7 @@ mod tests {
     fn sandboxed_pi_launch_line_carries_the_sidecar_env() {
         let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
         let temp_home = tempfile::tempdir().unwrap();
-        let _home = crate::session::test_support::EnvGuard::set(&[("HOME", temp_home.path())]);
+        let _home = crate::session::test_support::isolate_home(temp_home.path());
 
         let project = temp_home.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
@@ -755,7 +755,7 @@ mod tests {
         // The extension is written under `HOME`, so this owns one: the
         // global lock keeps it from racing another test's `HOME` swap.
         let temp_home = tempfile::tempdir().unwrap();
-        let _home = crate::session::test_support::EnvGuard::set(&[("HOME", temp_home.path())]);
+        let _home = crate::session::test_support::isolate_home(temp_home.path());
 
         let mut inst = Instance::new("pi-sandbox", "/tmp/pi-sandbox");
         inst.tool = "pi".to_string();

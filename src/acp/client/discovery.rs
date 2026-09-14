@@ -417,37 +417,29 @@ mod tests {
         assert_eq!(selected.url, urls[0].url);
     }
 
-    // Env-touching tests must run serially; cargo test runs in
-    // parallel by default and set_var races with the unset cases.
     #[test]
     #[serial_test::serial]
     fn discover_env_returns_none_when_unset() {
-        unsafe {
-            std::env::remove_var("AOE_DAEMON_URL");
-            std::env::remove_var("AOE_DAEMON_TOKEN");
-        }
+        let _env =
+            crate::session::test_support::EnvGuard::unset(&["AOE_DAEMON_URL", "AOE_DAEMON_TOKEN"]);
         assert!(discover_env().is_none());
     }
 
     #[test]
     #[serial_test::serial]
     fn discover_env_parses_url_and_token() {
-        unsafe {
-            std::env::set_var(
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            (
                 "AOE_DAEMON_URL",
                 "https://remote.example.com:9000/?token=zzz",
-            );
-            std::env::set_var("AOE_DAEMON_TOKEN", "real-token");
-        }
+            ),
+            ("AOE_DAEMON_TOKEN", "real-token"),
+        ]);
         let endpoint = discover_env().expect("env override should resolve");
         // ENV override strips the query string defensively even though
         // tokens should travel via AOE_DAEMON_TOKEN, not the URL.
         assert_eq!(endpoint.base_url, "https://remote.example.com:9000");
         assert_eq!(endpoint.cached_token().as_deref(), Some("real-token"));
         assert_eq!(endpoint.source, Source::Env);
-        unsafe {
-            std::env::remove_var("AOE_DAEMON_URL");
-            std::env::remove_var("AOE_DAEMON_TOKEN");
-        }
     }
 }

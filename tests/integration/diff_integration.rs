@@ -37,6 +37,7 @@ mod git_diff {
     };
 
     #[test]
+    #[serial_test::parallel]
     fn test_empty_diff_on_fresh_repo() {
         let dir = setup_test_repo();
         let files = compute_changed_files(dir.path(), "HEAD").unwrap();
@@ -44,6 +45,7 @@ mod git_diff {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn test_modified_file_detected() {
         let dir = setup_test_repo();
 
@@ -58,6 +60,7 @@ mod git_diff {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn test_added_file_detected() {
         let dir = setup_test_repo();
 
@@ -71,6 +74,7 @@ mod git_diff {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn test_deleted_file_detected() {
         let dir = setup_test_repo();
 
@@ -84,6 +88,7 @@ mod git_diff {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn test_file_diff_shows_changes() {
         let dir = setup_test_repo();
 
@@ -100,6 +105,7 @@ mod git_diff {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn test_list_branches() {
         let dir = setup_test_repo();
         let repo = git2::Repository::open(dir.path()).unwrap();
@@ -115,6 +121,7 @@ mod git_diff {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn test_get_default_branch() {
         let dir = setup_test_repo();
         let branch = get_default_branch(dir.path()).unwrap();
@@ -123,6 +130,7 @@ mod git_diff {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn test_diff_with_context_lines() {
         let dir = setup_test_repo();
 
@@ -171,6 +179,7 @@ mod config {
     use agent_of_empires::session::config::{Config, DiffConfig};
 
     #[test]
+    #[serial_test::parallel]
     fn test_diff_config_defaults() {
         let config = DiffConfig::default();
         assert!(config.default_branch.is_none());
@@ -178,6 +187,7 @@ mod config {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn test_diff_config_in_full_config() {
         let toml = r#"
             [diff]
@@ -190,6 +200,7 @@ mod config {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn test_diff_config_serialization() {
         let config = DiffConfig {
             default_branch: Some("main".to_string()),

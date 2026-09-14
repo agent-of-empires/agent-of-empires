@@ -2471,7 +2471,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_favorites_first_pins_root_groups_across_profiles() {
-        let original = crate::session::favorites_first();
+        let _flag = crate::session::test_support::FavoritesFirstGuard::new();
 
         let mut old_fav = Instance::new("old_fav", "/tmp/of");
         old_fav.source_profile = "p1".to_string();
@@ -2520,8 +2520,6 @@ mod tests {
             "old",
             "flag on: the group holding the favorite pins to the top"
         );
-
-        crate::session::set_favorites_first(original);
     }
 
     /// A group whose only favorite is archived must not be promoted.

@@ -2,6 +2,58 @@
 
 use super::*;
 
+#[cfg(test)]
+pub(super) mod test_support {
+    use super::Instance;
+
+    #[derive(Clone, Copy)]
+    pub(in crate::session::instance) enum FinalizePhase {
+        Before,
+        After,
+    }
+
+    type Callback = Box<dyn FnMut(&Instance, FinalizePhase)>;
+    thread_local! {
+        static OBSERVER: std::cell::RefCell<Option<(String, Callback)>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(in crate::session::instance) struct FinalizeObserver;
+
+    impl FinalizeObserver {
+        pub(in crate::session::instance) fn install(
+            id: String,
+            callback: impl FnMut(&Instance, FinalizePhase) + 'static,
+        ) -> Self {
+            OBSERVER.with(|slot| {
+                assert!(
+                    slot.borrow().is_none(),
+                    "one launch observer per test thread"
+                );
+                *slot.borrow_mut() = Some((id, Box::new(callback)));
+            });
+            Self
+        }
+    }
+
+    impl Drop for FinalizeObserver {
+        fn drop(&mut self) {
+            OBSERVER.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+
+    pub(super) fn observe(instance: &Instance, phase: FinalizePhase) {
+        OBSERVER.with(|slot| {
+            if let Some((id, callback)) = slot.borrow_mut().as_mut() {
+                if *id == instance.id {
+                    callback(instance, phase);
+                }
+            }
+        });
+    }
+}
+
 /// Outcome of `start_with_resume_fallback`.
 ///
 /// Tmux/process failures propagate as `Err` so callers keep the existing
@@ -273,6 +325,9 @@ impl Instance {
             }
         }
 
+        #[cfg(test)]
+        test_support::observe(self, test_support::FinalizePhase::Before);
+
         self.finalize_launch(
             session.name(),
             profile,
@@ -280,6 +335,9 @@ impl Instance {
             prepared.expected_prior_intent,
             omp_capture_metadata,
         );
+
+        #[cfg(test)]
+        test_support::observe(self, test_support::FinalizePhase::After);
 
         Ok(match launch_sid {
             Some(sid) => LaunchSidOutcome::Existing { sid },

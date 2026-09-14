@@ -246,40 +246,60 @@ fn request_session_feed_refresh_is_a_no_op_without_structured_rows() {
     );
 }
 
-/// The in-flight flag is the only thing stopping a slow daemon from
-/// accumulating one queued request per tick, so assert the full cycle:
-/// a first request arms it, a second while armed is dropped, and draining
-/// the worker disarms it so the next tick can fetch again. Asserting only
-/// that the flag is still true after the second call would pass even if
-/// the second call had enqueued another request.
+/// Only a completed fetch permits a later tick to enqueue another request.
 #[test]
 #[serial]
 fn request_session_feed_refresh_arms_and_disarms_the_in_flight_flag() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
     let mut env = create_test_env_empty();
-    let _id = structured_row(&mut env, Status::Idle);
+    structured_row(&mut env, Status::Idle);
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let mut requests = 0;
+    env.view.session_feed = SessionFeed::with_fetch_for_test(move || {
+        requests += 1;
+        entered_tx.send(requests).unwrap();
+        if requests == 1 {
+            release_rx.recv().expect("release first fetch");
+        }
+        SessionFeedResult::Unavailable(format!("controlled fetch {requests}"))
+    });
 
-    assert!(!env.view.pending_session_feed, "starts disarmed");
+    assert!(!env.view.pending_session_feed);
     env.view.request_session_feed_refresh();
-    assert!(env.view.pending_session_feed, "first request arms");
-
-    // While armed, further ticks are dropped at the guard rather than
-    // reaching the worker.
-    env.view.pending_session_feed = true;
+    assert_eq!(entered_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 1);
+    assert!(env.view.pending_session_feed);
     env.view.request_session_feed_refresh();
     assert!(env.view.pending_session_feed);
 
-    // Draining the worker disarms, so the next tick can fetch again. The
-    // fetch itself reports the daemon unavailable here (none in the test
-    // env), which is the same path a daemon-less TUI takes.
+    release_tx.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
     while env.view.pending_session_feed {
-        if env.view.apply_session_feed() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(
+            Instant::now() < deadline,
+            "completed feed result was not applied"
+        );
+        env.view.apply_session_feed();
+        std::thread::yield_now();
     }
+    env.view.request_session_feed_refresh();
     assert!(
-        !env.view.pending_session_feed,
-        "draining the worker disarms the flag"
+        env.view.pending_session_feed,
+        "a completed fetch permits the next tick"
+    );
+
+    let feed = std::mem::replace(
+        &mut env.view.session_feed,
+        SessionFeed::seeded_for_test(SessionFeedResult::Snapshot(Vec::new())),
+    );
+    // Closing and joining the request queue makes this an exhaustive count.
+    feed.finish_for_test();
+    assert_eq!(
+        entered_rx.try_iter().collect::<Vec<_>>(),
+        vec![2],
+        "the tick while pending must not enqueue a duplicate fetch"
     );
 }
 

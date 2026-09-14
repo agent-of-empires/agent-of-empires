@@ -35,6 +35,66 @@ mod worker;
 
 pub use app::*;
 
+/// Re-enter one libtest case in a private, killable process. Output stays off
+/// the terminal, including OSC52 sequences emitted by clipboard tests.
+#[cfg(test)]
+fn isolated_test_process(test: &str, timeout: std::time::Duration) -> bool {
+    use std::process::{Command, Stdio};
+    let _env = crate::session::test_support::EnvGuard::read_lock();
+    const CHILD: &str = "AOE_TUI_TEST_CHILD";
+    const ENTERED: &str = "AOE_TUI_TEST_ENTERED";
+    if std::env::var(CHILD).as_deref() == Ok(test) {
+        std::fs::write(std::env::var_os(ENTERED).expect("child entry path"), test)
+            .expect("acknowledge selected test");
+        return true;
+    }
+    let home = tempfile::tempdir().expect("private child home");
+    let socket = home.path().join("tmux.sock");
+    let entered = home.path().join("entered");
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", test, "--nocapture", "--test-threads=1"])
+        .env(CHILD, test)
+        .env(ENTERED, &entered)
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path())
+        .env("XDG_DATA_HOME", home.path())
+        .env("XDG_CACHE_HOME", home.path())
+        .env("TMPDIR", home.path())
+        .env("AOE_TMUX_SOCKET", &socket)
+        .env_remove("TMUX")
+        .stdin(Stdio::null());
+    let result = crate::process::run_with_timeout_process_group(&mut command, timeout);
+    // tmux daemonizes out of the child's process group; reap its private
+    // server after both normal exit and watchdog termination.
+    if socket.exists() {
+        let mut cleanup = Command::new("tmux");
+        cleanup
+            .arg("-S")
+            .arg(&socket)
+            .arg("kill-server")
+            .stdin(Stdio::null());
+        let cleanup = crate::process::run_with_timeout(&mut cleanup, timeout)
+            .expect("kill private tmux server")
+            .expect("private tmux cleanup timed out");
+        assert!(cleanup.status.success(), "private tmux cleanup failed");
+    }
+    let output = result
+        .expect("spawn isolated test")
+        .expect("isolated test watchdog expired");
+    assert!(
+        output.status.success(),
+        "isolated test failed: {:?}\n{:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(entered).expect("selected test did not run"),
+        test
+    );
+    false
+}
+
 /// Entry point for the hidden `aoe __vt-pipe <socket>` helper subprocess used
 /// by the VT live-preview path (`[tmux] vt_live`, default on). Copies the
 /// pane's piped output (stdin) to the unix socket, unbuffered. Dispatched in

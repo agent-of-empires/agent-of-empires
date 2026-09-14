@@ -1303,6 +1303,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_poller_detects_change() {
         let call_count = Arc::new(Mutex::new(0u32));
         let call_count_clone = call_count.clone();
@@ -1319,36 +1320,30 @@ mod tests {
 
         let changed_ids: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let changed_ids_clone = changed_ids.clone();
+        let (changed_tx, changed_rx) = mpsc::channel();
         let on_change: Box<dyn Fn(&str) + Send + 'static> = Box::new(move |id: &str| {
             lock_unpoisoned(&changed_ids_clone).push(id.to_string());
+            if id == "id-2" {
+                let _ = changed_tx.send(());
+            }
         });
 
         let mut poller = SessionPoller::new("test-session".to_string());
-        poller.start(
-            "test-change".to_string(),
-            poll_fn,
-            on_change,
-            Some("id-1".to_string()),
+        assert_eq!(
+            poller.start(
+                "test-change".to_string(),
+                poll_fn,
+                on_change,
+                Some("id-1".to_string()),
+            ),
+            PollerSpawn::Spawned
         );
 
-        // Wait for the change rather than for the 2s interval to elapse: each
-        // tick forks tmux, so a fixed sleep races that under load. Same reason
-        // `test_poller_starts_polling_immediately` polls.
-        let observed = |want: usize| {
-            for _ in 0..200 {
-                if lock_unpoisoned(&changed_ids).len() >= want {
-                    return true;
-                }
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            false
-        };
-        assert!(observed(1), "the poller must observe the changed id");
+        changed_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the changed observation must be published before retrying it");
         poller.retry_last_observation();
-        assert!(
-            observed(2),
-            "a retry must be able to re-emit the same observation"
-        );
+        // Stop follows RetryLast on the same FIFO and joins every callback.
         poller.stop();
 
         let ids = lock_unpoisoned(&changed_ids);
@@ -1478,38 +1473,43 @@ mod tests {
 
     #[test]
     fn test_poller_cleanup_decrements_counter() {
-        let budget =
-            test_support::IsolatedBudget::with_ceiling(DEFAULT_SESSION_ID_POLLER_MAX_THREADS);
-        let poll_count = Arc::new(Mutex::new(0u32));
-        let poll_count_clone = poll_count.clone();
-
+        let budget = test_support::IsolatedBudget::with_ceiling(1);
+        let sid = Arc::new(Mutex::new("initial-id".to_string()));
+        let observed_sid = sid.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
         let mut poller = SessionPoller::new("test-session".to_string());
-        poller.start(
-            "test-cleanup".to_string(),
-            Box::new(move || {
-                *lock_unpoisoned(&poll_count_clone) += 1;
-                Some("id".to_string())
-            }),
-            Box::new(|_| {}),
-            None,
+        // Stop is already queued, so no periodic tick can publish the final ID.
+        poller.cmd_tx.send(PollCommand::Stop).expect("queue stop");
+        assert_eq!(
+            poller.start(
+                "test-cleanup".to_string(),
+                Box::new(move || Some(lock_unpoisoned(&observed_sid).clone())),
+                Box::new(move |value| {
+                    if value == "initial-id" {
+                        started_tx.send(()).expect("report initial observation");
+                        let _ = release_rx.recv();
+                    }
+                }),
+                None,
+            ),
+            PollerSpawn::Spawned
         );
-
-        // Wait for the immediate first poll to run
-        std::thread::sleep(Duration::from_millis(100));
-
-        let count_before_stop = budget.active();
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("initial observation");
+        let active_before_stop = budget.active();
+        *lock_unpoisoned(&sid) = "final-id".to_string();
+        drop(release_tx);
         poller.stop();
-        let count_after_stop = budget.active();
-
-        assert!(
-            count_after_stop < count_before_stop,
-            "counter should decrement after stop (before_stop={}, after_stop={})",
-            count_before_stop,
-            count_after_stop
-        );
-        assert!(
-            *lock_unpoisoned(&poll_count) >= 2,
-            "stop must perform a final poll after the immediate first poll"
+        assert_eq!(active_before_stop, 1);
+        assert_eq!(budget.active(), 0);
+        assert_eq!(
+            poller.latest_observation(),
+            Some((
+                "test-cleanup".to_string(),
+                SessionIdObservation::unguarded("final-id".to_string()),
+            ))
         );
     }
 
@@ -1575,39 +1575,26 @@ mod tests {
     }
 
     #[test]
-    fn test_poller_starts_polling_immediately() {
-        let poll_count = Arc::new(Mutex::new(0u32));
-        let poll_count_clone = poll_count.clone();
-
-        let poll_fn: Box<dyn Fn() -> Option<String> + Send + 'static> = Box::new(move || {
-            let mut count = lock_unpoisoned(&poll_count_clone);
-            *count += 1;
-            Some("ses_polled".to_string())
-        });
-
-        let on_change: Box<dyn Fn(&str) + Send + 'static> = Box::new(|_| {});
-
+    #[serial]
+    fn test_poller_publishes_before_waiting_for_commands() {
         let mut poller = SessionPoller::new("test-session".to_string());
-        poller.start("test-immediate".to_string(), poll_fn, on_change, None);
+        // Disconnection prevents either a periodic tick or Stop's final poll.
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        drop(cmd_tx);
+        poller.cmd_rx = Some(cmd_rx);
+        let (observed_tx, observed_rx) = mpsc::channel();
 
-        // Wait for the first poll rather than sleeping a fixed window: the
-        // tick forks tmux twice (name resolution, pane probe), and against a
-        // socket that is not there those forks can outlast a 100ms sleep,
-        // which made this assertion flake.
-        let mut count = 0;
-        for _ in 0..100 {
-            count = *lock_unpoisoned(&poll_count);
-            if count > 0 {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(
-            count > 0,
-            "poller should have started polling immediately (count={})",
-            count
+        assert_eq!(
+            poller.start(
+                "test-immediate".to_string(),
+                Box::new(|| Some("ses_polled".to_string())),
+                Box::new(move |id| observed_tx.send(id.to_string()).unwrap()),
+                None,
+            ),
+            PollerSpawn::Spawned
         );
-
         poller.stop();
+
+        assert_eq!(observed_rx.try_recv().unwrap(), "ses_polled");
     }
 }

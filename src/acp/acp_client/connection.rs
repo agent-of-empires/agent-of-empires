@@ -2234,7 +2234,11 @@ pub(super) async fn run_connection_task<W, R>(
                                                     .into(),
                                             });
                                         }
-                                        Some(ClientCmd::Shutdown) | None => {
+                    #[cfg(test)]
+                    Some(ClientCmd::FlushForTest(done)) => {
+                        let _ = done.send(());
+                    }
+                    Some(ClientCmd::Shutdown) | None => {
                                             info!(
                                                 target: "acp.protocol",
                                                 "shutdown received during in-flight prompt; aborting turn"
@@ -2973,6 +2977,10 @@ pub(super) async fn run_connection_task<W, R>(
                                     .send(ResetSessionOutcome::Failed { message });
                             }
                         }
+                    }
+                    #[cfg(test)]
+                    Some(ClientCmd::FlushForTest(done)) => {
+                        let _ = done.send(());
                     }
                     Some(ClientCmd::Shutdown) | None => {
                         info!(target: "acp.protocol", "shutdown received, exiting connection loop");

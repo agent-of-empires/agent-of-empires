@@ -545,28 +545,60 @@ fn paste_into_dialog_over_live_send_clears_preview_selection() {
 #[test]
 #[serial]
 fn refresh_preserves_cache_when_live_capture_fails() {
-    // Pin the kill-switch behavior (originally introduced in #1501,
-    // re-implemented here against the fork-only capture path):
-    // when live-send is active and the capture call fails (in this
-    // unit fixture the backing tmux session doesn't exist, so the
-    // fork returns Err), the previous capture's content must stay
-    // in the cache. Pre-#1501 a single failed capture wiped
-    // `preview_cache.content` to "" and the preview rendered
-    // "No output available" until the user exited and re-entered
-    // live mode.
+    use crate::tui::home::live_send::LiveCaptureWorker;
+    use std::time::Duration;
+
     let mut env = create_test_env_with_sessions(1);
     let id = install_live_for_first_session(&mut env);
     env.view.selected_session = Some(id.clone());
-    env.view.preview_cache.content = "hello from a successful capture".to_string();
-    env.view.preview_cache.captured_lines = 1;
-    env.view.preview_cache.dimensions = (80, 24);
-    env.view.preview_cache.session_id = Some(id);
-
+    let (capture_tx, capture_rx) = std::sync::mpsc::channel();
+    let (worker, completed) =
+        LiveCaptureWorker::spawn_with_capture_for_test(env.view.preview_wake.clone(), move || {
+            (capture_rx.recv().unwrap_or(None), None)
+        });
+    env.view.preview_capture_worker = Some(worker);
+    env.view.vt_live_enabled = false;
+    let target = env.view.live_send.as_ref().unwrap().tmux_name.clone();
+    env.view.sync_preview_capture_worker(Some(target));
     env.view.refresh_preview_cache_if_needed(80, 24);
+    let generation = env
+        .view
+        .preview_capture_worker
+        .as_ref()
+        .unwrap()
+        .current_generation_for_test();
+    capture_tx
+        .send(Some("hello from a successful capture".to_string()))
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let successful = loop {
+        let receipt = completed
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .expect("successful capture completed");
+        if receipt.0 == generation && receipt.1 > 0 {
+            break receipt;
+        }
+    };
+    env.view.refresh_preview_cache_if_needed(80, 24);
+    assert_eq!(
+        env.view.preview_cache.content,
+        "hello from a successful capture"
+    );
+    assert_eq!(env.view.preview_cache.session_id, Some(id));
 
+    // Release exactly one failed capture after accepting the successful frame.
+    capture_tx.send(None).unwrap();
+    let failed = completed
+        .recv_timeout(Duration::from_secs(2))
+        .expect("failed capture completed");
+    assert_eq!(
+        failed, successful,
+        "failure belongs to the same target and budget"
+    );
+    env.view.refresh_preview_cache_if_needed(80, 24);
     assert_eq!(
         env.view.preview_cache.content, "hello from a successful capture",
-        "cache must be preserved when the fork capture fails inside live mode"
+        "completed failed capture must preserve the last-good cache"
     );
     assert_eq!(env.view.preview_cache.captured_lines, 1);
 }
