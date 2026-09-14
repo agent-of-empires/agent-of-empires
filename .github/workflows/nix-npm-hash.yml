@@ -29,7 +29,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
+      - uses: ./.github/actions/install-nix
 
       - name: Compute new npmDepsHash
         id: hash
