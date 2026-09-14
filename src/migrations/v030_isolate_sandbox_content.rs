@@ -573,6 +573,15 @@ pub(crate) fn revoke_content_root(app: &Path, instance: &str, root: &AnchoredDir
 
 #[cfg(test)]
 pub(crate) fn certify_owned_test_root(app: &Path, instance: &str, path: &Path) -> Result<()> {
+    certify_test_content(app, instance, path, &[])
+}
+#[cfg(test)]
+pub(crate) fn certify_test_content(
+    app: &Path,
+    instance: &str,
+    path: &Path,
+    roles: &[&str],
+) -> Result<()> {
     let path = canonical_expected_path(path)?;
     let certificate = RootCertificate {
         policy: CONTENT_POLICY,
@@ -580,7 +589,7 @@ pub(crate) fn certify_owned_test_root(app: &Path, instance: &str, path: &Path) -
         root: ContentRoot {
             path: path.clone(),
             host: PathBuf::new(),
-            roles: Vec::new(),
+            roles: roles.iter().map(|role| (*role).to_owned()).collect(),
         },
         identity: identity(&path)?.context("test fixture has no directory")?,
         transaction: uuid::Uuid::new_v4().to_string(),

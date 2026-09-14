@@ -1223,7 +1223,7 @@ fn seed_content_roles(
         .filter(|mount| root.roles.iter().any(|role| role == mount.container_suffix))
     {
         if source.exists() {
-            let mut boundary = NativeStateBoundary::new(source, mount, home, session)?;
+            let mut boundary = NativeStateBoundary::new(source, mount, home, session, destination)?;
             let stopped = matches!(mode, ContentSeedMode::StoppedOriginal);
             let files = if stopped {
                 boundary = boundary.for_stopped_original(&root.host);
@@ -1249,13 +1249,7 @@ fn seed_content_roles(
                 &boundary,
             )?;
             seed::seed_credential_pairs(source, destination, mount.credential_pairs, &boundary)?;
-            seed::seed_sqlite_files(
-                source,
-                destination,
-                mount.sqlite_seed_files,
-                &boundary,
-                stopped,
-            )?;
+            seed::seed_sqlite_files(source, destination, mount.sqlite_seed_files, &boundary)?;
             seed::seed_configured_resources(
                 mount,
                 source,
@@ -1369,7 +1363,8 @@ fn seed_sandbox_dir_from(
     std::fs::create_dir_all(&sandbox_dir)?;
 
     if host_dir.exists() {
-        let boundary = NativeStateBoundary::new(&host_dir, mount, home, session_config)?;
+        let boundary =
+            NativeStateBoundary::new(&host_dir, mount, home, session_config, &sandbox_dir)?;
         // Codex writes `trusted_hash` into `[hooks.state]` of the sandbox
         // copy of `config.toml` when the user accepts a hook hash inside
         // the container; that copy is overwritten on each
@@ -1405,13 +1400,7 @@ fn seed_sandbox_dir_from(
             &boundary,
         )?;
         seed::seed_credential_pairs(&host_dir, &sandbox_dir, mount.credential_pairs, &boundary)?;
-        seed::seed_sqlite_files(
-            &host_dir,
-            &sandbox_dir,
-            mount.sqlite_seed_files,
-            &boundary,
-            false,
-        )?;
+        seed::seed_sqlite_files(&host_dir, &sandbox_dir, mount.sqlite_seed_files, &boundary)?;
         seed::seed_configured_resources(
             mount,
             &host_dir,
@@ -3623,12 +3612,7 @@ mod tests {
             .iter()
             .find(|mount| mount.tool_name == "claude")
             .unwrap();
-        let boundary = NativeStateBoundary::new(
-            host,
-            mount,
-            host.parent().unwrap(),
-            &crate::session::config::SessionConfig::default(),
-        )?;
+        let boundary = NativeStateBoundary::for_fixture(host, sandbox, mount)?;
         sync_agent_config(
             host,
             sandbox,
@@ -3638,6 +3622,46 @@ mod tests {
             preserved,
             &boundary,
         )
+    }
+    fn certify_fixture_content(path: &Path, role: &str) -> Result<()> {
+        fs::create_dir_all(path)?;
+        let instance = path.file_name().and_then(|value| value.to_str()).unwrap();
+        crate::migrations::v030_isolate_sandbox_content::certify_test_content(
+            &crate::session::get_app_dir()?,
+            instance,
+            path,
+            &[role],
+        )
+    }
+    fn prepare_owned_fixture(
+        mount: &AgentConfigMount,
+        home: &Path,
+        instance: Option<&str>,
+        fold: CredentialFold,
+        session: &super::super::SessionConfig,
+        workspace: &Path,
+    ) -> Result<PathBuf> {
+        prepare_owned_fixture_from(
+            mount,
+            home.join(mount.host_rel),
+            sandbox_dir_for(mount, home, instance)?,
+            home,
+            fold,
+            session,
+            workspace,
+        )
+    }
+    fn prepare_owned_fixture_from(
+        mount: &AgentConfigMount,
+        host: PathBuf,
+        sandbox: PathBuf,
+        home: &Path,
+        fold: CredentialFold,
+        session: &super::super::SessionConfig,
+        workspace: &Path,
+    ) -> Result<PathBuf> {
+        certify_fixture_content(&sandbox, mount.container_suffix)?;
+        super::prepare_sandbox_dir_from(mount, host, sandbox, home, fold, session, workspace)
     }
     fn setup_host_dir(dir: &TempDir) -> std::path::PathBuf {
         let host = dir.path().join("host");
@@ -3683,7 +3707,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_hermes_mount_skips_runtime_dirs() {
+        let (_hook_guard, _, _application) = BaseGuard::ready();
         let dir = TempDir::new().unwrap();
         let host = dir.path().join(".hermes");
         fs::create_dir_all(&host).unwrap();
@@ -3710,7 +3736,7 @@ mod tests {
             .iter()
             .find(|m| m.tool_name == "hermes")
             .unwrap();
-        let sandbox = prepare_sandbox_dir(
+        let sandbox = prepare_owned_fixture(
             mount,
             dir.path(),
             None,
@@ -3734,13 +3760,14 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_opencode_mount_preserves_sqlite_db_across_prepares() {
-        // Regression for #2605. Before the fix, `prepare_sandbox_dir` walked
-        // `clean_files` on every invocation and wiped the sandbox-owned
-        // opencode SQLite DB, so `aoe resume` hit "Session not found". This
-        // test plants a DB in the sandbox subdir, invokes `prepare_sandbox_dir`
-        // (which fires at container_config.rs:987 and :1436), and asserts the
-        // DB survives byte-for-byte.
+        let (_hook_guard, _, _application) = BaseGuard::ready(); // Regression for #2605. Before the fix, `prepare_sandbox_dir` walked
+                                                                 // `clean_files` on every invocation and wiped the sandbox-owned
+                                                                 // opencode SQLite DB, so `aoe resume` hit "Session not found". This
+                                                                 // test plants a DB in the sandbox subdir, invokes `prepare_sandbox_dir`
+                                                                 // (which fires at container_config.rs:987 and :1436), and asserts the
+                                                                 // DB survives byte-for-byte.
         let dir = TempDir::new().unwrap();
         let host = dir.path().join(".local/share/opencode");
         let sandbox = host.join(SANDBOX_SUBDIR);
@@ -3760,7 +3787,7 @@ mod tests {
             .iter()
             .find(|m| m.tool_name == "opencode" && m.host_rel == ".local/share/opencode")
             .expect("opencode data-dir mount");
-        let out = prepare_sandbox_dir(
+        let out = prepare_owned_fixture(
             mount,
             dir.path(),
             None,
@@ -4012,7 +4039,9 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    #[serial_test::serial]
     fn test_prime_agent_mount_copies_user_skills() {
+        let (_hook_guard, _, _application) = BaseGuard::ready();
         let home = TempDir::new().unwrap();
         let _app_dir = crate::session::test_support::isolate_app_dir_at(home.path());
         let skill_dir = home.path().join(".prime/agent/skills/reviewing");
@@ -4023,7 +4052,7 @@ mod tests {
             .iter()
             .find(|m| m.tool_name == "prime-agent")
             .expect("prime-agent mount must exist");
-        let sandbox = prepare_sandbox_dir(
+        let sandbox = prepare_owned_fixture(
             prime_mount,
             home.path(),
             None,
@@ -4490,7 +4519,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn an_unreadable_shared_file_is_never_overwritten() {
+        let (_hook_guard, _, _application) = BaseGuard::ready();
         use std::os::unix::fs::PermissionsExt;
         let home = TempDir::new().unwrap();
         let host = home.path().join(".claude");
@@ -4501,7 +4532,7 @@ mod tests {
         // A failed sync is logged and the launch goes on; the file must be
         // left exactly as it was.
         let prepare = || {
-            prepare_sandbox_dir_from(
+            prepare_owned_fixture_from(
                 &mount,
                 host.clone(),
                 store.clone(),
@@ -4563,7 +4594,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn shared_credential_follows_the_freshest_copy_across_starts() {
+        let (_hook_guard, _, _application) = BaseGuard::ready();
         let home = TempDir::new().unwrap();
         let host = home.path().join(".claude");
         fs::create_dir_all(&host).unwrap();
@@ -4573,7 +4606,7 @@ mod tests {
         let shared = root.join(".credentials.json");
         let private = store.join(".credentials.json");
         let prepare = || {
-            prepare_sandbox_dir_from(
+            prepare_owned_fixture_from(
                 &mount,
                 host.clone(),
                 store.clone(),
@@ -4622,7 +4655,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn off_a_come_up_the_fold_only_seeds() {
+        let (_hook_guard, _, _application) = BaseGuard::ready();
         let home = TempDir::new().unwrap();
         let host = home.path().join(".claude");
         fs::create_dir_all(&host).unwrap();
@@ -4632,7 +4667,7 @@ mod tests {
         let shared = root.join(".credentials.json");
         fs::create_dir_all(&store).unwrap();
         let prepare = |fold| {
-            prepare_sandbox_dir_from(
+            prepare_owned_fixture_from(
                 &mount,
                 host.clone(),
                 store.clone(),
@@ -4667,7 +4702,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn an_emptied_shared_file_is_seeded_for_the_next_container() {
+        let (_hook_guard, _, _application) = BaseGuard::ready();
         let home = TempDir::new().unwrap();
         let host = home.path().join(".claude");
         fs::create_dir_all(&host).unwrap();
@@ -4677,7 +4714,7 @@ mod tests {
         let shared = root.join(".credentials.json");
         fs::create_dir_all(&store).unwrap();
         let prepare = |fold| {
-            prepare_sandbox_dir_from(
+            prepare_owned_fixture_from(
                 &mount,
                 host.clone(),
                 store.clone(),
@@ -4754,6 +4791,7 @@ mod tests {
             if stale_copy {
                 fs::write(store.join(".credentials.json"), credential(1)).unwrap();
             }
+            certify_fixture_content(&store, ".claude").unwrap();
             let config = build_container_config(
                 project_dir.path().to_str().unwrap(),
                 &sandbox_info,
@@ -6080,11 +6118,11 @@ codex-work = "{}"
         fs::write(
             codex_sandbox.join("config.toml"),
             r#"[projects."/workspace/project"]
-trust_level = "trusted"
-"#,
+    trust_level = "trusted"
+    "#,
         )
         .unwrap();
-
+        certify_fixture_content(&codex_sandbox, ".codex").unwrap();
         refresh_agent_configs_for_instance(
             &crate::session::config::effective_profile(""),
             instance_id,
@@ -6137,7 +6175,7 @@ trust_level = "trusted"
             r#"{"security":{"folderTrust":{"enabled":false}}}"#,
         )
         .unwrap();
-
+        certify_fixture_content(&gemini_sandbox, ".gemini").unwrap();
         refresh_agent_configs_for_instance(
             &crate::session::config::effective_profile(""),
             "gemini-yolo-refresh-test",
@@ -7446,7 +7484,9 @@ volume_ignores = ["target"]
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_opencode_auth_seed_does_not_import_host_database() {
+        let (_hook_guard, _, _application) = BaseGuard::ready();
         let home = TempDir::new().unwrap();
         let host_dir = home.path().join(".local/share/opencode");
         let sandbox_dir = host_dir.join("sandbox");
@@ -7461,7 +7501,7 @@ volume_ignores = ["target"]
             .find(|mount| mount.host_rel == ".local/share/opencode")
             .unwrap();
 
-        prepare_sandbox_dir(
+        prepare_owned_fixture(
             &mount,
             home.path(),
             None,
@@ -7996,8 +8036,8 @@ volume_ignores = ["target"]
         fs::write(
             profile_dir.join("config.toml"),
             "[session]
-agent_status_hooks = false
-",
+    agent_status_hooks = false
+    ",
         )
         .unwrap();
 
@@ -8029,7 +8069,7 @@ agent_status_hooks = false
             serde_json::to_vec_pretty(&settings).unwrap(),
         )
         .unwrap();
-
+        certify_fixture_content(settings_path.parent().unwrap(), ".gemini").unwrap();
         let project_dir = TempDir::new().unwrap();
         git2::Repository::init(project_dir.path()).unwrap();
         let sandbox_info = crate::session::SandboxInfo {

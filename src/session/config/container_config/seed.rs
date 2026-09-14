@@ -15,25 +15,44 @@ use crate::session::config::SessionConfig;
 
 use super::{AgentConfigMount, AGENT_CONFIG_MOUNTS, SANDBOX_PRIVATE_SUBDIR, SANDBOX_SUBDIR};
 
-#[derive(Default)]
+mod guard;
 pub(super) struct NativeStateBoundary {
-    source_root: PathBuf,
+    source_root: guard::SourceRoot,
+    private_stage: guard::PrivateStage,
     stopped_original: Option<PathBuf>,
     paths: Vec<(PathBuf, bool)>,
     patterns: Vec<(PathBuf, glob::Pattern)>,
 }
 
 impl NativeStateBoundary {
+    fn for_source(source: &Path, destination: &Path) -> Result<Self> {
+        let private_stage = guard::PrivateStage::new(destination)?;
+        Ok(Self {
+            source_root: guard::SourceRoot::new(source)?,
+            private_stage,
+            stopped_original: None,
+            paths: Vec::new(),
+            patterns: Vec::new(),
+        })
+    }
+    #[cfg(test)]
+    pub(super) fn for_fixture(
+        source: &Path,
+        destination: &Path,
+        mount: &AgentConfigMount,
+    ) -> Result<Self> {
+        let mut boundary = Self::for_source(source, destination)?;
+        boundary.add_root(source, mount)?;
+        Ok(boundary)
+    }
     pub(super) fn new(
         source: &Path,
         mount: &AgentConfigMount,
         home: &Path,
         config: &SessionConfig,
+        destination: &Path,
     ) -> Result<Self> {
-        let mut boundary = Self {
-            source_root: fs::canonicalize(source)?,
-            ..Self::default()
-        };
+        let mut boundary = Self::for_source(source, destination)?;
         for registered in AGENT_CONFIG_MOUNTS {
             boundary.add_root(&home.join(registered.host_rel), registered)?;
         }
@@ -64,7 +83,7 @@ impl NativeStateBoundary {
             .filter_map(|(path, storage)| {
                 path.strip_prefix(host)
                     .ok()
-                    .map(|relative| (self.source_root.join(relative), *storage))
+                    .map(|relative| (self.source_root.path().join(relative), *storage))
             })
             .collect();
         let mapped_patterns: Vec<_> = self
@@ -73,14 +92,14 @@ impl NativeStateBoundary {
             .filter_map(|(root, pattern)| {
                 root.strip_prefix(host)
                     .ok()
-                    .map(|relative| (self.source_root.join(relative), pattern.clone()))
+                    .map(|relative| (self.source_root.path().join(relative), pattern.clone()))
             })
             .collect();
         for (path, storage) in mapped_paths {
             self.add_classified_path(path, storage);
         }
         self.patterns.extend(mapped_patterns);
-        self.stopped_original = Some(self.source_root.clone());
+        self.stopped_original = Some(self.source_root.path().to_path_buf());
         self
     }
     fn add_declared_roots(&mut self, config: &SessionConfig, home: &Path) -> Result<()> {
@@ -114,10 +133,13 @@ impl NativeStateBoundary {
             .chain(mount.native_state_paths.iter().copied())
         {
             if name.contains(['*', '?', '[']) {
-                self.patterns
-                    .push((canonical_root.clone(), glob::Pattern::new(name)?));
-                let spelling = root.join(name);
-                for entry in glob::glob(&spelling.to_string_lossy())? {
+                let pattern = glob::Pattern::new(name)?;
+                let lexical_root = lexical_normalize(root);
+                if lexical_root != canonical_root {
+                    self.patterns.push((lexical_root, pattern.clone()));
+                }
+                self.patterns.push((canonical_root.clone(), pattern));
+                for entry in state_glob(root, name)? {
                     self.add_path(
                         entry.context("inspecting a native-state alias before config seeding")?,
                     );
@@ -142,30 +164,38 @@ impl NativeStateBoundary {
         self.paths.push((lexical_normalize(&path), storage));
     }
 
-    fn rejects(&self, candidate: &Path, directory: bool) -> bool {
-        self.paths.iter().any(|(state, storage)| {
-            let admitted_ancestor = *storage
-                && self.stopped_original.as_ref().is_some_and(|original| {
-                    candidate.starts_with(original)
-                        && original.starts_with(state)
-                        && original != state
-                });
-            !admitted_ancestor
-                && (candidate.starts_with(state) || (directory && state.starts_with(candidate)))
-        }) || self.patterns.iter().any(|(root, pattern)| {
-            candidate.strip_prefix(root).is_ok_and(|relative| {
-                relative.ancestors().any(|ancestor| {
-                    pattern.matches_path_with(
-                        ancestor,
-                        glob::MatchOptions {
-                            require_literal_separator: true,
-                            ..glob::MatchOptions::new()
-                        },
-                    )
-                })
-            }) || (directory && root.starts_with(candidate))
-        })
+    fn rejects_path(&self, candidate: &Path, state: &Path, directory: bool, storage: bool) -> bool {
+        let admitted_ancestor = storage
+            && self.stopped_original.as_ref().is_some_and(|original| {
+                candidate.starts_with(original) && original.starts_with(state) && original != state
+            });
+        !admitted_ancestor
+            && (candidate.starts_with(state) || (directory && state.starts_with(candidate)))
     }
+
+    fn rejects(&self, candidate: &Path, directory: bool) -> bool {
+        self.paths
+            .iter()
+            .any(|(state, storage)| self.rejects_path(candidate, state, directory, *storage))
+            || self.patterns.iter().any(|(root, pattern)| {
+                candidate.strip_prefix(root).is_ok_and(|relative| {
+                    relative.ancestors().any(|ancestor| {
+                        pattern.matches_path_with(
+                            ancestor,
+                            glob::MatchOptions {
+                                require_literal_separator: true,
+                                ..glob::MatchOptions::new()
+                            },
+                        )
+                    })
+                }) || (directory && root.starts_with(candidate))
+            })
+    }
+}
+
+fn state_glob(root: &Path, pattern: &str) -> Result<glob::Paths> {
+    let root = glob::Pattern::escape(root.to_str().context("native state root is not UTF-8")?);
+    Ok(glob::glob(&format!("{root}/{pattern}"))?)
 }
 
 fn canonical_expected_path(path: &Path) -> std::io::Result<PathBuf> {
@@ -216,32 +246,59 @@ fn canonical_source(
     Ok(Some(canonical))
 }
 
-fn open_source_file(path: &Path, boundary: &NativeStateBoundary) -> Result<Option<File>> {
-    let Some(canonical) = canonical_source(path, boundary, false)? else {
-        return Ok(None);
-    };
-    let parent = canonical
+fn open_canonical_file(path: &Path) -> Result<Option<File>> {
+    let parent = path
         .parent()
         .context("configuration source has no parent")?;
     let anchor = match open_canonical_dir(parent) {
         Ok(anchor) => anchor,
         Err(error) => {
-            tracing::warn!(target: "session.profile", path = %path.display(), %error,
-                "Skipping changed or unreadable configuration source parent");
+            tracing::warn!(target: "session.profile", path = %path.display(), %error, "Skipping changed or unreadable configuration source parent");
             return Ok(None);
         }
     };
     match anchor.open_regular(
-        Path::new(canonical.file_name().context("source has no leaf")?),
+        Path::new(path.file_name().context("source has no leaf")?),
         usize::MAX,
     ) {
         Ok(file) => Ok(file),
         Err(error) => {
-            tracing::warn!(target: "session.profile", path = %path.display(), %error,
-                "Skipping unreadable configuration file");
+            tracing::warn!(target: "session.profile", path = %path.display(), %error, "Skipping unreadable configuration file");
             Ok(None)
         }
     }
+}
+
+fn publish_source_file(
+    path: &Path,
+    destination: &AnchoredDir,
+    leaf: &Path,
+    boundary: &NativeStateBoundary,
+    replace: bool,
+) -> Result<bool> {
+    let Some(canonical) = canonical_source(path, boundary, false)? else {
+        return Ok(false);
+    };
+    let Some(mut file) = open_canonical_file(&canonical)? else {
+        return Ok(false);
+    };
+    let mut guard = guard::ReadGuard::new(boundary)?;
+    if !guard.record_file(&canonical, &file)? {
+        return Ok(false);
+    }
+    let private = &boundary.private_stage;
+    let validate = || guard.validate();
+    let permissions = file.metadata()?.permissions();
+    destination.publish_file(
+        leaf,
+        &mut file,
+        permissions,
+        replace,
+        Some(crate::session::anchored_fs::FilePublication {
+            staging: &private.anchor,
+            validate: &validate,
+        }),
+    )
 }
 
 pub(super) fn sync_agent_config(
@@ -277,11 +334,7 @@ pub(super) fn sync_agent_config(
         if preserve && parent.regular_lookup(leaf)?.is_some() {
             continue;
         }
-        let Some(mut source) = open_source_file(&host_dir.join(relative), boundary)? else {
-            continue;
-        };
-        let permissions = source.metadata()?.permissions();
-        parent.publish_file(leaf, &mut source, permissions, !preserve, None)?;
+        publish_source_file(&host_dir.join(relative), &parent, leaf, boundary, !preserve)?;
     }
     for &name in copy_dirs {
         let relative = Path::new(name);
@@ -312,132 +365,151 @@ fn seed_directory(
     let source = match open_canonical_dir(&canonical) {
         Ok(source) => source,
         Err(error) => {
-            tracing::warn!(target: "session.profile", path = %canonical.display(), %error,
-                "Skipping unreadable resource directory");
+            tracing::warn!(target: "session.profile", path = %canonical.display(), %error, "Skipping unreadable resource directory");
             return Ok(());
         }
     };
-    // Read before creating a stage: an unreadable top-level source must not
-    // become an empty, permanently seed-once resource directory.
+    let mut copy = ResourceCopy {
+        guard: guard::ReadGuard::new(boundary)?,
+        ancestors: HashSet::new(),
+    };
+    copy.guard.record_directory(&source)?;
     let entries = match source.read_dir(Path::new(""), usize::MAX) {
         Ok(entries) => entries,
         Err(error) => {
-            tracing::warn!(target: "session.profile", path = %canonical.display(), %error,
-                "Skipping unreadable resource directory");
+            tracing::warn!(target: "session.profile", path = %canonical.display(), %error, "Skipping unreadable resource directory");
             return Ok(());
         }
     };
+    let private = &boundary.private_stage;
     let stage_name = PathBuf::from(format!(".aoe-resource-{}", uuid::Uuid::new_v4()));
-    let stage = destination.create_child(&stage_name)?;
-    let mut ancestors = HashSet::new();
-    ancestors.insert(source.identity()?);
-    let result = copy_entries(
-        &source,
-        Path::new(""),
-        &stage,
-        entries,
-        boundary,
-        &mut ancestors,
-        discovery_links,
-    )
-    .and_then(|()| stage.sync())
-    .and_then(|()| destination.publish_directory(destination, &stage_name, leaf));
+    let stage = private.anchor.create_child(&stage_name)?;
+    copy.ancestors.insert(source.identity()?);
+    let result = copy
+        .entries(&source, Path::new(""), &stage, entries, discovery_links)
+        .and_then(|()| stage.sync())
+        .and_then(|()| copy.guard.validate())
+        .and_then(|()| {
+            if private.anchor.child(&stage_name)?.identity()? != stage.identity()? {
+                anyhow::bail!("private resource stage changed before publication");
+            }
+            destination.publish_directory(&private.anchor, &stage_name, leaf)
+        });
     if !matches!(result, Ok(true)) {
-        destination.remove_staged_dir(&stage_name)?;
+        stage.remove_contents()?;
+        let _ = fs::remove_dir(stage.path());
     }
     result.map(|_| ())
 }
 
-fn copy_entries(
-    source: &AnchoredDir,
-    relative: &Path,
-    destination: &AnchoredDir,
-    entries: Vec<std::ffi::OsString>,
-    boundary: &NativeStateBoundary,
-    ancestors: &mut HashSet<(libc::dev_t, libc::ino_t)>,
-    discovery_links: bool,
-) -> Result<()> {
-    for name in entries {
-        let input = relative.join(&name);
-        let spelling = source.path().join(&input);
-        let Some(canonical) = canonical_source(&spelling, boundary, false)? else {
-            continue;
-        };
-        let within = canonical.strip_prefix(source.path());
-        if within.is_err() {
-            if discovery_links && relative.as_os_str().is_empty() {
-                // An entry in a native discovery collection is an explicit
-                // resource root. Its own descendants cannot grant further roots.
-                copy_discovered_entry(&canonical, destination, Path::new(&name), boundary)?;
-            } else {
-                tracing::warn!(target: "session.profile", path = %spelling.display(),
-                    "Skipping resource link escaping its approved source root");
-            }
-            continue;
-        }
-        let within = within.expect("checked above");
-        match source.open_regular(within, usize::MAX) {
-            Ok(Some(mut file)) => {
-                let permissions = file.metadata()?.permissions();
-                destination.publish_file(Path::new(&name), &mut file, permissions, false, None)?;
-                continue;
-            }
-            Ok(None) => {}
-            Err(error) => {
-                tracing::warn!(target: "session.profile", path = %spelling.display(), %error,
-                    "Skipping unreadable resource file");
-                continue;
-            }
-        }
-        if boundary.rejects(&canonical, true) {
-            continue;
-        }
-        let child = match source.child(within) {
-            Ok(child) => child,
-            Err(error) => {
-                tracing::warn!(target: "session.profile", path = %spelling.display(), %error,
-                    "Skipping unreadable resource entry");
-                continue;
-            }
-        };
-        let identity = child.identity()?;
-        if !ancestors.insert(identity) {
-            tracing::warn!(target: "session.profile", path = %spelling.display(),
-                "Skipping a resource symlink cycle");
-            continue;
-        }
-        let children = match child.read_dir(Path::new(""), usize::MAX) {
-            Ok(children) => children,
-            Err(error) => {
-                ancestors.remove(&identity);
-                tracing::warn!(target: "session.profile", path = %spelling.display(), %error,
-                    "Skipping unreadable resource subtree");
-                continue;
-            }
-        };
-        let target = destination.create_child(Path::new(&name))?;
-        copy_entries(
-            source, within, &target, children, boundary, ancestors, false,
-        )?;
-        target.sync()?;
-        ancestors.remove(&identity);
-    }
-    Ok(())
+struct ResourceCopy<'a> {
+    guard: guard::ReadGuard<'a>,
+    ancestors: HashSet<(libc::dev_t, libc::ino_t)>,
 }
 
-fn copy_discovered_entry(
-    canonical: &Path,
-    destination: &AnchoredDir,
-    leaf: &Path,
-    boundary: &NativeStateBoundary,
-) -> Result<()> {
-    if let Some(mut file) = open_source_file(canonical, boundary)? {
-        let permissions = file.metadata()?.permissions();
-        destination.publish_file(leaf, &mut file, permissions, false, None)?;
-    } else {
-        seed_directory(canonical, destination, leaf, boundary, false)?;
+impl ResourceCopy<'_> {
+    fn entries(
+        &mut self,
+        source: &AnchoredDir,
+        relative: &Path,
+        destination: &AnchoredDir,
+        entries: Vec<std::ffi::OsString>,
+        discovery_links: bool,
+    ) -> Result<()> {
+        for name in entries {
+            let input = relative.join(&name);
+            let spelling = source.path().join(&input);
+            let Some(canonical) = canonical_source(&spelling, self.guard.boundary, false)? else {
+                continue;
+            };
+            let within = match canonical.strip_prefix(source.path()) {
+                Ok(within) => within,
+                Err(_) => {
+                    if discovery_links && relative.as_os_str().is_empty() {
+                        self.discovered_entry(&canonical, destination, Path::new(&name))?;
+                    } else {
+                        tracing::warn!(target: "session.profile", path = %spelling.display(), "Skipping resource link escaping its approved source root");
+                    }
+                    continue;
+                }
+            };
+            match source.open_regular(within, usize::MAX) {
+                Ok(Some(mut file)) => {
+                    if self.guard.record_file(&canonical, &file)? {
+                        let permissions = file.metadata()?.permissions();
+                        destination.publish_file(
+                            Path::new(&name),
+                            &mut file,
+                            permissions,
+                            false,
+                            None,
+                        )?;
+                    }
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(target: "session.profile", path = %spelling.display(), %error, "Skipping unreadable resource file");
+                    continue;
+                }
+            }
+            if self.guard.boundary.rejects(&canonical, true) {
+                continue;
+            }
+            let child = match source.child(within) {
+                Ok(child) => child,
+                Err(error) => {
+                    tracing::warn!(target: "session.profile", path = %spelling.display(), %error, "Skipping unreadable resource entry");
+                    continue;
+                }
+            };
+            let identity = child.identity()?;
+            if !self.ancestors.insert(identity) {
+                continue;
+            }
+            self.guard.record_directory(&child)?;
+            let children = match child.read_dir(Path::new(""), usize::MAX) {
+                Ok(children) => children,
+                Err(error) => {
+                    self.ancestors.remove(&identity);
+                    tracing::warn!(target: "session.profile", path = %spelling.display(), %error, "Skipping unreadable resource subtree");
+                    continue;
+                }
+            };
+            let target = destination.create_child(Path::new(&name))?;
+            self.entries(source, within, &target, children, false)?;
+            target.sync()?;
+            self.ancestors.remove(&identity);
+        }
+        Ok(())
     }
-    Ok(())
+
+    fn discovered_entry(
+        &mut self,
+        canonical: &Path,
+        destination: &AnchoredDir,
+        leaf: &Path,
+    ) -> Result<()> {
+        if let Some(mut file) = open_canonical_file(canonical)? {
+            if self.guard.record_file(canonical, &file)? {
+                let permissions = file.metadata()?.permissions();
+                destination.publish_file(leaf, &mut file, permissions, false, None)?;
+            }
+        } else if !self.guard.boundary.rejects(canonical, true) {
+            let source = open_canonical_dir(canonical)?;
+            let identity = source.identity()?;
+            if !self.ancestors.insert(identity) {
+                return Ok(());
+            }
+            self.guard.record_directory(&source)?;
+            let entries = source.read_dir(Path::new(""), usize::MAX)?;
+            let target = destination.create_child(leaf)?;
+            self.entries(&source, Path::new(""), &target, entries, false)?;
+            target.sync()?;
+            self.ancestors.remove(&identity);
+        }
+        Ok(())
+    }
 }
 
 /// Both public credential paths remain unreadable until the complete pair's
@@ -454,17 +526,18 @@ pub(super) fn seed_credential_pairs(
     }
     let destination = AnchoredDir::open(destination)?;
     let units = destination.create_child(Path::new(".aoe-credential-pairs"))?;
+    let private = &boundary.private_stage;
     for &(data_name, key_name) in pairs {
         let final_name = Path::new(data_name);
+        if units.regular_lookup(final_name)?.is_some() {
+            continue;
+        }
         let data_link = PathBuf::from(".aoe-credential-pairs")
             .join(final_name)
             .join("data");
         let key_link = PathBuf::from(".aoe-credential-pairs")
             .join(final_name)
             .join("key");
-        if units.regular_lookup(final_name)?.is_some() {
-            continue;
-        }
         let paths = [
             (Path::new(data_name), &data_link),
             (Path::new(key_name), &key_link),
@@ -480,14 +553,24 @@ pub(super) fn seed_credential_pairs(
         if local {
             continue;
         }
-        let Some(mut data) = open_source_file(&source.join(data_name), boundary)? else {
+        let Some(data_path) = canonical_source(&source.join(data_name), boundary, false)? else {
             continue;
         };
-        let Some(mut key) = open_source_file(&source.join(key_name), boundary)? else {
+        let Some(key_path) = canonical_source(&source.join(key_name), boundary, false)? else {
             continue;
         };
+        let Some(mut data) = open_canonical_file(&data_path)? else {
+            continue;
+        };
+        let Some(mut key) = open_canonical_file(&key_path)? else {
+            continue;
+        };
+        let mut guard = guard::ReadGuard::new(boundary)?;
+        if !guard.record_file(&data_path, &data)? || !guard.record_file(&key_path, &key)? {
+            continue;
+        }
         let stage_name = PathBuf::from(format!(".pair-{}", uuid::Uuid::new_v4()));
-        let stage = units.create_child(&stage_name)?;
+        let stage = private.anchor.create_child(&stage_name)?;
         let result = (|| -> Result<bool> {
             stage.publish_file(
                 Path::new("data"),
@@ -504,19 +587,23 @@ pub(super) fn seed_credential_pairs(
                 None,
             )?;
             stage.sync()?;
+            guard.validate()?;
             for (path, target) in paths {
                 destination.create_symlink(path, target)?;
             }
-            // A native login that replaced either path owns the pair now.
             for (path, target) in paths {
                 if destination.read_link(path)?.as_ref() != Some(target) {
                     return Ok(false);
                 }
             }
-            units.publish_directory(&units, &stage_name, final_name)
+            if private.anchor.child(&stage_name)?.identity()? != stage.identity()? {
+                anyhow::bail!("private credential stage changed before publication");
+            }
+            units.publish_directory(&private.anchor, &stage_name, final_name)
         })();
         if !matches!(result, Ok(true)) {
-            units.remove_staged_dir(&stage_name)?;
+            stage.remove_contents()?;
+            let _ = fs::remove_dir(stage.path());
         }
         result?;
     }
@@ -528,7 +615,6 @@ pub(super) fn seed_sqlite_files(
     destination: &Path,
     files: &[&str],
     boundary: &NativeStateBoundary,
-    stopped_original: bool,
 ) -> Result<()> {
     let destination = AnchoredDir::open(destination)?;
     for &name in files {
@@ -538,53 +624,92 @@ pub(super) fn seed_sqlite_files(
         if parent.regular_lookup(leaf)?.is_some() {
             continue;
         }
-        let Some(canonical) = canonical_source(&source.join(relative), boundary, false)? else {
-            continue;
-        };
-        let scratch = tempfile::tempdir()?;
-        let scratch_path = fs::canonicalize(scratch.path())?;
-        let scratch_anchor = open_canonical_dir(&scratch_path)?;
-        let input = if stopped_original {
-            // SQLite readers may create or alter SHM read marks. Never let a
-            // snapshot change any byte of the original that v030 must retain.
-            for suffix in ["", "-wal", "-shm"] {
-                let original = PathBuf::from(format!("{}{suffix}", canonical.display()));
-                let Some(mut file) = open_source_file(&original, boundary)? else {
-                    continue;
-                };
-                scratch_anchor.publish_file(
-                    Path::new(&format!("source.db{suffix}")),
-                    &mut file,
-                    Permissions::from_mode(0o600),
-                    false,
-                    None,
-                )?;
-            }
-            scratch_path.join("source.db")
-        } else {
-            canonical
-        };
-        let connection = rusqlite::Connection::open_with_flags(
-            &input,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
-                | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )?;
-        let snapshot = scratch_path.join("snapshot.db");
-        connection.execute("VACUUM INTO ?1", [snapshot.to_string_lossy().as_ref()])?;
-        drop(connection);
-        let mut snapshot = scratch_anchor
+        if let Some(snapshot) = snapshot_config_database(&source.join(relative), boundary)? {
+            snapshot.publish(&parent, leaf)?;
+        }
+    }
+    Ok(())
+}
+
+struct ConfigSnapshot<'a> {
+    directory: AnchoredDir,
+    guard: guard::ReadGuard<'a>,
+}
+
+impl ConfigSnapshot<'_> {
+    fn publish(&self, destination: &AnchoredDir, leaf: &Path) -> Result<bool> {
+        let mut file = self
+            .directory
             .open_regular(Path::new("snapshot.db"), usize::MAX)?
             .context("SQLite did not produce a regular config snapshot")?;
-        parent.publish_file(
+        let private = &self.guard.boundary.private_stage;
+        let validate = || self.guard.validate();
+        destination.publish_file(
             leaf,
-            &mut snapshot,
+            &mut file,
+            Permissions::from_mode(0o600),
+            false,
+            Some(crate::session::anchored_fs::FilePublication {
+                staging: &private.anchor,
+                validate: &validate,
+            }),
+        )
+    }
+}
+
+fn snapshot_config_database<'a>(
+    path: &Path,
+    boundary: &'a NativeStateBoundary,
+) -> Result<Option<ConfigSnapshot<'a>>> {
+    let Some(canonical) = canonical_source(path, boundary, false)? else {
+        return Ok(None);
+    };
+    let private = &boundary.private_stage;
+    let directory = private
+        .anchor
+        .create_child(Path::new(&format!(".sqlite-{}", uuid::Uuid::new_v4())))?;
+    let mut guard = guard::ReadGuard::new(boundary)?;
+    for suffix in ["", "-wal"] {
+        let mut spelling = canonical.as_os_str().to_os_string();
+        spelling.push(suffix);
+        let spelling = PathBuf::from(spelling);
+        match fs::symlink_metadata(&spelling) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !suffix.is_empty() => {
+                continue
+            }
+            Err(error) => return Err(error).context("inspecting native SQLite source"),
+        }
+        let Some(input) = canonical_source(&spelling, boundary, false)? else {
+            return Ok(None);
+        };
+        let Some(mut file) = open_canonical_file(&input)? else {
+            anyhow::bail!("native SQLite source is not a readable regular file");
+        };
+        if !guard.record_file(&input, &file)? {
+            return Ok(None);
+        }
+        directory.publish_file(
+            Path::new(&format!("source.db{suffix}")),
+            &mut file,
             Permissions::from_mode(0o600),
             false,
             None,
         )?;
     }
-    Ok(())
+    // Never SQLite-open the original: even read-only WAL readers can update
+    // SHM read marks. Rebuild that coordination state only in the private copy.
+    guard.validate()?;
+    let connection = rusqlite::Connection::open_with_flags(
+        directory.path().join("source.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    let snapshot = directory.path().join("snapshot.db");
+    connection.execute("VACUUM INTO ?1", [snapshot.to_string_lossy().as_ref()])?;
+    drop(connection);
+    Ok(Some(ConfigSnapshot { directory, guard }))
 }
 
 pub(super) fn seed_configured_resources(
@@ -810,7 +935,7 @@ impl ResourceSeed<'_> {
             .strip_prefix(&host_native)
             .or_else(|_| resolved.strip_prefix(&container_native))
             .or_else(|_| resolved.strip_prefix(self.source))
-            .or_else(|_| resolved.strip_prefix(&self.boundary.source_root))
+            .or_else(|_| resolved.strip_prefix(self.boundary.source_root.path()))
             .ok()?;
         let previously_supplied = if matches!(self.mount.tool_name, "pi" | "omp") {
             relative.starts_with("agent") && relative.components().count() > 1
@@ -838,10 +963,7 @@ impl ResourceSeed<'_> {
             return Ok(());
         }
         let input = self.source.join(relative);
-        if let Some(mut file) = open_source_file(&input, self.boundary)? {
-            let permissions = file.metadata()?.permissions();
-            parent.publish_file(leaf, &mut file, permissions, false, None)?;
-        } else if directory_allowed {
+        if !publish_source_file(&input, &parent, leaf, self.boundary, false)? && directory_allowed {
             seed_directory(&input, &parent, leaf, self.boundary, false)?;
         }
         Ok(())
@@ -934,5 +1056,208 @@ impl ResourceSeed<'_> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_state_hardlinks_are_not_configuration_but_authored_hardlinks_are() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let active = temporary.path().join("active");
+        let hermes = temporary.path().join(".hermes");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&active).unwrap();
+        fs::create_dir_all(hermes.join("sessions")).unwrap();
+        let history = hermes.join("sessions/foreign.jsonl");
+        fs::write(&history, b"FOREIGN_NATIVE_CONTEXT").unwrap();
+        fs::hard_link(&history, source.join("auth.json")).unwrap();
+        let authored = temporary.path().join("authored-settings");
+        fs::write(&authored, b"AUTHORED_SETTINGS").unwrap();
+        fs::hard_link(&authored, source.join("settings.json")).unwrap();
+        fs::write(active.join("auth.json"), b"LOCAL_AUTH").unwrap();
+        let mut boundary = NativeStateBoundary::for_source(&source, &active).unwrap();
+        let mount = AGENT_CONFIG_MOUNTS
+            .iter()
+            .find(|mount| mount.tool_name == "hermes")
+            .unwrap();
+        boundary.add_root(&hermes, mount).unwrap();
+        sync_agent_config(
+            &source,
+            &active,
+            &["auth.json", "settings.json"],
+            &[],
+            &[],
+            &[],
+            &boundary,
+        )
+        .unwrap();
+        assert_eq!(fs::read(active.join("auth.json")).unwrap(), b"LOCAL_AUTH");
+        assert_eq!(
+            fs::read(active.join("settings.json")).unwrap(),
+            b"AUTHORED_SETTINGS"
+        );
+        assert_eq!(fs::read(history).unwrap(), b"FOREIGN_NATIVE_CONTEXT");
+    }
+
+    #[test]
+    fn directory_publication_filters_state_hardlinks_under_literal_root_names() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let active = temporary.path().join("active");
+        let native = temporary.path().join("native[fixture]");
+        fs::create_dir_all(source.join("plugins/package")).unwrap();
+        fs::create_dir_all(&active).unwrap();
+        fs::create_dir_all(&native).unwrap();
+        fs::write(native.join("state.db-wal"), b"FOREIGN_NATIVE_CONTEXT").unwrap();
+        fs::hard_link(
+            native.join("state.db-wal"),
+            source.join("plugins/package/data.json"),
+        )
+        .unwrap();
+        let authored = temporary.path().join("authored-code");
+        fs::write(&authored, b"export const authored = true;").unwrap();
+        fs::hard_link(authored, source.join("plugins/package/index.js")).unwrap();
+        let mut boundary = NativeStateBoundary::for_source(&source, &active).unwrap();
+        let mount = AGENT_CONFIG_MOUNTS
+            .iter()
+            .find(|mount| mount.tool_name == "hermes")
+            .unwrap();
+        boundary.add_root(&native, mount).unwrap();
+        seed_directory(
+            &source.join("plugins"),
+            &AnchoredDir::open(&active).unwrap(),
+            Path::new("plugins"),
+            &boundary,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(active.join("plugins/package/index.js")).unwrap(),
+            b"export const authored = true;"
+        );
+        assert!(!active.join("plugins/package/data.json").exists());
+        assert_eq!(
+            fs::read(native.join("state.db-wal")).unwrap(),
+            b"FOREIGN_NATIVE_CONTEXT"
+        );
+    }
+
+    #[test]
+    fn unrelated_directory_churn_does_not_authorize_a_new_native_scope() {
+        use std::io::Seek;
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let active = temporary.path().join("active");
+        let native = temporary.path().join("not-yet-a-native-home");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&active).unwrap();
+        let input = source.join("settings.json");
+        fs::write(&input, b"APPROVED_CONFIGURATION").unwrap();
+        let mut boundary = NativeStateBoundary::for_source(&source, &active).unwrap();
+        let mount = AGENT_CONFIG_MOUNTS
+            .iter()
+            .find(|mount| mount.tool_name == "hermes")
+            .unwrap();
+        boundary.add_root(&native, mount).unwrap();
+        let mut guard = guard::ReadGuard::new(&boundary).unwrap();
+        let mut file = open_canonical_file(&input).unwrap().unwrap();
+        assert!(guard.record_file(&input, &file).unwrap());
+        let output = AnchoredDir::open(&active).unwrap();
+        fs::create_dir(temporary.path().join("unrelated-directory")).unwrap();
+        let validate = || guard.validate();
+        output
+            .publish_file(
+                Path::new("settings.json"),
+                &mut file,
+                Permissions::from_mode(0o600),
+                true,
+                Some(crate::session::anchored_fs::FilePublication {
+                    staging: &boundary.private_stage.anchor,
+                    validate: &validate,
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            fs::read(active.join("settings.json")).unwrap(),
+            b"APPROVED_CONFIGURATION"
+        );
+        fs::write(active.join("settings.json"), b"LOCAL_CONFIGURATION").unwrap();
+        fs::create_dir_all(native.join("sessions")).unwrap();
+        std::os::unix::fs::symlink(&input, native.join("sessions/new-native-state.jsonl")).unwrap();
+        file.rewind().unwrap();
+        assert!(output
+            .publish_file(
+                Path::new("settings.json"),
+                &mut file,
+                Permissions::from_mode(0o600),
+                true,
+                Some(crate::session::anchored_fs::FilePublication {
+                    staging: &boundary.private_stage.anchor,
+                    validate: &validate
+                })
+            )
+            .is_err());
+        assert_eq!(
+            fs::read(active.join("settings.json")).unwrap(),
+            b"LOCAL_CONFIGURATION"
+        );
+    }
+
+    #[test]
+    fn sqlite_seed_reads_committed_wal_without_mutating_originals_or_local_state() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let active = temporary.path().join("active");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&active).unwrap();
+        let original = rusqlite::Connection::open(source.join("agent.db")).unwrap();
+        original.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE configuration(value TEXT); INSERT INTO configuration VALUES ('INITIAL_CONFIGURATION');").unwrap();
+        let before: std::collections::BTreeMap<_, _> = fs::read_dir(&source)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name(), fs::read(entry.path()).unwrap())
+            })
+            .collect();
+        let boundary = NativeStateBoundary::for_source(&source, &active).unwrap();
+        seed_sqlite_files(&source, &active, &["agent.db"], &boundary).unwrap();
+        let after: std::collections::BTreeMap<_, _> = fs::read_dir(&source)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name(), fs::read(entry.path()).unwrap())
+            })
+            .collect();
+        assert_eq!(after, before);
+        let local = rusqlite::Connection::open(active.join("agent.db")).unwrap();
+        let initial: String = local
+            .query_row("SELECT value FROM configuration", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(initial, "INITIAL_CONFIGURATION");
+        local
+            .execute(
+                "INSERT INTO configuration VALUES ('LOCAL_CONFIGURATION')",
+                [],
+            )
+            .unwrap();
+        original
+            .execute(
+                "INSERT INTO configuration VALUES ('LATER_HOST_CONFIGURATION')",
+                [],
+            )
+            .unwrap();
+        seed_sqlite_files(&source, &active, &["agent.db"], &boundary).unwrap();
+        let values: Vec<String> = local
+            .prepare("SELECT value FROM configuration ORDER BY rowid")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(values, ["INITIAL_CONFIGURATION", "LOCAL_CONFIGURATION"]);
     }
 }
