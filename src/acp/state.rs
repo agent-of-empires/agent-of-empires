@@ -1059,7 +1059,7 @@ pub enum Event {
         reason: String,
         text: String,
     },
-    /// Agent-assigned ACP session id from a successful `session/new`.
+    /// Native ACP session id admitted by successful new, load, fork, or resume.
     /// Server-side listener catches this and persists the id on
     /// `Instance.acp_session_id` so the next spawn can call
     /// `session/load` and the model retains context across `aoe serve`

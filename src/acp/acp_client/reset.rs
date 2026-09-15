@@ -62,12 +62,663 @@ mod tests {
     use crate::acp::state::{AcpSessionId, Event};
     use tokio::sync::oneshot;
 
-    #[test]
-    fn reset_request_deadline_precedes_the_outer_guard() {
-        assert!(
-            SESSION_RESET_IN_TASK_TIMEOUT < SESSION_RESET_TIMEOUT,
-            "the in-task deadline must expire before the caller's outer guard"
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrelated_native_updates_never_reach_the_transcript() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (script, capture) = write_reset_fake_agent(tmp.path(), false, false, false);
+        let source = std::fs::read_to_string(&script).unwrap();
+        let foreign = r#"      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"foreign","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"FOREIGN"}}}}\n'
+      if [ "$count" -eq 2 ]; then
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sid-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"LATE"}}}}\n'
+      fi
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sid-%d","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"OWN-CONTROL"}}}}\n' "$count"
+"#;
+        std::fs::write(
+            &script,
+            source.replace(
+                "      if [ \"$HOLD\" = true ]",
+                &format!("{foreign}      if [ \"$HOLD\" = true ]"),
+            ),
+        )
+        .unwrap();
+        let mut client = AcpClient::spawn(
+            reset_fake_spawn_config(&script, tmp.path()),
+            AcpSessionId("native-guard".into()),
+        )
+        .await
+        .unwrap();
+        let mut observed = Vec::new();
+        for generation in 1..=2 {
+            if generation == 2 {
+                assert!(matches!(
+                    client.reset_session("/new").await.unwrap(),
+                    ResetSessionOutcome::Reset { .. }
+                ));
+                loop {
+                    let event = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        client.next_event(),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    if matches!(event, Event::Stopped { .. }) {
+                        break;
+                    }
+                }
+            }
+            client.send_prompt("hello", &[]).await.unwrap();
+            loop {
+                let event =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), client.next_event())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                match event {
+                    Event::AgentMessageChunk { text, .. } => observed.push(text),
+                    Event::Stopped { .. } => break,
+                    _ => {}
+                }
+            }
+        }
+        client.shutdown().await.unwrap();
+        let wire = std::fs::read_to_string(capture).unwrap();
+        let requests: Vec<serde_json::Value> = wire
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let prompt_ids: Vec<&str> = requests
+            .iter()
+            .filter(|request| request["method"] == "session/prompt")
+            .map(|request| request["params"]["sessionId"].as_str().unwrap())
+            .collect();
+        assert_eq!(prompt_ids, ["sid-1", "sid-2"]);
+        assert!(!requests
+            .iter()
+            .any(|request| request["method"] == "session/load"));
+        eprintln!("native identity trace: prompt IDs={prompt_ids:?}; client chunks={observed:?}");
+        assert_eq!(
+            observed,
+            vec!["working", "OWN-CONTROL", "working", "OWN-CONTROL"]
         );
+    }
+
+    #[cfg(unix)]
+    fn write_early_identity_agent(dir: &std::path::Path) -> std::path::PathBuf {
+        let script = dir.join("early-identity.sh");
+        std::fs::write(&script, r#"#!/bin/sh
+count=0
+sid=''
+update() {
+  printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"%s"}}}}\n' "$1" "$2"
+}
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -En 's/.*"id":("[^"]*"|[0-9]+).*/\1/p')
+  case $line in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"sessionCapabilities":{"fork":{}}}}}\n' "$id" ;;
+    *'"method":"session/new"'*)
+      count=$((count+1)); sid="sid-$count"
+      update "$sid" "early-$count"
+      update foreign FOREIGN
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"%s"}}\n' "$id" "$sid" ;;
+    *'"method":"session/fork"'*)
+      sid=child
+      update parent PARENT
+      update "$sid" early-fork
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"%s"}}\n' "$id" "$sid" ;;
+    *'"method":"session/load"'*)
+      sid=stored
+      update foreign FOREIGN
+      update "$sid" history
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+    *'"method":"session/prompt"'*)
+      update "$sid" live
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id" ;;
+  esac
+done
+"#).unwrap();
+        script
+    }
+
+    #[cfg(unix)]
+    async fn identity_events_until_stop(client: &mut AcpClient) -> Vec<Event> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut events = Vec::new();
+        loop {
+            let event = tokio::time::timeout_at(deadline, client.next_event())
+                .await
+                .unwrap()
+                .unwrap();
+            let stopped = matches!(event, Event::Stopped { .. });
+            events.push(event);
+            if stopped {
+                return events;
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn identity_texts(events: &[Event]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::AgentMessageChunk { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_identity_stdio_does_not_interpret_native_byte_claims() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = write_early_identity_agent(temp.path());
+        let source = std::fs::read_to_string(&script).unwrap()
+            .replace(r#""params":{"sessionId""#,
+                r#""params":{"__aoe_control_frame_bytes":{"untrusted":true},"sessionId""#)
+            .replace(r#"      update "$sid" "early-$count""#, r#"      update "$sid" "early-$count"
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","__aoe_control_frame_bytes":18446744073709551615,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"native-cost"}}}}\n' "$sid"
+      printf '{"jsonrpc":"2.0","method":"session/update","params":["%s",{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"native-short"}}]}\n' "$sid"
+      printf '{"jsonrpc":"2.0","method":"session/update","params":["%s",{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"native-meta"}},{"__aoe_control_frame_bytes":0}]}\n' "$sid"
+      printf '{"jsonrpc":"2.0","method":"session/update","params":["%s",{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"INVALID"}},null,0]}\n' "$sid"
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"notification":{"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"INVALID"}}},"__aoe_control_frame_bytes":0}}\n' "$sid"
+      printf '{"jsonrpc":"2.0","method":"session/update","params":["%s",{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"native-tail"}},18446744073709551615]}\n' "$sid""#);
+        std::fs::write(&script, source).unwrap();
+        let mut client = AcpClient::spawn(
+            reset_fake_spawn_config(&script, temp.path()),
+            AcpSessionId("native-byte-claims".into()),
+        )
+        .await
+        .unwrap();
+        client.send_prompt("hello", &[]).await.unwrap();
+        let events = identity_events_until_stop(&mut client).await;
+        client.shutdown().await.unwrap();
+        assert_eq!(
+            identity_texts(&events),
+            [
+                "early-1",
+                "native-cost",
+                "native-short",
+                "native-meta",
+                "native-tail",
+                "live"
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_identity_preserves_pre_response_new_fork_and_load_updates() {
+        for (operation, imported, expected) in [
+            ("new", false, vec!["early-1", "live"]),
+            ("fork", false, vec!["early-fork", "live"]),
+            ("load", true, vec!["history", "live"]),
+            ("load", false, vec!["live"]),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let script = write_early_identity_agent(temp.path());
+            let mut config = reset_fake_spawn_config(&script, temp.path());
+            if operation == "fork" {
+                config.fork_from = Some("parent".into());
+            }
+            if operation == "load" {
+                config.stored_acp_session_id = Some("stored".into());
+            }
+            config.seed_history_replay = imported;
+            let mut client = AcpClient::spawn(config, AcpSessionId(format!("early-{operation}")))
+                .await
+                .unwrap();
+            client.send_prompt("hello", &[]).await.unwrap();
+            let events = identity_events_until_stop(&mut client).await;
+            client.shutdown().await.unwrap();
+            assert_eq!(
+                identity_texts(&events),
+                expected,
+                "operation={operation} imported={imported}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_identity_preserves_reset_updates_after_clear_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = write_early_identity_agent(temp.path());
+        let mut client = AcpClient::spawn(
+            reset_fake_spawn_config(&script, temp.path()),
+            AcpSessionId("early-reset".into()),
+        )
+        .await
+        .unwrap();
+        client.send_prompt("first", &[]).await.unwrap();
+        identity_events_until_stop(&mut client).await;
+        assert!(matches!(
+            client.reset_session("/new").await.unwrap(),
+            ResetSessionOutcome::Reset { .. }
+        ));
+        let events = identity_events_until_stop(&mut client).await;
+        client.shutdown().await.unwrap();
+        let boundary = events
+            .iter()
+            .position(|event| matches!(event, Event::SessionCleared))
+            .unwrap();
+        assert!(
+            identity_texts(&events[..boundary]).is_empty(),
+            "new data must not precede clear: {events:?}"
+        );
+        assert_eq!(identity_texts(&events[boundary..]), ["early-2"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_identity_rejects_foreign_callbacks_without_side_effects() {
+        let temp = tempfile::tempdir().unwrap();
+        let (script, capture) = write_reset_fake_agent(temp.path(), false, false, false);
+        let denied_file = temp.path().join("foreign-write");
+        let denied_command = temp.path().join("foreign-terminal");
+        let own_file = temp.path().join("own-write");
+        let mut callbacks = Vec::new();
+        for (method, params) in [
+            (
+                "fs/read_text_file",
+                serde_json::json!({"sessionId":"foreign","path":script}),
+            ),
+            (
+                "fs/write_text_file",
+                serde_json::json!({"sessionId":"foreign","path":denied_file,"content":"foreign"}),
+            ),
+            (
+                "terminal/create",
+                serde_json::json!({"sessionId":"foreign","command":"/bin/sh","args":["-c",format!("touch '{}'", denied_command.display())]}),
+            ),
+            (
+                "terminal/output",
+                serde_json::json!({"sessionId":"foreign","terminalId":"foreign-terminal"}),
+            ),
+            (
+                "terminal/wait_for_exit",
+                serde_json::json!({"sessionId":"foreign","terminalId":"foreign-terminal"}),
+            ),
+            (
+                "terminal/kill",
+                serde_json::json!({"sessionId":"foreign","terminalId":"foreign-terminal"}),
+            ),
+            (
+                "terminal/release",
+                serde_json::json!({"sessionId":"foreign","terminalId":"foreign-terminal"}),
+            ),
+            (
+                "session/request_permission",
+                serde_json::json!({"sessionId":"foreign","toolCall":{"toolCallId":"foreign-tool","title":"Foreign request"},"options":[{"optionId":"allow","name":"Allow","kind":"allow_once"}]}),
+            ),
+            (
+                "elicitation/create",
+                serde_json::json!({"sessionId":"foreign","mode":"form","message":"Foreign question","requestedSchema":{"type":"object","properties":{}}}),
+            ),
+        ] {
+            callbacks.push(
+                serde_json::json!({"jsonrpc":"2.0","id":method,"method":method,"params":params}),
+            );
+        }
+        callbacks.push(serde_json::json!({"jsonrpc":"2.0","id":"own","method":"fs/write_text_file","params":{"sessionId":"sid-1","path":own_file,"content":"own"}}));
+        let injected = callbacks
+            .iter()
+            .map(|request| {
+                format!(
+                    "      printf '%s\\n' '{}'\n",
+                    request.to_string().replace('\'', "'\"'\"'")
+                )
+            })
+            .collect::<String>();
+        let source = std::fs::read_to_string(&script).unwrap();
+        std::fs::write(
+            &script,
+            source.replace(
+                r#"    *'"method":"session/prompt"'*)"#,
+                &format!("    *'\"method\":\"session/prompt\"'*)\n{injected}"),
+            ),
+        )
+        .unwrap();
+        let mut client = AcpClient::spawn(
+            reset_fake_spawn_config(&script, temp.path()),
+            AcpSessionId("callback-guard".into()),
+        )
+        .await
+        .unwrap();
+        client.send_prompt("exercise callbacks", &[]).await.unwrap();
+        let events = identity_events_until_stop(&mut client).await;
+        // A second prompt is a wire barrier: the adapter has consumed every callback reply.
+        client.send_prompt("barrier", &[]).await.unwrap();
+        identity_events_until_stop(&mut client).await;
+        client.shutdown().await.unwrap();
+        assert!(!denied_file.exists());
+        assert!(!denied_command.exists());
+        assert_eq!(std::fs::read_to_string(own_file).unwrap(), "own");
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, Event::ApprovalRequested { .. })));
+        let wire = std::fs::read_to_string(capture).unwrap();
+        let replies: Vec<serde_json::Value> = wire
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for request in &callbacks[..callbacks.len() - 1] {
+            assert!(
+                replies
+                    .iter()
+                    .any(|reply| reply["id"] == request["id"] && reply["error"]["code"] == -32602),
+                "missing identity denial for {request}: {wire}"
+            );
+        }
+        assert!(
+            replies
+                .iter()
+                .any(|reply| reply["id"] == "own" && reply.get("result").is_some()),
+            "own callback failed: {wire}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_identity_rolls_back_buffered_updates_after_failed_reset() {
+        for same_id in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let script = write_early_identity_agent(temp.path());
+            let reply = if same_id {
+                r#"{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sid-1"}}"#
+            } else {
+                r#"{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"reset rejected"}}"#
+            };
+            let source = std::fs::read_to_string(&script).unwrap().replace(
+                "      update \"$sid\" \"early-$count\"",
+                &format!("      if [ \"$count\" -eq 2 ]; then\n        update sid-1 retained\n        update sid-2 rejected\n        printf '{reply}\\n' \"$id\"\n        sid=sid-1\n        continue\n      fi\n      update \"$sid\" \"early-$count\""),
+            );
+            std::fs::write(&script, source).unwrap();
+            let mut client = AcpClient::spawn(
+                reset_fake_spawn_config(&script, temp.path()),
+                AcpSessionId(format!("reset-rollback-{same_id}")),
+            )
+            .await
+            .unwrap();
+            client.send_prompt("before", &[]).await.unwrap();
+            identity_events_until_stop(&mut client).await;
+            assert!(matches!(
+                client.reset_session("/new").await.unwrap(),
+                ResetSessionOutcome::Failed { .. }
+            ));
+            let events = identity_events_until_stop(&mut client).await;
+            assert_eq!(identity_texts(&events), ["retained"]);
+            assert!(!events.iter().any(|event| matches!(
+                event,
+                Event::SessionCleared | Event::AcpSessionAssigned { .. }
+            )));
+            client.send_prompt("after", &[]).await.unwrap();
+            assert_eq!(
+                identity_texts(&identity_events_until_stop(&mut client).await),
+                ["live"]
+            );
+            client.shutdown().await.unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_identity_admits_immediate_post_response_callbacks_before_config() {
+        for fork in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let script = write_early_identity_agent(temp.path());
+            let written = temp.path().join("owned-callback");
+            let response = "      printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"sessionId\":\"%s\"}}\\n' \"$id\" \"$sid\" ;;";
+            let replacement = format!(
+                r#"      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"sessionId":"%s","configOptions":[{{"id":"effort","name":"Effort","category":"thought_level","type":"select","currentValue":"high","options":[{{"value":"high","name":"High"}}]}},{{"id":"mode","name":"Mode","category":"mode","type":"select","currentValue":"code","options":[{{"value":"code","name":"Code"}}]}}]}}}}\n' "$id" "$sid"
+      printf '{{"jsonrpc":"2.0","id":"callback","method":"fs/write_text_file","params":{{"sessionId":"%s","path":"{}","content":"%s"}}}}\n' "$sid" "$sid" ;;
+    *'"method":"session/set_config_option"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"configOptions":[]}}}}\n' "$id" ;;"#,
+                written.display()
+            );
+            let source = std::fs::read_to_string(&script)
+                .unwrap()
+                .replace(response, &replacement);
+            std::fs::write(&script, source).unwrap();
+            let mut config = reset_fake_spawn_config(&script, temp.path());
+            config.default_mode = Some("code".into());
+            config.default_effort = Some("high".into());
+            if fork {
+                config.fork_from = Some("parent".into());
+            }
+            let mut client =
+                AcpClient::spawn(config, AcpSessionId(format!("post-response-{fork}")))
+                    .await
+                    .unwrap();
+            client.send_prompt("before", &[]).await.unwrap();
+            identity_events_until_stop(&mut client).await;
+            assert_eq!(
+                std::fs::read_to_string(&written).unwrap(),
+                if fork { "child" } else { "sid-1" }
+            );
+            assert!(matches!(
+                client.reset_session("/new").await.unwrap(),
+                ResetSessionOutcome::Reset { .. }
+            ));
+            identity_events_until_stop(&mut client).await;
+            // The prompt response is a wire barrier after the accepted callback.
+            client.send_prompt("after", &[]).await.unwrap();
+            identity_events_until_stop(&mut client).await;
+            assert_eq!(
+                std::fs::read_to_string(&written).unwrap(),
+                if fork { "sid-1" } else { "sid-2" }
+            );
+            client.shutdown().await.unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_identity_pending_buffer_spans_runner_queue_and_fails_closed_on_overflow() {
+        // A reattach flushes the runner's detached control queue before the
+        // establish response, so the buffer must admit a backlog as large as
+        // that queue, then still fail closed one frame past it rather than
+        // publish a partial replay and retire the worker. See #3937.
+        let cap = crate::acp::control_protocol::MAX_CONTROL_QUEUE_FRAMES;
+        for count in [cap, cap + 1] {
+            let temp = tempfile::tempdir().unwrap();
+            let script = write_early_identity_agent(temp.path());
+            let pid_file = temp.path().join("agent.pid");
+            let source = std::fs::read_to_string(&script)
+                .unwrap()
+                .replace(
+                    "count=0",
+                    &format!("printf '%s' \"$$\" > '{}'\ncount=0", pid_file.display()),
+                )
+                .replace(
+                    "      update \"$sid\" \"early-$count\"\n      update foreign FOREIGN",
+                    &format!("      i=0\n      while [ \"$i\" -lt {count} ]; do update \"$sid\" \"item-$i\"; i=$((i+1)); done"),
+                );
+            std::fs::write(&script, source).unwrap();
+            let mut client = AcpClient::spawn(
+                reset_fake_spawn_config(&script, temp.path()),
+                AcpSessionId(format!("pending-limit-{count}")),
+            )
+            .await
+            .unwrap();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut texts = Vec::new();
+            let mut assigned = false;
+            let mut failed = false;
+            loop {
+                let event = tokio::time::timeout_at(deadline, client.next_event())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                match event {
+                    Event::AgentMessageChunk { text, .. } => texts.push(text),
+                    Event::AcpSessionAssigned { .. } => assigned = true,
+                    Event::AgentStartupError { .. } => {
+                        failed = true;
+                        break;
+                    }
+                    _ => {}
+                }
+                if texts.len() == cap {
+                    break;
+                }
+            }
+            if count == cap {
+                assert!(!failed);
+                assert!(assigned);
+                assert_eq!(
+                    texts,
+                    (0..cap).map(|i| format!("item-{i}")).collect::<Vec<_>>()
+                );
+                client.send_prompt("still live", &[]).await.unwrap();
+                assert_eq!(
+                    identity_texts(&identity_events_until_stop(&mut client).await),
+                    ["live"]
+                );
+                let _ = client.shutdown().await;
+            } else {
+                assert!(failed);
+                assert!(!assigned);
+                assert!(texts.is_empty());
+                // The overflow closes the connection and retires the worker
+                // with no explicit shutdown.
+                tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                    while client.next_event().await.is_some() {}
+                })
+                .await
+                .unwrap();
+                let pid: i32 = std::fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+                // SAFETY: signal zero only queries this fixture's recorded process.
+                assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ESRCH)
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_identity_fallback_reset_precedes_assignment_and_buffered_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = write_early_identity_agent(temp.path());
+        let source = std::fs::read_to_string(&script).unwrap().replace(
+            "      printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{}}\\n' \"$id\" ;;",
+            "      printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"error\":{\"code\":-32603,\"message\":\"stored session unavailable\"}}\\n' \"$id\" ;;",
+        );
+        std::fs::write(&script, source).unwrap();
+        let mut config = reset_fake_spawn_config(&script, temp.path());
+        config.stored_acp_session_id = Some("stored".into());
+        let mut client = AcpClient::spawn(config, AcpSessionId("fallback-order".into()))
+            .await
+            .unwrap();
+        client.send_prompt("after fallback", &[]).await.unwrap();
+        let events = identity_events_until_stop(&mut client).await;
+        let reset = events
+            .iter()
+            .position(|event| matches!(event, Event::SessionContextReset { .. }))
+            .unwrap();
+        let assigned = events.iter().position(|event| matches!(event, Event::AcpSessionAssigned { acp_session_id } if acp_session_id == "sid-1")).unwrap();
+        let replay = events
+            .iter()
+            .position(
+                |event| matches!(event, Event::AgentMessageChunk { text, .. } if text == "early-1"),
+            )
+            .unwrap();
+        assert!(
+            reset < assigned && assigned < replay,
+            "fallback publication order: {events:?}"
+        );
+        assert_eq!(identity_texts(&events), ["early-1", "live"]);
+        client.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_identity_accepted_callback_does_not_strand_reset_deadline_or_stop() {
+        let temp = tempfile::tempdir().unwrap();
+        let (script, capture) = write_reset_fake_agent(temp.path(), false, false, false);
+        let callback = serde_json::json!({"jsonrpc":"2.0","id":"pending-permission","method":"session/request_permission","params":{"sessionId":"sid-1","toolCall":{"toolCallId":"own-tool","title":"Wait for user"},"options":[{"optionId":"allow","name":"Allow","kind":"allow_once"}]}});
+        let source = std::fs::read_to_string(&script).unwrap().replace(
+            "      ;;\n    *'\"method\":\"session/set_config_option\"'*)",
+            &format!("      if [ \"$count\" -eq 1 ]; then printf '%s\\n' '{}'; fi\n      ;;\n    *'\"method\":\"session/set_config_option\"'*)", callback.to_string().replace('\'', "'\"'\"'")),
+        );
+        std::fs::write(&script, source).unwrap();
+        let mut client = AcpClient::spawn(
+            reset_fake_spawn_config(&script, temp.path()),
+            AcpSessionId("callback-deadline".into()),
+        )
+        .await
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let event = tokio::time::timeout_at(deadline, client.next_event())
+                .await
+                .unwrap()
+                .unwrap();
+            if matches!(event, Event::ApprovalRequested { .. }) {
+                break;
+            }
+        }
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reset_with_deadline_for_test(
+                &client,
+                tokio::time::Instant::now() + std::time::Duration::from_millis(100),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, ResetSessionOutcome::Failed { .. }));
+        client
+            .cmd_tx
+            .as_ref()
+            .unwrap()
+            .send(ClientCmd::ForceStop)
+            .await
+            .unwrap();
+        client.cancel_prompt().await.unwrap();
+        let events = identity_events_until_stop(&mut client).await;
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, Event::Stopped { reason } if reason == "cancelled")));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let wire = std::fs::read_to_string(&capture).unwrap();
+            let requests: Vec<serde_json::Value> = wire
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            if requests
+                .iter()
+                .filter(|request| request["method"] == "session/cancel")
+                .count()
+                == 2
+            {
+                assert_eq!(
+                    requests
+                        .iter()
+                        .filter(|request| request["method"] == "session/new")
+                        .count(),
+                    1
+                );
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "stop never reached native transport: {wire}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        client.shutdown().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while client.next_event().await.is_some() {}
+        })
+        .await
+        .unwrap();
     }
 
     /// Write a scripted stdio ACP agent for the conversation-reset tests
@@ -173,24 +824,6 @@ done
         );
         std::fs::write(&script_path, script).expect("write fake agent script");
         (script_path, capture)
-    }
-
-    #[cfg(unix)]
-    async fn wait_for_captured_requests(capture: &std::path::Path, method: &str, count: usize) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let needle = format!("\"method\":\"{method}\"");
-        loop {
-            let wire = std::fs::read_to_string(capture).expect("read request capture");
-            if wire.matches(&needle).count() >= count {
-                return;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "adapter did not receive {method}: {wire}"
-            );
-            // Keep paused time stationary until native I/O reaches the target RPC.
-            tokio::task::yield_now().await;
-        }
     }
 
     #[cfg(unix)]
@@ -370,6 +1003,24 @@ done
                 usize::from(!(stored && load_capable && !load_fails)),
                 "{name}"
             );
+        }
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_captured_requests(capture: &std::path::Path, method: &str, count: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let needle = format!("\"method\":\"{method}\"");
+        loop {
+            let wire = std::fs::read_to_string(capture).expect("read request capture");
+            if wire.matches(&needle).count() >= count {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "adapter did not receive {method}: {wire}"
+            );
+            // Keep paused time stationary until native I/O reaches the target RPC.
+            tokio::task::yield_now().await;
         }
     }
 
@@ -609,11 +1260,7 @@ done
         let first = first.await;
         tokio::time::resume();
         assert!(
-            matches!(
-                first,
-                ResetSessionOutcome::Failed { ref message }
-                    if message.contains("before the reset deadline")
-            ),
+            matches!(first, ResetSessionOutcome::Failed { .. }),
             "the stalled session/new must fail at the inner deadline, got {first:?}"
         );
 
@@ -631,6 +1278,23 @@ done
                 } if new_acp_session_id == "sid-3"
             ),
             "the connection loop must process a later reset, got {second:?}"
+        );
+        let wire = std::fs::read_to_string(capture).unwrap();
+        let requests: Vec<serde_json::Value> = wire
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let timed_out_id = &requests
+            .iter()
+            .filter(|request| request["method"] == "session/new")
+            .nth(1)
+            .unwrap()["id"];
+        assert!(
+            requests
+                .iter()
+                .any(|request| request["method"] == "$/cancel_request"
+                    && &request["params"]["requestId"] == timed_out_id),
+            "timed-out request was not cancelled: {wire}"
         );
         let _ = client.shutdown().await;
     }

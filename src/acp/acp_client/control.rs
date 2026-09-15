@@ -16,6 +16,7 @@ use super::errors::{acp_error_from_value, acp_internal_error, AcpError};
 use super::lifecycle::TerminalClaim;
 use super::rate_limit::classify_rate_limit_error;
 use super::runner::runner_socket_deadline;
+use super::session_identity::{SessionIngress, CONTROL_FRAME_BYTES_FIELD};
 
 /// Cancel a socket handshake if its constructor is dropped before completion.
 /// Closing the exact runner control channel cancels only that runner.
@@ -37,6 +38,7 @@ impl Drop for ShutdownControlOnDrop {
 /// Until this attachment issues a local prompt, a waiterless completion can
 /// finish an adopted turn by claiming the terminal guard and firing `Stopped`.
 pub(super) struct DaemonControlClient {
+    pub(super) ingress: Arc<SessionIngress>,
     write: Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
     handshake_rx: Mutex<mpsc::Receiver<ControlBody>>,
     completion: Arc<std::sync::Mutex<PromptCompletion>>,
@@ -334,26 +336,32 @@ pub(super) async fn connect_runner_control_v3(
     let reader_session = session_label.clone();
     let reader_shim_write = shim_write.clone();
     let reader_correlation = correlation.clone();
+    let ingress = Arc::new(SessionIngress::default());
+    let reader_ingress = ingress.clone();
     tokio::spawn(async move {
         async {
             loop {
-            match control_protocol::read_frame(&mut read_half).await {
-                Ok(Some(
+            match control_protocol::read_frame_with_size(&mut read_half).await {
+                Ok(Some((
                     frame @ (ControlBody::Initialized { .. }
                     | ControlBody::SessionReady { .. }
                     | ControlBody::HandshakeFailed { .. }),
-                )) => {
+                    _,
+                ))) => {
+                    if let ControlBody::SessionReady { acp_session_id, .. } = &frame {
+                        reader_ingress.resolve(None, acp_session_id.clone().into());
+                    }
                     if hs_tx.send(frame).await.is_err() {
                         return;
                     }
                 }
-                Ok(Some(ControlBody::PromptStarted { prompt_req_id })) => {
+                Ok(Some((ControlBody::PromptStarted { prompt_req_id }, _))) => {
                     let mut completion = reader_completion.lock().expect("completion mutex poisoned");
                     if let PromptCompletion::Pending { prompt_req_id: id @ None, .. } = &mut *completion {
                         *id = Some(prompt_req_id);
                     }
                 }
-                Ok(Some(ControlBody::PromptCompleted { prompt_req_id, outcome })) => {
+                Ok(Some((ControlBody::PromptCompleted { prompt_req_id, outcome }, _))) => {
                     let waiter = {
                         let mut completion = reader_completion.lock().expect("completion mutex poisoned");
                         match &*completion {
@@ -413,13 +421,13 @@ pub(super) async fn connect_runner_control_v3(
                 // into the crate transport as an ordinary JSON-RPC request
                 // under a synthetic id, so the nine `on_receive_request`
                 // handlers serve it exactly as they did off the relay. The
-                // crate spawns each handler, so a permission parked for
-                // minutes never blocks this reader or the frames behind it.
-                Ok(Some(ControlBody::ServerCall {
+                // ordered SDK dispatcher starts each handler before reading
+                // the next frame; SessionReady must publish its candidate first.
+                Ok(Some((ControlBody::ServerCall {
                     call_id,
                     method,
                     params,
-                })) => {
+                }, _))) => {
                     let synthetic = {
                         let mut c = reader_correlation.lock().await;
                         let id = c.synthetic_id();
@@ -436,13 +444,21 @@ pub(super) async fn connect_runner_control_v3(
                         return;
                     }
                 }
-                // Fire-and-forget agent notification, forwarded verbatim.
-                Ok(Some(ControlBody::Notify { method, params })) => {
-                    let line = serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "method": method,
-                        "params": params,
-                    });
+                // Preserve producer bytes across the private SDK transport without
+                // adding nesting or trusting any native accounting claim.
+                Ok(Some((ControlBody::Notify { method, mut params }, wire_bytes))) => {
+                    if method == "session/update" {
+                        match &mut params {
+                            serde_json::Value::Object(fields) => {
+                                fields.insert(CONTROL_FRAME_BYTES_FIELD.into(), wire_bytes.into());
+                            }
+                            serde_json::Value::Array(fields) => fields.push(wire_bytes.into()),
+                            _ => {}
+                        }
+                    }
+                    let mut line = serde_json::json!({"jsonrpc": "2.0"});
+                    line["method"] = method.into();
+                    line["params"] = params;
                     if !shim_write_line(&reader_shim_write, &line).await {
                         return;
                     }
@@ -450,7 +466,7 @@ pub(super) async fn connect_runner_control_v3(
                 // #2977 forward lane: the runner's answer to a request the
                 // crate connection made. Handed back under the crate's own
                 // id so its `send_request` future resolves.
-                Ok(Some(ControlBody::AgentResult { call_id, result })) => {
+                Ok(Some((ControlBody::AgentResult { call_id, result }, _))) => {
                     let id = reader_correlation.lock().await.forward.remove(&call_id);
                     if let Some(id) = id {
                         let line = serde_json::json!({
@@ -461,7 +477,7 @@ pub(super) async fn connect_runner_control_v3(
                         }
                     }
                 }
-                Ok(Some(ControlBody::AgentError { call_id, error })) => {
+                Ok(Some((ControlBody::AgentError { call_id, error }, _))) => {
                     let id = reader_correlation.lock().await.forward.remove(&call_id);
                     if let Some(id) = id {
                         let line = serde_json::json!({
@@ -638,6 +654,7 @@ pub(super) async fn connect_runner_control_v3(
 
     Ok((
         Arc::new(DaemonControlClient {
+            ingress,
             write: write_half,
             handshake_rx: Mutex::new(hs_rx),
             completion,
@@ -1242,6 +1259,293 @@ mod tests {
             .await
             .expect("attach recovery must finish and close its control socket");
         }
+    }
+
+    #[tokio::test]
+    async fn native_identity_reattach_uses_runner_id_and_drains_adopted_updates() {
+        use crate::acp::acp_client::AcpClient;
+        use crate::acp::state::AcpSessionId;
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("native.sock");
+        let control = crate::process::worker::control_socket_sibling(&socket);
+        let listener = tokio::net::UnixListener::bind(control).unwrap();
+        let own_file = temp.path().join("own");
+        let foreign_file = temp.path().join("foreign");
+        let (callbacks_done, callbacks_ready) = oneshot::channel();
+        let runner = async {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            control_protocol::write_frame(
+                &mut peer,
+                &ControlBody::Hello {
+                    control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
+                    session_id: "native-resume".into(),
+                },
+            )
+            .await
+            .unwrap();
+            let mut callbacks_done = Some(callbacks_done);
+            let mut replies = 0;
+            while let Some(frame) = control_protocol::read_frame(&mut peer).await.unwrap() {
+                match frame {
+                    ControlBody::Attach { .. } => {}
+                    ControlBody::Initialize { .. } => {
+                        control_protocol::write_frame(&mut peer, &ControlBody::Initialized {
+                            result: serde_json::json!({"protocolVersion":1,"agentCapabilities":{}}),
+                        }).await.unwrap();
+                    }
+                    ControlBody::ResumeSession => {
+                        for index in 0..200 {
+                            control_protocol::write_frame(&mut peer, &ControlBody::Notify {
+                                method: "session/update".into(),
+                                params: serde_json::json!({"sessionId":"actual","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":format!("own-{index}")}}}),
+                            }).await.unwrap();
+                        }
+                        control_protocol::write_frame(&mut peer, &ControlBody::Notify {
+                            method: "session/update".into(),
+                            params: serde_json::json!({"sessionId":"stale","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"FOREIGN"}}}),
+                        }).await.unwrap();
+                        let update = |text: &str| {
+                            serde_json::json!({
+                                "sessionUpdate":"agent_message_chunk",
+                                "content":{"type":"text","text":text}
+                            })
+                        };
+                        // Invalid native shapes must not become valid by mistaking
+                        // a native field/tail for the shim-owned accounting marker.
+                        for params in [
+                            serde_json::Value::Null,
+                            serde_json::json!(7),
+                            serde_json::json!([]),
+                            serde_json::json!({"update":update("INVALID")}),
+                            serde_json::json!({"notification":{"sessionId":"actual","update":update("INVALID")},"__aoe_control_frame_bytes":0}),
+                            serde_json::json!(["actual", update("INVALID"), null, 0]),
+                        ] {
+                            control_protocol::write_frame(
+                                &mut peer,
+                                &ControlBody::Notify {
+                                    method: "session/update".into(),
+                                    params,
+                                },
+                            )
+                            .await
+                            .unwrap();
+                        }
+                        // Positional params and the existing JSON nesting ceiling
+                        // survive the private accounting transport unchanged.
+                        let deep = (0..124).fold(serde_json::Value::Null, |value, _| {
+                            serde_json::Value::Array(vec![value])
+                        });
+                        for params in [
+                            serde_json::json!(["actual",update("own-200"),{"deep":deep}]),
+                            serde_json::json!({"sessionId":"actual","update":update("own-201"),"__aoe_control_frame_bytes":{"untrusted":true}}),
+                            serde_json::json!({"sessionId":"actual","update":update("own-202"),"__aoe_control_frame_bytes":u64::MAX}),
+                            serde_json::json!(["actual", update("own-203")]),
+                        ] {
+                            control_protocol::write_frame(
+                                &mut peer,
+                                &ControlBody::Notify {
+                                    method: "session/update".into(),
+                                    params,
+                                },
+                            )
+                            .await
+                            .unwrap();
+                        }
+                        control_protocol::write_frame(
+                            &mut peer,
+                            &ControlBody::SessionReady {
+                                acp_session_id: "actual".into(),
+                                result: serde_json::json!({}),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                        for (call_id, session_id, path) in
+                            [(1, "actual", &own_file), (2, "stale", &foreign_file)]
+                        {
+                            control_protocol::write_frame(&mut peer, &ControlBody::ServerCall {
+                                call_id, method: "fs/write_text_file".into(),
+                                params: serde_json::json!({"sessionId":session_id,"path":path,"content":"owned"}),
+                            }).await.unwrap();
+                        }
+                    }
+                    ControlBody::ServerResult { call_id, .. } => {
+                        assert_eq!(call_id, 1);
+                        replies += 1;
+                    }
+                    ControlBody::ServerError { call_id, error } => {
+                        assert_eq!(call_id, 2);
+                        assert_eq!(error.code, -32602);
+                        replies += 1;
+                    }
+                    other => panic!("unexpected frame {other:?}"),
+                }
+                if replies == 2 {
+                    if let Some(done) = callbacks_done.take() {
+                        done.send(()).unwrap();
+                    }
+                }
+            }
+        };
+        let daemon = async {
+            let mut client = AcpClient::attach(
+                socket,
+                temp.path().into(),
+                vec![],
+                "stale".into(),
+                true,
+                AcpSessionId("native-resume".into()),
+                None,
+                "codex".into(),
+                None,
+            )
+            .await
+            .unwrap();
+            let mut chunks = Vec::new();
+            while chunks.len() < 204 {
+                match client.next_event().await.unwrap() {
+                    Event::AgentMessageChunk { text, .. } => chunks.push(text),
+                    Event::AgentStartupError { message } => panic!("{message}"),
+                    _ => {}
+                }
+            }
+            callbacks_ready.await.unwrap();
+            client.shutdown().await.unwrap();
+            assert_eq!(
+                chunks,
+                (0..204)
+                    .map(|index| format!("own-{index}"))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(std::fs::read_to_string(&own_file).unwrap(), "owned");
+            assert!(!foreign_file.exists());
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(runner, daemon);
+        })
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn native_identity_reattach_preserves_a_full_wire_byte_backlog() {
+        use crate::acp::acp_client::AcpClient;
+        use crate::acp::state::AcpSessionId;
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("byte-backlog.sock");
+        let control = crate::process::worker::control_socket_sibling(&socket);
+        let listener = tokio::net::UnixListener::bind(control).unwrap();
+        let own_file = temp.path().join("own");
+        let (callback_done, callback_ready) = oneshot::channel();
+        let runner = async {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            control_protocol::write_frame(
+                &mut peer,
+                &ControlBody::Hello {
+                    control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
+                    session_id: "byte-backlog".into(),
+                },
+            )
+            .await
+            .unwrap();
+            let mut callback_done = Some(callback_done);
+            while let Some(frame) = control_protocol::read_frame(&mut peer).await.unwrap() {
+                match frame {
+                    ControlBody::Attach { .. } => {}
+                    ControlBody::Initialize { .. } => {
+                        control_protocol::write_frame(&mut peer, &ControlBody::Initialized {
+                            result: serde_json::json!({"protocolVersion":1,"agentCapabilities":{}}),
+                        }).await.unwrap();
+                    }
+                    ControlBody::ResumeSession => {
+                        let mut wire_total = 0;
+                        for id in ["a", "b", "c"] {
+                            // Integer priorities become typed f64 values. Their later
+                            // encoding can exceed the original valid runner backlog.
+                            let body = ControlBody::Notify {
+                                method: "session/update".into(),
+                                params: serde_json::json!({
+                                    "sessionId":"s",
+                                    "update":{"sessionUpdate":"tool_call","toolCallId":id,"title":"t",
+                                        "content":vec![serde_json::json!({"type":"content","content":{
+                                            "type":"text","text":"x","annotations":{"priority":1}}});100]},
+                                    "_meta":{"pad":"x".repeat(44_730_469)}
+                                }),
+                            };
+                            let frame = control_protocol::encode_frame(&body).unwrap();
+                            wire_total += frame.len();
+                            assert!(wire_total <= control_protocol::MAX_CONTROL_QUEUE_BYTES);
+                            control_protocol::write_encoded_frame(&mut peer, &frame)
+                                .await
+                                .unwrap();
+                        }
+                        // SDK dispatch is ordered: this denied callback proves all
+                        // three updates reached pending admission before readiness.
+                        control_protocol::write_frame(
+                            &mut peer,
+                            &ControlBody::ServerCall {
+                                call_id: 1,
+                                method: "fs/read_text_file".into(),
+                                params: serde_json::json!({"sessionId":"unknown","path":own_file}),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    ControlBody::ServerError { call_id: 1, error } => {
+                        assert_eq!(error.code, -32602);
+                        control_protocol::write_frame(
+                            &mut peer,
+                            &ControlBody::SessionReady {
+                                acp_session_id: "s".into(),
+                                result: serde_json::json!({}),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                        control_protocol::write_frame(&mut peer, &ControlBody::ServerCall {
+                            call_id: 2, method: "fs/write_text_file".into(),
+                            params: serde_json::json!({"sessionId":"s","path":own_file,"content":"owned"}),
+                        }).await.unwrap();
+                    }
+                    ControlBody::ServerResult { call_id: 2, .. } => {
+                        callback_done.take().unwrap().send(()).unwrap();
+                    }
+                    other => panic!("unexpected frame {other:?}"),
+                }
+            }
+        };
+        let daemon = async {
+            let mut client = AcpClient::attach(
+                socket,
+                temp.path().into(),
+                vec![],
+                "stale".into(),
+                true,
+                AcpSessionId("byte-backlog".into()),
+                None,
+                "codex".into(),
+                None,
+            )
+            .await
+            .expect("producer-admitted backlog must attach");
+            let mut calls = Vec::new();
+            while calls.len() < 3 {
+                match client.next_event().await.unwrap() {
+                    Event::ToolCallStarted { tool_call } => calls.push(tool_call.id),
+                    Event::AgentStartupError { message } => panic!("{message}"),
+                    _ => {}
+                }
+            }
+            callback_ready.await.unwrap();
+            client.shutdown().await.unwrap();
+            assert_eq!(calls, ["a", "b", "c"]);
+            assert_eq!(std::fs::read_to_string(&own_file).unwrap(), "owned");
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            tokio::join!(runner, daemon);
+        })
+        .await
+        .unwrap();
     }
 
     /// A waiterless completion for an adopted turn publishes its terminal
