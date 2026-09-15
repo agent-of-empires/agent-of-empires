@@ -89,6 +89,10 @@ describe("composer usage indicator tooltip", () => {
     const tip = screen.getByRole("tooltip").textContent ?? "";
     expect(tip).toContain(`${(120_000).toLocaleString()} of ${(200_000).toLocaleString()} tokens used (60%)`);
     expect(tip).toContain("cumulative session spend since the last /clear or /compact");
+    // The compact form (percent and cost) is not breakpoint-hidden (#3916).
+    expect(indicator.classList.contains("hidden")).toBe(false);
+    expect(indicator.textContent).toContain("60%");
+    expect(indicator.textContent).toContain("0.42");
   });
 
   it("omits the cost sentence when the agent reports no cost", () => {
@@ -99,5 +103,7 @@ describe("composer usage indicator tooltip", () => {
     const tip = screen.getByRole("tooltip").textContent ?? "";
     expect(tip).toContain(`${(50_000).toLocaleString()} of ${(200_000).toLocaleString()} tokens used (25%)`);
     expect(tip).not.toContain("cumulative session spend");
+    expect(indicator.textContent).toContain("25%");
+    expect(indicator.textContent).not.toContain("·");
   });
 });

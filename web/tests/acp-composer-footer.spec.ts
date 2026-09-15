@@ -19,7 +19,7 @@
 // it; no coarse-pointer emulation is needed.
 
 import { test, expect } from "./helpers/mockedTest";
-import { mockAcpSession, openStructuredSession, configOptionsUpdated } from "./helpers/acpMock";
+import { mockAcpSession, openStructuredSession, configOptionsUpdated, usageUpdated } from "./helpers/acpMock";
 
 // Narrow viewport: the populated left cluster is wider than the row.
 test.use({ viewport: { width: 360, height: 740 } });
@@ -52,6 +52,8 @@ test("mobile composer footer keeps the Send action reachable when config control
           ],
         },
       ]),
+      // Usage is present at every width, so its hint competes for footer space (#3916).
+      usageUpdated({ used: 1_950_000, size: 2_000_000, cost: { amount: 1234.5678, currency: "EUR" } }),
     ],
   });
   await openStructuredSession(page, mock);
@@ -61,6 +63,7 @@ test("mobile composer footer keeps the Send action reachable when config control
   await expect(page.getByTestId("config-option-model")).toBeVisible({
     timeout: 15_000,
   });
+  await expect(page.getByTestId("composer-usage")).toBeVisible();
 
   // Core regression: the footer must not overflow horizontally, so the
   // right action cluster is never pushed past the clipped viewport edge.
@@ -88,4 +91,13 @@ test("mobile composer footer keeps the Send action reachable when config control
   await send.click();
   await expect.poll(() => mock.promptBodies.length).toBe(1);
   expect(mock.promptBodies[0]!.text).toBe("reachable on mobile");
+
+  // Mid-turn the cluster holds Stop and Queue, its widest state. An ancestor
+  // clips the composer, so the footer's own scroll width cannot see overflow.
+  for (const name of ["Stop", "Queue follow-up message"]) {
+    const button = page.getByRole("button", { name, exact: true });
+    await expect(button).toBeVisible();
+    const b = await button.boundingBox();
+    expect(b!.x + b!.width, name).toBeLessThanOrEqual(viewport!.width);
+  }
 });
