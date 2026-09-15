@@ -397,7 +397,7 @@ Manage session lifecycle (start, stop, attach, etc.)
 * `capture` — Capture tmux pane output
 * `current` — Auto-detect current session
 * `add-project` — Attach another repo to an existing session, so an agent that turns out to need a second repo can keep working in the same conversation instead of the session being recreated. Creates a worktree for the repo and restarts the agent so it can see it; the conversation is kept. See #3103
-* `set-session-id` — Set the resume target for a session; agents with resume disabled in AoE store the ID but do not use it
+* `set-session-id` — Set the resume target for a session; an agent whose exact native resume AoE cannot resolve is refused
 * `set-base` — Set or clear the per-session diff base branch. The diff view compares the worktree against this ref instead of the auto-detected default. Useful when the PR target differs from the project default (stacked PRs, hotfix off `release/*`, renamed default branch). See #970
 * `snooze` — Snooze a session for a duration (temporary archive, auto wakes)
 * `unsnooze` — Wake a snoozed session immediately
@@ -572,14 +572,18 @@ Attach another repo to an existing session, so an agent that turns out to need a
 
 ## `aoe session set-session-id`
 
-Set the resume target for a session; agents with resume disabled in AoE store the ID but do not use it
+Set the resume target for a session; an agent whose exact native resume AoE cannot resolve is refused
 
-**Usage:** `aoe session set-session-id <IDENTIFIER> <SESSION_ID>`
+**Usage:** `aoe session set-session-id [OPTIONS] <IDENTIFIER> <SESSION_ID>`
 
 ###### **Arguments:**
 
 * `<IDENTIFIER>` — Session ID or title
-* `<SESSION_ID>` — Resume target: for resume-enabled agents, a UUID/sid pins subsequent launches to that conversation; agents with resume disabled in AoE store but do not use it. An empty string forces a one-shot fresh start
+* `<SESSION_ID>` — Conversation to resume. An empty string requests a one-shot fresh start, which only a terminal session can take: a structured session keeps its ACP conversation and needs the native ID plus an explicit `--store` and a bound Claude conversation
+
+###### **Options:**
+
+* `--store <STORE>` — Assert the primary native store root, for example CLAUDE_CONFIG_DIR or CODEX_HOME
 
 
 

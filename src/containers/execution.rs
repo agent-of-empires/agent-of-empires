@@ -1,0 +1,494 @@
+//! Runtime endpoints, inspected mounts, and transport for a checked launch.
+
+use serde_json::Value;
+
+use super::runtime::RuntimeKind;
+use super::ContainerRuntime;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RuntimeExecutionSnapshot {
+    pub(crate) kind: crate::session::ContainerRuntimeName,
+    pub(crate) program: std::path::PathBuf,
+    pub(crate) cwd: std::path::PathBuf,
+    pub(crate) endpoint: String,
+    pub(crate) local_mounts: bool,
+    pub(crate) routing: Vec<(String, Option<String>)>,
+}
+
+const RUNTIME_ROUTING_KEYS: &[&str] = &[
+    "HOME",
+    "PATH",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_RUNTIME_DIR",
+    "DOCKER_HOST",
+    "DOCKER_CONTEXT",
+    "DOCKER_CONFIG",
+    "DOCKER_TLS",
+    "DOCKER_TLS_VERIFY",
+    "DOCKER_CERT_PATH",
+    "CONTAINER_HOST",
+    "CONTAINER_CONNECTION",
+    "CONTAINER_SSHKEY",
+    "CONTAINERS_CONF",
+    "CONTAINERS_CONF_OVERRIDE",
+    "CONTAINERS_CONF_MODULES",
+    "CONTAINERS_STORAGE_CONF",
+    "SSH_AUTH_SOCK",
+];
+
+impl RuntimeExecutionSnapshot {
+    fn runtime(&self) -> ContainerRuntime {
+        match self.kind {
+            crate::session::ContainerRuntimeName::Docker => ContainerRuntime::docker(),
+            crate::session::ContainerRuntimeName::Podman => ContainerRuntime::podman(),
+            crate::session::ContainerRuntimeName::AppleContainer => {
+                ContainerRuntime::apple_container()
+            }
+        }
+    }
+
+    fn value(&self, key: &str) -> Option<&str> {
+        self.routing
+            .iter()
+            .find(|(name, _)| name == key)
+            .and_then(|(_, value)| value.as_deref())
+            .filter(|value| !value.is_empty())
+    }
+
+    fn set(&mut self, key: &str, value: Option<String>) {
+        let entry = self
+            .routing
+            .iter_mut()
+            .find(|(name, _)| name == key)
+            .expect("runtime routing key is declared");
+        entry.1 = value;
+    }
+
+    pub(crate) fn command(&self, args: &[String]) -> std::process::Command {
+        let mut command = std::process::Command::new(&self.program);
+        command.current_dir(&self.cwd).args(args);
+        for (key, value) in &self.routing {
+            if let Some(value) = value {
+                command.env(key, value);
+            } else {
+                command.env_remove(key);
+            }
+        }
+        command
+    }
+
+    fn probe(&self, args: &[&str]) -> anyhow::Result<Vec<u8>> {
+        let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+        let output = self.runtime().base.probe_output(&mut self.command(&args))?;
+        anyhow::ensure!(
+            output.status.success(),
+            "runtime context probe failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        anyhow::ensure!(
+            output.stdout.len() <= 2 * 1024 * 1024,
+            "runtime context probe exceeded its size limit"
+        );
+        Ok(output.stdout)
+    }
+
+    fn probe_json(&self, args: &[&str]) -> anyhow::Result<Value> {
+        Ok(serde_json::from_slice(&self.probe(args)?)?)
+    }
+
+    fn validate_endpoint(endpoint: &str) -> anyhow::Result<()> {
+        let authority = endpoint
+            .split_once("://")
+            .map(|(_, rest)| rest.split('/').next().unwrap_or_default());
+        anyhow::ensure!(!authority.and_then(|authority| authority.split_once('@'))
+            .is_some_and(|(user, _)| user.contains(':')),
+            "managed runtime endpoints cannot embed credentials; use a configured transport identity");
+        anyhow::ensure!(
+            !endpoint.contains(['\n', '\r', '\0']),
+            "invalid runtime endpoint"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn capture(runtime: &ContainerRuntime) -> anyhow::Result<Self> {
+        use crate::session::ContainerRuntimeName as Name;
+        let routing = RUNTIME_ROUTING_KEYS
+            .iter()
+            .map(|key| {
+                let value = std::env::var_os(key)
+                    .map(|value| {
+                        value.into_string().map_err(|_| {
+                            anyhow::anyhow!("runtime routing variable {key} is not UTF-8")
+                        })
+                    })
+                    .transpose()?;
+                Ok(((*key).to_owned(), value))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let path = routing
+            .iter()
+            .find(|(key, _)| key == "PATH")
+            .and_then(|(_, value)| value.as_deref());
+        let cwd = std::env::current_dir()?;
+        let program = which::which_in(runtime.base.binary, path, &cwd)?;
+        anyhow::ensure!(
+            program.to_str().is_some(),
+            "runtime executable path is not UTF-8"
+        );
+        let mut snapshot = Self {
+            kind: match runtime.kind {
+                RuntimeKind::Docker => Name::Docker,
+                RuntimeKind::Podman => Name::Podman,
+                RuntimeKind::AppleContainer => Name::AppleContainer,
+            },
+            program,
+            cwd,
+            endpoint: String::new(),
+            local_mounts: false,
+            routing,
+        };
+        match snapshot.kind {
+            Name::Docker => {
+                if snapshot.value("DOCKER_CONTEXT").is_none()
+                    && snapshot.value("DOCKER_HOST").is_some()
+                {
+                    snapshot.endpoint = snapshot.value("DOCKER_HOST").unwrap().to_owned();
+                } else {
+                    let context =
+                        snapshot.probe_json(&["context", "inspect", "--format", "{{json .}}"])?;
+                    snapshot.endpoint = context
+                        .pointer("/Endpoints/docker/Host")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| anyhow::anyhow!("Docker context has no resolved endpoint"))?
+                        .to_owned();
+                    if context.get("Name").and_then(Value::as_str) != Some("default") {
+                        snapshot.set("DOCKER_TLS", None);
+                        snapshot.set("DOCKER_TLS_VERIFY", None);
+                        snapshot.set("DOCKER_CERT_PATH", None);
+                        if context
+                            .pointer("/TLSMaterial/docker")
+                            .and_then(Value::as_array)
+                            .is_some_and(|files| !files.is_empty())
+                        {
+                            let directory = context
+                                .pointer("/Storage/TLSPath")
+                                .and_then(Value::as_str)
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("Docker context TLS material has no path")
+                                })?;
+                            snapshot.set(
+                                "DOCKER_CERT_PATH",
+                                Some(
+                                    std::path::Path::new(directory)
+                                        .join("docker")
+                                        .to_str()
+                                        .ok_or_else(|| {
+                                            anyhow::anyhow!("Docker TLS path is not UTF-8")
+                                        })?
+                                        .to_owned(),
+                                ),
+                            );
+                            snapshot.set("DOCKER_TLS", Some("1".into()));
+                            if context
+                                .pointer("/Endpoints/docker/SkipTLSVerify")
+                                .and_then(Value::as_bool)
+                                != Some(true)
+                            {
+                                snapshot.set("DOCKER_TLS_VERIFY", Some("1".into()));
+                            }
+                        }
+                    }
+                }
+                Self::validate_endpoint(&snapshot.endpoint)?;
+                snapshot.set("DOCKER_HOST", Some(snapshot.endpoint.clone()));
+                snapshot.set("DOCKER_CONTEXT", None);
+                snapshot.local_mounts =
+                    snapshot
+                        .endpoint
+                        .strip_prefix("unix://")
+                        .is_some_and(|socket| {
+                            let socket = std::path::Path::new(socket);
+                            ["/var/run/docker.sock", "/run/docker.sock"]
+                                .iter()
+                                .any(|known| socket == std::path::Path::new(known))
+                                || snapshot.value("XDG_RUNTIME_DIR").is_some_and(|dir| {
+                                    socket == std::path::Path::new(dir).join("docker.sock")
+                                })
+                                || snapshot.value("HOME").is_some_and(|home| {
+                                    [".docker/run/docker.sock", ".docker/desktop/docker.sock"]
+                                        .iter()
+                                        .any(|suffix| {
+                                            socket == std::path::Path::new(home).join(suffix)
+                                        })
+                                })
+                        });
+            }
+            Name::Podman => {
+                let remote = snapshot
+                    .probe_json(&["info", "--format", "{{json .Host.ServiceIsRemote}}"])?
+                    .as_bool()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Podman did not establish transport locality")
+                    })?;
+                if !remote {
+                    snapshot.endpoint = "local://podman".into();
+                    snapshot.local_mounts = true;
+                } else {
+                    if let Some(endpoint) = snapshot.value("CONTAINER_HOST") {
+                        snapshot.endpoint = endpoint.to_owned();
+                    } else {
+                        let connections = snapshot.probe_json(&[
+                            "system",
+                            "connection",
+                            "list",
+                            "--format",
+                            "json",
+                        ])?;
+                        let selected = connections
+                            .as_array()
+                            .and_then(|connections| {
+                                connections.iter().find(|connection| {
+                                    match snapshot.value("CONTAINER_CONNECTION") {
+                                        Some(name) => {
+                                            connection.get("Name").and_then(Value::as_str)
+                                                == Some(name)
+                                        }
+                                        None => {
+                                            connection.get("Default").and_then(Value::as_bool)
+                                                == Some(true)
+                                        }
+                                    }
+                                })
+                            })
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("Podman connection endpoint is not established")
+                            })?;
+                        snapshot.endpoint = selected
+                            .get("URI")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| anyhow::anyhow!("Podman connection has no URI"))?
+                            .to_owned();
+                        if snapshot.value("CONTAINER_SSHKEY").is_none() {
+                            snapshot.set(
+                                "CONTAINER_SSHKEY",
+                                selected
+                                    .get("Identity")
+                                    .and_then(Value::as_str)
+                                    .filter(|value| !value.is_empty())
+                                    .map(str::to_owned),
+                            );
+                        }
+                    }
+                    Self::validate_endpoint(&snapshot.endpoint)?;
+                    snapshot.set("CONTAINER_HOST", Some(snapshot.endpoint.clone()));
+                    snapshot.set("CONTAINER_CONNECTION", None);
+                }
+            }
+            Name::AppleContainer => {
+                snapshot.endpoint = "local://apple-container".into();
+                snapshot.local_mounts = true;
+            }
+        }
+        Ok(snapshot)
+    }
+
+    pub(crate) fn exec(&self, name: &str, cwd: &str, args: &[String]) -> std::process::Command {
+        let argv = self.runtime().build_exec_argv(name, cwd, args);
+        self.command(&argv[1..])
+    }
+
+    pub(crate) fn exec_shell_command(
+        &self,
+        name: &str,
+        options: Option<&str>,
+        command: &str,
+    ) -> String {
+        let runtime = self.runtime();
+        let command = runtime.exec_command(name, options, command);
+        format!(
+            "{}{}",
+            crate::session::environment::shell_escape(
+                self.program.to_str().expect("validated runtime path")
+            ),
+            command
+                .strip_prefix(runtime.base.binary)
+                .expect("runtime command starts with its binary")
+        )
+    }
+
+    pub(crate) fn canonical_path(
+        &self,
+        name: &str,
+        path: &std::path::Path,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        anyhow::ensure!(path.is_absolute(), "container path must be absolute");
+        let path = path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("container path is not UTF-8"))?;
+        let script = r#"PATH=/usr/bin:/bin; export PATH
+if [ -e "$1" ] || [ -L "$1" ]; then exec readlink -f -- "$1"; fi
+p=$1; suffix=
+while [ ! -d "$p" ]; do
+  [ ! -L "$p" ] || exit 1
+  suffix=/${p##*/}$suffix
+  p=${p%/*}; [ -n "$p" ] || p=/
+done
+cd -P -- "$p" || exit 1
+printf '%s%s\n' "$PWD" "$suffix""#;
+        let args = ["/bin/sh", "-c", script, "aoe-path", path].map(str::to_owned);
+        let output = self
+            .runtime()
+            .base
+            .probe_output(&mut self.exec(name, "/", &args))?;
+        anyhow::ensure!(
+            output.status.success(),
+            "container path could not be resolved"
+        );
+        let output = String::from_utf8(output.stdout)?;
+        let path = std::path::PathBuf::from(output.strip_suffix('\n').unwrap_or(&output));
+        anyhow::ensure!(
+            path.is_absolute(),
+            "container path resolver returned a relative path"
+        );
+        Ok(path)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ContainerExecutionSnapshot {
+    pub(crate) runtime: RuntimeExecutionSnapshot,
+    pub(crate) name: String,
+    pub(crate) id: String,
+    pub(crate) mounts: Vec<super::VolumeMount>,
+    pub(crate) shadow_mounts: Vec<String>,
+}
+
+impl ContainerExecutionSnapshot {
+    pub(crate) fn capture(runtime: RuntimeExecutionSnapshot, name: &str) -> anyhow::Result<Self> {
+        use crate::session::ContainerRuntimeName as Name;
+        let inspected = match runtime.kind {
+            Name::Docker | Name::Podman => runtime.probe_json(&[
+                "container",
+                "inspect",
+                "--format",
+                "{\"id\":{{json .Id}},\"mounts\":{{json .Mounts}}}",
+                name,
+            ])?,
+            Name::AppleContainer => runtime.probe_json(&["inspect", name])?,
+        };
+        let (id, mounts) = match runtime.kind {
+            Name::Docker | Name::Podman => (inspected.get("id"), inspected.get("mounts")),
+            Name::AppleContainer => (
+                inspected
+                    .pointer("/0/id")
+                    .or_else(|| inspected.pointer("/0/configuration/id")),
+                inspected.pointer("/0/configuration/mounts"),
+            ),
+        };
+        let id = id
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("container inspect has no identity"))?
+            .to_owned();
+        let mounts = mounts
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("container inspect has no mount snapshot"))?;
+        let mut binds = Vec::new();
+        let mut shadows = Vec::new();
+        for mount in mounts {
+            let apple = runtime.kind == Name::AppleContainer;
+            let destination = mount
+                .get(if apple { "destination" } else { "Destination" })
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("inspected mount has no destination"))?;
+            anyhow::ensure!(
+                std::path::Path::new(destination).is_absolute(),
+                "inspected mount destination is not absolute"
+            );
+            let bind = if apple {
+                mount.pointer("/type/virtiofs").is_some()
+            } else {
+                mount.get("Type").and_then(Value::as_str) == Some("bind")
+            };
+            if bind {
+                let source = mount
+                    .get(if apple { "source" } else { "Source" })
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("inspected bind has no source"))?;
+                anyhow::ensure!(
+                    std::path::Path::new(source).is_absolute(),
+                    "inspected bind source is not absolute"
+                );
+                let read_only = if apple {
+                    mount
+                        .get("options")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| anyhow::anyhow!("inspected share has no mount options"))?
+                        .iter()
+                        .any(|option| option.as_str() == Some("ro"))
+                } else {
+                    !mount
+                        .get("RW")
+                        .and_then(Value::as_bool)
+                        .ok_or_else(|| anyhow::anyhow!("inspected bind has no access mode"))?
+                };
+                binds.push(super::VolumeMount {
+                    host_path: source.into(),
+                    container_path: destination.into(),
+                    read_only,
+                });
+            } else {
+                shadows.push(destination.into());
+            }
+        }
+        Ok(Self {
+            runtime,
+            name: name.into(),
+            id,
+            mounts: binds,
+            shadow_mounts: shadows,
+        })
+    }
+
+    fn mapped_path(&self, path: &std::path::Path, writable: bool) -> Option<std::path::PathBuf> {
+        super::container_interface::host_path_for_mounts(
+            &self.mounts,
+            self.shadow_mounts.iter().map(String::as_str),
+            path,
+            writable,
+        )
+    }
+
+    pub(crate) fn host_path(
+        &self,
+        path: &std::path::Path,
+        writable: bool,
+    ) -> Option<std::path::PathBuf> {
+        if !self.runtime.local_mounts {
+            return None;
+        }
+        self.mapped_path(path, writable)
+    }
+
+    pub(crate) fn physical_path(&self, path: &std::path::Path) -> (String, std::path::PathBuf) {
+        if let Some(mapped) = self.mapped_path(path, true) {
+            if self.runtime.local_mounts {
+                let canonical = std::fs::canonicalize(&mapped)
+                    .unwrap_or_else(|_| crate::git::template::lexical_normalize(&mapped));
+                return ("host".into(), canonical);
+            }
+            return (
+                format!("runtime:{:?}:{}", self.runtime.kind, self.runtime.endpoint),
+                crate::git::template::lexical_normalize(&mapped),
+            );
+        }
+        (
+            format!(
+                "container:{:?}:{}:{}",
+                self.runtime.kind, self.runtime.endpoint, self.id
+            ),
+            path.to_path_buf(),
+        )
+    }
+}

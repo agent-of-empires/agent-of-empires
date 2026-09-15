@@ -68,17 +68,20 @@ pub use groups::{
     ARCHIVED_SECTION_PATH, SCRATCH_GROUP_NAME, SCRATCH_GROUP_PATH, TRASH_SECTION_NAME,
     TRASH_SECTION_PATH,
 };
+#[cfg(test)]
+pub(crate) use instance::test_helpers::publish_host_pi_transcript;
 pub(crate) use instance::{
     duplicate_session_error, find_duplicate_session, is_duplicate_session,
-    persist_omp_session_to_storage, persist_session_to_storage, PassiveStatusPatch, ResumeIntent,
-    SidWrite, NEWER_GENERATION_BUSY_REASON,
+    persist_session_to_storage, PassiveStatusPatch, ResumeIntent, SidWrite,
+    NEWER_GENERATION_BUSY_REASON,
 };
 pub(crate) use instance::{
-    generic_host_config_path_for, sidecar_host_config_path_for, ResumeAttemptPolicy,
-    TerminalContextResume,
+    generic_host_config_path_for, sidecar_host_config_path_for, ConversationState,
+    ResumeAttemptPolicy, TerminalContextResume,
 };
 pub use instance::{
-    is_valid_session_color, DetectionState, EnsureReadyError, EnsureReadyOutcome, Instance,
+    is_valid_session_color, ConversationBinding, ConversationProvenance, DetectionState,
+    EnsureReadyError, EnsureReadyOutcome, ExecutionBinding, ExecutionLocation, Instance,
     LaunchSidOutcome, LifecycleOperation, LifecycleReservation, LifecycleReservationError,
     PluginCreateIdempotency, PollerStart, SandboxInfo, SessionBucket, StartOutcome, Status,
     TerminalInfo, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo, SESSION_COLORS,

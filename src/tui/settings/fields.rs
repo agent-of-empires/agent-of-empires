@@ -396,6 +396,7 @@ fn is_map_list(section: &str, field: &str) -> bool {
                 | "agent_detect_as"
                 | "agent_acp_cmd"
                 | "agent_config_dir"
+                | "agent_execution_as"
         )
 }
 
@@ -1252,6 +1253,7 @@ mod tests {
             "session.agent_acp_cmd",
             "session.default_tool",
             "session.agent_config_dir",
+            "session.agent_execution_as",
         ] {
             assert!(
                 !ident_present(&repo_rows, denied),
@@ -1600,6 +1602,23 @@ mod tests {
         for ident in ["acp.max_concurrent_workers", "acp.silent_orphan_grace_secs"] {
             let pos = fields.iter().position(|f| f.ident() == ident).unwrap();
             assert!(pos > header_idx, "{ident} must follow the Advanced header");
+        }
+    }
+
+    #[test]
+    fn map_list_fields_round_trip_as_objects() {
+        for field in ["agent_config_dir", "agent_execution_as"] {
+            let leaf = schema_value_to_json(
+                &WidgetKind::List,
+                "session",
+                field,
+                &FieldValue::List(vec!["my-claude=claude".to_string()]),
+            );
+            assert_eq!(
+                leaf,
+                serde_json::json!({ "my-claude": "claude" }),
+                "{field} must survive a TUI edit as a map, not an array"
+            );
         }
     }
 

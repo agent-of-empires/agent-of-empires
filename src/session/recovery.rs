@@ -147,7 +147,7 @@ const ORPHAN_SCAN_MIN_SID_LEN: usize = 8;
 /// on the same hook presence as `status_hook_env_prefix`, so it tracks exactly
 /// the agents whose live process carries the anchored env marker.
 fn agent_injects_instance_id_env(inst: &Instance) -> bool {
-    inst.resolved_agent()
+    inst.status_agent()
         .is_some_and(|agent| agent.hook_config.is_some() || agent.sidecar_hooks.is_some())
 }
 
@@ -977,17 +977,21 @@ mod tests {
         let _ = child.wait();
     }
 
-    /// A renamed wrapper still carries the pane's marker, because
-    /// `status_hook_env_prefix` injects it on hook presence alone. Its needles
-    /// must therefore stay on the env-plus-executable pair. Falling back to
-    /// the sid would let a `--fork-session` child, which carries its parent's
-    /// sid in argv, suppress the parent's recovery (#3006).
+    /// A fork child carries its parent SID, so recovery must match the instance marker.
     #[test]
+    #[serial_test::serial]
     fn wrapper_hook_agent_keeps_the_env_marker_and_never_matches_on_sid() {
+        let home = tempfile::tempdir().unwrap();
+        let _isolation = crate::session::test_support::isolate_app_dir_at(home.path());
         const PROFILE: &str = "orphan-wrapper-needles";
         let _registry = crate::session::instance::test_helpers::install_aliases(
             PROFILE,
             &[("claude-personal", "claude")],
+        );
+        crate::session::instance::test_helpers::declare_execution_aliases(
+            PROFILE,
+            &[("claude-personal", "claude")],
+            home.path(),
         );
         let mut inst = Instance::new("wrapper", "/tmp/orphan-wrapper");
         inst.source_profile = PROFILE.to_string();

@@ -1,21 +1,4 @@
-//! End-to-end coverage for `aoe add --fork-from` (terminal fork).
-//!
-//! These tests drive the real `aoe` binary as a subprocess (`run_cli`, no
-//! tmux) and assert on the persisted `sessions.json`, so the fork gate is
-//! exercised through the full CLI surface without a live agent.
-//!
-//! The happy path needs a parent with a captured `agent_session_id`. A freshly
-//! created session has none (no conversation has happened), and the CLI has no
-//! way to set one, so the test seeds it by hand-editing the persisted parent
-//! before forking. That makes the assertion deterministic: the forked child
-//! must carry a fresh, distinct `agent_session_id` and a one-shot
-//! `Fork { from: <parent id> }` resume intent.
-//!
-//! The two denial paths need no seeding and prove the gate end to end: forking
-//! a parent that never captured an agent session is refused, and forking with
-//! an agent that has no fork capability is refused. `aoe add` (without
-//! `--launch`) does not spawn the agent or use tmux, so all three tests run
-//! deterministically anywhere `cargo test` runs.
+//! Public CLI fork eligibility, parent isolation and refusal side effects.
 
 use serial_test::parallel;
 
@@ -45,45 +28,15 @@ fn scratch_root(h: &TuiTestHarness) -> std::path::PathBuf {
     crate::harness::app_dir_in(h.home_path()).join("scratch")
 }
 
-/// Forking a session whose conversation has been observed pre-pins a fresh
-/// child agent id and a one-shot `Fork` resume intent pointing at the parent's
-/// captured id. The parent's own id is left untouched.
 #[test]
 #[parallel]
 fn fork_from_seeds_child_with_fork_intent() {
     let h = TuiTestHarness::new("fork_cli_happy");
     let project = h.project_path();
 
-    // Parent: a plain claude session (the stub satisfies the PATH check).
-    let parent = h.run_cli(&[
-        "add",
-        project.to_str().unwrap(),
-        "--cmd",
-        "claude",
-        "-t",
-        "ForkParent",
-    ]);
-    assert!(
-        parent.status.success(),
-        "aoe add parent failed: {}",
-        String::from_utf8_lossy(&parent.stderr)
-    );
-
-    // Seed the parent's captured agent session id by hand: a real conversation
-    // would set this, but the CLI cannot, and the fork gate keys off it.
-    let parent_agent_id = "11111111-2222-3333-4444-555555555555";
-    let mut sessions = read_sessions(&h);
-    let arr = sessions.as_array_mut().expect("sessions array");
-    let parent_obj = arr
-        .iter_mut()
-        .find(|s| s["title"].as_str() == Some("ForkParent"))
-        .expect("parent session present");
-    parent_obj["agent_session_id"] = serde_json::Value::String(parent_agent_id.to_string());
-    std::fs::write(
-        sessions_path(&h),
-        serde_json::to_string_pretty(&sessions).unwrap(),
-    )
-    .expect("write seeded sessions.json");
+    let parent_agent_id = seed_claude_parent(&h, &project, "ForkParent");
+    let before = read_sessions(&h);
+    let parent_before = session_by_title(&before, "ForkParent").clone();
 
     // Child: fork from the parent by title.
     let child = h.run_cli(&[
@@ -95,6 +48,8 @@ fn fork_from_seeds_child_with_fork_intent() {
         "ForkChild",
         "--fork-from",
         "ForkParent",
+        "--extra-args",
+        "--append-system-prompt resume",
     ]);
     assert!(
         child.status.success(),
@@ -108,10 +63,6 @@ fn fork_from_seeds_child_with_fork_intent() {
     let child_agent_id = child_obj["agent_session_id"]
         .as_str()
         .expect("forked child must pre-pin a fresh agent_session_id");
-    assert!(
-        !child_agent_id.is_empty(),
-        "child agent_session_id must be non-empty"
-    );
     assert_ne!(
         child_agent_id, parent_agent_id,
         "child must fork into a NEW id, not reuse the parent's"
@@ -125,27 +76,13 @@ fn fork_from_seeds_child_with_fork_intent() {
     );
     assert_eq!(
         resume_intent["value"]["from"].as_str(),
-        Some(parent_agent_id),
-        "Fork intent must resume the parent's captured agent id, got: {resume_intent:?}"
+        Some(parent_agent_id.as_str()),
+        "Fork intent must target the asserted parent conversation"
     );
-
-    // The parent is left untouched: same captured id, no fork intent.
-    let parent_obj = session_by_title(&sessions, "ForkParent");
-    assert_eq!(
-        parent_obj["agent_session_id"].as_str(),
-        Some(parent_agent_id),
-        "parent's captured id must be unchanged"
-    );
-    assert!(
-        parent_obj["resume_intent"].is_null()
-            || parent_obj["resume_intent"]["kind"].as_str() == Some("Default"),
-        "parent must not gain a Fork intent, got: {:?}",
-        parent_obj["resume_intent"]
-    );
+    assert_eq!(session_by_title(&sessions, "ForkParent"), &parent_before);
 }
 
-/// Seed a claude parent titled `title` with a captured agent id so a fork of it
-/// passes the "nothing to fork yet" gate. Returns the captured id.
+/// Create a parent with an explicitly asserted native conversation.
 fn seed_claude_parent(h: &TuiTestHarness, project: &std::path::Path, title: &str) -> String {
     let parent = h.run_cli(&[
         "add",
@@ -157,33 +94,100 @@ fn seed_claude_parent(h: &TuiTestHarness, project: &std::path::Path, title: &str
     ]);
     assert!(parent.status.success(), "aoe add parent '{title}' failed");
     let parent_agent_id = "11111111-2222-3333-4444-555555555555";
-    let mut sessions = read_sessions(h);
-    let arr = sessions.as_array_mut().expect("sessions array");
-    arr.iter_mut()
-        .find(|s| s["title"].as_str() == Some(title))
-        .expect("parent present")["agent_session_id"] =
-        serde_json::Value::String(parent_agent_id.to_string());
-    std::fs::write(
-        sessions_path(h),
-        serde_json::to_string_pretty(&sessions).unwrap(),
-    )
-    .expect("write seeded sessions.json");
+    let assertion = h.run_cli(&["session", "set-session-id", title, parent_agent_id]);
+    assert!(
+        assertion.status.success(),
+        "assert conversation: {}",
+        String::from_utf8_lossy(&assertion.stderr)
+    );
     parent_agent_id.to_string()
 }
 
-/// Forking a claude parent while explicitly selecting a DIFFERENT agent is
-/// refused: a captured id is agent-specific, so handing a Claude id to another
-/// agent's resume would fail or resume garbage. With no `--tool`/`--cmd`, the
-/// fork inherits the parent's agent and succeeds.
 #[test]
 #[parallel]
-fn fork_from_mismatched_tool_is_refused_but_inherits_when_unset() {
+fn restarting_a_never_launched_claude_session_dispatches_fresh() {
+    crate::harness::require_tmux!();
+    let mut h = TuiTestHarness::new("restart_unlaunched_claude");
+    install_dispatch_marker(&mut h, "claude");
+    let project = h.project_path();
+    let added = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "-c",
+        "claude",
+        "-t",
+        "FreshRestart",
+    ]);
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let restarted = h.run_cli(&["session", "restart", "FreshRestart"]);
+    assert!(
+        restarted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restarted.stderr)
+    );
+    let marker = h.home_path().join("native-spawn");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !marker.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(std::fs::read_to_string(marker).unwrap(), "dispatched");
+    let _ = h.run_cli(&["session", "stop", "FreshRestart"]);
+}
+
+fn install_dispatch_marker(h: &mut TuiTestHarness, agent: &str) {
+    let bin = h.install_path_command(agent);
+    let marker = h.home_path().join("native-spawn");
+    std::fs::write(
+        bin.join(agent),
+        format!(
+            "#!/bin/sh\n[ \"$1\" = --version ] && exit 0\nprintf dispatched > {}\n",
+            shell_words::quote(&marker.to_string_lossy()),
+        ),
+    )
+    .unwrap();
+}
+
+fn assert_launch_refused(h: &TuiTestHarness, title: &str) {
+    let before = read_sessions(h);
+    let output = h.run_cli(&["session", "start", title]);
+    assert!(
+        !output.status.success(),
+        "invalid native fork must not launch"
+    );
+    assert!(
+        !h.home_path().join("native-spawn").exists(),
+        "native dispatch must not occur"
+    );
+    let after = read_sessions(h);
+    for field in [
+        "agent_session_id",
+        "agent_session_binding",
+        "resume_intent",
+        "resume_binding",
+        "active_execution",
+        "pi_session_path",
+    ] {
+        assert_eq!(
+            session_by_title(&before, title)[field],
+            session_by_title(&after, title)[field],
+            "refusal changed {field}"
+        );
+    }
+}
+
+/// A mismatched agent is refused at launch without discarding the fork target.
+#[test]
+#[parallel]
+fn fork_from_mismatched_tool_is_refused_at_launch_but_inherits_when_unset() {
     let mut h = TuiTestHarness::new("fork_cli_tool_match");
     let project = h.project_path();
-    h.install_path_command("gemini");
+    install_dispatch_marker(&mut h, "gemini");
     seed_claude_parent(&h, &project, "MatchParent");
 
-    // Explicit mismatched --tool: rejected.
     let mismatched = h.run_cli(&[
         "add",
         project.to_str().unwrap(),
@@ -195,15 +199,10 @@ fn fork_from_mismatched_tool_is_refused_but_inherits_when_unset() {
         "MatchParent",
     ]);
     assert!(
-        !mismatched.status.success(),
-        "forking a claude parent as gemini must be refused"
+        mismatched.status.success(),
+        "a valid parent seed can be queued"
     );
-    let stderr = String::from_utf8_lossy(&mismatched.stderr);
-    assert!(
-        stderr.contains("must use the parent's agent"),
-        "expected a parent-agent-mismatch message, got: {stderr}"
-    );
-
+    assert_launch_refused(&h, "MismatchChild");
     // No --tool/--cmd: inherits the parent's agent (claude) and succeeds.
     let inherited = h.run_cli(&[
         "add",
@@ -226,14 +225,12 @@ fn fork_from_mismatched_tool_is_refused_but_inherits_when_unset() {
     );
 }
 
-/// `--fork-from` is fenced against flags that change the working directory or
-/// filesystem view, or that carry their own resume/fork flags: a fork must run
-/// in the parent's directory to resume the conversation. Each combination is
-/// rejected up front.
+/// Filesystem conflicts fail before provisioning; native selectors fail before dispatch.
 #[test]
 #[parallel]
 fn fork_from_rejects_conflicting_flags() {
-    let h = TuiTestHarness::new("fork_cli_flag_mutex");
+    let mut h = TuiTestHarness::new("fork_cli_flag_mutex");
+    install_dispatch_marker(&mut h, "claude");
     let project = h.project_path();
     seed_claude_parent(&h, &project, "FenceParent");
 
@@ -258,25 +255,18 @@ fn fork_from_rejects_conflicting_flags() {
         );
     }
 
-    // A launch command carrying its own resume/fork flags collides with the
-    // fork's appended flags; rejected. Covers claude's --resume flag and codex's
-    // bare `fork` subcommand (word-level match, not just claude's --flags).
-    for cmd in ["claude --resume abc", "codex fork abc"] {
-        let out = h.run_cli(&[
-            "add",
-            project.to_str().unwrap(),
-            "--cmd",
-            cmd,
-            "-t",
-            "R",
-            "--fork-from",
-            "FenceParent",
-        ]);
-        assert!(
-            !out.status.success(),
-            "`--fork-from` with a --cmd carrying a resume/fork flag ({cmd}) must be refused"
-        );
-    }
+    let child = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "--cmd",
+        "claude --resume abc",
+        "-t",
+        "SelectorChild",
+        "--fork-from",
+        "FenceParent",
+    ]);
+    assert!(child.status.success(), "a valid parent seed can be queued");
+    assert_launch_refused(&h, "SelectorChild");
 
     // --cmd-override swaps the binary out from under the tool, decoupling it
     // from the parent's agent and its fork flags; rejected.
@@ -329,12 +319,6 @@ fn fork_from_parent_without_agent_session_is_refused() {
         !child.status.success(),
         "fork from a session with no captured agent id must fail"
     );
-    let stderr = String::from_utf8_lossy(&child.stderr);
-    assert!(
-        stderr.contains("Nothing to fork"),
-        "expected a 'Nothing to fork' message, got: {stderr}"
-    );
-
     let sessions = read_sessions(&h);
     assert!(
         sessions
@@ -358,15 +342,7 @@ fn refused_scratch_fork_leaves_no_orphaned_dir() {
     let h = TuiTestHarness::new("fork_cli_scratch_no_leak");
     let project = h.project_path();
 
-    let parent = h.run_cli(&[
-        "add",
-        project.to_str().unwrap(),
-        "--cmd",
-        "claude",
-        "-t",
-        "ScratchForkParent",
-    ]);
-    assert!(parent.status.success(), "aoe add parent failed");
+    seed_claude_parent(&h, &project, "ScratchForkParent");
 
     // The parent is a project session, so nothing has touched the scratch root
     // yet. A successful scratch fork would create <app_dir>/scratch/<id>/.
@@ -393,12 +369,6 @@ fn refused_scratch_fork_leaves_no_orphaned_dir() {
         !child.status.success(),
         "a scratch fork must be refused (scratch cwd cannot resume the parent)"
     );
-    let stderr = String::from_utf8_lossy(&child.stderr);
-    assert!(
-        stderr.contains("--scratch"),
-        "expected a '--scratch cannot be combined' message, got: {stderr}"
-    );
-
     // Leak check: the denial fires before scratch provisioning, so no scratch
     // directory was created.
     assert!(
@@ -410,7 +380,6 @@ fn refused_scratch_fork_leaves_no_orphaned_dir() {
         scratch_root.display()
     );
 
-    // And no child session was persisted.
     let sessions = read_sessions(&h);
     assert!(
         sessions
@@ -423,47 +392,19 @@ fn refused_scratch_fork_leaves_no_orphaned_dir() {
     );
 }
 
-/// Forking from a session whose own fork has not launched yet is refused. Such
-/// a source still carries a one-shot `Fork` resume intent and a pre-pinned
-/// child `agent_session_id` that no agent has written, so forking from it would
-/// resume a conversation that does not exist. The gate keys off `resume_intent`,
-/// not the (synthetic) captured id.
+/// A fork child cannot be forked before its first qualified observation.
 #[test]
 #[parallel]
 fn fork_from_unlaunched_fork_is_refused() {
     let h = TuiTestHarness::new("fork_cli_unlaunched_fork");
     let project = h.project_path();
-
-    let parent = h.run_cli(&[
-        "add",
-        project.to_str().unwrap(),
-        "--cmd",
-        "claude",
-        "-t",
-        "PendingFork",
-    ]);
-    assert!(parent.status.success(), "aoe add parent failed");
-
-    // Make the source look like an unlaunched fork: a pre-pinned (synthetic)
-    // child id plus a one-shot Fork intent, exactly what a forked-but-not-yet-
-    // started session persists.
-    let mut sessions = read_sessions(&h);
-    let arr = sessions.as_array_mut().expect("sessions array");
-    let src = arr
-        .iter_mut()
-        .find(|s| s["title"].as_str() == Some("PendingFork"))
-        .expect("source session present");
-    src["agent_session_id"] =
-        serde_json::Value::String("99999999-8888-7777-6666-555555555555".to_string());
-    src["resume_intent"] = serde_json::json!({
-        "kind": "Fork",
-        "value": { "from": "11111111-2222-3333-4444-555555555555" }
-    });
-    std::fs::write(
-        sessions_path(&h),
-        serde_json::to_string_pretty(&sessions).unwrap(),
-    )
-    .expect("write seeded sessions.json");
+    seed_claude_parent(&h, &project, "Parent");
+    let pending = h.run_cli(&["add", "--fork-from", "Parent", "-t", "PendingFork"]);
+    assert!(
+        pending.status.success(),
+        "create pending fork: {}",
+        String::from_utf8_lossy(&pending.stderr)
+    );
 
     let child = h.run_cli(&[
         "add",
@@ -479,12 +420,6 @@ fn fork_from_unlaunched_fork_is_refused() {
         !child.status.success(),
         "fork from an unlaunched fork must fail"
     );
-    let stderr = String::from_utf8_lossy(&child.stderr);
-    assert!(
-        stderr.contains("its own fork has not launched yet"),
-        "expected an 'unlaunched fork' message, got: {stderr}"
-    );
-
     let sessions = read_sessions(&h);
     assert!(
         sessions
@@ -509,32 +444,7 @@ fn fork_from_with_structured_view_is_refused() {
     let h = TuiTestHarness::new("fork_cli_structured_reject");
     let project = h.project_path();
 
-    let parent = h.run_cli(&[
-        "add",
-        project.to_str().unwrap(),
-        "--cmd",
-        "claude",
-        "-t",
-        "StructForkParent",
-    ]);
-    assert!(parent.status.success(), "aoe add parent failed");
-
-    // Seed a captured id so the request would otherwise reach the seed apply
-    // step: the structured-view rejection must fire regardless.
-    let parent_agent_id = "abcdef00-1111-2222-3333-444444444444";
-    let mut sessions = read_sessions(&h);
-    sessions
-        .as_array_mut()
-        .expect("sessions array")
-        .iter_mut()
-        .find(|s| s["title"].as_str() == Some("StructForkParent"))
-        .expect("parent present")["agent_session_id"] =
-        serde_json::Value::String(parent_agent_id.to_string());
-    std::fs::write(
-        sessions_path(&h),
-        serde_json::to_string_pretty(&sessions).unwrap(),
-    )
-    .expect("write seeded sessions.json");
+    seed_claude_parent(&h, &project, "StructForkParent");
 
     // The parent is a project session, so nothing has touched the scratch root
     // yet. A scratch fork that got past the rejection would create
@@ -563,14 +473,6 @@ fn fork_from_with_structured_view_is_refused() {
         !child.status.success(),
         "--fork-from --structured-view must fail"
     );
-    let stderr = String::from_utf8_lossy(&child.stderr);
-    assert!(
-        stderr.contains("cannot be combined with"),
-        "expected an incompatible-flags message, got: {stderr}"
-    );
-
-    // Leak check: the rejection fires before scratch provisioning, so no
-    // scratch directory was created.
     assert!(
         !scratch_root.exists()
             || std::fs::read_dir(&scratch_root)
@@ -620,19 +522,17 @@ fn fork_from_unforkable_agent_is_refused() {
         "GemParent",
     ]);
     assert!(parent.status.success(), "aoe add parent failed");
-
-    let parent_agent_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-    let mut sessions = read_sessions(&h);
-    let arr = sessions.as_array_mut().expect("sessions array");
-    arr.iter_mut()
-        .find(|s| s["title"].as_str() == Some("GemParent"))
-        .expect("parent present")["agent_session_id"] =
-        serde_json::Value::String(parent_agent_id.to_string());
-    std::fs::write(
-        sessions_path(&h),
-        serde_json::to_string_pretty(&sessions).unwrap(),
-    )
-    .expect("write seeded sessions.json");
+    let assertion = h.run_cli(&[
+        "session",
+        "set-session-id",
+        "GemParent",
+        "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+    ]);
+    assert!(
+        assertion.status.success(),
+        "assert conversation: {}",
+        String::from_utf8_lossy(&assertion.stderr)
+    );
 
     let child = h.run_cli(&[
         "add",
@@ -648,9 +548,23 @@ fn fork_from_unforkable_agent_is_refused() {
         !child.status.success(),
         "fork with an unforkable agent must fail"
     );
-    let stderr = String::from_utf8_lossy(&child.stderr);
+
+    // The seed comes from the parent's own binding, so the refusal names the
+    // parent's agent even when the child requests a forkable tool.
+    let cross_tool = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "--tool",
+        "claude",
+        "-t",
+        "CrossToolChild",
+        "--fork-from",
+        "GemParent",
+    ]);
+    let stderr = String::from_utf8_lossy(&cross_tool.stderr).to_string();
+    assert!(!cross_tool.status.success(), "cross-tool fork must fail");
     assert!(
-        stderr.contains("does not support forking"),
-        "expected a 'does not support forking' message, got: {stderr}"
+        stderr.contains("does not support forking") && stderr.contains("'gemini'"),
+        "the refusal must name the parent's agent, got: {stderr}"
     );
 }

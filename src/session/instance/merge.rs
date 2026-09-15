@@ -48,31 +48,27 @@ impl Instance {
         let generation_can_merge = self.omp_capture_generation == before.omp_capture_generation
             || self.omp_capture_generation == src.omp_capture_generation;
         self.lifecycle_generation = src.lifecycle_generation;
-        let sid_unchanged = self.agent_session_id == before.agent_session_id;
+        let conversation_unchanged = before.conversation_state().matches(self);
         let marker_unchanged = self.resume_probe_failed_sid == before.resume_probe_failed_sid;
 
         if generation_can_merge {
             self.omp_capture_generation = src.omp_capture_generation.clone();
+            if conversation_unchanged {
+                self.adopt_conversation_state(src.conversation_state());
+            }
+        }
+        if self.active_execution == src.active_execution {
             self.session_id_poller = src.session_id_poller.clone();
             self.session_id_poller_retry_after = src.session_id_poller_retry_after;
-            if sid_unchanged {
-                self.agent_session_id = src.agent_session_id.clone();
+            if src.session_id_poller_is_running() {
+                self.poller_repair.reset();
             }
-        } else if src.session_id_poller_is_running() {
-            // A concurrent launch already published a third generation. The
-            // restarted poller reloads tmux metadata on every tick, so keep
-            // that live worker and let it rebind to the newer generation
-            // without overwriting the newer durable identity.
-            self.session_id_poller = src.session_id_poller.clone();
+        } else {
+            src.stop_poller();
         }
         if generation_can_merge && marker_unchanged && self.agent_session_id == src.agent_session_id
         {
             self.resume_probe_failed_sid = src.resume_probe_failed_sid.clone();
-        }
-        // `install_poller` cleared the working clone's repair schedule when
-        // its poller started; the live row must not keep the stale backoff.
-        if src.session_id_poller_is_running() {
-            self.poller_repair.reset();
         }
     }
 
@@ -116,10 +112,13 @@ impl Instance {
         self.last_error = previous.last_error.clone();
         self.last_error_check = previous.last_error_check;
         self.last_start_time = previous.last_start_time;
-        self.session_id_poller = previous.session_id_poller.clone();
-        self.poller_repair = previous.poller_repair.clone();
-        self.session_id_poller_retry_after = previous.session_id_poller_retry_after;
-        self.retroactive_capture_excludes = previous.retroactive_capture_excludes.clone();
+        if self.active_execution == previous.active_execution {
+            self.session_id_poller = previous.session_id_poller.clone();
+            self.poller_repair = previous.poller_repair.clone();
+            self.session_id_poller_retry_after = previous.session_id_poller_retry_after;
+        } else {
+            previous.stop_poller();
+        }
         self.acp_load_session_capable = previous.acp_load_session_capable;
     }
 
@@ -176,85 +175,49 @@ impl Instance {
         self.extra_args = src.extra_args.clone();
     }
 
-    /// Move this row to a different `tool` (the TUI restart dialog's engine
-    /// swap), parking the outgoing agent's session ids and picking up the
-    /// incoming agent's, if it has been here before.
-    ///
-    /// Session ids live in per-agent namespaces: a Claude UUID means nothing
-    /// to codex or gemini, but `is_valid_session_id` accepts any shape, so a
-    /// carried-over sid makes the next launch emit `--resume <foreign-sid>`
-    /// and the new engine starts by failing to resume. #3077 made the swap
-    /// reach disk, which is what exposed this. The rest of what this clears
-    /// mirrors the structured-view agent switch (`POST /api/acp/:id/switch`).
-    ///
-    /// A no-op when `new_tool` is the current tool, so a caller may apply it
-    /// to a disk row and an in-memory row independently without the second
-    /// call double-stashing.
-    ///
-    /// Callers must persist the result themselves: `merge_from_tui`
-    /// deliberately does not sync these fields (the capture pollers own
-    /// `agent_session_id` through CAS writes), so an in-memory-only swap is
-    /// reverted by `reconcile_from_disk` on the next launch.
+    /// Switch tools, parking completed conversations per tool.
+    /// Pending forks retain their target for launch-time namespace validation.
+    /// Callers must persist this transition themselves.
     pub(crate) fn swap_tool(&mut self, new_tool: &str) {
         if new_tool == self.tool {
             return;
         }
-        // Park the outgoing agent's conversation under its own name so a swap
-        // back to it resumes there instead of starting a third conversation.
-        let outgoing = PriorToolSession {
-            agent_session_id: self.agent_session_id.take(),
-            acp_session_id: self.acp_session_id.take(),
-        };
-        if !outgoing.is_empty() {
-            self.prior_tool_session_ids
-                .insert(self.tool.clone(), outgoing);
+        if !matches!(self.resume_intent, ResumeIntent::Fork { .. }) {
+            let outgoing = PriorToolSession {
+                agent_session_id: self.agent_session_id.take(),
+                agent_session_binding: self.agent_session_binding.take(),
+                pi_session_path: self.pi_session_path.take(),
+                acp_session_id: self.acp_session_id.take(),
+            };
+            if !outgoing.is_empty() {
+                self.prior_tool_session_ids
+                    .insert(self.tool.clone(), outgoing);
+            }
+            let restored = self
+                .prior_tool_session_ids
+                .remove(new_tool)
+                .unwrap_or_default();
+            self.set_agent_conversation(
+                restored.agent_session_id,
+                restored.agent_session_binding,
+                restored.pi_session_path,
+            );
+            self.acp_session_id = restored.acp_session_id;
+            self.resume_intent = ResumeIntent::Default;
+            self.resume_binding = None;
         }
         self.tool = new_tool.to_string();
-        // The alias is resolved per-tool, so the outgoing tool's answer cannot
-        // survive: kept, it points `resolved_agent` at the wrong built-in
-        // outright (a `codex-personal` -> `claude-personal` swap would keep
-        // detecting as codex); cleared, the row lands in the same
-        // empty-`detect_as` state a session built before its tool joined
-        // `[session.agent_detect_as]` does. Re-resolve against the same
-        // process-global registry `effective_detect_as` reads, so this stays a
-        // lookup rather than a config load, and the row ends up exactly as if
-        // it had been built on the new tool.
         self.detect_as =
             tmux::status_rules::effective_detect_as(&self.source_profile, new_tool, "")
                 .into_owned();
-        // Consumed, not copied: the row owns exactly one live conversation per
-        // agent, and leaving the entry behind would let a later swap restore an
-        // id this session has since replaced.
-        let restored = self
-            .prior_tool_session_ids
-            .remove(new_tool)
-            .unwrap_or_default();
-        self.agent_session_id = restored.agent_session_id;
-        self.acp_session_id = restored.acp_session_id;
         self.acp_load_session_capable = None;
         self.resume_probe_failed_sid = None;
-        // A pin/clear/fork directive names an id in the old agent's namespace,
-        // so it cannot survive the swap either.
-        self.resume_intent = ResumeIntent::Default;
-        // Effort vocabularies are adapter-specific, so the old agent's pick is
-        // meaningless to the new one; it falls back to the new agent's default.
+        self.active_execution = None;
         self.acp_effort = None;
-        // Same for the pinned model: `claude-opus-4-7` means nothing to codex,
-        // and it is re-injected on every spawn, so it has to go too.
         self.agent_model = None;
-        // `acp_mode_id` deliberately stays. It is the session's approval
-        // posture, and clearing it does not fall back to "default": the spawn
-        // path's mode gate is `acp_mode_id.is_some() || yolo_mode`, whose
-        // `None` arm resolves the adapter's *bypass* mode id, so dropping an
-        // explicit restrictive mode from a `yolo_mode` row would silently
-        // escalate the new agent to auto-approve. An unrecognized mode id is a
-        // warn-and-continue no-op instead, which is the safe failure. The
-        // structured-view agent switch passes it through for the same reason.
+        // Keep the approval posture: clearing it can select the bypass mode.
         self.import_pending = None;
         self.fork_pending = None;
-        // The pinned structured-view agent belongs to the old tool; clearing it
-        // lets the spawn path pick the new tool's default agent instead of
-        // silently keeping the old backend alive across the swap.
         self.agent_name = None;
     }
 
@@ -785,6 +748,19 @@ mod tests {
         before.omp_capture_generation = Some("generation-a".to_string());
         let mut restarted = before.clone();
         restarted.omp_capture_generation = Some("generation-b".to_string());
+        restarted.active_execution = Some(ActiveExecution {
+            launch_id: "11111111-1111-4111-8111-111111111111".into(),
+            binding: ExecutionBinding {
+                agent: "omp".into(),
+                stores: vec!["/tmp/omp".into()],
+                configuration: Vec::new(),
+                cwd: "/tmp/test".into(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+            },
+            capture: None,
+            container: None,
+        });
         let mut poller = crate::session::poller::SessionPoller::new("omp-restarted".to_string());
         assert_eq!(
             poller.start(before.id.clone(), Box::new(|| None), Box::new(|_| {}), None,),
@@ -795,7 +771,16 @@ mod tests {
         let mut live = before.clone();
         live.merge_post_restart_with_baseline(&before, &restarted);
         assert_eq!(live.omp_capture_generation.as_deref(), Some("generation-b"));
-        assert!(live.session_id_poller.is_some());
+        assert!(live.session_id_poller_is_running());
+
+        let mut peer_metadata = before.clone();
+        peer_metadata.agent_session_binding = Some(ConversationBinding::unknown("old-sid"));
+        let expected = peer_metadata.conversation_state();
+        peer_metadata.merge_post_restart_with_baseline(&before, &restarted);
+        assert!(
+            expected.matches(&peer_metadata),
+            "same-SID metadata writes must survive restart"
+        );
 
         let mut generation_converged = before.clone();
         generation_converged.agent_session_id = Some("peer-sid".to_string());
@@ -805,7 +790,6 @@ mod tests {
             generation_converged.agent_session_id.as_deref(),
             Some("peer-sid")
         );
-        assert!(generation_converged.session_id_poller.is_some());
 
         let mut peer_relaunched = before.clone();
         peer_relaunched.omp_capture_generation = Some("peer-generation".to_string());
@@ -814,13 +798,6 @@ mod tests {
             peer_relaunched.omp_capture_generation.as_deref(),
             Some("peer-generation")
         );
-        assert!(std::sync::Arc::ptr_eq(
-            peer_relaunched
-                .session_id_poller
-                .as_ref()
-                .expect("running restart poller"),
-            &restarted_poller,
-        ));
         restarted_poller
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

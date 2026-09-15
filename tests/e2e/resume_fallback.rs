@@ -170,10 +170,6 @@ fn stale_resume_failure_persists_loop_breaker_and_next_restart_starts_fresh() {
         row.insert("command".to_string(), Value::String(FAKE_AGENT.to_string()));
         row.insert("tool".to_string(), Value::String("claude".to_string()));
         row.insert("status".to_string(), Value::String("idle".to_string()));
-        row.insert(
-            "agent_session_id".to_string(),
-            Value::String(STALE_SID.to_string()),
-        );
         row.remove("resume_probe_failed_sid");
         row.remove("resume_intent");
     });
@@ -183,10 +179,44 @@ fn stale_resume_failure_persists_loop_breaker_and_next_restart_starts_fresh() {
     // premise collapses. Seed one so the restart takes the `--resume` path.
     seed_claude_transcript(&h, &project, STALE_SID);
 
+    // A migrated ID carries unknown provenance, which a managed launch refuses.
+    // Assert the conversation through the documented path, then absorb that
+    // resolved binding as the observation an automatic capture would have
+    // recorded. The restart below is then the automatic `--resume` the loop
+    // breaker governs, not an explicit pin.
+    let asserted = h.run_cli(&["session", "set-session-id", TITLE, STALE_SID]);
+    assert!(
+        asserted.status.success(),
+        "set-session-id failed: {}",
+        String::from_utf8_lossy(&asserted.stderr)
+    );
+    patch_session(&h, TITLE, |row| {
+        let binding = row["resume_binding"]
+            .as_object()
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!(
+                    "set-session-id recorded no binding: {:?}",
+                    row["resume_binding"]
+                )
+            });
+        let mut binding = Value::Object(binding);
+        binding["provenance"] = Value::String("observed".to_string());
+        row.insert("agent_session_binding".to_string(), binding);
+        row.insert(
+            "agent_session_id".to_string(),
+            Value::String(STALE_SID.to_string()),
+        );
+        row.remove("resume_intent");
+        row.remove("resume_binding");
+        row.remove("resume_probe_failed_sid");
+    });
+
     let first = h.run_cli(&["session", "restart", TITLE]);
     assert!(
         !first.status.success(),
-        "first restart should fail after passing stale sid"
+        "first restart should fail after passing stale sid: {}",
+        String::from_utf8_lossy(&first.stderr)
     );
 
     let sessions = read_sessions(&h);

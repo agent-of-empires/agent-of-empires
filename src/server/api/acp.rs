@@ -2135,11 +2135,17 @@ pub async fn acp_enable(
             .agent_session_id
             .as_deref()
             .map(|sid| {
-                !crate::session::capture::claude_host_transcript_confirmed_absent(
-                    &instance.project_path,
-                    sid,
+                crate::session::capture::claude_home_for_host_environment(
                     &instance.resolved_host_environment(),
                 )
+                .map(|home| {
+                    !crate::session::capture::claude_host_transcript_confirmed_absent(
+                        &instance.project_path,
+                        sid,
+                        &home,
+                    )
+                })
+                .unwrap_or(true)
             })
             .unwrap_or(false);
     let seed = resolve_structured_seed(
@@ -2279,7 +2285,11 @@ pub async fn acp_disable(
         let profile = inst.source_profile.clone();
         (inst, profile)
     };
-
+    let memory_expected = (
+        instance.view,
+        instance.acp_session_id.clone(),
+        instance.conversation_state(),
+    );
     if !instance.is_structured() {
         // A reload may have installed a pre-enable terminal snapshot in the
         // cache. Confirm the durable row before taking the idempotent path, or
@@ -2333,11 +2343,12 @@ pub async fn acp_disable(
     // The idempotent already-terminal case returned above; commit the real
     // ACP-to-terminal transition before worker teardown.
 
-    // Decide whether this swap can preserve context. Resolve the ACTIVE
-    // structured-view adapter (switch_acp_agent can point agent_name away
-    // from the tool's default) and keep context only when it shares a
-    // CLI-resumable transcript with the terminal `<tool> --resume`, and an
-    // acp_session_id was actually captured. See #2252.
+    let disk_expected = (
+        instance.view,
+        instance.acp_session_id.clone(),
+        instance.conversation_state(),
+    );
+    // Only adapters sharing a native transcript can request a terminal handoff.
     let acp_agent = state
         .acp_supervisor
         .pick_agent_for_tool(
@@ -2356,7 +2367,9 @@ pub async fn acp_disable(
             session = %id,
             "keeping context on disable: carrying acp_session_id into agent_session_id for claude --resume"
         );
-        instance.switch_to_terminal_keep_context();
+        if let Err(error) = instance.switch_to_terminal_keep_context() {
+            return (StatusCode::CONFLICT, error.to_string()).into_response();
+        }
     } else {
         instance.view = crate::session::View::Terminal;
         instance.acp_load_session_capable = None;
@@ -2376,35 +2389,49 @@ pub async fn acp_disable(
         }
     }
 
-    // Persist + start tmux. start() now no longer short-circuits for
-    // structured_view, so it will create a fresh tmux session and run
-    // the agent CLI in the pane.
-    //
-    // Persist the fields this handler owns before mirroring them into memory.
-    // The epoch bump under the instances lock rejects any reload whose disk
-    // snapshot predates this view transition.
+    // Serialize durable handoff and cache publication against ACP identity events.
     let persist_acp_session_id = instance.acp_session_id.clone();
     let persist_import_pending = instance.import_pending;
-    let persist_agent_session_id = instance.agent_session_id.clone();
-    let persist_resume_intent = instance.resume_intent.clone();
+    let persist_conversation = instance.conversation_state();
     let disk_acp_session_id = persist_acp_session_id.clone();
     let disk_import_pending = persist_import_pending;
-    let disk_agent_session_id = persist_agent_session_id.clone();
-    let disk_resume_intent = persist_resume_intent.clone();
+    let disk_conversation = persist_conversation.clone();
     let id_for_save = id.clone();
     let profile_for_save = profile.clone();
     let file_watch_for_save = state.file_watch.clone();
+    let mut instances = state.instances.write().await;
+    let Some(slot) = instances.iter_mut().find(|row| row.id == id) else {
+        return (StatusCode::NOT_FOUND, "session not found").into_response();
+    };
+    if slot.view != memory_expected.0
+        || slot.acp_session_id != memory_expected.1
+        || (keep_context && !memory_expected.2.matches(slot))
+    {
+        return (
+            StatusCode::CONFLICT,
+            "ACP identity changed during terminal handoff; retry",
+        )
+            .into_response();
+    }
+    drop(instances);
     let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let storage = crate::session::Storage::new(&profile_for_save, file_watch_for_save)?;
         storage.update(|all, _groups| {
             if let Some(slot) = all.iter_mut().find(|candidate| candidate.id == id_for_save) {
+                anyhow::ensure!(
+                    slot.view == disk_expected.0
+                        && slot.acp_session_id == disk_expected.1
+                        && (!keep_context || disk_expected.2.matches(slot)),
+                    "ACP identity changed during terminal handoff; retry"
+                );
                 slot.view = crate::session::View::Terminal;
                 slot.acp_session_id = disk_acp_session_id.clone();
                 slot.import_pending = disk_import_pending;
                 if keep_context {
-                    slot.agent_session_id = disk_agent_session_id.clone();
-                    slot.resume_intent = disk_resume_intent.clone();
+                    slot.adopt_conversation_state(disk_conversation.clone());
                 }
+            } else {
+                anyhow::bail!("session disappeared during terminal handoff");
             }
             Ok(())
         })?;
@@ -2414,34 +2441,44 @@ pub async fn acp_disable(
     match save_result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
-            tracing::error!(target: "acp.switch", "save after disable: {e}");
+            return (
+                StatusCode::CONFLICT,
+                format!("terminal handoff was not saved: {e}"),
+            )
+                .into_response();
         }
         Err(join_err) => {
-            tracing::error!(target: "acp.switch", "save task panicked after disable: {join_err}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("terminal handoff save failed: {join_err}"),
+            )
+                .into_response();
         }
     }
-    {
-        let mut instances = state.instances.write().await;
-        if let Some(slot) = instances.iter_mut().find(|i| i.id == id) {
-            slot.view = crate::session::View::Terminal;
-            slot.acp_load_session_capable = None;
-            slot.acp_session_id = persist_acp_session_id;
-            slot.import_pending = persist_import_pending;
-            if keep_context {
-                slot.agent_session_id = persist_agent_session_id;
-                slot.resume_intent = persist_resume_intent;
-            }
-            state
-                .mutation_epoch
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let mut instances = state.instances.write().await;
+    if let Some(slot) = instances.iter_mut().find(|row| row.id == id) {
+        slot.view = crate::session::View::Terminal;
+        slot.acp_load_session_capable = None;
+        slot.acp_session_id = persist_acp_session_id;
+        slot.import_pending = persist_import_pending;
+        if keep_context {
+            slot.adopt_conversation_state(persist_conversation);
         }
+        state
+            .mutation_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    } else {
+        // The durable handoff is committed. A row dropped from the cache must
+        // not turn the teardown below into a 404 that leaves the structured
+        // worker, its registry record and its event store alive.
+        tracing::warn!(
+            target: "acp.switch",
+            session = %id,
+            "session missing from the cache after the terminal handoff was saved; continuing worker teardown"
+        );
     }
-
-    // Commit the desired view before removing the worker. Supervisor shutdown
-    // removes its worker entry before transport teardown completes; leaving the
-    // row structured in that window lets the reconciler spawn a replacement.
-    // `shutdown` preserves the transcript for the resumable path, while
-    // `shutdown_and_delete` releases it for the destructive path.
+    drop(instances);
+    // Publish the terminal view before worker removal so reconciliation cannot respawn ACP.
     let shutdown_result = if keep_context {
         state.acp_supervisor.shutdown(&id).await
     } else {
@@ -4064,17 +4101,15 @@ mod tests {
         );
     }
 
-    /// The ACP-side half of the #3650 worker-stopping barrier. `shutdown_acp`,
-    /// `switch_acp_agent` and `acp_disable` all tear the worker down, so a
-    /// queue drain mid-delivery must finish first: `send_turn` respawns a
-    /// worker it finds gone, which would undo the shutdown and, for the
-    /// switch, deliver the prompt to the agent the user just switched away
-    /// from.
+    /// Worker teardown must wait until the in-flight submission releases ownership.
     #[tokio::test]
+    #[serial_test::serial]
     async fn worker_stopping_acp_endpoints_wait_for_an_in_flight_submission() {
         let _app_dir = crate::session::test_support::isolate_app_dir();
         use std::time::Duration;
-
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let storage = crate::session::Storage::new_unwatched("acp-barrier").unwrap();
         async fn call(which: &str, state: Arc<AppState>, id: String) -> axum::response::Response {
             match which {
                 "shutdown" => shutdown_acp(State(state), Path(id)).await.into_response(),
@@ -4095,12 +4130,24 @@ mod tests {
         }
 
         for which in ["shutdown", "switch", "disable"] {
-            let mut inst = crate::session::Instance::new("acp-3650", "/tmp/aoe-3650-acp");
+            let mut inst = crate::session::Instance::new(
+                "acp-3650",
+                temp.path().join("missing-project").to_str().unwrap(),
+            );
+            inst.source_profile = "acp-barrier".into();
             inst.id = format!("sess-3650-acp-{which}");
             inst.view = crate::session::View::Structured;
             inst.status = crate::session::Status::Idle;
             inst.acp_load_session_capable = Some(true);
             let id = inst.id.clone();
+            if which == "disable" {
+                storage
+                    .update(|rows, _| {
+                        rows.push(inst.clone());
+                        Ok(())
+                    })
+                    .unwrap();
+            }
             let state = crate::server::test_support::build_test_app_state(vec![inst]);
 
             let delivering = state.session_service.prompt_submission(&id).await;
@@ -4123,10 +4170,11 @@ mod tests {
             );
 
             drop(delivering);
-            tokio::time::timeout(Duration::from_secs(10), handler)
+            let response = tokio::time::timeout(Duration::from_secs(10), handler)
                 .await
                 .unwrap_or_else(|_| panic!("{which} must finish once the submission releases"));
             if which == "disable" {
+                assert_eq!(response.status(), StatusCode::OK);
                 assert_eq!(
                     state
                         .instances
@@ -4166,6 +4214,221 @@ mod tests {
         let adopted = adopt_persisted_structured_instance(cached, persisted, "work");
 
         assert_eq!(adopted.effective_profile(), "work");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn terminal_handoff_rejects_an_acp_identity_changed_on_disk() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
+        let _path = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "claude",
+            "#!/bin/sh\nexit 1\n",
+        );
+        let _home = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path().to_path_buf()),
+            ("CLAUDE_CONFIG_DIR", temp.path().join(".claude")),
+        ]);
+        let profile = "handoff-cas";
+        let sid = "11111111-1111-4111-8111-111111111111";
+        let storage = crate::session::Storage::new_unwatched(profile).unwrap();
+        for changed in [Some("22222222-2222-4222-8222-222222222222"), None] {
+            let mut inst = crate::session::Instance::new("handoff", temp.path().to_str().unwrap());
+            inst.source_profile = profile.into();
+            inst.tool = "claude".into();
+            inst.command = "claude".into();
+            inst.agent_name = Some("claude-agent-acp".into());
+            inst.resume_binding = Some(inst.asserted_resume_binding(sid, None).unwrap());
+            inst.resume_intent = crate::session::ResumeIntent::Use(sid.into());
+            inst.view = crate::session::View::Structured;
+            inst.acp_session_id = Some(sid.into());
+            let id = inst.id.clone();
+            let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
+            inst.acp_session_id = changed.map(str::to_owned);
+            storage
+                .update(|rows, _| {
+                    *rows = vec![inst.clone()];
+                    Ok(())
+                })
+                .unwrap();
+            let response = acp_disable(State(state.clone()), Path(id.clone()))
+                .await
+                .into_response();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let rows = storage.load().unwrap();
+            let row = rows.iter().find(|row| row.id == id).unwrap();
+            assert_eq!(row.view, crate::session::View::Structured);
+            assert_eq!(row.acp_session_id.as_deref(), changed);
+            assert_eq!(
+                state.instances.read().await[0].view,
+                crate::session::View::Structured
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn terminal_handoff_does_not_lock_other_sessions_during_storage_contention() {
+        use std::time::Duration;
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let profile = "handoff-contention";
+        let mut inst =
+            crate::session::Instance::new("handoff", temp.path().join("missing").to_str().unwrap());
+        inst.tool = "shell".into();
+        inst.source_profile = profile.into();
+        inst.view = crate::session::View::Structured;
+        inst.acp_session_id = Some("original-acp".into());
+        inst.agent_session_id = Some("native-preserved".into());
+        let id = inst.id.clone();
+        let expected = inst.conversation_state();
+        let mut other = crate::session::Instance::new("other", "/tmp/other");
+        other.source_profile = profile.into();
+        other.view = crate::session::View::Structured;
+        let other_id = other.id.clone();
+        let rows = vec![inst, other];
+        let storage = crate::session::Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|all, _| {
+                *all = rows.clone();
+                Ok(())
+            })
+            .unwrap();
+        let state = crate::server::test_support::build_test_app_state(rows);
+        let listener = tokio::spawn(crate::server::acp_events::acp_event_listener(state.clone()));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.acp_events_tx.receiver_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = tokio::task::spawn_blocking(move || {
+            storage
+                .update(|_, _| {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.recv_timeout(Duration::from_secs(10));
+                    Ok(())
+                })
+                .unwrap();
+        });
+        entered_rx.await.unwrap();
+        let lock = state.instance_lock(&id).await;
+        let handler = tokio::spawn({
+            let state = state.clone();
+            let id = id.clone();
+            async move { acp_disable(State(state), Path(id)).await.into_response() }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while lock.try_lock().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        for (seq, event) in [
+            crate::acp::Event::AcpSessionAssigned {
+                acp_session_id: "late".into(),
+            },
+            crate::acp::Event::SessionContextReset {
+                reason: "late".into(),
+            },
+            crate::acp::Event::SessionCleared,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            state
+                .acp_events_tx
+                .send(crate::server::AcpBroadcastFrame {
+                    session_id: id.clone(),
+                    seq: seq as u64 + 1,
+                    event: Arc::new(event),
+                    worker_generation: None,
+                })
+                .unwrap();
+        }
+        let accessible = tokio::time::timeout(Duration::from_secs(2), async {
+            let rows = state.instances.read().await;
+            assert_eq!(
+                rows.iter()
+                    .find(|row| row.id == id)
+                    .unwrap()
+                    .acp_session_id
+                    .as_deref(),
+                Some("original-acp")
+            );
+            drop(rows);
+            let mut rows = state.instances.write().await;
+            rows.iter_mut()
+                .find(|row| row.id == other_id)
+                .unwrap()
+                .title = "edited during contention".into();
+        })
+        .await;
+        let still_waiting = !handler.is_finished();
+        release_tx.send(()).unwrap();
+        holder.await.unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(10), handler)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            accessible.is_ok(),
+            "storage contention blocked the global instance cache"
+        );
+        assert!(still_waiting);
+        assert_eq!(response.status(), StatusCode::OK);
+        state
+            .acp_events_tx
+            .send(crate::server::AcpBroadcastFrame {
+                session_id: other_id.clone(),
+                seq: 1,
+                event: Arc::new(crate::acp::Event::AcpSessionAssigned {
+                    acp_session_id: "drained".into(),
+                }),
+                worker_generation: None,
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if state
+                    .instances
+                    .read()
+                    .await
+                    .iter()
+                    .find(|row| row.id == other_id)
+                    .unwrap()
+                    .acp_session_id
+                    .as_deref()
+                    == Some("drained")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        listener.abort();
+        let rows = state.instances.read().await;
+        let row = rows.iter().find(|row| row.id == id).unwrap();
+        assert_eq!(row.view, crate::session::View::Terminal);
+        assert_eq!(row.acp_session_id, None);
+        assert!(expected.matches(row));
+        drop(rows);
+        let rows = crate::session::Storage::new_unwatched(profile)
+            .unwrap()
+            .load()
+            .unwrap();
+        let row = rows.iter().find(|row| row.id == id).unwrap();
+        assert_eq!(row.view, crate::session::View::Terminal);
+        assert_eq!(row.acp_session_id, None);
+        assert!(expected.matches(row));
     }
 
     #[tokio::test]

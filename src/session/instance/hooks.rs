@@ -92,7 +92,7 @@ impl Instance {
                 &self.extra_args,
             ))?;
         }
-        let agent = self.resolved_agent();
+        let agent = self.status_agent();
         self.ensure_disclosed_host_hook_path(agent)?;
         self.install_agent_status_hooks(agent);
         self.ensure_host_folder_trust(agent);
@@ -471,7 +471,7 @@ impl Instance {
                 if let Some(name) =
                     crate::agents::parse_selected_agent(&self.selected_agent_args(), selected.flag)
                 {
-                    let Some(agent) = self.resolved_agent() else {
+                    let Some(agent) = self.status_agent() else {
                         return false;
                     };
                     let config_path = sidecar_host_config_path_for(
@@ -504,7 +504,7 @@ impl Instance {
             }
         }
 
-        let Some(agent) = self.resolved_agent() else {
+        let Some(agent) = self.status_agent() else {
             return false;
         };
         let config_path = sidecar_host_config_path_for(
@@ -551,7 +551,7 @@ impl Instance {
         let Some(home) = home else {
             return false;
         };
-        let Some(agent) = self.resolved_agent() else {
+        let Some(agent) = self.status_agent() else {
             return false;
         };
         let Some(hook_cfg) = agent.hook_config.as_ref() else {
@@ -904,16 +904,24 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_custom_codex_detected_agent_uses_codex_hook_installer() {
+    fn declared_codex_wrapper_uses_codex_hook_installer() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let _isolation = crate::session::test_support::isolate_app_dir_at(tmp.path());
         let _codex_home_guard = EnvGuard::unset(&["CODEX_HOME"]);
-        let _home_guard = crate::session::test_support::isolate_home(tmp.path());
+        let profile = "declared-codex-hooks";
+        crate::session::instance::test_helpers::declare_execution_aliases(
+            profile,
+            &[("my-codex-wrapper", "codex")],
+            tmp.path(),
+        );
 
         acknowledge_hooks();
         let mut inst = Instance::new("wrapped", "/tmp/test");
-        inst.tool = "my-codex-wrapper".to_string();
-        inst.detect_as = "codex".to_string();
-        inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as));
+        inst.source_profile = profile.into();
+        inst.tool = "my-codex-wrapper".into();
+        inst.command = "my-codex-wrapper".into();
+        inst.detect_as = "codex".into();
+        inst.install_agent_status_hooks(inst.resolved_agent());
 
         let hooks_path = tmp.path().join(".codex").join("hooks.json");
         let hooks = std::fs::read_to_string(hooks_path).unwrap();
