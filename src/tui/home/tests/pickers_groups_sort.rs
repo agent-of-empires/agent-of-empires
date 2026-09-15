@@ -1845,6 +1845,7 @@ fn test_non_strict_w_cycles_through_all_idle_sessions_in_attention_sort() {
     env.view.strict_hotkeys = false;
     env.view.group_by = GroupByMode::Manual;
     env.view.sort_order = SortOrder::Attention;
+    env.view.idle_decay_window = std::time::Duration::ZERO;
 
     for (index, minutes_ago) in [5, 10, 15, 20].into_iter().enumerate() {
         let title = format!("idle-{index}");
