@@ -1182,15 +1182,21 @@ fn stage_receipt(
 /// Drop a stage that was built while a writer could still appear and return the
 /// journal to `Planned`, so the next pass seeds from a source it has proven
 /// stopped instead of publishing content a container may have written to.
-fn discard_stage(receipt: &mut Receipt, path: &Path) -> Result<()> {
-    // A transaction that already renamed a part into place is mid-publication,
-    // not a fresh seed: its stages are what the resume path needs.
-    if receipt.phase != Phase::Staged
-        || receipt
-            .roots
-            .iter()
-            .any(|part| part.original.is_some() && part.published.is_some())
-    {
+fn discard_stage(app: &Path, receipt: &mut Receipt, path: &Path) -> Result<()> {
+    // A part renamed into place but not certified is mid-publication, not a
+    // fresh seed, and its stage is what the resume path needs. A certificate is
+    // what tells the two apart: a part that was already owned keeps its own,
+    // while a part this transaction renamed has none yet.
+    let mut mid_publication = false;
+    for part in &receipt.roots {
+        if part.published.is_some()
+            && owned_root(app, &receipt.instance, &part.root.path)?.is_none()
+        {
+            mid_publication = true;
+            break;
+        }
+    }
+    if receipt.phase != Phase::Staged || mid_publication {
         return Ok(());
     }
     // Journal first: a stage that a later pass finds named but already gone is
@@ -1699,7 +1705,7 @@ fn migrate_target(
         .iter_mut()
         .find(|row| row.get("id").and_then(Value::as_str) == Some(id))
     else {
-        discard_stage(&mut receipt, &path)?;
+        discard_stage(app, &mut receipt, &path)?;
         return Ok(false);
     };
     let mut current_roots = row_roots(current, tool, home, &fresh_config)?;
@@ -1710,7 +1716,7 @@ fn migrate_target(
     {
         // A container could have started after the stage was seeded, so the
         // seed is dropped with the plan it was made for.
-        discard_stage(&mut receipt, &path)?;
+        discard_stage(app, &mut receipt, &path)?;
         return Ok(false);
     }
     layout::refresh_liveness();
@@ -1718,12 +1724,12 @@ fn migrate_target(
         progress::notice(format!(
             "sandbox {id}: stop its container and structured runner to isolate native history"
         ));
-        discard_stage(&mut receipt, &path)?;
+        discard_stage(app, &mut receipt, &path)?;
         return Ok(false);
     }
     if let Some(message) = recovery_exposure(app, &migration_targets(app, &roots)?, exposure)? {
         progress::notice(format!("{message}; this sandbox stays pending"));
-        discard_stage(&mut receipt, &path)?;
+        discard_stage(app, &mut receipt, &path)?;
         return Ok(false);
     }
     if receipt.phase == Phase::Staged {
@@ -2324,6 +2330,57 @@ mod tests {
             "a stale stage is not published"
         );
         assert!(!stage.exists());
+    }
+
+    /// A part renamed into place without a certificate is mid-publication: its
+    /// stage is what the resume path needs, and discarding it would make every
+    /// later pass refuse the store.
+    #[test]
+    #[serial_test::serial]
+    fn a_mid_publication_journal_is_not_returned_to_planned() {
+        let temporary = tempfile::tempdir().unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let home = dirs::home_dir().unwrap();
+        let app = crate::session::get_app_dir().unwrap();
+        let instance = crate::session::Instance::new("codex", temporary.path().to_str().unwrap());
+        let config = crate::session::Config::default();
+        let roots = container_config::sandbox_content_roots(
+            "codex",
+            None,
+            &config.session,
+            &home,
+            &instance.id,
+        )
+        .unwrap();
+        let root = &roots[0].path;
+        fs::create_dir_all(root.join("sessions")).unwrap();
+        fs::write(root.join("sessions/original.jsonl"), b"PRIVATE").unwrap();
+        let mut row = serde_json::to_value(&instance).unwrap();
+        row["sandbox_info"] = serde_json::json!({
+            "enabled": true,
+            "image": "img",
+            "container_name": "aoe-sandbox-fixture",
+        });
+        let (path, mut receipt) = checked_receipt(&app, &row, "codex", &roots).unwrap();
+        record_retirement(&mut receipt, &row, &home, &config).unwrap();
+        stage_receipt(&app, &mut receipt, &path, &home, &config, temporary.path()).unwrap();
+
+        // As `publish_receipt` leaves it: renamed into place, not yet certified.
+        let published = receipt.roots[0].staged.clone();
+        receipt.roots[0].published = published;
+        receipt.roots[0].original = None;
+        write_receipt(&path, &receipt).unwrap();
+        discard_stage(&app, &mut receipt, &path).unwrap();
+        assert_eq!(
+            read_receipt(&path).unwrap().unwrap().phase,
+            Phase::Staged,
+            "a part renamed into place keeps its stage for the resume path"
+        );
+
+        // The same part certified is a fresh seed, not mid-publication.
+        certify_test_content(&app, &instance.id, root, &[]).unwrap();
+        discard_stage(&app, &mut receipt, &path).unwrap();
+        assert_eq!(read_receipt(&path).unwrap().unwrap().phase, Phase::Planned);
     }
 
     #[test]
