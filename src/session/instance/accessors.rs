@@ -533,9 +533,9 @@ impl Instance {
     }
 
     /// The binding AoE can prove for an ACP ID without a user assertion: the
-    /// native execution this session's terminal launch resolves for that ID.
-    /// The adapter ran under that resolution, so the ID's store is established
-    /// rather than inferred.
+    /// native execution this session's terminal launch resolves for that ID, so
+    /// the handoff cannot validate against one store and then launch against
+    /// another.
     fn resolved_handoff_binding(&self, sid: &str) -> Option<ConversationBinding> {
         let execution = self
             .resolve_native_execution(Some((sid, None, true)))
