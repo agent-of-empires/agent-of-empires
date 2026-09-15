@@ -1537,6 +1537,10 @@ async fn sweep_notifies_then_respects_a_dismissal() {
         rec2.needs_approval.lock().unwrap().is_empty(),
         "a dismissed version does not re-notify",
     );
+    assert!(
+        rec2.applied.lock().unwrap().is_empty(),
+        "a dismissed update restarts nothing",
+    );
 
     std::env::remove_var("AOE_GITHUB_CLONE_BASE");
 }
