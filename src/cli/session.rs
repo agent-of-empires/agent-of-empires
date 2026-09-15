@@ -47,8 +47,8 @@ pub enum SessionCommands {
     /// restarts the agent so it can see it; the conversation is kept. See #3103.
     AddProject(AddProjectArgs),
 
-    /// Set the resume target for a session; agents with resume disabled in AoE
-    /// store the ID but do not use it
+    /// Set the resume target for a session; an agent whose exact native resume
+    /// AoE cannot resolve is refused
     SetSessionId(SetSessionIdArgs),
 
     /// Set or clear the per-session diff base branch. The diff view
