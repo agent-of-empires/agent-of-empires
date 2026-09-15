@@ -975,7 +975,17 @@ fn recovery_exposure(
                 .get("id")
                 .and_then(Value::as_str)
                 .context("sandbox row has no id")?;
-            let mut sources = exposure(id)?;
+            let mut sources = match exposure(id) {
+                Ok(sources) => sources,
+                // A mount that cannot be proved clear is not proved clear, and
+                // one unanswerable container must not stop every other session
+                // from moving, so this defers rather than fails the pass.
+                Err(error) => {
+                    return Ok(Some(format!(
+                        "sandbox {id}: cannot prove its mounts stay clear of the isolation recovery namespace ({error}); stop it and retry"
+                    )))
+                }
+            };
             for entry in &config.sandbox.extra_volumes {
                 if let Some((source, _)) = entry.split_once(':') {
                     sources.push(PathBuf::from(source));
@@ -2061,6 +2071,13 @@ mod tests {
         assert!(recovery_exposure(&app, &targets, &exposing)
             .unwrap()
             .is_some());
+        // A probe that cannot answer is not proof of privacy, and it defers
+        // rather than failing every other session's move with it.
+        assert!(recovery_exposure(&app, &targets, &|_: &str| anyhow::bail!(
+            "runtime unavailable"
+        ))
+        .unwrap()
+        .is_some());
         assert!(
             !migrate_target(
                 &app,
