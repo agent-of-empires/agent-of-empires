@@ -346,11 +346,18 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         if !user_chose_tool {
             resolved_tool = source.tool.clone();
         }
+        // The seed is derived from the parent's own binding, so this refusal is
+        // about the parent's agent, not about the tool the child requested.
+        let parent_agent = source
+            .fork_parent_binding()
+            .and_then(|binding| binding.execution.as_ref())
+            .map(|execution| execution.agent.clone())
+            .unwrap_or_else(|| source.tool.clone());
         let seed = crate::session::fork::terminal_fork_seed(source.fork_parent_binding(), crate::session::capture::generate_session_uuid())
         .map_err(|denied| match denied {
             crate::session::ForkDenied::AgentCannotFork => anyhow::anyhow!(
                 "Agent '{}' does not support forking. Forkable agents: claude, codex, opencode.",
-                resolved_tool
+                parent_agent
             ),
             crate::session::ForkDenied::NoParentSession => anyhow::anyhow!(
                 "Nothing to fork: session '{}' has no captured agent session yet. Start a conversation in it first.",

@@ -548,4 +548,23 @@ fn fork_from_unforkable_agent_is_refused() {
         !child.status.success(),
         "fork with an unforkable agent must fail"
     );
+
+    // The seed comes from the parent's own binding, so the refusal names the
+    // parent's agent even when the child requests a forkable tool.
+    let cross_tool = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "--tool",
+        "claude",
+        "-t",
+        "CrossToolChild",
+        "--fork-from",
+        "GemParent",
+    ]);
+    let stderr = String::from_utf8_lossy(&cross_tool.stderr).to_string();
+    assert!(!cross_tool.status.success(), "cross-tool fork must fail");
+    assert!(
+        stderr.contains("does not support forking") && stderr.contains("'gemini'"),
+        "the refusal must name the parent's agent, got: {stderr}"
+    );
 }
