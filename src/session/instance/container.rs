@@ -150,20 +150,32 @@ impl Instance {
 
         // A container built for another agent mounts that agent's config.
         // Decide on the disk row and a resolved profile: a stale in-memory copy
-        // or a defaulted config would remove a valid container.
-        if container.exists()?
-            && container.agent_tool_matches(&self.container_agent_identity()?)? == Some(false)
-        {
-            self.try_reconcile_from_disk().context(
-                "cannot confirm the session's tool before removing its sandbox container",
-            )?;
-            if container.agent_tool_matches(&self.container_agent_identity()?)? == Some(false) {
-                tracing::info!(
-                    target: "containers.runtime",
+        // can match an old container or mismatch one a peer rebuilt, and a
+        // defaulted config would misread a valid one. A failed reload still
+        // permits reuse, never removal.
+        if container.exists()? {
+            let reloaded = self.try_reconcile_from_disk();
+            let mismatch =
+                container.agent_tool_matches(&self.container_agent_identity()?)? == Some(false);
+            match (mismatch, reloaded) {
+                (true, reloaded) => {
+                    reloaded.context(
+                        "cannot confirm the session's tool before removing its sandbox container",
+                    )?;
+                    tracing::info!(
+                        target: "containers.runtime",
+                        session = %self.id,
+                        "removing sandbox container built for another tool; it will be recreated"
+                    );
+                    container.remove(true)?;
+                }
+                (false, Err(error)) => tracing::warn!(
+                    target: "session.store",
                     session = %self.id,
-                    "removing sandbox container built for another tool; it will be recreated"
-                );
-                container.remove(true)?;
+                    error = %format_args!("{error:#}"),
+                    "failed to reload disk state before reusing the sandbox container; using in-memory value"
+                ),
+                (false, Ok(_)) => {}
             }
         }
         // After every reload above, which may have replaced the tool.
@@ -851,6 +863,8 @@ claude-personal = "~/.claude-global"
             (("codex", ""), "codex", Disk::Absent, 0, Some(".codex")),
             (("codex", ""), "", Disk::Absent, 0, Some(".codex")),
             (("codex", ""), "claude", Disk::Corrupt, 0, None),
+            (("codex", ""), "codex", Disk::Corrupt, 0, Some(".codex")),
+            (("claude", ""), "claude", Disk::Row("codex", ""), 1, None),
             (
                 ("alias-a", "claude"),
                 "alias-b:codex",
