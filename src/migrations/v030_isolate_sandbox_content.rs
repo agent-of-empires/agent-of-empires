@@ -736,13 +736,21 @@ pub(crate) fn retain_legacy_original(source: &Path, host: &Path) -> Result<Retai
 }
 
 /// The live mounts a sandbox holds, or the sources a test asked to pretend it
-/// holds, so a test can drive the deferral without a container runtime.
+/// holds. Tests drive this seam rather than a container runtime, so the suite
+/// behaves the same on a host that has no runtime installed, which is also why
+/// an unset hook means "nothing is mounted".
 fn live_exposure(id: &str) -> Result<Vec<PathBuf>> {
     #[cfg(test)]
-    if let Some(sources) = EXPOSED_SOURCES.with(|hook| hook.borrow().clone()) {
-        return Ok(sources);
+    {
+        let _ = id;
+        Ok(EXPOSED_SOURCES
+            .with(|hook| hook.borrow().clone())
+            .unwrap_or_default())
     }
-    live_bind_sources(id)
+    #[cfg(not(test))]
+    {
+        live_bind_sources(id)
+    }
 }
 
 #[cfg(test)]
