@@ -52,11 +52,15 @@ impl Instance {
         // Retry once against the row as it now stands: a peer that committed
         // the same final observation makes this publication durable, while a
         // pin, a fork intent or another conversation skips again.
-        let retry = storage
-            .load()
-            .ok()?
-            .into_iter()
-            .find(|row| row.id == self.id)?;
+        // A retry that cannot read the row leaves the publication in doubt, so
+        // it must fail the flush: `None` would read as "nothing to publish" and
+        // let teardown delete the evidence.
+        let Ok(rows) = storage.load() else {
+            return Some(SidWrite::Failed);
+        };
+        let Some(retry) = rows.into_iter().find(|row| row.id == self.id) else {
+            return Some(SidWrite::Failed);
+        };
         Some(super::sid_persist::persist_session_with_storage(
             storage,
             &self.id,
