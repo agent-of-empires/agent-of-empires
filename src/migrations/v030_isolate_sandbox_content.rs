@@ -710,11 +710,16 @@ pub(crate) fn retain_legacy_original(source: &Path, host: &Path) -> Result<Optio
     };
     let app = crate::session::get_app_dir()?;
     let recovery = recovery_root(host)?;
-    ensure_private_recovery(
+    if let Some(message) = recovery_exposure(
         &app,
         &[canonical_expected_path(&recovery)?],
         &live_bind_sources,
-    )?;
+    )? {
+        progress::notice(format!(
+            "{message}; the shared store stays where it is until that mount is gone"
+        ));
+        return Ok(None);
+    }
     let root = private_recovery_root(host)?;
     let transaction = root.create_child(Path::new(&format!("v027-{}", uuid::Uuid::new_v4())))?;
     let destination = transaction.path().join("original");
@@ -899,11 +904,14 @@ fn live_bind_sources(id: &str) -> Result<Vec<PathBuf>> {
 
 type ExposureProbe<'a> = dyn Fn(&str) -> Result<Vec<PathBuf>> + 'a;
 
-fn ensure_private_recovery(
+/// The refusal a live mount deserves, or `None` when the recovery namespace
+/// stays private. Callers that can leave work pending report this instead of
+/// failing, so one exposed mount cannot stop every other session from moving.
+fn recovery_exposure(
     app: &Path,
     targets: &[PathBuf],
     exposure: &ExposureProbe<'_>,
-) -> Result<()> {
+) -> Result<Option<String>> {
     for (path, registry) in read_registries(app)? {
         let profile = layout::profile_for_registry(app, &path);
         let config = crate::session::config::profile_config::resolve_config(&profile)?;
@@ -956,12 +964,28 @@ fn ensure_private_recovery(
                         || target.starts_with(&canonical)
                         || canonical.starts_with(target)
                 }) {
-                    bail!("sandbox {id} exposes the isolation recovery namespace through {}; remove that mount before migrating", source.display());
+                    return Ok(Some(format!(
+                        "sandbox {id} exposes the isolation recovery namespace through {}; remove that mount before migrating",
+                        source.display()
+                    )));
                 }
             }
         }
     }
-    Ok(())
+    Ok(None)
+}
+
+/// Retained originals must stay invisible to a running sandbox, so an exposed
+/// namespace is a hard refusal where the caller cannot leave work pending.
+fn ensure_private_recovery(
+    app: &Path,
+    targets: &[PathBuf],
+    exposure: &ExposureProbe<'_>,
+) -> Result<()> {
+    match recovery_exposure(app, targets, exposure)? {
+        Some(message) => bail!(message),
+        None => Ok(()),
+    }
 }
 
 fn record_retirement(
@@ -1336,6 +1360,91 @@ fn reset_row(row: &mut Value, receipt: &Receipt) -> Result<()> {
     Ok(())
 }
 
+/// Record on one row the context a committed transaction retired, when that row
+/// still resolves the same store and never recorded it. Callers hold the
+/// registry lock; the row that ran the transaction is left exactly as it is.
+fn record_reset_in(
+    app: &Path,
+    registry: &Path,
+    id: &str,
+    tool: &str,
+    home: &Path,
+    config: &crate::session::Config,
+    roots: &[ContentRoot],
+) -> Result<()> {
+    let mut fresh: Value = serde_json::from_slice(&fs::read(registry)?)?;
+    let Some(current) = fresh
+        .as_array_mut()
+        .context("session registry must be an array")?
+        .iter_mut()
+        .find(|row| row.get("id").and_then(Value::as_str) == Some(id))
+    else {
+        return Ok(());
+    };
+    if current
+        .get("sandbox_content_policy")
+        .and_then(Value::as_u64)
+        == Some(u64::from(CONTENT_POLICY))
+        || row_roots(current, tool, home, config)? != roots
+    {
+        return Ok(());
+    }
+    let Some(receipt) = retired_receipt(app, id, tool, current)? else {
+        return Ok(());
+    };
+    reset_row(current, &receipt)?;
+    write_registry(registry, &fresh)
+}
+
+/// The journal entry that retired this row's context, read from beside the live
+/// receipt because a completed transaction archives its own.
+fn retired_receipt(app: &Path, instance: &str, tool: &str, row: &Value) -> Result<Option<Receipt>> {
+    let path = receipt_path(app, instance, tool)?;
+    let mut receipts = Vec::new();
+    if let Some(receipt) = read_receipt(&path)? {
+        receipts.push(receipt);
+    }
+    let Some(directory) = path.parent() else {
+        return Ok(None);
+    };
+    let key = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_owned();
+    for entry in match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    } {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name.starts_with(&format!("{key}.")) || !name.ends_with(".complete") {
+            continue;
+        }
+        if let Some(receipt) = read_receipt(&entry.path())? {
+            receipts.push(receipt);
+        }
+    }
+    Ok(receipts.into_iter().find(|receipt| {
+        receipt.phase == Phase::Committed
+            && !receipt.retired_tools.is_empty()
+            && receipt.retired_identity.get("id") == row.get("id")
+            && row
+                .get("agent_session_id")
+                .filter(|value| !value.is_null())
+                .is_some_and(|current| {
+                    receipt
+                        .retired_identity
+                        .get("agent_session_id")
+                        .filter(|value| !value.is_null())
+                        == Some(current)
+                })
+    }))
+}
+
 fn detached_writer_live(app: &Path, id: &str) -> Result<bool> {
     let path = app.join("acp-workers").join(format!("{id}.json"));
     let bytes = match fs::read(path) {
@@ -1423,6 +1532,11 @@ fn migrate_target(
     };
     let mut roots = row_roots(&snapshot, tool, home, &config)?;
     if roots.is_empty() || roots_ready(app, id, tool, &roots)? {
+        // A store another row already moved still has to stop this row from
+        // resuming the retired context, and this is the only pass that sees it.
+        let registries = lock_registries(app)?;
+        record_reset_in(app, registry, id, tool, home, &config, &roots)?;
+        drop(registries);
         return Ok(true);
     }
     container_config::expand_content_roles(&mut roots, home, &config.session)?;
@@ -1455,11 +1569,18 @@ fn migrate_target(
         ));
         return Ok(false);
     }
-    ensure_private_recovery(app, &migration_targets(app, &roots)?, exposure)?;
+    if let Some(message) = recovery_exposure(app, &migration_targets(app, &roots)?, exposure)? {
+        progress::notice(format!("{message}; this sandbox stays pending"));
+        return Ok(false);
+    }
     let (path, mut receipt) = checked_receipt(app, &row, tool, &roots)?;
     if receipt.phase == Phase::Committed {
         certify_receipt(app, &receipt)?;
         archive_receipt(&path, &receipt)?;
+        // The row that ran the transaction recorded its own reset. Every other
+        // row resolving this store still has to stop resuming the context that
+        // transaction retired.
+        record_reset_in(app, registry, id, tool, home, &config, &roots)?;
         return Ok(true);
     }
     drop(registries.take());
@@ -1494,7 +1615,10 @@ fn migrate_target(
     if running(id)? || detached_writer_live(app, id)? || !reap(id)? {
         return Ok(false);
     }
-    ensure_private_recovery(app, &migration_targets(app, &roots)?, exposure)?;
+    if let Some(message) = recovery_exposure(app, &migration_targets(app, &roots)?, exposure)? {
+        progress::notice(format!("{message}; this sandbox stays pending"));
+        return Ok(false);
+    }
     if receipt.phase == Phase::Staged {
         record_retirement(&mut receipt, current, home, &fresh_config)?;
         write_receipt(&path, &receipt)?;
@@ -1744,6 +1868,150 @@ pub(crate) fn guard_preparation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A mount that reaches the recovery namespace is refused, but refusing it
+    /// must leave the session pending rather than fail the pass: one such mount
+    /// cannot be allowed to stop every other session from moving either.
+    #[test]
+    #[serial_test::serial]
+    fn an_exposed_recovery_namespace_leaves_the_sandbox_pending() {
+        let temporary = tempfile::tempdir().unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let home = dirs::home_dir().unwrap();
+        let app = crate::session::get_app_dir().unwrap();
+        // A project inside HOME keeps the row's own mount clear of the recovery
+        // namespace, so only the injected source can expose it.
+        let project = temporary.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let mut instance = crate::session::Instance::new("codex", project.to_str().unwrap());
+        instance.tool = "codex".to_owned();
+        let config = crate::session::Config::default();
+        let roots = container_config::sandbox_content_roots(
+            "codex",
+            None,
+            &config.session,
+            &home,
+            &instance.id,
+        )
+        .unwrap();
+        let root = &roots[0].path;
+        fs::create_dir_all(root.join("sessions")).unwrap();
+        fs::write(
+            root.join("sessions/original.jsonl"),
+            b"PRIVATE_ORIGINAL_CONTEXT",
+        )
+        .unwrap();
+        let mut row = serde_json::to_value(&instance).unwrap();
+        row["sandbox_info"] = serde_json::json!({
+            "enabled": true,
+            "image": "img",
+            "container_name": "aoe-sandbox-fixture",
+        });
+        let registry = app.join("sessions.json");
+        fs::write(&registry, serde_json::to_vec(&vec![row]).unwrap()).unwrap();
+
+        let targets = migration_targets(&app, &roots).unwrap();
+        let exposing = |_: &str| Ok(vec![home.clone()]);
+        let elsewhere = |_: &str| Ok(vec![temporary.path().join("elsewhere")]);
+        assert!(recovery_exposure(&app, &targets, &elsewhere)
+            .unwrap()
+            .is_none());
+        assert!(recovery_exposure(&app, &targets, &exposing)
+            .unwrap()
+            .is_some());
+        assert!(
+            !migrate_target(
+                &app,
+                &home,
+                (&registry, &instance.id, "codex"),
+                &|_| Ok(false),
+                &|_| Ok(true),
+                &exposing,
+            )
+            .unwrap(),
+            "an exposed mount defers this sandbox instead of failing the pass"
+        );
+        assert_eq!(
+            fs::read(root.join("sessions/original.jsonl")).unwrap(),
+            b"PRIVATE_ORIGINAL_CONTEXT"
+        );
+        assert!(!roots_ready(&app, &instance.id, "codex", &roots).unwrap());
+        assert!(!receipt_path(&app, &instance.id, "codex").unwrap().exists());
+    }
+
+    /// One store can be resolved by more than one row: the same instance id in
+    /// another profile, or a row restored after the transaction committed. Every
+    /// such row has to stop resuming the context that transaction retired.
+    #[test]
+    #[serial_test::serial]
+    fn every_row_resolving_a_moved_store_records_the_retired_context() {
+        let temporary = tempfile::tempdir().unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let home = dirs::home_dir().unwrap();
+        let app = crate::session::get_app_dir().unwrap();
+        let project = temporary.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let mut instance = crate::session::Instance::new("codex", project.to_str().unwrap());
+        instance.tool = "codex".to_owned();
+        instance.agent_session_id = Some("old-native-context".to_owned());
+        let config = crate::session::Config::default();
+        let roots = container_config::sandbox_content_roots(
+            "codex",
+            None,
+            &config.session,
+            &home,
+            &instance.id,
+        )
+        .unwrap();
+        let root = &roots[0].path;
+        fs::create_dir_all(root.join("sessions")).unwrap();
+        fs::write(
+            root.join("sessions/original.jsonl"),
+            b"PRIVATE_ORIGINAL_CONTEXT",
+        )
+        .unwrap();
+        let mut row = serde_json::to_value(&instance).unwrap();
+        row["sandbox_info"] = serde_json::json!({
+            "enabled": true,
+            "image": "img",
+            "container_name": "aoe-sandbox-fixture",
+        });
+        let main = app.join("sessions.json");
+        fs::write(&main, serde_json::to_vec(&vec![row.clone()]).unwrap()).unwrap();
+        let side = app.join("profiles/side/sessions.json");
+        fs::create_dir_all(side.parent().unwrap()).unwrap();
+        fs::write(&side, serde_json::to_vec(&vec![row]).unwrap()).unwrap();
+
+        for registry in [&main, &side] {
+            assert!(
+                migrate_target(
+                    &app,
+                    &home,
+                    (registry, &instance.id, "codex"),
+                    &|_| Ok(false),
+                    &|_| Ok(true),
+                    &|_| Ok(Vec::new()),
+                )
+                .unwrap(),
+                "each row of a moved store completes"
+            );
+        }
+        for registry in [&main, &side] {
+            let rows: Value = serde_json::from_slice(&fs::read(registry).unwrap()).unwrap();
+            let row = &rows[0];
+            assert_eq!(
+                row.get("sandbox_content_policy").and_then(Value::as_u64),
+                Some(u64::from(CONTENT_POLICY)),
+                "{} was not reset: {row}",
+                registry.display()
+            );
+            assert!(
+                row.get("agent_session_id").is_none(),
+                "{} still resumes the retired context: {row}",
+                registry.display()
+            );
+        }
+    }
 
     #[test]
     #[serial_test::serial]
