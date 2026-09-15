@@ -495,18 +495,28 @@ impl Instance {
         self.view == View::Structured
     }
 
-    /// ACP IDs need an explicit native-store assertion before terminal handoff.
+    /// ACP IDs need a native-store binding before terminal handoff. A binding
+    /// already asserted for the current ID is used as-is; otherwise AoE records
+    /// the native execution this session's terminal launch resolves, so the
+    /// handoff stays available while the ID's conversation store stays
+    /// provable, and is refused when that resolution fails.
     pub(crate) fn switch_to_terminal_keep_context(&mut self) -> Result<()> {
         let sid = self
             .acp_session_id
-            .as_ref()
+            .clone()
             .context("ACP conversation ID is unavailable")?;
-        let binding = self.resume_binding.as_ref().filter(|binding| {
-            matches!(&self.resume_intent, ResumeIntent::Use(target) if target == sid) && binding.session_id == *sid
-                && binding.provenance == ConversationProvenance::Asserted
-                && binding.execution.as_ref().is_some_and(|execution| execution.agent == "claude")
-        }).cloned().context("ACP does not prove a native conversation store; bind its current ID with aoe session set-session-id SESSION ID --store /absolute/claude-store before switching to terminal")?;
-        let sid = self.acp_session_id.take().unwrap();
+        let binding = self
+            .resume_binding
+            .as_ref()
+            .filter(|binding| {
+                matches!(&self.resume_intent, ResumeIntent::Use(target) if target == &sid)
+                    && binding.session_id == sid
+                    && binding.provenance == ConversationProvenance::Asserted
+                    && binding.execution.as_ref().is_some_and(|execution| execution.agent == "claude")
+            })
+            .cloned()
+            .or_else(|| self.resolved_handoff_binding(&sid))
+            .context("ACP does not prove a native conversation store; bind its current ID with aoe session set-session-id SESSION ID --store /absolute/claude-store before switching to terminal")?;
         self.adopt_conversation_state(ConversationState {
             session_id: Some(sid.clone()),
             binding: Some(binding.clone()),
@@ -515,10 +525,27 @@ impl Instance {
             active: None,
             pi_session_path: None,
         });
+        self.acp_session_id = None;
         self.import_pending = None;
         self.acp_load_session_capable = None;
         self.view = View::Terminal;
         Ok(())
+    }
+
+    /// The binding AoE can prove for an ACP ID without a user assertion: the
+    /// native execution this session's terminal launch resolves for that ID.
+    /// The adapter ran under that resolution, so the ID's store is established
+    /// rather than inferred.
+    fn resolved_handoff_binding(&self, sid: &str) -> Option<ConversationBinding> {
+        let execution = self
+            .resolve_native_execution(Some((sid, None, true)))
+            .ok()?;
+        (execution.binding.agent == "claude").then(|| ConversationBinding {
+            session_id: sid.to_string(),
+            execution: Some(execution.binding.clone()),
+            provenance: ConversationProvenance::Asserted,
+            transcript_path: None,
+        })
     }
 }
 
@@ -528,16 +555,40 @@ mod tests {
     use crate::session::instance::test_helpers::*;
 
     #[test]
-    fn switch_to_terminal_keep_context_carries_acp_id_into_resume_target() {
+    fn switch_to_terminal_keep_context_resolves_the_native_binding() {
         let mut inst = Instance::new("claude", "/tmp");
         inst.view = View::Structured;
         inst.acp_session_id = Some("sid-abc".to_string());
         inst.import_pending = Some(true);
         inst.acp_load_session_capable = Some(true);
+        inst.pi_session_path = Some("/tmp/foreign.jsonl".into());
 
-        assert!(inst.switch_to_terminal_keep_context().is_err());
-        assert_eq!(inst.view, View::Structured);
-        assert_eq!(inst.acp_session_id.as_deref(), Some("sid-abc"));
+        inst.switch_to_terminal_keep_context().unwrap();
+
+        assert!(inst.fork_parent_binding().is_some());
+        assert_eq!(inst.view, View::Terminal);
+        assert_eq!(inst.agent_session_id.as_deref(), Some("sid-abc"));
+        assert_eq!(inst.resume_intent, ResumeIntent::Use("sid-abc".to_string()));
+        assert_eq!(
+            inst.agent_session_binding
+                .as_ref()
+                .and_then(|binding| binding.execution.as_ref())
+                .map(|execution| execution.agent.as_str()),
+            Some("claude"),
+            "the handoff must record the resolved claude execution"
+        );
+        // Structured-view-only state is dropped before terminal launch.
+        assert_eq!(inst.acp_session_id, None);
+        assert_eq!(inst.import_pending, None);
+        assert_eq!(inst.acp_load_session_capable, None);
+        assert!(inst.pi_session_path.is_none());
+    }
+
+    #[test]
+    fn switch_to_terminal_keep_context_prefers_an_asserted_binding() {
+        let mut inst = Instance::new("claude", "/tmp");
+        inst.view = View::Structured;
+        inst.acp_session_id = Some("sid-abc".to_string());
         inst.resume_intent = ResumeIntent::Use("sid-abc".into());
         inst.resume_binding = Some(ConversationBinding {
             session_id: "sid-abc".into(),
@@ -552,18 +603,36 @@ mod tests {
                 filesystem: "host".into(),
             }),
         });
-        inst.pi_session_path = Some("/tmp/foreign.jsonl".into());
-        inst.switch_to_terminal_keep_context().unwrap();
-        assert!(inst.fork_parent_binding().is_some());
-        assert!(inst.pi_session_path.is_none());
 
-        assert_eq!(inst.view, View::Terminal);
-        assert_eq!(inst.agent_session_id.as_deref(), Some("sid-abc"));
-        assert_eq!(inst.resume_intent, ResumeIntent::Use("sid-abc".to_string()));
-        // Structured-view-only state is dropped before terminal launch.
-        assert_eq!(inst.acp_session_id, None);
-        assert_eq!(inst.import_pending, None);
-        assert_eq!(inst.acp_load_session_capable, None);
+        inst.switch_to_terminal_keep_context().unwrap();
+
+        assert_eq!(
+            inst.agent_session_binding
+                .as_ref()
+                .and_then(|binding| binding.execution.as_ref())
+                .map(|execution| execution.stores.as_slice()),
+            Some(&[std::path::PathBuf::from("/tmp/claude")][..]),
+            "an existing assertion must win over the resolved default"
+        );
+    }
+
+    #[test]
+    fn switch_to_terminal_keep_context_refuses_an_unprovable_id() {
+        let mut inst = Instance::new("codex-structured", "/tmp");
+        inst.tool = "codex".into();
+        inst.command = "codex".into();
+        inst.view = View::Structured;
+        inst.acp_session_id = Some("sid-abc".to_string());
+
+        let error = inst.switch_to_terminal_keep_context().unwrap_err();
+
+        assert!(
+            error.to_string().contains("set-session-id"),
+            "refusal must carry recovery guidance: {error}"
+        );
+        assert_eq!(inst.view, View::Structured);
+        assert_eq!(inst.acp_session_id.as_deref(), Some("sid-abc"));
+        assert!(inst.agent_session_id.is_none());
     }
 
     #[test]
