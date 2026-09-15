@@ -277,9 +277,9 @@ impl Instance {
     }
 
     /// A failure fails the restart: relaunching into the old container would run
-    /// the new tool against the previous tool's config store. The swap is already
-    /// persisted, so later restarts do not retry the removal; the error names the
-    /// container to remove by hand.
+    /// the new tool against the previous tool's config store. Launch removes it
+    /// again only if it carries the tool label, so the error names the container
+    /// to remove by hand.
     fn discard_stale_sandbox_container(&self) -> Result<()> {
         if !self.is_sandboxed() {
             return Ok(());

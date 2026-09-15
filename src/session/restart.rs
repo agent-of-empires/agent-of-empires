@@ -18,8 +18,8 @@ pub struct RestartRequest {
     /// (the documented opt-out via `session.restart_wake_message`).
     pub wake_message: String,
     /// Remove the sandbox container before relaunching, so the next start
-    /// creates a fresh one. Set on a tool swap: agent config mounts are chosen
-    /// per tool at create time and a restart reuses the container (#3959).
+    /// creates a fresh one. Set on a tool swap: launch recreates a container
+    /// labelled for another tool, but not one created before that label (#3959).
     pub discard_sandbox_container: bool,
 }
 

@@ -150,8 +150,18 @@ impl Instance {
             };
 
         // A container built for another tool mounts that tool's agent config.
+        // Decide on the disk row: a stale in-memory copy would remove the
+        // container a peer just recreated for the swapped tool.
         if container.exists()? && container.agent_tool_matches(&self.tool)? == Some(false) {
-            container.remove(true)?;
+            self.reconcile_from_disk();
+            if container.agent_tool_matches(&self.tool)? == Some(false) {
+                tracing::info!(
+                    target: "containers.runtime",
+                    session = %self.id,
+                    "removing sandbox container built for another tool; it will be recreated"
+                );
+                container.remove(true)?;
+            }
         }
 
         // Direct is_running()? / exists()? here rather than probe_running():
@@ -794,13 +804,23 @@ claude-personal = "~/.claude-global"
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let _path = crate::session::test_support::path_prepended(&bin);
+        let profile = "agent-tool-label";
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
 
-        for (built_for, expected_removals) in [("claude", 1), ("codex", 0), ("", 0)] {
+        // `disk_tool` is the persisted row's tool when a peer swapped it after
+        // this in-memory copy was taken.
+        for (built_for, disk_tool, expected_removals) in [
+            ("claude", None, 1),
+            ("claude", Some("claude"), 0),
+            ("codex", None, 0),
+            ("", None, 0),
+        ] {
             let _ = std::fs::remove_file(&calls_path);
             let _ = std::fs::remove_file(&removed_path);
             std::fs::write(&label_path, built_for).unwrap();
             let mut instance = Instance::new("tool label", temp.path().to_str().unwrap());
             instance.tool = "codex".to_string();
+            instance.source_profile = profile.to_string();
             instance.sandbox_info = Some(SandboxInfo {
                 enabled: true,
                 container_id: None,
@@ -811,6 +831,17 @@ claude-personal = "~/.claude-global"
                 before_start_env: Vec::new(),
                 container_workdir: None,
             });
+            storage
+                .update(|instances, _groups| {
+                    instances.clear();
+                    if let Some(tool) = disk_tool {
+                        let mut disk = instance.clone();
+                        disk.tool = tool.to_string();
+                        instances.push(disk);
+                    }
+                    Ok(())
+                })
+                .unwrap();
             let container = DockerContainer::from_session_id(&instance.id).name;
 
             let error = instance
@@ -825,7 +856,7 @@ claude-personal = "~/.claude-global"
                 .count();
             assert_eq!(
                 removals, expected_removals,
-                "built_for={built_for:?}: {error:#}\n{calls}"
+                "built_for={built_for:?} disk_tool={disk_tool:?}: {error:#}\n{calls}"
             );
         }
     }
