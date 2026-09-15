@@ -506,6 +506,11 @@ impl Instance {
                 shell_escape(&profile),
                 shell_escape(&self.id)
             ));
+            if let Some(agent) = agent {
+                env_info
+                    .docker_args
+                    .push_str(&format!(" -e AOE_AGENT_BIN={}", shell_escape(agent.binary)));
+            }
             if let Some(&(key, expected)) = agent.and_then(|agent| {
                 agent
                     .container_env

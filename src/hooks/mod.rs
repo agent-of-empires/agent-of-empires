@@ -428,15 +428,16 @@ fn hook_command_session_id_host(field: crate::agents::HookIdentityField) -> Stri
 fn hook_command_session_id_sandbox(base: &str, field: crate::agents::HookIdentityField) -> String {
     let selector = match field {
         crate::agents::HookIdentityField::SessionId => {
-            r#"if .agent_id != null then empty elif (.session_id|type)=="string" then .session_id else empty end"#
+            r#"if (.session_id|type)=="string" then .session_id else empty end"#
         }
         crate::agents::HookIdentityField::ConversationIdOrSessionId => {
-            r#"if .agent_id != null then empty elif (.conversation_id|type)=="string" then .conversation_id elif (.session_id|type)=="string" then .session_id else empty end"#
+            r#"if (.conversation_id|type)=="string" then .conversation_id elif (.session_id|type)=="string" then .session_id else empty end"#
         }
     };
-    // jq performs structural top-level extraction like the host path, including
-    // its subagent (`agent_id`) skip. The POSIX guards then enforce the shared
-    // shell-safe session-id contract.
+    // jq performs structural top-level extraction like the host path. The
+    // POSIX guards then enforce the shared shell-safe session-id contract.
+    // As on the host, a second `AOE_AGENT_BIN` ancestor marks a nested agent;
+    // the container has no launch pid, so the walk runs to its root.
     format!(
         "sh -c 'unset IFS; set -f; umask 077; \
          [ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
@@ -445,6 +446,13 @@ fn hook_command_session_id_sandbox(base: &str, field: crate::agents::HookIdentit
          LS=$(LC_ALL=C ls -ldn \"$D\" 2>/dev/null) || exit 0; \
          set -- $LS; M=\"$1\"; \
          case \"$M\" in drwx------|drwx------.|drwx------+|drwx------@) ;; *) exit 0 ;; esac; \
+         B=\"${{AOE_AGENT_BIN:-}}\"; N=0; P=$PPID; \
+         while [ -n \"$B\" ] && [ \"${{P:-0}}\" -gt 0 ]; do \
+         A=$(tr \"\\0\" \"\\n\" < /proc/$P/cmdline 2>/dev/null | head -n 1); \
+         [ \"${{A##*/}}\" = \"$B\" ] && N=$((N + 1)); \
+         P=$(sed -n \"s/^PPid:[[:space:]]*//p\" /proc/$P/status 2>/dev/null); \
+         done; \
+         [ \"$N\" -le 1 ] || exit 0; \
          command -v jq >/dev/null 2>&1 || exit 0; \
          SID=$(jq -r '\\''{selector}'\\'' 2>/dev/null); \
          case \"$SID\" in \"\"|-*|*[!0-9a-zA-Z._-]*) exit 0 ;; esac; \
@@ -5106,25 +5114,51 @@ hooks_auto_accept: false
     }
 
     #[test]
-    fn test_hook_command_session_id_skips_subagent_payload() {
-        if skip_if_no_jq() {
+    fn test_hook_command_session_id_skips_nested_agent() {
+        if skip_if_no_jq() || !Path::new("/proc/self/cmdline").exists() {
             return;
         }
+        use std::io::Write;
         let tmp = TempDir::new().unwrap();
-        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-        let payload =
-            format!(r#"{{"session_id":"{uuid}","agent_id":"a1","agent_type":"Explore"}}"#);
-        let output = run_session_id_hook(&payload, "subagent", tmp.path());
-        assert!(output.status.success());
-        assert!(!tmp.path().join("subagent").join("session_id").exists());
-
-        // `--agent` sessions carry `agent_type` without `agent_id` and own the pane.
-        let payload = format!(r#"{{"session_id":"{uuid}","agent_type":"reviewer"}}"#);
-        let output = run_session_id_hook(&payload, "agent_flag", tmp.path());
-        assert!(output.status.success());
-        let written = std::fs::read_to_string(tmp.path().join("agent_flag").join("session_id"))
-            .expect("sidecar file");
-        assert_eq!(written, uuid);
+        let agent = tmp.path().join("aoe-fake-agent");
+        std::os::unix::fs::symlink("/bin/sh", &agent).unwrap();
+        let hook = hook_command_session_id_sandbox(
+            tmp.path().to_str().unwrap(),
+            crate::agents::HookIdentityField::SessionId,
+        );
+        let payload = r#"{"session_id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}"#;
+        for (instance_id, script, writes) in [
+            ("pane_agent", r#"eval "$HOOK"; true"#, true),
+            (
+                "nested_agent",
+                r#""$AGENT" -c 'eval "$HOOK"; true'; true"#,
+                false,
+            ),
+        ] {
+            let mut child = std::process::Command::new(&agent)
+                .args(["-c", script])
+                .env("AGENT", &agent)
+                .env("HOOK", &hook)
+                .env("AOE_AGENT_BIN", "aoe-fake-agent")
+                .env("AOE_INSTANCE_ID", instance_id)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn fake agent");
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(payload.as_bytes())
+                .unwrap();
+            assert!(child.wait_with_output().unwrap().status.success());
+            assert_eq!(
+                tmp.path().join(instance_id).join("session_id").exists(),
+                writes,
+                "{instance_id}"
+            );
+        }
     }
 
     /// End-to-end check against a Claude `PreToolUse` shape: pretty-printed
