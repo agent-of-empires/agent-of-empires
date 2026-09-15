@@ -149,15 +149,15 @@ impl Instance {
             };
 
         // A container built for another agent mounts that agent's config.
-        // Decide on the disk row: a stale in-memory copy would remove the
-        // container a peer just recreated for the swapped tool.
+        // Decide on the disk row and a resolved profile: a stale in-memory copy
+        // or a defaulted config would remove a valid container.
         if container.exists()?
-            && container.agent_tool_matches(&self.container_agent_identity())? == Some(false)
+            && container.agent_tool_matches(&self.container_agent_identity()?)? == Some(false)
         {
             self.try_reconcile_from_disk().context(
                 "cannot confirm the session's tool before removing its sandbox container",
             )?;
-            if container.agent_tool_matches(&self.container_agent_identity())? == Some(false) {
+            if container.agent_tool_matches(&self.container_agent_identity()?)? == Some(false) {
                 tracing::info!(
                     target: "containers.runtime",
                     session = %self.id,
@@ -313,12 +313,13 @@ impl Instance {
         Ok(container)
     }
 
-    fn container_agent_identity(&self) -> String {
+    fn container_agent_identity(&self) -> Result<String> {
         container_config::container_agent_identity(
             &self.tool,
             Some(&self.effective_detect_as()),
             &self.source_profile,
         )
+        .context("cannot resolve the session's agent to check its sandbox container")
     }
 
     /// Whether the session's container was created before its agent shared a
@@ -818,13 +819,24 @@ claude-personal = "~/.claude-global"
         }
         let _path = crate::session::test_support::path_prepended(&bin);
         let profile = "agent-tool-label";
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(profile);
         let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        // `alias-c` is aliased only in config, never on the session row.
+        std::fs::write(
+            crate::session::get_app_dir().unwrap().join("config.toml"),
+            "[session.agent_detect_as]\nalias-c = \"claude\"\n",
+        )
+        .unwrap();
+        let profile_config =
+            crate::session::config::profile_config::get_profile_config_path(profile).unwrap();
 
         enum Disk {
             Absent,
             Corrupt,
             /// A peer persisted this `(tool, detect_as)` after the in-memory copy.
             Row(&'static str, &'static str),
+            /// A persisted row whose profile config cannot be parsed.
+            RowBrokenProfile(&'static str, &'static str),
         }
         // `store` is the agent config root the reuse path refreshed, if any.
         let cases = [
@@ -847,6 +859,20 @@ claude-personal = "~/.claude-global"
                 Some(".codex"),
             ),
             (("alias-a", "codex"), "alias-a", Disk::Absent, 1, None),
+            (
+                ("alias-c", ""),
+                "alias-c:claude",
+                Disk::Row("alias-c", ""),
+                0,
+                Some(".claude"),
+            ),
+            (
+                ("alias-c", ""),
+                "alias-c:claude",
+                Disk::RowBrokenProfile("alias-c", ""),
+                0,
+                None,
+            ),
         ];
         for ((tool, detect_as), built_for, disk, expected_removals, expected_store) in cases {
             let _ = std::fs::remove_file(&calls_path);
@@ -867,10 +893,13 @@ claude-personal = "~/.claude-global"
                 container_workdir: None,
             });
             let _ = std::fs::remove_file(storage.sessions_path());
+            let _ = std::fs::remove_file(&profile_config);
             storage
                 .update(|instances, _groups| {
                     instances.clear();
-                    if let Disk::Row(tool, detect_as) = disk {
+                    if let Disk::Row(tool, detect_as) | Disk::RowBrokenProfile(tool, detect_as) =
+                        disk
+                    {
                         let mut row = instance.clone();
                         row.tool = tool.to_string();
                         row.detect_as = detect_as.to_string();
@@ -879,8 +908,13 @@ claude-personal = "~/.claude-global"
                     Ok(())
                 })
                 .unwrap();
-            if let Disk::Corrupt = disk {
-                std::fs::write(storage.sessions_path(), "not json").unwrap();
+            match disk {
+                Disk::Corrupt => std::fs::write(storage.sessions_path(), "not json").unwrap(),
+                Disk::RowBrokenProfile(..) => {
+                    std::fs::create_dir_all(profile_config.parent().unwrap()).unwrap();
+                    std::fs::write(&profile_config, "not toml [").unwrap();
+                }
+                Disk::Absent | Disk::Row(..) => {}
             }
             let container = DockerContainer::from_session_id(&instance.id).name;
 
@@ -907,7 +941,14 @@ claude-personal = "~/.claude-global"
                 })
                 .collect();
             assert_eq!(stores, Vec::from_iter(expected_store), "{case}");
+            if let Disk::RowBrokenProfile(..) = disk {
+                assert!(
+                    format!("{error:#}").contains("cannot resolve the session's agent"),
+                    "{case}"
+                );
+            }
         }
+        let _ = std::fs::remove_file(&profile_config);
 
         // The label written at create is the identity the check compares.
         for (tool, detect_as) in [("codex", ""), ("alias-b", "codex")] {
@@ -927,7 +968,7 @@ claude-personal = "~/.claude-global"
             });
             assert_eq!(
                 instance.build_container_config().unwrap().agent_tool,
-                instance.container_agent_identity(),
+                instance.container_agent_identity().unwrap(),
                 "{tool}/{detect_as}"
             );
         }

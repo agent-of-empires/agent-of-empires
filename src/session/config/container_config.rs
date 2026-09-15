@@ -1857,18 +1857,19 @@ fn resolve_active_agent(
 
 /// The identity a sandbox container's agent config mounts are built for. Mounts
 /// follow the resolved agent and store roots follow the tool, so an alias
-/// carries both.
+/// carries both. Fails rather than defaulting: defaults drop config-only
+/// aliases, which would misread a valid container as built for another agent.
 pub(crate) fn container_agent_identity(
     tool: &str,
     detect_as: Option<&str>,
     profile: &str,
-) -> String {
+) -> Result<String> {
     let resolved_profile = super::effective_profile(profile);
-    let session_config = super::profile_config::resolve_config_or_warn(&resolved_profile).session;
-    agent_identity(
+    let session_config = super::profile_config::resolve_config(&resolved_profile)?.session;
+    Ok(agent_identity(
         tool,
         resolve_active_agent(tool, detect_as, &session_config).map_or(tool, |a| a.name),
-    )
+    ))
 }
 
 fn agent_identity(tool: &str, config_tool: &str) -> String {
