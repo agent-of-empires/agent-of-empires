@@ -1035,7 +1035,10 @@ mod tests {
         assert!(inst.agent_session_id.is_none());
     }
 
+    // The status registry is process-global, so this test must not run beside
+    // another one that installs its own aliases.
     #[test]
+    #[serial_test::serial]
     fn empty_detect_as_resolves_status_without_granting_execution() {
         const PROFILE: &str = "detect-as-launch-path-test";
         let _registry = install_aliases(PROFILE, &[("claude-personal", "claude")]);
@@ -1048,14 +1051,8 @@ mod tests {
 
         assert_eq!(inst.effective_detect_as(), "claude");
         assert!(inst.resolved_agent().is_none());
-        assert_eq!(
-            status_hook_env_prefix(&inst.effective_profile(), "abc123", inst.status_agent()),
-            format!(
-                "AOE_PROFILE='{PROFILE}' AOE_INSTANCE_ID='abc123' AOE_HOOK_BIN={} AOE_AGENT_PID=$$ AOE_AGENT_BIN={} ",
-                shell_escape(&std::env::current_exe().unwrap().to_string_lossy()),
-                shell_escape("claude")
-            ),
-        );
+        // The hook environment prefix this alias feeds is pinned by
+        // `hooks::tests::test_status_hook_env_prefix_includes_hermes`.
     }
     #[test]
     fn native_resume_requires_a_direct_local_builtin_launch() {
