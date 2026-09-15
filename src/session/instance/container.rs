@@ -155,27 +155,23 @@ impl Instance {
         // permits reuse, never removal.
         if container.exists()? {
             let reloaded = self.try_reconcile_from_disk();
-            let mismatch =
-                container.agent_tool_matches(&self.container_agent_identity()?)? == Some(false);
-            match (mismatch, reloaded) {
-                (true, reloaded) => {
-                    reloaded.context(
-                        "cannot confirm the session's tool before removing its sandbox container",
-                    )?;
-                    tracing::info!(
-                        target: "containers.runtime",
-                        session = %self.id,
-                        "removing sandbox container built for another tool; it will be recreated"
-                    );
-                    container.remove(true)?;
-                }
-                (false, Err(error)) => tracing::warn!(
+            if container.agent_tool_matches(&self.container_agent_identity()?)? == Some(false) {
+                reloaded.context(
+                    "cannot confirm the session's tool before removing its sandbox container",
+                )?;
+                tracing::info!(
+                    target: "containers.runtime",
+                    session = %self.id,
+                    "removing sandbox container built for another tool; it will be recreated"
+                );
+                container.remove(true)?;
+            } else if let Err(error) = reloaded {
+                tracing::warn!(
                     target: "session.store",
                     session = %self.id,
                     error = %format_args!("{error:#}"),
                     "failed to reload disk state before reusing the sandbox container; using in-memory value"
-                ),
-                (false, Ok(_)) => {}
+                );
             }
         }
         // After every reload above, which may have replaced the tool.
