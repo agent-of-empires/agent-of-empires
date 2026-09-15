@@ -1751,7 +1751,8 @@
       "specs": [
         "src/components/diff/comments/buildPrompt.test.ts",
         "src/lib/acpTypes.test.ts",
-        "src/components/acp/AcpRuntime.test.ts"
+        "src/components/acp/AcpRuntime.test.ts",
+        "src/components/diff/comments/__tests__/DiffCommentsUserCard.test.tsx"
       ],
       "components": [
         "web/src/components/diff/comments/DiffCommentsUserCard.tsx",

@@ -669,6 +669,18 @@ function HighlightedBlock({ text, language, maxLines = 20 }: { text: string; lan
   // segments directly instead.
   const ansi = hasAnsi(shown);
 
+  // Drop stale highlighted markup when the rendered input changes, so a
+  // language-tagged block reused for unfenced text (no language, e.g. a Read
+  // card on an extensionless file) can't keep painting the previous block's
+  // html. Synced at render time (not in an effect) to satisfy the
+  // set-state-in-effect lint, mirroring FullFileViewer's syncKey pattern.
+  const inputKey = `${effectiveLang ?? ""} ${shown}`;
+  const [handledKey, setHandledKey] = useState(inputKey);
+  if (inputKey !== handledKey) {
+    setHandledKey(inputKey);
+    setHtml(null);
+  }
+
   useEffect(() => {
     if (ansi) return;
     let cancelled = false;
@@ -681,9 +693,10 @@ function HighlightedBlock({ text, language, maxLines = 20 }: { text: string; lan
           appearance: shiki.appearance,
         });
         if (cancelled) return;
-        if (out) setHtml(out);
+        setHtml(out);
       } catch {
         // unknown language; fall back to plain
+        if (!cancelled) setHtml(null);
       }
     })();
     return () => {

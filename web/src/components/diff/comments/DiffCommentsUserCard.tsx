@@ -56,6 +56,18 @@ export function DiffCommentsUserCard({ payload }: Props) {
 function HighlightedSnippet({ code, language, filePath }: { code: string; language?: string; filePath: string }) {
   const [html, setHtml] = useState<string | null>(null);
   const shiki = useShikiTheme();
+
+  // Drop stale highlighted markup when the snippet changes, so a switch to an
+  // unknown-language or load-failing snippet can't keep painting the previous
+  // one's html. Synced at render time (not in an effect) to satisfy the
+  // set-state-in-effect lint, mirroring FullFileViewer's syncKey pattern.
+  const inputKey = `${code} ${language ?? ""} ${filePath}`;
+  const [handledKey, setHandledKey] = useState(inputKey);
+  if (inputKey !== handledKey) {
+    setHandledKey(inputKey);
+    setHtml(null);
+  }
+
   useEffect(() => {
     let cancelled = false;
     const hint = language && language.length > 0 ? language : (filePath.split(".").pop() ?? "");
@@ -64,9 +76,10 @@ function HighlightedSnippet({ code, language, filePath }: { code: string; langua
       try {
         const out = await highlightSnippet(code, { langHint: hint, theme: shiki.theme, appearance: shiki.appearance });
         if (cancelled) return;
-        if (out) setHtml(out);
+        setHtml(out);
       } catch {
         // Unknown lang → fall through to plain rendering.
+        if (!cancelled) setHtml(null);
       }
     })();
     return () => {

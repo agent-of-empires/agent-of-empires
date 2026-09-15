@@ -13,7 +13,7 @@
 // a plain <pre> and the test doesn't depend on async theme loading.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 
 vi.mock("../../lib/snippetHighlighter", () => ({
@@ -26,6 +26,7 @@ vi.mock("../../hooks/useShikiTheme", () => ({
   useShikiTheme: () => ({ theme: "dark-plus", appearance: "dark" }),
 }));
 
+import { highlightSnippet } from "../../lib/snippetHighlighter";
 import { ToolCard, TodoGroupCard } from "./ToolCards";
 import { AgentProfileProvider } from "../../lib/agentProfileContext";
 import { AcpFileRefContext } from "./AcpFileRefContext";
@@ -1083,5 +1084,81 @@ describe("hyperlinks in tool output", () => {
     const { container } = outputWith("run \x1b]8;;javascript:alert(1)\x1b\\this\x1b]8;;\x1b\\ now");
     expect(container.querySelector("a")).toBeNull();
     expect(container.textContent).toContain("run this now");
+  });
+});
+
+describe("HighlightedBlock stale-content transitions (#3974)", () => {
+  afterEach(() => {
+    vi.mocked(highlightSnippet).mockReset();
+    vi.mocked(highlightSnippet).mockResolvedValue(null);
+  });
+
+  it("clears highlighted output when a reused read card's file becomes extensionless", async () => {
+    vi.mocked(highlightSnippet).mockResolvedValueOnce('<pre class="shiki">highlighted rust</pre>');
+
+    const tool = makeToolCall({ kind: "read", args_preview: JSON.stringify({ file_path: "/tmp/a.rs" }) });
+    const result = makeCompletion({ text: "fn main() {}" });
+
+    const { container, rerender } = render(
+      <Wrap>
+        <ToolCard tool={tool} result={result} />
+      </Wrap>,
+    );
+    fireEvent.click(container.querySelector("button")!);
+
+    await waitFor(() => {
+      expect(container.querySelector("pre.shiki")).toBeTruthy();
+    });
+
+    vi.mocked(highlightSnippet).mockResolvedValueOnce(null);
+    const extensionlessTool = makeToolCall({
+      kind: "read",
+      args_preview: JSON.stringify({ file_path: "/tmp/README" }),
+    });
+    const newResult = makeCompletion({ text: "plain readme text" });
+
+    rerender(
+      <Wrap>
+        <ToolCard tool={extensionlessTool} result={newResult} />
+      </Wrap>,
+    );
+
+    expect(container.querySelector("pre.shiki")).toBeNull();
+    expect(container.textContent).toContain("plain readme text");
+    expect(container.textContent).not.toContain("fn main");
+  });
+
+  it("clears highlighted output when a reused read card's highlight rejects", async () => {
+    vi.mocked(highlightSnippet).mockResolvedValueOnce('<pre class="shiki">highlighted rust</pre>');
+
+    const tool = makeToolCall({ kind: "read", args_preview: JSON.stringify({ file_path: "/tmp/a.rs" }) });
+    const result = makeCompletion({ text: "fn main() {}" });
+
+    const { container, rerender } = render(
+      <Wrap>
+        <ToolCard tool={tool} result={result} />
+      </Wrap>,
+    );
+    fireEvent.click(container.querySelector("button")!);
+
+    await waitFor(() => {
+      expect(container.querySelector("pre.shiki")).toBeTruthy();
+    });
+
+    vi.mocked(highlightSnippet).mockRejectedValueOnce(new Error("boom"));
+    const otherTool = makeToolCall({ kind: "read", args_preview: JSON.stringify({ file_path: "/tmp/b.rs" }) });
+    const otherResult = makeCompletion({ text: "fn other() {}" });
+
+    rerender(
+      <Wrap>
+        <ToolCard tool={otherTool} result={otherResult} />
+      </Wrap>,
+    );
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("fn other() {}");
+    });
+    expect(container.querySelector("pre.shiki")).toBeNull();
+    expect(container.textContent).not.toContain("fn main");
   });
 });
