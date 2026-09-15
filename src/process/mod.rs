@@ -707,11 +707,11 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        // argv reads empty until the child finishes exec.
+        // Until exec completes, argv is empty or still the parent's.
         let deadline = Instant::now() + Duration::from_secs(5);
         let read = loop {
             let read = parent_and_argv0(child.id());
-            if read.as_ref().is_some_and(|(_, argv0)| !argv0.is_empty())
+            if read.as_ref().is_some_and(|(_, argv0)| argv0 == "sleep")
                 || Instant::now() >= deadline
             {
                 break read;
