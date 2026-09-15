@@ -567,10 +567,13 @@ impl Instance {
             let worker = value("CLAUDE_CONFIG_DIR")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| home.join(".claude"));
-            let worker = crate::session::capture::canonicalize_or_raw(worker.to_str()?);
-            let terminal = crate::session::capture::canonicalize_or_raw(
-                execution.binding.stores.first()?.to_str()?,
-            );
+            // The two spellings can differ only by symlinks in the session's
+            // own root (a symlinked home or temp directory), so both sides are
+            // reduced to the same identity before comparing.
+            let worker = crate::session::capture::canonicalize_allowing_missing_leaf(&worker)?;
+            let terminal = crate::session::capture::canonicalize_allowing_missing_leaf(
+                execution.binding.stores.first()?,
+            )?;
             if worker != terminal {
                 return None;
             }
@@ -594,6 +597,11 @@ mod tests {
     fn switch_to_terminal_keep_context_resolves_the_native_binding() {
         let temp = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "claude",
+            "#!/bin/sh\nexit 0\n",
+        );
         let mut inst = Instance::new("claude", "/tmp");
         inst.view = View::Structured;
         inst.acp_session_id = Some("sid-abc".to_string());
@@ -662,6 +670,11 @@ mod tests {
     fn switch_to_terminal_keep_context_accepts_a_session_home_store() {
         let temp = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "claude",
+            "#!/bin/sh\nexit 0\n",
+        );
         let session_home = temp.path().join("agent-home");
         let mut inst = Instance::new("claude-session-home", "/tmp");
         // The worker and the terminal launch both read this HOME, so the
@@ -678,7 +691,7 @@ mod tests {
                 .and_then(|binding| binding.execution.as_ref())
                 .and_then(|execution| execution.stores.first())
                 .map(std::path::PathBuf::as_path),
-            Some(session_home.join(".claude").as_path()),
+            Some(path_identity(&session_home.join(".claude")).as_path()),
             "a session HOME store the worker shares must be accepted"
         );
     }
@@ -734,6 +747,11 @@ mod tests {
             ),
         )
         .unwrap();
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "claude",
+            "#!/bin/sh\nexit 0\n",
+        );
         let project = temp.path().join("project");
         std::fs::create_dir(&project).unwrap();
         let mut inst = Instance::new("claude-asserted-store", project.to_str().unwrap());

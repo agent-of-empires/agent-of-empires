@@ -58,6 +58,29 @@ fn claude_config_dir_override(host_env: &[String]) -> Option<String> {
 /// historical unnormalized spelling (a pre-#2858 worktree `project_path` like
 /// `/repos/x/../x-worktrees/b`) still compares equal to the plain spelling
 /// after the directory has been deleted.
+/// Resolve a path to a comparable identity even when its leaf does not exist.
+///
+/// [`canonicalize_or_raw`] canonicalizes the whole path or falls back to its
+/// lexical spelling, so two names for the same directory (a symlinked temp or
+/// home root) compare unequal as soon as the leaf is missing. This walks up to
+/// the first existing ancestor, canonicalizes that, and re-appends the rest.
+pub(crate) fn canonicalize_allowing_missing_leaf(path: &Path) -> Option<PathBuf> {
+    let mut resolved = path.to_path_buf();
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(canonical) = resolved.canonicalize() {
+            let mut identity = canonical;
+            for component in missing.iter().rev() {
+                identity.push(component);
+            }
+            return Some(identity);
+        }
+        let name = resolved.file_name()?.to_os_string();
+        missing.push(name);
+        resolved = resolved.parent()?.to_path_buf();
+    }
+}
+
 pub(crate) fn canonicalize_or_raw(path: &str) -> PathBuf {
     std::fs::canonicalize(path)
         .unwrap_or_else(|_| crate::git::template::lexical_normalize(Path::new(path)))

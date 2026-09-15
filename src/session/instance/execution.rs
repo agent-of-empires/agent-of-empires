@@ -295,8 +295,20 @@ impl NativeLaunchInputs {
                 "Hermes SQLite files must not be redirected by symlinks"
             );
             let projected = self.physical_location(&canonical);
+            // A sidecar that does not exist yet is spelled through the mount's
+            // configured path, which a symlinked root spells differently from
+            // the canonical directory. Compare the parent's identity and the
+            // file name instead of the raw spellings.
+            let projected_directory = crate::session::capture::canonicalize_allowing_missing_leaf(
+                projected
+                    .path
+                    .parent()
+                    .context("Hermes SQLite file has no parent directory")?,
+            );
             anyhow::ensure!(
-                projected.filesystem == "host" && projected.path == directory.join(name),
+                projected.filesystem == "host"
+                    && projected_directory.as_deref() == Some(directory.as_path())
+                    && projected.path.file_name() == path.file_name(),
                 "Hermes SQLite directory and sidecars have inconsistent projections"
             );
             match std::fs::symlink_metadata(&projected.path) {
@@ -1705,6 +1717,35 @@ impl Instance {
         })
     }
 
+    /// Whether two executions describe one context.
+    ///
+    /// A symlinked app, temp or home root spells the same store or working
+    /// directory two ways, so the paths are reduced to their identities before
+    /// comparing; everything else must match exactly.
+    fn execution_identity_matches(left: &ExecutionBinding, right: &ExecutionBinding) -> bool {
+        fn identity(path: &std::path::Path) -> std::path::PathBuf {
+            crate::session::capture::canonicalize_allowing_missing_leaf(path)
+                .unwrap_or_else(|| path.to_path_buf())
+        }
+        fn locations_match(left: &[ExecutionLocation], right: &[ExecutionLocation]) -> bool {
+            left.len() == right.len()
+                && left.iter().zip(right).all(|(left, right)| {
+                    left.filesystem == right.filesystem
+                        && identity(&left.path) == identity(&right.path)
+                })
+        }
+        left.agent == right.agent
+            && left.filesystem == right.filesystem
+            && left.cwd_filesystem == right.cwd_filesystem
+            && identity(&left.cwd) == identity(&right.cwd)
+            && locations_match(&left.configuration, &right.configuration)
+            && left
+                .stores
+                .iter()
+                .map(|store| identity(store))
+                .eq(right.stores.iter().map(|store| identity(store)))
+    }
+
     pub(super) fn validate_conversation_target(
         &self,
         execution: &ExecutionBinding,
@@ -1730,7 +1771,11 @@ impl Instance {
         // conversion) rebinds it instead of failing. A known conversation still
         // has to match this launch exactly.
         anyhow::ensure!(
-            binding.execution.as_ref() == Some(execution) || !binding.is_known(),
+            binding
+                .execution
+                .as_ref()
+                .is_some_and(|bound| Self::execution_identity_matches(bound, execution))
+                || !binding.is_known(),
             "conversation execution identity, store or working directory differs from this launch; restore its context or explicitly rebind the intended conversation"
         );
         Ok(())
