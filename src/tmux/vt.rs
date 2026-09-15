@@ -2056,13 +2056,9 @@ impl ReaderCtx {
     fn lock_snapshot(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, ()>> {
         #[cfg(test)]
         if let Some(contended) = &self.snapshot_contended {
-            match self.snapshot.try_lock() {
-                Ok(guard) => return Ok(guard),
-                Err(std::sync::TryLockError::Poisoned(error)) => return Err(error),
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    let _ = contended.send(());
-                }
-            }
+            return crate::session::test_support::lock_reporting_contention(&self.snapshot, || {
+                let _ = contended.send(());
+            });
         }
         self.snapshot.lock()
     }

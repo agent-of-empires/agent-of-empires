@@ -495,18 +495,13 @@ pub fn drain_recovery_pending(
     id: &str,
 ) {
     #[cfg(test)]
-    let lock = match pending.try_write() {
-        Ok(guard) => Ok(guard),
-        Err(std::sync::TryLockError::Poisoned(error)) => Err(error),
-        Err(std::sync::TryLockError::WouldBlock) => {
-            DRAIN_CONTENTION_OBSERVER.with(|slot| {
-                if let Some(sender) = slot.borrow_mut().take() {
-                    let _ = sender.send(());
-                }
-            });
-            pending.write()
-        }
-    };
+    let lock = crate::session::test_support::write_reporting_contention(pending, || {
+        DRAIN_CONTENTION_OBSERVER.with(|slot| {
+            if let Some(sender) = slot.borrow_mut().take() {
+                let _ = sender.send(());
+            }
+        })
+    });
     #[cfg(not(test))]
     let lock = pending.write();
     if let Ok(mut guard) = lock {
