@@ -1970,13 +1970,30 @@ impl Instance {
         self.pi_session_path = pi_session_path.filter(|_| sid.is_some());
         self.agent_session_id = sid;
     }
+    /// The binding an observation is allowed to establish for this instance.
+    ///
+    /// An observation without launch evidence cannot qualify a conversation, so
+    /// it may refresh the published id and transcript path but must keep the
+    /// binding an earlier qualified publication established.
+    pub(super) fn observed_binding(
+        &self,
+        observation: &crate::session::poller::SessionIdObservation,
+    ) -> Option<ConversationBinding> {
+        observation.conversation_binding().or_else(|| {
+            self.agent_session_binding
+                .clone()
+                .filter(|binding| binding.session_id == observation.sid)
+        })
+    }
+
     pub(crate) fn apply_conversation_observation(
         &mut self,
         observation: &crate::session::poller::SessionIdObservation,
     ) {
+        let binding = self.observed_binding(observation);
         self.set_agent_conversation(
             Some(observation.sid.clone()),
-            observation.conversation_binding(),
+            binding,
             observation.pi_session_path.clone(),
         );
     }

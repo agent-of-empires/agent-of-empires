@@ -126,12 +126,20 @@ pub(super) fn persist_session_with_storage(
         }
         let instance = &mut instances[index];
         let confirms_pin = observation.confirms_omp_pin(&instance.resume_intent);
+        // A source-less observation of the id the row already holds is not
+        // evidence that a conversation qualified, nor that a failed resume now
+        // works; keep the binding and the loop breaker.
+        let establishes = binding.is_some();
+        let new_conversation = instance.agent_session_id.as_deref() != Some(session_id);
+        let binding = binding.or_else(|| instance.observed_binding(observation));
         instance.set_agent_conversation(
             Some(session_id.into()),
-            binding.clone(),
+            binding,
             observation.pi_session_path.clone(),
         );
-        instance.resume_probe_failed_sid = None;
+        if establishes || new_conversation {
+            instance.resume_probe_failed_sid = None;
+        }
         if confirms_pin {
             instance.resume_intent = ResumeIntent::Default;
             instance.resume_binding = None;
@@ -485,6 +493,113 @@ mod tests {
 
         let loaded = storage.load().unwrap();
         assert_eq!(loaded[0].agent_session_id.as_deref(), Some("new"));
+    }
+
+    #[test]
+    #[serial]
+    fn source_less_observation_cannot_withdraw_a_qualified_binding() {
+        let temp = tempdir().unwrap();
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+
+        let profile = "source-less-observation";
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        let sid = "019342ab-1234-7def-8901-abcdef012345";
+        let execution = crate::session::ExecutionBinding {
+            agent: "claude".into(),
+            stores: vec![temp.path().join("claude")],
+            configuration: Vec::new(),
+            cwd: "/tmp/x".into(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+        };
+        let mut inst = Instance::new("title", "/tmp/x");
+        inst.source_profile = profile.into();
+        inst.tool = "claude".into();
+        inst.set_agent_conversation(
+            Some(sid.into()),
+            Some(ConversationBinding {
+                session_id: sid.into(),
+                execution: Some(execution.clone()),
+                provenance: ConversationProvenance::Observed,
+                transcript_path: None,
+            }),
+            None,
+        );
+        inst.resume_probe_failed_sid = Some(sid.into());
+        let on_disk = vec![inst.clone()];
+        storage
+            .update(|i, g| {
+                *i = on_disk.clone();
+                *g = crate::session::GroupTree::new_with_groups(&on_disk, &[]).get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+
+        // A plain sidecar publication carries no launch evidence, so it may
+        // refresh the transcript path but it cannot withdraw the qualification
+        // or the loop breaker for the id the row already holds.
+        let mut source_less = crate::session::poller::SessionIdObservation::unguarded(sid.into());
+        source_less.pi_session_path = Some("/sidecar/transcript.jsonl".into());
+        assert_eq!(
+            super::persist_session_to_storage(
+                profile,
+                &inst.id,
+                &source_less,
+                &inst.conversation_state(),
+                &crate::file_watch::FileWatchService::noop(),
+            ),
+            super::SidWrite::Applied
+        );
+
+        let loaded = storage.load().unwrap();
+        let row = loaded.iter().find(|row| row.id == inst.id).unwrap();
+        assert_eq!(
+            row.agent_session_binding
+                .as_ref()
+                .and_then(|binding| binding.execution.as_ref()),
+            Some(&execution),
+            "a source-less observation must keep the qualified binding"
+        );
+        assert_eq!(
+            row.resume_probe_failed_sid.as_deref(),
+            Some(sid),
+            "a source-less observation must keep the resume loop breaker"
+        );
+        assert_eq!(
+            row.pi_session_path.as_deref(),
+            Some("/sidecar/transcript.jsonl"),
+            "a source-less observation still refreshes the transcript path"
+        );
+
+        let mut live = inst.clone();
+        live.apply_conversation_observation(&source_less);
+        assert_eq!(
+            live.agent_session_binding
+                .as_ref()
+                .and_then(|binding| binding.execution.as_ref()),
+            Some(&execution),
+            "the in-memory apply must keep the qualified binding"
+        );
+
+        // A different id is a different conversation: its publication must not
+        // inherit the previous binding or loop breaker.
+        let expected = row.conversation_state();
+        assert_eq!(
+            super::persist_session_to_storage(
+                profile,
+                &inst.id,
+                &crate::session::poller::SessionIdObservation::unguarded(
+                    "019342ac-5678-7def-8901-abcdef012345".into()
+                ),
+                &expected,
+                &crate::file_watch::FileWatchService::noop(),
+            ),
+            super::SidWrite::Applied
+        );
+        let loaded = storage.load().unwrap();
+        let row = loaded.iter().find(|row| row.id == inst.id).unwrap();
+        assert!(row.agent_session_binding.is_none());
+        assert_eq!(row.resume_probe_failed_sid, None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

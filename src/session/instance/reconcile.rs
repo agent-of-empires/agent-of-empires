@@ -103,9 +103,8 @@ impl Instance {
             return;
         };
         let fresh = &observation.sid;
-        if Some(fresh) == self.agent_session_id.as_ref()
-            && self.agent_session_binding == observation.conversation_binding()
-        {
+        let binding = self.observed_binding(&observation);
+        if Some(fresh) == self.agent_session_id.as_ref() && self.agent_session_binding == binding {
             return;
         }
         if self.is_capture_excluded(fresh, observation.source.as_ref()) {
@@ -121,7 +120,6 @@ impl Instance {
             &self.resolve_file_watch(),
         ) {
             SidWrite::Applied => {
-                let binding = observation.conversation_binding();
                 self.set_agent_conversation(Some(observation.sid), binding, None);
             }
             SidWrite::Skipped => {
