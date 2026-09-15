@@ -708,6 +708,25 @@ impl Instance {
 #[cfg(test)]
 mod tests {
 
+    /// Mirror the launch path's content admission for a sandboxed fixture: a
+    /// real launch runs `admit_fresh_instance` before anything reads the
+    /// store, and an unadmitted sandboxed pane resolves no sidecar path (so no
+    /// launch line). That call also holds a launch transition lock, which a
+    /// fixture must not carry into the paths these tests exercise, so this
+    /// certifies exactly the roots `instance_roots` names — the same roots
+    /// admission proves.
+    fn admit_fixture_content(inst: &Instance) {
+        let app = crate::session::get_app_dir().unwrap();
+        for root in crate::migrations::v030_isolate_sandbox_content::instance_roots(inst).unwrap() {
+            std::fs::create_dir_all(&root.path).unwrap();
+            let roles: Vec<&str> = root.roles.iter().map(String::as_str).collect();
+            crate::migrations::v030_isolate_sandbox_content::certify_test_content(
+                &app, &inst.id, &root.path, &roles,
+            )
+            .unwrap();
+        }
+    }
+
     // The sidecar env var has to survive into the docker argv, not just be
     // computed: nothing in CI runs a container to catch it going missing.
     #[test]
@@ -731,6 +750,7 @@ mod tests {
             container_workdir: Some("/workspace".to_string()),
             before_start_env: Vec::new(),
         });
+        admit_fixture_content(&inst);
 
         let (cmd, _, _, _) = inst
             .build_launch_command()
@@ -779,6 +799,7 @@ mod tests {
             container_workdir: None,
             before_start_env: Vec::new(),
         });
+        admit_fixture_content(&inst);
 
         let (flag, env) = inst
             .identity_extension_launch()

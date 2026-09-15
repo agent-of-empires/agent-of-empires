@@ -3642,10 +3642,25 @@ gemini = "{}"
         assert!(!root.join(peer).exists());
         assert!(!root.join(orphan).exists());
         assert!(!root.join("common").exists());
+        let recovered: Vec<_> =
+            fs::read_dir(home.join(crate::migrations::v030_isolate_sandbox_content::RECOVERY))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("v027-"))
+                })
+                .collect();
+        assert_eq!(recovered.len(), 1, "the shared root is retained whole");
         assert_eq!(
-            fs::read(root.join("sessions").join("other")).unwrap(),
+            fs::read(recovered[0].join("original/sessions/other")).unwrap(),
             b"other",
-            "what no private store received is the only copy left, so it stays"
+            "what no private store received stays in the retained original"
+        );
+        assert!(
+            !root.exists(),
+            "a retained root leaves nothing at its old path"
         );
     }
 
@@ -3834,9 +3849,11 @@ gemini = "{}"
     }
 
     /// A registry row shaped like a real `Instance`, so `Storage::update`
-    /// can load the registry it sits in.
-    fn instance_row(id: &str) -> Value {
-        let mut row = serde_json::to_value(crate::session::Instance::new(id, "/tmp")).unwrap();
+    /// can load the registry it sits in. The project must not be an ancestor
+    /// of HOME: the isolation pass refuses a sandbox whose mount would expose
+    /// the recovery namespace.
+    fn instance_row(id: &str, project: &str) -> Value {
+        let mut row = serde_json::to_value(crate::session::Instance::new(id, project)).unwrap();
         row["id"] = id.into();
         row["tool"] = "gemini".into();
         // A fresh `Instance` is born on the current generation; this one
@@ -4007,13 +4024,19 @@ gemini = "{}"
         let home = dirs::home_dir().unwrap();
         fs::create_dir_all(home.join(".gemini/sandbox/history")).unwrap();
         fs::write(home.join(".gemini/sandbox/history/id.json"), b"legacy").unwrap();
+        let project = home.join("project");
+        fs::create_dir_all(&project).unwrap();
         let alpha = app.join("profiles/alpha/sessions.json");
         let beta = app.join("profiles/beta/sessions.json");
         fs::create_dir_all(alpha.parent().unwrap()).unwrap();
         fs::create_dir_all(beta.parent().unwrap()).unwrap();
         fs::write(
             &alpha,
-            serde_json::to_vec(&vec![instance_row("1111111111111111")]).unwrap(),
+            serde_json::to_vec(&vec![instance_row(
+                "1111111111111111",
+                project.to_str().unwrap(),
+            )])
+            .unwrap(),
         )
         .unwrap();
         fs::write(&beta, b"[]").unwrap();
@@ -4025,15 +4048,17 @@ gemini = "{}"
 
         let writes = {
             let (alpha, beta) = (alpha.clone(), beta.clone());
+            let project = project.clone();
             std::thread::spawn(move || {
                 let write = |profile: &str, path: PathBuf, title: &str| {
                     crate::session::Storage::new_for_test_path(profile, path).update(
                         |instances, _| {
                             match instances.first_mut() {
                                 Some(first) => first.title = title.to_string(),
-                                None => {
-                                    instances.push(crate::session::Instance::new(title, "/tmp"))
-                                }
+                                None => instances.push(crate::session::Instance::new(
+                                    title,
+                                    project.to_str().unwrap(),
+                                )),
                             }
                             Ok(())
                         },

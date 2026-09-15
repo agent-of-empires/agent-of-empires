@@ -655,6 +655,25 @@ mod tests {
     use super::PollerStart;
     use crate::session::{Instance, SandboxInfo, Status};
 
+    /// Mirror the launch path's content admission for a sandboxed fixture: a
+    /// real launch runs `admit_fresh_instance` before anything reads the
+    /// store, and an unadmitted sandboxed instance resolves no store (nor
+    /// passes the poller gate). That call also holds a launch transition lock,
+    /// which a fixture must not carry into the paths these tests exercise, so
+    /// this certifies exactly the roots `instance_roots` names — the same
+    /// roots admission proves.
+    fn admit_fixture_content(inst: &Instance) {
+        let app = crate::session::get_app_dir().unwrap();
+        for root in crate::migrations::v030_isolate_sandbox_content::instance_roots(inst).unwrap() {
+            std::fs::create_dir_all(&root.path).unwrap();
+            let roles: Vec<&str> = root.roles.iter().map(String::as_str).collect();
+            crate::migrations::v030_isolate_sandbox_content::certify_test_content(
+                &app, &inst.id, &root.path, &roles,
+            )
+            .unwrap();
+        }
+    }
+
     /// The 2026-09-04 fleet shape: two sessions past the poller budget were
     /// re-probed by the daemon every 2 s tick, each attempt logging a
     /// "budget exhausted" + "Failed to start session poller" pair (~2.5
@@ -791,6 +810,7 @@ mod tests {
             before_start_env: Vec::new(),
             container_workdir: Some("/workspace/prime-repair".to_string()),
         });
+        admit_fixture_content(&inst);
         let store = inst.sandbox_capture_store_dir().unwrap();
         std::fs::create_dir_all(&store).unwrap();
         let live = crate::tmux::LiveSessionSnapshot::from_parts(
@@ -911,6 +931,7 @@ mod tests {
             container_workdir: None,
             before_start_env: Vec::new(),
         });
+        admit_fixture_content(&sandboxed);
         let dir = sandboxed
             .pi_sidecar_source()
             .and_then(|s| match s {
@@ -974,6 +995,7 @@ mod tests {
         });
         let name = inst.tmux_session().unwrap().name().to_string();
         let live = crate::tmux::LiveSessionSnapshot::from_parts(Some(vec![name]), None);
+        admit_fixture_content(&inst);
         inst.session_id_poller_retry_after =
             Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
 
@@ -1016,13 +1038,16 @@ mod tests {
 
         let mut current = sandboxed_gemini("current", "/repos/current", "/workspace/current");
         current.source_profile = current_profile.to_string();
-        current.sandbox_store_generation = 1;
         let mut peer = sandboxed_gemini("peer", "/repos/peer", "/workspace/peer");
         peer.source_profile = peer_profile.to_string();
-        peer.sandbox_store_generation = 1;
+        // The store is keyed by instance id (`sandbox-v2/<instance>`), so the
+        // one physical store two rows can still share is the same sandbox
+        // recorded in a second profile — the shape of a row moved or copied
+        // between profiles. Generation no longer selects the store path.
+        peer.id = current.id.clone();
+        admit_fixture_content(&current);
         let shared_store = current.sandbox_capture_store_dir().unwrap();
         assert_eq!(peer.sandbox_capture_store_dir().unwrap(), shared_store);
-        std::fs::create_dir_all(&shared_store).unwrap();
 
         current_storage
             .update(|instances, _| {
@@ -1038,14 +1063,16 @@ mod tests {
             .unwrap();
         assert!(
             !current.managed_capture_store_is_exclusive(backend),
-            "different rows and workdirs sharing one store are not exclusive"
+            "a peer row in another profile on the same physical store is not exclusive"
         );
 
-        peer.sandbox_store_generation =
-            crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION;
+        // A peer sandbox with an id of its own resolves a store of its own, so
+        // the same cross-profile scan finds nothing to conflict with.
+        let mut peer = sandboxed_gemini("peer", "/repos/peer", "/workspace/peer");
+        peer.source_profile = peer_profile.to_string();
+        admit_fixture_content(&peer);
         let peer_store = peer.sandbox_capture_store_dir().unwrap();
         assert_ne!(peer_store, shared_store);
-        std::fs::create_dir_all(&peer_store).unwrap();
         peer_storage
             .update(|instances, _| {
                 *instances = vec![peer.clone()];
