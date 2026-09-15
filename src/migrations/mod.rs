@@ -283,7 +283,13 @@ fn run_migrations_inner(reporter: Option<progress::Reporter>, announce: bool) ->
     }
     if current == CURRENT_VERSION {
         v027_isolate_sandbox_stores::reconcile_pending(announce)?;
-        return v030_isolate_sandbox_content::reconcile_pending(announce);
+        // Content isolation is keyed by home, and v027 defers that lookup for
+        // the same reason: a host that cannot name a home has no content root
+        // to reconcile and must still start.
+        if dirs::home_dir().is_some() {
+            return v030_isolate_sandbox_content::reconcile_pending(announce);
+        }
+        return Ok(());
     }
 
     let pending: Vec<&Migration> = MIGRATIONS

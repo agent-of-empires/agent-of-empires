@@ -1241,7 +1241,13 @@ fn run_pass(
             progress::step(format!("retiring shared agent store {}", root.display()));
             if !retire_legacy(root)? {
                 // The retention was deferred, so the shared store is still
-                // there: keep the root pending and retry on a later pass.
+                // there. A journal path alone carries no retirement authority,
+                // and this pass would otherwise stamp the cohort current and
+                // never plan this root again: keep the rows pending so a later
+                // pass re-derives the root and retries the retirement.
+                for target in &related {
+                    ready_rows.remove(&(target.registry, target.row));
+                }
                 pending.push(root.to_string_lossy().into_owned());
             }
         } else {
@@ -2117,15 +2123,11 @@ fn retire_legacy(source: &Path) -> Result<bool> {
     // leaves the root pending and a later pass retires it.
     let mut deferred = false;
     for candidate in [&quarantine, source] {
-        match super::v030_isolate_sandbox_content::retain_legacy_original(candidate, host)? {
-            super::v030_isolate_sandbox_content::Retained::Original(kept) => {
-                progress::notice(format!(
-                    "Retained complete legacy sandbox original at {}",
-                    kept.display()
-                ));
-            }
-            super::v030_isolate_sandbox_content::Retained::Absent => {}
-            super::v030_isolate_sandbox_content::Retained::Deferred => deferred = true,
+        if matches!(
+            super::v030_isolate_sandbox_content::retain_legacy_original(candidate, host)?,
+            super::v030_isolate_sandbox_content::Retained::Deferred
+        ) {
+            deferred = true;
         }
     }
     if deferred {
@@ -3682,6 +3684,60 @@ gemini = "{}"
             !root.exists(),
             "a retained root leaves nothing at its old path"
         );
+    }
+
+    /// A retirement a live mount defers must not be lost: the cohort stays
+    /// pending, and the pass that follows retires the root once the mount is
+    /// gone instead of stamping it current and leaving the shared store forever.
+    #[test]
+    #[serial_test::serial]
+    fn a_deferred_retirement_is_retried_by_a_later_pass() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        let home = dirs::home_dir().unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let id = "3333333333333333";
+        let root = home.join(".gemini/sandbox");
+        fs::create_dir_all(root.join(id)).unwrap();
+        fs::write(root.join(id).join("own"), b"own").unwrap();
+        fs::write(
+            app.join("sessions.json"),
+            format!(
+                r#"[{{"id":"{id}","tool":"gemini","project_path":"{}","sandbox_info":{{"enabled":true}}}}]"#,
+                project.display()
+            ),
+        )
+        .unwrap();
+
+        let expose = |sources: Option<Vec<std::path::PathBuf>>| {
+            super::super::v030_isolate_sandbox_content::EXPOSED_SOURCES
+                .with(|hook| *hook.borrow_mut() = sources);
+        };
+        expose(Some(vec![home.clone()]));
+        run_in(&app, &home, &|_| Ok(false)).unwrap();
+        let rows: Value =
+            serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
+        assert!(
+            rows[0]
+                .get("sandbox_store_generation")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                < 2,
+            "a deferred retirement keeps its cohort pending: {rows}"
+        );
+        assert!(app.join(JOURNAL).is_file(), "the root stays pending");
+        assert!(root.join(id).is_dir(), "nothing moved while it was exposed");
+
+        expose(None);
+        run_in(&app, &home, &|_| Ok(false)).unwrap();
+        assert!(
+            !root.exists(),
+            "the next pass retires the shared store once nothing exposes it"
+        );
+        assert!(!app.join(JOURNAL).exists());
+        assert!(home.join(".gemini/sandbox-v2").join(id).is_dir());
     }
 
     #[test]

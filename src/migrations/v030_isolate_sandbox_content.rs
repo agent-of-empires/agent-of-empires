@@ -713,7 +713,30 @@ pub(crate) enum Retained {
 /// holds the stopped cohort lock; the entire tree moves intact,
 /// including unclassified entries and links that were never copy candidates.
 pub(crate) fn retain_legacy_original(source: &Path, host: &Path) -> Result<Retained> {
-    retain_legacy_original_with(source, host, &live_bind_sources)
+    let retained = retain_legacy_original_with(source, host, &live_exposure)?;
+    if let Retained::Original(kept) = &retained {
+        progress::notice(format!(
+            "Retained complete legacy sandbox original at {}",
+            kept.display()
+        ));
+    }
+    Ok(retained)
+}
+
+/// The live mounts a sandbox holds, or the sources a test asked to pretend it
+/// holds, so a test can drive the deferral without a container runtime.
+fn live_exposure(id: &str) -> Result<Vec<PathBuf>> {
+    #[cfg(test)]
+    if let Some(sources) = EXPOSED_SOURCES.with(|hook| hook.borrow().clone()) {
+        return Ok(sources);
+    }
+    live_bind_sources(id)
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static EXPOSED_SOURCES: std::cell::RefCell<Option<Vec<PathBuf>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn retain_legacy_original_with(
