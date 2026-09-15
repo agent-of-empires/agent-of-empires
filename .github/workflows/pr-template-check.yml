@@ -75,6 +75,9 @@ jobs:
             const labelName = 'missing-template';
 
             if (!hasChecklist) {
+              // Fail every run, not only the one that applies the label.
+              core.setFailed('PR template checklist is missing');
+
               // Check if we already labeled this PR
               const { data: labels } = await github.rest.issues.listLabelsOnIssue({
                 owner: context.repo.owner,
@@ -115,8 +118,6 @@ jobs:
                 issue_number: prNumber,
                 body: `⚠️ **PR Template Missing**\n\nThis PR appears to be missing the required checklist from the PR template.\n\nPlease edit your PR description to include the checklist section. The checklist helps maintainers review your contribution.\n\n**This PR will be automatically closed in 24 hours if the template is not restored.**\n\nIf you're using an AI coding tool, please ensure it preserves the PR template.`
               });
-
-              core.setFailed('PR template checklist is missing');
             } else {
               // Template is present, remove the label if it exists
               try {
