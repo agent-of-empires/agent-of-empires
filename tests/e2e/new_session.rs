@@ -473,7 +473,9 @@ fn init_git_repo_for_project(path: &std::path::Path) {
 fn test_new_session_from_saved_project_prefills_path() {
     require_tmux!();
 
-    let mut h = TuiTestHarness::new("new_from_project");
+    // Rooted at `/tmp/.tmpXXXXXX` whatever TMPDIR is, so the path segments are
+    // alphanumeric and cannot match the `-app` filter below.
+    let mut h = TuiTestHarness::new_in_tmp("new_from_project");
     // Seed several projects so the picker's filter has something to narrow.
     for name in ["frontend", "backend", "mobile-app"] {
         let repo = h.home_path().join(name);
@@ -499,8 +501,7 @@ fn test_new_session_from_saved_project_prefills_path() {
     h.assert_screen_contains("mobile-app");
 
     // Typing filters the list; "-app" narrows to the single "mobile-app" project.
-    // Labels embed the project path, so the filter needs a `-`: tempdir names
-    // are alphanumeric and could otherwise match it.
+    // Labels embed the project path, so an all-letter filter could match it.
     // Send one char at a time: `type_text`'s literal (`-l`) mode arrives as a
     // bracketed paste, which the picker's filter input doesn't capture.
     for key in ["-", "a", "p", "p"] {
