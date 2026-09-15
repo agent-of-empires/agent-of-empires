@@ -43,6 +43,10 @@ fn run_inner<R: Read>(
     let mut buf = String::new();
     stdin.take(STDIN_BYTE_CAP).read_to_string(&mut buf)?;
     let value: serde_json::Value = serde_json::from_str(&buf)?;
+    // Claude Code sets `agent_id` only inside a subagent; its id never names the pane.
+    if value.get("agent_id").is_some_and(|v| !v.is_null()) {
+        return Ok(());
+    }
     let sid = match field {
         crate::agents::HookIdentityField::SessionId => value
             .get("session_id")
@@ -89,6 +93,31 @@ mod tests {
         let payload = format!(r#"{{"context":{{"session_id":"{nested}"}},"session_id":"{top}"}}"#);
         extract(&payload, "nested_first").unwrap();
         assert_eq!(read_sidecar(&base, "nested_first").as_deref(), Some(top));
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn subagent_payload_leaves_pane_identity_untouched() {
+        let (_g, base, _tmp) = BaseGuard::ready();
+        let parent = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let subagent = "11111111-2222-3333-4444-555555555555";
+        for field in [
+            crate::agents::HookIdentityField::SessionId,
+            crate::agents::HookIdentityField::ConversationIdOrSessionId,
+        ] {
+            let inst = "subagent_skip";
+            extract(&format!(r#"{{"session_id":"{parent}"}}"#), inst).unwrap();
+            let payload = format!(
+                r#"{{"session_id":"{subagent}","conversation_id":"{subagent}","agent_id":"a1","agent_type":"general-purpose"}}"#
+            );
+            run_inner(payload.as_bytes(), inst, field).unwrap();
+            assert_eq!(read_sidecar(&base, inst).as_deref(), Some(parent));
+        }
+
+        // `--agent` sessions carry `agent_type` without `agent_id` and own the pane.
+        let payload = format!(r#"{{"session_id":"{subagent}","agent_type":"reviewer"}}"#);
+        extract(&payload, "agent_flag").unwrap();
+        assert_eq!(read_sidecar(&base, "agent_flag").as_deref(), Some(subagent));
     }
 
     #[test]

@@ -428,14 +428,15 @@ fn hook_command_session_id_host(field: crate::agents::HookIdentityField) -> Stri
 fn hook_command_session_id_sandbox(base: &str, field: crate::agents::HookIdentityField) -> String {
     let selector = match field {
         crate::agents::HookIdentityField::SessionId => {
-            r#"if (.session_id|type)=="string" then .session_id else empty end"#
+            r#"if .agent_id != null then empty elif (.session_id|type)=="string" then .session_id else empty end"#
         }
         crate::agents::HookIdentityField::ConversationIdOrSessionId => {
-            r#"if (.conversation_id|type)=="string" then .conversation_id elif (.session_id|type)=="string" then .session_id else empty end"#
+            r#"if .agent_id != null then empty elif (.conversation_id|type)=="string" then .conversation_id elif (.session_id|type)=="string" then .session_id else empty end"#
         }
     };
-    // jq performs structural top-level extraction like the host path. The
-    // POSIX guards then enforce the shared shell-safe session-id contract.
+    // jq performs structural top-level extraction like the host path, including
+    // its subagent (`agent_id`) skip. The POSIX guards then enforce the shared
+    // shell-safe session-id contract.
     format!(
         "sh -c 'unset IFS; set -f; umask 077; \
          [ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
@@ -5102,6 +5103,28 @@ hooks_auto_accept: false
         assert!(output.status.success());
         let path = tmp.path().join("no_sid").join("session_id");
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn test_hook_command_session_id_skips_subagent_payload() {
+        if skip_if_no_jq() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let payload =
+            format!(r#"{{"session_id":"{uuid}","agent_id":"a1","agent_type":"Explore"}}"#);
+        let output = run_session_id_hook(&payload, "subagent", tmp.path());
+        assert!(output.status.success());
+        assert!(!tmp.path().join("subagent").join("session_id").exists());
+
+        // `--agent` sessions carry `agent_type` without `agent_id` and own the pane.
+        let payload = format!(r#"{{"session_id":"{uuid}","agent_type":"reviewer"}}"#);
+        let output = run_session_id_hook(&payload, "agent_flag", tmp.path());
+        assert!(output.status.success());
+        let written = std::fs::read_to_string(tmp.path().join("agent_flag").join("session_id"))
+            .expect("sidecar file");
+        assert_eq!(written, uuid);
     }
 
     /// End-to-end check against a Claude `PreToolUse` shape: pretty-printed
