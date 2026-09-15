@@ -2456,19 +2456,27 @@ pub async fn acp_disable(
         }
     }
     let mut instances = state.instances.write().await;
-    let Some(slot) = instances.iter_mut().find(|row| row.id == id) else {
-        return (StatusCode::NOT_FOUND, "session not found").into_response();
-    };
-    slot.view = crate::session::View::Terminal;
-    slot.acp_load_session_capable = None;
-    slot.acp_session_id = persist_acp_session_id;
-    slot.import_pending = persist_import_pending;
-    if keep_context {
-        slot.adopt_conversation_state(persist_conversation);
+    if let Some(slot) = instances.iter_mut().find(|row| row.id == id) {
+        slot.view = crate::session::View::Terminal;
+        slot.acp_load_session_capable = None;
+        slot.acp_session_id = persist_acp_session_id;
+        slot.import_pending = persist_import_pending;
+        if keep_context {
+            slot.adopt_conversation_state(persist_conversation);
+        }
+        state
+            .mutation_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    } else {
+        // The durable handoff is committed. A row dropped from the cache must
+        // not turn the teardown below into a 404 that leaves the structured
+        // worker, its registry record and its event store alive.
+        tracing::warn!(
+            target: "acp.switch",
+            session = %id,
+            "session missing from the cache after the terminal handoff was saved; continuing worker teardown"
+        );
     }
-    state
-        .mutation_epoch
-        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     drop(instances);
     // Publish the terminal view before worker removal so reconciliation cannot respawn ACP.
     let shutdown_result = if keep_context {
