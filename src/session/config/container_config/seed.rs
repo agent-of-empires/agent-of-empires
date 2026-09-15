@@ -2,7 +2,6 @@
 
 use std::collections::HashSet;
 use std::fs::{self, File, Permissions};
-use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
@@ -1069,16 +1068,25 @@ pub(super) fn seed_configured_resources(
     Ok(())
 }
 
+/// A store document is rewritten by the container that mounts the store, so its
+/// size is not trusted: a document past this bound is skipped, not read.
+const MAX_STORE_DOCUMENT_BYTES: usize = 4 * 1024 * 1024;
+
 fn read_document(
     root: &AnchoredDir,
     relative: &Path,
     yaml: bool,
 ) -> Result<Option<serde_json::Value>> {
-    let Some(mut file) = root.open_regular(relative, usize::MAX)? else {
+    let Some(bytes) = root.read_regular(relative, MAX_STORE_DOCUMENT_BYTES)? else {
         return Ok(None);
     };
-    let mut text = String::new();
-    file.read_to_string(&mut text)?;
+    let Ok(text) = String::from_utf8(bytes) else {
+        // Arbitrary bytes in a store document are a skip, like malformed
+        // configuration, never a reason to refuse the launch.
+        tracing::warn!(target: "session.profile", path = %root.path().join(relative).display(),
+            "Cannot enumerate resources from an undecodable native configuration");
+        return Ok(None);
+    };
     let text = text.trim_start_matches('\u{feff}');
     let parsed = if yaml {
         serde_yaml::from_str::<serde_json::Value>(text).map_err(anyhow::Error::from)
@@ -1181,11 +1189,17 @@ impl ResourceSeed<'_> {
         if depth >= 5 || !visited.insert(relative.to_path_buf()) {
             return Ok(());
         }
-        let Some(mut file) = self.destination.open_regular(relative, usize::MAX)? else {
+        let Some(bytes) = self
+            .destination
+            .read_regular(relative, MAX_STORE_DOCUMENT_BYTES)?
+        else {
             return Ok(());
         };
-        let mut content = String::new();
-        file.read_to_string(&mut content)?;
+        let Ok(content) = String::from_utf8(bytes) else {
+            tracing::warn!(target: "session.profile", path = %self.destination.path().join(relative).display(),
+                "Cannot follow imports from an undecodable native configuration");
+            return Ok(());
+        };
         self.follow_imports(&content, relative, depth, visited)
     }
 
