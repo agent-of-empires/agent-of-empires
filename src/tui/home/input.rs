@@ -4038,19 +4038,32 @@ impl HomeView {
             }
         }
 
-        // A collapsed group may hide an idle session from `flat_items`. Reveal
-        // the first hidden idle row after the visible list has been exhausted.
-        let hidden_idle = self
-            .instances
-            .values()
-            .find(|inst| {
-                !visible_sessions.contains(&inst.id)
-                    && current_session.as_deref() != Some(inst.id.as_str())
-                    && !inst.is_dismissed()
-                    && inst.status == Status::Idle
-            })
-            .map(|inst| inst.id.clone());
-        if let Some(id) = hidden_idle {
+        // A collapsed group may hide an idle session from `flat_items`. Keep
+        // the existing most-recently-accessed selection for hidden rows.
+        let mut best_hidden: Option<(String, Option<chrono::DateTime<chrono::Utc>>)> = None;
+        for inst in self.instances.values() {
+            if visible_sessions.contains(&inst.id)
+                || current_session.as_deref() == Some(inst.id.as_str())
+                || inst.is_dismissed()
+                || inst.status != Status::Idle
+            {
+                continue;
+            }
+            let ts = inst.last_accessed_at;
+            let beats = match best_hidden {
+                None => true,
+                Some((_, b)) => match (ts, b) {
+                    (Some(a), Some(b)) => a > b,
+                    (Some(_), None) => true,
+                    (None, _) => false,
+                },
+            };
+            if beats {
+                best_hidden = Some((inst.id.clone(), ts));
+            }
+        }
+
+        if let Some((id, _)) = best_hidden {
             self.jump_to_session_id(&id);
             return;
         }
