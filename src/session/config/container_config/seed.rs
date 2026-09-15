@@ -640,13 +640,43 @@ impl ResourceCopy<'_> {
             .boundary
             .rejects(canonical, true, self.guard.access)
         {
-            let source = open_canonical_dir(canonical)?;
-            let identity = source.identity()?;
+            // A discovered link can point at anything the host holds; an entry
+            // this walk cannot open is skipped like every other unreadable one
+            // rather than failing the launch.
+            let source = match open_canonical_dir(canonical) {
+                Ok(source) => source,
+                Err(error) => {
+                    tracing::warn!(target: "session.profile", path = %canonical.display(), %error,
+                        "Skipping unreadable discovered resource directory");
+                    return Ok(());
+                }
+            };
+            let identity = match source.identity() {
+                Ok(identity) => identity,
+                Err(error) => {
+                    tracing::warn!(target: "session.profile", path = %canonical.display(), %error,
+                        "Skipping changed discovered resource directory");
+                    return Ok(());
+                }
+            };
             if !self.ancestors.insert(identity) {
                 return Ok(());
             }
-            self.guard.record_directory(&source)?;
-            let entries = source.read_dir(Path::new(""), usize::MAX)?;
+            if let Err(error) = self.guard.record_directory(&source) {
+                self.ancestors.remove(&identity);
+                tracing::warn!(target: "session.profile", path = %canonical.display(), %error,
+                    "Skipping changed discovered resource directory");
+                return Ok(());
+            }
+            let entries = match source.read_dir(Path::new(""), usize::MAX) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    self.ancestors.remove(&identity);
+                    tracing::warn!(target: "session.profile", path = %canonical.display(), %error,
+                        "Skipping unreadable discovered resource directory");
+                    return Ok(());
+                }
+            };
             let target = destination.create_child(leaf)?;
             self.entries(&source, Path::new(""), &target, entries, false)?;
             publish_or_prune(&target, destination, leaf)?;
