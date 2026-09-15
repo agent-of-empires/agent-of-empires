@@ -382,9 +382,9 @@ impl ContainerRuntime {
         ))
     }
 
-    /// Whether `name` was created for `tool`. A container created before the
-    /// label existed matches, since its tool is unknown.
-    pub fn agent_tool_matches(&self, name: &str, tool: &str) -> Result<Option<bool>> {
+    /// Whether `name` was created for the agent `identity`. A container created
+    /// before the label existed matches, since its identity is unknown.
+    pub fn agent_tool_matches(&self, name: &str, identity: &str) -> Result<Option<bool>> {
         if !self.base.supports_labels {
             return Ok(None);
         }
@@ -393,7 +393,7 @@ impl ContainerRuntime {
                 name,
                 crate::containers::container_interface::AGENT_TOOL_LABEL,
             )?
-            .is_none_or(|value| value == tool),
+            .is_none_or(|value| value == identity),
         ))
     }
 

@@ -908,5 +908,28 @@ claude-personal = "~/.claude-global"
                 .collect();
             assert_eq!(stores, Vec::from_iter(expected_store), "{case}");
         }
+
+        // The label written at create is the identity the check compares.
+        for (tool, detect_as) in [("codex", ""), ("alias-b", "codex")] {
+            let mut instance = Instance::new("tool label", temp.path().to_str().unwrap());
+            instance.tool = tool.to_string();
+            instance.detect_as = detect_as.to_string();
+            instance.source_profile = profile.to_string();
+            instance.sandbox_info = Some(SandboxInfo {
+                enabled: true,
+                container_id: None,
+                image: "test:latest".to_string(),
+                container_name: "tool-label".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                container_workdir: None,
+            });
+            assert_eq!(
+                instance.build_container_config().unwrap().agent_tool,
+                instance.container_agent_identity(),
+                "{tool}/{detect_as}"
+            );
+        }
     }
 }

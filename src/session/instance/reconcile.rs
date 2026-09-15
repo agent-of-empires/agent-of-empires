@@ -14,7 +14,7 @@ impl Instance {
         if let Err(error) = self.try_reconcile_from_disk() {
             tracing::warn!(target: "session.store",
                 session = %self.id,
-                error = %error,
+                error = %format_args!("{error:#}"),
                 "failed to reload disk state before launch; using in-memory value");
         }
     }
