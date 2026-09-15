@@ -86,7 +86,6 @@ Override sandbox settings for this repo:
 
 ```toml
 [sandbox]
-environment = ["NODE_ENV", "DATABASE_URL", "CUSTOM_KEY=value"]
 volume_ignores = ["node_modules", ".next", "target"]
 cpu_limit = "8"
 memory_limit = "16g"
@@ -94,13 +93,13 @@ auto_cleanup = true
 default_terminal_mode = "host"   # "host" or "container"
 ```
 
-Security-sensitive sandbox settings are ignored from repo config (with a warning naming the keys): `enabled_by_default`, `default_image`, `container_runtime`, `extra_volumes`, `mount_ssh`, `selinux_relabel`, `privileged`, `cap_add`, `cap_drop`, `security_opt`, and `extra_run_args`. Set them in global or profile config instead, or pass `--sandbox` / `--sandbox-image` per session; `container_runtime` is global-only, so set it in the global config.
+Security-sensitive sandbox settings are ignored from repo config (with a warning naming the keys): `enabled_by_default`, `default_image`, `container_runtime`, `environment`, `extra_volumes`, `mount_ssh`, `selinux_relabel`, `privileged`, `cap_add`, `cap_drop`, `security_opt`, and `extra_run_args`. Set them in global or profile config instead, or pass `--sandbox` / `--sandbox-image` per session; `container_runtime` is global-only, so set it in the global config. `environment` is denied because its bare `KEY` and `KEY=$VAR` forms copy host variables into the container.
 
-List fields (`environment`, `volume_ignores`, `port_mappings`) accept either an array or a single string:
+List fields (`volume_ignores`, `port_mappings`) accept either an array or a single string:
 
 ```toml
 [sandbox]
-environment = "ANTHROPIC_API_KEY"          # single value
+port_mappings = "3000:3000"                # single value
 volume_ignores = ["node_modules", ".next"] # multiple values
 ```
 
@@ -110,12 +109,11 @@ Override worktree settings for this repo:
 
 ```toml
 [worktree]
-enabled = true
-path_template = "../{repo-name}-worktrees/{branch}"
-bare_repo_path_template = "./{branch}"
 auto_cleanup = true
 delete_branch_on_cleanup = false
 ```
+
+`enabled`, `path_template`, `bare_repo_path_template`, and `workspace_path_template` are ignored from repo config (with a warning naming the keys), because they decide whether and where AoE creates a checkout on the host. Set them in global or profile config instead.
 
 ## Hook Trust System
 
@@ -152,11 +150,10 @@ on_destroy = ["docker-compose down"]
 agent_detect_as = { my-agent = "claude" }
 
 [sandbox]
-environment = ["DATABASE_URL", "REDIS_URL", "NODE_ENV=development"]
 volume_ignores = ["node_modules", ".next"]
 
 [worktree]
-enabled = true
+auto_cleanup = true
 ```
 
 ## Checking Into Version Control

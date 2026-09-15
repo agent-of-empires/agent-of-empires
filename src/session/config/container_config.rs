@@ -4834,9 +4834,9 @@ mod tests {
         assert!(fs::symlink_metadata(&copy).unwrap().is_file());
     }
 
-    /// End-to-end test: repo-level sandbox config (environment, volume_ignores,
-    /// extra_volumes) flows through build_container_config into the final ContainerConfig.
-    /// Regression test for #557.
+    /// End-to-end test: repo-level `volume_ignores` flows through
+    /// build_container_config into the final ContainerConfig (#557), while
+    /// repo-denied `environment` and `extra_volumes` do not.
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_includes_repo_sandbox_settings() {
@@ -4887,17 +4887,12 @@ mount_ssh = true
         )
         .unwrap();
 
-        // Verify environment variables from repo config are present
+        // A repo cannot set container env (#3710).
         let env_keys: Vec<&str> = config.environment.iter().map(|e| e.key()).collect();
         assert!(
-            env_keys.contains(&"MY_VAR"),
-            "MY_VAR should be in environment, got: {:?}",
-            config.environment
-        );
-        assert!(
-            env_keys.contains(&"CI"),
-            "CI should be in environment, got: {:?}",
-            config.environment
+            !env_keys.contains(&"MY_VAR") && !env_keys.contains(&"CI"),
+            "repo-declared environment must not apply, got: {:?}",
+            env_keys
         );
 
         // Verify volume_ignores became anonymous volumes
@@ -6873,17 +6868,16 @@ trusted_hash = "keep"
         let temp_home = TempDir::new().unwrap();
         let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
-        let project_dir = TempDir::new().unwrap();
-        let config_dir = project_dir.path().join(".agent-of-empires");
-        fs::create_dir_all(&config_dir).unwrap();
+        let app_dir = crate::session::get_app_dir().unwrap();
         fs::write(
-            config_dir.join("config.toml"),
+            app_dir.join("config.toml"),
             r#"
 [sandbox]
 environment = ["CODEX_HOME=/root/profile-codex"]
 "#,
         )
         .unwrap();
+        let project_dir = TempDir::new().unwrap();
         git2::Repository::init(project_dir.path()).unwrap();
 
         let sandbox_info = crate::session::instance::SandboxInfo {
