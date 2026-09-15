@@ -1811,6 +1811,13 @@ fn reconcile_in(
 }
 
 pub fn run() -> Result<()> {
+    // Content isolation is keyed by home and this pass only reports pending
+    // rows, so a host that cannot name one still advances the schema; the
+    // reconcile below makes the same call on the schema-current path. Nothing
+    // is lost: the startup pass retries once a host home exists.
+    if dirs::home_dir().is_none() {
+        return Ok(());
+    }
     reconcile_pending(false)
 }
 
