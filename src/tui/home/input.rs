@@ -4018,14 +4018,13 @@ impl HomeView {
             return;
         }
 
-        // Pass 2: fall back to the most-recently-accessed Idle session, skipping
-        // the cursor. Sessions never attached (last_accessed_at == None) rank
-        // last but remain eligible.
-        let mut best: Option<(usize, Option<chrono::DateTime<chrono::Utc>>)> = None;
-        for idx in 0..len {
-            if idx == self.cursor {
-                continue;
-            }
+        // Pass 2: fall back to the next non-dismissed Idle session in list
+        // order, skipping the cursor. Recomputing a global
+        // most-recently-accessed row here made older idle sessions
+        // unreachable: repeated `w` presses only toggled between the newest
+        // rows.
+        for i in 0..len - 1 {
+            let idx = (start + i) % len;
             let id = match self.flat_items.get(idx) {
                 Some(Item::Session { id, .. }) => id.clone(),
                 _ => continue,
@@ -4033,59 +4032,25 @@ impl HomeView {
             let Some(inst) = self.get_instance(&id) else {
                 continue;
             };
-            if inst.is_dismissed() {
-                continue;
-            }
-            if inst.status != Status::Idle {
-                continue;
-            }
-            let ts = inst.last_accessed_at;
-            let beats = match best {
-                None => true,
-                Some((_, b)) => match (ts, b) {
-                    (Some(a), Some(b)) => a > b,
-                    (Some(_), None) => true,
-                    (None, _) => false,
-                },
-            };
-            if beats {
-                best = Some((idx, ts));
+            if !inst.is_dismissed() && inst.status == Status::Idle {
+                self.jump_to_session_id(&id);
+                return;
             }
         }
 
-        if let Some((idx, _)) = best {
-            let id = match self.flat_items.get(idx) {
-                Some(Item::Session { id, .. }) => id.clone(),
-                _ => return,
-            };
-            self.jump_to_session_id(&id);
-            return;
-        }
-
-        let mut best_hidden: Option<(String, Option<chrono::DateTime<chrono::Utc>>)> = None;
-        for inst in self.instances.values() {
-            if visible_sessions.contains(&inst.id)
-                || current_session.as_deref() == Some(inst.id.as_str())
-                || inst.is_dismissed()
-                || inst.status != Status::Idle
-            {
-                continue;
-            }
-            let ts = inst.last_accessed_at;
-            let beats = match best_hidden {
-                None => true,
-                Some((_, b)) => match (ts, b) {
-                    (Some(a), Some(b)) => a > b,
-                    (Some(_), None) => true,
-                    (None, _) => false,
-                },
-            };
-            if beats {
-                best_hidden = Some((inst.id.clone(), ts));
-            }
-        }
-
-        if let Some((id, _)) = best_hidden {
+        // A collapsed group may hide an idle session from `flat_items`. Reveal
+        // the first hidden idle row after the visible list has been exhausted.
+        let hidden_idle = self
+            .instances
+            .values()
+            .find(|inst| {
+                !visible_sessions.contains(&inst.id)
+                    && current_session.as_deref() != Some(inst.id.as_str())
+                    && !inst.is_dismissed()
+                    && inst.status == Status::Idle
+            })
+            .map(|inst| inst.id.clone());
+        if let Some(id) = hidden_idle {
             self.jump_to_session_id(&id);
             return;
         }
