@@ -169,6 +169,37 @@ impl Instance {
         expected
     }
 
+    /// The conversation a fresh launch abandons, for the capture-exclusion log.
+    ///
+    /// A launch that re-emits the id it started from, preallocated or observed
+    /// under this launch's execution, is running that conversation: nothing is
+    /// abandoned, and a stale exclusion for it must be dropped instead. Only an
+    /// id the launch did not keep is recorded as abandoned.
+    fn abandoned_prior_conversation(
+        &self,
+        expected: &ConversationState,
+        prior_sid: &str,
+    ) -> Option<ConversationBinding> {
+        let kept = self.agent_session_id.as_deref() == Some(prior_sid)
+            && self.agent_session_binding.as_ref().is_some_and(|binding| {
+                binding.session_id == prior_sid
+                    && self.active_execution.as_ref().is_some_and(|execution| {
+                        binding.execution.as_ref() == Some(&execution.binding)
+                    })
+            });
+        if kept {
+            return None;
+        }
+        Some(
+            expected
+                .binding
+                .as_ref()
+                .filter(|binding| binding.session_id == prior_sid)
+                .cloned()
+                .unwrap_or_else(|| ConversationBinding::unknown(prior_sid.to_string())),
+        )
+    }
+
     pub(super) fn spawn_prepared_launch(
         &mut self,
         size: Option<(u16, u16)>,
@@ -319,28 +350,17 @@ impl Instance {
             self.agent_session_binding = None;
         }
         if !prepared.is_existing {
-            if let Some(prior_sid) = prepared.expected_conversation.session_id.as_ref() {
-                let emitted = self.agent_session_id.as_ref() == Some(prior_sid)
-                    && self.agent_session_binding.as_ref().is_some_and(|binding| {
-                        binding.session_id == *prior_sid
-                            && binding.provenance == ConversationProvenance::Preallocated
-                            && self.active_execution.as_ref().is_some_and(|execution| {
-                                binding.execution.as_ref() == Some(&execution.binding)
-                            })
-                    });
-                if emitted {
-                    let source = self.active_execution.as_ref().map(|active| &active.binding);
-                    self.retroactive_capture_excludes
-                        .retain(|binding| !binding.excludes_capture(prior_sid, source));
-                } else {
-                    let abandoned = prepared
-                        .expected_conversation
-                        .binding
-                        .as_ref()
-                        .filter(|binding| binding.session_id == *prior_sid)
-                        .cloned()
-                        .unwrap_or_else(|| ConversationBinding::unknown(prior_sid.clone()));
-                    self.retroactive_capture_excludes.insert(abandoned);
+            if let Some(prior_sid) = prepared.expected_conversation.session_id.clone() {
+                match self.abandoned_prior_conversation(&prepared.expected_conversation, &prior_sid)
+                {
+                    Some(abandoned) => {
+                        self.retroactive_capture_excludes.insert(abandoned);
+                    }
+                    None => {
+                        let source = self.active_execution.as_ref().map(|active| &active.binding);
+                        self.retroactive_capture_excludes
+                            .retain(|binding| !binding.excludes_capture(&prior_sid, source));
+                    }
                 }
             }
         }
