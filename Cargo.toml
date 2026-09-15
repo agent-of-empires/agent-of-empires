@@ -37,7 +37,7 @@ tui-input = "0.15"
 # drops the unused HTML renderer.
 pulldown-cmark = { version = "0.13", default-features = false }
 
-# Async runtime
+# Async runtime and synchronization
 tokio = { version = "1.52", features = ["full"] }
 
 # Settings single-source-of-truth derive (#1692)
