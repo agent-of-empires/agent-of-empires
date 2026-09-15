@@ -48,6 +48,7 @@ pub enum SettingsCategory {
     Hooks,
     Web,
     Acp,
+    ModelGateway,
     Diff,
     Logging,
     Plugins,
@@ -70,6 +71,7 @@ impl SettingsCategory {
             Self::Hooks => "Lifecycle Hooks",
             Self::Web => "Web",
             Self::Acp => "Acp",
+            Self::ModelGateway => "Model Gateway",
             Self::Diff => "Diff",
             Self::Logging => "Logging",
             Self::Plugins => "Plugins",
@@ -94,6 +96,7 @@ impl SettingsCategory {
             Self::Hooks => "Lifecycle Hooks",
             Self::Web => "Web",
             Self::Acp => "Acp",
+            Self::ModelGateway => "Model Gateway",
             Self::Diff => "Diff",
             Self::Telemetry => "Telemetry",
             Self::Logging => "Logging",
@@ -552,6 +555,11 @@ fn custom_value_from_json(id: &str, current: &Value) -> FieldValue {
             };
             FieldValue::Text(text)
         }
+        // model-gateway: the web renders the URL row with a bespoke test-
+        // discovery widget; the TUI edits the URL as plain text. Text
+        // passthrough both ways so the custom binding does not blank the
+        // saved URL (the unknown-id fallback would).
+        "model-gateway" => FieldValue::Text(current.as_str().unwrap_or("").to_string()),
         // logging-targets is expanded into per-target rows during build and
         // never lands here.
         _ => FieldValue::Text(String::new()),
@@ -685,6 +693,8 @@ fn custom_value_to_json(id: &str, value: &FieldValue) -> Value {
                 _ => json!({}),
             }
         }
+        // model-gateway: plain text URL (see custom_value_from_json).
+        ("model-gateway", FieldValue::Text(s)) => json!(s),
         _ => Value::Null,
     }
 }

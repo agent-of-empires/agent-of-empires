@@ -74,6 +74,9 @@ pub struct Config {
     pub acp: AcpConfig,
 
     #[serde(default)]
+    pub model_gateway: ModelGatewayConfig,
+
+    #[serde(default)]
     pub logging: LoggingConfig,
 
     /// Trusted global/profile agent runtime overrides. Repo config does not
@@ -405,6 +408,65 @@ fn default_keep_count() -> u8 {
 
 fn default_show_spans() -> bool {
     false
+}
+
+/// One model gateway root serving every supported harness (claude, codex,
+/// copilot). When `base_url` is set, spawn-env derivation points each
+/// harness's own routing env vars at the gateway's provider-specific routes
+/// (e.g. `ANTHROPIC_BASE_URL` → `<root>/anthropic`, `OPENAI_BASE_URL` →
+/// `<root>/openai/v1`) and forwards the resolved key — so one catalogue of
+/// models + one credential backs per-session model switching across agents.
+/// Port of nodeterm's model gateway; see `crate::acp::model_gateway`. An
+/// empty `base_url` = the feature is off and spawn env is untouched.
+///
+/// `#[derive(SettingsSection)]` makes every `#[setting]`-annotated field the
+/// single source of truth for the TUI, web dashboard, server policy, and
+/// validation (#1692).
+#[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
+#[setting_section(name = "model_gateway", category = "Model Gateway")]
+pub struct ModelGatewayConfig {
+    #[serde(default)]
+    #[setting(
+        label = "Model gateway URL",
+        widget = "custom:model-gateway",
+        web = "elevation:routes every agent subprocess's API traffic at an external endpoint"
+    )]
+    pub gateway_base_url: String,
+    /// The gateway credential: a literal key, one exact `${env:VAR}`
+    /// reference (resolved from the daemon's own environment at spawn and
+    /// discovery time), or `${secret:model-gateway-api-key}` (same, under
+    /// `MODEL_GATEWAY_API_KEY`). References keep the secret out of
+    /// config.toml; an unresolvable one fails closed — the spawn emits no
+    /// gateway env rather than a partial credential. Never logged.
+    #[serde(default)]
+    #[setting(
+        label = "Model gateway API key",
+        widget = "text",
+        web = "elevation:sets the credential agent subprocesses send to the gateway; prefer a ${env:VAR} or ${secret:model-gateway-api-key} reference over a literal"
+    )]
+    pub gateway_api_key: String,
+    /// Optional path appended to `gateway_base_url` for model discovery
+    /// when the gateway serves its catalogue somewhere other than the
+    /// conventional `/v1/models` (e.g. `/openai/v1/models`). A PATH
+    /// SUFFIX, never a full URL: it can never move the discovery request
+    /// — or the resolved key — off the saved host.
+    #[serde(default)]
+    #[setting(
+        label = "Model gateway discovery path",
+        widget = "text",
+        web = "elevation:changes where the daemon-side model discovery fetch lands"
+    )]
+    pub gateway_discovery_path: String,
+}
+
+impl Default for ModelGatewayConfig {
+    fn default() -> Self {
+        Self {
+            gateway_base_url: String::new(),
+            gateway_api_key: String::new(),
+            gateway_discovery_path: String::new(),
+        }
+    }
 }
 
 /// Configuration for the acp (ACP-based native rendering of agent

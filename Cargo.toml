@@ -99,6 +99,9 @@ reqwest = { version = "0.13", features = ["json", "query", "rustls", "stream"], 
 # Percent-encode path segments (release tags) for GitHub API URLs.
 percent-encoding = "2"
 
+# URL parsing for model-gateway route derivation (http/https roots only).
+url = "2"
+
 # Unix sockets + futures-compat for ACP byte streams
 tokio-util = { version = "0.7", features = ["codec", "compat"] }
 

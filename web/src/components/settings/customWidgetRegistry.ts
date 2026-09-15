@@ -1,5 +1,6 @@
 import { AcpDefaultsWidget } from "./AcpDefaultsWidget";
 import type { CustomSettingsWidget } from "./customWidgets";
+import { ModelGatewayWidget } from "./ModelGatewayWidget";
 import {
   DefaultToolWidget,
   LoggingTargetsWidget,
@@ -21,4 +22,5 @@ export const CUSTOM_SETTINGS_WIDGETS: Record<string, CustomSettingsWidget> = {
   "sound-volume": SoundVolumeWidget,
   "logging-targets": LoggingTargetsWidget,
   "acp-defaults": AcpDefaultsWidget,
+  "model-gateway": ModelGatewayWidget,
 };

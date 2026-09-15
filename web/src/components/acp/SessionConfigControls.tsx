@@ -24,11 +24,34 @@ import { ChevronUp } from "lucide-react";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import type { ConfigOptionDescriptor, AcpState } from "../../lib/acpTypes";
+import { fetchGatewayModels, type GatewayModelInfo } from "../../lib/api";
 
 interface Props {
   configOptions: AcpState["configOptions"];
   pendingConfigOption: AcpState["pendingConfigOption"];
   onSetConfigOption: (configId: string, value: string) => void | Promise<void>;
+}
+
+// Module-level cache + in-flight dedupe for the gateway catalogue. Discovery
+// hits the daemon's `/api/acp/models`, which fans out to the gateway over the
+// network; one fetch per page load (per selector mount that actually opens a
+// model menu) is plenty, and every structured session shares the result.
+let gatewayModelsCache: GatewayModelInfo[] | null = null;
+let gatewayModelsInFlight: Promise<GatewayModelInfo[] | null> | null = null;
+
+async function loadGatewayModels(): Promise<GatewayModelInfo[] | null> {
+  if (gatewayModelsCache !== null) return gatewayModelsCache;
+  gatewayModelsInFlight ??= fetchGatewayModels().then((res) => {
+    gatewayModelsInFlight = null;
+    // A daemon-side error (gateway unconfigured, discovery failed) and a
+    // transport failure both degrade the same way: no gateway section. The
+    // response is not cached when the gateway errored so a retry after the
+    // user fixes settings can succeed without a reload.
+    if (res === null || res.error) return null;
+    gatewayModelsCache = res.models ?? [];
+    return gatewayModelsCache;
+  });
+  return gatewayModelsInFlight;
 }
 
 const MODEL_LABEL_MAX = 24;
@@ -145,6 +168,11 @@ function ModelDropdown({ option, pending, onSelect }: SubProps) {
   const menuId = `config-option-menu-${option.id}`;
   const current = option.options.find((o) => o.value === option.current_value) ?? option.options[0];
   const label = current?.name ?? option.current_value;
+  // Gateway catalogue, fetched lazily the first time a model menu opens.
+  // Only the MODEL-category dropdown merges gateway models: an effort
+  // segmented control or a mode picker must not grow rows it cannot apply.
+  const [gatewayModels, setGatewayModels] = useState<GatewayModelInfo[] | null>(null);
+  const isModelCategory = option.category === "model";
 
   useEffect(() => {
     if (!open) return;
@@ -161,6 +189,21 @@ function ModelDropdown({ option, pending, onSelect }: SubProps) {
       document.removeEventListener("keydown", onKey);
     };
   }, [open]);
+
+  // Gateway models load once, on the first open of a model menu. A failed
+  // discovery (no gateway configured, gateway down) stays silent: the
+  // adapter's own options remain the whole menu, exactly as before this
+  // feature existed.
+  useEffect(() => {
+    if (!open || !isModelCategory) return;
+    let cancelled = false;
+    void loadGatewayModels().then((models) => {
+      if (!cancelled && models && models.length > 0) setGatewayModels(models);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, isModelCategory]);
 
   // The menu prefers opening upward, so its usual ceiling is the trigger
   // button's distance from the top of the viewport, not a fixed guess.
@@ -260,6 +303,56 @@ function ModelDropdown({ option, pending, onSelect }: SubProps) {
                 </button>
               );
             })}
+            {gatewayModels && gatewayModels.length > 0 && (
+              <>
+                <div className="mt-1 border-t border-surface-800 px-3 py-1.5 text-[10px] uppercase tracking-wider text-text-dim">
+                  Gateway
+                </div>
+                {gatewayModels.map((gwModel) => {
+                  const isCurrent = gwModel.id === option.current_value;
+                  const isPending = pending === gwModel.id;
+                  const ctx =
+                    gwModel.context_window != null
+                      ? gwModel.context_window >= 1_000_000
+                        ? `${Math.round(gwModel.context_window / 100_000) / 10}M ctx`
+                        : `${Math.round(gwModel.context_window / 1000)}K ctx`
+                      : null;
+                  return (
+                    <button
+                      key={`gateway-${gwModel.id}`}
+                      type="button"
+                      role="menuitem"
+                      disabled={isPending}
+                      onClick={() => {
+                        if (isPending || isCurrent) {
+                          setOpen(false);
+                          return;
+                        }
+                        setOpen(false);
+                        void onSelect(gwModel.id);
+                      }}
+                      data-testid={`config-option-${option.id}-gateway-${gwModel.id}`}
+                      className={[
+                        "flex w-full items-start gap-2 px-3 py-1.5 text-left text-[12px]",
+                        isCurrent
+                          ? "bg-surface-800 text-text-primary"
+                          : "text-text-secondary hover:bg-surface-800 hover:text-text-primary",
+                        isPending ? "cursor-not-allowed opacity-50" : "",
+                      ].join(" ")}
+                    >
+                      <span className="flex-1">
+                        <span className="block font-medium">{gwModel.name || gwModel.id}</span>
+                        <span className="block text-[11px] text-text-dim">
+                          {ctx ? `${gwModel.id} · ${ctx}` : gwModel.id}
+                        </span>
+                      </span>
+                      {isCurrent && !isPending && <span className="text-[10px] uppercase text-brand-500">Active</span>}
+                      {isPending && <span className="text-[10px] uppercase text-text-dim">…</span>}
+                    </button>
+                  );
+                })}
+              </>
+            )}
           </div>
         </div>
       )}

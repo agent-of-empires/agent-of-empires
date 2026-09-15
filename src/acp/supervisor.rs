@@ -1893,6 +1893,73 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
         }
 
+        // Model gateway (port of nodeterm's model-gateway): when a gateway
+        // root is configured, derive the harness's own routing env
+        // (ANTHROPIC_BASE_URL/AUTH_TOKEN, OPENAI_BASE_URL/KEY,
+        // COPILOT_PROVIDER_*) from one root + one resolved credential, and
+        // append with the same retain+push last-wins pattern — AFTER the
+        // static `environment` list and the hook-minted pairs, so the
+        // gateway's base-url/token pair can never be split by an older
+        // same-key entry pointing elsewhere. Fail-closed: an unresolvable
+        // credential, a missing stored secret, or an unsupported agent emits
+        // nothing, never a partial credential. Values ride
+        // `host_environment` only — never argv — and are applied last by the
+        // spawn paths.
+        if sandbox_info.is_none()
+            && !resolved_cfg
+                .model_gateway
+                .gateway_base_url
+                .trim()
+                .is_empty()
+        {
+            let gw_settings = crate::acp::model_gateway::ModelGatewaySettings {
+                base_url: resolved_cfg.model_gateway.gateway_base_url.clone(),
+                api_key: resolved_cfg.model_gateway.gateway_api_key.clone(),
+                discovery_path: {
+                    let p = resolved_cfg.model_gateway.gateway_discovery_path.trim();
+                    (!p.is_empty()).then(|| p.to_string())
+                },
+            };
+            let gw_agent = agent.clone();
+            let gw_model = model.clone();
+            let stored_secret =
+                std::env::var(crate::acp::model_gateway::MODEL_GATEWAY_SECRET_ENV_NAME).ok();
+            let pairs = crate::acp::model_gateway::model_gateway_env(
+                &gw_settings,
+                &gw_agent,
+                gw_model.as_deref(),
+                &|name| std::env::var(name).ok(),
+                stored_secret.as_deref(),
+            );
+            for (key, value) in pairs {
+                host_environment.retain(|(k, _)| k != &key);
+                host_environment.push((key, value));
+            }
+            // Adapter-facing model env (claude-agent-acp reads
+            // ANTHROPIC_MODEL / CLAUDE_MODEL_CONFIG, not AOE_AGENT_MODEL):
+            // route the pinned model through the gateway's own catalogue.
+            // The catalogue comes from the daemon's last successful
+            // discovery (`GET /api/acp/models` publishes it); with no cache
+            // yet the pin still applies via ANTHROPIC_MODEL, and only the
+            // catalogue-derived pieces ([1m]/autocompact, picker seed,
+            // subagent routing) degrade — a guess is never emitted.
+            if crate::acp::model_gateway::GatewayAgent::from_agent_id(&gw_agent).is_some() {
+                let catalog = crate::acp::model_gateway::cached_model_catalog(
+                    &gw_settings.base_url,
+                    &gw_settings.api_key,
+                    gw_settings.discovery_path.as_deref(),
+                );
+                let adapter_pairs = crate::acp::model_gateway::claude_adapter_model_env(
+                    gw_model.as_deref(),
+                    catalog.as_deref(),
+                );
+                for (key, value) in adapter_pairs {
+                    host_environment.retain(|(k, _)| k != &key);
+                    host_environment.push((key, value));
+                }
+            }
+        }
+
         let mut env = provider_env;
         if let Some(model) = model {
             env.push(("AOE_AGENT_MODEL".into(), model));

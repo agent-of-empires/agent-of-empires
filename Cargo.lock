@@ -168,6 +168,7 @@ dependencies = [
  "unicode-normalization",
  "unicode-segmentation",
  "unicode-width",
+ "url",
  "uuid",
  "vt100",
  "webbrowser",
