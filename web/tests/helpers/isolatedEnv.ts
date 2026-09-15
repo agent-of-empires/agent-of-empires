@@ -87,8 +87,11 @@ export const HOST_STATE_VARS = new Set([
   "AOE_UPDATE_BASE_URL",
   // The session the test runner was launched from: `aoe` resolves "the
   // current session" from `TMUX_PANE`, `AOE_INSTANCE_ID` names a host session
-  // directly, and the capture markers `aoe` writes into a pane make the
+  // directly, `AOE_AGENT_PID` and `AOE_AGENT_BIN` name that session's agent
+  // process, and the capture markers `aoe` writes into a pane make the
   // daemon read a host launch as its own.
+  "AOE_AGENT_BIN",
+  "AOE_AGENT_PID",
   "AOE_CAPTURED_SESSION_ID",
   "AOE_INSTANCE_ID",
   "AOE_OMP_CAPTURE_META",
