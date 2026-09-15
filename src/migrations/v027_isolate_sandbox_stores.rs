@@ -1002,7 +1002,16 @@ fn run_pass(
                 orphan_blocked_roots.insert(root.clone());
                 continue;
             }
-            relocate_store(&source, &destination_parent.join(orphan))?;
+            if !relocate_store(&source, &destination_parent.join(orphan))? {
+                // The orphan is still at its source, so this root keeps both,
+                // and every row reading it waits with them for a later pass.
+                tracing::warn!(
+                    "v027 leaving orphan store {} in place: its retention was deferred",
+                    source.display()
+                );
+                blocked_roots.insert(root.clone());
+                orphan_blocked_roots.insert(root.clone());
+            }
         }
     }
 
@@ -1059,8 +1068,8 @@ fn run_pass(
                 // requires every member to be `Move` and ready.
                 continue;
             }
-            copied_targets += 1;
-            if copied_targets == 1 {
+            let ordinal = copied_targets + 1;
+            if ordinal == 1 {
                 // Said once, right before the first copy: this is the part
                 // that can take minutes, and the one a user may want to skip.
                 progress::notice(format!(
@@ -1071,7 +1080,7 @@ fn run_pass(
                 ));
             }
             progress::step(format!(
-                "copying agent store {copied_targets}/{total_targets}: {} -> {}",
+                "copying agent store {ordinal}/{total_targets}: {} -> {}",
                 shared.display(),
                 target.private.display()
             ));
@@ -1081,13 +1090,23 @@ fn run_pass(
             if gated_roots.insert(target.cleanup_root.clone()) {
                 copy_gate(&target.cleanup_root);
             }
-            publish_store(
+            if !publish_store(
                 shared,
                 &target.private,
                 excluded,
                 (shared != &target.cleanup_root).then_some(target.cleanup_root.as_path()),
                 shared == &target.cleanup_root,
-            )?;
+            )? {
+                // The store was not published, so the row stays pending with
+                // its whole root rather than counting as moved.
+                tracing::warn!(
+                    "v027 leaving {} pending: the retention of its source was deferred",
+                    target.id
+                );
+                ready_rows.remove(&(target.registry, target.row));
+                continue;
+            }
+            copied_targets += 1;
         }
         if cohort
             .iter()
@@ -1610,13 +1629,16 @@ pub(crate) fn instance_children(root: &Path) -> Result<BTreeSet<std::ffi::OsStri
     Ok(children)
 }
 
+/// Publish one store, answering whether it did. `false` means a live mount
+/// kept the quarantine's original where it was, so nothing was published and
+/// the caller must leave the target pending for a later pass.
 fn publish_store(
     source: &Path,
     destination: &Path,
     excluded_root_children: &BTreeSet<std::ffi::OsString>,
     overlay_shared_root: Option<&Path>,
     exclude_source_children: bool,
-) -> Result<()> {
+) -> Result<bool> {
     let parent = destination
         .parent()
         .context("private store has no parent")?;
@@ -1631,7 +1653,9 @@ fn publish_store(
             return Err(error).with_context(|| format!("inspecting {}", source.display()))
         }
     };
-    let publication = Publication::prepare(destination)?;
+    let Some(publication) = Publication::prepare(destination)? else {
+        return Ok(false);
+    };
     if !source_exists {
         publication.anchored_parent.ensure_dir(Path::new(
             destination
@@ -1639,7 +1663,7 @@ fn publish_store(
                 .context("private store has no leaf")?,
         ))?;
         fs::File::open(parent)?.sync_all()?;
-        return Ok(());
+        return Ok(true);
     }
     let stage = &publication.stage;
     fs::create_dir(stage)?;
@@ -1697,12 +1721,17 @@ fn publish_store(
     }
     fs::rename(stage, destination)?;
     fs::File::open(parent)?.sync_all()?;
-    super::v030_isolate_sandbox_content::retain_legacy_original(
+    let retained = super::v030_isolate_sandbox_content::retain_legacy_original(
         &publication.quarantine,
         parent.parent().context("private layout has no parent")?,
     )?;
     fs::File::open(parent)?.sync_all()?;
-    Ok(())
+    // The displaced destination is still at the quarantine when this defers,
+    // so the publish is not finished and the target is retried with it.
+    Ok(!matches!(
+        retained,
+        super::v030_isolate_sandbox_content::Retained::Deferred
+    ))
 }
 
 /// The staging and quarantine paths one destination publishes through, with
@@ -1719,7 +1748,10 @@ struct Publication {
 }
 
 impl Publication {
-    fn prepare(destination: &Path) -> Result<Self> {
+    /// `None` means a live mount keeps the recovery namespace reachable, so
+    /// the quarantine still holds an original the destination would have to be
+    /// renamed onto. The caller publishes nothing and retries later.
+    fn prepare(destination: &Path) -> Result<Option<Self>> {
         let parent = destination
             .parent()
             .context("private store has no parent")?;
@@ -1736,13 +1768,21 @@ impl Publication {
         let quarantine = anchored_parent
             .path()
             .join(format!(".v027-quarantine-{leaf}"));
+        // Before the stage, and before anything else the caller would build
+        // on: a quarantine the retention cannot move is one the destination
+        // cannot be renamed onto either.
+        if matches!(
+            super::v030_isolate_sandbox_content::retain_legacy_original(&quarantine, layout_root)?,
+            super::v030_isolate_sandbox_content::Retained::Deferred
+        ) {
+            return Ok(None);
+        }
         remove_tree_no_links(&stage)?;
-        super::v030_isolate_sandbox_content::retain_legacy_original(&quarantine, layout_root)?;
-        Ok(Self {
+        Ok(Some(Self {
             anchored_parent,
             stage,
             quarantine,
-        })
+        }))
     }
 }
 
@@ -1760,11 +1800,16 @@ impl Publication {
 /// around the rename, so a crash leaves either the old destination or the new
 /// one. A rename that cannot reach the destination, across filesystems or
 /// otherwise, falls back to the copy.
-fn relocate_store(source: &Path, destination: &Path) -> Result<()> {
+///
+/// `false` is [`publish_store`]'s deferral: the store is not where the plan
+/// wanted it, so the caller leaves its root and rows pending.
+fn relocate_store(source: &Path, destination: &Path) -> Result<bool> {
     let parent = destination
         .parent()
         .context("private store has no parent")?;
-    let publication = Publication::prepare(destination)?;
+    let Some(publication) = Publication::prepare(destination)? else {
+        return Ok(false);
+    };
     let mut quarantined = false;
     match fs::symlink_metadata(destination) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -1793,12 +1838,15 @@ fn relocate_store(source: &Path, destination: &Path) -> Result<()> {
         return publish_store(source, destination, &BTreeSet::new(), None, false);
     }
     fs::File::open(parent)?.sync_all()?;
-    super::v030_isolate_sandbox_content::retain_legacy_original(
+    let retained = super::v030_isolate_sandbox_content::retain_legacy_original(
         &publication.quarantine,
         parent.parent().context("private layout has no parent")?,
     )?;
     fs::File::open(parent)?.sync_all()?;
-    Ok(())
+    Ok(!matches!(
+        retained,
+        super::v030_isolate_sandbox_content::Retained::Deferred
+    ))
 }
 
 #[cfg(unix)]
@@ -3740,6 +3788,182 @@ gemini = "{}"
         assert!(home.join(".gemini/sandbox-v2").join(id).is_dir());
     }
 
+    /// A publish its quarantine defers must lose nothing either: the displaced
+    /// original keeps the destination from being renamed onto it, so the pass
+    /// publishes nothing and the row is retried with both stores intact.
+    #[test]
+    #[serial_test::serial]
+    fn a_deferred_publication_is_retried_by_a_later_pass() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        let home = dirs::home_dir().unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let id = "4444444444444444";
+        let root = home.join(".gemini/sandbox");
+        fs::create_dir_all(root.join(id)).unwrap();
+        fs::write(root.join(id).join("own"), b"own").unwrap();
+        fs::write(root.join("auth.json"), b"auth").unwrap();
+        let layout = home.join(".gemini/sandbox-v2");
+        // A killed pass published this session and left the destination it
+        // displaced at the quarantine, where nothing has retained it yet.
+        let destination = layout.join(id);
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join("published"), b"published").unwrap();
+        let quarantine = layout.join(format!(".v027-quarantine-{id}"));
+        fs::create_dir_all(&quarantine).unwrap();
+        fs::write(quarantine.join("displaced"), b"displaced").unwrap();
+        fs::write(
+            app.join("sessions.json"),
+            format!(
+                r#"[{{"id":"{id}","tool":"gemini","project_path":"{}","sandbox_info":{{"enabled":true}}}}]"#,
+                project.display()
+            ),
+        )
+        .unwrap();
+
+        let expose = |sources: Option<Vec<std::path::PathBuf>>| {
+            super::super::v030_isolate_sandbox_content::EXPOSED_SOURCES
+                .with(|hook| *hook.borrow_mut() = sources);
+        };
+        expose(Some(vec![home.clone()]));
+        run_in(&app, &home, &|_| Ok(false)).unwrap();
+
+        assert_eq!(
+            fs::read(destination.join("published")).unwrap(),
+            b"published",
+            "a deferred publish leaves the destination as it was"
+        );
+        assert_eq!(
+            fs::read(quarantine.join("displaced")).unwrap(),
+            b"displaced",
+            "a deferred retention leaves the quarantine as it was"
+        );
+        assert!(!destination.join("auth.json").exists());
+        assert!(!quarantine.join("published").exists());
+        assert!(root.join("auth.json").is_file());
+        let rows: Value =
+            serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
+        assert!(
+            rows[0]
+                .get("sandbox_store_generation")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                < 2,
+            "a deferred publish keeps its row pending: {rows}"
+        );
+        assert!(app.join(JOURNAL).is_file(), "the root stays pending");
+
+        expose(None);
+        run_in(&app, &home, &|_| Ok(false)).unwrap();
+
+        assert_eq!(fs::read(destination.join("auth.json")).unwrap(), b"auth");
+        assert!(!destination.join("published").exists());
+        assert!(
+            !quarantine.exists(),
+            "the pass that publishes retains the quarantine it publishes through"
+        );
+        assert!(!root.exists(), "the next pass retires the shared store");
+        assert!(!app.join(JOURNAL).exists());
+        let mut retained = Vec::new();
+        let recovery = home.join(crate::migrations::v030_isolate_sandbox_content::RECOVERY);
+        for transaction in fs::read_dir(recovery).unwrap() {
+            for original in fs::read_dir(transaction.unwrap().path().join("original")).unwrap() {
+                retained.push(original.unwrap().file_name().to_string_lossy().into_owned());
+            }
+        }
+        for name in ["displaced", "published"] {
+            assert!(
+                retained.iter().any(|entry| entry == name),
+                "{name} is retained whole rather than dropped: {retained:?}"
+            );
+        }
+    }
+
+    /// The orphan path defers on the same retention: an orphan that cannot
+    /// move keeps its root, and every row reading that root, pending rather
+    /// than retiring a root that still holds it.
+    #[test]
+    #[serial_test::serial]
+    fn a_deferred_orphan_move_keeps_its_root_pending() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        let home = dirs::home_dir().unwrap();
+        let root = home.join(".codex/sandbox");
+        let peer = "1111111111111111";
+        let orphan = "2222222222222222";
+        fs::create_dir_all(root.join(peer)).unwrap();
+        fs::create_dir_all(root.join(orphan)).unwrap();
+        fs::write(root.join(peer).join("peer"), b"peer").unwrap();
+        fs::write(root.join(orphan).join("orphan"), b"orphan").unwrap();
+        let layout = home.join(".codex/sandbox-v2");
+        // A killed pass moved this orphan once and left the destination it
+        // displaced at the quarantine, where nothing has retained it yet.
+        let destination = layout.join(orphan);
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join("moved"), b"moved").unwrap();
+        let quarantine = layout.join(format!(".v027-quarantine-{orphan}"));
+        fs::create_dir_all(&quarantine).unwrap();
+        fs::write(quarantine.join("displaced"), b"displaced").unwrap();
+        fs::write(
+            app.join("sessions.json"),
+            format!(r#"[{{"id":"{peer}","tool":"codex","sandbox_info":{{"enabled":true}}}}]"#),
+        )
+        .unwrap();
+
+        let expose = |sources: Option<Vec<std::path::PathBuf>>| {
+            super::super::v030_isolate_sandbox_content::EXPOSED_SOURCES
+                .with(|hook| *hook.borrow_mut() = sources);
+        };
+        expose(Some(vec![home.clone()]));
+        run_in(&app, &home, &|_| Ok(false)).unwrap();
+
+        assert_eq!(
+            fs::read(root.join(orphan).join("orphan")).unwrap(),
+            b"orphan",
+            "a deferred move leaves the orphan at its source"
+        );
+        assert_eq!(fs::read(destination.join("moved")).unwrap(), b"moved");
+        assert_eq!(
+            fs::read(quarantine.join("displaced")).unwrap(),
+            b"displaced"
+        );
+        assert!(root.is_dir(), "the root holding it stays where it is");
+        let rows: Value =
+            serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
+        assert!(
+            rows[0]
+                .get("sandbox_store_generation")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                < 2,
+            "a root that still holds an orphan keeps its rows pending: {rows}"
+        );
+        assert!(app.join(JOURNAL).is_file(), "the root stays pending");
+
+        expose(None);
+        run_in(&app, &home, &|_| Ok(false)).unwrap();
+
+        assert_eq!(fs::read(destination.join("orphan")).unwrap(), b"orphan");
+        assert!(!destination.join("moved").exists());
+        assert!(!quarantine.exists());
+        assert!(!root.exists(), "the next pass retires the emptied root");
+        assert!(!app.join(JOURNAL).exists());
+        let mut retained = Vec::new();
+        let recovery = home.join(crate::migrations::v030_isolate_sandbox_content::RECOVERY);
+        for transaction in fs::read_dir(recovery).unwrap() {
+            for original in fs::read_dir(transaction.unwrap().path().join("original")).unwrap() {
+                retained.push(original.unwrap().file_name().to_string_lossy().into_owned());
+            }
+        }
+        assert!(
+            retained.iter().any(|entry| entry == "moved"),
+            "the displaced orphan store is retained whole: {retained:?}"
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn retiring_a_root_retains_its_complete_original() {
@@ -4337,7 +4561,7 @@ gemini = "{}"
         )
         .unwrap();
 
-        publish_store(&source, &destination, &BTreeSet::new(), None, false).unwrap();
+        assert!(publish_store(&source, &destination, &BTreeSet::new(), None, false).unwrap());
 
         let copied = fs::symlink_metadata(destination.join("link")).unwrap();
         assert_eq!(
@@ -4403,7 +4627,7 @@ gemini = "{}"
         fs::set_permissions(source.join("credential"), fs::Permissions::from_mode(0o600)).unwrap();
         symlink(outside.join("secret"), source.join("escape")).unwrap();
         symlink("credential", source.join("credential-link")).unwrap();
-        publish_store(&source, &destination, &BTreeSet::new(), None, false).unwrap();
+        assert!(publish_store(&source, &destination, &BTreeSet::new(), None, false).unwrap());
         assert!(!destination.join("escape").exists());
         assert_eq!(
             fs::read(destination.join("credential-link")).unwrap(),
@@ -4479,14 +4703,14 @@ gemini = "{}"
                     }
                 });
                 let _guard = progress::install(Some(reporter));
-                publish_store(
+                assert!(publish_store(
                     &root.join("a/source"),
                     &root.join("a/private/one"),
                     &BTreeSet::new(),
                     None,
                     false,
                 )
-                .unwrap();
+                .unwrap());
             })
         };
 
@@ -4496,14 +4720,14 @@ gemini = "{}"
         let b_seen = Arc::new(Mutex::new(Vec::new()));
         {
             let _guard = progress::install(Some(collecting_reporter(&b_seen)));
-            publish_store(
+            assert!(publish_store(
                 &temp.path().join("b/source"),
                 &temp.path().join("b/private/two"),
                 &BTreeSet::new(),
                 None,
                 false,
             )
-            .unwrap();
+            .unwrap());
         }
         resume_tx.send(()).unwrap();
         mover_a.join().unwrap();
