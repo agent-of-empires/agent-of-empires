@@ -1169,6 +1169,27 @@ fn stage_receipt(
     write_receipt(path, receipt)
 }
 
+/// Drop a stage that was built while a writer could still appear and return the
+/// journal to `Planned`, so the next pass seeds from a source it has proven
+/// stopped instead of publishing content a container may have written to.
+fn discard_stage(receipt: &mut Receipt, path: &Path) -> Result<()> {
+    if receipt.phase != Phase::Staged {
+        return Ok(());
+    }
+    for part in &mut receipt.roots {
+        if part.published.is_some() || part.staged.is_none() {
+            continue;
+        }
+        let parent = part.stage.parent().context("stage has no parent")?;
+        let anchor = AnchoredDir::open(parent)?;
+        let leaf = Path::new(part.stage.file_name().context("stage has no leaf")?);
+        anchor.remove_staged_dir(leaf)?;
+        part.staged = None;
+    }
+    receipt.phase = Phase::Planned;
+    write_receipt(path, receipt)
+}
+
 fn publish_receipt(receipt: &mut Receipt, path: &Path) -> Result<()> {
     if receipt.phase != Phase::Staged {
         return Ok(());
@@ -1668,10 +1689,12 @@ fn migrate_target(
         progress::notice(format!(
             "sandbox {id}: stop its container and structured runner to isolate native history"
         ));
+        discard_stage(&mut receipt, &path)?;
         return Ok(false);
     }
     if let Some(message) = recovery_exposure(app, &migration_targets(app, &roots)?, exposure)? {
         progress::notice(format!("{message}; this sandbox stays pending"));
+        discard_stage(&mut receipt, &path)?;
         return Ok(false);
     }
     if receipt.phase == Phase::Staged {
@@ -2179,6 +2202,81 @@ mod tests {
             context.stored_session_id.is_none(),
             "the retired adapter context is not resumed"
         );
+    }
+
+    /// A stage built while a container could still have been writing is not
+    /// content to publish: the pass discards it and seeds again once the row is
+    /// proven stopped, rather than certifying a possibly concurrent copy.
+    #[test]
+    #[serial_test::serial]
+    fn a_deferred_stage_is_rebuilt_before_it_is_published() {
+        let temporary = tempfile::tempdir().unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let home = dirs::home_dir().unwrap();
+        let app = crate::session::get_app_dir().unwrap();
+        let project = temporary.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let mut instance = crate::session::Instance::new("codex", project.to_str().unwrap());
+        instance.tool = "codex".to_owned();
+        instance.agent_session_id = Some("old-native-context".to_owned());
+        let config = crate::session::Config::default();
+        let roots = container_config::sandbox_content_roots(
+            "codex",
+            None,
+            &config.session,
+            &home,
+            &instance.id,
+        )
+        .unwrap();
+        let root = &roots[0].path;
+        fs::create_dir_all(root.join("sessions")).unwrap();
+        fs::write(
+            root.join("sessions/original.jsonl"),
+            b"PRIVATE_ORIGINAL_CONTEXT",
+        )
+        .unwrap();
+        let mut row = serde_json::to_value(&instance).unwrap();
+        row["sandbox_info"] = serde_json::json!({
+            "enabled": true,
+            "image": "img",
+            "container_name": "aoe-sandbox-fixture",
+        });
+        let registry = app.join("sessions.json");
+        fs::write(&registry, serde_json::to_vec(&vec![row]).unwrap()).unwrap();
+        let target = (registry.as_path(), instance.id.as_str(), "codex");
+
+        assert!(
+            !migrate_target(
+                &app,
+                &home,
+                target,
+                &|_| Ok(false),
+                &|_| Ok(false),
+                &|_| Ok(Vec::new()),
+            )
+            .unwrap(),
+            "a container that cannot be reaped defers the row"
+        );
+        let stored = read_receipt(&receipt_path(&app, &instance.id, "codex").unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.phase, Phase::Planned, "the deferral drops the stage");
+        for part in &stored.roots {
+            assert!(identity(&part.stage).unwrap().is_none());
+        }
+        assert_eq!(
+            fs::read(root.join("sessions/original.jsonl")).unwrap(),
+            b"PRIVATE_ORIGINAL_CONTEXT"
+        );
+
+        assert!(
+            migrate_target(&app, &home, target, &|_| Ok(false), &|_| Ok(true), &|_| Ok(
+                Vec::new()
+            ),)
+            .unwrap()
+        );
+        assert!(roots_ready(&app, &instance.id, "codex", &roots).unwrap());
+        assert!(!root.join("sessions").exists());
     }
 
     #[test]
