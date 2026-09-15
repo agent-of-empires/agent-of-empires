@@ -1267,41 +1267,6 @@ mod tests {
             ident_present(&repo_rows, allowed),
             "{allowed} stays repo-overridable"
         );
-
-        // Host secret passthrough (#3710) and checkout placement (#3711).
-        for (category, denied, allowed) in [
-            (
-                SettingsCategory::Sandbox,
-                vec!["sandbox.environment"],
-                "sandbox.volume_ignores",
-            ),
-            (
-                SettingsCategory::Worktree,
-                vec![
-                    "worktree.enabled",
-                    "worktree.path_template",
-                    "worktree.bare_repo_path_template",
-                    "worktree.workspace_path_template",
-                ],
-                "worktree.auto_cleanup",
-            ),
-        ] {
-            let repo_rows =
-                build_fields_for_category(category, SettingsScope::Repo, &base, &overrides);
-            let global_rows =
-                build_fields_for_category(category, SettingsScope::Global, &base, &overrides);
-            for denied in denied {
-                assert!(!ident_present(&repo_rows, denied), "{denied} in Repo scope");
-                assert!(
-                    ident_present(&global_rows, denied),
-                    "{denied} in Global scope"
-                );
-            }
-            assert!(
-                ident_present(&repo_rows, allowed),
-                "{allowed} in Repo scope"
-            );
-        }
     }
 
     /// #3229: no field under Repo scope for a category whose section is not

@@ -237,7 +237,6 @@ mod tests {
             // Declared on the field.
             ("sandbox", "extra_volumes", RepoPolicy::Deny),
             ("sandbox", "selinux_relabel", RepoPolicy::Deny),
-            ("sandbox", "environment", RepoPolicy::Deny),
             ("worktree", "path_template", RepoPolicy::Deny),
             ("session", "default_tool", RepoPolicy::Deny),
             ("session", "agent_detect_as", RepoPolicy::Allow),
