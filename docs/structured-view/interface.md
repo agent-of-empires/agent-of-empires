@@ -31,8 +31,10 @@ stay in sync.
   native store it resolves for the session's agent, and an explicit
   [native-store assertion](../guides/session-resume.md#pinning-or-resetting-a-conversation)
   names a different store when needed. An ACP ID alone is not native-store
-  provenance; a handoff whose store cannot be resolved is refused before
-  worker teardown. Switching back can reload the Claude transcript.
+  provenance; a handoff whose store cannot be resolved, or that the
+  structured-view worker does not share (a declared
+  `session.agent_config_dir` on a host session), is refused before worker
+  teardown. Switching back can reload the Claude transcript.
   Other agent pairings start a fresh conversation under the new view.
 - **TUI status indicators**: a healthy structured view session shows as
   Idle/Active in the session list, observed via the ACP event stream

@@ -536,11 +536,34 @@ impl Instance {
     /// native execution this session's terminal launch resolves for that ID, so
     /// the handoff cannot validate against one store and then launch against
     /// another.
+    ///
+    /// A host structured-view worker resolves Claude's store from the host
+    /// environment, the same way the ACP transcript gate does, while this
+    /// execution also honours `session.agent_config_dir`. A declaration that
+    /// moves the store away from that resolution would hand the conversation to
+    /// a store the worker never wrote to, so it needs the user to name the
+    /// store explicitly.
     fn resolved_handoff_binding(&self, sid: &str) -> Option<ConversationBinding> {
         let execution = self
             .resolve_native_execution(Some((sid, None, true)))
             .ok()?;
-        (execution.binding.agent == "claude").then(|| ConversationBinding {
+        if execution.binding.agent != "claude" {
+            return None;
+        }
+        if !self.is_sandboxed() {
+            let worker = crate::session::capture::claude_home_for_host_environment(
+                &self.resolved_host_environment(),
+            )
+            .ok()?;
+            let worker = crate::session::capture::canonicalize_or_raw(worker.to_str()?);
+            let terminal = crate::session::capture::canonicalize_or_raw(
+                execution.binding.stores.first()?.to_str()?,
+            );
+            if worker != terminal {
+                return None;
+            }
+        }
+        Some(ConversationBinding {
             session_id: sid.to_string(),
             execution: Some(execution.binding.clone()),
             provenance: ConversationProvenance::Asserted,
@@ -555,7 +578,10 @@ mod tests {
     use crate::session::instance::test_helpers::*;
 
     #[test]
+    #[serial_test::serial]
     fn switch_to_terminal_keep_context_resolves_the_native_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
         let mut inst = Instance::new("claude", "/tmp");
         inst.view = View::Structured;
         inst.acp_session_id = Some("sid-abc".to_string());
@@ -585,7 +611,10 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn switch_to_terminal_keep_context_prefers_an_asserted_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
         let mut inst = Instance::new("claude", "/tmp");
         inst.view = View::Structured;
         inst.acp_session_id = Some("sid-abc".to_string());
@@ -614,6 +643,39 @@ mod tests {
             Some(&[std::path::PathBuf::from("/tmp/claude")][..]),
             "an existing assertion must win over the resolved default"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn switch_to_terminal_keep_context_refuses_a_store_the_worker_never_wrote() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let profile = "handoff-declared-store";
+        let declared = temp.path().join("declared-claude");
+        let path =
+            crate::session::config::profile_config::get_profile_config_path(profile).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "[session.agent_config_dir]\nclaude = {:?}\n",
+                declared.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        let mut inst = Instance::new("claude-declared", "/tmp");
+        inst.source_profile = profile.into();
+        inst.view = View::Structured;
+        inst.acp_session_id = Some("sid-abc".to_string());
+
+        let error = inst.switch_to_terminal_keep_context().unwrap_err();
+
+        assert!(
+            error.to_string().contains("set-session-id"),
+            "refusal must carry recovery guidance: {error}"
+        );
+        assert_eq!(inst.view, View::Structured);
+        assert_eq!(inst.acp_session_id.as_deref(), Some("sid-abc"));
     }
 
     #[test]
