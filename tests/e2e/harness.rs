@@ -722,7 +722,7 @@ last_seen_version = "{}"
 
     /// Send one or more tmux key names (e.g. "Enter", "Escape", "q", "C-c").
     pub fn send_keys(&self, keys: &str) {
-        if keys == "Escape" {
+        if matches!(keys, "Escape" | "C-[") {
             self.send_hex_keys(ESCAPE_CSI_U);
         } else {
             self.send_keys_unfenced(keys);
@@ -730,7 +730,7 @@ last_seen_version = "{}"
         self.synchronize_input();
     }
 
-    fn send_hex_keys(&self, bytes: &[&str]) {
+    fn send_hex_keys<S: AsRef<std::ffi::OsStr>>(&self, bytes: &[S]) {
         assert!(self.spawned, "must call spawn_tui() or spawn() first");
         let output = Command::new("tmux")
             .arg("-S")
@@ -841,21 +841,7 @@ last_seen_version = "{}"
         bytes.extend_from_slice(text.as_bytes());
         bytes.extend_from_slice(b"\x1b[201~");
         let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        let output = Command::new("tmux")
-            .arg("-S")
-            .arg(&self.socket_path)
-            .arg("send-keys")
-            .arg("-t")
-            .arg(&self.session_name)
-            .arg("-H")
-            .args(&hex)
-            .output()
-            .expect("failed to send paste");
-        assert!(
-            output.status.success(),
-            "send_paste failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        self.send_hex_keys(&hex);
         self.synchronize_input();
     }
 
