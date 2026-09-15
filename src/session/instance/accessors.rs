@@ -551,10 +551,22 @@ impl Instance {
             return None;
         }
         if !self.is_sandboxed() {
-            let worker = crate::session::capture::claude_home_for_host_environment(
+            // Resolve the worker's store the way the launch resolves Claude's
+            // root, minus `session.agent_config_dir`, which the worker never
+            // reads: the session's own HOME, not the daemon's.
+            let environment = crate::session::capture::host_launcher_environment(
                 &self.resolved_host_environment(),
-            )
-            .ok()?;
+            );
+            let value = |key: &str| {
+                environment
+                    .get(key)
+                    .filter(|value| !value.is_empty())
+                    .cloned()
+            };
+            let home = std::path::PathBuf::from(value("HOME")?);
+            let worker = value("CLAUDE_CONFIG_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| home.join(".claude"));
             let worker = crate::session::capture::canonicalize_or_raw(worker.to_str()?);
             let terminal = crate::session::capture::canonicalize_or_raw(
                 execution.binding.stores.first()?.to_str()?,
@@ -647,6 +659,32 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn switch_to_terminal_keep_context_accepts_a_session_home_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let session_home = temp.path().join("agent-home");
+        let mut inst = Instance::new("claude-session-home", "/tmp");
+        // The worker and the terminal launch both read this HOME, so the
+        // conversation store is shared even though the daemon's HOME differs.
+        inst.pending_host_env = vec![("HOME".into(), session_home.display().to_string())];
+        inst.view = View::Structured;
+        inst.acp_session_id = Some("sid-abc".to_string());
+
+        inst.switch_to_terminal_keep_context().unwrap();
+
+        assert_eq!(
+            inst.agent_session_binding
+                .as_ref()
+                .and_then(|binding| binding.execution.as_ref())
+                .and_then(|execution| execution.stores.first())
+                .map(std::path::PathBuf::as_path),
+            Some(session_home.join(".claude").as_path()),
+            "a session HOME store the worker shares must be accepted"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn switch_to_terminal_keep_context_refuses_a_store_the_worker_never_wrote() {
         let temp = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
@@ -676,6 +714,59 @@ mod tests {
         );
         assert_eq!(inst.view, View::Structured);
         assert_eq!(inst.acp_session_id.as_deref(), Some("sid-abc"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn an_asserted_worker_store_produces_a_launchable_handoff() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let profile = "handoff-asserted-worker-store";
+        let declared = temp.path().join("declared-claude");
+        let path =
+            crate::session::config::profile_config::get_profile_config_path(profile).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "[session.agent_config_dir]\nclaude = {:?}\n",
+                declared.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let mut inst = Instance::new("claude-asserted-store", project.to_str().unwrap());
+        inst.source_profile = profile.into();
+        inst.view = View::Structured;
+        inst.acp_session_id = Some("sid-abc".to_string());
+
+        // The declaration moves the pane, so the handoff alone is refused; the
+        // documented recovery names the store the structured-view worker writes,
+        // and the launch must then honour it.
+        assert!(inst.switch_to_terminal_keep_context().is_err());
+        let worker_store = temp.path().join("worker-claude");
+        std::fs::create_dir_all(&worker_store).unwrap();
+        let binding = inst
+            .asserted_resume_binding("sid-abc", Some(&worker_store))
+            .unwrap();
+        inst.resume_intent = ResumeIntent::Use("sid-abc".into());
+        inst.resume_binding = Some(binding);
+
+        inst.switch_to_terminal_keep_context().unwrap();
+
+        let prepared = inst
+            .prepare_launch_command(inst.conversation_state())
+            .expect("an asserted store must produce a launchable handoff");
+        let command = prepared.command.unwrap();
+        assert!(
+            command.contains(&worker_store.canonicalize().unwrap().display().to_string()),
+            "the launch must route the asserted store: {command}"
+        );
+        assert!(
+            !command.contains(&declared.display().to_string()),
+            "the declared store must not be routed: {command}"
+        );
     }
 
     #[test]

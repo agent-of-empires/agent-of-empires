@@ -79,6 +79,8 @@ For an explicit store assertion:
 aoe session set-session-id <session> <native-id> --store /absolute/native/store
 ```
 
+For a terminal agent whose store comes from configuration, such as Claude, `--store` names the store directory the launch routes, so an explicit assertion restores a conversation that the session's own configuration would place elsewhere. The assertion wins over that configuration until it is changed.
+
 For Pi and OMP, `--store` instead names the exact existing transcript file within the configured store. Its header must name the requested ID. A missing or incompatible store is an error, not an implicit fresh start.
 
 Retry after fixing the underlying issue, set a different conversation ID, or explicitly start fresh once:
