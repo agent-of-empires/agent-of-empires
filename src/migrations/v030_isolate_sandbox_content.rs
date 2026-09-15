@@ -1173,21 +1173,36 @@ fn stage_receipt(
 /// journal to `Planned`, so the next pass seeds from a source it has proven
 /// stopped instead of publishing content a container may have written to.
 fn discard_stage(receipt: &mut Receipt, path: &Path) -> Result<()> {
-    if receipt.phase != Phase::Staged {
+    // A transaction that already renamed a part into place is mid-publication,
+    // not a fresh seed: its stages are what the resume path needs.
+    if receipt.phase != Phase::Staged
+        || receipt
+            .roots
+            .iter()
+            .any(|part| part.original.is_some() && part.published.is_some())
+    {
         return Ok(());
     }
+    // Journal first: a stage that a later pass finds named but already gone is
+    // read as a rename it may tolerate, and a leftover stage this transaction
+    // owns is removed by the next `stage_receipt` before it seeds.
     for part in &mut receipt.roots {
-        if part.published.is_some() || part.staged.is_none() {
+        if part.published.is_none() {
+            part.staged = None;
+        }
+    }
+    receipt.phase = Phase::Planned;
+    write_receipt(path, receipt)?;
+    for part in &receipt.roots {
+        if part.published.is_some() {
             continue;
         }
         let parent = part.stage.parent().context("stage has no parent")?;
         let anchor = AnchoredDir::open(parent)?;
         let leaf = Path::new(part.stage.file_name().context("stage has no leaf")?);
         anchor.remove_staged_dir(leaf)?;
-        part.staged = None;
     }
-    receipt.phase = Phase::Planned;
-    write_receipt(path, receipt)
+    Ok(())
 }
 
 fn publish_receipt(receipt: &mut Receipt, path: &Path) -> Result<()> {
@@ -1674,6 +1689,7 @@ fn migrate_target(
         .iter_mut()
         .find(|row| row.get("id").and_then(Value::as_str) == Some(id))
     else {
+        discard_stage(&mut receipt, &path)?;
         return Ok(false);
     };
     let mut current_roots = row_roots(current, tool, home, &fresh_config)?;
@@ -1682,6 +1698,9 @@ fn migrate_target(
         || !row_tools(current).contains(tool)
         || current.get("project_path") != row.get("project_path")
     {
+        // A container could have started after the stage was seeded, so the
+        // seed is dropped with the plan it was made for.
+        discard_stage(&mut receipt, &path)?;
         return Ok(false);
     }
     layout::refresh_liveness();
@@ -2269,6 +2288,12 @@ mod tests {
             b"PRIVATE_ORIGINAL_CONTEXT"
         );
 
+        // A crash between the journal write and the removal leaves a stage the
+        // next pass must clean rather than publish.
+        let stage = stored.roots[0].stage.clone();
+        fs::create_dir_all(&stage).unwrap();
+        fs::write(stage.join("stale"), b"STALE").unwrap();
+
         assert!(
             migrate_target(&app, &home, target, &|_| Ok(false), &|_| Ok(true), &|_| Ok(
                 Vec::new()
@@ -2277,6 +2302,11 @@ mod tests {
         );
         assert!(roots_ready(&app, &instance.id, "codex", &roots).unwrap());
         assert!(!root.join("sessions").exists());
+        assert!(
+            !root.join("stale").exists(),
+            "a stale stage is not published"
+        );
+        assert!(!stage.exists());
     }
 
     #[test]
