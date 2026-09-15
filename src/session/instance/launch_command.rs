@@ -1047,6 +1047,55 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn a_preallocated_id_survives_a_moved_working_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let _isolation = crate::session::test_support::isolate_app_dir_at(home.path());
+        let (_hooks, _, _hook_dir) = crate::hooks::test_support::BaseGuard::ready();
+        let program = home.path().join("claude");
+        std::fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let sid = "11111111-1111-4111-8111-111111111111";
+        let old_directory = home.path().join("worktrees").join("moved");
+        let new_directory = home.path().join("workspace").join("moved");
+        std::fs::create_dir_all(&old_directory).unwrap();
+        std::fs::create_dir_all(&new_directory).unwrap();
+
+        let mut instance = Instance::new("moved-directory", new_directory.to_str().unwrap());
+        instance.tool = "claude".into();
+        instance.command = "claude".into();
+        instance.pending_host_env = vec![
+            (
+                "PATH".into(),
+                format!("{}:/usr/bin:/bin", home.path().display()),
+            ),
+            ("HOME".into(), home.path().display().to_string()),
+        ];
+        let resolved = instance.resolve_native_execution(None).unwrap().binding;
+        let mut stale = resolved.clone();
+        stale.cwd = old_directory.clone();
+        instance.set_agent_conversation(
+            Some(sid.into()),
+            Some(ConversationBinding {
+                session_id: sid.into(),
+                execution: Some(stale),
+                provenance: ConversationProvenance::Preallocated,
+                transcript_path: None,
+            }),
+            None,
+        );
+
+        // A workspace conversion moves the session's directory. The id AoE
+        // preallocated for it has no conversation behind it, so the launch
+        // rebinds instead of refusing.
+        instance
+            .prepare_launch_command(instance.conversation_state())
+            .expect("a preallocated id must survive the directory move");
+        assert_eq!(instance.agent_session_id.as_deref(), Some(sid));
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn fork_preparation_rejects_a_different_native_program() {
         let home = tempfile::tempdir().unwrap();
         let _isolation = crate::session::test_support::isolate_app_dir_at(home.path());
