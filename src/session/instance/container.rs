@@ -156,6 +156,21 @@ impl Instance {
                 None
             };
 
+        // A container built for another tool mounts that tool's agent config.
+        // Decide on the disk row: a stale in-memory copy would remove the
+        // container a peer just recreated for the swapped tool.
+        if container.exists()? && container.agent_tool_matches(&self.tool)? == Some(false) {
+            self.reconcile_from_disk();
+            if container.agent_tool_matches(&self.tool)? == Some(false) {
+                tracing::info!(
+                    target: "containers.runtime",
+                    session = %self.id,
+                    "removing sandbox container built for another tool; it will be recreated"
+                );
+                container.remove(true)?;
+            }
+        }
+
         // Direct is_running()? / exists()? here rather than probe_running():
         // this function already returns Result, so `?` correctly propagates
         // a daemon-down transient to the caller as Err, letting them render
@@ -753,5 +768,102 @@ claude-personal = "~/.claude-global"
             fs::read_to_string(legacy.join(".claude.json")).unwrap(),
             legacy_json
         );
+    }
+
+    /// A container built for another tool is recreated rather than reused (#3976).
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn container_built_for_another_tool_is_removed_before_reuse() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let calls_path = temp.path().join("runtime-calls");
+        let label_path = temp.path().join("tool-label");
+        let removed_path = temp.path().join("removed");
+        // A stopped container carrying the tool label read from `label_path`.
+        // Removal makes it absent; every other call fails, so the launch stops
+        // before tmux.
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{calls}'\n\
+             if [ \"$1\" = rm ]; then touch '{removed}'; exit 0; fi\n\
+             if [ \"$1\" = container ] && [ \"$2\" = inspect ]; then\n\
+             if [ -e '{removed}' ]; then echo 'Error: No such container: c' >&2; exit 1; fi\n\
+             case \"$*\" in\n\
+             *agent-tool*) cat '{label}' ;;\n\
+             *sandbox-store-generation*) echo 2 ;;\n\
+             *State.Running*) echo false ;;\n\
+             esac\n\
+             exit 0\n\
+             fi\n\
+             echo 'permission denied' >&2\nexit 1\n",
+            calls = calls_path.display(),
+            removed = removed_path.display(),
+            label = label_path.display(),
+        );
+        for binary in ["docker", "podman", "container"] {
+            let path = bin.join(binary);
+            std::fs::write(&path, &script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _path = crate::session::test_support::path_prepended(&bin);
+        let profile = "agent-tool-label";
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+
+        // `disk_tool` is the persisted row's tool when a peer swapped it after
+        // this in-memory copy was taken.
+        for (built_for, disk_tool, expected_removals) in [
+            ("claude", None, 1),
+            ("claude", Some("claude"), 0),
+            ("codex", None, 0),
+            ("", None, 0),
+        ] {
+            let _ = std::fs::remove_file(&calls_path);
+            let _ = std::fs::remove_file(&removed_path);
+            std::fs::write(&label_path, built_for).unwrap();
+            let mut instance = Instance::new("tool label", temp.path().to_str().unwrap());
+            instance.tool = "codex".to_string();
+            instance.source_profile = profile.to_string();
+            instance.sandbox_info = Some(SandboxInfo {
+                enabled: true,
+                container_id: None,
+                image: "test:latest".to_string(),
+                container_name: "tool-label".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                container_workdir: None,
+            });
+            storage
+                .update(|instances, _groups| {
+                    instances.clear();
+                    if let Some(tool) = disk_tool {
+                        let mut disk = instance.clone();
+                        disk.tool = tool.to_string();
+                        instances.push(disk);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            let container = DockerContainer::from_session_id(&instance.id).name;
+
+            let error = instance
+                .get_container_for_instance()
+                .err()
+                .expect("the fake runtime fails every launch");
+
+            let calls = std::fs::read_to_string(&calls_path).unwrap_or_default();
+            let removals = calls
+                .lines()
+                .filter(|line| line.starts_with("rm -f") && line.ends_with(&container))
+                .count();
+            assert_eq!(
+                removals, expected_removals,
+                "built_for={built_for:?} disk_tool={disk_tool:?}: {error:#}\n{calls}"
+            );
+        }
     }
 }

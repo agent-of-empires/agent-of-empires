@@ -918,6 +918,13 @@ impl Instance {
                 .env
                 .push((crate::hooks::SESSION_SOURCE_ENV.into(), source.to_owned()));
         }
+        // The container has no launch pid, so the session-id hook identifies a
+        // nested agent by this binary name instead.
+        if let Some(agent) = agent {
+            environment
+                .env
+                .push(("AOE_AGENT_BIN".into(), agent.binary.to_owned()));
+        }
         if let Some((key, value)) = agent.and_then(|agent| {
             agent
                 .container_env
