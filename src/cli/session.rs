@@ -3469,7 +3469,10 @@ mod set_session_id_tests {
                 .as_ref()
                 .unwrap()
                 .stores,
-            vec![temp.path().join(".claude")]
+            vec![crate::session::capture::canonicalize_allowing_missing_leaf(
+                &temp.path().join(".claude")
+            )
+            .unwrap()]
         );
     }
 }

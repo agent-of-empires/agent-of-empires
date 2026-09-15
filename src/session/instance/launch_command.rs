@@ -1447,7 +1447,12 @@ mod tests {
             } else {
                 format!("--resume\n{sid}\nnamespace:{}||||session\n", root.display())
             };
-            assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+            // A symlinked temp root spells the same directory two ways, so the
+            // namespace line is compared after resolving each path component.
+            assert_eq!(
+                identity_paths(&String::from_utf8(output.stdout).unwrap()),
+                identity_paths(&expected)
+            );
             {
                 let _shell = EnvGuard::set(&[("SHELL", "/bin/fish")]);
                 let prepared = inst
@@ -1483,7 +1488,10 @@ mod tests {
                     .env("BASH_ENV", &startup)
                     .output()
                     .unwrap();
-                if !output.status.success() || String::from_utf8_lossy(&output.stdout) != expected {
+                if !output.status.success()
+                    || identity_paths(&String::from_utf8_lossy(&output.stdout))
+                        != identity_paths(&expected)
+                {
                     failures.push(format!(
                         "{agent}: matching readonly routing was not exported: {}",
                         String::from_utf8_lossy(&output.stderr)
@@ -1761,6 +1769,36 @@ mod tests {
             );
         }
     }
+    /// Resolve every path this text mentions so two spellings of the same
+    /// symlinked directory compare equal.
+    fn identity_paths(text: &str) -> String {
+        fn identity(part: &str) -> String {
+            if part.is_empty() || matches!(part, "local" | "session" | "default") {
+                return part.to_string();
+            }
+            let path = std::path::Path::new(part);
+            crate::session::capture::canonicalize_allowing_missing_leaf(path)
+                .map(|resolved| resolved.display().to_string())
+                .unwrap_or_else(|| part.to_string())
+        }
+        text.split('\0')
+            .map(|chunk| {
+                chunk
+                    .lines()
+                    .map(|line| match line.strip_prefix("namespace:") {
+                        Some(rest) => format!(
+                            "namespace:{}",
+                            rest.split('|').map(identity).collect::<Vec<_>>().join("|")
+                        ),
+                        None => identity(line),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .collect::<Vec<_>>()
+            .join("\0")
+    }
+
     #[test]
     #[serial_test::serial]
     fn test_wrap_command_reasserts_working_dir_after_login_shell() {
@@ -1802,8 +1840,10 @@ mod tests {
                     .args(["-c", &wrapped])
                     .output()
                     .unwrap();
-                let expected = format!("{}\0{}", cwd.display(), store.display()).into_bytes();
-                if !output.status.success() || output.stdout != expected {
+                let expected = format!("{}\0{}", cwd.display(), store.display());
+                let emitted = String::from_utf8_lossy(&output.stdout).to_string();
+                if !output.status.success() || identity_paths(&emitted) != identity_paths(&expected)
+                {
                     failures.push(format!(
                         "{context} {suffix:?}: status={} stdout={:?} stderr={:?}",
                         output.status,

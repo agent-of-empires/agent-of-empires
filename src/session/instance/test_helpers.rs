@@ -62,6 +62,13 @@ pub(crate) fn declare_execution_aliases(
     std::fs::write(path, toml::to_string(&config).unwrap()).unwrap();
 }
 
+/// A path's identity for assertions: a symlinked temp or home root spells the
+/// same directory two ways, so expectations compare the resolved identity.
+pub(crate) fn path_identity(path: &std::path::Path) -> std::path::PathBuf {
+    crate::session::capture::canonicalize_allowing_missing_leaf(path)
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
 pub(super) fn create_hermes_database(root: &std::path::Path) -> rusqlite::Connection {
     std::fs::create_dir_all(root).unwrap();
     let database = rusqlite::Connection::open(root.join("state.db")).unwrap();
