@@ -135,8 +135,9 @@ pub struct ContainerConfig {
     /// shares, one bind mount each. Labelled at create, so a container built
     /// before a file was shared, which mounts only the store, can be told apart.
     pub shared_credential_mounts: Vec<String>,
-    /// The tool whose agent config this container mounts. Labelled at create,
-    /// so a container reused after a tool swap can be told apart.
+    /// The agent identity whose config this container mounts; see
+    /// `container_agent_identity`. Labelled at create, so a container reused
+    /// after a tool swap can be told apart.
     pub agent_tool: String,
     pub run_policy: RunPolicy,
 }

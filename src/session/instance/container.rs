@@ -111,7 +111,6 @@ impl Instance {
     }
 
     pub fn get_container_for_instance(&mut self) -> Result<containers::DockerContainer> {
-        let detect_as = self.effective_detect_as().into_owned();
         let image = self
             .sandbox_info
             .as_ref()
@@ -149,12 +148,16 @@ impl Instance {
                 None
             };
 
-        // A container built for another tool mounts that tool's agent config.
+        // A container built for another agent mounts that agent's config.
         // Decide on the disk row: a stale in-memory copy would remove the
         // container a peer just recreated for the swapped tool.
-        if container.exists()? && container.agent_tool_matches(&self.tool)? == Some(false) {
-            self.reconcile_from_disk();
-            if container.agent_tool_matches(&self.tool)? == Some(false) {
+        if container.exists()?
+            && container.agent_tool_matches(&self.container_agent_identity())? == Some(false)
+        {
+            self.try_reconcile_from_disk().context(
+                "cannot confirm the session's tool before removing its sandbox container",
+            )?;
+            if container.agent_tool_matches(&self.container_agent_identity())? == Some(false) {
                 tracing::info!(
                     target: "containers.runtime",
                     session = %self.id,
@@ -163,6 +166,8 @@ impl Instance {
                 container.remove(true)?;
             }
         }
+        // After every reload above, which may have replaced the tool.
+        let detect_as = self.effective_detect_as().into_owned();
 
         // Direct is_running()? / exists()? here rather than probe_running():
         // this function already returns Result, so `?` correctly propagates
@@ -306,6 +311,14 @@ impl Instance {
         }
 
         Ok(container)
+    }
+
+    fn container_agent_identity(&self) -> String {
+        container_config::container_agent_identity(
+            &self.tool,
+            Some(&self.effective_detect_as()),
+            &self.source_profile,
+        )
     }
 
     /// Whether the session's container was created before its agent shared a
@@ -807,19 +820,41 @@ claude-personal = "~/.claude-global"
         let profile = "agent-tool-label";
         let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
 
-        // `disk_tool` is the persisted row's tool when a peer swapped it after
-        // this in-memory copy was taken.
-        for (built_for, disk_tool, expected_removals) in [
-            ("claude", None, 1),
-            ("claude", Some("claude"), 0),
-            ("codex", None, 0),
-            ("", None, 0),
-        ] {
+        enum Disk {
+            Absent,
+            Corrupt,
+            /// A peer persisted this `(tool, detect_as)` after the in-memory copy.
+            Row(&'static str, &'static str),
+        }
+        // `store` is the agent config root the reuse path refreshed, if any.
+        let cases = [
+            (("codex", ""), "claude", Disk::Absent, 1, None),
+            (
+                ("codex", ""),
+                "claude",
+                Disk::Row("claude", ""),
+                0,
+                Some(".claude"),
+            ),
+            (("codex", ""), "codex", Disk::Absent, 0, Some(".codex")),
+            (("codex", ""), "", Disk::Absent, 0, Some(".codex")),
+            (("codex", ""), "claude", Disk::Corrupt, 0, None),
+            (
+                ("alias-a", "claude"),
+                "alias-b:codex",
+                Disk::Row("alias-b", "codex"),
+                0,
+                Some(".codex"),
+            ),
+            (("alias-a", "codex"), "alias-a", Disk::Absent, 1, None),
+        ];
+        for ((tool, detect_as), built_for, disk, expected_removals, expected_store) in cases {
             let _ = std::fs::remove_file(&calls_path);
             let _ = std::fs::remove_file(&removed_path);
             std::fs::write(&label_path, built_for).unwrap();
             let mut instance = Instance::new("tool label", temp.path().to_str().unwrap());
-            instance.tool = "codex".to_string();
+            instance.tool = tool.to_string();
+            instance.detect_as = detect_as.to_string();
             instance.source_profile = profile.to_string();
             instance.sandbox_info = Some(SandboxInfo {
                 enabled: true,
@@ -831,17 +866,22 @@ claude-personal = "~/.claude-global"
                 before_start_env: Vec::new(),
                 container_workdir: None,
             });
+            let _ = std::fs::remove_file(storage.sessions_path());
             storage
                 .update(|instances, _groups| {
                     instances.clear();
-                    if let Some(tool) = disk_tool {
-                        let mut disk = instance.clone();
-                        disk.tool = tool.to_string();
-                        instances.push(disk);
+                    if let Disk::Row(tool, detect_as) = disk {
+                        let mut row = instance.clone();
+                        row.tool = tool.to_string();
+                        row.detect_as = detect_as.to_string();
+                        instances.push(row);
                     }
                     Ok(())
                 })
                 .unwrap();
+            if let Disk::Corrupt = disk {
+                std::fs::write(storage.sessions_path(), "not json").unwrap();
+            }
             let container = DockerContainer::from_session_id(&instance.id).name;
 
             let error = instance
@@ -854,10 +894,19 @@ claude-personal = "~/.claude-global"
                 .lines()
                 .filter(|line| line.starts_with("rm -f") && line.ends_with(&container))
                 .count();
-            assert_eq!(
-                removals, expected_removals,
-                "built_for={built_for:?} disk_tool={disk_tool:?}: {error:#}\n{calls}"
-            );
+            let case = format!("{tool}/{detect_as} built_for={built_for:?}: {error:#}\n{calls}");
+            assert_eq!(removals, expected_removals, "{case}");
+            let stores: Vec<_> = [".claude", ".codex"]
+                .into_iter()
+                .filter(|root| {
+                    temp.path()
+                        .join(root)
+                        .join("sandbox-v2")
+                        .join(&instance.id)
+                        .exists()
+                })
+                .collect();
+            assert_eq!(stores, Vec::from_iter(expected_store), "{case}");
         }
     }
 }

@@ -1855,6 +1855,30 @@ fn resolve_active_agent(
         })
 }
 
+/// The identity a sandbox container's agent config mounts are built for. Mounts
+/// follow the resolved agent and store roots follow the tool, so an alias
+/// carries both.
+pub(crate) fn container_agent_identity(
+    tool: &str,
+    detect_as: Option<&str>,
+    profile: &str,
+) -> String {
+    let resolved_profile = super::effective_profile(profile);
+    let session_config = super::profile_config::resolve_config_or_warn(&resolved_profile).session;
+    agent_identity(
+        tool,
+        resolve_active_agent(tool, detect_as, &session_config).map_or(tool, |a| a.name),
+    )
+}
+
+fn agent_identity(tool: &str, config_tool: &str) -> String {
+    if tool == config_tool {
+        tool.to_string()
+    } else {
+        format!("{tool}:{config_tool}")
+    }
+}
+
 /// The managed Codex home for an instance, when its resolved agent uses Codex
 /// configuration. This is also passed to `docker exec`, so pre-isolation
 /// containers use their private child directory without being recreated.
@@ -2773,7 +2797,7 @@ pub(crate) fn build_container_config(
         selinux_relabel: sandbox_config.selinux_relabel,
         identity_publisher_installed,
         shared_credential_mounts,
-        agent_tool: agent_selection.tool.to_string(),
+        agent_tool: agent_identity(agent_selection.tool, config_tool),
         run_policy: RunPolicy {
             privileged: sandbox_config.privileged,
             cap_add: sandbox_config.cap_add.clone(),
