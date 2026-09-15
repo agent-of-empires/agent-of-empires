@@ -579,7 +579,7 @@ Set the resume target for a session; an agent whose exact native resume AoE cann
 ###### **Arguments:**
 
 * `<IDENTIFIER>` — Session ID or title
-* `<SESSION_ID>` — Conversation to resume. An empty string requests a one-shot fresh start
+* `<SESSION_ID>` — Conversation to resume. An empty string requests a one-shot fresh start, which only a terminal session can take: a structured session keeps its ACP conversation and needs the native ID plus an explicit `--store` and a bound Claude conversation
 
 ###### **Options:**
 

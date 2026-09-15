@@ -11,6 +11,15 @@ pub(crate) fn host_path_for_mounts<'a>(
     container_path: &std::path::Path,
     writable: bool,
 ) -> Option<std::path::PathBuf> {
+    // The prefix matching below is lexical, so `/workspace/project/../other/x`
+    // would match the `/workspace/project` bind and then resolve outside it.
+    // Refuse traversal before matching; these paths come from stored rows.
+    if container_path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return None;
+    }
     let (volume, relative) = volumes
         .iter()
         .filter_map(|volume| {
@@ -405,6 +414,14 @@ mod tests {
         assert_eq!(
             config.host_path_for_container_path(source, false),
             Some(std::path::PathBuf::from("/host/project/src/lib.rs"))
+        );
+        assert_eq!(
+            config.host_path_for_container_path(
+                std::path::Path::new("/workspace/project/../other/file.jsonl"),
+                false
+            ),
+            None,
+            "a traversal component must not resolve outside the matched bind"
         );
 
         let settings = std::path::Path::new("/workspace/project/.prime/agent/settings.json");

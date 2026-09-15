@@ -155,9 +155,13 @@ impl Instance {
                 None
             };
 
-        // A container built for another agent mounts that agent's config.
-        // Decide on the disk row and a resolved profile: a stale in-memory copy
-        // or a defaulted config would remove a valid container.
+        // A container built for another agent mounts that agent's config, so
+        // the row decides the identity, not this process's copy: a peer can
+        // change the tool while the instance is cached, and a stale copy that
+        // still matches the label would reuse the wrong mounts.
+        if container.exists()? {
+            self.reconcile_from_disk();
+        }
         if container.exists()?
             && container.agent_tool_matches(&self.container_agent_identity()?)? == Some(false)
         {

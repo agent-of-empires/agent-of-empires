@@ -281,7 +281,10 @@ struct CaptureOutput {
 pub struct SetSessionIdArgs {
     /// Session ID or title
     identifier: String,
-    /// Conversation to resume. An empty string requests a one-shot fresh start.
+    /// Conversation to resume. An empty string requests a one-shot fresh
+    /// start, which only a terminal session can take: a structured session
+    /// keeps its ACP conversation and needs the native ID plus an explicit
+    /// `--store` and a bound Claude conversation.
     session_id: String,
     /// Assert the primary native store root, for example CLAUDE_CONFIG_DIR or CODEX_HOME.
     #[arg(long)]

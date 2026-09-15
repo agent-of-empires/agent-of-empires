@@ -1155,7 +1155,9 @@ pub struct SessionConfig {
     )]
     pub agent_detect_as: HashMap<String, String>,
 
-    /// Explicit native execution contract for wrappers, paired with agent_config_dir.
+    /// Explicit native execution contract: wrapper=builtin (e.g. lenovo-claude=claude).
+    /// Asserts which agent a wrapper executes and whose conversation namespace
+    /// it writes, paired with agent_config_dir.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[setting(
         label = "Agent Execution As",

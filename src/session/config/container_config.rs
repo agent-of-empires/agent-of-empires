@@ -1863,20 +1863,17 @@ pub(crate) fn resolve_active_agent(
 /// aliases, which would misread a valid container as built for another agent.
 pub(crate) fn container_agent_identity(
     tool: &str,
-    detect_as: Option<&str>,
+    command: Option<&str>,
     profile: &str,
 ) -> Result<String> {
     let resolved_profile = super::effective_profile(profile);
     let session_config = super::profile_config::resolve_config(&resolved_profile)?.session;
-    // A mount identity, never conversation authority: the configured command
-    // resolves the agent, and the session's own status alias is the same
-    // fallback the label writer applies, so reader and writer agree and the
-    // container is not rebuilt on every launch.
+    // A mount identity, never conversation authority: resolve the agent from
+    // the same inputs as the label writer in `build_container_config`, so a
+    // reused container is not rebuilt on every launch.
     Ok(agent_identity(
         tool,
-        resolve_active_agent(tool, None, &session_config)
-            .or_else(|| detect_as.and_then(crate::agents::get_agent))
-            .map_or(tool, |a| a.name),
+        resolve_active_agent(tool, command, &session_config).map_or(tool, |a| a.name),
     ))
 }
 

@@ -126,7 +126,8 @@ impl Instance {
     ///
     /// Pi polls its sidecar or nothing: the pane publishes its own
     /// conversation, and a store keyed by cwd cannot say which pane owns what.
-    /// Reads memory only: this runs per session on every TUI refresh.
+    /// Resolving the capture specification reads the profile configuration;
+    /// callers are launch and session-ID persistence, not the refresh path.
     pub(crate) fn launch_has_session_publisher(&self) -> bool {
         let Some((capture, context)) = self.resolved_session_support() else {
             return false;
