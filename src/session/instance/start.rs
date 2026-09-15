@@ -182,10 +182,14 @@ impl Instance {
                 self.id
             );
         }
+        let canonicalized = prepared.canonical_conversation.is_some();
         let launch_sid = if prepared.is_existing {
             Some(
-                self.agent_session_id
-                    .clone()
+                prepared
+                    .canonical_conversation
+                    .as_ref()
+                    .and_then(|state| state.session_id.clone())
+                    .or_else(|| self.agent_session_id.clone())
                     .expect("existing launch command carries agent_session_id"),
             )
         } else {
@@ -270,6 +274,9 @@ impl Instance {
             }
         }
 
+        if let Some(canonical) = prepared.canonical_conversation.take() {
+            self.adopt_conversation_state(canonical);
+        }
         if let Some(execution) = prepared.execution.take() {
             self.active_execution = Some(ActiveExecution {
                 launch_id: execution.inputs.launch_id,
@@ -342,7 +349,8 @@ impl Instance {
             profile,
             &prepared.expected_conversation,
             omp_capture_metadata,
-        );
+            canonicalized,
+        )?;
 
         Ok(match launch_sid {
             Some(sid) => LaunchSidOutcome::Existing { sid },
@@ -357,7 +365,8 @@ impl Instance {
         profile: &str,
         expected: &ConversationState,
         mut omp_capture_metadata: Option<OmpCaptureMetadata>,
-    ) {
+        canonicalized: bool,
+    ) -> Result<()> {
         if let Some(metadata) = omp_capture_metadata.as_ref() {
             let published = serde_json::to_string(metadata).ok().and_then(|encoded| {
                 crate::tmux::env::set_hidden_env(
@@ -379,7 +388,22 @@ impl Instance {
             }
         }
 
+        let desired = canonicalized.then(|| {
+            let mut desired = self.conversation_state();
+            if matches!(desired.intent, ResumeIntent::Use(_)) && self.launch_has_session_publisher()
+            {
+                desired.intent = ResumeIntent::Default;
+                desired.resume_binding = None;
+            }
+            desired
+        });
         let outcome = self.persist_session_id(profile, expected);
+        if desired.is_some_and(|desired| {
+            !matches!(outcome, SidPersistOutcome::Published) || !desired.matches(self)
+        }) {
+            self.reconcile_from_disk();
+            anyhow::bail!("Hermes canonical publication was not confirmed; durable reconciliation was attempted but may be unavailable, and the pane may remain if reservation verification or teardown fails");
+        }
 
         // Skip outcomes leave AOE_CAPTURED_SESSION_ID untouched: this path
         // runs before any poller publish, so env is empty for fresh sessions.
@@ -433,29 +457,31 @@ impl Instance {
         let sandbox = self.sandbox_display();
         let options_profile = profile.to_string();
         match std::thread::Builder::new()
-        .name(format!("finalize-tmux-{}", instance_id_for_log))
-        .spawn(move || {
-            if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                crate::tmux::status_bar::apply_all_tmux_options(
-                    &session_name,
-                    &title,
-                    branch.as_deref(),
-                    sandbox.as_ref(),
-                    &options_profile,
+            .name(format!("finalize-tmux-{}", instance_id_for_log))
+            .spawn(move || {
+                if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::tmux::status_bar::apply_all_tmux_options(
+                        &session_name,
+                        &title,
+                        branch.as_deref(),
+                        sandbox.as_ref(),
+                        &options_profile,
+                    );
+                })) {
+                    tracing::error!(target: "session.store", "finalize-tmux thread panicked: {:?}", panic);
+                }
+            })
+        {
+            Ok(_handle) => {}
+            Err(e) => {
+                tracing::error!(target: "session.store",
+                    session = %instance_id_for_log,
+                    error = %e,
+                    "Failed to spawn finalize-tmux thread"
                 );
-            })) {
-                tracing::error!(target: "session.store", "finalize-tmux thread panicked: {:?}", panic);
             }
-        }) {
-        Ok(_handle) => {}
-        Err(e) => {
-            tracing::error!(target: "session.store",
-                session = %instance_id_for_log,
-                error = %e,
-                "Failed to spawn finalize-tmux thread"
-            );
         }
-    }
+        Ok(())
     }
 }
 

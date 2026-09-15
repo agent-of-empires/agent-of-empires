@@ -216,39 +216,89 @@ impl Instance {
         let expected_prior_intent_for_closure = expected_prior_intent.clone();
         let mut cleared_holder_ids: Vec<String> = Vec::new();
         let outcome = storage.update(|instances, _groups| {
-            let Some(index) = instances.iter().position(|instance| instance.id == instance_id) else {
+            let Some(index) = instances
+                .iter()
+                .position(|instance| instance.id == instance_id)
+            else {
                 return Ok(SidWrite::Failed);
             };
             if !expected.matches(&instances[index]) {
                 return Ok(SidWrite::Skipped);
             }
             if let Some(sid) = new_sid_for_closure.as_deref() {
-                let binding = self.agent_session_binding.as_ref().filter(|binding| binding.session_id == sid);
-                let source = binding.filter(|binding| binding.provenance != ConversationProvenance::Unknown)
+                let binding = self
+                    .agent_session_binding
+                    .as_ref()
+                    .filter(|binding| binding.session_id == sid);
+                let source = binding
+                    .filter(|binding| binding.provenance != ConversationProvenance::Unknown)
                     .and_then(|binding| binding.execution.as_ref());
                 let owns = |id: Option<&str>, owner: Option<&ConversationBinding>| {
                     id == Some(sid) && crate::session::capture::owner_excludes(source, owner, sid)
                 };
-                let consumed_pin = matches!(&expected_prior_intent_for_closure, ResumeIntent::Use(pinned) if pinned == sid)
-                    && binding.is_some_and(ConversationBinding::is_known)
-                    && expected.resume_binding.as_ref() == binding;
+                let consumed_pin = binding.is_some_and(|binding| {
+                    let Some(original) = expected.resume_binding.as_ref() else {
+                        return false;
+                    };
+                    if !binding.is_known() {
+                        return false;
+                    }
+                    match (&expected_prior_intent_for_closure, &self.resume_intent) {
+                        (ResumeIntent::Use(pinned), _) if pinned == sid => original == binding,
+                        (ResumeIntent::Use(pinned), ResumeIntent::Use(current)) => {
+                            current == sid
+                                && original.session_id == *pinned
+                                && original.is_known()
+                                && self.resume_binding.as_ref() == Some(binding)
+                                && binding
+                                    .execution
+                                    .as_ref()
+                                    .is_some_and(|execution| execution.agent == "hermes")
+                                && binding.execution == original.execution
+                                && binding.provenance == original.provenance
+                                && binding.transcript_path == original.transcript_path
+                        }
+                        _ => false,
+                    }
+                });
                 let refuses_transfer = |id: Option<&str>, owner: Option<&ConversationBinding>| {
-                    owns(id, owner) && (!consumed_pin || !owner.filter(|binding| binding.session_id == sid).is_some_and(ConversationBinding::is_known))
+                    owns(id, owner)
+                        && (!consumed_pin
+                            || !owner
+                                .filter(|binding| binding.session_id == sid)
+                                .is_some_and(ConversationBinding::is_known))
                 };
-                if instances.iter().filter(|peer| peer.id != instance_id).any(|peer| {
-                    refuses_transfer(peer.agent_session_id.as_deref(), peer.agent_session_binding.as_ref())
-                        || peer.prior_tool_session_ids.values().any(|parked| refuses_transfer(parked.agent_session_id.as_deref(), parked.agent_session_binding.as_ref()))
-                }) {
+                if instances
+                    .iter()
+                    .filter(|peer| peer.id != instance_id)
+                    .any(|peer| {
+                        refuses_transfer(
+                            peer.agent_session_id.as_deref(),
+                            peer.agent_session_binding.as_ref(),
+                        ) || peer.prior_tool_session_ids.values().any(|parked| {
+                            refuses_transfer(
+                                parked.agent_session_id.as_deref(),
+                                parked.agent_session_binding.as_ref(),
+                            )
+                        })
+                    })
+                {
                     return Ok(SidWrite::Skipped);
                 }
                 for peer in instances.iter_mut().filter(|peer| peer.id != instance_id) {
-                    if owns(peer.agent_session_id.as_deref(), peer.agent_session_binding.as_ref()) {
+                    if owns(
+                        peer.agent_session_id.as_deref(),
+                        peer.agent_session_binding.as_ref(),
+                    ) {
                         cleared_holder_ids.push(peer.id.clone());
                         peer.set_agent_conversation(None, None, None);
                         peer.resume_probe_failed_sid = None;
                     }
                     peer.prior_tool_session_ids.retain(|_, parked| {
-                        if owns(parked.agent_session_id.as_deref(), parked.agent_session_binding.as_ref()) {
+                        if owns(
+                            parked.agent_session_id.as_deref(),
+                            parked.agent_session_binding.as_ref(),
+                        ) {
                             parked.agent_session_id = None;
                             parked.agent_session_binding = None;
                             parked.pi_session_path = None;
@@ -258,13 +308,22 @@ impl Instance {
                 }
             }
             let instance = &mut instances[index];
-            instance.set_agent_conversation(new_sid_for_closure.clone(), self.agent_session_binding.clone(), self.pi_session_path.clone());
+            instance.set_agent_conversation(
+                new_sid_for_closure.clone(),
+                self.agent_session_binding.clone(),
+                self.pi_session_path.clone(),
+            );
             instance.active_execution = self.active_execution.clone();
-            instance.retroactive_capture_excludes.clone_from(&self.retroactive_capture_excludes);
+            instance
+                .retroactive_capture_excludes
+                .clone_from(&self.retroactive_capture_excludes);
             instance.resume_probe_failed_sid = None;
             if promote_one_shot {
                 instance.resume_intent = ResumeIntent::Default;
                 instance.resume_binding = None;
+            } else {
+                instance.resume_intent = self.resume_intent.clone();
+                instance.resume_binding = self.resume_binding.clone();
             }
             Ok(SidWrite::Applied)
         });
@@ -530,7 +589,7 @@ mod tests {
         let _ = inst.persist_session_id(
             "persist-skipped-reload",
             &ConversationState {
-                session_id: Some("stale").map(str::to_owned),
+                session_id: Some("stale".to_owned()),
                 intent: ResumeIntent::Default,
                 ..inst.conversation_state()
             },
@@ -926,7 +985,7 @@ mod tests {
         let _ = inst.persist_session_id(
             "persist-clear-resume-marker",
             &ConversationState {
-                session_id: Some("019342aa-2222-7eee-8fff-aaaabbbbcccc").map(str::to_owned),
+                session_id: Some("019342aa-2222-7eee-8fff-aaaabbbbcccc".to_owned()),
                 intent: ResumeIntent::Default,
                 ..inst.conversation_state()
             },
@@ -1028,7 +1087,7 @@ mod tests {
         let _ = inst.persist_session_id(
             "persist-skipped-reload-both",
             &ConversationState {
-                session_id: Some("stale").map(str::to_owned),
+                session_id: Some("stale".to_owned()),
                 intent: ResumeIntent::Cleared,
                 ..inst.conversation_state()
             },
@@ -1574,6 +1633,142 @@ mod tests {
         }
         #[test]
         #[serial]
+        fn hermes_canonical_publication_preserves_authority_and_rejects_false_success() {
+            if skip_if_no_tmux() {
+                return;
+            }
+            for case in [
+                "explicit",
+                "default-owner",
+                "unknown-owner",
+                "stale-generation",
+                "exact-reload",
+                "unavailable",
+            ] {
+                let temp = tempdir().unwrap();
+                let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+                let profile = "hermes-canonical-publication";
+                let mut instance = make_inst(profile, case);
+                instance.tool = "my-hermes".into();
+                instance.command = "my-hermes".into();
+                let original_binding = crate::session::ConversationBinding {
+                    session_id: "S".into(),
+                    execution: Some(crate::session::ExecutionBinding {
+                        agent: "hermes".into(),
+                        stores: vec![temp.path().join("state.db")],
+                        configuration: Vec::new(),
+                        cwd: "/tmp/x".into(),
+                        cwd_filesystem: "host".into(),
+                        filesystem: "host".into(),
+                    }),
+                    provenance: crate::session::ConversationProvenance::Asserted,
+                    transcript_path: None,
+                };
+                instance.set_agent_conversation(
+                    Some("S".into()),
+                    Some(original_binding.clone()),
+                    None,
+                );
+                if case != "default-owner" {
+                    instance.resume_intent = ResumeIntent::Use("S".into());
+                    instance.resume_binding = Some(original_binding.clone());
+                }
+                if case == "explicit" {
+                    instance.set_agent_conversation(Some("previous".into()), None, None);
+                }
+                seed_disk_row(profile, &instance);
+                let expected = instance.conversation_state();
+                let mut target_binding = original_binding;
+                target_binding.session_id = "T".into();
+                instance.set_agent_conversation(
+                    Some("T".into()),
+                    Some(target_binding.clone()),
+                    None,
+                );
+                if case != "default-owner" {
+                    instance.resume_intent = ResumeIntent::Use("T".into());
+                    instance.resume_binding = Some(target_binding.clone());
+                }
+                instance.active_execution = Some(crate::session::instance::ActiveExecution {
+                    launch_id: uuid::Uuid::new_v4().to_string(),
+                    binding: target_binding.execution.clone().unwrap(),
+                    capture: None,
+                    container: None,
+                });
+                let desired = instance.conversation_state();
+                let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+                if matches!(case, "explicit" | "default-owner" | "unknown-owner") {
+                    let mut owner = make_inst(profile, "owner");
+                    let binding = if case == "unknown-owner" {
+                        crate::session::ConversationBinding::unknown("T")
+                    } else {
+                        target_binding
+                    };
+                    owner.set_agent_conversation(Some("T".into()), Some(binding), None);
+                    storage
+                        .update(|rows, _| {
+                            rows.push(owner.clone());
+                            Ok(())
+                        })
+                        .unwrap();
+                } else if matches!(case, "stale-generation" | "exact-reload") {
+                    let mut committed = instance.clone();
+                    if case == "stale-generation" {
+                        committed.active_execution.as_mut().unwrap().launch_id =
+                            "older-generation".into();
+                    }
+                    storage
+                        .update(|rows, _| {
+                            rows[0] = committed.clone();
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+                let tmux = TmuxSession::create(&instance.id, &instance.title);
+                let profile_dir = crate::session::get_profile_dir_path(profile).unwrap();
+                let saved = temp.path().join("saved-profile");
+                if case == "unavailable" {
+                    std::fs::rename(&profile_dir, &saved).unwrap();
+                    std::fs::write(&profile_dir, b"not a directory").unwrap();
+                }
+                let result = instance.finalize_launch(tmux.name(), profile, &expected, None, true);
+                let success = matches!(case, "explicit" | "exact-reload");
+                assert_eq!(result.is_ok(), success, "{case}: {result:?}");
+                assert_eq!(
+                    captured_env(tmux.name()).as_deref(),
+                    success.then_some("T"),
+                    "{case}"
+                );
+                assert!(instance.session_id_poller.is_none(), "{case}");
+                if case == "unavailable" {
+                    assert!(desired.matches(&instance));
+                    std::fs::remove_file(&profile_dir).unwrap();
+                    std::fs::rename(&saved, &profile_dir).unwrap();
+                }
+                let rows = storage.load().unwrap();
+                let row = rows.iter().find(|row| row.id == instance.id).unwrap();
+                if success {
+                    assert!(desired.matches(row));
+                    assert_eq!(row.resume_intent, ResumeIntent::Use("T".into()));
+                } else if case == "stale-generation" {
+                    assert_eq!(
+                        row.active_execution.as_ref().unwrap().launch_id,
+                        "older-generation"
+                    );
+                } else {
+                    assert!(expected.matches(row));
+                }
+                if let Some(owner) = rows.iter().find(|row| row.id != instance.id) {
+                    assert_eq!(
+                        owner.agent_session_id.as_deref(),
+                        if success { None } else { Some("T") }
+                    );
+                }
+            }
+        }
+
+        #[test]
+        #[serial]
         fn omp_launch_without_capture_plan_publishes_tombstone_generation() {
             let temp = tempdir().unwrap();
             let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
@@ -1749,7 +1944,9 @@ mod tests {
                     routing_fingerprint: plan.routing_fingerprint.clone(),
                     container_runtime: plan.container_runtime,
                 }),
-            );
+                false,
+            )
+            .unwrap();
 
             assert_eq!(captured_env(tmux.name()).as_deref(), Some(VALID_SID));
             let metadata: crate::session::capture::OmpCaptureMetadata = serde_json::from_str(
@@ -1891,7 +2088,9 @@ mod tests {
                     ..inst.conversation_state()
                 },
                 None,
-            );
+                false,
+            )
+            .unwrap();
 
             assert_eq!(
                 captured_env(tmux.name()).as_deref(),
@@ -1921,12 +2120,14 @@ mod tests {
                 tmux.name(),
                 profile,
                 &ConversationState {
-                    session_id: Some("stale").map(str::to_owned),
+                    session_id: Some("stale".to_owned()),
                     intent: ResumeIntent::Default,
                     ..inst.conversation_state()
                 },
                 None,
-            );
+                false,
+            )
+            .unwrap();
 
             assert_eq!(inst.agent_session_id.as_deref(), Some(PEER_SID));
             assert_eq!(captured_env(tmux.name()).as_deref(), Some(PEER_SID));
@@ -1959,12 +2160,14 @@ mod tests {
                 tmux.name(),
                 profile,
                 &ConversationState {
-                    session_id: Some("stale").map(str::to_owned),
+                    session_id: Some("stale".to_owned()),
                     intent: ResumeIntent::Default,
                     ..inst.conversation_state()
                 },
                 None,
-            );
+                false,
+            )
+            .unwrap();
 
             assert!(inst.agent_session_id.is_none());
             assert!(captured_env(tmux.name()).is_none());
@@ -2001,7 +2204,9 @@ mod tests {
                     ..inst.conversation_state()
                 },
                 None,
-            );
+                false,
+            )
+            .unwrap();
 
             assert_eq!(
                 captured_env(tmux.name()).as_deref(),
@@ -2046,7 +2251,9 @@ mod tests {
                     ..inst.conversation_state()
                 },
                 None,
-            );
+                false,
+            )
+            .unwrap();
 
             assert_eq!(
                 captured_env(tmux.name()).as_deref(),
@@ -2081,7 +2288,9 @@ mod tests {
                     ..inst.conversation_state()
                 },
                 None,
-            );
+                false,
+            )
+            .unwrap();
 
             assert_eq!(inst.agent_session_id.as_deref(), Some(VALID_SID));
             assert_eq!(inst.resume_intent, ResumeIntent::Default);

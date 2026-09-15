@@ -62,6 +62,13 @@ pub(crate) fn declare_execution_aliases(
     std::fs::write(path, toml::to_string(&config).unwrap()).unwrap();
 }
 
+pub(super) fn create_hermes_database(root: &std::path::Path) -> rusqlite::Connection {
+    std::fs::create_dir_all(root).unwrap();
+    let database = rusqlite::Connection::open(root.join("state.db")).unwrap();
+    database.execute_batch("CREATE TABLE sessions(id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT, ended_at REAL, model_config TEXT, source TEXT, started_at REAL, last_activity_at REAL, session_key TEXT, cwd TEXT); CREATE TABLE messages(session_id TEXT, timestamp REAL);").unwrap();
+    database
+}
+
 pub(crate) fn publish_host_pi_transcript(
     instance_id: &str,
     sid: &str,

@@ -20,6 +20,7 @@ pub(super) struct PreparedLaunch {
     pub(super) omp_capture_plan: Option<OmpCapturePlan>,
     pub(super) launch_env: LaunchEnvironment,
     pub(super) expected_conversation: ConversationState,
+    pub(super) canonical_conversation: Option<ConversationState>,
     pub(super) expected_prior_omp_generation: Option<String>,
     pub(super) execution: Option<super::execution::NativeExecution>,
 }
@@ -315,8 +316,26 @@ fn execution_context(
     );
     if !case_insensitive_routing.is_empty() {
         script.push_str(
-            "eval \"$(set | while IFS='=' read -r aoe_key aoe_value; do\ncase \"$aoe_key\" in\n",
+            "eval \"$(unset aoe_key aoe_value || { printf 'exit 1\\n'; exit 1; }\nset | while IFS='=' read -r aoe_key aoe_value; do\ncase \"$aoe_key\" in\n",
         );
+        let mut retained = routing
+            .iter()
+            .filter(|(key, value)| {
+                value.is_some()
+                    && case_insensitive_routing
+                        .iter()
+                        .any(|name| key.eq_ignore_ascii_case(name))
+            })
+            .peekable();
+        if retained.peek().is_some() {
+            for (index, (key, _)) in retained.enumerate() {
+                if index != 0 {
+                    script.push('|');
+                }
+                script.push_str(key);
+            }
+            script.push_str(") ;;\n");
+        }
         for (index, key) in case_insensitive_routing.iter().enumerate() {
             if index != 0 {
                 script.push('|');
@@ -333,15 +352,18 @@ fn execution_context(
             }
         }
         // Only fixed identifier patterns can emit an unset command.
-        script.push_str(") printf 'unset %s\\n' \"$aoe_key\";;\nesac\ndone)\"\n");
+        script
+            .push_str(") printf 'unset %s || exit 1\\n' \"$aoe_key\";;\nesac\ndone)\" || exit 1\n");
     }
     for (key, value) in routing {
         match value {
-            Some(value) => script.push_str(&format!(
-                "export {key}={}\n",
-                crate::session::environment::shell_escape_script_word(value)
-            )),
-            None => script.push_str(&format!("unset {key}\n")),
+            Some(value) => {
+                let value = crate::session::environment::shell_escape_script_word(value);
+                script.push_str(&format!(
+                    "if [ \"${{{key}+x}}\" = x ] && [ \"${key}\" = {value} ]; then\nexport {key} || exit 1\nelse\nexport {key}={value} || exit 1\nfi\n"
+                ));
+            }
+            None => script.push_str(&format!("unset {key} || exit 1\n")),
         }
     }
     script
@@ -461,6 +483,30 @@ impl Instance {
                 Err(error) if managed => return Err(error),
                 Err(_) => None,
             };
+            let prior_canonical = if let Some(target) = execution
+                .as_ref()
+                .and_then(|execution| execution.resolved_target_session_id.as_ref())
+            {
+                let prior = self.conversation_state();
+                let mut binding = self
+                    .conversation_target()
+                    .and_then(|(_, binding, _)| binding)
+                    .context("resolved Hermes target has no validated binding")?
+                    .clone();
+                binding.session_id.clone_from(target);
+                if matches!(self.resume_intent, ResumeIntent::Use(_)) {
+                    self.resume_intent = ResumeIntent::Use(target.clone());
+                    self.resume_binding = Some(binding.clone());
+                }
+                self.set_agent_conversation(
+                    Some(target.clone()),
+                    Some(binding),
+                    self.pi_session_path.clone(),
+                );
+                Some(prior)
+            } else {
+                None
+            };
             let parts = self.build_launch_command(execution.as_ref())?;
             if managed || parts.1 {
                 let execution = execution
@@ -468,21 +514,32 @@ impl Instance {
                     .context("conversation execution adapter is unavailable")?;
                 self.validate_conversation_target(
                     &execution.binding,
-                    execution.target_session_id.as_deref(),
+                    execution
+                        .resolved_target_session_id
+                        .as_deref()
+                        .or(execution.target_session_id.as_deref()),
                 )?;
             }
-            Ok((parts, execution))
+            let canonical_conversation = prior_canonical.map(|prior| {
+                let canonical = self.conversation_state();
+                self.adopt_conversation_state(prior);
+                canonical
+            });
+            Ok((parts, execution, canonical_conversation))
         })();
-        let ((command, is_existing, omp_capture_plan, mut launch_env), mut execution) =
-            match preparation {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    self.adopt_conversation_state(expected_conversation);
-                    self.resume_probe_failed_sid = prior_probe_failed_sid;
-                    self.omp_capture_generation = expected_prior_omp_generation;
-                    return Err(error);
-                }
-            };
+        let (
+            (command, is_existing, omp_capture_plan, mut launch_env),
+            mut execution,
+            canonical_conversation,
+        ) = match preparation {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.adopt_conversation_state(expected_conversation);
+                self.resume_probe_failed_sid = prior_probe_failed_sid;
+                self.omp_capture_generation = expected_prior_omp_generation;
+                return Err(error);
+            }
+        };
         if let Some(execution) = execution.as_mut() {
             launch_env.pane = std::mem::take(&mut execution.inputs.pane_env);
             launch_env.container = execution
@@ -498,6 +555,7 @@ impl Instance {
             omp_capture_plan,
             launch_env,
             expected_conversation,
+            canonical_conversation,
             expected_prior_omp_generation,
             execution,
         })
@@ -1064,7 +1122,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn prepared_hermes_sandbox_retains_post_launch_capture() {
+    fn prepared_hermes_sandbox_keeps_capture_and_coherent_resume_projection() {
         let temp = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
         let project = temp.path().join("project");
@@ -1107,10 +1165,8 @@ mod tests {
             .unwrap()
             .host_path
             .clone();
-        std::fs::create_dir_all(&root).unwrap();
-        let database =
-            rusqlite::Connection::open(std::path::Path::new(&root).join("state.db")).unwrap();
-        database.execute_batch("CREATE TABLE sessions(id TEXT, source TEXT, started_at REAL, ended_at REAL, cwd TEXT, git_repo_root TEXT); INSERT INTO sessions VALUES ('stale', 'cli', 1000, NULL, '/workspace/project', NULL), ('foreign', 'cli', 4000, NULL, '/other', NULL), ('hermes_fresh', 'cli', 3000, NULL, '/workspace/project', NULL);").unwrap();
+        let database = super::test_helpers::create_hermes_database(std::path::Path::new(&root));
+        database.execute_batch("ALTER TABLE sessions ADD COLUMN git_repo_root TEXT; INSERT INTO sessions(id,source,started_at,cwd,parent_session_id,end_reason) VALUES ('stale','cli',1000,'/workspace/project',NULL,'compression'),('foreign','cli',4000,'/other',NULL,NULL),('hermes_fresh','cli',3000,'/workspace/project','stale',NULL); INSERT INTO messages VALUES ('hermes_fresh',3000);").unwrap();
         let execution = inst.resolve_native_execution(None).unwrap();
         let binding = execution.binding.clone();
         inst.active_execution = Some(ActiveExecution {
@@ -1129,6 +1185,102 @@ mod tests {
             Some(binding),
         );
         assert_eq!(poll().as_deref(), Some("hermes_fresh"));
+        let execution = inst
+            .resolve_native_execution(Some(("stale", None, false)))
+            .unwrap();
+        assert_eq!(
+            execution.resolved_target_session_id.as_deref(),
+            Some("hermes_fresh")
+        );
+        let shadow = temp.path().join("shadow");
+        std::fs::write(&shadow, b"").unwrap();
+        for name in ["state.db", "state.db-wal"] {
+            let mut volumes = config.volumes.clone();
+            volumes.push(crate::containers::VolumeMount {
+                host_path: shadow.display().to_string(),
+                container_path: format!("/root/.hermes/{name}"),
+                read_only: false,
+            });
+            let _shadow_transport = super::test_helpers::install_container_transport(
+                temp.path(),
+                "hermes-capture",
+                &volumes,
+            );
+            assert!(
+                inst.resolve_native_execution(Some(("stale", None, false)))
+                    .is_err(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn hermes_continuation_is_staged_without_changing_caller() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _path = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "my-hermes",
+            "#!/bin/sh\nprintf '%s\n' \"$@\"\n",
+        );
+        let profile = "hermes-staged-continuation";
+        super::test_helpers::declare_execution_aliases(
+            profile,
+            &[("my-hermes", "hermes")],
+            temp.path(),
+        );
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let mut instance = Instance::new("hermes-staged", project.to_str().unwrap());
+        instance.tool = "my-hermes".into();
+        instance.command = "my-hermes".into();
+        instance.source_profile = profile.into();
+        instance.pending_host_env = vec![
+            ("HOME".into(), temp.path().display().to_string()),
+            (
+                "HERMES_MANAGED_DIR".into(),
+                temp.path().join("managed").display().to_string(),
+            ),
+            ("TERMINAL_ENV".into(), "local".into()),
+            ("TERMINAL_CWD".into(), project.display().to_string()),
+        ];
+        let binding = instance
+            .asserted_resume_binding("hermes-root", None)
+            .unwrap();
+        instance.set_agent_conversation(Some("hermes-root".into()), Some(binding.clone()), None);
+        instance.resume_intent = ResumeIntent::Use("hermes-root".into());
+        instance.resume_binding = Some(binding);
+        let database = super::test_helpers::create_hermes_database(&temp.path().join(".hermes"));
+        database.execute_batch("INSERT INTO sessions(id, parent_session_id, end_reason, started_at) VALUES ('hermes-root', NULL, 'compression', 1), ('hermes-compressed', 'hermes-root', NULL, 2), ('hermes-continuation', 'hermes-compressed', NULL, 3); INSERT INTO messages VALUES ('hermes-continuation', 4);").unwrap();
+        database
+            .execute("UPDATE sessions SET cwd = ?", [project.to_str().unwrap()])
+            .unwrap();
+        let expected = instance.conversation_state();
+        let prepared = instance.prepare_launch_command(expected.clone()).unwrap();
+        assert!(expected.matches(&instance));
+        let prepared = instance
+            .refresh_prepared_prime_launch_after_pane_stop(prepared)
+            .unwrap();
+        assert!(expected.matches(&instance));
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", prepared.command.as_deref().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "--profile\ndefault\n--resume\nhermes-continuation\n"
+        );
+        std::fs::remove_dir(&project).unwrap();
+        assert!(instance
+            .spawn_prepared_launch(None, profile, prepared)
+            .is_err());
+        assert!(expected.matches(&instance));
     }
 
     #[test]
@@ -1209,6 +1361,12 @@ mod tests {
                     continue;
                 }
             };
+            if agent == "hermes" {
+                let database = super::test_helpers::create_hermes_database(&root);
+                database
+                    .execute("INSERT INTO sessions(id) VALUES (?)", [sid])
+                    .unwrap();
+            }
             inst.resume_intent = ResumeIntent::Use(sid.into());
             inst.resume_binding = Some(binding);
             let mut redirected = inst.clone();
@@ -1241,6 +1399,48 @@ mod tests {
                 format!("--resume\n{sid}\nnamespace:{}||||session\n", root.display())
             };
             assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+            {
+                let _shell = EnvGuard::set(&[("SHELL", "/bin/fish")]);
+                let prepared = inst
+                    .prepare_launch_command(inst.conversation_state())
+                    .unwrap();
+                let startup = temp.path().join("readonly-startup");
+                let key = if agent == "hermes" {
+                    "TERMINAL_ENV"
+                } else {
+                    "vIbE_sEsSiOn_LoGgInG__sAvE_dIr"
+                };
+                std::fs::write(&startup, format!("export {key}=/foreign\nreadonly {key}\n"))
+                    .unwrap();
+                let output = std::process::Command::new("/bin/sh")
+                    .args(["-c", prepared.command.as_deref().unwrap()])
+                    .env("BASH_ENV", &startup)
+                    .output()
+                    .unwrap();
+                if output.status.success() || !output.stdout.is_empty() {
+                    failures.push(format!(
+                        "{agent}: readonly routing reached native command: {}",
+                        String::from_utf8_lossy(&output.stdout)
+                    ));
+                }
+                let (key, value) = if agent == "hermes" {
+                    ("TERMINAL_ENV", "local")
+                } else {
+                    ("vibe_session_logging__session_prefix", "session")
+                };
+                std::fs::write(&startup, format!("readonly {key}={value}\n")).unwrap();
+                let output = std::process::Command::new("/bin/sh")
+                    .args(["-c", prepared.command.as_deref().unwrap()])
+                    .env("BASH_ENV", &startup)
+                    .output()
+                    .unwrap();
+                if !output.status.success() || String::from_utf8_lossy(&output.stdout) != expected {
+                    failures.push(format!(
+                        "{agent}: matching readonly routing was not exported: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
+            }
             if agent == "hermes" {
                 std::fs::write(
                     root.join("config.yaml"),

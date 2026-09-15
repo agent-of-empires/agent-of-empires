@@ -159,6 +159,7 @@ pub(super) struct NativeExecution {
     pub(super) pi_transcript_path: Option<String>,
     pub(super) namespace_arguments: Vec<String>,
     pub(super) target_session_id: Option<String>,
+    pub(super) resolved_target_session_id: Option<String>,
     pub(super) pi_pinnable: bool,
     pub(super) opencode_preassign: bool,
 }
@@ -235,6 +236,222 @@ impl NativeLaunchInputs {
         );
         Ok(())
     }
+    fn validate_hermes_stored_cwd(&self, value: Option<&str>, setup: bool) -> Result<()> {
+        let Some(value) = value.filter(|value| !value.is_empty()) else {
+            return Ok(());
+        };
+        let value = if setup {
+            value
+        } else {
+            value.trim_matches(|c: char| c.is_whitespace() || matches!(c, '\u{1c}'..='\u{1f}'))
+        };
+        let path = if setup && value.starts_with('~') {
+            anyhow::ensure!(
+                value == "~" || value.starts_with("~/"),
+                "Hermes stored cwd has an unresolved user home"
+            );
+            PathBuf::from(
+                self.environment
+                    .get("HOME")
+                    .context("Hermes HOME is unavailable")?,
+            )
+            .join(value.strip_prefix("~/").unwrap_or(""))
+        } else {
+            PathBuf::from(value)
+        };
+        anyhow::ensure!(
+            self.canonical_path(&path)? == self.cwd,
+            "Hermes stored cwd differs from the prepared launch context"
+        );
+        Ok(())
+    }
+
+    fn resolve_hermes_target(&self, root: &std::path::Path, sid: &str) -> Result<String> {
+        anyhow::ensure!(
+            !sid.eq_ignore_ascii_case("latest"),
+            "Hermes latest is not an exact resume identity"
+        );
+        let native = self.canonical_path(root)?;
+        let location = self.physical_location(&native);
+        anyhow::ensure!(
+            location.filesystem == "host",
+            "Hermes resume requires a local database-directory projection"
+        );
+        let directory = location.path.canonicalize()?;
+        anyhow::ensure!(
+            directory == location.path && std::fs::metadata(&directory)?.is_dir(),
+            "Hermes database directory is unavailable"
+        );
+        for name in [
+            "state.db",
+            "state.db-wal",
+            "state.db-shm",
+            "state.db-journal",
+        ] {
+            let path = native.join(name);
+            let canonical = self.canonical_path(&path)?;
+            anyhow::ensure!(
+                canonical == path,
+                "Hermes SQLite files must not be redirected by symlinks"
+            );
+            let projected = self.physical_location(&canonical);
+            anyhow::ensure!(
+                projected.filesystem == "host" && projected.path == directory.join(name),
+                "Hermes SQLite directory and sidecars have inconsistent projections"
+            );
+            match std::fs::symlink_metadata(&projected.path) {
+                Ok(metadata) => {
+                    anyhow::ensure!(
+                        metadata.file_type().is_file(),
+                        "Hermes SQLite file is not a regular file"
+                    );
+                    std::fs::File::open(&projected.path)?;
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound && name != "state.db" => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let mut database = rusqlite::Connection::open_with_flags(
+            directory.join("state.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        database.busy_timeout(std::time::Duration::from_millis(100))?;
+        let transaction = database.transaction()?;
+        let target = self.hermes_resume_tip(&transaction, sid)?;
+        anyhow::ensure!(
+            !target.eq_ignore_ascii_case("latest"),
+            "Hermes resolved target is a reserved resume selector"
+        );
+        anyhow::ensure!(
+            self.hermes_resume_tip(&transaction, &target)? == target,
+            "Hermes resume target redirects again when emitted"
+        );
+        transaction.commit()?;
+        Ok(target)
+    }
+
+    fn hermes_resume_tip(&self, database: &rusqlite::Connection, sid: &str) -> Result<String> {
+        use rusqlite::OptionalExtension;
+        fn exact(database: &rusqlite::Connection, sid: &str) -> Result<()> {
+            anyhow::ensure!(
+                crate::session::capture::is_valid_session_id(sid),
+                "Hermes session identity is invalid"
+            );
+            let mut query =
+                database.prepare_cached("SELECT id FROM sessions WHERE id = ? LIMIT 2")?;
+            let mut rows = query.query([sid])?;
+            let row = rows
+                .next()?
+                .context("Hermes exact session identity does not exist")?;
+            anyhow::ensure!(
+                row.get_ref(0)?.as_str()? == sid && rows.next()?.is_none(),
+                "Hermes exact session identity is ambiguous"
+            );
+            Ok(())
+        }
+        fn edge(database: &rusqlite::Connection, child: &str) -> Result<()> {
+            let boundary: bool = database.prepare_cached(r#"
+                SELECT json_extract(CASE WHEN json_valid(child.model_config) THEN child.model_config ELSE json_object() END, '$._branched_from') IS NOT NULL
+                    OR json_extract(CASE WHEN json_valid(child.model_config) THEN child.model_config ELSE json_object() END, '$._reset_from') IS NOT NULL
+                    OR EXISTS (SELECT 1 FROM sessions parent WHERE parent.id = child.parent_session_id
+                        AND parent.end_reason = 'branched' AND child.started_at >= parent.ended_at)
+                    OR EXISTS (SELECT 1 FROM sessions parent WHERE parent.id = child.parent_session_id
+                        AND parent.end_reason IN ('session_reset','session_switch','idle','daily','suspended','resume_pending_expired')
+                        AND child.session_key IS NOT NULL AND child.session_key != '' AND child.session_key = parent.session_key)
+                FROM sessions child WHERE child.id = ?
+            "#)?.query_row([child], |row| row.get(0))?;
+            anyhow::ensure!(
+                !boundary,
+                "Hermes selected lineage crosses a separate conversation boundary"
+            );
+            Ok(())
+        }
+        let mut compression = database.prepare_cached(r#"
+            SELECT child.id FROM sessions parent JOIN sessions child ON child.parent_session_id = parent.id
+            WHERE parent.id = ? AND parent.end_reason = 'compression'
+                AND json_extract(CASE WHEN json_valid(child.model_config) THEN child.model_config ELSE json_object() END, '$._branched_from') IS NULL
+                AND json_extract(CASE WHEN json_valid(child.model_config) THEN child.model_config ELSE json_object() END, '$._delegate_from') IS NULL
+                AND COALESCE(child.source, '') != 'tool'
+            ORDER BY CASE WHEN child.end_reason = 'compression' THEN 0 WHEN child.ended_at IS NULL THEN 1 ELSE 2 END,
+                COALESCE((SELECT MAX(activity.v) FROM (SELECT child.last_activity_at AS v UNION ALL SELECT
+                    (SELECT MAX(message.timestamp) FROM messages message WHERE message.session_id = child.id)) activity), child.started_at) DESC,
+                child.started_at DESC, child.id DESC LIMIT 1
+        "#)?;
+        let mut continuation = database.prepare_cached(r#"
+            SELECT child.id FROM sessions child WHERE child.parent_session_id = ?
+                AND json_extract(CASE WHEN json_valid(child.model_config) THEN child.model_config ELSE json_object() END, '$._branched_from') IS NULL
+                AND json_extract(CASE WHEN json_valid(child.model_config) THEN child.model_config ELSE json_object() END, '$._delegate_from') IS NULL
+                AND json_extract(CASE WHEN json_valid(child.model_config) THEN child.model_config ELSE json_object() END, '$._reset_from') IS NULL
+                AND NOT EXISTS (SELECT 1 FROM sessions parent WHERE parent.id = child.parent_session_id
+                    AND parent.end_reason IN ('session_reset','session_switch','idle','daily','suspended','resume_pending_expired')
+                    AND child.session_key IS NOT NULL AND child.session_key != '' AND child.session_key = parent.session_key)
+                AND COALESCE(child.source, '') != 'tool'
+            ORDER BY child.started_at DESC, child.id DESC LIMIT 1
+        "#)?;
+        let mut current = sid.to_owned();
+        let mut seen = std::collections::HashSet::new();
+        for depth in 0..=100 {
+            anyhow::ensure!(
+                !seen.contains(&current),
+                "Hermes compression lineage contains a cycle"
+            );
+            exact(database, &current)?;
+            let next: Option<String> = compression
+                .query_row([&current], |row| row.get(0))
+                .optional()?;
+            let Some(next) = next else {
+                break;
+            };
+            anyhow::ensure!(
+                depth < 100,
+                "Hermes compression lineage exceeds the native traversal bound"
+            );
+            exact(database, &next)?;
+            edge(database, &next)?;
+            seen.insert(current);
+            current = next;
+        }
+        let mut cwd = database.prepare_cached("SELECT cwd FROM sessions WHERE id = ?")?;
+        let main_cwd: Option<String> = cwd.query_row([&current], |row| row.get(0))?;
+        self.validate_hermes_stored_cwd(main_cwd.as_deref(), false)?;
+        // R repeats C, which is already exhausted in this read transaction.
+        let compression_tip = current.clone();
+        seen.clear();
+        let mut best = None;
+        let mut messages =
+            database.prepare_cached("SELECT 1 FROM messages WHERE session_id = ? LIMIT 1")?;
+        for depth in 0..32 {
+            anyhow::ensure!(
+                !seen.contains(&current),
+                "Hermes continuation lineage contains a cycle"
+            );
+            if messages.exists([&current])? {
+                best = Some(current.clone());
+            }
+            let next: Option<String> = continuation
+                .query_row([&current], |row| row.get(0))
+                .optional()?;
+            let Some(next) = next else {
+                break;
+            };
+            anyhow::ensure!(
+                depth < 31,
+                "Hermes continuation lineage exceeds the native traversal bound"
+            );
+            exact(database, &next)?;
+            edge(database, &next)?;
+            seen.insert(current);
+            current = next;
+        }
+        let target = best.unwrap_or(compression_tip);
+        let setup_cwd: Option<String> = cwd.query_row([&target], |row| row.get(0))?;
+        self.validate_hermes_stored_cwd(setup_cwd.as_deref(), true)?;
+        Ok(target)
+    }
+
     fn validate_vibe_namespace(
         &self,
         root: &std::path::Path,
@@ -900,6 +1117,7 @@ impl Instance {
         let session_dir = self.managed_user_argv(agent)?;
         let direct_capture = self.launch_invokes_resolved_agent_directly(agent);
         let target_session_id = target.map(|(sid, _, _)| sid.to_owned());
+        let mut resolved_target_session_id = None;
         let mut inputs = self.native_launch_inputs(agent, &config)?;
         anyhow::ensure!(
             inputs.container.as_ref().is_none_or(|container| {
@@ -1137,6 +1355,10 @@ impl Instance {
                     None => bail!("Hermes managed resume requires an explicit configuration-directory declaration"),
                 };
                 inputs.validate_hermes_namespace(&root)?;
+                if let Some((sid, _, _)) = target {
+                    let resolved = inputs.resolve_hermes_target(&root, sid)?;
+                    resolved_target_session_id = (resolved != sid).then_some(resolved);
+                }
                 routing.push(("HERMES_HOME".into(), Some(root.to_str().context("Hermes home is not UTF-8")?.into())));
                 for key in ["HERMES_MANAGED_DIR", "TERMINAL_ENV", "TERMINAL_CWD"] {
                     routing.push((key.into(), value(key)));
@@ -1447,6 +1669,7 @@ impl Instance {
             pi_transcript_path,
             namespace_arguments,
             target_session_id,
+            resolved_target_session_id,
             pi_pinnable,
             opencode_preassign,
         })
@@ -1868,6 +2091,142 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hermes_fixture() -> (tempfile::TempDir, NativeLaunchInputs, rusqlite::Connection) {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().canonicalize().unwrap();
+        let inputs = NativeLaunchInputs {
+            launch_id: uuid::Uuid::new_v4().to_string(),
+            environment: std::collections::HashMap::from([(
+                "HOME".into(),
+                cwd.display().to_string(),
+            )]),
+            cwd,
+            profile: "default".into(),
+            container: None,
+            docker_env: None,
+            pane_env: Vec::new(),
+            identity_extension: None,
+        };
+        let database = crate::session::instance::test_helpers::create_hermes_database(root.path());
+        (root, inputs, database)
+    }
+
+    #[test]
+    fn hermes_native_lineage_preserves_selection_and_conversation_boundaries() {
+        for (name, requested, sql, expected) in [
+            ("compression priority", "S", "INSERT INTO sessions(id,parent_session_id,end_reason,started_at) VALUES ('S',NULL,'compression',1),('A','S','compression',2),('B','S',NULL,4),('T','A',NULL,3),('foreign',NULL,NULL,100); INSERT INTO messages VALUES ('B',99),('T',3),('foreign',100);", Some("T")),
+            ("message recency", "S", "INSERT INTO sessions(id,parent_session_id,end_reason,started_at,last_activity_at) VALUES ('S',NULL,'compression',1,NULL),('A','S',NULL,2,3),('B','S',NULL,4,5); INSERT INTO messages VALUES ('A',10);", Some("A")),
+            ("compression tie", "S", "INSERT INTO sessions(id,parent_session_id,end_reason,started_at) VALUES ('S',NULL,'compression',1),('A','S',NULL,2),('B','S',NULL,2); INSERT INTO messages VALUES ('A',2),('B',2);", Some("B")),
+            ("continuation tie", "S", "INSERT INTO sessions(id,parent_session_id,started_at) VALUES ('S',NULL,1),('A','S',2),('B','S',2); INSERT INTO messages VALUES ('A',2),('B',2);", Some("B")),
+            ("excluded native children", "S", r#"INSERT INTO sessions(id,parent_session_id,started_at,model_config,source) VALUES ('S',NULL,0,NULL,NULL),('T','S',1,NULL,NULL),('branch','S',5,'{"_branched_from":false}',NULL),('delegate','S',6,'{"_delegate_from":false}',NULL),('reset','S',7,'{"_reset_from":false}',NULL),('tool','S',8,NULL,'tool'); INSERT INTO messages SELECT id,started_at FROM sessions;"#, Some("T")),
+            ("empty newest path", "S", "INSERT INTO sessions(id,parent_session_id,started_at) VALUES ('S',NULL,1),('A','S',2),('B','S',3); INSERT INTO messages VALUES ('S',1),('A',2);", Some("S")),
+            ("selected reset under compression", "S", r#"INSERT INTO sessions(id,parent_session_id,end_reason,started_at,model_config) VALUES ('S',NULL,'compression',1,NULL),('A','S',NULL,2,NULL),('T','S',NULL,3,'{"_reset_from":false}'); INSERT INTO messages VALUES ('A',2),('T',3);"#, None),
+            ("historical branch equality", "S", "INSERT INTO sessions(id,parent_session_id,end_reason,ended_at,started_at) VALUES ('S',NULL,'branched',2,0),('A','S',NULL,NULL,1),('T','S',NULL,NULL,2); INSERT INTO messages VALUES ('A',1),('T',2);", None),
+            ("historical branch NULL", "S", "INSERT INTO sessions(id,parent_session_id,end_reason,started_at) VALUES ('S',NULL,'branched',1),('T','S',NULL,2); INSERT INTO messages VALUES ('T',2);", Some("T")),
+            ("reset different key", "S", "INSERT INTO sessions(id,parent_session_id,end_reason,started_at,session_key) VALUES ('S',NULL,'session_reset',1,'one'),('same','S',NULL,4,'one'),('T','S',NULL,3,'two'); INSERT INTO messages VALUES ('same',4),('T',3);", Some("T")),
+            ("reset empty key", "S", "INSERT INTO sessions(id,parent_session_id,end_reason,started_at,session_key) VALUES ('S',NULL,'session_reset',1,''),('T','S',NULL,2,''); INSERT INTO messages VALUES ('T',2);", Some("T")),
+            ("explicit boundary root", "T", r#"INSERT INTO sessions(id,parent_session_id,end_reason,ended_at,started_at,model_config) VALUES ('S',NULL,'branched',1,0,NULL),('T','S','compression',NULL,2,'{"_branched_from":false,"_reset_from":false}'),('U','T',NULL,NULL,3,NULL); INSERT INTO messages VALUES ('U',3);"#, Some("U")),
+            ("nonfixed emitted target", "S", "INSERT INTO sessions(id,parent_session_id,end_reason,started_at) VALUES ('S',NULL,NULL,0),('A','S','compression',1),('B','A',NULL,2),('C','A',NULL,3); INSERT INTO messages VALUES ('A',1),('B',10);", None),
+            ("malformed optional model JSON", "S", "INSERT INTO sessions(id,parent_session_id,started_at,model_config) VALUES ('S',NULL,1,NULL),('T','S',2,'{bad'); INSERT INTO messages VALUES ('T',2);", Some("T")),
+        ] {
+            let (root, inputs, database) = hermes_fixture();
+            database.execute_batch(sql).unwrap();
+            let result = inputs.resolve_hermes_target(root.path(), requested);
+            match expected {
+                Some(expected) => assert_eq!(result.unwrap_or_else(|error| panic!("{name}: {error:#}")), expected, "{name}"),
+                None => assert!(result.is_err(), "{name}: {result:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn hermes_native_lineage_rejects_cycles_and_unexamined_remainders() {
+        for (compression, edges, accepted) in [
+            (true, 100, true),
+            (true, 101, false),
+            (false, 31, true),
+            (false, 32, false),
+        ] {
+            let (root, inputs, database) = hermes_fixture();
+            for index in 0..=edges {
+                database.execute("INSERT INTO sessions(id,parent_session_id,end_reason,started_at) VALUES (?,?,?,?)", rusqlite::params![format!("node_{index}"), (index > 0).then(|| format!("node_{}", index - 1)), (compression && index < edges).then_some("compression"), index]).unwrap();
+            }
+            let target = format!("node_{edges}");
+            database
+                .execute("INSERT INTO messages VALUES (?,1)", [&target])
+                .unwrap();
+            let result = inputs.resolve_hermes_target(root.path(), "node_0");
+            if accepted {
+                assert_eq!(result.unwrap(), target);
+            } else {
+                assert!(result.is_err());
+            }
+        }
+        for reason in [None, Some("compression")] {
+            let (root, inputs, database) = hermes_fixture();
+            database.execute("INSERT INTO sessions(id,parent_session_id,end_reason) VALUES ('S','T',?),('T','S',?)", [reason,reason]).unwrap();
+            assert!(inputs.resolve_hermes_target(root.path(), "S").is_err());
+        }
+    }
+
+    #[test]
+    fn hermes_stored_cwd_uses_both_native_interpretations() {
+        for (node, value, accepted) in [
+            ("C", " \n", true),
+            ("T", " \n", false),
+            ("C", "auto", false),
+            ("C", "~", false),
+            ("T", "~other", false),
+            ("C", "{cwd}/missing", false),
+            ("C", "\u{1c} {cwd}\r\n ", true),
+            ("T", " {cwd} ", false),
+            ("T", ".", true),
+        ] {
+            let (root, inputs, database) = hermes_fixture();
+            database.execute_batch("INSERT INTO sessions(id,parent_session_id,end_reason) VALUES ('S',NULL,'compression'),('C','S',NULL),('T','C',NULL); INSERT INTO messages VALUES ('T',1);").unwrap();
+            let value = value.replace("{cwd}", inputs.cwd.to_str().unwrap());
+            database
+                .execute("UPDATE sessions SET cwd=? WHERE id=?", [&value, node])
+                .unwrap();
+            let result = inputs.resolve_hermes_target(root.path(), "S");
+            if accepted {
+                assert_eq!(result.unwrap(), "T");
+            } else {
+                assert!(result.is_err(), "{node}: {value:?}");
+            }
+        }
+        let (root, inputs, database) = hermes_fixture();
+        std::os::unix::fs::symlink(&inputs.cwd, inputs.cwd.join("~")).unwrap();
+        database.execute_batch("INSERT INTO sessions(id,cwd) VALUES ('T','~'); INSERT INTO messages VALUES ('T',1);").unwrap();
+        assert_eq!(inputs.resolve_hermes_target(root.path(), "T").unwrap(), "T");
+    }
+
+    #[test]
+    fn hermes_resume_requires_exact_unique_ids_and_readable_schema() {
+        let (root, inputs, database) = hermes_fixture();
+        database.execute_batch("INSERT INTO sessions(id,parent_session_id,end_reason) VALUES ('S',NULL,'compression'),('latest','S',NULL); INSERT INTO messages VALUES ('latest',1);").unwrap();
+        assert!(inputs.resolve_hermes_target(root.path(), "latest").is_err());
+        assert!(inputs.resolve_hermes_target(root.path(), "S").is_err());
+        assert!(inputs
+            .resolve_hermes_target(root.path(), "missing-title")
+            .is_err());
+        database.execute_batch("UPDATE sessions SET id='T' WHERE id='latest'; UPDATE messages SET session_id='T'; CREATE TABLE copied AS SELECT * FROM sessions; DROP TABLE sessions; ALTER TABLE copied RENAME TO sessions; INSERT INTO sessions SELECT * FROM sessions WHERE id='T';").unwrap();
+        assert!(inputs.resolve_hermes_target(root.path(), "S").is_err());
+        database.execute_batch("DELETE FROM sessions WHERE rowid=(SELECT MAX(rowid) FROM sessions); ALTER TABLE sessions DROP COLUMN cwd;").unwrap();
+        assert!(inputs.resolve_hermes_target(root.path(), "S").is_err());
+    }
+
+    #[test]
+    fn hermes_resume_reads_live_wal_and_refuses_redirected_sidecars() {
+        let (root, inputs, database) = hermes_fixture();
+        database.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; INSERT INTO sessions(id,parent_session_id,end_reason) VALUES ('S',NULL,'compression'),('T','S',NULL); INSERT INTO messages VALUES ('T',1);").unwrap();
+        assert_eq!(inputs.resolve_hermes_target(root.path(), "S").unwrap(), "T");
+        let foreign = root.path().join("foreign");
+        std::fs::write(&foreign, b"").unwrap();
+        std::os::unix::fs::symlink(&foreign, root.path().join("state.db-journal")).unwrap();
+        assert!(inputs.resolve_hermes_target(root.path(), "S").is_err());
+    }
 
     #[test]
     fn missing_store_keeps_physical_identity_after_creation() {
