@@ -604,8 +604,9 @@ pub(crate) fn current_hook_timeout() -> Option<Duration> {
 
 /// RAII guard for the per-thread on_launch hook deadline. Restores the
 /// previous value on drop, so nested scopes behave LIFO.
-// ponytail: save/restore covers LIFO nesting only; production installs a
-// single scope (recovery), so out-of-order drops never occur.
+// Save/restore covers LIFO nesting only; production installs at most one scope
+// per thread (recovery, or a bounded `perform_restart`), so out-of-order drops
+// never occur.
 pub struct HookTimeoutScope {
     previous: Option<Duration>,
 }

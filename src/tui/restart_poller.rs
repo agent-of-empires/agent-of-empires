@@ -89,6 +89,8 @@ mod tests {
             instance,
             size: None,
             wake_message: String::new(),
+            skip_on_launch: false,
+            bound_hooks: true,
             discard_sandbox_container: false,
         });
 
