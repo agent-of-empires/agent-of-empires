@@ -1121,6 +1121,9 @@ struct SeedGuard<'a> {
     pipe: Option<&'a UnixStream>,
 }
 
+/// Grid generation and received chunk sequence, sampled for one capture.
+type SeedFenceSample = (Option<u64>, Option<u64>);
+
 struct SeedInstallFence<'a> {
     snapshot: Option<&'a Mutex<()>>,
     socket: Option<&'a Mutex<Option<UnixStream>>>,
@@ -1150,14 +1153,42 @@ fn refresh_commits_geometry(result: VtRefreshResult) -> bool {
 fn seed_parser(
     target: &str,
     sink: SeedSink<'_>,
-    since: Option<u64>,
+    guarded: bool,
     size: (u16, u16),
     deadline: &crate::tmux::TmuxCommandDeadline,
-    guard: SeedGuard<'_>,
+    chunk: Option<(&AtomicU64, &AtomicU64)>,
     fence: SeedInstallFence<'_>,
 ) -> VtRefreshResult {
-    let Some(stream) = capture_seed_stream(target, size, deadline) else {
+    seed_parser_with(sink, guarded, size, chunk, fence, |sample| {
+        capture_seed_stream(target, size, deadline, sample)
+    })
+}
+
+/// Capture through `capture` and install behind the fence. `guarded` enables
+/// the generation guard; `chunk` is the reader's received/settled pair.
+fn seed_parser_with(
+    sink: SeedSink<'_>,
+    guarded: bool,
+    size: (u16, u16),
+    chunk: Option<(&AtomicU64, &AtomicU64)>,
+    fence: SeedInstallFence<'_>,
+    capture: impl FnOnce(&mut dyn FnMut() -> SeedFenceSample) -> Option<(Vec<u8>, SeedFenceSample)>,
+) -> VtRefreshResult {
+    let grid_gen = sink.grid_gen;
+    let mut sample = || -> SeedFenceSample {
+        (
+            guarded.then(|| grid_gen.load(Ordering::Relaxed)),
+            chunk.map(|(received, _)| received.load(Ordering::Acquire)),
+        )
+    };
+    let Some((stream, (since, expected))) = capture(&mut sample) else {
         return VtRefreshResult::Failed;
+    };
+    let guard = SeedGuard {
+        chunk: chunk
+            .zip(expected)
+            .map(|((received, settled), expected)| (received, settled, expected)),
+        pipe: None,
     };
     install_seeded_parser(sink, since, &stream, size, guard, fence)
 }
@@ -1209,17 +1240,18 @@ fn install_seeded_parser(
     )
 }
 /// Capture the pane and weave its modes and cursor into one replayable byte
-/// stream, or `None` when the pane could not be captured. Split from the swap
-/// so a caller can bracket the (forking, multi-millisecond) capture with the
-/// generation check `swap_seeded_parser` needs.
-fn capture_seed_stream(
+/// stream, or `None` when the pane could not be captured. `sample` runs
+/// immediately before the capture fork, and its value is returned with the
+/// snapshot it fences.
+fn capture_seed_stream<S>(
     target: &str,
     size: (u16, u16),
     deadline: &crate::tmux::TmuxCommandDeadline,
-) -> Option<Vec<u8>> {
+    sample: impl FnMut() -> S,
+) -> Option<(Vec<u8>, S)> {
     let (cols, rows) = size;
-    let (body, state) = capture_seed_snapshot(target, (cols, rows), deadline)?;
-    Some(assemble_seed_stream(&body, &state, rows))
+    let (body, state, sampled) = capture_seed_snapshot(target, (cols, rows), deadline, sample)?;
+    Some((assemble_seed_stream(&body, &state, rows), sampled))
 }
 
 fn pipe_has_unread_bytes(pipe: &UnixStream) -> bool {
@@ -1333,13 +1365,14 @@ const SEED_INSTALL_RETRY: Duration = Duration::from_millis(20);
 /// from the final snapshot (its post-probe rode the same fork as the capture,
 /// so it is the tightest pairing available, and the next live chunk heals any
 /// residue).
-fn capture_seed_snapshot(
+fn capture_seed_snapshot<S>(
     target: &str,
     want: (u16, u16),
     deadline: &crate::tmux::TmuxCommandDeadline,
-) -> Option<(Vec<u8>, PaneSeedState)> {
+    mut sample: impl FnMut() -> S,
+) -> Option<(Vec<u8>, PaneSeedState, S)> {
     let seed_start = format!("-{SCROLLBACK_LINES}");
-    let mut last: Option<(Vec<u8>, PaneSeedState)> = None;
+    let mut last: Option<(Vec<u8>, PaneSeedState, S)> = None;
     for attempt in 0..SEED_PROBE_ATTEMPTS {
         if attempt > 0 {
             std::thread::sleep(SEED_RETRY_SETTLE);
@@ -1371,6 +1404,9 @@ fn capture_seed_snapshot(
         ]);
         let mut command = crate::tmux::tmux_command();
         command.args(&args);
+        // tmux parses pane output before it can run a command sent after it, so
+        // every chunk the reader already holds is in this capture.
+        let sampled = sample();
         let Ok(out) = deadline.run(&mut command) else {
             break;
         };
@@ -1393,12 +1429,12 @@ fn capture_seed_snapshot(
         // entered while the pane disagrees, so the settled case still returns on
         // the first pass.
         let at_want = (post.pane_width, post.pane_height) == want;
-        last = Some((body.to_vec(), post));
+        last = Some((body.to_vec(), post, sampled));
         if agreed && at_want {
             return last;
         }
     }
-    if let Some((_, state)) = last.as_ref() {
+    if let Some((_, state, _)) = last.as_ref() {
         tracing::debug!(
             %target,
             attempts = SEED_PROBE_ATTEMPTS,
@@ -2741,7 +2777,6 @@ impl VtChannel {
             if attempt > 0 {
                 std::thread::sleep(SEED_INSTALL_RETRY);
             }
-            let expected_chunk_seq = chunk_seq.load(Ordering::Acquire);
             seed_result = seed_parser(
                 &target,
                 SeedSink {
@@ -2750,13 +2785,10 @@ impl VtChannel {
                     grid_gen: &grid_gen,
                     links: &links,
                 },
-                None,
+                false,
                 (cols, rows),
                 deadline,
-                SeedGuard {
-                    chunk: Some((&chunk_seq, &settled_chunk_seq, expected_chunk_seq)),
-                    pipe: None,
-                },
+                Some((&chunk_seq, &settled_chunk_seq)),
                 SeedInstallFence {
                     snapshot: Some(&snapshot),
                     socket: Some(&stream),
@@ -2945,7 +2977,6 @@ impl VtChannel {
         guarded: bool,
         deadline: &crate::tmux::TmuxCommandDeadline,
     ) -> VtRefreshResult {
-        let since = guarded.then(|| self.grid_gen.load(Ordering::Relaxed));
         // A resize is the one caller whose Busy is expected rather than
         // informative: tmux repaints the whole pane, so the fence almost
         // always finds those bytes in flight on the first attempt. Retry it
@@ -2958,7 +2989,6 @@ impl VtChannel {
             if attempt > 0 {
                 std::thread::sleep(SEED_INSTALL_RETRY);
             }
-            let expected_chunk_seq = self.chunk_seq.load(Ordering::Acquire);
             result = seed_parser(
                 &self.target,
                 SeedSink {
@@ -2967,13 +2997,10 @@ impl VtChannel {
                     grid_gen: &self.grid_gen,
                     links: &self.links,
                 },
-                since,
+                guarded,
                 (cols, rows),
                 deadline,
-                SeedGuard {
-                    chunk: Some((&self.chunk_seq, &self.settled_chunk_seq, expected_chunk_seq)),
-                    pipe: None,
-                },
+                Some((&self.chunk_seq, &self.settled_chunk_seq)),
                 SeedInstallFence {
                     snapshot: Some(&self.snapshot),
                     socket: Some(&self.stream),
@@ -4089,13 +4116,10 @@ mod tests {
                     grid_gen: &grid_gen,
                     links: &LinkTable::default(),
                 },
-                None,
+                false,
                 (80, 24),
                 &deadline,
-                SeedGuard {
-                    chunk: None,
-                    pipe: None,
-                },
+                None,
                 SeedInstallFence {
                     snapshot: None,
                     socket: None,
@@ -5159,6 +5183,119 @@ mod tests {
     }
 
     #[test]
+    fn seed_counts_output_from_before_the_capture_fork_as_captured() {
+        use std::io::Write;
+
+        // Arming probes the pane before forking the capture, and a repainting
+        // pane lands chunks in that window. tmux parses a chunk before it can
+        // run a command sent after it, so those chunks are in the snapshot and
+        // must not make the install stand down. A chunk after the fork still must.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("s.sock");
+        let listener = UnixListener::bind(&sock).expect("bind");
+        let stop = Arc::new(AtomicBool::new(false));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        let app_cursor = Arc::new(AtomicBool::new(false));
+        let grid_gen = Arc::new(AtomicU64::new(0));
+        let chunk_seq = Arc::new(AtomicU64::new(0));
+        let settled_chunk_seq = Arc::new(AtomicU64::new(0));
+        let ctx = ReaderCtx {
+            snapshot_contended: None,
+            parser: parser.clone(),
+            stop: stop.clone(),
+            seeded: Arc::new(AtomicBool::new(true)),
+            snapshot: Arc::new(Mutex::new(())),
+            stream: Arc::new(Mutex::new(None)),
+            app_cursor: app_cursor.clone(),
+            lifecycle: Arc::new(AtomicU8::new(VtLifecycle::Starting as u8)),
+            wakeup: Arc::new(Mutex::new(None)),
+            clipboard: Arc::new(Mutex::new(None)),
+            links: Arc::new(LinkTable::default()),
+            chunk_seq: chunk_seq.clone(),
+            settled_chunk_seq: settled_chunk_seq.clone(),
+            last_chunk_ms: Arc::new(AtomicU64::new(0)),
+            prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
+            grid_gen: grid_gen.clone(),
+            signals: Arc::new(ViewerSignals::new()),
+        };
+        let reader = std::thread::spawn(move || run_reader(listener, ctx, chunk_now_ms));
+        let mut conn = UnixStream::connect(&sock).expect("connect");
+        let links = LinkTable::default();
+        let wait_settled = |n: u64| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while settled_chunk_seq.load(Ordering::Acquire) < n {
+                assert!(Instant::now() < deadline, "reader never settled chunk {n}");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        let no_fence = || SeedInstallFence {
+            snapshot: None,
+            socket: None,
+            control: None,
+        };
+        let sink = || SeedSink {
+            parser: &parser,
+            app_cursor: &app_cursor,
+            grid_gen: &grid_gen,
+            links: &links,
+        };
+
+        let result = seed_parser_with(
+            sink(),
+            true,
+            (80, 24),
+            Some((&chunk_seq, &settled_chunk_seq)),
+            no_fence(),
+            |sample| {
+                conn.write_all(b"probe-window-chunk").expect("write");
+                wait_settled(1);
+                let sampled = sample();
+                let body = assemble_seed_stream(b"snapshot-body\n", &PaneSeedState::default(), 24);
+                Some((body, sampled))
+            },
+        );
+        assert_eq!(
+            result,
+            VtRefreshResult::Refreshed,
+            "output settled before the capture fork is part of the snapshot"
+        );
+        let grid = parser.lock().expect("parser").screen().contents();
+        assert!(
+            grid.contains("snapshot-body"),
+            "snapshot must be installed:\n{grid:?}"
+        );
+
+        let result = seed_parser_with(
+            sink(),
+            true,
+            (80, 24),
+            Some((&chunk_seq, &settled_chunk_seq)),
+            no_fence(),
+            |sample| {
+                let sampled = sample();
+                conn.write_all(b"capture-window-chunk").expect("write");
+                wait_settled(2);
+                let body = assemble_seed_stream(b"stale-snapshot\n", &PaneSeedState::default(), 24);
+                Some((body, sampled))
+            },
+        );
+        assert_eq!(
+            result,
+            VtRefreshResult::Busy,
+            "output after the capture fork must still fence the install"
+        );
+        let grid = parser.lock().expect("parser").screen().contents();
+        assert!(
+            grid.contains("capture-window-chunk") && !grid.contains("stale-snapshot"),
+            "the raced chunk must survive in the live grid:\n{grid:?}"
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        drop(conn);
+        let _ = reader.join();
+    }
+
+    #[test]
     fn unread_pipe_chunk_blocks_snapshot_replay() {
         use std::io::{Read, Write};
 
@@ -5971,8 +6108,9 @@ mod tests {
         // Seed a grid SHORTER than the pane, the racing shape: the body's top
         // rows scroll into history and take the prompt with them.
         let rows: u16 = 24;
-        let stream =
-            capture_seed_stream(&target, (80, rows), &deadline).expect("capture seed stream");
+        let stream = capture_seed_stream(&target, (80, rows), &deadline, || ())
+            .expect("capture seed stream")
+            .0;
         let mut p = vt100::Parser::new(rows, 80, SCROLLBACK_LINES);
         p.process(&stream);
 
@@ -6043,7 +6181,9 @@ mod tests {
         let deadline = crate::tmux::TmuxCommandDeadline::new();
         let mut stream = Vec::new();
         for _ in 0..50 {
-            stream = capture_seed_stream(&target, (80, 24), &deadline).unwrap_or_default();
+            stream = capture_seed_stream(&target, (80, 24), &deadline, || ())
+                .map(|(stream, ())| stream)
+                .unwrap_or_default();
             if crate::tmux::osc8::extract_links(&stream) == expected {
                 break;
             }
