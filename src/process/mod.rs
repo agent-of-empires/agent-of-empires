@@ -697,11 +697,7 @@ mod tests {
         assert!(!flags[1], "a marker no live process carries must not match");
     }
 
-    /// The environment signal: a live process with `AOE_INSTANCE_ID=<marker>`
-    /// in its environment is matched by the anchored env needle even when the
-    /// marker is absent from argv. This is the argv-rewrite-proof identity
-    /// signal the #2994 guard relies on for hook-enabled agents. Linux-only:
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn parent_and_argv0_reads_a_live_child() {
         let mut child = Command::new("sleep")
@@ -711,7 +707,7 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        // `cmdline` reads empty until the child finishes exec.
+        // argv reads empty until the child finishes exec.
         let deadline = Instant::now() + Duration::from_secs(5);
         let read = loop {
             let read = parent_and_argv0(child.id());
@@ -727,6 +723,10 @@ mod tests {
         assert_eq!(read, Some((std::process::id(), "sleep".to_string())));
     }
 
+    /// The environment signal: a live process with `AOE_INSTANCE_ID=<marker>`
+    /// in its environment is matched by the anchored env needle even when the
+    /// marker is absent from argv. This is the argv-rewrite-proof identity
+    /// signal the #2994 guard relies on for hook-enabled agents. Linux-only:
     /// `/proc/<pid>/environ` is a stable probe; macOS `ps -E` env visibility is
     /// hardening-dependent and not asserted here.
     #[cfg(target_os = "linux")]

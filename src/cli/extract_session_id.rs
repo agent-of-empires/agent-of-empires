@@ -74,9 +74,10 @@ fn walk_reaches_single_agent(
 ) -> bool {
     let mut pid = start;
     let mut agents = 0;
-    for _ in 0..MAX_ANCESTORS {
+    for hop in 0..MAX_ANCESTORS {
         let Some((ppid, argv0)) = parent_and_argv0(pid) else {
-            return false;
+            // No readable process table proves nothing, so keep the write.
+            return hop == 0;
         };
         if std::path::Path::new(&argv0)
             .file_name()
@@ -156,7 +157,7 @@ mod tests {
     fn only_the_pane_agent_owns_the_hook() {
         // (pid, ppid, argv0) from the hook's parent shell upward.
         type Chain = &'static [(u32, u32, &'static str)];
-        let cases: [(&str, u32, Chain, bool); 6] = [
+        let cases: [(&str, u32, Chain, bool); 7] = [
             ("direct launch", 9, &[(10, 9, "sh"), (9, 1, "claude")], true),
             (
                 "wrapper runs the agent as a child",
@@ -194,6 +195,7 @@ mod tests {
                 false,
             ),
             ("unreadable ancestor", 7, &[(10, 9, "sh")], false),
+            ("process table unavailable", 7, &[], true),
         ];
         for (name, agent_pid, chain, owned) in cases {
             let table: std::collections::HashMap<u32, (u32, String)> = chain

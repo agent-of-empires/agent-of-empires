@@ -360,7 +360,6 @@ pub(super) fn boot_id() -> Option<String> {
     }
 }
 
-/// Get the foreground process group leader for a shell PID
 pub(super) fn parent_and_argv0(pid: u32) -> Option<(u32, String)> {
     let output = Command::new("ps")
         .args(["-o", "ppid=,args=", "-p", &pid.to_string()])
@@ -375,6 +374,7 @@ pub(super) fn parent_and_argv0(pid: u32) -> Option<(u32, String)> {
     Some((ppid, fields.next().unwrap_or_default().to_string()))
 }
 
+/// Get the foreground process group leader for a shell PID
 pub fn get_foreground_pid(shell_pid: u32) -> Option<u32> {
     // Use ps to get the foreground process group
     // ps -o tpgid= -p <pid> gives us the terminal foreground process group ID
