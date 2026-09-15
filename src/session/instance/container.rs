@@ -118,7 +118,6 @@ impl Instance {
     }
 
     pub fn get_container_for_instance(&mut self) -> Result<containers::DockerContainer> {
-        let command = self.get_tool_command().to_owned();
         let image = self
             .sandbox_info
             .as_ref()
@@ -175,7 +174,7 @@ impl Instance {
             }
         }
         // After every reload above, which may have replaced the tool.
-        let detect_as = self.effective_detect_as().into_owned();
+        let command = self.get_tool_command().to_owned();
 
         // Direct is_running()? / exists()? here rather than probe_running():
         // this function already returns Result, so `?` correctly propagates
@@ -324,7 +323,7 @@ impl Instance {
     fn container_agent_identity(&self) -> Result<String> {
         container_config::container_agent_identity(
             &self.tool,
-            Some(&self.effective_detect_as()),
+            Some(self.get_tool_command()),
             &self.source_profile,
         )
         .context("cannot resolve the session's agent to check its sandbox container")
@@ -858,14 +857,19 @@ claude-personal = "~/.claude-global"
             (("codex", ""), "codex", Disk::Absent, 0, Some(".codex")),
             (("codex", ""), "", Disk::Absent, 0, Some(".codex")),
             (("codex", ""), "claude", Disk::Corrupt, 0, None),
+            // A status-only alias is not an execution identity, so this row's
+            // container label is its tool name and the reuse path refreshes no
+            // store. A wrapper or a built-in tool is what carries a store.
             (
                 ("alias-a", "claude"),
-                "alias-b:codex",
+                "alias-b",
                 Disk::Row("alias-b", "codex"),
                 0,
-                Some(".codex"),
+                None,
             ),
-            (("alias-a", "codex"), "alias-a", Disk::Absent, 1, None),
+            // Same contract: the alias-only row labels its container "alias-a"
+            // and therefore reuses it instead of rebuilding.
+            (("alias-a", "codex"), "alias-a", Disk::Absent, 0, None),
             (
                 ("alias-c", ""),
                 "alias-c:claude",
