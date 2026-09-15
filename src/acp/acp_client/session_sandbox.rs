@@ -472,9 +472,7 @@ mod tests {
     /// when the adapter's `env_allowlist` names it (#3238). The path resolves
     /// to nothing inside the container, so forwarding it points the adapter
     /// away from the config dir `AGENT_CONFIG_MOUNTS` bind-mounts at the
-    /// canonical container location. `CLAUDE_CONFIG_DIR` established the rule;
-    /// `CODEX_HOME` and `GOOGLE_APPLICATION_CREDENTIALS` reach the same
-    /// function through the per-adapter allowlists.
+    /// canonical container location.
     ///
     /// Tagged `#[serial]` because the test mutates the process-wide
     /// env; parallel readers of `std::env::var` would race.
@@ -492,6 +490,16 @@ mod tests {
             (
                 "GOOGLE_APPLICATION_CREDENTIALS",
                 "/Users/operator/gcp-key.json",
+            ),
+            ("AWS_CONFIG_FILE", "/Users/operator/.aws/config"),
+            (
+                "AWS_SHARED_CREDENTIALS_FILE",
+                "/Users/operator/.aws/credentials",
+            ),
+            ("AWS_WEB_IDENTITY_TOKEN_FILE", "/Users/operator/.aws/token"),
+            (
+                "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+                "/Users/operator/.aws/container-token",
             ),
             ("OPENAI_API_KEY", "sk-test-value"),
         ]);
@@ -518,6 +526,10 @@ mod tests {
                     "CLAUDE_CONFIG_DIR".into(),
                     "CODEX_HOME".into(),
                     "GOOGLE_APPLICATION_CREDENTIALS".into(),
+                    "AWS_CONFIG_FILE".into(),
+                    "AWS_SHARED_CREDENTIALS_FILE".into(),
+                    "AWS_WEB_IDENTITY_TOKEN_FILE".into(),
+                    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE".into(),
                     "OPENAI_API_KEY".into(),
                 ]),
             },
@@ -545,6 +557,10 @@ mod tests {
             "CLAUDE_CONFIG_DIR",
             "CODEX_HOME",
             "GOOGLE_APPLICATION_CREDENTIALS",
+            "AWS_CONFIG_FILE",
+            "AWS_SHARED_CREDENTIALS_FILE",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+            "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
         ] {
             assert!(
                 !argv.docker_args.iter().any(|a| a == key),
