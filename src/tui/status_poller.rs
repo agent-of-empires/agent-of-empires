@@ -217,7 +217,7 @@ pub(super) fn poll_statuses_once(
                 &instance.effective_profile(),
                 &instance.id,
                 &instance.tool,
-                Some(&instance.detect_as),
+                instance.get_tool_command().into(),
                 crate::session::config::container_config::CredentialFold::SeedOnly,
             );
         }
