@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from "react";
-import { ensureThemeLoaded, getHighlighter, langImportForPath, type ThemedToken } from "../lib/highlighter";
+import { getSnippetHighlighter, langHintForPath, type ThemedToken } from "../lib/snippetHighlighter";
 import type { RichDiffHunk } from "../lib/types";
 import { useShikiTheme } from "./useShikiTheme";
 
-// Highlights on the main thread via `lib/highlighter`, not the diff pane's
-// worker pool. See #3913.
+// Highlights on the main thread via the shared `@pierre/diffs` highlighter,
+// not the diff pane's worker pool: short per-line highlighting doesn't
+// benefit from a worker round-trip.
 
 /** A single token with content and an optional foreground color. */
 export interface SyntaxToken {
@@ -63,33 +64,20 @@ export function useHighlightedLines(hunks: RichDiffHunk[], filePath: string): Hi
   useEffect(() => {
     const reqId = ++requestRef.current;
 
-    const langImport = langImportForPath(filePath);
-    if (!langImport) return;
+    const langHint = langHintForPath(filePath);
+    if (!langHint) return;
 
     (async () => {
       try {
-        const resolvedTheme = await ensureThemeLoaded(shiki.theme, shiki.appearance);
-        const hl = await getHighlighter();
-
-        // Load the grammar if not already registered.
-        const mod = await langImport();
-        const registration = (mod as Record<string, unknown>).default ?? mod;
-        const langs = Array.isArray(registration) ? registration : [registration];
-        for (const lang of langs) {
-          const id = (lang as { name?: string }).name;
-          if (id && !hl.getLoadedLanguages().includes(id)) {
-            await hl.loadLanguage(lang as Parameters<typeof hl.loadLanguage>[0]);
-          }
-        }
+        const resolved = await getSnippetHighlighter({ langHint, theme: shiki.theme, appearance: shiki.appearance });
 
         if (!isMountedRef.current || reqId !== requestRef.current) return;
 
-        // Determine the language id from the first registration.
-        const langId = (langs[0] as { name?: string }).name;
-        if (!langId) {
+        if (!resolved) {
           setState({ grid: [], path: filePath });
           return;
         }
+        const { highlighter: hl, langId, theme: resolvedTheme } = resolved;
 
         const result: TokenGrid = [];
 

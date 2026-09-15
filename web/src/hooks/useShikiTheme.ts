@@ -1,13 +1,12 @@
 import { useEffect, useState } from "react";
 import { readCachedResolvedTheme, THEME_CHANGED_EVENT, type ResolvedTheme } from "../lib/theme";
-import { DEFAULT_SHIKI_THEME } from "../lib/highlighter";
+import { DEFAULT_SHIKI_THEME } from "../lib/snippetHighlighter";
 
 export interface ShikiThemeState {
-  /** Bundled Shiki theme name to pass to ensureThemeLoaded. */
+  /** Bundled Shiki theme name. */
   theme: string;
-  /** Appearance of the active AoE theme; passed to ensureThemeLoaded
-   *  so a light AoE theme that names an unbundled Shiki theme falls
-   *  back to `github-light` instead of `github-dark`. */
+  /** Appearance of the active AoE theme, so a light AoE theme that names
+   *  an unbundled Shiki theme falls back to `github-light`, not `github-dark`. */
   appearance: "dark" | "light";
 }
 

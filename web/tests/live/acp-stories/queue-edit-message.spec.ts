@@ -20,7 +20,7 @@ const SCRIPT = {
           sessionUpdate: "agent_message_chunk",
           content: { type: "text", text: "Working on turn 1..." },
         },
-        { sessionUpdate: "wait_ms", ms: 8_000 },
+        { sessionUpdate: "wait_for_release" },
       ],
       stopReason: "end_turn",
     },

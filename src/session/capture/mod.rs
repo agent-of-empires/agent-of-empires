@@ -1980,6 +1980,9 @@ mod tests {
             .set_times(std::fs::FileTimes::new().set_modified(hour_ago))
             .unwrap();
 
+        let _env =
+            crate::session::test_support::EnvGuard::set(&[("CLAUDE_CONFIG_DIR", tmp.path())]);
+
         assert!(
             !claude_host_transcript_confirmed_absent("/tmp/myproject", present, tmp.path()),
             "a transcript on disk (even stale) must not be reported absent"

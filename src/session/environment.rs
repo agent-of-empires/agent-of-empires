@@ -967,9 +967,7 @@ mod tests {
     #[serial_test::serial]
     fn test_build_docker_env_args_uses_passed_profile_not_global_default() {
         let temp_home = tempfile::TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         // Determine app dir layout (matches session::get_app_dir_path).
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1050,6 +1048,55 @@ environment = ["GH_TOKEN=write_token"]
         assert!(result_empty
             .env
             .contains(&("GH_TOKEN".to_string(), "read_only_token".to_string())));
+    }
+
+    /// #3710: a repo's `sandbox.environment` cannot pull host variables into
+    /// the container; the profile's passthrough still resolves.
+    #[test]
+    #[serial_test::serial]
+    fn test_build_docker_env_args_ignores_repo_host_passthrough() {
+        let temp_home = tempfile::TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("AOE_TEST_REPO_SECRET_3710", "repo-secret"),
+            ("AOE_TEST_PROFILE_PT_3710", "profile-value"),
+        ]);
+
+        let profile: crate::session::ProfileConfig = serde_json::from_value(serde_json::json!({
+            "sandbox": {"environment": ["PROFILE_PT=$AOE_TEST_PROFILE_PT_3710"]}
+        }))
+        .unwrap();
+        crate::session::save_profile_config("default", &profile).unwrap();
+
+        let project = temp_home.path().join("project");
+        std::fs::create_dir_all(project.join(".agent-of-empires")).unwrap();
+        std::fs::write(
+            project.join(".agent-of-empires").join("config.toml"),
+            r#"
+[sandbox]
+environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
+"#,
+        )
+        .unwrap();
+
+        let sandbox = SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test".to_string(),
+            container_name: "test".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
+        let env = build_docker_env_args("default", &sandbox, &project).env;
+
+        assert!(
+            !env.iter().any(|(_, v)| v == "repo-secret"),
+            "repo config resolved a host variable: {:?}",
+            env.iter().map(|(k, _)| k).collect::<Vec<_>>()
+        );
+        assert!(env.contains(&("PROFILE_PT".to_string(), "profile-value".to_string())));
     }
 
     #[test]
@@ -1338,6 +1385,7 @@ environment = ["GH_TOKEN=write_token"]
 
     #[test]
     fn test_session_host_env_pairs_uses_extra_env() {
+        let _app_guard = crate::session::test_support::isolate_app_dir();
         // With a per-session extra_env and no repo config at the path, every
         // entry survives the repo filter and is resolved to a host pair.
         let tmp = tempfile::tempdir().unwrap();
@@ -1729,30 +1777,13 @@ environment = ["GH_TOKEN=write_token"]
     #[test]
     #[serial_test::serial(shell_env)]
     fn test_validate_env_entries_skips_default_terminal_vars_when_unset() {
-        // Stash + remove the defaults so the test catches all four keys even
-        // on CI hosts where TERM/COLORTERM are set. `serial(shell_env)` matches
-        // the pattern used by other tests in this file that mutate globally-
-        // shared env vars.
-        let originals: Vec<(&&str, Option<String>)> = DEFAULT_TERMINAL_ENV_VARS
-            .iter()
-            .map(|k| (k, std::env::var(*k).ok()))
-            .collect();
-        for key in DEFAULT_TERMINAL_ENV_VARS {
-            std::env::remove_var(key);
-        }
+        let _env = EnvGuard::unset(DEFAULT_TERMINAL_ENV_VARS);
 
         let entries: Vec<String> = DEFAULT_TERMINAL_ENV_VARS
             .iter()
             .map(|s| s.to_string())
             .collect();
         let warnings = validate_env_entries(&entries);
-
-        for (key, original) in originals {
-            match original {
-                Some(v) => std::env::set_var(*key, v),
-                None => std::env::remove_var(*key),
-            }
-        }
 
         assert!(
             warnings.is_empty(),
@@ -1764,7 +1795,8 @@ environment = ["GH_TOKEN=write_token"]
     #[test]
     #[serial_test::serial]
     fn test_build_docker_env_args_inherit_uses_key_only_in_args() {
-        std::env::set_var("AOE_TEST_TOKEN", "secret123");
+        let _app_guard = crate::session::test_support::isolate_app_dir();
+        let _env_0 = EnvGuard::set(&[("AOE_TEST_TOKEN", "secret123")]);
         let sandbox = SandboxInfo {
             enabled: true,
             container_id: None,
@@ -1781,13 +1813,13 @@ environment = ["GH_TOKEN=write_token"]
         assert!(result
             .env
             .contains(&("AOE_TEST_TOKEN".to_string(), "secret123".to_string())));
-        std::env::remove_var("AOE_TEST_TOKEN");
     }
 
     #[test]
     #[serial_test::serial]
     fn test_build_docker_env_args_inherit_with_different_key() {
-        std::env::set_var("AOE_TEST_SOURCE", "secret456");
+        let _app_guard = crate::session::test_support::isolate_app_dir();
+        let _env_0 = EnvGuard::set(&[("AOE_TEST_SOURCE", "secret456")]);
         let sandbox = SandboxInfo {
             enabled: true,
             container_id: None,
@@ -1804,13 +1836,13 @@ environment = ["GH_TOKEN=write_token"]
         assert!(result
             .env
             .contains(&("MY_MAPPED".to_string(), "secret456".to_string())));
-        std::env::remove_var("AOE_TEST_SOURCE");
     }
 
     #[test]
     #[serial_test::serial]
     fn test_build_docker_env_args_bare_key_uses_protected_env() {
-        std::env::set_var("AOE_TEST_BARE", "barevalue");
+        let _app_guard = crate::session::test_support::isolate_app_dir();
+        let _env_0 = EnvGuard::set(&[("AOE_TEST_BARE", "barevalue")]);
         let sandbox = SandboxInfo {
             enabled: true,
             container_id: None,
@@ -1827,11 +1859,11 @@ environment = ["GH_TOKEN=write_token"]
         assert!(result
             .env
             .contains(&("AOE_TEST_BARE".to_string(), "barevalue".to_string())));
-        std::env::remove_var("AOE_TEST_BARE");
     }
 
     #[test]
     fn test_build_docker_env_args_literal_uses_protected_env() {
+        let _app_guard = crate::session::test_support::isolate_app_dir();
         let sandbox = SandboxInfo {
             enabled: true,
             container_id: None,
@@ -1853,7 +1885,8 @@ environment = ["GH_TOKEN=write_token"]
     #[test]
     #[serial_test::serial]
     fn test_build_docker_env_args_mixed_values_never_inline() {
-        std::env::set_var("AOE_TEST_SECRET", "mysecret");
+        let _app_guard = crate::session::test_support::isolate_app_dir();
+        let _env_0 = EnvGuard::set(&[("AOE_TEST_SECRET", "mysecret")]);
         let sandbox = SandboxInfo {
             enabled: true,
             container_id: None,
@@ -1877,11 +1910,11 @@ environment = ["GH_TOKEN=write_token"]
         assert!(result
             .env
             .contains(&("MY_LITERAL".to_string(), "literal-secret".to_string())));
-        std::env::remove_var("AOE_TEST_SECRET");
     }
 
     #[test]
     fn test_managed_codex_home_is_passed_to_exec_unless_overridden() {
+        let _app_guard = crate::session::test_support::isolate_app_dir();
         let project_path = std::path::Path::new("/nonexistent");
         let managed_home = "/root/.codex/codex-upgrade-test";
         let cases = [
@@ -1975,9 +2008,9 @@ environment = ["GH_TOKEN=write_token"]
     #[test]
     #[serial_test::serial]
     fn test_collect_environment_auto_forwards_vertex_vars_when_enabled() {
-        std::env::set_var("CLAUDE_CODE_USE_VERTEX", "1");
-        std::env::set_var("ANTHROPIC_VERTEX_PROJECT_ID", "my-proj");
-        std::env::set_var("CLOUD_ML_REGION", "us-east5");
+        let _env_0 = EnvGuard::set(&[("CLAUDE_CODE_USE_VERTEX", "1")]);
+        let _env_1 = EnvGuard::set(&[("ANTHROPIC_VERTEX_PROJECT_ID", "my-proj")]);
+        let _env_2 = EnvGuard::set(&[("CLOUD_ML_REGION", "us-east5")]);
         let config = SandboxConfig::default();
         let info = SandboxInfo {
             enabled: true,
@@ -2003,18 +2036,14 @@ environment = ["GH_TOKEN=write_token"]
 
         let region = find_entry(&result, "CLOUD_ML_REGION").expect("CLOUD_ML_REGION not found");
         assert_eq!(region.value(), "us-east5");
-
-        std::env::remove_var("CLAUDE_CODE_USE_VERTEX");
-        std::env::remove_var("ANTHROPIC_VERTEX_PROJECT_ID");
-        std::env::remove_var("CLOUD_ML_REGION");
     }
 
     #[test]
     #[serial_test::serial]
     fn test_collect_environment_skips_vertex_vars_when_flag_unset() {
-        std::env::remove_var("CLAUDE_CODE_USE_VERTEX");
-        std::env::set_var("ANTHROPIC_VERTEX_PROJECT_ID", "my-proj");
-        std::env::set_var("CLOUD_ML_REGION", "us-east5");
+        let _vertex = EnvGuard::unset(&["CLAUDE_CODE_USE_VERTEX"]);
+        let _env_0 = EnvGuard::set(&[("ANTHROPIC_VERTEX_PROJECT_ID", "my-proj")]);
+        let _env_1 = EnvGuard::set(&[("CLOUD_ML_REGION", "us-east5")]);
         let config = SandboxConfig::default();
         let info = SandboxInfo {
             enabled: true,
@@ -2033,16 +2062,13 @@ environment = ["GH_TOKEN=write_token"]
             "Vertex vars should not auto-forward when CLAUDE_CODE_USE_VERTEX is unset",
         );
         assert!(find_entry(&result, "CLOUD_ML_REGION").is_none());
-
-        std::env::remove_var("ANTHROPIC_VERTEX_PROJECT_ID");
-        std::env::remove_var("CLOUD_ML_REGION");
     }
 
     #[test]
     #[serial_test::serial]
     fn test_collect_environment_skips_vertex_vars_when_flag_empty() {
-        std::env::set_var("CLAUDE_CODE_USE_VERTEX", "");
-        std::env::set_var("ANTHROPIC_VERTEX_PROJECT_ID", "my-proj");
+        let _env_0 = EnvGuard::set(&[("CLAUDE_CODE_USE_VERTEX", "")]);
+        let _env_1 = EnvGuard::set(&[("ANTHROPIC_VERTEX_PROJECT_ID", "my-proj")]);
         let config = SandboxConfig::default();
         let info = SandboxInfo {
             enabled: true,
@@ -2060,16 +2086,13 @@ environment = ["GH_TOKEN=write_token"]
             find_entry(&result, "ANTHROPIC_VERTEX_PROJECT_ID").is_none(),
             "Empty CLAUDE_CODE_USE_VERTEX must be treated as unset",
         );
-
-        std::env::remove_var("CLAUDE_CODE_USE_VERTEX");
-        std::env::remove_var("ANTHROPIC_VERTEX_PROJECT_ID");
     }
 
     #[test]
     #[serial_test::serial]
     fn test_collect_environment_does_not_auto_forward_anthropic_api_key() {
-        std::env::set_var("CLAUDE_CODE_USE_VERTEX", "1");
-        std::env::set_var("ANTHROPIC_API_KEY", "sk-host-key");
+        let _env_0 = EnvGuard::set(&[("CLAUDE_CODE_USE_VERTEX", "1")]);
+        let _env_1 = EnvGuard::set(&[("ANTHROPIC_API_KEY", "sk-host-key")]);
         let config = SandboxConfig::default();
         let info = SandboxInfo {
             enabled: true,
@@ -2087,16 +2110,13 @@ environment = ["GH_TOKEN=write_token"]
             find_entry(&result, "ANTHROPIC_API_KEY").is_none(),
             "ANTHROPIC_API_KEY must not be auto-forwarded; users opt in via sandbox.environment",
         );
-
-        std::env::remove_var("CLAUDE_CODE_USE_VERTEX");
-        std::env::remove_var("ANTHROPIC_API_KEY");
     }
 
     #[test]
     #[serial_test::serial]
     fn test_collect_environment_vertex_vars_not_duplicated() {
-        std::env::set_var("CLAUDE_CODE_USE_VERTEX", "1");
-        std::env::set_var("ANTHROPIC_VERTEX_PROJECT_ID", "my-proj");
+        let _env_0 = EnvGuard::set(&[("CLAUDE_CODE_USE_VERTEX", "1")]);
+        let _env_1 = EnvGuard::set(&[("ANTHROPIC_VERTEX_PROJECT_ID", "my-proj")]);
         let config = SandboxConfig {
             environment: vec!["ANTHROPIC_VERTEX_PROJECT_ID".to_string()],
             ..Default::default()
@@ -2119,8 +2139,5 @@ environment = ["GH_TOKEN=write_token"]
             .collect();
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].value(), "my-proj");
-
-        std::env::remove_var("CLAUDE_CODE_USE_VERTEX");
-        std::env::remove_var("ANTHROPIC_VERTEX_PROJECT_ID");
     }
 }

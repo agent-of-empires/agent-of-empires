@@ -3491,6 +3491,7 @@ mod tests {
     /// 503 with nothing written.
     #[tokio::test]
     async fn wake_prompt_frees_instance_lock_and_publishes_nothing_without_a_worker() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
         use crate::acp::supervisor::{ResumeKind, ResumeReservationOutcome};
         use std::time::Duration;
 
@@ -3511,6 +3512,7 @@ mod tests {
             ResumeReservationOutcome::AlreadyPresent => panic!("expected a fresh reservation"),
         };
 
+        let mut waits = state.acp_supervisor.watch_worker_waits();
         let handler = tokio::spawn({
             let state = Arc::clone(&state);
             let id = id.clone();
@@ -3529,9 +3531,13 @@ mod tests {
             }
         });
 
-        // Let the handler reach its parked wait. It cannot return until the
-        // reservation drops, so anything past the wake is enough.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), waits.recv())
+                .await
+                .expect("worker readiness reached")
+                .expect("worker wait observation"),
+            id
+        );
 
         // The 2s budget is far under the 10s `WORKER_READY_TIMEOUT` the
         // pre-fix handler holds the lock for, and far over the microseconds
@@ -3597,25 +3603,29 @@ mod tests {
             .await
             .expect("seeded session must admit a submission");
 
-        let cancel = tokio::spawn({
+        let mut claims = state.session_service.watch_submission_claims();
+
+        let cancel = {
             let state = Arc::clone(&state);
             let id = id.clone();
             async move { acp_cancel(State(state), Path(id)).await.into_response() }
-        });
-
-        // 500ms is orders of magnitude over the microseconds cancel needs to
-        // reach the agent-facing work once it is past the guard.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+        tokio::pin!(cancel);
         assert!(
-            !cancel.is_finished(),
+            futures_util::poll!(&mut cancel).is_pending(),
             "acp_cancel must wait for the in-flight submission instead of racing ahead of it"
+        );
+        assert_eq!(
+            claims
+                .try_recv()
+                .expect("contender reached submission claim"),
+            id
         );
 
         drop(submission);
         tokio::time::timeout(Duration::from_secs(10), cancel)
             .await
-            .expect("cancel must finish once the guard drops")
-            .expect("handler task must not panic");
+            .expect("cancel must finish once the guard drops");
     }
 
     /// #3859: a Stop landing while a prompt handler wakes or resumes the
@@ -3791,6 +3801,7 @@ mod tests {
     /// resume ran at all.
     #[tokio::test]
     async fn exhausted_rate_limit_prompt_resumes_instead_of_queueing() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
         let mut inst = crate::session::Instance::new("exhausted-3688", "/tmp/aoe-3688-project");
         inst.id = "sess-3688".to_string();
         inst.view = crate::session::View::Structured;
@@ -3861,6 +3872,7 @@ mod tests {
     /// started leaves its row queued instead of retiring it into a rejection.
     #[tokio::test]
     async fn a_direct_prompt_and_the_queue_drain_cannot_both_own_the_same_turn() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
         use std::time::Duration;
 
         let mut inst = crate::session::Instance::new("race-3621", "/tmp/aoe-3621-race");
@@ -3893,7 +3905,9 @@ mod tests {
         // span.
         let drain_owns_it = state.session_service.prompt_submission(&id).await;
 
-        let handler = tokio::spawn({
+        let mut claims = state.session_service.watch_submission_claims();
+
+        let handler = {
             let state = Arc::clone(&state);
             let id = id.clone();
             async move {
@@ -3909,19 +3923,23 @@ mod tests {
                 .await
                 .into_response()
             }
-        });
-
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        };
+        tokio::pin!(handler);
         assert!(
-            !handler.is_finished(),
+            futures_util::poll!(&mut handler).is_pending(),
             "a direct prompt must not decide its disposition while a drain owns the session"
+        );
+        assert_eq!(
+            claims
+                .try_recv()
+                .expect("contender reached submission claim"),
+            id
         );
 
         drop(drain_owns_it);
         let response = tokio::time::timeout(Duration::from_secs(30), handler)
             .await
-            .expect("the handler must finish once the drain releases the session")
-            .expect("handler task must not panic");
+            .expect("the handler must finish once the drain releases the session");
         assert_eq!(response.status(), StatusCode::ACCEPTED);
 
         // Its publish is what makes the fold read `turn_active`, so the drain
@@ -3938,7 +3956,7 @@ mod tests {
             "the queued follow-up survives for the next tick instead of being retired into an agent_busy rejection"
         );
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        state.acp_supervisor.test_flush_worker_commands(&id).await;
         assert_eq!(
             *cmds.lock().expect("cmd log mutex poisoned"),
             ["prompt"],
@@ -3953,6 +3971,7 @@ mod tests {
     /// reasoning as the prompt test above.
     #[tokio::test]
     async fn diff_comments_on_an_exhausted_park_resume_instead_of_refusing() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
         let mut inst = crate::session::Instance::new("dc-3688", "/tmp/aoe-3688-diff");
         inst.id = "sess-3688-diff".to_string();
         inst.view = crate::session::View::Structured;
@@ -4006,6 +4025,7 @@ mod tests {
     /// then have the agent refuse the prompt as `agent_busy`.
     #[tokio::test]
     async fn diff_comments_refuse_to_open_a_turn_another_submission_started() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
         use std::time::Duration;
 
         let mut inst = crate::session::Instance::new("dc-3649", "/tmp/aoe-3649-diff");
@@ -4020,7 +4040,8 @@ mod tests {
             .await;
 
         let winner = state.session_service.prompt_submission(&id).await;
-        let handler = tokio::spawn({
+        let mut claims = state.session_service.watch_submission_claims();
+        let handler = {
             let state = Arc::clone(&state);
             let id = id.clone();
             async move {
@@ -4038,11 +4059,17 @@ mod tests {
                 .await
                 .into_response()
             }
-        });
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        };
+        tokio::pin!(handler);
         assert!(
-            !handler.is_finished(),
+            futures_util::poll!(&mut handler).is_pending(),
             "diff comments must not decide their disposition while another submission owns the session"
+        );
+        assert_eq!(
+            claims
+                .try_recv()
+                .expect("contender reached submission claim"),
+            id
         );
 
         // What the winner does before it releases: the publish is the choke
@@ -4055,9 +4082,9 @@ mod tests {
 
         let response = tokio::time::timeout(Duration::from_secs(10), handler)
             .await
-            .expect("the handler must finish once the winner releases the session")
-            .expect("handler task must not panic");
+            .expect("the handler must finish once the winner releases the session");
         assert_eq!(response.status(), StatusCode::CONFLICT);
+        state.acp_supervisor.test_flush_worker_commands(&id).await;
         assert_eq!(
             *cmds.lock().expect("cmd log mutex poisoned"),
             Vec::<&'static str>::new(),
@@ -4078,6 +4105,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn worker_stopping_acp_endpoints_wait_for_an_in_flight_submission() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
         use std::time::Duration;
         let temp = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
@@ -4123,23 +4151,28 @@ mod tests {
             let state = crate::server::test_support::build_test_app_state(vec![inst]);
 
             let delivering = state.session_service.prompt_submission(&id).await;
-            let handler = tokio::spawn({
+            let mut claims = state.session_service.watch_submission_claims();
+            let handler = {
                 let state = Arc::clone(&state);
                 let id = id.clone();
                 async move { call(which, state, id).await }
-            });
-
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            };
+            tokio::pin!(handler);
             assert!(
-                !handler.is_finished(),
+                futures_util::poll!(&mut handler).is_pending(),
                 "{which} must not tear the worker down under an in-flight submission"
+            );
+            assert_eq!(
+                claims
+                    .try_recv()
+                    .expect("contender reached submission claim"),
+                id
             );
 
             drop(delivering);
             let response = tokio::time::timeout(Duration::from_secs(10), handler)
                 .await
-                .unwrap_or_else(|_| panic!("{which} must finish once the submission releases"))
-                .unwrap_or_else(|e| panic!("{which} task must not panic: {e}"));
+                .unwrap_or_else(|_| panic!("{which} must finish once the submission releases"));
             if which == "disable" {
                 assert_eq!(response.status(), StatusCode::OK);
                 assert_eq!(

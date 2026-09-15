@@ -223,12 +223,26 @@ pub(super) fn poll_statuses_once(
         }
     }
 
+    project_status_updates(
+        instances,
+        state.cycle_count,
+        &pane_metadata,
+        &state.container_states,
+    )
+}
+
+fn project_status_updates(
+    instances: Vec<Instance>,
+    cycle_count: u64,
+    pane_metadata: &HashMap<String, crate::tmux::PaneMetadata>,
+    container_states: &HashMap<String, bool>,
+) -> Vec<StatusUpdate> {
     instances
         .into_iter()
         .filter_map(|mut inst| {
             // Adaptive polling: skip instances whose tier interval hasn't elapsed
             let tier = polling_tier(inst.status);
-            if tier == 0 || state.cycle_count % tier != 0 {
+            if tier == 0 || cycle_count % tier != 0 {
                 return None;
             }
 
@@ -270,7 +284,7 @@ pub(super) fn poll_statuses_once(
                 )
             {
                 if let Some(sandbox) = &inst.sandbox_info {
-                    if let Some(&running) = state.container_states.get(&sandbox.container_name) {
+                    if let Some(&running) = container_states.get(&sandbox.container_name) {
                         if !running {
                             return Some(StatusUpdate {
                                 id: inst.id,
@@ -295,7 +309,7 @@ pub(super) fn poll_statuses_once(
             // title moved without its tmux session being renamed is still
             // found (and not reported as Error for a live pane).
             let session_name = crate::tmux::resolve_agent_session_name_in(
-                &pane_metadata,
+                pane_metadata,
                 &inst.id,
                 &crate::tmux::Session::generate_name(&inst.id, &inst.title),
             );
@@ -490,18 +504,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn poll_statuses_once_never_emits_idle_intent_keep() {
-        // Regression guard for #2690: the asymmetry that only
-        // `attached_status_hooks::snapshot` produces `IdleIntent::Keep`
-        // and `poll_statuses_once` never does is load-bearing (see the
-        // comment above the `idle_entered_at` projection). A future
-        // consolidation that adds `Keep` to this producer would erase
-        // the baseline seed that `update_status_with_metadata` writes
-        // on its first observation, silently reintroducing the #2690
-        // restamp bug.
-        //
-        // Structural today (both emit sites hardcode Set/Clear), so
-        // this test tightens against a refactor that would relax the
-        // projection into a match arm capable of returning Keep.
+        let _home = crate::session::test_support::isolate_app_dir();
+        // This is the projection shared by the native poller, after acquisition.
         let mut running = Instance::new("running", "/tmp/running");
         running.status = Status::Running;
         let mut idle = Instance::new("idle", "/tmp/idle");
@@ -510,12 +514,19 @@ mod tests {
         let mut error = Instance::new("error", "/tmp/error");
         error.status = Status::Error;
 
-        let mut state = StatusPollState::new();
-        let updates = poll_statuses_once(vec![running, idle, error], &mut state);
-
-        assert!(
-            !updates.is_empty(),
-            "hot/warm/cold instances all align on the first cycle; at least one update expected"
+        let expected_ids = vec![running.id.clone(), idle.id.clone(), error.id.clone()];
+        let updates = project_status_updates(
+            vec![running, idle, error],
+            TIER_COLD,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(
+            updates
+                .iter()
+                .map(|update| update.id.clone())
+                .collect::<Vec<_>>(),
+            expected_ids
         );
         for update in updates {
             assert!(
@@ -540,15 +551,8 @@ mod tests {
         }
     }
 
-    /// Pin `container_states` for the per-instance decision: the live
-    /// `batch_container_health()` refresh would otherwise overwrite the seeded
-    /// map with an empty one (no docker in the test environment), and an
-    /// absent entry skips the sandbox-dead branch for the wrong reason.
-    fn state_with_dead_container(name: &str) -> StatusPollState {
-        let mut state = StatusPollState::new();
-        state.last_container_check = Instant::now();
-        state.container_states.insert(name.to_string(), false);
-        state
+    fn dead_container_states(name: &str) -> HashMap<String, bool> {
+        HashMap::from([(name.to_string(), false)])
     }
 
     #[test]
@@ -567,8 +571,12 @@ mod tests {
         inst.status = Status::Idle;
         inst.sandbox_info = Some(dead_container_sandbox("aoe-sandbox-structured"));
 
-        let mut state = state_with_dead_container("aoe-sandbox-structured");
-        let updates = poll_statuses_once(vec![inst], &mut state);
+        let updates = project_status_updates(
+            vec![inst],
+            TIER_COLD,
+            &HashMap::new(),
+            &dead_container_states("aoe-sandbox-structured"),
+        );
 
         assert!(
             updates.is_empty(),
@@ -586,8 +594,12 @@ mod tests {
         inst.status = Status::Idle;
         inst.sandbox_info = Some(dead_container_sandbox("aoe-sandbox-terminal"));
 
-        let mut state = state_with_dead_container("aoe-sandbox-terminal");
-        let updates = poll_statuses_once(vec![inst], &mut state);
+        let updates = project_status_updates(
+            vec![inst],
+            TIER_COLD,
+            &HashMap::new(),
+            &dead_container_states("aoe-sandbox-terminal"),
+        );
 
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].status, Status::Error);

@@ -67,11 +67,16 @@ export const HOST_STATE_VARS = new Set([
   // daemon outright.
   "AOE_CITYHALL_BUNDLE_TOKEN",
   "AOE_CITYHALL_BUNDLE_URL",
-  // `discovery::discover()` prefers these over the local daemon, so every
-  // `aoe` call the harness makes with this env, teardown's `acp stop --all`
-  // included, would hit the developer's own daemon and kill its workers.
+  // Discovery must not prefer a host endpoint over the private daemon.
   "AOE_DAEMON_TOKEN",
   "AOE_DAEMON_URL",
+  // Private fixture files and subprocess controls cannot come from the host.
+  "AOE_E2E_INPUT_BARRIER",
+  "AOE_E2E_PARTIAL_FRAME_FILE",
+  "AOE_E2E_PROMPT_COMPLETED_FILE",
+  "AOE_E2E_STORAGE_LOCK_CONTENDED",
+  "AOE_TUI_TEST_CHILD",
+  "AOE_TUI_TEST_ENTERED",
   "AOE_GITHUB_CLONE_BASE", // redirects plugin clones at a host path or tree
   "AOE_OPEN_URL_TO", // appends every URL the TUI opens to a host file
   "AOE_SERVE_INSTANCE_ID", // identifies a host daemon process as this one

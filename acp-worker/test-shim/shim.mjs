@@ -49,7 +49,16 @@ function emitUnsolicitedNotifIfRequested(client) {
   if (!sessionId) return;
   const delayMs = Number.parseInt(raw, 10);
   setTimeout(
-    () => {
+    async () => {
+      const release = process.env.SHIM_UNSOLICITED_RELEASE_FILE;
+      if (release) {
+        const { access } = await import("node:fs/promises");
+        while (true) {
+          try { await access(release); break; } catch {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+        }
+      }
       client
         .notify("session/update", {
           sessionId,
@@ -479,6 +488,21 @@ async function handlePrompt(params, client) {
   });
   if (slow) await sleep(800);
 
+  // Usage on either side of completion exercises native turn observation.
+  if (userText.includes("USAGE_BEFORE_")) {
+    await client.notify("session/update", {
+      sessionId: params.sessionId,
+      update: {
+        sessionUpdate: "usage_update",
+        used: 120,
+        size: 200000,
+        ...(userText.includes("USAGE_BEFORE_COST")
+          ? { cost: { amount: 0.01, currency: "USD" } }
+          : {}),
+      },
+    });
+  }
+
   await client.notify("session/update", {
     sessionId: params.sessionId,
     update: {
@@ -503,6 +527,20 @@ async function handlePrompt(params, client) {
     },
   });
   if (slow) await sleep(800);
+
+  if (userText.includes("USAGE_AFTER_NO_COST")) {
+    await client.notify("session/update", {
+      sessionId: params.sessionId,
+      update: { sessionUpdate: "usage_update", used: 300, size: 200000 },
+    });
+  }
+
+  if (userText.includes("USAGE_OBSERVATION")) {
+    await new Promise((resolve) => {
+      parkedPromptResolve = resolve;
+    });
+    return { stopReason: "cancelled" };
+  }
 
   // Optional fs round-trip exercised by tests via prompt keywords.
   if (userText.includes("FS_READ_WRITE")) {
@@ -659,6 +697,13 @@ async function handlePrompt(params, client) {
     },
   });
 
+  const completionRelease = process.env.SHIM_PROMPT_COMPLETION_RELEASE_FILE;
+  if (completionRelease) {
+    const { access } = await import("node:fs/promises");
+    while (true) {
+      try { await access(completionRelease); break; } catch { await sleep(10); }
+    }
+  }
   return {
     stopReason: userText.includes("MAX_TOKENS") ? "max_tokens" : "end_turn",
   };

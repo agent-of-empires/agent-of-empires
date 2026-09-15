@@ -199,11 +199,7 @@ mod tests {
     #[serial_test::serial]
     fn repair_structured_rows_from_live_workers_restores_structured_session_rows() {
         let temp = tempfile::TempDir::with_prefix_in("aoe-repair-", "/tmp").expect("tempdir");
-        // SAFETY: serialized test; no other test mutates HOME concurrently.
-        unsafe {
-            std::env::set_var("HOME", temp.path());
-            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
-        }
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
 
         let socket_path = crate::process::worker_registry::workers_dir()
             .expect("workers dir")

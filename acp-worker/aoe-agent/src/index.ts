@@ -21,7 +21,7 @@ import { anthropic } from "@ai-sdk/anthropic";
 import { openai } from "@ai-sdk/openai";
 import { google } from "@ai-sdk/google";
 import { z } from "zod";
-import { appendTurn, loadTranscript } from "./transcript.ts";
+import { appendTurn, createTranscript, loadTranscript } from "./transcript.ts";
 import { classifyKind } from "./toolKind.ts";
 
 const DEFAULT_MODEL = "claude-opus-4-7";
@@ -164,7 +164,12 @@ async function handlePrompt(
     const artifactDir = process.env.AOE_ARTIFACT_DIR;
     if (artifactDir && assistantBuffer) {
       try {
-        await appendTurn(artifactDir, userText, assistantBuffer);
+        await appendTurn(
+          artifactDir,
+          params.sessionId,
+          userText,
+          assistantBuffer,
+        );
       } catch (err) {
         process.stderr.write(`[aoe-agent] transcript persist failed: ${err}\n`);
       }
@@ -311,7 +316,7 @@ function main() {
     .onRequest("initialize", ({ params }) => ({
       protocolVersion: params.protocolVersion ?? acp.PROTOCOL_VERSION,
       agentCapabilities: {
-        loadSession: true,
+        loadSession: Boolean(process.env.AOE_ARTIFACT_DIR),
         promptCapabilities: {
           image: false,
           audio: false,
@@ -319,8 +324,21 @@ function main() {
       },
     }))
     .onRequest("authenticate", () => ({}))
-    .onRequest("session/new", () => {
+    .onRequest("session/new", async () => {
       const sessionId = randomHexId();
+      const artifactDir = process.env.AOE_ARTIFACT_DIR;
+      // Best-effort: a non-writable artifact dir must not block the clear.
+      // The session runs ephemerally; a later load of a missing transcript
+      // resets context rather than replaying another session's history.
+      if (artifactDir) {
+        try {
+          await createTranscript(artifactDir, sessionId);
+        } catch (err) {
+          process.stderr.write(
+            `[aoe-agent] transcript create failed: ${err}\n`,
+          );
+        }
+      }
       const modelId = process.env.AOE_AGENT_MODEL ?? DEFAULT_MODEL;
       sessions.set(sessionId, {
         pendingPrompt: null,
@@ -330,23 +348,10 @@ function main() {
       return { sessionId };
     })
     .onRequest("session/load", async ({ params }) => {
-      // Reattach across an `aoe serve` restart: seed the model's context from
-      // the persisted transcript. aoe rebuilds the UI from its own event
-      // store and drops any transcript we might replay, so no session/update
-      // replay is needed here, only restoring in-memory history. Registering
-      // the session in the map is required, else the next session/prompt fails
-      // with "Session not found".
+      // AoE replays UI events itself; restore only this native model context.
       const artifactDir = process.env.AOE_ARTIFACT_DIR;
-      let messages: ModelMessage[] = [];
-      if (artifactDir) {
-        try {
-          messages = await loadTranscript(artifactDir);
-        } catch (err) {
-          process.stderr.write(
-            `[aoe-agent] transcript load failed: ${err}\n`,
-          );
-        }
-      }
+      if (!artifactDir) throw new Error("Session persistence is unavailable");
+      const messages = await loadTranscript(artifactDir, params.sessionId);
       sessions.set(params.sessionId, {
         pendingPrompt: null,
         modelId: process.env.AOE_AGENT_MODEL ?? DEFAULT_MODEL,

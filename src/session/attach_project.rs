@@ -986,6 +986,7 @@ pub fn resume_after_conversion(
                     // moved rather than restarted, and an unsolicited prompt
                     // would start a turn nobody asked for.
                     wake_message: String::new(),
+                    discard_sandbox_container: false,
                 });
                 match result.outcome {
                     Ok(_) => {

@@ -46,6 +46,7 @@ fn watch_path_exists(base: &Path, watched: &str) -> bool {
 }
 
 #[test]
+#[serial_test::parallel]
 fn watch_paths_resolve_in_a_git_worktree() {
     if !git_available() {
         eprintln!("skipping: git not available");
@@ -114,6 +115,7 @@ fn watch_paths_resolve_in_a_git_worktree() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn watch_paths_resolve_in_a_normal_checkout() {
     if !git_available() {
         eprintln!("skipping: git not available");
@@ -145,6 +147,7 @@ fn watch_paths_resolve_in_a_normal_checkout() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn git_watch_paths_empty_when_git_cannot_resolve() {
     if !git_available() {
         eprintln!("skipping: git not available");
@@ -166,6 +169,7 @@ fn git_watch_paths_empty_when_git_cannot_resolve() {
 /// filesystem timestamp granularity; a rewrite is what moves the mtime cargo
 /// actually compares.
 #[test]
+#[serial_test::parallel]
 fn watched_paths_move_on_a_commit_but_not_on_a_plain_status() {
     if !git_available() {
         eprintln!("skipping: git not available");

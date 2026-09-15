@@ -32,7 +32,7 @@ async fn drain_for_stopped_reason(client: &mut AcpClient, deadline: Instant) -> 
         match tokio::time::timeout(Duration::from_millis(200), client.next_event()).await {
             Ok(Some(Event::Stopped { reason })) => return Some(reason),
             Ok(Some(_)) => continue,
-            Ok(None) => return None,
+            Ok(None) => panic!("ACP stream closed during reattach observation"),
             Err(_) => continue,
         }
     }
@@ -49,7 +49,7 @@ async fn attach_in_flight_synthesizes_reattach_idle_stopped() {
 
     // Shorten the watchdog grace so the test completes inside ~3s
     // instead of the 10s production default.
-    std::env::set_var("AOE_RESUME_IDLE_GRACE_MS", "500");
+    let _env = crate::common::EnvGuard::new(&[]).and_set("AOE_RESUME_IDLE_GRACE_MS", "500");
 
     // The runner must announce the same session id the daemon attaches
     // with; the control handshake verifies it.
@@ -89,7 +89,7 @@ async fn attach_idle_session_does_not_synthesize_stopped() {
         return;
     }
 
-    std::env::set_var("AOE_RESUME_IDLE_GRACE_MS", "500");
+    let _env = crate::common::EnvGuard::new(&[]).and_set("AOE_RESUME_IDLE_GRACE_MS", "500");
 
     // The runner must announce the same session id the daemon attaches
     // with; the control handshake verifies it.
@@ -134,12 +134,11 @@ async fn attach_in_flight_disarms_after_first_inbound_notification() {
         return;
     }
 
-    // Grace 800ms; the shim emits its single chunk at 200ms. Without the
-    // disarm-on-first-event fix the watchdog would fire ~800ms after that
-    // chunk (around t=1s); we drain for 2.5s to catch it. With the fix it
-    // disarms on the chunk and never fires.
-    std::env::set_var("AOE_RESUME_IDLE_GRACE_MS", "800");
+    // Release the notification only after the intended client attaches.
+    let _env = crate::common::EnvGuard::new(&[]).and_set("AOE_RESUME_IDLE_GRACE_MS", "800");
 
+    let release_dir = tempfile::tempdir().expect("notification release directory");
+    let release = release_dir.path().join("release");
     let session_id = "test-acp-session-id";
     // The runner must announce the same session id the daemon attaches
     // with; the control handshake verifies it.
@@ -148,7 +147,11 @@ async fn attach_in_flight_disarms_after_first_inbound_notification() {
         SESSION,
         &[
             ("SHIM_PRESEED_SESSION_ID", session_id.to_string()),
-            ("SHIM_EMIT_UNSOLICITED_NOTIF", "200".to_string()),
+            ("SHIM_EMIT_UNSOLICITED_NOTIF", "0".to_string()),
+            (
+                "SHIM_UNSOLICITED_RELEASE_FILE",
+                release.display().to_string(),
+            ),
         ],
     )
     .await;
@@ -167,6 +170,20 @@ async fn attach_in_flight_disarms_after_first_inbound_notification() {
     .await
     .expect("attach in_flight=true");
 
+    std::fs::write(&release, b"release").expect("release notification after attachment");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match client.next_event().await.expect("reattached stream open") {
+                Event::AgentMessageChunk { text } if text == "mid-turn chunk after reattach" => {
+                    break
+                }
+                Event::Stopped { reason } => panic!("stopped before notification: {reason}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("final attachment received the intended notification");
     let stopped =
         drain_for_stopped_reason(&mut client, Instant::now() + Duration::from_millis(2500)).await;
     let _ = client.shutdown().await;
@@ -181,6 +198,7 @@ async fn attach_in_flight_disarms_after_first_inbound_notification() {
 /// confirm the response returns as `AgentMessageChunk` and `Stopped`
 /// events through the v3 control transport.
 #[tokio::test]
+#[serial_test::parallel]
 async fn socket_transport_round_trips_prompt_via_attach() {
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
@@ -259,7 +277,23 @@ async fn read_typed_control(
 async fn replay_completion_after_disconnect(session: &str, in_flight_turn: bool) -> Option<String> {
     use agent_of_empires::acp::control_protocol::{self, ControlBody};
 
-    let (socket_path, _runner) = spawn_runner_with_shim(session, &[]).await;
+    let completion_dir = tempfile::tempdir().expect("completion observation directory");
+    let completed = completion_dir.path().join("completed");
+    let completion_release = completion_dir.path().join("release-completion");
+    let (socket_path, _runner) = spawn_runner_with_shim(
+        session,
+        &[
+            (
+                "AOE_E2E_PROMPT_COMPLETED_FILE",
+                completed.display().to_string(),
+            ),
+            (
+                "SHIM_PROMPT_COMPLETION_RELEASE_FILE",
+                completion_release.display().to_string(),
+            ),
+        ],
+    )
+    .await;
     let control_path = agent_of_empires::process::worker::control_socket_sibling(&socket_path);
     let mut first = tokio::net::UnixStream::connect(&control_path)
         .await
@@ -324,8 +358,15 @@ async fn replay_completion_after_disconnect(session: &str, in_flight_turn: bool)
         Some(ControlBody::Notify { .. })
     ));
     drop(first);
+    std::fs::write(&completion_release, b"release").expect("release completion after detach");
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while std::fs::read(&completed).ok().as_deref() != Some(b"queued") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("runner queued detached completion before reattachment");
     let mut resumed = AcpClient::attach(
         socket_path.clone(),
         std::env::temp_dir(),
@@ -366,6 +407,7 @@ async fn replay_completion_after_disconnect(session: &str, in_flight_turn: bool)
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn cached_completion_obeys_durable_in_flight_state_on_attach() {
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");

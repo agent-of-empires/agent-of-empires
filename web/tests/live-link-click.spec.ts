@@ -1,4 +1,4 @@
-import { test, expect } from "./helpers/mockedTest";
+import { test, expect, observeFor } from "./helpers/mockedTest";
 import { devices, type Page } from "@playwright/test";
 import { clickSidebarSession, openMobileSidebar } from "./helpers/sidebar";
 import { mockTerminalApis, seedSettings, type MockHandle } from "./helpers/terminal-mocks";
@@ -18,9 +18,9 @@ const anchor = (page: Page) => page.locator(`a[href="${LINK}"]`).first();
 const mouseBytes = (h: MockHandle) => h.liveMessages.map((b) => b.toString("latin1")).filter((s) => /\x1b\[</.test(s));
 
 /** A full-screen SGR-mouse frame whose output contains a URL. */
-function pushLinkFrame(handle: MockHandle) {
+async function pushLinkFrame(handle: MockHandle) {
   const lines = [PROMPT, `see ${LINK} for details`, ...Array<string>(22).fill("")];
-  handle.pushLiveFrame({
+  await handle.pushLiveFrame({
     content: `${lines.join("\n")}\n`,
     rows: 24,
     history: 0,
@@ -50,24 +50,6 @@ async function hittableCentre(page: Page, selector: string) {
   return point;
 }
 
-/** Wait until the client stops sending control messages. The mock answers
- *  every resize/window with its own default frame, so pushing the link frame
- *  before the layout settles (mobile sends extra resizes) loses it. */
-async function quiesce(handle: MockHandle) {
-  let last = -1;
-  await expect
-    .poll(
-      async () => {
-        const seen = handle.liveMessages.length;
-        const settled = seen === last;
-        last = seen;
-        return settled;
-      },
-      { timeout: 10_000, intervals: [300] },
-    )
-    .toBe(true);
-}
-
 async function setup(page: Page, mobile: boolean) {
   // Route on the CONTEXT, not the page: the link opens a new tab, and a
   // page-scoped route would leave that tab to hit the real network.
@@ -84,8 +66,8 @@ async function setup(page: Page, mobile: boolean) {
   await clickSidebarSession(page, "pinch-test");
   await page.locator("[data-live-terminal]").first().waitFor({ state: "visible", timeout: 10_000 });
   await expect.poll(() => handle.liveMessages.length, { timeout: 5_000 }).toBeGreaterThan(0);
-  await quiesce(handle);
-  pushLinkFrame(handle);
+  await handle.waitForLiveReady();
+  await pushLinkFrame(handle);
   await expect(scroller(page)).toHaveClass(/overflow-hidden/);
   await expect(anchor(page)).toBeVisible();
   return handle;
@@ -143,8 +125,12 @@ test.describe("Live terminal link taps (mobile)", () => {
   test("a tap on output beside the link opens nothing", async ({ page }) => {
     await setup(page, true);
     const [x, y] = await hittableCentre(page, "[data-live-terminal]");
+    const opened: string[] = [];
+    page.context().on("page", (popup) => opened.push(popup.url()));
     await page.touchscreen.tap(x, y);
-    await page.waitForTimeout(500);
-    expect(page.context().pages()).toHaveLength(1);
+    await observeFor(page, 500, async () => {
+      expect(opened).toEqual([]);
+      expect(page.context().pages()).toHaveLength(1);
+    });
   });
 });

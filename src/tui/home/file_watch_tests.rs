@@ -18,7 +18,7 @@ use tempfile::TempDir;
 
 use super::HomeView;
 use crate::file_watch::FileWatchService;
-use crate::session::test_support::isolate_home;
+use crate::session::test_support::{isolate_home, EnvGuard};
 use crate::session::{Instance, Storage};
 
 fn watcher_err(profile: Option<&str>, message: &str) -> super::watchers::WatcherInitError {
@@ -47,28 +47,6 @@ where
     false
 }
 
-/// RAII guard that sets `AOE_E2E_DEBUG=1` for the scope and clears it
-/// on drop. Mirrors `FailNextListProfilesGuard`'s shape so a panic
-/// between assertions cannot leak the env var to subsequent tests in
-/// the same `cargo test` process.
-struct E2eDebugGuard;
-
-impl E2eDebugGuard {
-    fn enable() -> Self {
-        // SAFETY: env mutation; the Drop impl pairs with this set_var.
-        // #[serial] guards cross-test races on the process env.
-        unsafe { std::env::set_var("AOE_E2E_DEBUG", "1") };
-        Self
-    }
-}
-
-impl Drop for E2eDebugGuard {
-    fn drop(&mut self) {
-        // SAFETY: env cleanup; matches set_var in E2eDebugGuard::enable.
-        unsafe { std::env::remove_var("AOE_E2E_DEBUG") };
-    }
-}
-
 /// Locks the adapter-spawn contract: real watcher events must flip
 /// `disk_watch.dirty` through the `HomeView::new` wiring.
 #[tokio::test]
@@ -80,7 +58,7 @@ async fn home_view_new_spawns_adapter_that_flips_disk_dirty() {
     let live = FileWatchService::new().expect("live svc");
     crate::session::get_profile_dir("hv-adapter").expect("seed dir");
 
-    let view = HomeView::new(
+    let view = HomeView::new_for_test(
         Some("hv-adapter".to_string()),
         crate::tmux::AvailableTools::with_tools(&["claude"]),
         live.clone(),
@@ -124,7 +102,7 @@ async fn rewire_disk_subscriptions_drops_removed_profile_entry() {
     crate::session::get_profile_dir("hv-keep").expect("dir");
     crate::session::get_profile_dir("hv-drop").expect("dir");
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("hv-keep".to_string()),
         crate::tmux::AvailableTools::with_tools(&["claude"]),
         live.clone(),
@@ -170,7 +148,7 @@ async fn config_subscriptions_remove_then_recreate_does_not_leak_or_double_subsc
     let live = FileWatchService::new().expect("live svc");
     crate::session::get_profile_dir("cfg-leak").expect("seed dir");
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("cfg-leak".to_string()),
         crate::tmux::AvailableTools::with_tools(&["claude"]),
         live.clone(),
@@ -226,7 +204,7 @@ async fn rewire_config_subscriptions_does_not_resurrect_deleted_profile_dir() {
     let live = FileWatchService::new().expect("live svc");
     let profile_dir = crate::session::get_profile_dir("ghost").expect("seed dir");
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("ghost".to_string()),
         crate::tmux::AvailableTools::with_tools(&["claude"]),
         live.clone(),
@@ -273,7 +251,7 @@ async fn reload_storage_only_keeps_disk_watch_scoped_in_single_profile_mode() {
     crate::session::get_profile_dir("peer-one").expect("seed peer 1 dir");
     crate::session::get_profile_dir("peer-two").expect("seed peer 2 dir");
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("active-only".to_string()),
         crate::tmux::AvailableTools::with_tools(&["claude"]),
         live.clone(),
@@ -328,7 +306,7 @@ async fn reload_storage_only_preserves_live_send_state_while_adding_peer_row() {
         })
         .expect("seed active row");
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("live-refresh".to_string()),
         crate::tmux::AvailableTools::with_tools(&["claude"]),
         live.clone(),
@@ -444,7 +422,7 @@ async fn reload_storage_only_ends_live_send_when_active_row_is_removed() {
         })
         .expect("seed rows");
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("live-refresh".to_string()),
         crate::tmux::AvailableTools::with_tools(&["claude"]),
         live,
@@ -495,7 +473,7 @@ async fn reload_failure_dialog_waits_until_live_send_exits() {
     let _home = isolate_home(temp.path());
 
     let live = FileWatchService::new().expect("live svc");
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("live-failure".to_string()),
         crate::tmux::AvailableTools::with_tools(&["claude"]),
         live,
@@ -547,7 +525,7 @@ async fn rewire_after_profile_delete_keeps_disk_watch_scoped_in_single_profile_m
     crate::session::get_profile_dir("peer-stays").expect("seed peer that stays");
     crate::session::get_profile_dir("peer-deleted").expect("seed peer to delete");
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("active-scoped".to_string()),
         crate::tmux::AvailableTools::with_tools(&["claude"]),
         live.clone(),
@@ -602,7 +580,7 @@ async fn rewire_after_profile_delete_surfaces_dialog_when_list_profiles_fails() 
     let live = FileWatchService::new().expect("live svc");
     crate::session::get_profile_dir("seam-test").expect("seed dir");
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("seam-test".to_string()),
         crate::tmux::AvailableTools::with_tools(&["claude"]),
         live.clone(),
@@ -638,7 +616,7 @@ async fn reload_storage_only_survives_list_profiles_failure() {
     let live = FileWatchService::new().expect("live svc");
     crate::session::get_profile_dir("reload-fallback").expect("seed dir");
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("reload-fallback".to_string()),
         crate::tmux::AvailableTools::with_tools(&["claude"]),
         live.clone(),
@@ -678,7 +656,7 @@ async fn rewire_after_profile_delete_preserves_existing_info_dialog() {
     let live = FileWatchService::new().expect("live svc");
     crate::session::get_profile_dir("dialog-guard").expect("seed dir");
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("dialog-guard".to_string()),
         crate::tmux::AvailableTools::with_tools(&["claude"]),
         live.clone(),
@@ -727,7 +705,7 @@ async fn rewire_after_profile_delete_watcher_warning_survives_recovery_edge() {
     let live = FileWatchService::new().expect("live svc");
     crate::session::get_profile_dir("watcher-warning-edge").expect("seed dir");
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("watcher-warning-edge".to_string()),
         crate::tmux::AvailableTools::with_tools(&["claude"]),
         live.clone(),
@@ -781,7 +759,7 @@ async fn rewire_no_op_preserves_latched_disk_watcher_init_failure() {
     let live = FileWatchService::new().expect("live svc");
     crate::session::get_profile_dir("hv-noop").expect("seed dir");
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("hv-noop".to_string()),
         crate::tmux::AvailableTools::with_tools(&["claude"]),
         live.clone(),
@@ -828,7 +806,7 @@ async fn rewire_disk_clears_stale_latch_when_failing_profile_is_removed() {
     let live = FileWatchService::new().expect("live svc");
     crate::session::get_profile_dir("active-stale").expect("seed active");
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("active-stale".to_string()),
         crate::tmux::AvailableTools::with_tools(&["claude"]),
         live.clone(),
@@ -867,7 +845,7 @@ async fn rewire_config_clears_stale_latch_when_failing_profile_is_removed() {
     let live = FileWatchService::new().expect("live svc");
     crate::session::get_profile_dir("active-stale-cfg").expect("seed active");
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("active-stale-cfg".to_string()),
         crate::tmux::AvailableTools::with_tools(&["claude"]),
         live.clone(),
@@ -908,7 +886,7 @@ async fn config_init_failure_survives_concurrent_disk_rewire_clear() {
     let live = FileWatchService::new().expect("live svc");
     crate::session::get_profile_dir("hv-iso").expect("seed dir");
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("hv-iso".to_string()),
         crate::tmux::AvailableTools::with_tools(&["claude"]),
         live.clone(),
@@ -1223,7 +1201,7 @@ async fn try_present_reload_failure_dialog_refreshes_body_for_new_source() {
     let live = FileWatchService::new().expect("live svc");
     crate::session::get_profile_dir("body-refresh").expect("seed dir");
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("body-refresh".to_string()),
         crate::tmux::AvailableTools::with_tools(&["claude"]),
         live.clone(),
@@ -1278,7 +1256,7 @@ async fn try_present_reload_failure_dialog_skips_while_foreign_dialog_occupies_s
     let live = FileWatchService::new().expect("live svc");
     crate::session::get_profile_dir("foreign-skip").expect("seed dir");
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("foreign-skip".to_string()),
         crate::tmux::AvailableTools::with_tools(&["claude"]),
         live.clone(),
@@ -1337,7 +1315,7 @@ async fn rewire_config_subscriptions_install_loop_skips_missing_profile_dir() {
     let live = FileWatchService::new().expect("live svc");
     crate::session::get_profile_dir("active").expect("seed active");
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("active".to_string()),
         crate::tmux::AvailableTools::with_tools(&["claude"]),
         live.clone(),
@@ -1386,7 +1364,7 @@ async fn rewire_disk_subscriptions_install_loop_skips_missing_profile_dir() {
     let live = FileWatchService::new().expect("live svc");
     crate::session::get_profile_dir("disk-active").expect("seed active");
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("disk-active".to_string()),
         crate::tmux::AvailableTools::with_tools(&["claude"]),
         live.clone(),
@@ -1430,7 +1408,7 @@ async fn try_present_reload_failure_dialog_refreshes_body_on_partial_recovery() 
     let live = FileWatchService::new().expect("live svc");
     crate::session::get_profile_dir("partial-recovery").expect("seed dir");
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("partial-recovery".to_string()),
         crate::tmux::AvailableTools::with_tools(&["claude"]),
         live.clone(),
@@ -1503,11 +1481,12 @@ async fn try_present_reload_failure_dialog_refreshes_body_on_partial_recovery() 
 async fn watcher_config_refresh_count_exports_to_e2e_debug_file() {
     let temp = TempDir::new().expect("tempdir");
     let _home = isolate_home(temp.path());
+    let _debug_absent = EnvGuard::unset(&["AOE_E2E_DEBUG"]);
 
     let live = FileWatchService::new().expect("live svc");
     crate::session::get_profile_dir("e2e-debug").expect("seed dir");
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("e2e-debug".to_string()),
         crate::tmux::AvailableTools::with_tools(&["claude"]),
         live.clone(),
@@ -1534,7 +1513,7 @@ async fn watcher_config_refresh_count_exports_to_e2e_debug_file() {
          builds and unrelated test runs leave the disk untouched"
     );
 
-    let _guard = E2eDebugGuard::enable();
+    let _debug_enabled = EnvGuard::set(&[("AOE_E2E_DEBUG", "1")]);
 
     let _ = view.try_refresh_from_config_watcher();
     let exported = std::fs::read_to_string(&counter_path)
@@ -1571,7 +1550,7 @@ async fn rewire_config_invalidates_on_inode_change_with_same_canonical_path() {
     let live = FileWatchService::new().expect("live svc");
     let _seed = crate::session::get_profile_dir("inode-drift-cfg").expect("seed dir");
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("inode-drift-cfg".to_string()),
         crate::tmux::AvailableTools::with_tools(&["claude"]),
         live.clone(),
@@ -1588,12 +1567,14 @@ async fn rewire_config_invalidates_on_inode_change_with_same_canonical_path() {
 
     let profile_dir =
         crate::session::get_profile_dir_path("inode-drift-cfg").expect("resolve profile dir");
-    // Cross a kernel coarse-clock tick before the recreate so the new
-    // dir's btime cannot tie with the seed dir's even when the inode
-    // number is recycled (see the sibling primitive test for details).
-    std::thread::sleep(std::time::Duration::from_millis(50));
-    std::fs::remove_dir_all(&profile_dir).expect("remove first incarnation");
+    // Retain the old inode so the replacement cannot reuse its identity.
+    std::fs::rename(&profile_dir, temp.path().join("retired-profile")).unwrap();
     std::fs::create_dir_all(&profile_dir).expect("recreate same-name dir");
+    let replacement_identity = crate::file_watch::capture_watch_identity(&profile_dir).unwrap();
+    assert_ne!(
+        identity_before, replacement_identity,
+        "distinct native identity"
+    );
 
     view.rewire_config_subscriptions(&["inode-drift-cfg".to_string()]);
 
@@ -1604,9 +1585,9 @@ async fn rewire_config_invalidates_on_inode_change_with_same_canonical_path() {
         .expect("entry rebuilt after inode drift")
         .installed_identity;
 
-    assert_ne!(
-        identity_before, identity_after,
-        "rewire must rebuild the entry when the inode drifts even though the canonical path string is unchanged"
+    assert_eq!(
+        identity_after, replacement_identity,
+        "rewire must install the replacement directory at the unchanged canonical path"
     );
 }
 
@@ -1623,7 +1604,7 @@ async fn rewire_disk_invalidates_on_inode_change_with_same_canonical_path() {
     let live = FileWatchService::new().expect("live svc");
     let _seed = crate::session::get_profile_dir("inode-drift-disk").expect("seed dir");
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("inode-drift-disk".to_string()),
         crate::tmux::AvailableTools::with_tools(&["claude"]),
         live.clone(),
@@ -1639,12 +1620,14 @@ async fn rewire_disk_invalidates_on_inode_change_with_same_canonical_path() {
 
     let profile_dir =
         crate::session::get_profile_dir_path("inode-drift-disk").expect("resolve profile dir");
-    // Cross a kernel coarse-clock tick before the recreate so the new
-    // dir's btime cannot tie with the seed dir's even when the inode
-    // number is recycled (see the sibling primitive test for details).
-    std::thread::sleep(std::time::Duration::from_millis(50));
-    std::fs::remove_dir_all(&profile_dir).expect("remove first incarnation");
+    // Retain the old inode so the replacement cannot reuse its identity.
+    std::fs::rename(&profile_dir, temp.path().join("retired-profile")).unwrap();
     std::fs::create_dir_all(&profile_dir).expect("recreate same-name dir");
+    let replacement_identity = crate::file_watch::capture_watch_identity(&profile_dir).unwrap();
+    assert_ne!(
+        identity_before, replacement_identity,
+        "distinct native identity"
+    );
 
     view.rewire_disk_subscriptions(&["inode-drift-disk".to_string()]);
 
@@ -1655,8 +1638,8 @@ async fn rewire_disk_invalidates_on_inode_change_with_same_canonical_path() {
         .expect("entry rebuilt after inode drift")
         .installed_identity;
 
-    assert_ne!(
-        identity_before, identity_after,
-        "rewire must rebuild the entry when the inode drifts even though the canonical path string is unchanged"
+    assert_eq!(
+        identity_after, replacement_identity,
+        "rewire must install the replacement directory at the unchanged canonical path"
     );
 }

@@ -1126,8 +1126,47 @@ mod tests {
     /// `AcpState::apply_event` takes no seq and is not idempotent, and the
     /// drain overlaps the live broadcast by design, so a duplicated event
     /// would leave a second, unresolvable approval card in the shelf.
-    #[test]
-    fn control_fold_skips_events_the_drain_already_applied() {
+    type TestSocket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    async fn connect_test_socket(
+        state: Arc<AppState>,
+    ) -> (TestSocket, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = axum::Router::new()
+            .route("/{id}", axum::routing::get(acp_ws))
+            .with_state(state);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/s-1?frames=0"))
+            .await
+            .unwrap();
+        (socket, server)
+    }
+
+    async fn receive_kind(socket: &mut TestSocket, kind: &str) -> serde_json::Value {
+        use futures_util::StreamExt;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let message = socket.next().await.expect("socket remains open").unwrap();
+                if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if value["kind"] == kind {
+                        return value;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("expected websocket frame")
+    }
+
+    #[tokio::test]
+    async fn control_fold_skips_events_the_drain_already_applied() {
+        let _home = crate::session::test_support::isolate_app_dir();
         let approval = |nonce: &str| crate::acp::approvals::Approval {
             nonce: crate::acp::approvals::Nonce(nonce.into()),
             tool_call: crate::acp::state::ToolCall {
@@ -1146,41 +1185,89 @@ mod tests {
             requested_at: chrono::Utc::now(),
             resolved: None,
         };
-        let mut reduced =
-            AcpState::new(AcpSessionId("s-1".into()), AgentName("claude".into()), None);
-        let mut transcript = TranscriptModel::new();
-        let mut cold = ColdFieldCache::default();
-        let mut folds = ConnectionFolds {
-            reduced: &mut reduced,
-            transcript: &mut transcript,
-            cold: &mut cold,
-            last_applied_seq: 0,
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let event = Event::ApprovalRequested {
+            approval: approval("n-1"),
         };
-        fold_connect_history(
-            vec![(
-                7,
-                Event::ApprovalRequested {
-                    approval: approval("n-1"),
-                },
-            )],
-            0,
-            &mut folds,
-        );
-        assert_eq!(folds.reduced.pending_approvals.len(), 1);
-
-        // The same event arrives again over the broadcast channel. This mirrors
-        // the guard in the live loop.
-        let redelivered_seq = 7;
-        if redelivered_seq > folds.last_applied_seq {
-            let _ = folds.reduced.apply_event(Event::ApprovalRequested {
-                approval: approval("n-1"),
-            });
-        }
+        state.acp_event_store.record("s-1", 7, &event).unwrap();
+        let (mut socket, server) = connect_test_socket(state.clone()).await;
+        let initial = receive_kind(&mut socket, "reduced_state").await;
         assert_eq!(
-            folds.reduced.pending_approvals.len(),
-            1,
-            "a redelivered event must not double the shelf"
+            initial["state"]["pending_approvals"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
         );
+        receive_kind(&mut socket, "transcript_snapshot").await;
+        publish(
+            &state,
+            AcpBroadcastFrame {
+                session_id: "s-1".into(),
+                seq: 7,
+                event: Arc::new(event),
+                worker_generation: None,
+            },
+        );
+        let repeated = receive_kind(&mut socket, "reduced_state").await;
+        assert_eq!(repeated["seq"], 7);
+        assert_eq!(
+            repeated["state"]["pending_approvals"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        state.shutdown.cancel();
+        drop(socket);
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn lagged_broadcast_reports_gap_and_rebuilds_control_state() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        state
+            .acp_event_store
+            .record("s-1", 1, &Event::ThinkingStarted)
+            .unwrap();
+        let (mut socket, server) = connect_test_socket(state.clone()).await;
+        let initial = receive_kind(&mut socket, "reduced_state").await;
+        assert_eq!(initial["state"]["turn_active"], true);
+        receive_kind(&mut socket, "transcript_snapshot").await;
+        // No await in this burst: the current-thread receiver cannot drain its eight slots.
+        for seq in 2..=17 {
+            let event = if seq == 2 {
+                Event::Stopped {
+                    reason: "done".into(),
+                }
+            } else {
+                Event::ThinkingEnded
+            };
+            state.acp_event_store.record("s-1", seq, &event).unwrap();
+            publish(
+                &state,
+                AcpBroadcastFrame {
+                    session_id: "s-1".into(),
+                    seq,
+                    event: Arc::new(event),
+                    worker_generation: None,
+                },
+            );
+        }
+        let gap = receive_kind(&mut socket, "lagged").await;
+        assert_eq!(gap["skipped"], 8);
+        let rebuilt = receive_kind(&mut socket, "reduced_state").await;
+        assert_eq!(rebuilt["seq"], 17);
+        assert_eq!(
+            rebuilt["state"]["turn_active"], false,
+            "missed Stop must be recovered from durable history"
+        );
+        state.shutdown.cancel();
+        drop(socket);
+        server.abort();
+        let _ = server.await;
     }
 
     /// `frames` gates only the raw-frame forwarding, and its default has to
@@ -1264,21 +1351,29 @@ mod tests {
 
     #[tokio::test]
     async fn publish_with_no_receivers_does_not_panic() {
-        // Create a minimal AppState-like fixture: in real code the server
-        // owns AppState; for this unit test we just need the broadcast
-        // channel by itself.
-        let (tx, _rx) = tokio::sync::broadcast::channel::<AcpBroadcastFrame>(8);
-        // Drop receiver: send should not error.
-        drop(_rx);
-        let send_result = tx.send(AcpBroadcastFrame {
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let frame = AcpBroadcastFrame {
             session_id: "s".into(),
             seq: 1,
-            event: Arc::new(crate::acp::Event::ThinkingStarted),
+            event: Arc::new(Event::ThinkingStarted),
             worker_generation: None,
-        });
-        // Sending to a channel with no receivers returns Err, but
-        // publish() in this module deliberately discards the result.
-        assert!(send_result.is_err() || send_result.is_ok());
+        };
+        publish(&state, frame);
+        let mut receiver = state.acp_events_tx.subscribe();
+        publish(
+            &state,
+            AcpBroadcastFrame {
+                session_id: "s".into(),
+                seq: 2,
+                event: Arc::new(Event::ThinkingEnded),
+                worker_generation: None,
+            },
+        );
+        let delivered = receiver
+            .try_recv()
+            .expect("publisher remains usable after a disconnected publish");
+        assert_eq!(delivered.seq, 2);
+        assert!(matches!(*delivered.event, Event::ThinkingEnded));
     }
 
     /// PONG_IDLE_TIMEOUT must outrun PING_INTERVAL by enough margin to

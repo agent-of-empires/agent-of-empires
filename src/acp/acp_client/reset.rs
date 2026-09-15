@@ -75,25 +75,22 @@ mod tests {
     /// `session/new` (each carrying a `thought_level` config option so the
     /// default-effort application path has a target), acks
     /// `session/set_config_option`, and answers every `session/prompt`
-    /// with an `agent_message_chunk` notification, a `prompt_delay_secs`
-    /// pause (0 = immediate), then the turn-ending response.
-    /// `reset_new_delay_secs` delays only the second `session/new`, while
-    /// `reset_config_delay_secs` delays only the second config request;
-    /// those hooks exercise the reset deadlines without slowing ordinary
-    /// tests. Appends every inbound request line to the returned capture
-    /// file so tests can assert exactly which requests were issued.
+    /// with an `agent_message_chunk` notification followed by a turn response.
+    /// Hold flags gate that response, the second `session/new`, or the second
+    /// config request until the test writes the corresponding release file.
+    /// Every inbound request is captured before its response gate.
     #[cfg(unix)]
     fn write_reset_fake_agent(
         dir: &std::path::Path,
-        prompt_delay_secs: u32,
-        reset_new_delay_secs: u32,
-        reset_config_delay_secs: u32,
+        hold_prompt: bool,
+        hold_reset_new: bool,
+        hold_reset_config: bool,
     ) -> (std::path::PathBuf, std::path::PathBuf) {
         write_reset_fake_agent_with_initial_update(
             dir,
-            prompt_delay_secs,
-            reset_new_delay_secs,
-            reset_config_delay_secs,
+            hold_prompt,
+            hold_reset_new,
+            hold_reset_config,
             None,
         )
     }
@@ -104,9 +101,9 @@ mod tests {
     #[cfg(unix)]
     fn write_reset_fake_agent_with_initial_update(
         dir: &std::path::Path,
-        prompt_delay_secs: u32,
-        reset_new_delay_secs: u32,
-        reset_config_delay_secs: u32,
+        hold_prompt: bool,
+        hold_reset_new: bool,
+        hold_reset_config: bool,
         initial_update: Option<serde_json::Value>,
     ) -> (std::path::PathBuf, std::path::PathBuf) {
         let capture = dir.join("capture.ndjson");
@@ -128,9 +125,9 @@ mod tests {
             .unwrap_or_else(|| ":".into());
         let script = r#"#!/bin/sh
 CAPTURE=__CAPTURE__
-DELAY=__DELAY__
-RESET_NEW_DELAY=__RESET_NEW_DELAY__
-RESET_CONFIG_DELAY=__RESET_CONFIG_DELAY__
+HOLD=__HOLD__
+RESET_NEW_HOLD=__RESET_NEW_HOLD__
+RESET_CONFIG_HOLD=__RESET_CONFIG_HOLD__
 count=0
 config_count=0
 while IFS= read -r line; do
@@ -142,33 +139,238 @@ while IFS= read -r line; do
       ;;
     *'"method":"session/new"'*)
       count=$((count+1))
-      if [ "$count" -eq 2 ] && [ "$RESET_NEW_DELAY" -gt 0 ]; then sleep "$RESET_NEW_DELAY"; fi
+      if [ "$count" -eq 2 ] && [ "$RESET_NEW_HOLD" = true ]; then
+        while [ -d "__DIR__" ] && [ ! -f "$CAPTURE.new-release" ]; do sleep 0.01; done
+      fi
       printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sid-%d","configOptions":[{"id":"effort","name":"Reasoning Effort","category":"thought_level","type":"select","currentValue":"default","options":[{"value":"default","name":"Default"},{"value":"high","name":"High"}]}]}}\n' "$id" "$count"
       __INITIAL_NOTIFICATION__
       ;;
     *'"method":"session/set_config_option"'*)
       config_count=$((config_count+1))
-      if [ "$config_count" -eq 2 ] && [ "$RESET_CONFIG_DELAY" -gt 0 ]; then sleep "$RESET_CONFIG_DELAY"; fi
+      if [ "$config_count" -eq 2 ] && [ "$RESET_CONFIG_HOLD" = true ]; then
+        while [ -d "__DIR__" ] && [ ! -f "$CAPTURE.config-release" ]; do sleep 0.01; done
+      fi
       printf '{"jsonrpc":"2.0","id":%s,"result":{"configOptions":[]}}\n' "$id"
       ;;
     *'"method":"session/prompt"'*)
       printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sid-%d","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"working"}}}}\n' "$count"
-      if [ "$DELAY" -gt 0 ]; then sleep "$DELAY"; fi
+      if [ "$HOLD" = true ]; then
+        while [ -d "__DIR__" ] && [ ! -f "$CAPTURE.prompt-release" ]; do sleep 0.01; done
+      fi
       printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
       ;;
   esac
 done
 "#
         .replace("__CAPTURE__", capture.to_str().expect("utf8 tmp path"))
-        .replace("__DELAY__", &prompt_delay_secs.to_string())
-        .replace("__RESET_NEW_DELAY__", &reset_new_delay_secs.to_string())
+        .replace("__DIR__", dir.to_str().expect("utf8 tmp path"))
+        .replace("__HOLD__", &hold_prompt.to_string())
+        .replace("__RESET_NEW_HOLD__", &hold_reset_new.to_string())
         .replace("__INITIAL_NOTIFICATION__", &initial_notification)
         .replace(
-            "__RESET_CONFIG_DELAY__",
-            &reset_config_delay_secs.to_string(),
+            "__RESET_CONFIG_HOLD__",
+            &hold_reset_config.to_string(),
         );
         std::fs::write(&script_path, script).expect("write fake agent script");
         (script_path, capture)
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_captured_requests(capture: &std::path::Path, method: &str, count: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let needle = format!("\"method\":\"{method}\"");
+        loop {
+            let wire = std::fs::read_to_string(capture).expect("read request capture");
+            if wire.matches(&needle).count() >= count {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "adapter did not receive {method}: {wire}"
+            );
+            // Keep paused time stationary until native I/O reaches the target RPC.
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn unavailable_resume_reports_durable_context_reset() {
+        use crate::acp::event_store::EventStore;
+        use crate::acp::transcript::{TranscriptModel, TranscriptRowKind};
+
+        for (name, stored, load_capable, load_fails, new_fails, fork, expected_resets) in [
+            ("unavailable", true, false, false, false, false, 1),
+            ("initial", false, false, false, false, false, 0),
+            ("loaded", true, true, false, false, false, 0),
+            ("load_failed", true, true, true, false, false, 1),
+            ("unavailable_new_failed", true, false, false, true, false, 0),
+            ("load_and_new_failed", true, true, true, true, false, 0),
+            ("fork_unsupported", true, false, false, false, true, 1),
+            (
+                "fork_unsupported_load_failed",
+                true,
+                true,
+                true,
+                false,
+                true,
+                1,
+            ),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let script = tmp.path().join("resume-agent.sh");
+            let capture = tmp.path().join("capture.ndjson");
+            let error = r#""error":{"code":-32603,"message":"fixture refused establishment"}"#;
+            let script_body = r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> '__CAPTURE__'
+  id=$(printf '%s' "$line" | sed -En 's/.*"id":("[^"]*"|[0-9]+).*/\1/p')
+  case $line in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":__LOAD_CAPABLE__}}}\n' "$id" ;;
+    *'"method":"session/load"'*)
+      printf '{"jsonrpc":"2.0","id":%s,__LOAD_REPLY__}\n' "$id" ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,__NEW_REPLY__}\n' "$id" ;;
+    *'"method":"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id" ;;
+  esac
+done
+"#
+            .replace("__CAPTURE__", capture.to_str().unwrap())
+            .replace("__LOAD_CAPABLE__", if load_capable { "true" } else { "false" })
+            .replace("__LOAD_REPLY__", if load_fails { error } else { r#""result":{}"# })
+            .replace("__NEW_REPLY__", if new_fails { error } else { r#""result":{"sessionId":"replacement-session"}"# });
+            std::fs::write(&script, script_body).unwrap();
+            let mut config = reset_fake_spawn_config(&script, tmp.path());
+            config.stored_acp_session_id = stored.then(|| "previous-session".into());
+            config.fork_from = fork.then(|| "parent-session".into());
+            let mut client = AcpClient::spawn(config, AcpSessionId(name.into()))
+                .await
+                .unwrap();
+            let mut events = Vec::new();
+            if stored {
+                events.push(Event::UserPromptSent {
+                    prompt_id: None,
+                    text: "prior user turn".into(),
+                    attachments: vec![],
+                });
+                events.push(Event::AgentMessageChunk {
+                    text: "prior assistant turn".into(),
+                });
+            }
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while let Some(event) = tokio::time::timeout_at(deadline, client.next_event())
+                .await
+                .expect(name)
+            {
+                let assigned = matches!(event, Event::AcpSessionAssigned { .. });
+                let stopped = matches!(event, Event::Stopped { .. });
+                events.push(event);
+                if assigned {
+                    client.send_prompt("continue", &[]).await.unwrap();
+                }
+                if stopped {
+                    client.shutdown().await.unwrap();
+                }
+            }
+            client.shutdown().await.unwrap();
+            let assignment = events
+                .iter()
+                .position(|event| matches!(event, Event::AcpSessionAssigned { .. }));
+            assert_eq!(assignment.is_some(), !new_fails, "{name}");
+            assert_eq!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, Event::AgentStartupError { .. })),
+                new_fails,
+                "{name}"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, Event::Stopped { .. })),
+                !new_fails,
+                "{name}"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, Event::SessionContextReset { .. }))
+                    .count(),
+                expected_resets,
+                "{name}"
+            );
+            if expected_resets > 0 {
+                let reset = events
+                    .iter()
+                    .position(|event| matches!(event, Event::SessionContextReset { .. }))
+                    .unwrap();
+                assert!(
+                    reset < assignment.unwrap(),
+                    "{name}: reset must precede assignment"
+                );
+            }
+
+            let db = tmp.path().join("events.db");
+            let store = EventStore::open(&db, 100).unwrap();
+            for (index, event) in events.iter().enumerate() {
+                store.record(name, index as u64 + 1, event).unwrap();
+            }
+            drop(store);
+            let store = EventStore::open(&db, 100).unwrap();
+            let mut transcript = TranscriptModel::new();
+            for (seq, event) in store.replay_from(name, 0) {
+                transcript.apply_event(seq, &event);
+            }
+            assert_eq!(
+                transcript
+                    .rows()
+                    .iter()
+                    .filter(|row| row.kind == TranscriptRowKind::ContextReset)
+                    .count(),
+                expected_resets,
+                "{name}"
+            );
+            if stored {
+                assert!(
+                    transcript
+                        .rows()
+                        .iter()
+                        .any(|row| row.text == "prior user turn"),
+                    "{name}"
+                );
+                assert!(
+                    transcript
+                        .rows()
+                        .iter()
+                        .any(|row| row.text == "prior assistant turn"),
+                    "{name}"
+                );
+            }
+            let requests: Vec<serde_json::Value> = std::fs::read_to_string(capture)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let loads: Vec<_> = requests
+                .iter()
+                .filter(|request| request["method"] == "session/load")
+                .collect();
+            assert_eq!(loads.len(), usize::from(stored && load_capable), "{name}");
+            if let Some(load) = loads.first() {
+                assert_eq!(load["params"]["sessionId"], "previous-session", "{name}");
+            }
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request["method"] == "session/new")
+                    .count(),
+                usize::from(!(stored && load_capable && !load_fails)),
+                "{name}"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -186,7 +388,7 @@ done
             })
             .await
             .expect("send reset command");
-        tokio::time::timeout(std::time::Duration::from_secs(4), response)
+        tokio::time::timeout_at(deadline + std::time::Duration::from_secs(4), response)
             .await
             .expect("connection task must answer the reset")
             .expect("reset response channel open")
@@ -240,8 +442,9 @@ done
     #[cfg(unix)]
     #[tokio::test]
     async fn expired_reset_deadline_does_not_send_session_new() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         let tmp = tempfile::TempDir::new().expect("tempdir");
-        let (script, capture) = write_reset_fake_agent(tmp.path(), 0, 0, 0);
+        let (script, capture) = write_reset_fake_agent(tmp.path(), false, false, false);
         let config = reset_fake_spawn_config(&script, tmp.path());
         let client = AcpClient::spawn(config, AcpSessionId("reset-expired".into()))
             .await
@@ -278,6 +481,7 @@ done
     #[tokio::test]
     #[serial_test::serial]
     async fn reset_between_prompts_with_open_tool_is_refused() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let initial_update = serde_json::json!({
             "sessionUpdate": "tool_call",
@@ -287,8 +491,13 @@ done
             "status": "in_progress",
             "rawInput": {},
         });
-        let (script, capture) =
-            write_reset_fake_agent_with_initial_update(tmp.path(), 0, 0, 0, Some(initial_update));
+        let (script, capture) = write_reset_fake_agent_with_initial_update(
+            tmp.path(),
+            false,
+            false,
+            false,
+            Some(initial_update),
+        );
         let config = reset_fake_spawn_config(&script, tmp.path());
         let mut client = AcpClient::spawn(config, AcpSessionId("reset-open-tool".into()))
             .await
@@ -320,6 +529,7 @@ done
     #[tokio::test]
     #[serial_test::serial]
     async fn reset_between_prompts_with_background_agent_is_refused() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let transcript = tmp.path().join("background-agent.jsonl");
         std::fs::write(&transcript, "").expect("create background-agent transcript");
@@ -340,8 +550,13 @@ done
                 },
             },
         });
-        let (script, capture) =
-            write_reset_fake_agent_with_initial_update(tmp.path(), 0, 0, 0, Some(initial_update));
+        let (script, capture) = write_reset_fake_agent_with_initial_update(
+            tmp.path(),
+            false,
+            false,
+            false,
+            Some(initial_update),
+        );
         let config = reset_fake_spawn_config(&script, tmp.path());
         let mut client = AcpClient::spawn(config, AcpSessionId("reset-background-agent".into()))
             .await
@@ -374,18 +589,25 @@ done
     #[tokio::test]
     #[serial_test::serial]
     async fn reset_session_new_timeout_releases_the_connection_loop() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         let tmp = tempfile::TempDir::new().expect("tempdir");
-        let (script, _capture) = write_reset_fake_agent(tmp.path(), 0, 1, 0);
+        let (script, capture) = write_reset_fake_agent(tmp.path(), false, true, false);
         let config = reset_fake_spawn_config(&script, tmp.path());
         let client = AcpClient::spawn(config, AcpSessionId("reset-timeout-new".into()))
             .await
             .expect("spawn scripted fake agent");
 
-        let first = reset_with_deadline_for_test(
-            &client,
-            tokio::time::Instant::now() + std::time::Duration::from_millis(200),
-        )
-        .await;
+        tokio::time::pause();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let first = reset_with_deadline_for_test(&client, deadline);
+        tokio::pin!(first);
+        tokio::select! {
+            outcome = &mut first => panic!("reset finished before the target RPC was held: {outcome:?}"),
+            _ = wait_for_captured_requests(&capture, "session/new", 2) => {}
+        }
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        let first = first.await;
+        tokio::time::resume();
         assert!(
             matches!(
                 first,
@@ -395,6 +617,7 @@ done
             "the stalled session/new must fail at the inner deadline, got {first:?}"
         );
 
+        std::fs::write(tmp.path().join("capture.ndjson.new-release"), "release").unwrap();
         let second = reset_with_deadline_for_test(
             &client,
             tokio::time::Instant::now() + std::time::Duration::from_secs(3),
@@ -420,19 +643,26 @@ done
     #[tokio::test]
     #[serial_test::serial]
     async fn reset_config_timeout_commits_and_releases_the_connection_loop() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         let tmp = tempfile::TempDir::new().expect("tempdir");
-        let (script, capture) = write_reset_fake_agent(tmp.path(), 0, 0, 1);
+        let (script, capture) = write_reset_fake_agent(tmp.path(), false, false, true);
         let mut config = reset_fake_spawn_config(&script, tmp.path());
         config.default_effort = Some("high".into());
         let client = AcpClient::spawn(config, AcpSessionId("reset-timeout-config".into()))
             .await
             .expect("spawn scripted fake agent");
 
-        let first = reset_with_deadline_for_test(
-            &client,
-            tokio::time::Instant::now() + std::time::Duration::from_millis(200),
-        )
-        .await;
+        tokio::time::pause();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let first = reset_with_deadline_for_test(&client, deadline);
+        tokio::pin!(first);
+        tokio::select! {
+            outcome = &mut first => panic!("reset finished before the target RPC was held: {outcome:?}"),
+            _ = wait_for_captured_requests(&capture, "session/set_config_option", 2) => {}
+        }
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        let first = first.await;
+        tokio::time::resume();
         assert!(
             matches!(
                 first,
@@ -443,6 +673,7 @@ done
             "a post-commit config timeout must preserve reset success, got {first:?}"
         );
 
+        std::fs::write(tmp.path().join("capture.ndjson.config-release"), "release").unwrap();
         client
             .send_prompt("after config timeout", &[])
             .await
@@ -482,8 +713,9 @@ done
     #[cfg(unix)]
     #[tokio::test]
     async fn codex_clear_drives_fresh_session_new_on_live_worker() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         let tmp = tempfile::TempDir::new().expect("tempdir");
-        let (script, capture) = write_reset_fake_agent(tmp.path(), 0, 0, 0);
+        let (script, capture) = write_reset_fake_agent(tmp.path(), false, false, false);
         let mut config = reset_fake_spawn_config(&script, tmp.path());
         // A configured default effort must survive the reset: spawn applies
         // it after its session/new, and the driven reset must re-apply it
@@ -608,10 +840,10 @@ done
     #[tokio::test]
     #[serial_test::serial]
     async fn reset_during_in_flight_prompt_is_refused_with_prompt_rejected() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         let tmp = tempfile::TempDir::new().expect("tempdir");
-        // 3s prompt delay: long enough to land the reset mid-turn, short
-        // enough to keep the test snappy.
-        let (script, capture) = write_reset_fake_agent(tmp.path(), 3, 0, 0);
+        // The adapter remains in-flight until the refusal is observed.
+        let (script, capture) = write_reset_fake_agent(tmp.path(), true, false, false);
         let config = reset_fake_spawn_config(&script, tmp.path());
         let mut client = AcpClient::spawn(config, AcpSessionId("reset-busy-2979".into()))
             .await
@@ -654,6 +886,8 @@ done
                     assert_eq!(reason, "agent_busy");
                     assert_eq!(text, "/new", "the retry pill needs the typed alias");
                     saw_rejected = true;
+                    std::fs::write(tmp.path().join("capture.ndjson.prompt-release"), "release")
+                        .unwrap();
                 }
                 Event::SessionCleared => saw_cleared = true,
                 Event::Stopped { .. } => break,

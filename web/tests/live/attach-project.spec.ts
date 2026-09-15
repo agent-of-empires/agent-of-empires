@@ -16,19 +16,12 @@ import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { appDirFor, listSessions, resolveAoeBinary, spawnAoeServe, type ServeHandle } from "../helpers/aoeServe";
 
-const GIT_ENV = {
-  GIT_AUTHOR_NAME: "t",
-  GIT_AUTHOR_EMAIL: "t@t",
-  GIT_COMMITTER_NAME: "t",
-  GIT_COMMITTER_EMAIL: "t@t",
-  GIT_CONFIG_GLOBAL: "/dev/null",
-  GIT_CONFIG_SYSTEM: "/dev/null",
-} as const;
+import { gitEnv } from "../helpers/gitFixture";
 
-function run(cmd: string, args: string[], cwd: string) {
+function run(env: NodeJS.ProcessEnv, cmd: string, args: string[], cwd: string) {
   const res = spawnSync(cmd, args, {
     cwd,
-    env: { ...process.env, ...GIT_ENV },
+    env: gitEnv(env),
     encoding: "utf8",
   });
   if (res.error || res.status !== 0) {
@@ -40,13 +33,13 @@ function run(cmd: string, args: string[], cwd: string) {
   return res.stdout.trim();
 }
 
-function seedRepo(home: string, name: string, extraBranch?: string) {
+function seedRepo(env: NodeJS.ProcessEnv, home: string, name: string, extraBranch?: string) {
   const dir = join(home, name);
-  run("git", ["init", "-q", "--initial-branch=main", dir], home);
+  run(env, "git", ["init", "-q", "--initial-branch=main", dir], home);
   writeFileSync(join(dir, "file.txt"), `${name}\n`);
-  run("git", ["add", "file.txt"], dir);
-  run("git", ["commit", "-q", "-m", "init"], dir);
-  if (extraBranch) run("git", ["branch", extraBranch], dir);
+  run(env, "git", ["add", "file.txt"], dir);
+  run(env, "git", ["commit", "-q", "-m", "init"], dir);
+  if (extraBranch) run(env, "git", ["branch", extraBranch], dir);
   return dir;
 }
 
@@ -95,15 +88,16 @@ base("attaching a project over the daemon converts the session into a workspace"
       authMode: "none",
       workerIndex: testInfo.workerIndex,
       parallelIndex: testInfo.parallelIndex,
-      seedFn: ({ home }) => {
-        seedRepo(home, "backend");
+      seedFn: ({ home, env }) => {
+        seedRepo(env, home, "backend");
         // `taken` already has the branch the session will suggest, so the
         // refuse / opt-in behaviour can be exercised without a second attach.
-        seedRepo(home, "frontend");
-        seedRepo(home, "taken", "feature/attach-live");
+        seedRepo(env, home, "frontend");
+        seedRepo(env, home, "taken", "feature/attach-live");
       },
     });
 
+    const env = serve.env;
     const created = await fetch(`${serve.baseUrl}/api/sessions`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -139,7 +133,7 @@ base("attaching a project over the daemon converts the session into a workspace"
     for (const name of ["backend", "frontend"]) {
       const worktree = join(workspaceDir!, name);
       expect(existsSync(join(worktree, ".git"))).toBe(true);
-      expect(run("git", ["rev-parse", "--abbrev-ref", "HEAD"], worktree)).toBe("feature/attach-live");
+      expect(run(env, "git", ["rev-parse", "--abbrev-ref", "HEAD"], worktree)).toBe("feature/attach-live");
     }
 
     // Nothing is parked in the app dir any more: the whole point of the

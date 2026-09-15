@@ -157,7 +157,9 @@ pub(super) fn resolve_detected_status(
             }
         }
         Status::Idle if is_dead => Status::Error,
-        Status::Idle if is_shell_stale => resolve_shell_stale_status(pane_content, tool),
+        Status::Idle | Status::Waiting if is_shell_stale => {
+            resolve_shell_stale_status(pane_content, tool)
+        }
         other => other,
     }
 }
@@ -308,17 +310,19 @@ mod tests {
 
     #[test]
     fn test_resolve_detected_status_shell_stale_bare_prompt_is_error() {
-        assert_eq!(
-            resolve_detected_status(
-                Status::Idle,
-                false,
-                true,
-                false,
-                "Welcome\nuser@host:~$ ",
-                "opencode",
-            ),
-            Status::Error
-        );
+        for detected in [Status::Idle, Status::Waiting] {
+            assert_eq!(
+                resolve_detected_status(
+                    detected,
+                    false,
+                    true,
+                    false,
+                    "Welcome\nuser@host:~$ ",
+                    "opencode",
+                ),
+                Status::Error
+            );
+        }
     }
 
     #[test]

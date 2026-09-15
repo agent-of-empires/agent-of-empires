@@ -55,7 +55,7 @@ fn boot_ambiguous_state(with_journal: bool) -> (TempDir, AppDirGuard, String) {
 fn interrupted_move_with_journal_repairs_before_publish() {
     let (_temp, _guard, id) = boot_ambiguous_state(true);
 
-    let view = HomeView::new(
+    let view = HomeView::new_for_test(
         None,
         AvailableTools::with_tools(&["claude"]),
         crate::file_watch::FileWatchService::noop(),
@@ -83,7 +83,7 @@ fn interrupted_move_with_journal_repairs_before_publish() {
 fn legacy_duplicate_stays_excluded_and_is_surfaced() {
     let (_temp, _guard, id) = boot_ambiguous_state(false);
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         None,
         AvailableTools::with_tools(&["claude"]),
         crate::file_watch::FileWatchService::noop(),

@@ -10,6 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[test]
+#[serial_test::parallel]
 fn no_stale_init_hook_base_references() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut offenders: Vec<(PathBuf, usize, String)> = Vec::new();

@@ -10,7 +10,7 @@
 // "Legacy mobile/touch recipe".
 
 import { devices } from "@playwright/test";
-import { test, expect } from "./helpers/mockedTest";
+import { test, expect, publishedRequests, observeFor } from "./helpers/mockedTest";
 import { installSidebarMocks, threeSessionsInOneRepo } from "./helpers/sidebarMocks";
 
 test.use({ ...devices["iPhone 13"] });
@@ -67,6 +67,9 @@ test("touch flick on the sidebar does not reorder rows", async ({ page }) => {
     touchPoints: [],
   });
 
-  await page.waitForTimeout(300);
+  await observeFor(page, 300, async () => {
+    expect(await publishedRequests(page, "/api/workspace-ordering", "PUT")).toEqual([]);
+    expect(handle.puts).toEqual([]);
+  });
   expect(handle.puts).toEqual([]);
 });

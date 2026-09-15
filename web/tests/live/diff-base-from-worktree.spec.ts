@@ -17,19 +17,12 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { spawnAoeServe, type ServeHandle } from "../helpers/aoeServe";
 
-const GIT_ENV = {
-  GIT_AUTHOR_NAME: "t",
-  GIT_AUTHOR_EMAIL: "t@t",
-  GIT_COMMITTER_NAME: "t",
-  GIT_COMMITTER_EMAIL: "t@t",
-  GIT_CONFIG_GLOBAL: "/dev/null",
-  GIT_CONFIG_SYSTEM: "/dev/null",
-} as const;
+import { gitEnv } from "../helpers/gitFixture";
 
-function run(cmd: string, args: string[], cwd: string) {
+function run(env: NodeJS.ProcessEnv, cmd: string, args: string[], cwd: string) {
   const res = spawnSync(cmd, args, {
     cwd,
-    env: { ...process.env, ...GIT_ENV },
+    env: gitEnv(env),
     encoding: "utf8",
   });
   if (res.error || res.status !== 0) {
@@ -73,20 +66,20 @@ base("diff base defaults to the worktree's base branch, override still wins", as
       authMode: "none",
       workerIndex: testInfo.workerIndex,
       parallelIndex: testInfo.parallelIndex,
-      seedFn: ({ home }) => {
+      seedFn: ({ home, env }) => {
         // Healthy single repo: `main` with two commits, plus a
         // `release` branch pinned at the first commit. Auto-detection
         // resolves to `main`, so a later base of `release` can only
         // come from the worktree base layer.
         const primary = join(home, "primary");
-        run("git", ["init", "-q", "--initial-branch=main", primary], home);
+        run(env, "git", ["init", "-q", "--initial-branch=main", primary], home);
         writeFileSync(join(primary, "file.txt"), "hello\n");
-        run("git", ["add", "file.txt"], primary);
-        run("git", ["commit", "-q", "-m", "commit A"], primary);
-        run("git", ["branch", "release"], primary);
+        run(env, "git", ["add", "file.txt"], primary);
+        run(env, "git", ["commit", "-q", "-m", "commit A"], primary);
+        run(env, "git", ["branch", "release"], primary);
         writeFileSync(join(primary, "file2.txt"), "world\n");
-        run("git", ["add", "file2.txt"], primary);
-        run("git", ["commit", "-q", "-m", "commit B"], primary);
+        run(env, "git", ["add", "file2.txt"], primary);
+        run(env, "git", ["commit", "-q", "-m", "commit B"], primary);
       },
     });
 

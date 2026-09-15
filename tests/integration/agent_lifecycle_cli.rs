@@ -109,6 +109,7 @@ fn run_aoe(home: &Path, xdg: &Path, stub: &Path, args: &[&str]) -> std::process:
 }
 
 #[test]
+#[serial_test::parallel]
 fn aoe_agents_lists_deprecated_notice() {
     let (_tmp, home, xdg) = isolated_dirs();
     let (_stub_tmp, stub) = stub_dir(&["gemini"]);
@@ -130,6 +131,7 @@ fn aoe_agents_lists_deprecated_notice() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn acp_doctor_text_emits_amber_lifecycle_notice() {
     let (_tmp, home, xdg) = isolated_dirs();
     let (_stub_tmp, stub) = stub_dir(&["gemini"]);
@@ -147,6 +149,7 @@ fn acp_doctor_text_emits_amber_lifecycle_notice() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn aoe_add_lifecycle_warning_covers_all_resolution_paths() {
     struct Case {
         name: &'static str,

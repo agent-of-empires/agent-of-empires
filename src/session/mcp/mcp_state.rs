@@ -322,18 +322,9 @@ mod tests {
     use super::*;
     use crate::session::mcp::project_mcp::parse_standard_mcp_servers;
 
-    /// The drift store path derives from HOME; the env mutation is serialized
-    /// across the whole suite by `#[serial_test::serial]` on each test (the same
-    /// global lock the supervisor's HOME-touching tests use), and the returned
-    /// `TempDir` must be kept alive for the test body.
-    fn set_tmp_home() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        // SAFETY: serialized by `#[serial]`; matches the existing pattern.
-        unsafe {
-            std::env::set_var("HOME", dir.path());
-            std::env::set_var("XDG_CONFIG_HOME", dir.path().join(".config"));
-        }
-        dir
+    /// Keep the HOME-derived drift store isolated until the test finishes.
+    fn set_tmp_home() -> crate::session::test_support::AppDirGuard {
+        crate::session::test_support::isolate_app_dir()
     }
 
     fn read(json: &str) -> NativeRead {

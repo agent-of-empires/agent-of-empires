@@ -335,7 +335,7 @@ fn reconcile_scoped(
     reap: &ReapProbe<'_>,
 ) -> Result<()> {
     let app_dir = crate::session::get_app_dir()?;
-    if !transition_may_be_pending(&app_dir)? {
+    if !transition_may_be_pending(&app_dir, !announce && only.is_none())? {
         return Ok(());
     }
     let home = dirs::home_dir().context("home directory unavailable for sandbox migration")?;
@@ -362,8 +362,11 @@ fn reconcile_scoped(
     Ok(())
 }
 
-fn transition_may_be_pending(app_dir: &Path) -> Result<bool> {
-    if app_dir.join(JOURNAL).exists() {
+/// Whether a pass has anything to do. A bare start copies, publishes and
+/// retires nothing, so the journal and a parked row, even one planned before
+/// it was parked, are work only for a launch or `aoe migrate`.
+fn transition_may_be_pending(app_dir: &Path, bare_start: bool) -> Result<bool> {
+    if !bare_start && app_dir.join(JOURNAL).exists() {
         return Ok(true);
     }
     for registry in load_registries(app_dir)? {
@@ -371,23 +374,43 @@ fn transition_may_be_pending(app_dir: &Path) -> Result<bool> {
             continue;
         };
         if rows.iter().any(|row| {
-            row.get("sandbox_info")
-                .and_then(|sandbox| sandbox.get("enabled"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-                && (row
-                    .get("sandbox_store_generation")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0)
-                    < u64::from(
-                        crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION,
-                    )
-                    || transition_paths(row).ok().flatten().is_some())
+            if on_shared_store(row) {
+                !(bare_start && row_is_parked(row))
+            } else {
+                is_sandboxed(row) && transition_paths(row).ok().flatten().is_some()
+            }
         }) {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+fn is_sandboxed(row: &Value) -> bool {
+    row.pointer("/sandbox_info/enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn on_shared_store(row: &Value) -> bool {
+    is_sandboxed(row)
+        && row
+            .get("sandbox_store_generation")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            < u64::from(crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION)
+}
+
+/// How many sandboxed sessions still use a shared agent store, so `aoe
+/// migrate` does not call a run that left some there complete.
+pub(crate) fn sessions_on_shared_store() -> Result<usize> {
+    let app_dir = crate::session::get_app_dir()?;
+    Ok(load_registries(&app_dir)?
+        .iter()
+        .filter_map(|registry| registry.value.as_array())
+        .flatten()
+        .filter(|row| on_shared_store(row))
+        .count())
 }
 
 /// Whether a row's store move is published but not yet finished, so its
@@ -1290,9 +1313,14 @@ fn run_pass(
     }
 
     let done = ready_rows.len();
-    if !affected_rows.is_empty() && (announce || done > 0) {
+    // A held-only backlog is announced too: without it `aoe migrate` reports
+    // nothing about sessions it deliberately left on the shared store.
+    if (!affected_rows.is_empty() || held_row_count > 0) && (announce || done > 0) {
         let left = affected_rows.len().saturating_sub(done);
         progress::notice(match (left, held_row_count) {
+            (0, held) if affected_rows.is_empty() => format!(
+                "{held} trashed or archived sandboxed session(s) stay on the shared agent store; each moves when it is started, or restore or unarchive it and run `aoe migrate`."
+            ),
             (0, 0) => format!("{done} sandboxed session(s) now use private agent stores."),
             (0, held) => format!(
                 "{done} sandboxed session(s) now use private agent stores. {held} trashed or archived session(s) stay on the shared agent store; each moves when it is started, or restore or unarchive it and run `aoe migrate`."
@@ -2371,8 +2399,28 @@ mod tests {
         .unwrap();
         fs::write(app.join(JOURNAL), br#"["/home/u/.claude/sandbox"]"#).unwrap();
 
-        assert!(transition_may_be_pending(&app).unwrap());
+        assert!(transition_may_be_pending(&app, false).unwrap());
+        assert!(
+            !transition_may_be_pending(&app, true).unwrap(),
+            "a bare start has nothing to do for a parked row and a journal"
+        );
         assert!(!transition_in_flight(&app).unwrap());
+
+        // Planned by an earlier pass, then archived.
+        fs::write(
+            app.join("sessions.json"),
+            r#"[{"id":"1111111111111111","sandbox_info":{"enabled":true},"archived_at":"2026-01-01T00:00:00Z","sandbox_store_generation":1,"sandbox_store_transition_paths":[{"source":"/a","destination":"/b"}]}]"#,
+        )
+        .unwrap();
+        assert!(transition_may_be_pending(&app, false).unwrap());
+        assert!(!transition_may_be_pending(&app, true).unwrap());
+
+        fs::write(
+            app.join("sessions.json"),
+            r#"[{"id":"1111111111111111","sandbox_info":{"enabled":true}}]"#,
+        )
+        .unwrap();
+        assert!(transition_may_be_pending(&app, true).unwrap());
 
         fs::write(
             app.join("sessions.json"),
@@ -2380,6 +2428,7 @@ mod tests {
         )
         .unwrap();
 
+        assert!(transition_may_be_pending(&app, true).unwrap());
         assert!(transition_in_flight(&app).unwrap());
 
         // Metadata the migration cannot parse is state it cannot validate, so
@@ -2431,7 +2480,7 @@ mod tests {
             home.join(".gemini/sandbox").is_dir(),
             "the legacy source must survive a deferred reap"
         );
-        assert!(transition_may_be_pending(&app).unwrap());
+        assert!(transition_may_be_pending(&app, false).unwrap());
 
         super::run_in(
             &app,
@@ -2451,7 +2500,7 @@ mod tests {
             b"legacy"
         );
         assert!(!home.join(".gemini/sandbox").exists());
-        assert!(!transition_may_be_pending(&app).unwrap());
+        assert!(!transition_may_be_pending(&app, false).unwrap());
     }
 
     /// `AOE_DEFER_SANDBOX_MIGRATION` must behave exactly like a live cohort: no
@@ -2548,9 +2597,8 @@ mod tests {
         assert!(!defer_requested_by(Some(std::ffi::OsStr::new(""))));
         assert!(defer_requested_by(Some(std::ffi::OsStr::new("1"))));
 
-        std::env::set_var(DEFER_ENV, "1");
+        let _defer = crate::session::test_support::EnvGuard::set(&[(DEFER_ENV, "1")]);
         let result = super::super::run_migrations_announced(None);
-        std::env::remove_var(DEFER_ENV);
         result.unwrap();
 
         // The runner commits the build's target version, not v27 in
@@ -2562,7 +2610,7 @@ mod tests {
             super::super::CURRENT_VERSION.to_string()
         );
         assert!(!super::super::has_pending_migrations());
-        assert!(transition_may_be_pending(&app).unwrap());
+        assert!(transition_may_be_pending(&app, false).unwrap());
         assert!(home.join(".gemini/sandbox").is_dir());
         assert!(!home.join(".gemini/sandbox-v2").exists());
         let pending: Value =
@@ -3191,6 +3239,24 @@ gemini = "{}"
             legacy.exists(),
             "a parked row must protect the shared source it still reads"
         );
+
+        // Only the parked rows are left: `aoe migrate` must still say why.
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let guard = progress::install(Some(std::sync::Arc::new(move |event| {
+            sink.lock().unwrap().push(event)
+        })));
+        run_in(&app, &home, &|_| Ok(false)).unwrap();
+        drop(guard);
+        assert!(
+            events.lock().unwrap().iter().any(|event| matches!(
+                event,
+                progress::Event::Notice(line) if line.starts_with("2 trashed or archived")
+            )),
+            "{:?}",
+            events.lock().unwrap()
+        );
+        assert_eq!(sessions_on_shared_store().unwrap(), 2);
     }
 
     /// Clearing `trashed_at` makes the row eligible again, and the start that
@@ -3941,31 +4007,33 @@ gemini = "{}"
         row
     }
 
-    /// Run a full pass on its own thread, paused inside its first copy until
-    /// `release` is sent; `paused` reports when it is. The pass holds only its
-    /// cohort lock while paused.
-    fn paused_pass(
-        app: &Path,
-        home: &Path,
-    ) -> (
-        std::thread::JoinHandle<Result<()>>,
-        std::sync::mpsc::Receiver<()>,
-        std::sync::mpsc::Sender<()>,
-    ) {
+    struct PausedPass {
+        pass: Option<std::thread::JoinHandle<Result<()>>>,
+        paused: std::sync::mpsc::Receiver<()>,
+        release: Option<std::sync::mpsc::Sender<()>>,
+    }
+
+    impl PausedPass {
+        fn finish(mut self) -> std::thread::Result<Result<()>> {
+            drop(self.release.take());
+            self.pass.take().unwrap().join()
+        }
+    }
+
+    impl Drop for PausedPass {
+        fn drop(&mut self) {
+            drop(self.release.take());
+            if let Some(pass) = self.pass.take() {
+                let _ = pass.join();
+            }
+        }
+    }
+
+    fn paused_pass(app: &Path, home: &Path) -> PausedPass {
         paused_pass_with(app, home, false)
     }
 
-    /// `live_after_gate` makes every container read as running once the
-    /// copy has been released, as if one came up during the copy.
-    fn paused_pass_with(
-        app: &Path,
-        home: &Path,
-        live_after_gate: bool,
-    ) -> (
-        std::thread::JoinHandle<Result<()>>,
-        std::sync::mpsc::Receiver<()>,
-        std::sync::mpsc::Sender<()>,
-    ) {
+    fn paused_pass_with(app: &Path, home: &Path, live_after_gate: bool) -> PausedPass {
         let (paused_tx, paused_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let app = app.to_path_buf();
@@ -3976,7 +4044,7 @@ gemini = "{}"
             COPY_GATE.with(|gate| {
                 *gate.borrow_mut() = Some(Box::new(move |_: &Path| {
                     paused_tx.send(()).unwrap();
-                    release_rx.recv().unwrap();
+                    let _ = release_rx.recv();
                     gate_live.set(live_after_gate);
                 }));
             });
@@ -3990,7 +4058,11 @@ gemini = "{}"
                 None,
             )
         });
-        (pass, paused_rx, release_tx)
+        PausedPass {
+            pass: Some(pass),
+            paused: paused_rx,
+            release: Some(release_tx),
+        }
     }
 
     /// The copy runs without the transition lock, so publication re-reads
@@ -4019,9 +4091,8 @@ gemini = "{}"
                 format!("[{}]", row("1111111111111111")),
             )
             .unwrap();
-            let (pass, paused, release) =
-                paused_pass_with(&app, &home, matches!(case, Case::ContainerUp));
-            paused
+            let pass = paused_pass_with(&app, &home, matches!(case, Case::ContainerUp));
+            pass.paused
                 .recv_timeout(std::time::Duration::from_secs(10))
                 .expect("the pass reached its copy");
             match case {
@@ -4043,8 +4114,7 @@ gemini = "{}"
                 }
                 Case::ContainerUp => {}
             }
-            release.send(()).unwrap();
-            pass.join().unwrap().unwrap();
+            pass.finish().unwrap().unwrap();
 
             let rows: Value =
                 serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
@@ -4074,7 +4144,7 @@ gemini = "{}"
         }
     }
 
-    fn wait_finished<T>(handle: &std::thread::JoinHandle<T>, what: &str) {
+    fn wait_finished<T>(handle: &std::thread::ScopedJoinHandle<'_, T>, what: &str) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !handle.is_finished() {
             assert!(
@@ -4109,40 +4179,41 @@ gemini = "{}"
         .unwrap();
         fs::write(&beta, b"[]").unwrap();
 
-        let (pass, paused, release) = paused_pass(&app, &home);
-        paused
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .expect("the pass reached its copy");
+        std::thread::scope(|scope| {
+            let pass = paused_pass(&app, &home);
+            pass.paused
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the pass reached its copy");
 
-        let writes = {
-            let (alpha, beta) = (alpha.clone(), beta.clone());
-            std::thread::spawn(move || {
-                let write = |profile: &str, path: PathBuf, title: &str| {
-                    crate::session::Storage::new_for_test_path(profile, path).update(
-                        |instances, _| {
-                            match instances.first_mut() {
-                                Some(first) => first.title = title.to_string(),
-                                None => {
-                                    instances.push(crate::session::Instance::new(title, "/tmp"))
+            let writes = {
+                let (alpha, beta) = (alpha.clone(), beta.clone());
+                scope.spawn(move || {
+                    let write = |profile: &str, path: PathBuf, title: &str| {
+                        crate::session::Storage::new_for_test_path(profile, path).update(
+                            |instances, _| {
+                                match instances.first_mut() {
+                                    Some(first) => first.title = title.to_string(),
+                                    None => {
+                                        instances.push(crate::session::Instance::new(title, "/tmp"))
+                                    }
                                 }
-                            }
-                            Ok(())
-                        },
+                                Ok(())
+                            },
+                        )
+                    };
+                    (
+                        write("alpha", alpha, "renamed mid-copy"),
+                        write("beta", beta, "beta row"),
                     )
-                };
-                (
-                    write("alpha", alpha, "renamed mid-copy"),
-                    write("beta", beta, "beta row"),
-                )
-            })
-        };
-        wait_finished(&writes, "storage writes during the copy");
-        let (alpha_write, beta_write) = writes.join().unwrap();
-        alpha_write.unwrap();
-        beta_write.unwrap();
+                })
+            };
+            wait_finished(&writes, "storage writes during the copy");
+            let (alpha_write, beta_write) = writes.join().unwrap();
+            alpha_write.unwrap();
+            beta_write.unwrap();
 
-        release.send(()).unwrap();
-        pass.join().unwrap().unwrap();
+            pass.finish().unwrap().unwrap();
+        });
 
         let alpha_rows: Value = serde_json::from_slice(&fs::read(&alpha).unwrap()).unwrap();
         assert_eq!(alpha_rows[0]["title"], "renamed mid-copy");
@@ -4180,78 +4251,96 @@ gemini = "{}"
         )
         .unwrap();
 
-        let (holder, paused, release) = paused_pass(&app, &home);
-        paused
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .expect("the holder reached its copy");
+        // Planning canonicalizes the source before choosing its cohort lock.
+        // Resolve it before publication removes it, including symlinked temp
+        // ancestors such as macOS /var -> /private/var.
+        let cohort_root = fs::canonicalize(home.join(".gemini/sandbox")).unwrap();
 
-        let copies = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counting_pass = |only: Option<&'static str>| {
-            let (app, home, copies) = (app.clone(), home.clone(), copies.clone());
-            std::thread::spawn(move || {
-                COPY_GATE.with(|gate| {
-                    *gate.borrow_mut() = Some(Box::new(move |_: &Path| {
-                        copies.fetch_add(1, Ordering::Relaxed);
-                    }));
-                });
-                super::run_in(
-                    &app,
-                    &home,
-                    &|_| Ok(false),
-                    &|_| Ok(true),
-                    false,
-                    true,
-                    only,
-                )
-            })
-        };
+        std::thread::scope(|scope| {
+            let holder = paused_pass(&app, &home);
+            holder
+                .paused
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the holder reached its copy");
 
-        // A full pass gets its turn at the transition lock, sees the root is
-        // busy, and returns without copying while the holder is still paused.
-        let full = counting_pass(None);
-        wait_finished(&full, "a full pass beside a held cohort");
-        full.join().unwrap().unwrap();
-        assert_eq!(copies.load(Ordering::Relaxed), 0);
-        let rows: Value =
-            serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
-        assert_eq!(rows[0]["sandbox_store_generation"], 1, "nothing published");
+            let copies = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (contended_tx, contended_rx) = std::sync::mpsc::channel();
+            let counting_pass = |only: Option<&'static str>| {
+                let contended_tx = contended_tx.clone();
+                let (app, home, copies) = (app.clone(), home.clone(), copies.clone());
+                scope.spawn(move || {
+                    let _observer = only
+                        .map(|_| crate::session::observe_lock_contention_for_test(contended_tx));
+                    COPY_GATE.with(|gate| {
+                        *gate.borrow_mut() = Some(Box::new(move |_: &Path| {
+                            copies.fetch_add(1, Ordering::Relaxed);
+                        }));
+                    });
+                    super::run_in(
+                        &app,
+                        &home,
+                        &|_| Ok(false),
+                        &|_| Ok(true),
+                        false,
+                        true,
+                        only,
+                    )
+                })
+            };
 
-        // A scoped pass waits for the holder instead of copying beside it.
-        let scoped = counting_pass(Some("1111111111111111"));
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        assert!(
-            !scoped.is_finished(),
-            "a scoped pass must wait for the holder"
-        );
-        assert_eq!(copies.load(Ordering::Relaxed), 0);
+            // A full pass gets its turn at the transition lock, sees the root is
+            // busy, and returns without copying while the holder is still paused.
+            let full = counting_pass(None);
+            wait_finished(&full, "a full pass beside a held cohort");
+            full.join().unwrap().unwrap();
+            assert_eq!(copies.load(Ordering::Relaxed), 0);
+            let rows: Value =
+                serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
+            assert_eq!(rows[0]["sandbox_store_generation"], 1, "nothing published");
 
-        release.send(()).unwrap();
-        holder.join().unwrap().unwrap();
-        wait_finished(&scoped, "the scoped pass after the holder finished");
-        scoped.join().unwrap().unwrap();
-        assert_eq!(
-            copies.load(Ordering::Relaxed),
-            0,
-            "the holder's copy was the only one"
-        );
-
-        let rows: Value =
-            serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
-        assert_eq!(rows[0]["sandbox_store_generation"], 2);
-        assert_eq!(rows[1]["sandbox_store_generation"], 2);
-        for id in ["1111111111111111", "2222222222222222"] {
+            // A scoped pass waits for the holder instead of copying beside it.
+            let scoped = counting_pass(Some("1111111111111111"));
+            let contention = contended_rx.recv_timeout(std::time::Duration::from_secs(10));
+            let finished_while_held = scoped.is_finished();
+            let copies_while_held = copies.load(Ordering::Relaxed);
+            let holder_result = holder.finish();
+            wait_finished(&scoped, "the scoped pass after the holder finished");
+            let scoped_result = scoped.join();
+            holder_result.unwrap().unwrap();
+            scoped_result.unwrap().unwrap();
             assert_eq!(
-                fs::read(
-                    home.join(".gemini/sandbox-v2")
-                        .join(id)
-                        .join("history/id.json")
-                )
-                .unwrap(),
-                b"legacy"
+                contention.expect("scoped pass must reach the held cohort lock"),
+                app.join(cohort_lock_name(&cohort_root))
             );
-        }
-        assert!(!home.join(".gemini/sandbox").exists());
-        assert!(!app.join(JOURNAL).exists());
+            assert!(
+                !finished_while_held,
+                "a scoped pass must wait for the holder"
+            );
+            assert_eq!(copies_while_held, 0);
+            assert_eq!(
+                copies.load(Ordering::Relaxed),
+                0,
+                "the holder's copy was the only one"
+            );
+
+            let rows: Value =
+                serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
+            assert_eq!(rows[0]["sandbox_store_generation"], 2);
+            assert_eq!(rows[1]["sandbox_store_generation"], 2);
+            for id in ["1111111111111111", "2222222222222222"] {
+                assert_eq!(
+                    fs::read(
+                        home.join(".gemini/sandbox-v2")
+                            .join(id)
+                            .join("history/id.json")
+                    )
+                    .unwrap(),
+                    b"legacy"
+                );
+            }
+            assert!(!home.join(".gemini/sandbox").exists());
+            assert!(!app.join(JOURNAL).exists());
+        });
     }
 
     #[test]

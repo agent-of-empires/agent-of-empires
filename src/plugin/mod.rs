@@ -91,3 +91,17 @@ pub fn reload_registry() -> Arc<PluginRegistry> {
     *REGISTRY.write_safe() = Some(reg.clone());
     reg
 }
+
+/// Test guard that reloads the registry on drop. Drop it after the test's
+/// `EnvGuard` so the reload reads the restored dirs; it re-takes the env lock
+/// so no peer test mutates them mid-reload.
+#[cfg(test)]
+pub(crate) struct ReloadRegistryOnDrop;
+
+#[cfg(test)]
+impl Drop for ReloadRegistryOnDrop {
+    fn drop(&mut self) {
+        let _lock = crate::session::test_support::EnvGuard::unset(&[]);
+        reload_registry();
+    }
+}

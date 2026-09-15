@@ -649,6 +649,8 @@ mod tests {
 
     #[test]
     fn test_shorten_path_without_home_prefix() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
         let path = "/tmp/some/path";
         let shortened = shorten_path(path);
         assert_eq!(shortened, "/tmp/some/path");

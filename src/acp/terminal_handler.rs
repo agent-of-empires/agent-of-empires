@@ -205,6 +205,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_runs_and_captures_output() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         let mgr = TerminalManager::new();
         let cwd = std::env::temp_dir();
         let id = mgr
@@ -218,6 +219,7 @@ mod tests {
 
     #[tokio::test]
     async fn release_is_idempotent_cleanup() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         let mgr = TerminalManager::new();
         let id = mgr
             .create_and_run("s-1", "true", vec![], std::env::temp_dir(), None)
@@ -239,6 +241,7 @@ mod tests {
     // surface as a fast failure instead of a stalled CI job.
     #[tokio::test]
     async fn large_stderr_does_not_deadlock() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         let mgr = TerminalManager::new();
         let cwd = std::env::temp_dir();
         let script = "head -c 204800 /dev/zero | tr '\\0' 'x' >&2; echo done";
@@ -261,6 +264,7 @@ mod tests {
 
     #[tokio::test]
     async fn large_stdout_and_stderr_drain_concurrently() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         let mgr = TerminalManager::new();
         let cwd = std::env::temp_dir();
         let script = "head -c 204800 /dev/zero | tr '\\0' 'o' \

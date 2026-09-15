@@ -70,6 +70,7 @@ test.describe("mobile jump-to-bottom", () => {
     // Stream several tall chunks while the reader is at the bottom.
     for (let i = 0; i < 6; i++) {
       mock.pushEvents([agentMessageChunk("\n" + Array.from({ length: 12 }, (_, j) => `stream ${i}-${j}`).join("\n"))]);
+      await expect(viewport).toContainText(`stream ${i}-11`);
       await expect.poll(isPinned).toBe(true);
     }
     // Never had to reach for the button: it stays hidden the whole time.
@@ -94,7 +95,9 @@ test.describe("mobile jump-to-bottom", () => {
     // covered by the growing box. Typing is not a scroll gesture, so it never
     // drops the stick intent.
     const textarea = page.getByRole("textbox").first();
+    const beforeHeight = await textarea.evaluate((el) => el.getBoundingClientRect().height);
     await textarea.fill(Array.from({ length: 8 }, (_, i) => `draft line ${i}`).join("\n"));
+    await expect.poll(() => textarea.evaluate((el) => el.getBoundingClientRect().height)).toBeGreaterThan(beforeHeight);
     await expect.poll(isPinned).toBe(true);
   });
 
@@ -222,7 +225,7 @@ test.describe("mobile jump-to-bottom", () => {
 
     // New content arriving at the bottom must not move a reader who scrolled up.
     mock.pushEvents([agentMessageChunk("\nlater\nlater\nlater\nlater")]);
-    await page.waitForTimeout(150);
+    await expect(viewport).toContainText("later");
     const after = await viewport.evaluate((el) => el.scrollTop);
     expect(Math.abs(after - before)).toBeLessThan(4);
     await expect(page.getByTestId("acp-jump-to-bottom")).toBeVisible();

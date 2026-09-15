@@ -237,6 +237,7 @@ mod tests {
             // Declared on the field.
             ("sandbox", "extra_volumes", RepoPolicy::Deny),
             ("sandbox", "selinux_relabel", RepoPolicy::Deny),
+            ("worktree", "path_template", RepoPolicy::Deny),
             ("session", "default_tool", RepoPolicy::Deny),
             ("session", "agent_detect_as", RepoPolicy::Allow),
             // Inherited: `session` declares repo_default = "deny", every other
@@ -244,7 +245,7 @@ mod tests {
             ("session", "yolo_mode_default", RepoPolicy::Deny),
             ("sandbox", "memory_limit", RepoPolicy::Allow),
             ("sandbox", "container_runtime", RepoPolicy::Allow),
-            ("worktree", "path_template", RepoPolicy::Allow),
+            ("worktree", "auto_cleanup", RepoPolicy::Allow),
         ] {
             let d = descriptor(section, field).unwrap_or_else(|| panic!("{section}.{field}"));
             assert_eq!(d.repo_policy, expected, "{section}.{field}");

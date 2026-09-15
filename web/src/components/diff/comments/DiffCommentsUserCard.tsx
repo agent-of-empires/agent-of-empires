@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { CommentMarkdown } from "./CommentMarkdown";
 import type { DiffCommentsCardPayload } from "./buildPrompt";
 import type { DiffComment } from "./types";
-import { ensureThemeLoaded, getHighlighter, langKeyForExt, loadLanguage } from "../../../lib/highlighter";
+import { highlightSnippet } from "../../../lib/snippetHighlighter";
 import { useShikiTheme } from "../../../hooks/useShikiTheme";
 
 interface Props {
@@ -51,9 +51,8 @@ export function DiffCommentsUserCard({ payload }: Props) {
 }
 
 /** Shiki-backed snippet renderer matching the structured view Markdown code
- *  block style. Loads the language module on demand and falls back to
- *  plain `<pre>` while loading or when the language can't be resolved.
- *  See `lib/highlighter.ts`. */
+ *  block style. Falls back to plain `<pre>` while loading or when the
+ *  language can't be resolved. See `lib/snippetHighlighter.ts`. */
 function HighlightedSnippet({ code, language, filePath }: { code: string; language?: string; filePath: string }) {
   const [html, setHtml] = useState<string | null>(null);
   const shiki = useShikiTheme();
@@ -63,13 +62,9 @@ function HighlightedSnippet({ code, language, filePath }: { code: string; langua
     if (!hint) return;
     (async () => {
       try {
-        const langKey = langKeyForExt(hint) ?? hint;
-        await loadLanguage(langKey);
-        const resolvedTheme = await ensureThemeLoaded(shiki.theme, shiki.appearance);
-        const hl = await getHighlighter();
+        const out = await highlightSnippet(code, { langHint: hint, theme: shiki.theme, appearance: shiki.appearance });
         if (cancelled) return;
-        if (!hl.getLoadedLanguages().includes(langKey)) return;
-        setHtml(hl.codeToHtml(code, { lang: langKey, theme: resolvedTheme }));
+        if (out) setHtml(out);
       } catch {
         // Unknown lang → fall through to plain rendering.
       }

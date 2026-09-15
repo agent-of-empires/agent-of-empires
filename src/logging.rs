@@ -1033,14 +1033,18 @@ fn apply_filter_file(path: &std::path::Path) {
             "runner filter swap failed"
         ),
     }
+    #[cfg(feature = "test-support")]
+    if path.with_extension("observe").exists() {
+        std::fs::write(path.with_extension("applied"), directive)
+            .expect("publish e2e filter application");
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Env-touching tests must serialize.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::session::test_support::EnvGuard;
 
     #[test]
     fn log_level_parse_accepts_known() {
@@ -1149,11 +1153,12 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn from_env_no_vars() {
-        let _g = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("AOE_LOG_LEVEL");
-        std::env::remove_var("AGENT_OF_EMPIRES_DEBUG");
-        std::env::remove_var("AOE_ACP_TRACE");
-        std::env::remove_var("AOE_TERMINAL_TRACE");
+        let _env = EnvGuard::unset(&[
+            "AOE_LOG_LEVEL",
+            "AGENT_OF_EMPIRES_DEBUG",
+            "AOE_ACP_TRACE",
+            "AOE_TERMINAL_TRACE",
+        ]);
         let cfg = LogConfig::from_env();
         assert_eq!(cfg.level, None);
         assert!(!cfg.acp_trace);
@@ -1163,22 +1168,16 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn from_env_aoe_log_level() {
-        let _g = ENV_LOCK.lock().unwrap();
-        std::env::set_var("AOE_LOG_LEVEL", "trace");
-        std::env::remove_var("AGENT_OF_EMPIRES_DEBUG");
+        let _env = EnvGuard::unset(&["AGENT_OF_EMPIRES_DEBUG"]).and_set("AOE_LOG_LEVEL", "trace");
         let cfg = LogConfig::from_env();
-        std::env::remove_var("AOE_LOG_LEVEL");
         assert_eq!(cfg.level, Some(LogLevel::Trace));
     }
 
     #[test]
     #[serial_test::serial]
     fn from_env_legacy_debug_flag() {
-        let _g = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("AOE_LOG_LEVEL");
-        std::env::set_var("AGENT_OF_EMPIRES_DEBUG", "1");
+        let _env = EnvGuard::unset(&["AOE_LOG_LEVEL"]).and_set("AGENT_OF_EMPIRES_DEBUG", "1");
         let cfg = LogConfig::from_env();
-        std::env::remove_var("AGENT_OF_EMPIRES_DEBUG");
         assert_eq!(cfg.level, Some(LogLevel::Debug));
     }
 

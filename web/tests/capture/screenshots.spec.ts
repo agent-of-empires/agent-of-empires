@@ -57,20 +57,20 @@ base("web dashboard surfaces", async ({ page }, testInfo) => {
         ["web-frontend", "web-frontend"],
       ] as const) {
         const dir = join(home, sub);
-        initWorkingRepo(dir);
+        initWorkingRepo(dir, env);
         writeFiles(dir, { "README.md": `# ${title}\n` });
-        commitAll(dir, "init");
+        commitAll(dir, "init", env);
         add(dir, title);
       }
       // A session with uncommitted changes for the diff view.
       const apiDir = join(home, "api-server");
-      initWorkingRepo(apiDir);
+      initWorkingRepo(apiDir, env);
       writeFiles(apiDir, {
         "src/routes.ts": "export const routes = [];\n",
         "src/auth.ts": "export function login() {}\n",
         "README.md": "# api-server\n",
       });
-      commitAll(apiDir, "baseline");
+      commitAll(apiDir, "baseline", env);
       writeFiles(apiDir, {
         "src/routes.ts": "export const routes = [\n  { path: '/health', handler: health },\n];\n",
         "src/auth.ts": "export function login(user: string) {\n  return issueToken(user);\n}\n",

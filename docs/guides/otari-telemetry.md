@@ -70,7 +70,7 @@ To include optional outcome counters, add `"OTEL_METRICS_EXPORTER=otlp"` to the 
 
 ### Profile precedence
 
-AoE resolves global configuration first, then the active profile, then repository configuration. Arrays replace rather than extend the earlier layer: a profile's `sandbox.environment` replaces the global list, and a repository-level `.agent-of-empires/config.toml` list replaces the profile list. Preserve or add the OTel entries in every applicable profile and in each repository-level list that overrides it.
+AoE resolves global configuration first, then the active profile. Arrays replace rather than extend the earlier layer: a profile's `sandbox.environment` replaces the global list. Preserve or add the OTel entries in every applicable profile. A repository's `.agent-of-empires/config.toml` cannot set `sandbox.environment`.
 
 ## Apply and verify
 
@@ -112,7 +112,7 @@ AoE resolves global configuration first, then the active profile, then repositor
 ## Troubleshooting
 
 - **The header is missing in the container:** confirm the variable is set in the exact shell or service environment that launched AoE, then restart AoE and create a new sandbox session.
-- **Other sandbox variables disappeared:** restore the prior entries in the last `sandbox.environment` list AoE applies. Profile lists replace the global list, and repository-level lists replace profile lists.
+- **Other sandbox variables disappeared:** restore the prior entries in the last `sandbox.environment` list AoE applies. Profile lists replace the global list.
 - **Otari returns 403:** confirm the key is active, belongs to the intended user, and is budget-exempt.
 - **Otari returns 404 for `/v1/logs`:** telemetry import requires a standalone Otari gateway, not a hybrid gateway.
 - **A manual `curl` or Python probe is blocked while Claude Code works:** a reverse proxy or WAF can classify clients differently. Check its rules and Otari logs before changing the OTel configuration.

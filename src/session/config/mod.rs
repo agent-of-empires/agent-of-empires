@@ -2254,6 +2254,8 @@ pub struct TelemetryConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
+// Activation and the path templates are repo-denied: a repo could otherwise
+// choose where on the host AoE materializes a checkout (#3711).
 #[setting_section(name = "worktree", category = "Worktree")]
 pub struct WorktreeConfig {
     /// Enable worktree mode by default for new sessions.
@@ -2261,7 +2263,8 @@ pub struct WorktreeConfig {
     #[setting(
         label = "Enabled by Default",
         widget = "toggle",
-        web = "elevation:worktree config affects host filesystem"
+        web = "elevation:worktree config affects host filesystem",
+        repo = "deny"
     )]
     pub enabled: bool,
 
@@ -2270,7 +2273,8 @@ pub struct WorktreeConfig {
     #[setting(
         label = "Path Template",
         widget = "text",
-        web = "elevation:worktree config affects host filesystem"
+        web = "elevation:worktree config affects host filesystem",
+        repo = "deny"
     )]
     pub path_template: String,
 
@@ -2281,6 +2285,7 @@ pub struct WorktreeConfig {
         label = "Bare Repo Template",
         widget = "text",
         web = "elevation:worktree config affects host filesystem",
+        repo = "deny",
         advanced
     )]
     pub bare_repo_path_template: String,
@@ -2311,6 +2316,7 @@ pub struct WorktreeConfig {
         label = "Workspace Path Template",
         widget = "text",
         web = "elevation:worktree config affects host filesystem",
+        repo = "deny",
         advanced
     )]
     pub workspace_path_template: String,
@@ -2419,6 +2425,8 @@ pub struct SandboxConfig {
     /// argv), KEY=$VAR (passthrough from host, hidden from argv), KEY=$$literal
     /// (escape a leading $), or bare KEY (passthrough). For host (non-sandboxed)
     /// sessions, see Session > Host Environment instead.
+    // Repo-denied: the passthrough forms would let a repo read named host
+    // secrets into the container (#3710).
     #[serde(
         default = "default_sandbox_environment",
         deserialize_with = "super::serde_helpers::string_or_vec"
@@ -2428,6 +2436,7 @@ pub struct SandboxConfig {
         widget = "list",
         validate = "env_list",
         web = "elevation:sandbox config affects host isolation",
+        repo = "deny",
         advanced
     )]
     pub environment: Vec<String>,
@@ -3769,15 +3778,13 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_user_tmux_config_found_under_xdg_config_home() {
-        let prev_home = std::env::var_os("HOME");
-        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
         let temp = tempfile::TempDir::new().unwrap();
         // An XDG root deliberately outside `$HOME/.config`, the case the
         // two-path list could not see.
         let xdg = temp.path().join("xdg-elsewhere");
         std::fs::create_dir_all(xdg.join("tmux")).unwrap();
-        std::env::set_var("HOME", temp.path().join("home"));
-        std::env::set_var("XDG_CONFIG_HOME", &xdg);
+        let _home_guard = crate::session::test_support::isolate_home(&temp.path().join("home"))
+            .and_set("XDG_CONFIG_HOME", &xdg);
 
         assert!(
             !user_has_tmux_config(),
@@ -3794,15 +3801,6 @@ mod tests {
             !user_tmux_config_sets_any(&["set-clipboard"]),
             "a file silent on clipboard must not defer clipboard too"
         );
-
-        match prev_home {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
-        match prev_xdg {
-            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
     }
 
     /// The one resolver, over every setting and mode. `Auto` is the only row
@@ -3902,9 +3900,7 @@ mod tests {
     #[serial_test::serial]
     fn test_effective_profile_falls_back_to_global_default_when_empty() {
         let temp_home = tempfile::TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         let app_dir = temp_home
@@ -3928,9 +3924,7 @@ mod tests {
     #[serial_test::serial]
     fn test_load_or_warn_returns_defaults_on_malformed_toml() {
         let temp_home = tempfile::TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         let app_dir = temp_home

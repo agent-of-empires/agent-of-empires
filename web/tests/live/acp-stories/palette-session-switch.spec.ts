@@ -9,6 +9,7 @@ import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { test as base, expect } from "@playwright/test";
 import { spawnAoeServe, listSessions, resolveAoeBinary } from "../../helpers/aoeServe";
+import { gitEnv } from "../../helpers/gitFixture";
 
 const MOD = process.platform === "darwin" ? "Meta" : "Control";
 
@@ -20,17 +21,8 @@ function seedTwoSessions(): (seedEnv: { home: string; shimBin: string; env: Node
     ] as const) {
       const projectDir = join(home, subdir);
       mkdirSync(projectDir, { recursive: true });
-      spawnSync("git", ["init", "-q"], { cwd: projectDir });
-      spawnSync("git", ["commit", "--allow-empty", "-q", "-m", "init"], {
-        cwd: projectDir,
-        env: {
-          ...env,
-          GIT_AUTHOR_NAME: "t",
-          GIT_AUTHOR_EMAIL: "t@t",
-          GIT_COMMITTER_NAME: "t",
-          GIT_COMMITTER_EMAIL: "t@t",
-        },
-      });
+      spawnSync("git", ["init", "-q"], { cwd: projectDir, env: gitEnv(env) });
+      spawnSync("git", ["commit", "--allow-empty", "-q", "-m", "init"], { cwd: projectDir, env: gitEnv(env) });
       const res = spawnSync(resolveAoeBinary(), ["add", projectDir, "-t", title, "-c", "claude"], { env });
       if (res.status !== 0) {
         throw new Error(`aoe add ${title} failed: status=${res.status} stderr=${res.stderr?.toString() ?? "<none>"}`);

@@ -40,10 +40,8 @@ const SCRIPT = {
           sessionUpdate: "agent_message_chunk",
           content: { type: "text", text: "First turn." },
         },
-        // Long enough to queue and leave the chat while turn 1 runs, but
-        // under the supervisor's resume idle grace (see
-        // `RESUME_IDLE_GRACE_DEFAULT` in src/acp/acp_client/connection.rs).
-        { sessionUpdate: "wait_ms", ms: 6_000 },
+        // The test releases this turn after its competing action.
+        { sessionUpdate: "wait_for_release" },
       ],
       stopReason: "end_turn",
     },
@@ -113,6 +111,7 @@ base("a queued follow-up drains while its chat is closed", async ({ page }, test
     await expect(page).toHaveURL(/\/settings/, { timeout: 10_000 });
     await expect(page.locator("select").first()).toBeVisible({ timeout: 10_000 });
 
+    writeFileSync(`${scriptPath}.release`, "release");
     // Delivered without ever reopening the session: the queued text
     // reaches the agent and turn 2 answers it. Asserted against the
     // server's replay log, not the DOM, precisely because the session's

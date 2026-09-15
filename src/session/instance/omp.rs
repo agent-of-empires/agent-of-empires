@@ -610,6 +610,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn omp_routing_fingerprint_accepts_matching_live_env_and_rejects_drift() {
+        let _env_read = crate::session::test_support::EnvGuard::read_lock();
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         let project = tmp.path().join("project");
@@ -642,6 +643,155 @@ mod tests {
 
         assert_eq!(run(&home).stdout, b"captured");
         assert_eq!(run(&tmp.path().join("drifted")).stdout, b"raw");
+    }
+
+    #[cfg(unix)]
+    fn exercise_omp_wrapper(collision: Option<(&str, &str)>) {
+        use crate::tmux::test_helpers::{only_pane_id, pane_field, TmuxTestSession};
+        use std::os::unix::fs::PermissionsExt;
+        let _env = crate::session::test_support::EnvGuard::unset(
+            &crate::session::capture::OMP_STORE_ENV_KEYS,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let canonical_root = dir.path().canonicalize().unwrap();
+        let root = canonical_root.as_path();
+        let home = root.join("home");
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir(&bin).unwrap();
+        let context = resolve_omp_store_layout_with_environment(
+            std::collections::HashMap::from([("HOME".into(), home.display().to_string())]),
+            root.to_str().unwrap(),
+            &OmpCliCaptureOptions::default(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(&context.layout.terminal_sessions).unwrap();
+        let plan = OmpCapturePlan {
+            layout: context.layout.clone(),
+            routing_fingerprint: context.routing_fingerprint.clone(),
+            launch_id: "native-wrapper-test".to_string(),
+            launch_marker: root.join("marker").to_string_lossy().into_owned(),
+            container_runtime: None,
+        };
+        let victim = root.join("victim");
+        let attempted = root.join("collision-attempted");
+        std::fs::write(&victim, "unchanged").unwrap();
+        if let Some((stage, kind)) = collision {
+            let command = if stage == "breadcrumb" { "ln" } else { "mkdir" };
+            let real = which::which(command).unwrap();
+            let ln = which::which("ln").unwrap();
+            let mkfifo = which::which("mkfifo").unwrap();
+            let target = if stage == "breadcrumb" { "$3" } else { "$1" };
+            let predicate = if stage == "marker" {
+                "case \"$1\" in */marker.tmp.*)"
+            } else {
+                "case \"$1\" in *)"
+            };
+            let create = match kind {
+                "symlink" => format!(
+                    "{} -s {} \"{target}\"",
+                    shell_escape(&ln.to_string_lossy()),
+                    shell_escape(&victim.to_string_lossy())
+                ),
+                "directory-symlink" => format!(
+                    "{} -s {} \"{target}\"",
+                    shell_escape(&ln.to_string_lossy()),
+                    shell_escape(&root.to_string_lossy())
+                ),
+                "fifo" => format!("{} \"{target}\"", shell_escape(&mkfifo.to_string_lossy())),
+                "file" => format!("printf winner > \"{target}\""),
+                _ => panic!("unknown collision"),
+            };
+            let script = format!("#!/bin/sh\n{predicate} {create}; printf '%s' \"{target}\" > {} ;; esac\nexec {} \"$@\"\n", shell_escape(&attempted.to_string_lossy()), shell_escape(&real.to_string_lossy()));
+            let shim = bin.join(command);
+            std::fs::write(&shim, script).unwrap();
+            std::fs::set_permissions(shim, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let output = root.join("launched");
+        let raw = format!(
+            "printf launched > {}; exec sleep 30",
+            shell_escape(&output.to_string_lossy())
+        );
+        let wrapped = wrap_omp_launch(&raw, &plan);
+        let mut env = format!(
+            "env -i PATH={} ",
+            shell_escape(&test_path_with_shim(&bin).to_string_lossy())
+        );
+        for (key, value) in &context.launcher_routing {
+            let Some(value) = value else { continue };
+            env.push_str(&shell_escape(&format!("{key}={value}")));
+            env.push(' ');
+        }
+        let script = root.join("launch.sh");
+        std::fs::write(&script, format!("exec {env}{wrapped}")).unwrap();
+        let session = TmuxTestSession::new("omp_wrapper");
+        let command = format!("sh {}", shell_escape(&script.to_string_lossy()));
+        let result = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                session.name(),
+                "-c",
+                root.to_str().unwrap(),
+                &command,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let pane = only_pane_id(session.name());
+        let terminal_id = pane_field(&pane, "#{pane_tty}")
+            .strip_prefix("/dev/")
+            .unwrap()
+            .replace('/', "-");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match std::fs::read_to_string(&output) {
+                Ok(content) if content == "launched" => break,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("cannot read launch output: {error}"),
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "wrapper did not execute the agent command"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "unchanged");
+        if let Some((_, kind)) = collision {
+            let target =
+                std::fs::read_to_string(&attempted).expect("wrapper reached the hostile operation");
+            assert!(
+                !std::path::Path::new(&plan.launch_marker).exists(),
+                "collision must launch raw without publishing a marker"
+            );
+            if kind == "file" {
+                assert_eq!(std::fs::read_to_string(target).unwrap(), "winner");
+            }
+        } else {
+            let marker = std::fs::read_to_string(&plan.launch_marker).unwrap();
+            let fields: Vec<_> = marker.lines().collect();
+            assert_eq!(fields.len(), 4);
+            assert_eq!(fields[0], terminal_id);
+            assert_eq!(fields[1], plan.launch_id);
+            assert_eq!(fields[3], plan.routing_fingerprint);
+            let breadcrumb =
+                std::fs::read_to_string(plan.layout.terminal_sessions.join(terminal_id)).unwrap();
+            let crumb: Vec<_> = breadcrumb.lines().collect();
+            assert_eq!(crumb, [root.to_str().unwrap(), fields[2], "fresh"]);
+            assert!(fields[2].ends_with("aoe-pending_native-wrapper-test.jsonl"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn omp_launch_wrapper_hashes_live_routing_and_marker_is_noclobber() {
+        exercise_omp_wrapper(None);
     }
 
     /// The shim dir, then the caller's `PATH`. Shim first, so the fake `tmux`
@@ -733,51 +883,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn omp_private_paths_reject_symlink_fifo_and_breadcrumb_races() {
-        let dir = tempfile::tempdir().unwrap();
-        let victim = dir.path().join("victim");
-        let marker_link = dir.path().join("marker-link.tmp");
-        let marker_fifo = dir.path().join("marker-fifo.tmp");
-        std::fs::write(&victim, "unchanged").unwrap();
-        std::os::unix::fs::symlink(&victim, &marker_link).unwrap();
-        assert!(std::process::Command::new("mkfifo")
-            .arg(&marker_fifo)
-            .status()
-            .unwrap()
-            .success());
-
-        for collision in [&marker_link, &marker_fifo] {
-            let output = std::process::Command::new("sh")
-                .args(["-c", "(umask 077; mkdir \"$1\")", "sh"])
-                .arg(collision)
-                .output()
-                .unwrap();
-            assert!(
-                !output.status.success(),
-                "private-dir creation must reject an existing path"
-            );
+        for collision in [
+            ("marker", "symlink"),
+            ("marker", "fifo"),
+            ("breadcrumb", "file"),
+            ("breadcrumb", "symlink"),
+            ("breadcrumb", "directory-symlink"),
+        ] {
+            exercise_omp_wrapper(Some(collision));
         }
-
-        let placeholder = dir.path().join("placeholder");
-        let raced_file = dir.path().join("breadcrumb-file");
-        let raced_link = dir.path().join("breadcrumb-link");
-        std::fs::write(&placeholder, "cwd\nsentinel\nfresh\n").unwrap();
-        std::fs::write(&raced_file, "winner").unwrap();
-        std::os::unix::fs::symlink(&victim, &raced_link).unwrap();
-        let raced_dir_link = dir.path().join("breadcrumb-dir-link");
-        std::os::unix::fs::symlink(dir.path(), &raced_dir_link).unwrap();
-        for collision in [&raced_file, &raced_link, &raced_dir_link] {
-            let output = std::process::Command::new("sh")
-                .args(["-c", "ln -n \"$1\" \"$2\"", "sh"])
-                .arg(&placeholder)
-                .arg(collision)
-                .output()
-                .unwrap();
-            assert!(
-                !output.status.success(),
-                "hardlink installation must not clobber a raced destination"
-            );
-        }
-        assert_eq!(std::fs::read_to_string(raced_file).unwrap(), "winner");
-        assert_eq!(std::fs::read_to_string(victim).unwrap(), "unchanged");
     }
 }

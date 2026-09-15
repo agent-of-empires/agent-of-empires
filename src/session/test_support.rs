@@ -84,6 +84,8 @@ fn acquire_env_lock() -> Option<MutexGuard<'static, ()>> {
     if ENV_LOCK_HELD.with(Cell::get) {
         None
     } else {
+        #[cfg(test)]
+        tests::observe_env_lock_contention();
         let guard = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         ENV_LOCK_HELD.with(|held| held.set(true));
         Some(guard)
@@ -216,6 +218,27 @@ impl Drop for EnvGuard {
         if self._lock.is_some() {
             ENV_LOCK_HELD.with(|held| held.set(false));
         }
+    }
+}
+
+pub(crate) struct FavoritesFirstGuard {
+    previous: bool,
+    _env: EnvGuard,
+}
+
+impl FavoritesFirstGuard {
+    pub(crate) fn new() -> Self {
+        let env = EnvGuard::read_lock();
+        Self {
+            previous: crate::session::favorites_first(),
+            _env: env,
+        }
+    }
+}
+
+impl Drop for FavoritesFirstGuard {
+    fn drop(&mut self) {
+        crate::session::set_favorites_first(self.previous);
     }
 }
 
@@ -541,139 +564,109 @@ mod tests {
     use serial_test::serial;
     use std::panic::AssertUnwindSafe;
 
-    /// Restores one ambient env key on `Drop` so a panicking assertion
-    /// mid-test cannot leak a seeded value into the next `#[serial]`
-    /// test in the process.
-    struct AmbientEnvRestore(&'static str, Option<OsString>);
+    struct AmbientEnvRestore {
+        key: &'static str,
+        previous: Option<OsString>,
+        _guard: EnvGuard,
+    }
+
     impl Drop for AmbientEnvRestore {
         fn drop(&mut self) {
-            restore_or_remove(self.0, self.1.take());
+            restore_or_remove(self.key, self.previous.take());
         }
     }
+
     impl AmbientEnvRestore {
         fn capture(key: &'static str) -> Self {
-            Self(key, std::env::var_os(key))
+            let guard = EnvGuard::read_lock();
+            Self {
+                key,
+                previous: std::env::var_os(key),
+                _guard: guard,
+            }
         }
     }
 
-    /// #3469: [`ENV_LOCK`] must exclude a reader from a peer guard's
-    /// mutation, which is the property a `#[serial]` key cannot provide.
-    ///
-    /// No `#[serial]` here on purpose: the claim is that the lock alone is
-    /// enough, so an annotation would hide what is being measured.
-    #[test]
-    fn env_lock_excludes_a_reader_from_a_peer_guards_mutation() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        // Under the lock: an unrelated guard's mutation live at this instant
-        // would otherwise become the baseline and fail the comparison below
-        // for a reason other than the one being measured.
-        let ambient = {
-            let _read = EnvGuard::read_lock();
-            std::env::var_os("PATH")
-        };
-        let shim = TempDir::new().unwrap();
-        let scrubbed = AtomicBool::new(false);
-        let releasing = AtomicBool::new(false);
-        let reader_waiting = AtomicBool::new(false);
-
-        // Collected inside the scope, asserted after it joins, so a failure
-        // cannot leave the peer thread running against a dropped guard.
-        let (observed_path, released_first) = std::thread::scope(|scope| {
-            scope.spawn(|| {
-                let scrub = path_prepended(shim.path());
-                scrubbed.store(true, Ordering::SeqCst);
-                while !reader_waiting.load(Ordering::SeqCst) {
-                    std::thread::yield_now();
-                }
-                // Widens the window rather than timing anything: a reader
-                // that waits for the lock reads the restored value however
-                // long this is, so only a reader that does not wait can lose
-                // here. Both observations below stay valid at any duration.
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                releasing.store(true, Ordering::SeqCst);
-                drop(scrub);
-            });
-
-            while !scrubbed.load(Ordering::SeqCst) {
-                std::thread::yield_now();
-            }
-            reader_waiting.store(true, Ordering::SeqCst);
-            let _read = EnvGuard::read_lock();
-            (std::env::var_os("PATH"), releasing.load(Ordering::SeqCst))
-        });
-
-        assert_eq!(
-            observed_path, ambient,
-            "a peer guard's PATH mutation was visible under ENV_LOCK"
-        );
-        assert!(
-            released_first,
-            "the reader entered ENV_LOCK while a peer guard still held it"
-        );
+    thread_local! {
+        static LOCK_WAITING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
     }
 
-    /// #3469: a helper that derives its value from the process env has to read
-    /// the old value under [`ENV_LOCK`] as well. Reading first and calling
-    /// [`EnvGuard::set`] afterwards leaves the helper racing the very scrub it
-    /// exists to be excluded from, and bakes that scrub into what it installs.
-    /// `#[serial]` on the default key, unlike its sibling above: this one
-    /// *removes* `PATH` for the width of the window rather than prepending to
-    /// it, and the tmux tests that resolve a bare `tmux` through `PATH` carry
-    /// that key without taking `ENV_LOCK`. Where tmux lives outside the
-    /// execvp fallback path (Homebrew, Nix), an overlap makes
-    /// `tmux_available()` skip silently. The key does not weaken this test's
-    /// own oracle: `serial_test` orders whole tests, so the peer thread and
-    /// the reader below still need `ENV_LOCK` to exclude each other.
-    #[test]
-    #[serial]
-    fn path_prepended_derives_its_value_under_the_lock() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let ambient = {
-            let _read = EnvGuard::read_lock();
-            std::env::var_os("PATH")
-        };
-        let shim = TempDir::new().unwrap();
-        let scrubbed = AtomicBool::new(false);
-        let reader_waiting = AtomicBool::new(false);
-
-        let built = std::thread::scope(|scope| {
-            scope.spawn(|| {
-                let scrub = EnvGuard::unset(&["PATH"]);
-                scrubbed.store(true, Ordering::SeqCst);
-                while !reader_waiting.load(Ordering::SeqCst) {
-                    std::thread::yield_now();
+    pub(super) fn observe_env_lock_contention() {
+        LOCK_WAITING.with_borrow_mut(|waiting| {
+            if let Some(waiting) = waiting.take() {
+                if matches!(
+                    ENV_LOCK.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ) {
+                    let _ = waiting.send(());
                 }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                drop(scrub);
-            });
-
-            while !scrubbed.load(Ordering::SeqCst) {
-                std::thread::yield_now();
             }
-            reader_waiting.store(true, Ordering::SeqCst);
-            let _path = path_prepended(shim.path());
-            std::env::var_os("PATH")
         });
+    }
 
-        let built = built.expect("path_prepended sets PATH");
-        let entries: Vec<PathBuf> = std::env::split_paths(&built).collect();
-        assert_eq!(
-            entries.first(),
-            Some(&shim.path().to_path_buf()),
-            "the shim must come first"
-        );
-        let inherited: Vec<PathBuf> = ambient
-            .iter()
-            .filter(|value| !value.is_empty())
-            .flat_map(std::env::split_paths)
-            .collect();
-        assert_eq!(
-            &entries[1..],
-            inherited.as_slice(),
-            "a peer guard's scrub was baked into the derived PATH"
-        );
+    #[test]
+    fn env_lock_orders_readers_and_path_derivation() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        for derive_path in [false, true] {
+            let writer = EnvGuard::read_lock();
+            let ambient = std::env::var_os("PATH");
+            let inherited: Vec<_> = ambient
+                .iter()
+                .filter(|v| !v.is_empty())
+                .flat_map(std::env::split_paths)
+                .collect();
+            let peer = TempDir::new().unwrap();
+            let shim = TempDir::new().unwrap();
+            let scrubbed = std::env::join_paths(
+                std::iter::once(peer.path().to_path_buf()).chain(inherited.iter().cloned()),
+            )
+            .unwrap();
+            let writer = writer.and_set("PATH", scrubbed);
+            let expected = if derive_path {
+                Some(
+                    std::env::join_paths(
+                        std::iter::once(shim.path().to_path_buf()).chain(inherited),
+                    )
+                    .unwrap(),
+                )
+            } else {
+                ambient
+            };
+            let (waiting_tx, waiting_rx) = mpsc::channel();
+            let (observed_tx, observed_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+            let (contended, observed, exclusive) = std::thread::scope(|scope| {
+                let shim = shim.path();
+                let reader = scope.spawn(move || {
+                    LOCK_WAITING.with_borrow_mut(|waiting| *waiting = Some(waiting_tx));
+                    let _guard = if derive_path {
+                        path_prepended(shim)
+                    } else {
+                        EnvGuard::read_lock()
+                    };
+                    observed_tx.send(std::env::var_os("PATH")).unwrap();
+                    let _ = release_rx.recv();
+                });
+                let contended = waiting_rx.recv_timeout(Duration::from_secs(30));
+                drop(writer);
+                let observed = observed_rx.recv_timeout(Duration::from_secs(30));
+                let exclusive = matches!(
+                    ENV_LOCK.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                );
+                drop(release_tx);
+                reader.join().unwrap();
+                (contended, observed, exclusive)
+            });
+            contended.expect("reader must encounter the held writer lock");
+            assert_eq!(observed.unwrap(), expected, "derive_path={derive_path}");
+            assert!(
+                exclusive,
+                "the reader must retain exclusion until its guard drops"
+            );
+        }
     }
 
     /// Locks #2751: a non-UTF-8 prior value MUST round-trip through the
@@ -812,6 +805,9 @@ mod tests {
     #[test]
     #[serial]
     fn app_dir_guard_drop_restores_env_vars() {
+        let _home = AmbientEnvRestore::capture("HOME");
+        let _xdg = AmbientEnvRestore::capture("XDG_CONFIG_HOME");
+        let _data = AmbientEnvRestore::capture("XDG_DATA_HOME");
         let before_home = std::env::var_os("HOME");
         let before_xdg = std::env::var_os("XDG_CONFIG_HOME");
         let before_xdg_data = std::env::var_os("XDG_DATA_HOME");
@@ -936,6 +932,9 @@ mod tests {
     #[test]
     #[serial]
     fn app_dir_guard_drop_restores_env_vars_on_panic() {
+        let _home = AmbientEnvRestore::capture("HOME");
+        let _xdg = AmbientEnvRestore::capture("XDG_CONFIG_HOME");
+        let _data = AmbientEnvRestore::capture("XDG_DATA_HOME");
         let before_home = std::env::var_os("HOME");
         let before_xdg = std::env::var_os("XDG_CONFIG_HOME");
 
@@ -969,6 +968,9 @@ mod tests {
     #[test]
     #[serial]
     fn app_dir_guard_drop_ignores_mid_scope_env_writes() {
+        let _home = AmbientEnvRestore::capture("HOME");
+        let _xdg = AmbientEnvRestore::capture("XDG_CONFIG_HOME");
+        let _data = AmbientEnvRestore::capture("XDG_DATA_HOME");
         let before_home = std::env::var_os("HOME");
 
         {
@@ -1006,6 +1008,9 @@ mod tests {
         use std::sync::{Arc, Barrier};
         use std::thread;
 
+        let _home = AmbientEnvRestore::capture("HOME");
+        let _xdg = AmbientEnvRestore::capture("XDG_CONFIG_HOME");
+        let _data = AmbientEnvRestore::capture("XDG_DATA_HOME");
         let before_home = std::env::var_os("HOME");
 
         let peer_at_swap = Arc::new(Barrier::new(2));

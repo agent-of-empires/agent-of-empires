@@ -1529,7 +1529,7 @@ mod tests {
         // The extension is written under `HOME`, so this owns one: the
         // global lock keeps it from racing another test's `HOME` swap.
         let temp_home = tempfile::tempdir().unwrap();
-        let _home = crate::session::test_support::EnvGuard::set(&[("HOME", temp_home.path())]);
+        let _home = crate::session::test_support::isolate_home(temp_home.path());
 
         let mut inst = Instance::new("pi-sandbox", "/tmp/pi-sandbox");
         inst.tool = "pi".to_string();

@@ -4,7 +4,7 @@
 // instead. Locks the desktop activation threshold from drifting
 // silently (#1419).
 
-import { test, expect } from "./helpers/mockedTest";
+import { test, expect, publishedRequests, observeFor } from "./helpers/mockedTest";
 import { installSidebarMocks, threeSessionsInOneRepo } from "./helpers/sidebarMocks";
 
 test("stationary click on a row navigates without reordering", async ({ page }) => {
@@ -28,6 +28,9 @@ test("stationary click on a row navigates without reordering", async ({ page }) 
   // change is the user-observable contract here.
   await expect(page).toHaveURL(/\/session\/s-b$/, { timeout: 5_000 });
 
-  await page.waitForTimeout(200);
+  await observeFor(page, 200, async () => {
+    expect(await publishedRequests(page, "/api/workspace-ordering", "PUT")).toEqual([]);
+    expect(handle.puts).toEqual([]);
+  });
   expect(handle.puts).toEqual([]);
 });

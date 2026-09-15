@@ -31,11 +31,8 @@ const SCRIPT = {
           sessionUpdate: "agent_message_chunk",
           content: { type: "text", text: "First turn." },
         },
-        // Long enough that the navigate-away + navigate-back cycle
-        // below completes while turn 1 is still in flight, but well
-        // under `RESUME_IDLE_GRACE_DEFAULT` in
-        // src/acp/acp_client/connection.rs.
-        { sessionUpdate: "wait_ms", ms: 6_000 },
+        // The test releases this turn after its competing action.
+        { sessionUpdate: "wait_for_release" },
       ],
       stopReason: "end_turn",
     },
@@ -129,11 +126,12 @@ base("queued follow-up fires after navigation away and back", async ({ page }, t
     await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(sessionA.id)}`);
     await waitForStructuredView(page);
 
-    // The first turn ends shortly after; the drained follow-up fires
+    // Release the first turn after remount; the drained follow-up fires
     // turn 2 EXACTLY ONCE and its distinct chunk appears in the
     // transcript. Assert toHaveCount(1) so a regression that double-
     // fires the queued prompt after remount would fail here instead
     // of silently passing on the first occurrence.
+    writeFileSync(`${scriptPath}.release`, "release");
     const secondTurn = page.getByText("Second turn after nav.", {
       exact: true,
     });

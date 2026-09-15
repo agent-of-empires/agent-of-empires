@@ -1328,22 +1328,23 @@ fn trash_teardown_release_clears_durable_claim() {
     );
 }
 
-/// End-to-end `d`-then-restore handoff through the TUI: the restore seizes
-/// the teardown's fresh Trash claim (instant, no lockout), commits untrash,
-/// and releases; the teardown's later result then finds nothing to do and
-/// never re-trashes or re-claims the row.
+/// Restore takes over a fresh Trash reservation before the queued teardown starts.
 #[test]
 #[serial]
 fn trash_then_immediate_restore_hands_off_cleanly() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
     let mut env = create_test_env_with_sessions(2);
     let id = env.view.instance_at(0).id.clone();
-    env.view.selected_session = Some(id.clone());
-
-    env.view.trash_session_by_id(&id);
-    // Immediate restore, well inside the teardown window.
-    env.view.selected_session = Some(id.clone());
-    env.view.restore_selected_from_trash();
-
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    env.view.trash_poller =
+        crate::tui::trash_poller::TrashPoller::with_handler_for_test(move |request| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().expect("release teardown");
+            crate::session::trash::perform_trash(&request)
+        });
     let row = |view: &HomeView| {
         view.storages
             .get("test")
@@ -1354,30 +1355,46 @@ fn trash_then_immediate_restore_hands_off_cleanly() {
             .find(|i| i.id == id)
             .unwrap()
     };
-    let restored = row(&env.view);
-    assert!(!restored.is_trashed(), "restore must win instantly");
-    assert_eq!(
-        restored.lifecycle_reservation, None,
-        "restore seized the Trash claim and released it on commit"
-    );
 
-    // Let the stale teardown result drain; it must not resurrect anything.
-    let mut drained = false;
-    for _ in 0..100 {
-        env.view.apply_trash_results();
-        if !env.view.trash_poller.is_pending(&id) {
-            drained = true;
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    assert!(drained, "teardown result never drained");
-    let final_row = row(&env.view);
-    assert!(!final_row.is_trashed(), "row stays restored");
-    assert_eq!(
-        final_row.lifecycle_reservation, None,
-        "no claim resurrected"
+    env.view.selected_session = Some(id.clone());
+    env.view.trash_session_by_id(&id);
+    entered_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("teardown entered");
+    let trashed = row(&env.view);
+    assert!(trashed.is_trashed());
+    assert!(trashed.lifecycle_reservation_is_owned(
+        crate::session::LifecycleOperation::Trash,
+        trashed.lifecycle_generation,
+    ));
+
+    env.view.selected_session = Some(id.clone());
+    env.view.restore_selected_from_trash();
+    let restored = row(&env.view);
+    assert!(
+        !restored.is_trashed(),
+        "restore must seize the held Trash claim"
     );
+    assert!(restored.lifecycle_generation > trashed.lifecycle_generation);
+    assert_eq!(restored.lifecycle_reservation, None);
+
+    release_tx.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while env.view.trash_poller.is_pending(&id) {
+        assert!(Instant::now() < deadline, "teardown result never drained");
+        env.view.apply_trash_results();
+        std::thread::yield_now();
+    }
+    let final_row = row(&env.view);
+    assert!(
+        !final_row.is_trashed(),
+        "stale teardown must not undo restore"
+    );
+    assert_eq!(
+        final_row.lifecycle_generation,
+        restored.lifecycle_generation
+    );
+    assert_eq!(final_row.lifecycle_reservation, None);
 }
 
 /// Right-clicking the synthetic Trash section header opens the bulk menu

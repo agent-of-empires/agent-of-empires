@@ -53,6 +53,8 @@ pub(super) enum ClientCmd {
         deadline: tokio::time::Instant,
         respond_to: oneshot::Sender<ResetSessionOutcome>,
     },
+    #[cfg(test)]
+    FlushForTest(oneshot::Sender<()>),
     Shutdown,
 }
 

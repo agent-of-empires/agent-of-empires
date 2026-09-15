@@ -718,6 +718,16 @@ impl App {
         // born into raw mode rather than attached to a briefly-cooked tty.
         self.event_stream = Some(EventStream::new());
         crate::tui::clear_terminal(terminal)?;
+        #[cfg(feature = "e2e-tests")]
+        if let Some(path) = std::env::var_os("AOE_E2E_INPUT_BARRIER") {
+            let path = std::path::PathBuf::from(path).with_extension("resumed");
+            let previous = match std::fs::read_to_string(&path) {
+                Ok(value) => value.parse::<u64>()?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                Err(error) => return Err(error.into()),
+            };
+            std::fs::write(path, (previous + 1).to_string())?;
+        }
 
         Ok(result)
     }
@@ -797,6 +807,8 @@ impl App {
         // Otherwise the user would have to press a key first.
         self.sync_mouse_capture(terminal)?;
         self.draw(terminal)?;
+        #[cfg(feature = "e2e-tests")]
+        e2e_render_ack(true)?;
 
         // Spawn async update check at startup. The periodic re-check below
         // covers long-running sessions (#1471). `last_update_check` stays
@@ -2940,12 +2952,36 @@ fn quit_intent(
     QuitIntent::Quit
 }
 
+#[cfg(feature = "e2e-tests")]
+pub(crate) fn e2e_render_ack(initial: bool) -> Result<()> {
+    let Some(path) = std::env::var_os("AOE_E2E_INPUT_BARRIER") else {
+        return Ok(());
+    };
+    let sequence = if initial {
+        0
+    } else {
+        std::fs::read_to_string(&path)?.parse::<u64>()? + 1
+    };
+    std::fs::write(path, sequence.to_string())?;
+    crossterm::execute!(
+        std::io::stdout(),
+        crossterm::terminal::SetTitle(format!("aoe-e2e-{sequence}"))
+    )?;
+    Ok(())
+}
+
 impl App {
     async fn handle_key(
         &mut self,
         key: KeyEvent,
         terminal: &mut Terminal<TuiBackend>,
     ) -> Result<()> {
+        #[cfg(feature = "e2e-tests")]
+        if key.code == KeyCode::F(12) && std::env::var_os("AOE_E2E_INPUT_BARRIER").is_some() {
+            self.draw(terminal)?;
+            e2e_render_ack(false)?;
+            return Ok(());
+        }
         // An ACTIVE embedded structured view owns the keyboard, just as
         // the full-screen view owned the whole event stream: letters must
         // reach the composer, not home-view shortcuts (q, n, d…). A merely

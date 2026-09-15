@@ -143,7 +143,7 @@ mod tests {
     #[serial]
     fn reconcile_from_disk_picks_up_peer_persist() {
         let temp = tempdir().unwrap();
-        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let storage = crate::session::storage::Storage::new_unwatched("reconcile-test").unwrap();
         let mut inst = Instance::new("title", "/tmp/x");
@@ -207,9 +207,7 @@ mod tests {
     #[serial]
     fn reconcile_from_disk_preserves_publisher_launch_proof() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
         let storage =
             crate::session::storage::Storage::new_unwatched("reconcile-publisher").unwrap();
         let mut inst = Instance::new("publisher proof", "/tmp/test");
@@ -239,9 +237,7 @@ mod tests {
         // the live host-minted cache forward, or an already-running
         // container would re-mint on every relaunch.
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let storage =
             crate::session::storage::Storage::new_unwatched("reconcile-before-start").unwrap();
@@ -292,9 +288,7 @@ mod tests {
         // tolerance window and drop back to the short never-present one
         // on every relaunch.
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let storage =
             crate::session::storage::Storage::new_unwatched("reconcile-unknown-since").unwrap();
@@ -334,9 +328,7 @@ mod tests {
     #[serial]
     fn reconcile_from_disk_picks_up_peer_clear() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let storage = crate::session::storage::Storage::new_unwatched("reconcile-clear").unwrap();
         let mut inst = Instance::new("title", "/tmp/x");
@@ -368,9 +360,7 @@ mod tests {
     #[serial]
     fn reconcile_from_disk_picks_up_peer_resume_intent() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let storage = crate::session::storage::Storage::new_unwatched("intent-reconcile").unwrap();
         let mut inst = Instance::new("title", "/tmp/x");
@@ -406,9 +396,7 @@ mod tests {
     #[serial]
     fn reconcile_sidecar_adopts_fresh_sid_for_claude_default() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let profile = "sidecar-adopt";
         let mut inst = Instance::new("title", "/tmp/x");
@@ -444,9 +432,7 @@ mod tests {
     #[serial]
     fn reconcile_sidecar_adopts_published_cursor_conversation() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let profile = "cursor-sidecar-adopt";
         let mut inst = Instance::new("title", "/tmp/x");
@@ -477,9 +463,7 @@ mod tests {
     #[serial]
     fn reconcile_sidecar_noop_without_identity_sidecar_backend() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let profile = "sidecar-noop-tool";
         let mut inst = Instance::new("title", "/tmp/x");
@@ -509,9 +493,7 @@ mod tests {
     #[serial]
     fn reconcile_sidecar_noop_when_intent_use() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let profile = "sidecar-noop-use";
         let mut inst = Instance::new("title", "/tmp/x");
@@ -541,9 +523,7 @@ mod tests {
     #[serial]
     fn reconcile_sidecar_noop_when_intent_cleared() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let profile = "sidecar-noop-cleared";
         let mut inst = Instance::new("title", "/tmp/x");
@@ -573,9 +553,7 @@ mod tests {
     #[serial]
     fn reconcile_sidecar_noop_when_sid_in_retroactive_excludes() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let profile = "sidecar-noop-excluded";
         let mut inst = Instance::new("title", "/tmp/x");
@@ -609,9 +587,7 @@ mod tests {
     #[serial]
     fn reconcile_sidecar_noop_when_sidecar_absent() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let profile = "sidecar-absent";
         let mut inst = Instance::new("title", "/tmp/x");
@@ -638,9 +614,7 @@ mod tests {
     #[serial]
     fn reconcile_sidecar_reloads_on_cas_skip() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let profile = "sidecar-cas-skip";
         let mut inst = Instance::new("title", "/tmp/x");

@@ -14,7 +14,7 @@
 // Pure page.route stubs; no WS frames needed. The mock helper captures
 // every `POST /api/telemetry/seen` body into `mock.telemetryPings`.
 
-import { test, expect } from "./helpers/mockedTest";
+import { test, expect, waitForResponseBody, publishedRequests, observeFor } from "./helpers/mockedTest";
 import { mockAcpSession, openStructuredSession } from "./helpers/acpMock";
 
 test("opening a structured view session fires the structured view seen-ping", async ({ page }) => {
@@ -42,9 +42,10 @@ test("a read-only server sends no telemetry seen-ping", async ({ page }) => {
 
   await page.goto("/");
   await expect(page.locator("header")).toBeVisible();
-  // Settle so React commits the read-only serverAbout state and any effect
-  // that was going to fire would have fired.
-  await page.waitForTimeout(500);
-
-  expect(mock.telemetryPings).toHaveLength(0);
+  await waitForResponseBody(page, "/api/about");
+  await expect(page.getByTestId("sidebar-session-row")).toHaveCount(1);
+  await observeFor(page, 500, async () => {
+    expect(await publishedRequests(page, "/api/telemetry/seen", "POST")).toEqual([]);
+    expect(mock.telemetryPings).toEqual([]);
+  });
 });

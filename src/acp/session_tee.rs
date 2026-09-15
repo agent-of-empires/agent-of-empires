@@ -284,46 +284,12 @@ impl Visit for LineVisitor {
 mod tests {
     use super::*;
     use serial_test::serial;
-    use tempfile::TempDir;
     use tracing::subscriber::with_default;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::Registry;
 
-    /// Point `get_app_dir` at a throwaway home so `log_path_for` resolves
-    /// under a temp dir. Restoration runs from an RAII guard so a panicking
-    /// `f()` cannot leak the temp env into later serialized tests.
     fn with_temp_home<F: FnOnce()>(f: F) {
-        struct EnvGuard {
-            home: Option<std::ffi::OsString>,
-            xdg: Option<std::ffi::OsString>,
-        }
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                // SAFETY: tests are serialized via `#[serial]`.
-                unsafe {
-                    match self.home.take() {
-                        Some(v) => std::env::set_var("HOME", v),
-                        None => std::env::remove_var("HOME"),
-                    }
-                    match self.xdg.take() {
-                        Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                        None => std::env::remove_var("XDG_CONFIG_HOME"),
-                    }
-                }
-            }
-        }
-
-        let tmp = TempDir::new().unwrap();
-        let _guard = EnvGuard {
-            home: std::env::var_os("HOME"),
-            xdg: std::env::var_os("XDG_CONFIG_HOME"),
-        };
-        // SAFETY: tests are serialized via `#[serial]`; the guard restores
-        // the originals on scope exit, including an unwind.
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
-        }
+        let _home = crate::session::test_support::isolate_app_dir();
         f();
     }
 

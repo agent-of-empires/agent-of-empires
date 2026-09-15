@@ -17,6 +17,10 @@ pub struct RestartRequest {
     /// Keys to send once the pane is live again. Empty disables the wake-up
     /// (the documented opt-out via `session.restart_wake_message`).
     pub wake_message: String,
+    /// Remove the sandbox container before relaunching, so the next start
+    /// creates a fresh one. Set on a tool swap: agent config mounts are chosen
+    /// per tool at create time and a restart reuses the container (#3959).
+    pub discard_sandbox_container: bool,
 }
 
 pub struct RestartResult {
@@ -38,6 +42,7 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
         mut instance,
         size,
         wake_message,
+        discard_sandbox_container,
     } = request;
 
     let title = instance.title.clone();
@@ -53,7 +58,9 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
         let _scope = crate::session::recovery::HookTimeoutScope::new(
             crate::session::recovery::recovery_hook_timeout(),
         );
-        instance.restart_with_size(size).map_err(|e| e.to_string())
+        instance
+            .restart_discarding_sandbox_container(size, discard_sandbox_container)
+            .map_err(|e| e.to_string())
     };
 
     // On a successful restart, send the wake-up keys on a detached thread so
@@ -132,6 +139,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn perform_restart_preserves_session_id_and_returns_instance() {
+        let _app_guard = crate::session::test_support::isolate_app_dir();
         let instance = test_instance();
         let id = instance.id.clone();
         let title = instance.title.clone();
@@ -140,6 +148,7 @@ mod tests {
             instance,
             size: None,
             wake_message: String::new(),
+            discard_sandbox_container: false,
         });
         // The cascade may create a real tmux session; tear it down so the test
         // cleans up after itself.
@@ -148,6 +157,94 @@ mod tests {
         }
         assert_eq!(result.session_id, id);
         assert_eq!(result.instance.id, id);
+    }
+
+    /// A tool-swap restart must not remove a container whose session a peer
+    /// lifecycle operation still owns (#3972).
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn tool_swap_restart_removes_container_only_after_owning_launch_reservation() {
+        use crate::session::{LifecycleOperation, LifecycleReservation, SandboxInfo};
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let calls = temp.path().join("runtime-calls");
+        // Record every runtime call; only removal succeeds, so an owned
+        // relaunch stops at container creation instead of reaching tmux.
+        for binary in ["docker", "podman", "container"] {
+            let script = bin.join(binary);
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n\
+                     if [ \"$1\" = rm ]; then exit 0; fi\n\
+                     echo 'permission denied' >&2\nexit 1\n",
+                    calls.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _path = crate::session::test_support::path_prepended(&bin);
+
+        let profile = "restart-discard-reservation";
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        for (peer_reserved, expected_removals) in [(true, 0), (false, 1)] {
+            let mut instance = test_instance();
+            instance.source_profile = profile.to_string();
+            instance.tool = "codex".to_string();
+            instance.sandbox_info = Some(SandboxInfo {
+                enabled: true,
+                container_id: None,
+                image: "ubuntu:latest".to_string(),
+                container_name: "test-container".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                container_workdir: None,
+            });
+            if peer_reserved {
+                instance.lifecycle_generation = 1;
+                instance.lifecycle_reservation = Some(LifecycleReservation {
+                    op: LifecycleOperation::Launch,
+                    generation: 1,
+                    at: chrono::Utc::now(),
+                });
+            }
+            storage
+                .update(|instances, _groups| {
+                    instances.push(instance.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let container = crate::containers::DockerContainer::from_session_id(&instance.id).name;
+
+            let result = perform_restart(RestartRequest {
+                session_id: instance.id.clone(),
+                instance,
+                size: None,
+                wake_message: String::new(),
+                discard_sandbox_container: true,
+            });
+
+            let error = result
+                .outcome
+                .expect_err("the fake runtime fails every launch");
+            assert_eq!(error.contains("busy"), peer_reserved, "{error}");
+            let removals = std::fs::read_to_string(&calls)
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| line.starts_with("rm ") && line.ends_with(&container))
+                .count();
+            assert_eq!(
+                removals, expected_removals,
+                "peer_reserved={peer_reserved}: {error}"
+            );
+        }
     }
 
     #[test]

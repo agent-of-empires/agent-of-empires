@@ -48,7 +48,7 @@ test("palette hides creation commands in read-only mode", async ({ serveReadOnly
   });
   await page.goto(serveReadOnly.baseUrl);
   await aboutPromise;
-  await page.waitForTimeout(200);
+  await expect(page.getByText("This dashboard is in read-only mode.")).toBeVisible();
 
   await page.locator("body").click();
   await page.keyboard.press("ControlOrMeta+KeyK");

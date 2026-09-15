@@ -28,7 +28,10 @@ fn spawn_config(
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
-            command: "node".into(),
+            command: crate::common::shim_node()
+                .expect("shim prerequisite")
+                .to_string_lossy()
+                .into_owned(),
             args: vec![shim.to_string_lossy().to_string()],
             description: "thought-level shim".into(),
             env_allowlist: None,
@@ -62,10 +65,12 @@ async fn drive_one_turn(client: &mut AcpClient) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(200), client.next_event()).await {
-            Ok(Some(Event::Stopped { .. })) => break,
-            Ok(_) | Err(_) => continue,
+            Ok(Some(Event::Stopped { .. })) => return,
+            Ok(None) => panic!("ACP event stream closed before prompt completion"),
+            Ok(Some(_)) | Err(_) => continue,
         }
     }
+    panic!("prompt did not complete after the handshake");
 }
 
 fn shim_env(record_path: &std::path::Path, load_session: bool) -> Vec<(String, String)> {
@@ -86,6 +91,7 @@ fn shim_env(record_path: &std::path::Path, load_session: bool) -> Vec<(String, S
 /// stored id, so the handshake resumes via `session/load`. The pinned effort
 /// must still be applied, or the pick the user made before the restart is gone.
 #[tokio::test]
+#[serial_test::parallel]
 async fn pinned_effort_applied_on_session_load() {
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
@@ -115,6 +121,7 @@ async fn pinned_effort_applied_on_session_load() {
 
 /// The fresh-session path keeps working, and applies the effort exactly once.
 #[tokio::test]
+#[serial_test::parallel]
 async fn pinned_effort_applied_once_on_session_new() {
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
@@ -149,6 +156,7 @@ async fn pinned_effort_applied_once_on_session_new() {
 /// An unpinned session sends no config-option RPC at all, so it keeps whatever
 /// the agent's own default is.
 #[tokio::test]
+#[serial_test::parallel]
 async fn no_config_option_rpc_without_a_pinned_effort() {
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");

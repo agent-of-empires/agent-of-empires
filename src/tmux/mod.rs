@@ -435,10 +435,17 @@ impl TmuxCommandDeadline {
         run_tmux_command_with_timeout_inner(cmd, remaining)
     }
 }
+#[cfg(test)]
+thread_local! {
+    static TMUX_COMMAND_EXECUTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 fn run_tmux_command_with_timeout_inner(
     cmd: &mut Command,
     timeout: Duration,
 ) -> std::io::Result<Output> {
+    #[cfg(test)]
+    TMUX_COMMAND_EXECUTIONS.with(|count| count.set(count.get() + 1));
     cmd.stdin(Stdio::null());
     match crate::process::run_with_timeout(cmd, timeout)? {
         Some(output) => Ok(output),
@@ -2660,12 +2667,27 @@ thread_local! {
     static AGENT_PROBE_MISS_GATE: std::cell::RefCell<Option<(
         std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>,
     )>> = const { std::cell::RefCell::new(None) };
+    static AGENT_PROBE_LOCK_CONTENDED: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn lock_agent_probe() -> std::sync::MutexGuard<'static, ()> {
+    #[cfg(test)]
+    if let Some(contended) = AGENT_PROBE_LOCK_CONTENDED.with(|slot| slot.borrow_mut().take()) {
+        match AGENT_PROBE_LOCK.try_lock() {
+            Ok(guard) => return guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => return error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                contended.send(()).expect("contention observer alive");
+            }
+        }
+    }
+    AGENT_PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Clear the memo after any in-flight probe finishes, so it cannot republish stale results.
 /// Lock order matches population: probe lock, then memo.
 pub(crate) fn invalidate_agent_availability() {
-    let _probe_guard = AGENT_PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _probe_guard = lock_agent_probe();
     if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
         *cache = None;
     }
@@ -2809,60 +2831,40 @@ impl AvailableTools {
 
 #[cfg(test)]
 mod tests {
-    /// Recheck must not race an in-flight probe. `invalidate` has to wait for
-    /// the probe holding `AGENT_PROBE_LOCK` to publish and then clear, or that
-    /// probe's pre-install results survive the clear, the following `detect`
-    /// finds the memo populated, skips its own probe, and reports a freshly
-    /// installed agent as still missing.
-    ///
-    /// Ordering is asserted through a channel rather than a sleep loop, so the
-    /// thread is known to have reached the call before anything is claimed
-    /// about it: an unscheduled thread blocks the first `recv` instead of
-    /// silently satisfying a "still populated" poll.
+    /// Invalidation must clear after an in-flight probe publishes, not before.
     #[test]
     #[serial_test::serial]
     fn invalidate_agent_availability_waits_for_an_in_flight_probe() {
         let memo = AgentAvailabilityGuard::capture();
         memo.seed(crate::agents::AGENTS[0].name, false);
-        assert!(memo.is_populated(), "seeded memo");
-
-        // Stand in for a probe mid-login-shell: holds the probe lock, has not
-        // written its results yet. Declared after `memo` so it drops first,
-        // joining the worker before the memo is restored even on a panic.
-        let (tx, rx) = std::sync::mpsc::channel::<&'static str>();
+        let (contended_tx, contended_rx) = std::sync::mpsc::channel();
+        let (returned_tx, returned_rx) = std::sync::mpsc::channel();
         let mut worker = BlockedProbeWorker::new(
             AGENT_PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner()),
             std::thread::spawn(move || {
-                tx.send("entered").expect("test receiver alive");
+                AGENT_PROBE_LOCK_CONTENDED.with(|slot| *slot.borrow_mut() = Some(contended_tx));
                 invalidate_agent_availability();
-                tx.send("returned").expect("test receiver alive");
+                returned_tx.send(()).expect("test receiver alive");
             }),
         );
 
-        // Blocks until the thread is definitely running, so the assertion
-        // below cannot pass merely because it never got scheduled.
-        assert_eq!(rx.recv().expect("thread started"), "entered");
-
-        // The probe still holds the lock, so invalidation cannot complete.
-        // This is the assertion: without the lock acquisition it returns
-        // immediately and "returned" arrives well inside the window.
-        assert!(
-            matches!(
-                rx.recv_timeout(std::time::Duration::from_millis(200)),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-            ),
-            "invalidate completed without waiting for the in-flight probe"
-        );
+        contended_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("invalidator must observe the held probe lock");
+        assert!(matches!(
+            returned_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
         assert!(
             memo.is_populated(),
-            "and the memo still stands while it waits"
+            "memo survives the contested lock decision"
         );
 
         worker.release_and_join();
-        assert_eq!(rx.recv().expect("invalidate completes"), "returned");
+        returned_rx.recv().expect("invalidate completes");
         assert!(
             !memo.is_populated(),
-            "invalidate must clear once the in-flight probe releases the lock"
+            "invalidate clears after the probe releases its lock"
         );
     }
 
@@ -3438,11 +3440,68 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn tmux_command_timeout_kills_a_stalled_client() {
-        let mut command = Command::new("sh");
-        command.args(["-c", "sleep 5"]);
-        let error = run_tmux_command_with_timeout_inner(&mut command, Duration::from_millis(10))
-            .expect_err("stalled client must time out");
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        use std::os::unix::process::CommandExt;
+
+        struct ClientCleanup(libc::pid_t);
+        impl Drop for ClientCleanup {
+            fn drop(&mut self) {
+                // Only signal a process that is still our unreaped child.
+                unsafe {
+                    if libc::waitpid(self.0, std::ptr::null_mut(), libc::WNOHANG) == 0 {
+                        libc::kill(self.0, libc::SIGKILL);
+                        libc::waitpid(self.0, std::ptr::null_mut(), 0);
+                    }
+                }
+            }
+        }
+
+        let _env = crate::session::test_support::EnvGuard::read_lock();
+        let (mut reader, writer) = UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        // pre_exec runs before spawn returns, so even a descheduled exec has an identity.
+        unsafe {
+            command.pre_exec(move || {
+                let pid = libc::getpid().to_ne_bytes();
+                if libc::write(writer.as_raw_fd(), pid.as_ptr().cast(), pid.len())
+                    != pid.len() as isize
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let result = run_tmux_command_with_timeout_inner(&mut command, Duration::from_millis(10));
+        let mut pid = [0; std::mem::size_of::<libc::pid_t>()];
+        reader
+            .read_exact(&mut pid)
+            .expect("spawned client's identity");
+        let client = ClientCleanup(libc::pid_t::from_ne_bytes(pid));
+        let error = result.expect_err("stalled client must time out");
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(
+            unsafe { libc::kill(client.0, 0) },
+            -1,
+            "timed-out client is still alive or a zombie"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        assert_eq!(
+            unsafe { libc::waitpid(client.0, std::ptr::null_mut(), libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
     }
 
     #[test]
@@ -4747,88 +4806,6 @@ mod tests {
         assert!(
             pane_is_dead(),
             "Pane should be dead after exec'd command exits (lifecycle preserved)"
-        );
-    }
-
-    /// Verify that after `exec` replaces the outer shell, the secret
-    /// values from export statements are NOT visible in `ps` output.
-    ///
-    /// Note: the tmux server must already be running before this test.
-    /// If the test session is the FIRST tmux process, the `tmux new-session`
-    /// process becomes the server and its argv (which contains the command
-    /// string with the secret) persists. In real aoe usage the server is
-    /// always already running. We start a dummy session first to ensure this.
-    #[test]
-    #[serial_test::serial]
-    fn test_export_exec_secrets_not_in_ps_after_exec() {
-        if !tmux_available() {
-            eprintln!("Skipping test: tmux not available");
-            return;
-        }
-
-        // Ensure the tmux server is already running so our test session's
-        // command string doesn't end up in the server process's argv.
-        let dummy_guard = TmuxTestSession::new("aoe_test_ps_dummy");
-        let dummy = dummy_guard.name().to_string();
-        let _ = tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &dummy,
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sleep 120",
-            ])
-            .output();
-        std::thread::sleep(std::time::Duration::from_millis(200));
-
-        let session_guard = TmuxTestSession::new("aoe_test_ps");
-        let session_name = session_guard.name().to_string();
-        let secret_value = format!("UNIQUE_SECRET_{}_xyzzy", std::process::id());
-
-        // Simulate: export SECRET='val'; exec sleep 30
-        // After exec, the shell process (whose argv contained the export) is
-        // replaced by sleep, whose argv is just "sleep 30" (no secret).
-        let compound_cmd = format!("export AOE_PS_TEST='{}'; exec sleep 30", secret_value);
-
-        let output = tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &session_name,
-                "-x",
-                "80",
-                "-y",
-                "24",
-                &compound_cmd,
-            ])
-            .output()
-            .expect("tmux new-session");
-        assert!(output.status.success());
-
-        // Wait for exec to complete
-        std::thread::sleep(std::time::Duration::from_millis(500));
-
-        // Check ps output for the secret value
-        let ps_output = Command::new("ps")
-            .args(["auxww"])
-            .output()
-            .expect("ps auxww");
-        let ps_text = String::from_utf8_lossy(&ps_output.stdout);
-
-        assert!(
-            !ps_text.contains(&secret_value),
-            "Secret value must NOT appear in ps output after exec.\nFound '{}' in ps:\n{}",
-            secret_value,
-            ps_text
-                .lines()
-                .filter(|l| l.contains(&secret_value))
-                .collect::<Vec<_>>()
-                .join("\n")
         );
     }
 

@@ -130,12 +130,20 @@ async fn run(
     let mut state = RemoteHomeState::new(endpoint)?;
     refresh(&mut state).await;
     terminal.draw(|f| render::render(f, f.area(), theme, &state))?;
+    #[cfg(feature = "e2e-tests")]
+    crate::tui::app::e2e_render_ack(true)?;
 
     while let Some(evt) = event_stream.next().await {
         let Ok(evt) = evt else { return Ok(()) };
         let CrosstermEvent::Key(key) = evt else {
             continue;
         };
+        #[cfg(feature = "e2e-tests")]
+        if key.code == KeyCode::F(12) && std::env::var_os("AOE_E2E_INPUT_BARRIER").is_some() {
+            terminal.draw(|f| render::render(f, f.area(), theme, &state))?;
+            crate::tui::app::e2e_render_ack(false)?;
+            continue;
+        }
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             continue;
         }

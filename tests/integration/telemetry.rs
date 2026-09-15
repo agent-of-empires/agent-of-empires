@@ -18,15 +18,13 @@ use std::time::Duration;
 
 /// Redirect the app dir at a temp location and clear the telemetry-related env
 /// vars. Returns the guard; keep it alive for the test's duration.
-fn isolate() -> tempfile::TempDir {
-    let tmp = tempfile::TempDir::new().expect("tempdir");
-    unsafe {
-        std::env::set_var("HOME", tmp.path());
-        std::env::set_var("XDG_CONFIG_HOME", tmp.path());
-        std::env::remove_var("DO_NOT_TRACK");
-        std::env::remove_var("AOE_TELEMETRY_ENDPOINT");
-    }
-    tmp
+fn isolate() -> crate::common::TestHome {
+    let mut home = crate::common::setup_temp_home();
+    home.env = home.env.and_set("DO_NOT_TRACK", "");
+    home.env = home.env.and_set("AOE_TELEMETRY_ENDPOINT", "");
+    std::env::remove_var("DO_NOT_TRACK");
+    std::env::remove_var("AOE_TELEMETRY_ENDPOINT");
+    home
 }
 
 fn set_enabled(enabled: bool) {

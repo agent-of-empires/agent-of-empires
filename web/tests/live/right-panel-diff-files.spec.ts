@@ -20,7 +20,7 @@ base("right panel diff list: counts, tree/flat toggle, keyboard select", async (
     parallelIndex: testInfo.parallelIndex,
     seedFn: ({ home, env }) => {
       const projectDir = join(home, "project");
-      initWorkingRepo(projectDir);
+      initWorkingRepo(projectDir, env);
       const baseline = {
         "src/a.ts": "export const a = 1;\n",
         "src/b.ts": "export const b = 2;\n",
@@ -29,7 +29,7 @@ base("right panel diff list: counts, tree/flat toggle, keyboard select", async (
         "README.md": "# Old\n",
       };
       writeFiles(projectDir, baseline);
-      commitAll(projectDir, "baseline");
+      commitAll(projectDir, "baseline", env);
       writeFiles(projectDir, {
         "src/a.ts": "export const a = 11;\n",
         "src/b.ts": "export const b = 22;\n",

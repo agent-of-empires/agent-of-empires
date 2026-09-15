@@ -308,16 +308,10 @@ pub const AOE_AGENT: AgentProfile = AgentProfile {
     // to a parent. Populate this only once the adapter emits linkage.
     parent_meta_namespaces: &[],
     clear_aliases: &["/clear"],
-    // Same defect class as codex-acp: the adapter has no clear handler of any
-    // kind, so a forwarded `/clear` is answered as an ordinary prompt and the
-    // model keeps its whole history while AoE draws a clear divider. Driving
-    // the reset via `session/new` mints an id we can persist and does reset
-    // the in-memory history.
-    //
-    // Known hole: the adapter reseeds from `${AOE_ARTIFACT_DIR}/transcript.jsonl`
-    // on `session/load`, and that file still holds the pre-clear turns, so a
-    // worker restart after a clear resurrects the cleared context. Fixing that
-    // means truncating the transcript on reset, tracked separately.
+    // A forwarded /clear is ordinary model text. AoE creates a new native
+    // session instead; the adapter persists that identity best-effort, so a
+    // failed persist does not block the clear and a missing transcript resets
+    // context on load.
     clear_requires_driven_reset: true,
     // No ExitPlanMode tool and no mode channel; no ScheduleWakeup or cron
     // tools. Synthesising Plan or WakeupScheduled events here would fire on

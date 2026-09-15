@@ -408,6 +408,140 @@ fn restart_selected_session_tool_swap_clears_old_agent_session_state() {
     assert_eq!(parked.acp_session_id.as_deref(), Some("acp-sess-1"));
 }
 
+/// Only a tool swap removes the sandbox container, and a failed removal fails the restart (#3959).
+#[cfg(unix)]
+#[test]
+#[serial]
+fn restart_selected_session_tool_swap_discards_sandbox_container() {
+    use crate::session::SandboxInfo;
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+
+    let bin = env._temp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let calls = env._temp.path().join("runtime-calls");
+    let fail_removal = env._temp.path().join("fail-removal");
+    // Record every runtime call and fail all but removal (unless the
+    // `fail_removal` file exists), so the relaunch stops at the container probe
+    // instead of reaching tmux.
+    for binary in ["docker", "podman", "container"] {
+        let script = bin.join(binary);
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n\
+                 if [ \"$1\" = rm ] && [ ! -e '{}' ]; then exit 0; fi\n\
+                 echo 'permission denied' >&2\nexit 1\n",
+                calls.display(),
+                fail_removal.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let _path = crate::session::test_support::path_prepended(&bin);
+
+    let seed = |inst: &mut Instance| {
+        inst.tool = "claude".to_string();
+        inst.sandbox_info = Some(SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "ubuntu:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        });
+    };
+    env.view.mutate_instance(&id, seed);
+    env.view
+        .storages
+        .get("test")
+        .unwrap()
+        .update(|instances, _groups| {
+            seed(instances.iter_mut().find(|i| i.id == id).unwrap());
+            Ok(())
+        })
+        .unwrap();
+
+    let container = crate::containers::DockerContainer::from_session_id(&id).name;
+    let runtime_calls = || {
+        std::fs::read_to_string(&calls)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    let removals = || {
+        runtime_calls()
+            .iter()
+            .filter(|line| line.starts_with("rm ") && line.ends_with(&container))
+            .count()
+    };
+    let restart = |env: &mut TestEnv, tool: Option<&str>| {
+        env.view.restart_cooldown_at.clear();
+        env.view
+            .restart_selected_session(None, tool, None, None)
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !env.view.apply_restart_results() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "restart did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    };
+
+    for (tool, removal_fails, expected_removals, case) in [
+        (None, false, 0, "a plain restart must reuse the container"),
+        (
+            Some("claude"),
+            false,
+            0,
+            "restarting on the same tool is not a swap",
+        ),
+        (
+            Some("codex"),
+            false,
+            1,
+            "a tool swap must remove the container",
+        ),
+        (
+            Some("claude"),
+            true,
+            2,
+            "a failed removal must fail the restart",
+        ),
+    ] {
+        if removal_fails {
+            std::fs::write(&fail_removal, "").unwrap();
+        }
+        let calls_before = runtime_calls().len();
+        restart(&mut env, tool);
+        assert!(
+            runtime_calls().len() > calls_before,
+            "{case}: the relaunch never reached the container runtime"
+        );
+        assert_eq!(removals(), expected_removals, "{case}");
+        let error = env
+            .view
+            .instance_at(0)
+            .last_error
+            .clone()
+            .unwrap_or_default();
+        assert_eq!(
+            error.contains(&format!("{container} built for the previous tool")),
+            removal_fails,
+            "{case}: {error}"
+        );
+    }
+}
+
 /// The disk row a tool swap writes must resolve `agent_detect_as` against the
 /// session's own profile. `source_profile` is `skip_serializing`, so a
 /// storage-loaded row comes back blank and would key the default profile's
@@ -660,7 +794,7 @@ fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
     std::fs::write(claude_dir.join(format!("{stale_sid}.jsonl")), "seed\n").unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some(profile.to_string()),
         tools,
         crate::file_watch::FileWatchService::noop(),
@@ -1433,7 +1567,7 @@ fn scratch_label_pin_gate_keys_on_backing_repo_not_label() {
             .unwrap();
         }
 
-        let mut view = HomeView::new(
+        let mut view = HomeView::new_for_test(
             Some("test".to_string()),
             AvailableTools::with_tools(&["claude"]),
             crate::file_watch::FileWatchService::noop(),
@@ -1520,7 +1654,7 @@ fn synthetic_scratch_bucket_is_distinct_from_real_repo() {
         })
         .unwrap();
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         AvailableTools::with_tools(&["claude"]),
         crate::file_watch::FileWatchService::noop(),
@@ -1603,7 +1737,7 @@ fn scratch_bucket_lends_no_repo_path_for_new_session_prefill() {
         })
         .unwrap();
 
-    let view = HomeView::new(
+    let view = HomeView::new_for_test(
         Some("test".to_string()),
         AvailableTools::with_tools(&["claude"]),
         crate::file_watch::FileWatchService::noop(),
@@ -1639,7 +1773,7 @@ fn scratch_bucket_absent_from_main_flow_when_only_scratch_is_archived() {
         })
         .unwrap();
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         AvailableTools::with_tools(&["claude"]),
         crate::file_watch::FileWatchService::noop(),
@@ -1790,7 +1924,7 @@ fn stale_registry_entry_with_mismatched_archived_path_stays_pinned_and_unpinnabl
     .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         tools,
         crate::file_watch::FileWatchService::noop(),
@@ -2015,7 +2149,8 @@ fn all_profiles_view_includes_profile_scoped_pins() {
     .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    let mut view =
+        HomeView::new_for_test(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
     view.group_by = GroupByMode::Project;
     view.flat_items = view.build_flat_items();
 
@@ -2074,7 +2209,8 @@ fn unpin_profile_scoped_pin_from_all_profiles_clears_header() {
     .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    let mut view =
+        HomeView::new_for_test(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
     view.group_by = GroupByMode::Project;
     view.flat_items = view.build_flat_items();
 
@@ -2343,7 +2479,7 @@ fn profile_move_group_metadata_survives_reload() {
     let tools = AvailableTools::with_tools(&["claude"]);
 
     {
-        let mut view = HomeView::new(
+        let mut view = HomeView::new_for_test(
             None,
             tools.clone(),
             crate::file_watch::FileWatchService::noop(),
@@ -2375,7 +2511,8 @@ fn profile_move_group_metadata_survives_reload() {
             .unwrap();
     }
 
-    let reloaded = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    let reloaded =
+        HomeView::new_for_test(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
     assert!(
         reloaded.group_trees.contains_key("alpha"),
         "alpha tree must still load after the move"
@@ -3554,13 +3691,27 @@ fn startup_recovery_waits_for_the_first_reconcile_sweep() {
         "construction must arm the gate rather than recover from unrepaired paths"
     );
 
-    // An unchanged sweep still releases it: the paths are now known good.
+    // Observe completion directly, rather than mistaking gate expiry for a sweep.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let result = loop {
+        match view.reconcile_poller.try_recv_result() {
+            Ok(result) => break result,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                panic!("startup worker disconnected")
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "startup sweep did not complete"
+                );
+                std::thread::yield_now();
+            }
+        }
+    };
+    assert!(!result.changed, "empty storage needs no repair");
     view.reconcile_poller =
-        crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(false);
-    assert!(
-        !view.apply_reconcile_results(),
-        "nothing changed, so no reload"
-    );
+        crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(result.changed);
+    assert!(!view.apply_reconcile_results());
     assert!(
         view.startup_recovery_gate.is_none(),
         "the sweep landing must release the recovery gate"
@@ -3584,14 +3735,15 @@ fn startup_recovery_gate_expires_when_the_sweep_never_lands() {
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
     let _storage = Storage::new_unwatched("test").unwrap();
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         AvailableTools::with_tools(&["claude"]),
         crate::file_watch::FileWatchService::noop(),
     )
     .unwrap();
-    // A poller that never reports, standing in for a sweep blocked on a flock.
+    // No request is queued: only the gate deadline can release recovery.
     view.reconcile_poller = crate::tui::reconcile_poller::ReconcilePoller::new();
+    view.startup_recovery_gate = Some(std::time::Instant::now());
 
     assert!(!view.apply_reconcile_results());
     assert!(
@@ -3625,7 +3777,7 @@ fn a_failed_reload_backs_off_instead_of_retrying_every_tick() {
             Ok(())
         })
         .unwrap();
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         AvailableTools::with_tools(&["claude"]),
         crate::file_watch::FileWatchService::noop(),
@@ -3676,7 +3828,7 @@ fn startup_recovery_gate_expires_during_live_send() {
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
     let _storage = Storage::new_unwatched("test").unwrap();
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         AvailableTools::with_tools(&["claude"]),
         crate::file_watch::FileWatchService::noop(),
@@ -3720,7 +3872,7 @@ fn a_queued_repair_is_applied_before_the_gate_opens_at_the_deadline() {
         })
         .unwrap();
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         AvailableTools::with_tools(&["claude"]),
         crate::file_watch::FileWatchService::noop(),
@@ -3775,7 +3927,7 @@ fn a_queued_repair_keeps_the_gate_armed_while_live_send_holds_the_reload() {
         })
         .unwrap();
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         AvailableTools::with_tools(&["claude"]),
         crate::file_watch::FileWatchService::noop(),
@@ -3838,7 +3990,7 @@ fn a_failed_reload_keeps_the_repair_pending_and_the_gate_shut() {
         })
         .unwrap();
 
-    let mut view = HomeView::new(
+    let mut view = HomeView::new_for_test(
         Some("test".to_string()),
         AvailableTools::with_tools(&["claude"]),
         crate::file_watch::FileWatchService::noop(),
@@ -3852,6 +4004,8 @@ fn a_failed_reload_keeps_the_repair_pending_and_the_gate_shut() {
         .unwrap();
     view.reconcile_poller =
         crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(true);
+
+    view.startup_recovery_gate = Some(std::time::Instant::now());
 
     // A groups.json that is a directory makes `load_with_groups` fail.
     let groups = crate::session::get_app_dir()

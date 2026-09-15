@@ -35,8 +35,9 @@ pub enum PluginCommands {
         #[arg(long)]
         yes: bool,
     },
-    /// Update an installed external plugin from its recorded source. Prompts to
-    /// re-approve capabilities if the update changes the capability set.
+    /// Update an installed external plugin from its recorded source and restart
+    /// its worker in a running daemon. Prompts to re-approve capabilities if the
+    /// update changes the capability set.
     Update {
         /// Plugin id
         id: String,
@@ -213,8 +214,16 @@ async fn run_install(source: &str, yes: bool) -> Result<()> {
 }
 
 async fn run_update(id: &str) -> Result<()> {
+    use crate::plugin::install::LiveRestart;
     let report = crate::plugin::install::update(id).await?;
     print_report(&report, "Updated");
+    match crate::plugin::install::restart_worker_live(id).await {
+        LiveRestart::Daemon => println!("  the running daemon reloaded the plugin."),
+        LiveRestart::NoDaemon => {}
+        LiveRestart::DaemonStale { reason } => println!(
+            "  warning: a daemon is running but did not reload the plugin ({reason}); its worker keeps the previous build until the daemon restarts."
+        ),
+    }
     Ok(())
 }
 
