@@ -308,16 +308,19 @@ Each sandboxed session gets its own agent store on the host, under
 `~/.claude/sandbox-v2/<id>`). AoE builds that store from the configuration it
 declares for the agent: its config files, credentials and authored resources.
 The host's native history is never imported, so a session's transcripts,
-caches and logs start empty and belong to it alone. The container mounts the
+caches and logs start empty and belong to it alone. A host file AoE does not
+declare for that agent, such as one you wrote yourself, stays on the host
+instead of being copied. The container mounts the
 store at the agent's usual config path, so credentials, hooks and conversation
 history belong to one session and `aoe` can resume the right conversation.
 
 A session keeps the store it was given for as long as AoE can still prove it
 wrote that store. When it cannot, the whole store is moved intact under
-`.aoe-sandbox-recovery/<transaction>/` beside the agent's config directory,
-a fresh store is seeded in its place, and AoE says so before the session's next
-start. Nothing is deleted and nothing from the retained store is replayed
-automatically; copy back whatever you still want from it.
+`.aoe-sandbox-recovery/<transaction>/` beside the agent's config directory and
+a fresh store is seeded in its place, with the session's original left alone.
+The next start says the session's native history was isolated and names the
+retained originals; nothing is replayed from them automatically, so copy back
+whatever you still want.
 
 Sessions created before this layout shared one agent store per agent (for
 example `~/.claude/sandbox`). Each one moves when you start it: AoE copies the

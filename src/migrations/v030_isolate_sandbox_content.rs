@@ -701,24 +701,38 @@ fn private_recovery_root(host: &Path) -> Result<AnchoredDir> {
     Ok(root)
 }
 
+/// What a retention request did, so a caller that can leave work pending tells
+/// "there was nothing to retain" from "a live mount keeps the namespace open".
+pub(crate) enum Retained {
+    Original(PathBuf),
+    Absent,
+    Deferred,
+}
+
 /// Retain a v027 original without its lossy copy/overlay policy. The caller
 /// holds the stopped cohort lock; the entire tree moves intact,
 /// including unclassified entries and links that were never copy candidates.
-pub(crate) fn retain_legacy_original(source: &Path, host: &Path) -> Result<Option<PathBuf>> {
+pub(crate) fn retain_legacy_original(source: &Path, host: &Path) -> Result<Retained> {
+    retain_legacy_original_with(source, host, &live_bind_sources)
+}
+
+fn retain_legacy_original_with(
+    source: &Path,
+    host: &Path,
+    exposure: &ExposureProbe<'_>,
+) -> Result<Retained> {
     let Some(original) = identity(source)? else {
-        return Ok(None);
+        return Ok(Retained::Absent);
     };
     let app = crate::session::get_app_dir()?;
     let recovery = recovery_root(host)?;
-    if let Some(message) = recovery_exposure(
-        &app,
-        &[canonical_expected_path(&recovery)?],
-        &live_bind_sources,
-    )? {
+    if let Some(message) =
+        recovery_exposure(&app, &[canonical_expected_path(&recovery)?], exposure)?
+    {
         progress::notice(format!(
             "{message}; the shared store stays where it is until that mount is gone"
         ));
-        return Ok(None);
+        return Ok(Retained::Deferred);
     }
     let root = private_recovery_root(host)?;
     let transaction = root.create_child(Path::new(&format!("v027-{}", uuid::Uuid::new_v4())))?;
@@ -735,11 +749,7 @@ pub(crate) fn retain_legacy_original(source: &Path, host: &Path) -> Result<Optio
         bail!("legacy original changed before retention");
     }
     rename_directory(source, &destination)?;
-    progress::notice(format!(
-        "Retained complete legacy sandbox original at {}",
-        destination.display()
-    ));
-    Ok(Some(destination))
+    Ok(Retained::Original(destination))
 }
 
 fn read_registries(app: &Path) -> Result<Vec<(PathBuf, Value)>> {
@@ -1381,19 +1391,26 @@ fn record_reset_in(
     else {
         return Ok(());
     };
-    if current
-        .get("sandbox_content_policy")
-        .and_then(Value::as_u64)
-        == Some(u64::from(CONTENT_POLICY))
-        || row_roots(current, tool, home, config)? != roots
-    {
+    let mut current_roots = row_roots(current, tool, home, config)?;
+    container_config::expand_content_roles(&mut current_roots, home, &config.session)?;
+    // The reset is per transaction, and `reset_row` already answers for this
+    // one. What the caller must decide is whether the row still resolves the
+    // store the transaction moved, which is about paths: a shared config
+    // directory gains roles from later tool registrations without moving.
+    let resolves_same_store: BTreeSet<_> =
+        current_roots.iter().map(|root| root.path.clone()).collect();
+    if resolves_same_store != roots.iter().map(|root| root.path.clone()).collect() {
         return Ok(());
     }
     let Some(receipt) = retired_receipt(app, id, tool, current)? else {
         return Ok(());
     };
+    let before = current.clone();
     reset_row(current, &receipt)?;
-    write_registry(registry, &fresh)
+    if *current != before {
+        write_registry(registry, &fresh)?;
+    }
+    Ok(())
 }
 
 /// The journal entry that retired this row's context, read from beside the live
@@ -1868,6 +1885,51 @@ pub(crate) fn guard_preparation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A live mount that reaches the recovery namespace defers retention, and
+    /// the caller has to be able to tell that from "nothing to retain", or the
+    /// deferred root would never be retried.
+    #[test]
+    #[serial_test::serial]
+    fn retention_is_deferred_while_a_mount_reaches_the_recovery_namespace() {
+        let temporary = tempfile::tempdir().unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let home = dirs::home_dir().unwrap();
+        let app = crate::session::get_app_dir().unwrap();
+        fs::create_dir_all(&app).unwrap();
+        let project = temporary.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let mut row = serde_json::to_value(crate::session::Instance::new(
+            "codex",
+            project.to_str().unwrap(),
+        ))
+        .unwrap();
+        row["sandbox_info"] = serde_json::json!({ "enabled": true });
+        fs::write(
+            app.join("sessions.json"),
+            serde_json::to_vec(&vec![row]).unwrap(),
+        )
+        .unwrap();
+        let host = home.join(".codex");
+        let source = host.join("sandbox");
+        fs::create_dir_all(source.join("one")).unwrap();
+        fs::write(source.join("one/own"), b"own").unwrap();
+
+        assert!(matches!(
+            retain_legacy_original_with(&source, &host, &|_| Ok(vec![home.clone()])).unwrap(),
+            Retained::Deferred
+        ));
+        assert_eq!(fs::read(source.join("one/own")).unwrap(), b"own");
+        assert!(!recovery_root(&host).unwrap().exists());
+        assert!(matches!(
+            retain_legacy_original_with(&source, &host, &|_| Ok(vec![temporary
+                .path()
+                .join("elsewhere")]))
+            .unwrap(),
+            Retained::Original(_)
+        ));
+        assert!(!source.exists());
+    }
 
     /// A mount that reaches the recovery namespace is refused, but refusing it
     /// must leave the session pending rather than fail the pass: one such mount

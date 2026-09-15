@@ -1239,7 +1239,11 @@ fn run_pass(
             });
         if !defer_source_retirement && !blocked_roots.contains(root) && all_ready {
             progress::step(format!("retiring shared agent store {}", root.display()));
-            retire_legacy(root)?;
+            if !retire_legacy(root)? {
+                // The retention was deferred, so the shared store is still
+                // there: keep the root pending and retry on a later pass.
+                pending.push(root.to_string_lossy().into_owned());
+            }
         } else {
             pending.push(root.to_string_lossy().into_owned());
         }
@@ -2094,7 +2098,7 @@ fn sync_tree(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn retire_legacy(source: &Path) -> Result<()> {
+fn retire_legacy(source: &Path) -> Result<bool> {
     let parent = source.parent().context("legacy store has no parent")?;
     let quarantine = parent.join(format!(
         ".{}.v027-quarantine",
@@ -2108,16 +2112,32 @@ fn retire_legacy(source: &Path) -> Result<()> {
         parent
     };
     // A killed old migration may already have renamed the original aside.
-    // Preserve that whole original too; never clear a recovery candidate.
-    super::v030_isolate_sandbox_content::retain_legacy_original(&quarantine, host)?;
-    super::v030_isolate_sandbox_content::retain_legacy_original(source, host)?;
+    // Preserve that whole original too; never clear a recovery candidate. A
+    // mount that reaches the recovery namespace defers both, so the caller
+    // leaves the root pending and a later pass retires it.
+    let mut deferred = false;
+    for candidate in [&quarantine, source] {
+        match super::v030_isolate_sandbox_content::retain_legacy_original(candidate, host)? {
+            super::v030_isolate_sandbox_content::Retained::Original(kept) => {
+                progress::notice(format!(
+                    "Retained complete legacy sandbox original at {}",
+                    kept.display()
+                ));
+            }
+            super::v030_isolate_sandbox_content::Retained::Absent => {}
+            super::v030_isolate_sandbox_content::Retained::Deferred => deferred = true,
+        }
+    }
+    if deferred {
+        return Ok(false);
+    }
     if parent.file_name().is_some_and(|name| name == "sandbox") {
         let _ = fs::remove_dir(parent);
         if let Some(grandparent) = parent.parent() {
             let _ = fs::File::open(grandparent).and_then(|dir| dir.sync_all());
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 fn remove_tree_no_links(path: &Path) -> Result<()> {
@@ -3677,9 +3697,12 @@ gemini = "{}"
         fs::write(root.join("sessions/other"), b"other").unwrap();
         fs::write(root.join("auth.json"), b"secret").unwrap();
         std::os::unix::fs::symlink("/outside-do-not-follow", root.join("latest")).unwrap();
-        let kept = super::super::v030_isolate_sandbox_content::retain_legacy_original(&root, &host)
-            .unwrap()
-            .unwrap();
+        let super::super::v030_isolate_sandbox_content::Retained::Original(kept) =
+            super::super::v030_isolate_sandbox_content::retain_legacy_original(&root, &host)
+                .unwrap()
+        else {
+            panic!("the complete original is retained")
+        };
         assert!(!root.exists());
         assert_eq!(fs::read(kept.join("one/own")).unwrap(), b"own");
         assert_eq!(fs::read(kept.join("sessions/other")).unwrap(), b"other");
@@ -3688,11 +3711,11 @@ gemini = "{}"
             fs::read_link(kept.join("latest")).unwrap(),
             Path::new("/outside-do-not-follow")
         );
-        assert!(
+        assert!(matches!(
             super::super::v030_isolate_sandbox_content::retain_legacy_original(&root, &host)
-                .unwrap()
-                .is_none()
-        );
+                .unwrap(),
+            super::super::v030_isolate_sandbox_content::Retained::Absent
+        ));
     }
 
     /// Retiring a fully replicated root deletes it, so every later row that

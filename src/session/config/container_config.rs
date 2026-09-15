@@ -353,16 +353,10 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         shared_credential_files: &[],
         credential_pairs: &[],
         sqlite_seed_files: &[],
-        native_state_paths: &[
-            "sessions",
-            "logs",
-            "cache",
-            "pastes",
-            "images",
-            "chrome-debug",
-            "tmp",
-            "state.db*",
-        ],
+        // Hermes native state is declared by its own rule catalogue
+        // (`seed/hermes/state.rs`), which registers through `register_home`
+        // before this list is ever read.
+        native_state_paths: &[],
     },
     AgentConfigMount {
         tool_name: "droid",
