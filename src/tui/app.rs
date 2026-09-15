@@ -1954,6 +1954,11 @@ impl App {
                 refresh_needed = true;
                 needs_full_refresh = true;
             }
+            for session_id in self.home.take_restarted_attaches() {
+                self.attach_live_session(&session_id, terminal)?;
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
 
             if self.home.apply_attach_project_results() {
                 refresh_needed = true;
@@ -3866,50 +3871,24 @@ impl App {
                 return Ok(());
             }
 
-            // Get terminal size to pass to tmux session creation
-            // This ensures the session starts at the correct size instead of 80x24 default
-            let size = crate::terminal::get_size();
-
             // Skip on_launch hooks if they already ran in the background creation poller
             let skip_on_launch = self.home.take_on_launch_hooks_ran(session_id);
-
+            // The attach follows from the tick loop; failures surface as the
+            // restart worker's dialogs.
             self.home
-                .set_instance_status(session_id, crate::session::Status::Starting);
-            match self
-                .home
-                .restart_instance_with_size_opts(session_id, size, skip_on_launch)
-            {
-                Err(e) => {
-                    let err_str = e.to_string();
-                    self.home
-                        .set_instance_error(session_id, Some(err_str.clone()));
-                    self.home
-                        .set_instance_status(session_id, crate::session::Status::Error);
-                    // Without a toast, set_instance_error + Status::Error are
-                    // invisible to the user: the TUI redraws on home as if Enter
-                    // did nothing. Toast text is single-line; the bar truncates
-                    // at terminal width without us needing to pre-clip.
-                    self.update_status = Some(UpdateStatus::transient(format!(
-                        "restart failed: {err_str}"
-                    )));
-                    return Ok(());
-                }
-                Ok(crate::session::StartOutcome::ResumeFailed { sid }) => {
-                    self.update_status = Some(UpdateStatus::transient(format!(
-                        "Resume failed for sid {sid}; preserved for retry"
-                    )));
-                    return Ok(());
-                }
-                Ok(crate::session::StartOutcome::FreshAfterFailedResume { sid }) => {
-                    self.update_status = Some(UpdateStatus::transient(format!(
-                        "Started fresh; resume previously failed for sid {sid}"
-                    )));
-                }
-                Ok(_) => {}
-            }
-            self.home.set_instance_error(session_id, None);
+                .restart_then_attach(session_id, crate::terminal::get_size(), skip_on_launch);
+            return Ok(());
         }
 
+        self.attach_live_session(session_id, terminal)
+    }
+
+    /// Attach to `session_id`'s running tmux pane and settle the row on return.
+    fn attach_live_session(
+        &mut self,
+        session_id: &str,
+        terminal: &mut Terminal<TuiBackend>,
+    ) -> Result<()> {
         let tmux_session = match self.home.get_instance(session_id) {
             Some(inst) => inst.tmux_session()?,
             None => return Ok(()),

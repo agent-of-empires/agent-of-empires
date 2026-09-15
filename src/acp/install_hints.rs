@@ -55,8 +55,8 @@ pub fn npm_package_for(binary: &str) -> Option<&'static str> {
 
 /// Operator env vars to forward to a given ACP binary, on top of the
 /// infrastructure-only `ALWAYS_FORWARD_ENV` in `acp_client/spawn.rs`. Empty slice
-/// means no ambient provider credentials. Five adapters (`pi-acp`, `omp`,
-/// `kimi`, `vibe-acp`, `prime-agent`) are intentionally deferred because
+/// means no ambient provider credentials. Four adapters (`pi-acp`, `omp`,
+/// `kimi`, `vibe-acp`) are intentionally deferred because
 /// their env-var names could not be source-verified for #3238 and shipping a
 /// guess that never matches would silently no-op the fix. Follow-up: verify
 /// each adapter's real reads from its own package/binary and add its arm.
@@ -129,6 +129,66 @@ pub fn env_allowlist_for(binary: &str) -> &'static [&'static str] {
             "GOOGLE_APPLICATION_CREDENTIALS",
             "GOOGLE_CLOUD_PROJECT",
             "GOOGLE_CLOUD_LOCATION",
+        ],
+        // Verified from prime-agent's packages/ai at 032e3ee74574:
+        // env-api-keys.ts names every provider key plus PRIME_TEAM_ID;
+        // providers/google-vertex.ts adds GCLOUD_PROJECT and
+        // GOOGLE_CLOUD_LOCATION; providers/amazon-bedrock.ts adds the region
+        // pair. Bedrock hands the rest to the AWS SDK default chain, whose
+        // env, web-identity, http, and shared-ini providers (3.972.x) read
+        // the session token, role, container-auth, and config-file companions.
+        "prime-agent" => &[
+            "PRIME_API_KEY",
+            "PRIME_TEAM_ID",
+            "ANTHROPIC_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "AZURE_OPENAI_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "GEMINI_API_KEY",
+            "GROQ_API_KEY",
+            "CEREBRAS_API_KEY",
+            "XAI_API_KEY",
+            "OPENROUTER_API_KEY",
+            "AI_GATEWAY_API_KEY",
+            "ZAI_API_KEY",
+            "MISTRAL_API_KEY",
+            "MINIMAX_API_KEY",
+            "MINIMAX_CN_API_KEY",
+            "MOONSHOT_API_KEY",
+            "HF_TOKEN",
+            "FIREWORKS_API_KEY",
+            "OPENCODE_API_KEY",
+            "KIMI_API_KEY",
+            "CLOUDFLARE_API_KEY",
+            "XIAOMI_API_KEY",
+            "XIAOMI_TOKEN_PLAN_CN_API_KEY",
+            "XIAOMI_TOKEN_PLAN_AMS_API_KEY",
+            "XIAOMI_TOKEN_PLAN_SGP_API_KEY",
+            "COPILOT_GITHUB_TOKEN",
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GOOGLE_CLOUD_API_KEY",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "GOOGLE_CLOUD_PROJECT",
+            "GCLOUD_PROJECT",
+            "GOOGLE_CLOUD_LOCATION",
+            "AWS_BEARER_TOKEN_BEDROCK",
+            "AWS_PROFILE",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_REGION",
+            "AWS_DEFAULT_REGION",
+            "AWS_CONFIG_FILE",
+            "AWS_SHARED_CREDENTIALS_FILE",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+            "AWS_ROLE_ARN",
+            "AWS_ROLE_SESSION_NAME",
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+            "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
         ],
         _ => &[],
     }

@@ -260,7 +260,11 @@ fn test_attach_uses_terminal_backend() {
         "with_attached_status_hooks should not use std::io::stdout() directly"
     );
 
-    for attach_method in ["attach_session", "attach_terminal", "attach_tool_session"] {
+    for attach_method in [
+        "attach_live_session",
+        "attach_terminal",
+        "attach_tool_session",
+    ] {
         let attach_body = app_method_body(&source, attach_method);
 
         assert!(
@@ -283,7 +287,11 @@ fn test_attach_uses_terminal_backend() {
 fn test_attach_applies_attached_status_snapshot_after_reload() {
     let source = std::fs::read_to_string("src/tui/app.rs").expect("Failed to read app.rs");
 
-    for attach_method in ["attach_session", "attach_terminal", "attach_tool_session"] {
+    for attach_method in [
+        "attach_live_session",
+        "attach_terminal",
+        "attach_tool_session",
+    ] {
         let attach_body = app_method_body(&source, attach_method);
         assert_contains_in_order(
             attach_body,
@@ -311,45 +319,5 @@ fn test_attach_resets_status_refresh_without_watcher() {
             "self.home.reset_status_refresh()",
             "result.map",
         ],
-    );
-}
-
-/// Test that a failed restart inside attach surfaces a transient toast.
-///
-/// Before the fix, when `restart_instance_with_size_opts` returned Err the
-/// code stored the error on the instance and bailed `Ok(())`, with no
-/// user-visible signal. This test guards the wiring that turns the failure
-/// into an `UpdateStatus::transient` toast.
-#[test]
-#[serial_test::parallel]
-fn test_attach_restart_failure_emits_transient_toast() {
-    let source = std::fs::read_to_string("src/tui/app.rs").expect("Failed to read app.rs");
-
-    let attach_fn_start = source
-        .find("fn attach_session(")
-        .expect("attach_session function not found");
-
-    // Walk to the end of attach_session by finding the next `fn ` at the
-    // same indentation level.
-    let attach_fn_section = &source[attach_fn_start..];
-    let attach_fn_end = attach_fn_section
-        .find("\n    fn ")
-        .unwrap_or(attach_fn_section.len());
-    let attach_fn_body = &attach_fn_section[..attach_fn_end];
-
-    let restart_idx = attach_fn_body
-        .find("restart_instance_with_size_opts")
-        .expect("attach_session should call restart_instance_with_size_opts");
-    let after_restart = &attach_fn_body[restart_idx..];
-
-    assert!(
-        after_restart.contains("UpdateStatus::transient"),
-        "attach_session must surface restart failure via UpdateStatus::transient. \
-         Without this, the TUI silently stays on home and the user sees no error."
-    );
-    assert!(
-        after_restart.contains("restart failed"),
-        "the toast should carry the `restart failed: ...` prefix so the error \
-         is recognizable in the bar."
     );
 }

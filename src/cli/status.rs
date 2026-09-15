@@ -153,19 +153,8 @@ fn print_status_group(
 
     println!("{} ({}):", label, matching.len());
     for inst in matching {
-        let path = shorten_path(&inst.project_path);
+        let path = crate::util::collapse_tilde(&inst.project_path);
         println!("  {} {:<16} {:<10} {}", symbol, inst.title, inst.tool, path);
     }
     println!();
-}
-
-fn shorten_path(path: &str) -> String {
-    if let Some(home) = dirs::home_dir() {
-        if let Some(home_str) = home.to_str() {
-            if let Some(stripped) = path.strip_prefix(home_str) {
-                return format!("~{}", stripped);
-            }
-        }
-    }
-    path.to_string()
 }

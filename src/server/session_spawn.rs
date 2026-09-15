@@ -725,4 +725,34 @@ mod tests {
         assert!(!state.acp_supervisor.is_running(&id).await);
         state.acp_supervisor.test_remove_worker("occupant").await;
     }
+
+    /// The test above runs on a current-thread runtime, where an unlock moved
+    /// above the epoch bump has no await to yield at and still passes (#3968).
+    /// Pin the order instead: the guard must outlive the bump.
+    #[test]
+    fn publication_bumps_the_epoch_before_releasing_the_instances_lock() {
+        // Whitespace-normalised so rustfmt's wrapping cannot change the result.
+        let source = include_str!("session_spawn.rs")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let start = source
+            .find("async fn publish_created_instance(")
+            .expect("publication function");
+        let body = &source[start..];
+        let body = &body[..body
+            .find("#[cfg(test)] mod tests")
+            .expect("tests follow publication")];
+        let lock = body
+            .find("let mut instances = service.instances.write().await;")
+            .expect("publication takes the instances write lock");
+        let bump = body
+            .find(".mutation_epoch .fetch_add(")
+            .expect("publication bumps the epoch");
+        assert!(lock < bump, "the bump must happen under the lock");
+        assert!(
+            !body[lock..bump].contains("drop(instances)"),
+            "the instances guard must be held until the epoch is bumped"
+        );
+    }
 }

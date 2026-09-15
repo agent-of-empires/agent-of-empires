@@ -439,10 +439,9 @@ mod tests {
     }
 
     /// #3238: verified adapters (`claude`, `codex`, `opencode`, `gemini`,
-    /// `aoe-agent`)
+    /// `aoe-agent`, `prime-agent`)
     /// forward the operator's provider-auth env; adapters whose real env
-    /// vars couldn't be source-verified (pi, omp, kimi, vibe, prime-agent)
-    /// stay `None`.
+    /// vars couldn't be source-verified (pi, omp, kimi, vibe) stay `None`.
     /// One row asserts a specific negative for `aoe-agent`: it must NOT
     /// receive `GEMINI_API_KEY` (that's the CLI-native name; the bundled
     /// AI-SDK agent reads `GOOGLE_GENERATIVE_AI_API_KEY` instead). The
@@ -528,9 +527,71 @@ mod tests {
             assert!(opencode.iter().any(|k| k == key), "opencode missing {key}");
         }
 
+        // Pinned whole so a dropped or guessed name fails here.
+        assert_eq!(
+            al("prime-agent"),
+            Some(
+                [
+                    "PRIME_API_KEY",
+                    "PRIME_TEAM_ID",
+                    "ANTHROPIC_OAUTH_TOKEN",
+                    "ANTHROPIC_API_KEY",
+                    "OPENAI_API_KEY",
+                    "AZURE_OPENAI_API_KEY",
+                    "DEEPSEEK_API_KEY",
+                    "GEMINI_API_KEY",
+                    "GROQ_API_KEY",
+                    "CEREBRAS_API_KEY",
+                    "XAI_API_KEY",
+                    "OPENROUTER_API_KEY",
+                    "AI_GATEWAY_API_KEY",
+                    "ZAI_API_KEY",
+                    "MISTRAL_API_KEY",
+                    "MINIMAX_API_KEY",
+                    "MINIMAX_CN_API_KEY",
+                    "MOONSHOT_API_KEY",
+                    "HF_TOKEN",
+                    "FIREWORKS_API_KEY",
+                    "OPENCODE_API_KEY",
+                    "KIMI_API_KEY",
+                    "CLOUDFLARE_API_KEY",
+                    "XIAOMI_API_KEY",
+                    "XIAOMI_TOKEN_PLAN_CN_API_KEY",
+                    "XIAOMI_TOKEN_PLAN_AMS_API_KEY",
+                    "XIAOMI_TOKEN_PLAN_SGP_API_KEY",
+                    "COPILOT_GITHUB_TOKEN",
+                    "GH_TOKEN",
+                    "GITHUB_TOKEN",
+                    "GOOGLE_CLOUD_API_KEY",
+                    "GOOGLE_APPLICATION_CREDENTIALS",
+                    "GOOGLE_CLOUD_PROJECT",
+                    "GCLOUD_PROJECT",
+                    "GOOGLE_CLOUD_LOCATION",
+                    "AWS_BEARER_TOKEN_BEDROCK",
+                    "AWS_PROFILE",
+                    "AWS_ACCESS_KEY_ID",
+                    "AWS_SECRET_ACCESS_KEY",
+                    "AWS_SESSION_TOKEN",
+                    "AWS_REGION",
+                    "AWS_DEFAULT_REGION",
+                    "AWS_CONFIG_FILE",
+                    "AWS_SHARED_CREDENTIALS_FILE",
+                    "AWS_WEB_IDENTITY_TOKEN_FILE",
+                    "AWS_ROLE_ARN",
+                    "AWS_ROLE_SESSION_NAME",
+                    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+                    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+                    "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+                    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+                ]
+                .map(String::from)
+                .to_vec()
+            )
+        );
+
         // Deferred adapters stay None until each adapter's env reads are
         // verified from its own source.
-        for name in ["pi", "omp", "kimi", "vibe", "prime-agent"] {
+        for name in ["pi", "omp", "kimi", "vibe"] {
             assert!(
                 al(name).is_none(),
                 "{name} must have None env_allowlist until source-verified"
@@ -557,6 +618,7 @@ mod tests {
                 "codex",
                 "gemini",
                 "opencode",
+                "prime-agent",
             ]
                 .into_iter()
                 .collect::<std::collections::BTreeSet<_>>(),

@@ -131,6 +131,9 @@ struct SessionJson {
     workspace_repos: Vec<WorkspaceRepoJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     worktree: Option<WorktreeJson>,
+    /// The session this one was added under with `aoe add -P`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_session_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -175,6 +178,7 @@ fn session_json(inst: &Instance, profile: &str) -> SessionJson {
         pinned_at: inst.pinned_at,
         workspace_repos: workspace_repos_for(inst),
         worktree: worktree_for(inst),
+        parent_session_id: inst.parent_session_id.clone(),
     }
 }
 
@@ -234,8 +238,58 @@ fn print_table_header(show_state: bool) {
     }
 }
 
-fn print_table_row(inst: &Instance, show_state: bool) {
-    let title = super::truncate(&inst.title, TABLE_COL_TITLE);
+/// `instances` in table order with each row's nesting depth: an `aoe add -P`
+/// child follows its parent. A child whose parent is not listed stays
+/// top-level, and a parent cycle still lists every row once.
+fn nest_children<'a>(instances: &[&'a Instance]) -> Vec<(&'a Instance, usize)> {
+    fn place<'a>(
+        inst: &'a Instance,
+        depth: usize,
+        instances: &[&'a Instance],
+        placed: &mut std::collections::HashSet<&'a str>,
+        ordered: &mut Vec<(&'a Instance, usize)>,
+    ) {
+        if !placed.insert(inst.id.as_str()) {
+            return;
+        }
+        ordered.push((inst, depth));
+        for child in instances
+            .iter()
+            .filter(|c| c.parent_session_id.as_deref() == Some(inst.id.as_str()))
+        {
+            place(child, depth + 1, instances, placed, ordered);
+        }
+    }
+
+    let listed: std::collections::HashSet<&str> = instances.iter().map(|i| i.id.as_str()).collect();
+    let mut placed = std::collections::HashSet::new();
+    let mut ordered = Vec::with_capacity(instances.len());
+    for inst in instances {
+        let under_listed_parent = inst
+            .parent_session_id
+            .as_deref()
+            .is_some_and(|p| p != inst.id && listed.contains(p));
+        if !under_listed_parent {
+            place(inst, 0, instances, &mut placed, &mut ordered);
+        }
+    }
+    // Rows reachable only through a parent cycle.
+    for inst in instances {
+        place(inst, 0, instances, &mut placed, &mut ordered);
+    }
+    ordered
+}
+
+/// A row's title, indented under its parent when nested.
+fn table_title(inst: &Instance, depth: usize) -> String {
+    match depth {
+        0 => inst.title.clone(),
+        _ => format!("{}└ {}", "  ".repeat(depth - 1), inst.title),
+    }
+}
+
+fn print_table_row(inst: &Instance, depth: usize, show_state: bool) {
+    let title = super::truncate(&table_title(inst, depth), TABLE_COL_TITLE);
     let group = super::truncate(&inst.group_path, TABLE_COL_GROUP);
     let path = super::truncate(&inst.project_path, TABLE_COL_PATH);
     let id_display = super::truncate_id(&inst.id, TABLE_COL_ID_DISPLAY);
@@ -312,8 +366,9 @@ pub async fn run(profile: &str, args: ListArgs) -> Result<()> {
     let show_state = table_shows_state(scope);
     println!("Profile: {}\n", storage.profile());
     print_table_header(show_state);
-    for inst in &instances {
-        print_table_row(inst, show_state);
+    let listed: Vec<&Instance> = instances.iter().collect();
+    for (inst, depth) in nest_children(&listed) {
+        print_table_row(inst, depth, show_state);
     }
     println!("\nTotal: {} sessions", instances.len());
 
@@ -363,8 +418,8 @@ async fn run_all_profiles(json: bool, scope: SessionScope) -> Result<()> {
 
                 println!("\n═══ Profile: {} ═══\n", profile_name);
                 print_table_header(show_state);
-                for inst in &instances {
-                    print_table_row(inst, show_state);
+                for (inst, depth) in nest_children(&instances) {
+                    print_table_row(inst, depth, show_state);
                 }
                 println!("({} sessions)", instances.len());
                 total_sessions += instances.len();
@@ -385,6 +440,55 @@ async fn run_all_profiles(json: bool, scope: SessionScope) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #3472: `aoe add -P` children render under their parent in the table.
+    #[test]
+    fn nest_children_lists_each_child_under_its_listed_parent() {
+        let row = |title: &str, parent: Option<&str>| {
+            let mut inst = Instance::new(title, "/repo");
+            inst.parent_session_id = parent.map(str::to_string);
+            inst
+        };
+        let root = row("root", None);
+        let child = row("child", Some(&root.id));
+        let grandchild = row("grandchild", Some(&child.id));
+        let orphan = row("orphan", Some("not-listed"));
+        let other = row("other", None);
+        let mut loop_a = row("loop-a", None);
+        let loop_b = row("loop-b", Some(&loop_a.id));
+        loop_a.parent_session_id = Some(loop_b.id.clone());
+
+        let listed = [
+            &grandchild,
+            &root,
+            &orphan,
+            &child,
+            &other,
+            &loop_a,
+            &loop_b,
+        ];
+        let titles: Vec<String> = nest_children(&listed)
+            .into_iter()
+            .map(|(inst, depth)| table_title(inst, depth))
+            .collect();
+        assert_eq!(
+            titles,
+            [
+                "root",
+                "└ child",
+                "  └ grandchild",
+                "orphan",
+                "other",
+                "loop-a",
+                "└ loop-b",
+            ]
+        );
+
+        assert_eq!(
+            session_json(&child, "p").parent_session_id.as_deref(),
+            Some(root.id.as_str())
+        );
+    }
 
     #[test]
     fn state_tag_covers_the_three_states() {

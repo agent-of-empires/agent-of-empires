@@ -586,6 +586,8 @@ impl HomeView {
             instance,
             size,
             wake_message,
+            skip_on_launch: false,
+            bound_hooks: true,
             discard_sandbox_container: tool_swapped,
         });
         Ok(())

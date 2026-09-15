@@ -307,6 +307,15 @@ impl SubscriptionStore {
         Ok(removed)
     }
 
+    /// Hold the store's lock, stalling every store operation until the guard
+    /// drops.
+    #[cfg(test)]
+    pub(crate) async fn hold_for_test(
+        &self,
+    ) -> tokio::sync::RwLockWriteGuard<'_, HashMap<String, Subscription>> {
+        self.subs.write().await
+    }
+
     async fn persist(&self) -> anyhow::Result<()> {
         let all: Vec<Subscription> = self.subs.read().await.values().cloned().collect();
         let body = serde_json::to_string_pretty(&all)?;
