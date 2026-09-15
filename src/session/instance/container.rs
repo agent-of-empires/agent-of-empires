@@ -913,6 +913,8 @@ claude-personal = "~/.claude-global"
                 Disk::RowBrokenProfile(..) => {
                     std::fs::create_dir_all(profile_config.parent().unwrap()).unwrap();
                     std::fs::write(&profile_config, "not toml [").unwrap();
+                    // A failed resolve elsewhere leaves the alias registry empty.
+                    crate::session::config::profile_config::resolve_config_or_warn(profile);
                 }
                 Disk::Absent | Disk::Row(..) => {}
             }
