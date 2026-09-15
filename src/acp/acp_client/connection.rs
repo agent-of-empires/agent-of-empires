@@ -6,15 +6,15 @@ use crate::acp::state::{Event, ModeInfo, StartupErrorDetail};
 use crate::acp::{agent_profiles, control_protocol, mcp_config};
 use agent_client_protocol::schema::v1::{
     CancelNotification, ContentBlock, CreateElicitationRequest, CreateElicitationResponse,
-    CreateTerminalRequest, CreateTerminalResponse, ForkSessionRequest, ForkSessionResponse,
-    InitializeResponse, KillTerminalRequest, KillTerminalResponse, LoadSessionRequest,
-    LoadSessionResponse, McpServer, NewSessionRequest, NewSessionResponse, PromptRequest,
-    PromptResponse, ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest,
-    ReleaseTerminalResponse, RequestPermissionRequest, RequestPermissionResponse, SessionConfigId,
-    SessionConfigValueId, SessionId, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, StopReason, TerminalOutputRequest, TerminalOutputResponse,
-    WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
-    WriteTextFileResponse,
+    CreateTerminalRequest, CreateTerminalResponse, ElicitationScope, ForkSessionRequest,
+    ForkSessionResponse, InitializeResponse, KillTerminalRequest, KillTerminalResponse,
+    LoadSessionRequest, LoadSessionResponse, McpServer, NewSessionRequest, NewSessionResponse,
+    PromptRequest, PromptResponse, ReadTextFileRequest, ReadTextFileResponse,
+    ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionRequest,
+    RequestPermissionResponse, SessionConfigId, SessionConfigValueId, SessionId,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, StopReason,
+    TerminalOutputRequest, TerminalOutputResponse, WaitForTerminalExitRequest,
+    WaitForTerminalExitResponse, WriteTextFileRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
 use std::collections::{HashMap, VecDeque};
@@ -50,6 +50,9 @@ use super::rate_limit::{
 };
 use super::reset::{
     await_reset_request, ResetRequestError, ResetSessionOutcome, SESSION_RESET_IN_TASK_TIMEOUT,
+};
+use super::session_identity::{
+    ordered_session_request, SessionIngress, SessionIngressNotification,
 };
 use super::session_sandbox::agent_request_cwd;
 use super::steer::{first_text_block, SteerOutcome, SteerRequest};
@@ -183,6 +186,31 @@ pub(super) async fn run_connection_task<W, R>(
 {
     use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
+    let ingress = control_client
+        .as_ref()
+        .map(|control| control.ingress.clone())
+        .unwrap_or_else(|| {
+            let initial = match &mode {
+                ConnectMode::Resume { acp_session_id, .. } => {
+                    Some(SessionId::from(acp_session_id.clone()))
+                }
+                ConnectMode::Fresh { .. } => None,
+            };
+            Arc::new(SessionIngress::new(initial))
+        });
+    if control_client.is_some() && matches!(&mode, ConnectMode::Resume { .. }) {
+        ingress.begin();
+    }
+    let ingress_for_notif = ingress.clone();
+    let ingress_for_perm = ingress.clone();
+    let ingress_for_elicit = ingress.clone();
+    let ingress_for_read = ingress.clone();
+    let ingress_for_write = ingress.clone();
+    let ingress_for_term_create = ingress.clone();
+    let ingress_for_term_output = ingress.clone();
+    let ingress_for_term_wait = ingress.clone();
+    let ingress_for_term_kill = ingress.clone();
+    let ingress_for_term_release = ingress.clone();
     let ready_tx = Arc::new(Mutex::new(ready_tx));
     let ready_for_block = ready_tx.clone();
     let event_tx_for_notif = event_tx.clone();
@@ -379,8 +407,306 @@ pub(super) async fn run_connection_task<W, R>(
     // new turn that legitimately reuses the prior turn's trailing text under a
     // fresh message_id would be misclassified as a restatement. See #2281.
     let agent_msg_dedup_for_block = agent_msg_dedup.clone();
+    let control_notifications = control_client.is_some();
     let control_on_close = control_client.clone();
     let control_on_exit = control_client.clone();
+
+    let apply_notification = Arc::new(
+        move |notification: SessionNotification, local_prompt_signals: bool| {
+            let event_tx = event_tx_for_notif.clone();
+            let suppress = suppress_for_notif.clone();
+            let session_label = session_label_for_notif.clone();
+            let last_event_at = last_event_at_for_notif.clone();
+            let first_event_after_attach = first_event_after_attach_for_notif.clone();
+            let lifecycle_signal_tx = lifecycle_signal_tx_for_notif.clone();
+            let current_prompt_epoch = current_prompt_epoch_for_notif.clone();
+            let agent_msg_dedup = agent_msg_dedup_for_notif.clone();
+            let bg_transcript_source = bg_transcript_source_for_notif.clone();
+            let last_lifecycle_at = last_lifecycle_at_for_notif.clone();
+            let between_prompt_active = between_prompt_active_for_notif.clone();
+            let terminal_claim = terminal_claim_for_notif.clone();
+            let between_prompt_cost_seen = between_prompt_cost_seen_for_notif.clone();
+            let between_prompt_wake_at = between_prompt_wake_at_for_notif.clone();
+            let last_rate_limit_rejections = last_rate_limit_rejections_for_notif.clone();
+            let between_prompt_tools = between_prompt_tools_for_notif.clone();
+            let between_prompt_off_protocol = between_prompt_off_protocol_for_notif.clone();
+            let between_prompt_bg_agents = between_prompt_bg_agents_for_notif.clone();
+            let adopted_turn_active = adopted_turn_active_for_notif.clone();
+            let prompt_in_flight = prompt_in_flight_for_notif.clone();
+            let tool_context_cache = tool_context_cache_for_notif.clone();
+            async move {
+                last_event_at.store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
+                let suppressing = suppress.load(Ordering::Relaxed);
+                // Drop claude-agent-acp's leaked consolidated
+                // agent_message_chunk restatement before it reaches the
+                // watchdog, the event store, or any client (#2281). During
+                // post-load history replay the deduper is reset rather than
+                // fed, so replayed chunks can't poison live block tracking.
+                {
+                    let mut dedup = agent_msg_dedup
+                        .lock()
+                        .expect("agent message dedup mutex poisoned");
+                    if suppressing {
+                        dedup.reset();
+                    } else if dedup.observe(&notification.update) {
+                        debug!(
+                            target: "acp.protocol",
+                            session = %session_label,
+                            "dropping leaked consolidated agent_message_chunk restatement (#2281)"
+                        );
+                        return Ok(());
+                    }
+                }
+                // Snapshot the prompt epoch ONCE per notification so
+                // every signal derived from this update shares the
+                // same epoch. If the prompt loop bumps the atomic
+                // between the classifier call and the send, the
+                // envelope's epoch reflects the prompt the signal
+                // semantically belongs to (the one current when
+                // the notification arrived), not the one that
+                // started racing it.
+                let envelope_epoch = current_prompt_epoch.load(Ordering::Relaxed);
+                // Classify watchdog signals before consuming
+                // `notification.update` in the event mapping below.
+                // During post-load replay suppression this returns no
+                // signal so stale chunks from a prior turn cannot
+                // influence the current prompt's watchdog state.
+                let (lifecycle_signal, wakeup_signal) = classify_watchdog_notification_signals(
+                    &notification.update,
+                    profile,
+                    suppressing,
+                );
+                // Disarm resume-idle only on lifecycle-bearing
+                // notifications (progress/tool/terminal/wakeup). Pure
+                // ambient updates (mode, command list, metadata) are
+                // not proof of in-flight turn progress.
+                if lifecycle_signal.is_some() || wakeup_signal.is_some() {
+                    first_event_after_attach.store(true, Ordering::Relaxed);
+                }
+                let prompt_active = prompt_in_flight.load(Ordering::Relaxed);
+                // Between-prompt idle tracking (#2325). Only while no
+                // aoe-issued prompt is in flight: a lifecycle signal here
+                // means the agent resumed itself (Monitor / scheduled
+                // wake), a turn the per-prompt watchdog never sees. Mirror
+                // its cost/progress/wake semantics so the outer loop's
+                // idle tick applies the same grace. During a real prompt
+                // the per-prompt watchdog owns this, so skip.
+                if !prompt_active {
+                    let now = chrono::Utc::now().timestamp_millis();
+                    if let Some(u) = between_prompt_signal_update(
+                        lifecycle_signal.as_ref(),
+                        wakeup_signal.as_ref(),
+                        now,
+                        between_prompt_wake_at.load(Ordering::Relaxed),
+                    ) {
+                        // False -> true is an agent-initiated turn
+                        // starting, so it gets its own terminal to claim.
+                        // Logged because the arming decision was
+                        // previously invisible: the watchdog only ever
+                        // logged when it fired, which is exactly the
+                        // information a stuck-Running investigation
+                        // needs. See #3190.
+                        if !between_prompt_active.swap(true, Ordering::Relaxed) {
+                            terminal_claim.begin_turn();
+                            debug!(
+                                target: "acp.protocol",
+                                session = %session_label,
+                                "between-prompt watchdog armed for an agent-initiated turn"
+                            );
+                        }
+                        between_prompt_cost_seen.store(u.cost_seen, Ordering::Relaxed);
+                        // Refresh from `now` on every tracked signal,
+                        // including TerminalUsage, so the fast grace
+                        // measures from when the turn wrapped up rather
+                        // than from a possibly-stale earlier progress
+                        // event. See #2325 review.
+                        last_lifecycle_at.store(u.last_lifecycle_at, Ordering::Relaxed);
+                        between_prompt_wake_at.store(u.wake_at, Ordering::Relaxed);
+                    }
+                    // Track in-flight tool calls and off-protocol work for
+                    // the between-prompt path so the idle watchdog never
+                    // fires while a tool is open or backgrounded work is
+                    // still running. Mirrors the per-prompt watchdog's
+                    // `tool_calls_in_flight` + `off_protocol_work_seen`.
+                    // See #2371, #1401.
+                    match lifecycle_signal.as_ref() {
+                        Some(LifecycleSignal::ToolStarted {
+                            id,
+                            is_background_task,
+                        }) => {
+                            let mut tools = between_prompt_tools
+                                .lock()
+                                .expect("between-prompt tools mutex poisoned");
+                            let entry = tools.entry(id.clone()).or_insert(false);
+                            *entry = *entry || *is_background_task;
+                        }
+                        Some(LifecycleSignal::ToolCompleted {
+                            id,
+                            succeeded,
+                            off_protocol_work,
+                        }) => {
+                            let was_background = between_prompt_tools
+                                .lock()
+                                .expect("between-prompt tools mutex poisoned")
+                                .remove(id)
+                                .unwrap_or(false);
+                            // A failed launch keeps no background work
+                            // running, so it must not pin the floor.
+                            // Async sub-agents are tracked precisely in
+                            // between_prompt_bg_agents (a tailer removes
+                            // them on their terminal event), so they must
+                            // NOT also latch the 30-min off-protocol floor;
+                            // that floor is only for untracked backgrounded
+                            // work (Bash) with no completion signal. See
+                            // #2573.
+                            let is_tracked_async =
+                                matches!(off_protocol_work, Some(OffProtocolWorkKind::AsyncAgent));
+                            if *succeeded
+                                && !is_tracked_async
+                                && (off_protocol_work.is_some() || was_background)
+                            {
+                                between_prompt_off_protocol.store(true, Ordering::Relaxed);
+                            }
+                        }
+                        Some(LifecycleSignal::TerminalUsage)
+                            if adopted_turn_active.load(Ordering::Relaxed) =>
+                        {
+                            // Adopted-turn barrier (#2899). A tool that was
+                            // in flight across the reattach boundary had its
+                            // ToolCall start on the previous connection; this
+                            // connection may see a trailing InProgress update
+                            // (re-inserting it into between_prompt_tools) but
+                            // never the terminal Completed/Failed frame, which
+                            // went to the old connection or only rode the
+                            // dropped PromptResponse. That leaks a stuck entry
+                            // that pins `work_in_flight` true forever, so the
+                            // between-prompt watchdog can never fire. A cost-
+                            // populated end-of-turn UsageUpdate is the adapter's
+                            // authoritative "turn wrapped up" marker (same signal
+                            // the per-prompt watchdog trusts), so drop the
+                            // unreliable inherited tool + untracked-background
+                            // bookkeeping. A future scheduled wake
+                            // (between_prompt_wake_at) and precisely tracked
+                            // async agents (between_prompt_bg_agents) keep their
+                            // own suppression: they carry real continuation
+                            // semantics, unlike a stale ACP tool entry.
+                            between_prompt_tools
+                                .lock()
+                                .expect("between-prompt tools mutex poisoned")
+                                .clear();
+                            between_prompt_off_protocol.store(false, Ordering::Relaxed);
+                        }
+                        _ => {}
+                    }
+                }
+                // Capture the reset epoch the adapter forwards on a
+                // `usage_update` (#3028) before the update is consumed
+                // below. Only rejections are retained; a warning epoch
+                // cannot be attributed to whichever window later rejects
+                // (#3152). Log every observation either way: this is the
+                // only breadcrumb for diagnosing a wrong reset time from
+                // `debug.log`.
+                if let SessionUpdate::UsageUpdate(u) = &notification.update {
+                    if let Some(raw) = u.meta.as_ref().and_then(|m| m.get("_claude/rateLimit")) {
+                        let rejection = rate_limit_rejection_from_meta(&u.meta);
+                        debug!(
+                            target: "acp.protocol",
+                            session = %session_label,
+                            observed = %raw,
+                            retained = rejection.is_some(),
+                            "observed adapter rate-limit meta"
+                        );
+                        if let Some(r) = rejection {
+                            last_rate_limit_rejections
+                                .lock()
+                                .expect("rate-limit capture mutex poisoned")
+                                .insert(r.window, r.resets_at_secs);
+                        }
+                    }
+                }
+                let update_for_tool_context = notification.update.clone();
+                let mapped_events = map_update_to_events(notification.update, profile);
+                // Deliver lifecycle signals BEFORE publishing the
+                // user-visible event vector. The watchdog uses
+                // ToolStarted / ToolCompleted / WakeupPending /
+                // TerminalUsage to decide whether to fire; if
+                // `event_tx.send().await` backpressures (slow web
+                // consumer, replay drain), the prompt-loop tick
+                // could otherwise evaluate `should_fire` before
+                // ever seeing the suppression-bearing signal and
+                // cancel a legitimate wait. Watchdog correctness
+                // wins; UI ordering is reconciled by the event
+                // store's monotonic seq anyway. See #1401 post-
+                // impl review. Skipped entirely between prompts:
+                // nothing drains the channel then, so at capacity
+                // the awaited send would wedge this handler, and
+                // every notification behind it, until the next
+                // prompt (#2888).
+                forward_lifecycle_signals(
+                    local_prompt_signals && prompt_active && envelope_epoch != 0,
+                    &lifecycle_signal_tx,
+                    envelope_epoch,
+                    lifecycle_signal,
+                    wakeup_signal,
+                    &session_label,
+                )
+                .await;
+                for event in mapped_events {
+                    // An async sub-agent launch: spawn a tailer that
+                    // follows the agent's on-disk transcript and emits
+                    // BackgroundAgent{Progress,Completed}. The tailer
+                    // owns its own lifecycle (self-terminates on
+                    // completion, hard-idle, or when event_tx closes),
+                    // so it can never outlive the session. Skipped on
+                    // replay (the agent already finished). See
+                    // src/acp/background_agent.rs.
+                    if let Event::BackgroundAgentLaunched {
+                        agent_id,
+                        output_file,
+                        ..
+                    } = &event
+                    {
+                        if !suppressing && !output_file.is_empty() {
+                            crate::acp::background_agent::spawn_tailer(
+                                agent_id.clone(),
+                                output_file.clone(),
+                                bg_transcript_source.clone(),
+                                event_tx.clone(),
+                                between_prompt_bg_agents.clone(),
+                            );
+                        }
+                    }
+                    // During the post-load replay window, drop only
+                    // events that would reproduce the prior turns'
+                    // visible transcript (assistant chunks, tool
+                    // calls, plans, etc.). Ambient state events
+                    // (mode/usage/available_commands) and lifecycle
+                    // events (stopped, errors) must pass through;
+                    // otherwise the composer footer and pickers
+                    // stay stale until the user types something.
+                    if suppressing && is_transcript_event(&event) {
+                        debug!(
+                            target: "acp.protocol",
+                            session = %session_label,
+                            kind = transcript_event_kind(&event),
+                            "dropping post-load history-replay event"
+                        );
+                        continue;
+                    }
+                    update_tool_context_cache(
+                        &tool_context_cache,
+                        &event,
+                        &update_for_tool_context,
+                    );
+                    if event_tx.send(event).await.is_err() {
+                        break;
+                    }
+                }
+                Ok::<(), agent_client_protocol::Error>(())
+            }
+        },
+    );
+    let apply_for_notif = apply_notification.clone();
 
     let result = Client
         .builder()
@@ -392,313 +718,13 @@ pub(super) async fn run_connection_task<W, R>(
             Err(acp_internal_error("agent transport closed".into()))
         })
         .on_receive_notification(
-            move |notification: SessionNotification, _cx| {
-                let event_tx = event_tx_for_notif.clone();
-                let suppress = suppress_for_notif.clone();
-                let session_label = session_label_for_notif.clone();
-                let last_event_at = last_event_at_for_notif.clone();
-                let first_event_after_attach =
-                    first_event_after_attach_for_notif.clone();
-                let lifecycle_signal_tx = lifecycle_signal_tx_for_notif.clone();
-                let current_prompt_epoch = current_prompt_epoch_for_notif.clone();
-                let agent_msg_dedup = agent_msg_dedup_for_notif.clone();
-                let bg_transcript_source = bg_transcript_source_for_notif.clone();
-                let last_lifecycle_at = last_lifecycle_at_for_notif.clone();
-                let between_prompt_active = between_prompt_active_for_notif.clone();
-                let terminal_claim = terminal_claim_for_notif.clone();
-                let between_prompt_cost_seen =
-                    between_prompt_cost_seen_for_notif.clone();
-                let between_prompt_wake_at =
-                    between_prompt_wake_at_for_notif.clone();
-                let last_rate_limit_rejections =
-                    last_rate_limit_rejections_for_notif.clone();
-                let between_prompt_tools = between_prompt_tools_for_notif.clone();
-                let between_prompt_off_protocol =
-                    between_prompt_off_protocol_for_notif.clone();
-                let between_prompt_bg_agents =
-                    between_prompt_bg_agents_for_notif.clone();
-                let adopted_turn_active = adopted_turn_active_for_notif.clone();
-                let prompt_in_flight = prompt_in_flight_for_notif.clone();
-                let tool_context_cache = tool_context_cache_for_notif.clone();
+            move |notification: SessionIngressNotification, _cx| {
+                let ingress = ingress_for_notif.clone();
+                let apply = apply_for_notif.clone();
                 async move {
-                    last_event_at
-                        .store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
-                    let suppressing = suppress.load(Ordering::Relaxed);
-                    // Drop claude-agent-acp's leaked consolidated
-                    // agent_message_chunk restatement before it reaches the
-                    // watchdog, the event store, or any client (#2281). During
-                    // post-load history replay the deduper is reset rather than
-                    // fed, so replayed chunks can't poison live block tracking.
-                    {
-                        let mut dedup = agent_msg_dedup
-                            .lock()
-                            .expect("agent message dedup mutex poisoned");
-                        if suppressing {
-                            dedup.reset();
-                        } else if dedup.observe(&notification.update) {
-                            debug!(
-                                target: "acp.protocol",
-                                session = %session_label,
-                                "dropping leaked consolidated agent_message_chunk restatement (#2281)"
-                            );
-                            return Ok(());
-                        }
-                    }
-                    // Snapshot the prompt epoch ONCE per notification so
-                    // every signal derived from this update shares the
-                    // same epoch. If the prompt loop bumps the atomic
-                    // between the classifier call and the send, the
-                    // envelope's epoch reflects the prompt the signal
-                    // semantically belongs to (the one current when
-                    // the notification arrived), not the one that
-                    // started racing it.
-                    let envelope_epoch =
-                        current_prompt_epoch.load(Ordering::Relaxed);
-                    // Classify watchdog signals before consuming
-                    // `notification.update` in the event mapping below.
-                    // During post-load replay suppression this returns no
-                    // signal so stale chunks from a prior turn cannot
-                    // influence the current prompt's watchdog state.
-                    let (lifecycle_signal, wakeup_signal) =
-                        classify_watchdog_notification_signals(
-                            &notification.update,
-                            profile,
-                            suppressing,
-                        );
-                    // Disarm resume-idle only on lifecycle-bearing
-                    // notifications (progress/tool/terminal/wakeup). Pure
-                    // ambient updates (mode, command list, metadata) are
-                    // not proof of in-flight turn progress.
-                    if lifecycle_signal.is_some() || wakeup_signal.is_some() {
-                        first_event_after_attach.store(true, Ordering::Relaxed);
-                    }
-                    let prompt_active = prompt_in_flight.load(Ordering::Relaxed);
-                    // Between-prompt idle tracking (#2325). Only while no
-                    // aoe-issued prompt is in flight: a lifecycle signal here
-                    // means the agent resumed itself (Monitor / scheduled
-                    // wake), a turn the per-prompt watchdog never sees. Mirror
-                    // its cost/progress/wake semantics so the outer loop's
-                    // idle tick applies the same grace. During a real prompt
-                    // the per-prompt watchdog owns this, so skip.
-                    if !prompt_active {
-                        let now = chrono::Utc::now().timestamp_millis();
-                        if let Some(u) = between_prompt_signal_update(
-                            lifecycle_signal.as_ref(),
-                            wakeup_signal.as_ref(),
-                            now,
-                            between_prompt_wake_at.load(Ordering::Relaxed),
-                        ) {
-                            // False -> true is an agent-initiated turn
-                            // starting, so it gets its own terminal to claim.
-                            // Logged because the arming decision was
-                            // previously invisible: the watchdog only ever
-                            // logged when it fired, which is exactly the
-                            // information a stuck-Running investigation
-                            // needs. See #3190.
-                            if !between_prompt_active.swap(true, Ordering::Relaxed) {
-                                terminal_claim.begin_turn();
-                                debug!(
-                                    target: "acp.protocol",
-                                    session = %session_label,
-                                    "between-prompt watchdog armed for an agent-initiated turn"
-                                );
-                            }
-                            between_prompt_cost_seen.store(u.cost_seen, Ordering::Relaxed);
-                            // Refresh from `now` on every tracked signal,
-                            // including TerminalUsage, so the fast grace
-                            // measures from when the turn wrapped up rather
-                            // than from a possibly-stale earlier progress
-                            // event. See #2325 review.
-                            last_lifecycle_at.store(u.last_lifecycle_at, Ordering::Relaxed);
-                            between_prompt_wake_at.store(u.wake_at, Ordering::Relaxed);
-                        }
-                        // Track in-flight tool calls and off-protocol work for
-                        // the between-prompt path so the idle watchdog never
-                        // fires while a tool is open or backgrounded work is
-                        // still running. Mirrors the per-prompt watchdog's
-                        // `tool_calls_in_flight` + `off_protocol_work_seen`.
-                        // See #2371, #1401.
-                        match lifecycle_signal.as_ref() {
-                            Some(LifecycleSignal::ToolStarted {
-                                id,
-                                is_background_task,
-                            }) => {
-                                let mut tools = between_prompt_tools
-                                    .lock()
-                                    .expect("between-prompt tools mutex poisoned");
-                                let entry = tools.entry(id.clone()).or_insert(false);
-                                *entry = *entry || *is_background_task;
-                            }
-                            Some(LifecycleSignal::ToolCompleted {
-                                id,
-                                succeeded,
-                                off_protocol_work,
-                            }) => {
-                                let was_background = between_prompt_tools
-                                    .lock()
-                                    .expect("between-prompt tools mutex poisoned")
-                                    .remove(id)
-                                    .unwrap_or(false);
-                                // A failed launch keeps no background work
-                                // running, so it must not pin the floor.
-                                // Async sub-agents are tracked precisely in
-                                // between_prompt_bg_agents (a tailer removes
-                                // them on their terminal event), so they must
-                                // NOT also latch the 30-min off-protocol floor;
-                                // that floor is only for untracked backgrounded
-                                // work (Bash) with no completion signal. See
-                                // #2573.
-                                let is_tracked_async = matches!(
-                                    off_protocol_work,
-                                    Some(OffProtocolWorkKind::AsyncAgent)
-                                );
-                                if *succeeded
-                                    && !is_tracked_async
-                                    && (off_protocol_work.is_some() || was_background)
-                                {
-                                    between_prompt_off_protocol
-                                        .store(true, Ordering::Relaxed);
-                                }
-                            }
-                            Some(LifecycleSignal::TerminalUsage)
-                                if adopted_turn_active.load(Ordering::Relaxed) =>
-                            {
-                                // Adopted-turn barrier (#2899). A tool that was
-                                // in flight across the reattach boundary had its
-                                // ToolCall start on the previous connection; this
-                                // connection may see a trailing InProgress update
-                                // (re-inserting it into between_prompt_tools) but
-                                // never the terminal Completed/Failed frame, which
-                                // went to the old connection or only rode the
-                                // dropped PromptResponse. That leaks a stuck entry
-                                // that pins `work_in_flight` true forever, so the
-                                // between-prompt watchdog can never fire. A cost-
-                                // populated end-of-turn UsageUpdate is the adapter's
-                                // authoritative "turn wrapped up" marker (same signal
-                                // the per-prompt watchdog trusts), so drop the
-                                // unreliable inherited tool + untracked-background
-                                // bookkeeping. A future scheduled wake
-                                // (between_prompt_wake_at) and precisely tracked
-                                // async agents (between_prompt_bg_agents) keep their
-                                // own suppression: they carry real continuation
-                                // semantics, unlike a stale ACP tool entry.
-                                between_prompt_tools
-                                    .lock()
-                                    .expect("between-prompt tools mutex poisoned")
-                                    .clear();
-                                between_prompt_off_protocol.store(false, Ordering::Relaxed);
-                            }
-                            _ => {}
-                        }
-                    }
-                    // Capture the reset epoch the adapter forwards on a
-                    // `usage_update` (#3028) before the update is consumed
-                    // below. Only rejections are retained; a warning epoch
-                    // cannot be attributed to whichever window later rejects
-                    // (#3152). Log every observation either way: this is the
-                    // only breadcrumb for diagnosing a wrong reset time from
-                    // `debug.log`.
-                    if let SessionUpdate::UsageUpdate(u) = &notification.update {
-                        if let Some(raw) = u
-                            .meta
-                            .as_ref()
-                            .and_then(|m| m.get("_claude/rateLimit"))
-                        {
-                            let rejection = rate_limit_rejection_from_meta(&u.meta);
-                            debug!(
-                                target: "acp.protocol",
-                                session = %session_label,
-                                observed = %raw,
-                                retained = rejection.is_some(),
-                                "observed adapter rate-limit meta"
-                            );
-                            if let Some(r) = rejection {
-                                last_rate_limit_rejections
-                                    .lock()
-                                    .expect("rate-limit capture mutex poisoned")
-                                    .insert(r.window, r.resets_at_secs);
-                            }
-                        }
-                    }
-                    let update_for_tool_context = notification.update.clone();
-                    let mapped_events = map_update_to_events(notification.update, profile);
-                    // Deliver lifecycle signals BEFORE publishing the
-                    // user-visible event vector. The watchdog uses
-                    // ToolStarted / ToolCompleted / WakeupPending /
-                    // TerminalUsage to decide whether to fire; if
-                    // `event_tx.send().await` backpressures (slow web
-                    // consumer, replay drain), the prompt-loop tick
-                    // could otherwise evaluate `should_fire` before
-                    // ever seeing the suppression-bearing signal and
-                    // cancel a legitimate wait. Watchdog correctness
-                    // wins; UI ordering is reconciled by the event
-                    // store's monotonic seq anyway. See #1401 post-
-                    // impl review. Skipped entirely between prompts:
-                    // nothing drains the channel then, so at capacity
-                    // the awaited send would wedge this handler, and
-                    // every notification behind it, until the next
-                    // prompt (#2888).
-                    forward_lifecycle_signals(
-                        prompt_active,
-                        &lifecycle_signal_tx,
-                        envelope_epoch,
-                        lifecycle_signal,
-                        wakeup_signal,
-                        &session_label,
-                    )
-                    .await;
-                    for event in mapped_events {
-                        // An async sub-agent launch: spawn a tailer that
-                        // follows the agent's on-disk transcript and emits
-                        // BackgroundAgent{Progress,Completed}. The tailer
-                        // owns its own lifecycle (self-terminates on
-                        // completion, hard-idle, or when event_tx closes),
-                        // so it can never outlive the session. Skipped on
-                        // replay (the agent already finished). See
-                        // src/acp/background_agent.rs.
-                        if let Event::BackgroundAgentLaunched {
-                            agent_id,
-                            output_file,
-                            ..
-                        } = &event
-                        {
-                            if !suppressing && !output_file.is_empty() {
-                                crate::acp::background_agent::spawn_tailer(
-                                    agent_id.clone(),
-                                    output_file.clone(),
-                                    bg_transcript_source.clone(),
-                                    event_tx.clone(),
-                                    between_prompt_bg_agents.clone(),
-                                );
-                            }
-                        }
-                        // During the post-load replay window, drop only
-                        // events that would reproduce the prior turns'
-                        // visible transcript (assistant chunks, tool
-                        // calls, plans, etc.). Ambient state events
-                        // (mode/usage/available_commands) and lifecycle
-                        // events (stopped, errors) must pass through;
-                        // otherwise the composer footer and pickers
-                        // stay stale until the user types something.
-                        if suppressing && is_transcript_event(&event) {
-                            debug!(
-                                target: "acp.protocol",
-                                session = %session_label,
-                                kind = transcript_event_kind(&event),
-                                "dropping post-load history-replay event"
-                            );
-                            continue;
-                        }
-                        update_tool_context_cache(
-                            &tool_context_cache,
-                            &event,
-                            &update_for_tool_context,
-                        );
-                        if event_tx.send(event).await.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(())
+                    let (notification, wire_bytes) = notification.decode(control_notifications)?;
+                    let Some((notification, _guard)) = ingress.notification(notification, wire_bytes).await? else { return Ok(()); };
+                    apply(notification, true).await
                 }
             },
             agent_client_protocol::on_receive_notification!(),
@@ -710,7 +736,12 @@ pub(super) async fn run_connection_task<W, R>(
                 let event_tx = event_tx_for_perm.clone();
                 let pending = pending_for_perm.clone();
                 let tool_context_cache = tool_context_cache_for_perm.clone();
+                let ingress = ingress_for_perm.clone();
                 async move {
+                    let _guard = match ingress.request(&request.session_id).await {
+                        Ok(guard) => guard,
+                        Err(error) => return reply(responder, Err(error)),
+                    };
                     reply(
                         responder,
                         handle_permission_request(
@@ -732,7 +763,16 @@ pub(super) async fn run_connection_task<W, R>(
                   _conn| {
                 let event_tx = event_tx_for_elicit.clone();
                 let pending = pending_for_elicit.clone();
+                let ingress = ingress_for_elicit.clone();
                 async move {
+                    let _guard = if let ElicitationScope::Session(scope) = request.scope() {
+                        match ingress.request(&scope.session_id).await {
+                            Ok(guard) => Some(guard),
+                            Err(error) => return reply(responder, Err(error)),
+                        }
+                    } else {
+                        None
+                    };
                     reply(
                         responder,
                         handle_elicitation_request(request, event_tx, pending).await,
@@ -746,7 +786,14 @@ pub(super) async fn run_connection_task<W, R>(
                   responder: Responder<ReadTextFileResponse>,
                   _conn| {
                 let res = res_read.clone();
-                async move { reply(responder, handle_read_text_file(request, res).await) }
+                let ingress = ingress_for_read.clone();
+                async move {
+                    let _guard = match ingress.request(&request.session_id).await {
+                        Ok(guard) => guard,
+                        Err(error) => return reply(responder, Err(error)),
+                    };
+                    reply(responder, handle_read_text_file(request, res).await)
+                }
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -755,7 +802,14 @@ pub(super) async fn run_connection_task<W, R>(
                   responder: Responder<WriteTextFileResponse>,
                   _conn| {
                 let res = res_write.clone();
-                async move { reply(responder, handle_write_text_file(request, res).await) }
+                let ingress = ingress_for_write.clone();
+                async move {
+                    let _guard = match ingress.request(&request.session_id).await {
+                        Ok(guard) => guard,
+                        Err(error) => return reply(responder, Err(error)),
+                    };
+                    reply(responder, handle_write_text_file(request, res).await)
+                }
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -764,7 +818,14 @@ pub(super) async fn run_connection_task<W, R>(
                   responder: Responder<CreateTerminalResponse>,
                   _conn| {
                 let res = res_term_create.clone();
-                async move { reply(responder, handle_create_terminal(request, res).await) }
+                let ingress = ingress_for_term_create.clone();
+                async move {
+                    let _guard = match ingress.request(&request.session_id).await {
+                        Ok(guard) => guard,
+                        Err(error) => return reply(responder, Err(error)),
+                    };
+                    reply(responder, handle_create_terminal(request, res).await)
+                }
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -773,7 +834,14 @@ pub(super) async fn run_connection_task<W, R>(
                   responder: Responder<TerminalOutputResponse>,
                   _conn| {
                 let res = res_term_output.clone();
-                async move { reply(responder, handle_terminal_output(request, res).await) }
+                let ingress = ingress_for_term_output.clone();
+                async move {
+                    let _guard = match ingress.request(&request.session_id).await {
+                        Ok(guard) => guard,
+                        Err(error) => return reply(responder, Err(error)),
+                    };
+                    reply(responder, handle_terminal_output(request, res).await)
+                }
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -782,7 +850,14 @@ pub(super) async fn run_connection_task<W, R>(
                   responder: Responder<WaitForTerminalExitResponse>,
                   _conn| {
                 let res = res_term_wait.clone();
-                async move { reply(responder, handle_wait_for_terminal_exit(request, res).await) }
+                let ingress = ingress_for_term_wait.clone();
+                async move {
+                    let _guard = match ingress.request(&request.session_id).await {
+                        Ok(guard) => guard,
+                        Err(error) => return reply(responder, Err(error)),
+                    };
+                    reply(responder, handle_wait_for_terminal_exit(request, res).await)
+                }
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -791,7 +866,14 @@ pub(super) async fn run_connection_task<W, R>(
                   responder: Responder<KillTerminalResponse>,
                   _conn| {
                 let res = res_term_kill.clone();
-                async move { reply(responder, handle_kill_terminal(request, res).await) }
+                let ingress = ingress_for_term_kill.clone();
+                async move {
+                    let _guard = match ingress.request(&request.session_id).await {
+                        Ok(guard) => guard,
+                        Err(error) => return reply(responder, Err(error)),
+                    };
+                    reply(responder, handle_kill_terminal(request, res).await)
+                }
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -800,11 +882,22 @@ pub(super) async fn run_connection_task<W, R>(
                   responder: Responder<ReleaseTerminalResponse>,
                   _conn| {
                 let res = res_term_release.clone();
-                async move { reply(responder, handle_release_terminal(request, res).await) }
+                let ingress = ingress_for_term_release.clone();
+                async move {
+                    let _guard = match ingress.request(&request.session_id).await {
+                        Ok(guard) => guard,
+                        Err(error) => return reply(responder, Err(error)),
+                    };
+                    reply(responder, handle_release_terminal(request, res).await)
+                }
             },
             agent_client_protocol::on_receive_request!(),
         )
         .connect_with(transport, |connection: ConnectionTo<Agent>| async move {
+            let failure_ingress = ingress.clone();
+            tokio::select! {
+                error = failure_ingress.failed() => Err(error),
+                result = async move {
             info!(target: "acp.protocol", session = %session_label, "initializing ACP agent");
             // A detached v3 runner owns `initialize` and caches its result, so
             // the daemon requests it over the control channel. Direct stdio
@@ -951,9 +1044,24 @@ pub(super) async fn run_connection_task<W, R>(
             // for a clear command must forward the same gated list.
             let mcp_servers_for_reset = mcp_servers.clone();
 
+            let commit_session = |id: SessionId| {
+                let ingress = ingress.clone();
+                let event_tx = event_tx_for_block.clone();
+                let apply = apply_notification.clone();
+                async move {
+                    let _guard = ingress.fence.lock().await;
+                    let replay = ingress.finish(Some(id.clone()))?;
+                    let _ = event_tx.send(Event::AcpSessionAssigned { acp_session_id: id.0.to_string() }).await;
+                    for notification in replay {
+                        apply(notification, false).await?;
+                    }
+                    Ok::<(), agent_client_protocol::Error>(())
+                }
+            };
+
             // Resets replace this ID and clear its stored-session provenance.
             let mut session_from_storage = matches!(mode, ConnectMode::Resume { .. });
-            let mut acp_session_id: SessionId = match mode {
+            let acp_session_id: SessionId = match mode {
                 ConnectMode::Resume {
                     acp_session_id: stored,
                     in_flight_turn: _,
@@ -977,12 +1085,9 @@ pub(super) async fn run_connection_task<W, R>(
                     // crash. The server-side listener treats a same-id
                     // Assigned as a no-op, so this doesn't rewrite
                     // sessions.json.
-                    let _ = event_tx_for_block
-                        .send(Event::AcpSessionAssigned {
-                            acp_session_id: stored.clone(),
-                        })
-                        .await;
-                    SessionId::from(stored)
+                    let id = SessionId::from(stored);
+                    commit_session(id.clone()).await?;
+                    id
                 }
                 ConnectMode::Fresh {
                     stored_acp_session_id,
@@ -1023,6 +1128,10 @@ pub(super) async fn run_connection_task<W, R>(
                             .mcp_servers(mcp_servers.clone());
                         // Detached v3 runners own session creation; direct stdio
                         // sends the request through the crate connection.
+                        let generation = {
+                            let _guard = ingress.fence.lock().await;
+                            ingress.begin()
+                        };
                         let fork_result = if let Some(control) = control_client.as_ref() {
                             establish_session_v3::<ForkSessionResponse>(
                                 control,
@@ -1031,11 +1140,12 @@ pub(super) async fn run_connection_task<W, R>(
                             )
                             .await
                         } else {
-                            connection.send_request(req).block_task().await
+                            ordered_session_request(&connection, &ingress, generation, req, |response: &ForkSessionResponse| response.session_id.clone()).await
                         };
                         match fork_result {
                             Ok(resp) => {
                                 let new_id = resp.session_id.clone();
+                                commit_session(new_id.clone()).await?;
                                 info!(
                                     target: "acp.protocol",
                                     session = %session_label,
@@ -1088,11 +1198,6 @@ pub(super) async fn run_connection_task<W, R>(
                                         })
                                         .await;
                                 }
-                                let _ = event_tx_for_block
-                                    .send(Event::AcpSessionAssigned {
-                                        acp_session_id: new_id.0.to_string(),
-                                    })
-                                    .await;
                                 if let Some(event) = config_options_event(resp.config_options) {
                                     let _ = event_tx_for_block.send(event).await;
                                 }
@@ -1160,6 +1265,10 @@ pub(super) async fn run_connection_task<W, R>(
                             // normally.
                             if !seed_history_replay {
                                 suppress_for_block.store(true, Ordering::Relaxed);
+                            }
+                            {
+                                let _guard = ingress.fence.lock().await;
+                                ingress.finish(Some(SessionId::from(stored.clone())))?;
                             }
                             let req = LoadSessionRequest::new(stored.clone(), agent_cwd.clone())
                                 .mcp_servers(mcp_servers.clone());
@@ -1254,6 +1363,10 @@ pub(super) async fn run_connection_task<W, R>(
                                         stored_id = %stored,
                                         "session/load failed, falling back to session/new: {e}"
                                     );
+                                    {
+                                        let _guard = ingress.fence.lock().await;
+                                        ingress.finish(None)?;
+                                    }
                                     suppress_for_block.store(false, Ordering::Relaxed);
                                     if !fork_requested {
                                         context_reset_reason = Some(format!("session/load failed: {e}"));
@@ -1273,12 +1386,16 @@ pub(super) async fn run_connection_task<W, R>(
                         );
                         let req =
                             NewSessionRequest::new(agent_cwd.clone()).mcp_servers(mcp_servers);
+                        let generation = {
+                            let _guard = ingress.fence.lock().await;
+                            ingress.begin()
+                        };
                         // Detached v3 runners own session/new.
                         let new_session = if let Some(control) = control_client.as_ref() {
                             establish_session_v3::<NewSessionResponse>(control, "session/new", &req)
                                 .await?
                         } else {
-                            connection.send_request(req).block_task().await?
+                            ordered_session_request(&connection, &ingress, generation, req, |response: &NewSessionResponse| response.session_id.clone()).await?
                         };
                         let id = new_session.session_id.clone();
                         if let Some(reason) = context_reset_reason {
@@ -1286,6 +1403,7 @@ pub(super) async fn run_connection_task<W, R>(
                                 .send(Event::SessionContextReset { reason })
                                 .await;
                         }
+                        commit_session(id.clone()).await?;
                         info!(
                             target: "acp.protocol",
                             session = %session_label,
@@ -1399,14 +1517,6 @@ pub(super) async fn run_connection_task<W, R>(
                             }
                         }
 
-                        // Tell the server-side listener so it can persist the
-                        // new id on Instance.acp_session_id.
-                        let _ = event_tx_for_block
-                            .send(Event::AcpSessionAssigned {
-                                acp_session_id: id.0.to_string(),
-                            })
-                            .await;
-
                         id
                     }
                 }
@@ -1466,12 +1576,12 @@ pub(super) async fn run_connection_task<W, R>(
             // turn, otherwise through the direct-stdio crate connection. The
             // macro preserves each callsite's error-handling shape.
             macro_rules! send_session_cancel {
-                () => {{
+                ($session_id:expr) => {{
                     if let Some(control) = control_client.as_ref() {
                         control.cancel().await;
                         Ok::<(), agent_client_protocol::Error>(())
                     } else {
-                        connection.send_notification(CancelNotification::new(acp_session_id.clone()))
+                        connection.send_notification(CancelNotification::new($session_id.clone()))
                     }
                 }};
             }
@@ -1568,6 +1678,7 @@ pub(super) async fn run_connection_task<W, R>(
             // sole consumer of deadlocks once that channel fills.
             let mut pending_prompts: VecDeque<Vec<ContentBlock>> = VecDeque::new();
             loop {
+                let acp_session_id = ingress.current().ok_or_else(|| acp_internal_error("native session is not established".into()))?;
                 // Drain the fallback queue ahead of the channel so a
                 // message the user sent first cannot be overtaken by one
                 // they sent after it.
@@ -2040,7 +2151,7 @@ pub(super) async fn run_connection_task<W, R>(
                                                 target: "acp.protocol",
                                                 "sending session/cancel during in-flight prompt"
                                             );
-                                            send_session_cancel!()?;
+                                            send_session_cancel!(acp_session_id)?;
                                             // Arm the escalation watchdog on
                                             // the first cancel only; later
                                             // cancels just resend the
@@ -2079,7 +2190,7 @@ pub(super) async fn run_connection_task<W, R>(
                                             // real lever is ending the turn so
                                             // the drain task kills the process
                                             // group and respawns. See #1727.
-                                            let _ = send_session_cancel!();
+                                            let _ = send_session_cancel!(acp_session_id);
                                             force_stopped = true;
                                             shutdown = true;
                                             break;
@@ -2346,7 +2457,7 @@ pub(super) async fn run_connection_task<W, R>(
                                         // the cancel_grace arm fires
                                         // and we synthesize Stopped
                                         // with reason "prompt_orphaned".
-                                        if let Err(err) = send_session_cancel!() {
+                                        if let Err(err) = send_session_cancel!(acp_session_id) {
                                             warn!(
                                                 target: "acp.protocol",
                                                 session = %session_label,
@@ -2611,7 +2722,7 @@ pub(super) async fn run_connection_task<W, R>(
                         // is exactly when the UI most needs the synthetic
                         // Stopped below to unstick. Propagating the error here
                         // would skip that emit and defeat the desync recovery.
-                        if let Err(e) = send_session_cancel!() {
+                        if let Err(e) = send_session_cancel!(acp_session_id) {
                             warn!(
                                 target: "acp.protocol",
                                 error = %e,
@@ -2655,7 +2766,7 @@ pub(super) async fn run_connection_task<W, R>(
                         terminal_claim.claim();
                         adopted_turn_active.store(false, Ordering::Relaxed);
                         between_prompt_active.store(false, Ordering::Relaxed);
-                        let _ = send_session_cancel!();
+                        let _ = send_session_cancel!(acp_session_id);
                     }
                     Some(ClientCmd::SetMode(mode_id)) => {
                         dispatch_set_mode(
@@ -2689,6 +2800,15 @@ pub(super) async fn run_connection_task<W, R>(
                         deadline: reset_deadline,
                         respond_to,
                     }) => {
+                        let transition_guard = match tokio::time::timeout_at(reset_deadline, ingress.fence.lock()).await {
+                            Ok(guard) => guard,
+                            Err(_) => {
+                                let _ = respond_to.send(ResetSessionOutcome::Failed {
+                                    message: "reset deadline expired while agent callbacks were in flight".into(),
+                                });
+                                continue;
+                            }
+                        };
                         let work_in_flight = between_prompt_work_state(
                             &between_prompt_tools,
                             &between_prompt_bg_agents,
@@ -2742,12 +2862,21 @@ pub(super) async fn run_connection_task<W, R>(
                         );
                         let req = NewSessionRequest::new(agent_cwd.clone())
                             .mcp_servers(mcp_servers_for_reset.clone());
-                        match await_reset_request(
+                        let generation = ingress.begin();
+                        drop(transition_guard);
+                        let reset_result = await_reset_request(
                             reset_deadline,
-                            || connection.send_request(req).block_task(),
-                        )
-                        .await
-                        {
+                            || ordered_session_request(&connection, &ingress, generation, req, |response: &NewSessionResponse| response.session_id.clone()),
+                        ).await;
+                        let commit_guard = ingress.fence.lock().await;
+                        let retained_id = reset_result.as_ref().map(|response| response.session_id.clone()).unwrap_or_else(|_| acp_session_id.clone());
+                        let mut replay = ingress.finish(Some(retained_id.clone()))?;
+                        if retained_id == acp_session_id {
+                            for notification in replay.drain(..) {
+                                apply_notification(notification, false).await?;
+                            }
+                        }
+                        match reset_result {
                             Ok(new_session)
                                 if new_session.session_id.0 != acp_session_id.0 =>
                             {
@@ -2757,7 +2886,6 @@ pub(super) async fn run_connection_task<W, R>(
                                 // best-effort config restoration so this
                                 // client and the runner cannot disagree
                                 // about which session owns later prompts.
-                                acp_session_id = new_id.clone();
                                 // The id in use is now agent-created, not
                                 // the stored one, so a later prompt
                                 // rejection is not a stale resume.
@@ -2798,6 +2926,10 @@ pub(super) async fn run_connection_task<W, R>(
                                         acp_session_id: new_id.0.to_string(),
                                     })
                                     .await;
+                                for notification in replay {
+                                    apply_notification(notification, false).await?;
+                                }
+                                drop(commit_guard);
                                 // Re-announce the fresh session's modes and
                                 // config options (mirroring the handshake):
                                 // the new session starts on adapter defaults,
@@ -2989,6 +3121,8 @@ pub(super) async fn run_connection_task<W, R>(
                 }
             }
             Ok(())
+                } => result,
+            }
         })
         .await;
 

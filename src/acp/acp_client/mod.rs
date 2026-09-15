@@ -33,6 +33,7 @@ mod raw_input;
 mod reset;
 mod resolve_command;
 mod runner;
+mod session_identity;
 mod session_sandbox;
 mod spawn;
 mod steer;
