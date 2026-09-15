@@ -315,9 +315,14 @@ fn canonical_expected_path(path: &Path) -> std::io::Result<PathBuf> {
 /// Resolve intentional /tmp, dotfile and Nix links, then pin the spelling
 /// without following any subsequent component replacement.
 fn open_canonical_dir(path: &Path) -> Result<AnchoredDir> {
+    // The host may reach this path through a link it owns (macOS `/tmp`, a
+    // developer's symlinked temporary root), so resolve the spelling before the
+    // walk: every component below the anchor is then one this process created.
+    let resolved = canonical_expected_path(path)?;
     let filesystem = AnchoredDir::open(Path::new("/"))?;
     filesystem.child(
-        path.strip_prefix("/")
+        resolved
+            .strip_prefix("/")
             .context("canonical source must be absolute")?,
     )
 }

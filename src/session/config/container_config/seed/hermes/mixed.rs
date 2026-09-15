@@ -461,7 +461,9 @@ mod tests {
             .hermes
             .homes
             .iter()
-            .position(|scope| scope.lookup == coder)
+            .position(|scope| {
+                scope.lookup == super::super::super::canonical_expected_path(&coder).unwrap()
+            })
             .unwrap();
         let profile = guard::SourceRoot::new(&coder).unwrap();
         let output = AnchoredDir::open(&destination).unwrap();

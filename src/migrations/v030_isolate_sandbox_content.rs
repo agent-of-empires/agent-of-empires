@@ -64,14 +64,17 @@ impl SandboxContentReset {
 
 fn claim_context_reset(
     instance: &mut crate::session::Instance,
-    agent: &str,
+    agent: Option<&str>,
     view: NativeContextView,
     generation: u64,
 ) -> Option<(String, Vec<String>)> {
     let mut slots = Vec::new();
     let mut recovery = BTreeSet::new();
     for reset in &mut instance.sandbox_content_resets {
-        if reset.tool != instance.tool || reset.agent != agent || !reset.lane(view).pending {
+        if reset.tool != instance.tool
+            || agent.is_some_and(|agent| reset.agent != agent)
+            || !reset.lane(view).pending
+        {
             continue;
         }
         if reset.lane(view).generation.is_none() {
@@ -127,7 +130,8 @@ fn claim_context_reset(
     } else {
         "starts a fresh"
     };
-    Some((format!("Sandbox native history was isolated; this launch {context} {agent} conversation. The existing AoE transcript is retained. Complete originals: {}", recovery.into_iter().collect::<Vec<_>>().join(", ")), slots))
+    let labelled = agent.unwrap_or(instance.tool.as_str());
+    Some((format!("Sandbox native history was isolated; this launch {context} {labelled} conversation. The existing AoE transcript is retained. Complete originals: {}", recovery.into_iter().collect::<Vec<_>>().join(", ")), slots))
 }
 
 pub(crate) struct AcpLaunchContext {
@@ -162,19 +166,20 @@ pub(crate) fn prepare_acp_context(
         if !instance.is_sandboxed() || !instance_ready(instance)? {
             bail!("sandbox native content is not ready for structured launch");
         }
-        if matches!(usage, AcpContextUse::Attach)
-            && instance.sandbox_content_resets.iter().any(|reset| {
-                reset.tool == instance.tool
-                    && Some(reset.agent.as_str()) == agent
-                    && reset.structured.pending
-                    && reset.structured.generation.is_none()
-            })
-        {
+        // An adapter that names no native agent cannot prove which lane it is
+        // about to continue, so it is answered for the whole row: refuse the
+        // attach while any structured lane is pending, and claim them all.
+        let pending = instance.sandbox_content_resets.iter().any(|reset| {
+            reset.tool == instance.tool
+                && agent.is_none_or(|agent| reset.agent == agent)
+                && reset.structured.pending
+                && reset.structured.generation.is_none()
+        });
+        if matches!(usage, AcpContextUse::Attach) && pending {
             bail!("runner predates its sandbox content reset; a fresh launch is required");
         }
-        let notice = agent.and_then(|agent| {
-            claim_context_reset(instance, agent, NativeContextView::Structured, generation)
-        });
+        let notice =
+            claim_context_reset(instance, agent, NativeContextView::Structured, generation);
         Ok(AcpLaunchContext {
             profile: storage.profile().to_owned(),
             stored_session_id: instance.acp_session_id.clone(),
@@ -207,7 +212,8 @@ pub(crate) fn prepare_terminal_launch_context(
             if row.lifecycle_generation != generation || row.tool != instance.tool {
                 bail!("terminal content reset lost its launch scope");
             }
-            let notice = claim_context_reset(row, agent, NativeContextView::Terminal, generation);
+            let notice =
+                claim_context_reset(row, Some(agent), NativeContextView::Terminal, generation);
             Ok((
                 row.sandbox_content_resets.clone(),
                 notice,
@@ -653,6 +659,12 @@ fn certify_receipt(app: &Path, receipt: &Receipt) -> Result<()> {
 }
 
 fn rename_directory(source: &Path, destination: &Path) -> Result<()> {
+    // Walk from a resolved spelling: an ancestor that is a symlink belongs to
+    // the host (macOS `/tmp`, a developer's symlinked temporary root), is not a
+    // component this process owns, and refusing it would fail every move below
+    // it. The leaf keeps its own check when the directory is published.
+    let source = canonical_expected_path(source)?;
+    let destination = canonical_expected_path(destination)?;
     let filesystem = AnchoredDir::open(Path::new("/"))?;
     if !filesystem.publish_directory(
         &filesystem,
@@ -1653,6 +1665,9 @@ fn migrate_target(
     }
     layout::refresh_liveness();
     if running(id)? || detached_writer_live(app, id)? || !reap(id)? {
+        progress::notice(format!(
+            "sandbox {id}: stop its container and structured runner to isolate native history"
+        ));
         return Ok(false);
     }
     if let Some(message) = recovery_exposure(app, &migration_targets(app, &roots)?, exposure)? {
@@ -2096,6 +2111,74 @@ mod tests {
                 registry.display()
             );
         }
+    }
+
+    /// An adapter that names no native agent still has to answer for a pending
+    /// structured lane, or that row keeps resuming the retired conversation.
+    #[test]
+    #[serial_test::serial]
+    fn an_adapter_without_a_native_agent_still_claims_its_structured_lane() {
+        let temporary = tempfile::tempdir().unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let home = dirs::home_dir().unwrap();
+        let app = crate::session::get_app_dir().unwrap();
+        let mut instance =
+            crate::session::Instance::new("codex", temporary.path().to_str().unwrap());
+        instance.tool = "codex".to_owned();
+        instance.agent_session_id = Some("old-native-context".to_owned());
+        instance.acp_session_id = Some("retired-adapter-context".to_owned());
+        let config = crate::session::Config::default();
+        let roots = container_config::sandbox_content_roots(
+            "codex",
+            None,
+            &config.session,
+            &home,
+            &instance.id,
+        )
+        .unwrap();
+        let root = &roots[0].path;
+        fs::create_dir_all(root.join("sessions")).unwrap();
+        fs::write(
+            root.join("sessions/original.jsonl"),
+            b"PRIVATE_ORIGINAL_CONTEXT",
+        )
+        .unwrap();
+        let mut row = serde_json::to_value(&instance).unwrap();
+        row["sandbox_info"] = serde_json::json!({
+            "enabled": true,
+            "image": "img",
+            "container_name": "aoe-sandbox-fixture",
+        });
+        let (path, mut receipt) = checked_receipt(&app, &row, "codex", &roots).unwrap();
+        record_retirement(&mut receipt, &row, &home, &config).unwrap();
+        stage_receipt(&app, &mut receipt, &path, &home, &config, temporary.path()).unwrap();
+        publish_receipt(&mut receipt, &path).unwrap();
+        reset_row(&mut row, &receipt).unwrap();
+        receipt.phase = Phase::Committed;
+        write_receipt(&path, &receipt).unwrap();
+        certify_receipt(&app, &receipt).unwrap();
+        archive_receipt(&path, &receipt).unwrap();
+        fs::create_dir_all(&app).unwrap();
+        let registry = crate::session::get_profile_dir("default")
+            .unwrap()
+            .join("sessions.json");
+        fs::create_dir_all(registry.parent().unwrap()).unwrap();
+        fs::write(&registry, serde_json::to_vec(&vec![row]).unwrap()).unwrap();
+
+        assert!(
+            prepare_acp_context("default", &instance.id, None, 1, AcpContextUse::Attach).is_err(),
+            "an adapter that names no native agent cannot attach to a moved lane"
+        );
+        let context =
+            prepare_acp_context("default", &instance.id, None, 1, AcpContextUse::Launch).unwrap();
+        assert!(
+            context.notice.is_some(),
+            "the structured lane is claimed and announced"
+        );
+        assert!(
+            context.stored_session_id.is_none(),
+            "the retired adapter context is not resumed"
+        );
     }
 
     #[test]
