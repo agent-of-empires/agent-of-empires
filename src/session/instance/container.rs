@@ -149,8 +149,7 @@ impl Instance {
                 None
             };
 
-        // Mounts another tool's agent config, so nothing in it runs this tool.
-        // Structured sessions reach relaunch without the restart's removal (#3976).
+        // A container built for another tool mounts that tool's agent config.
         if container.exists()? && container.agent_tool_matches(&self.tool)? == Some(false) {
             container.remove(true)?;
         }
