@@ -3700,18 +3700,31 @@ mod import_tests {
         assert_eq!(inst.resume_intent, ResumeIntent::Default);
     }
 
+    /// A row claims a conversation in one of three places, and a re-import
+    /// must see all of them: a terminal import pins `resume_intent`, the
+    /// poller writes `agent_session_id`, and a structured import seeds
+    /// `acp_session_id` while leaving `resume_intent` at `Default`. Missing
+    /// any one of them creates a second row claiming a conversation that is
+    /// already claimed.
     #[test]
-    fn already_imported_matches_resume_and_observed_ids() {
+    fn already_imported_matches_every_spelling_of_a_claim() {
         let mut by_resume = Instance::new("a", "/p");
         by_resume.resume_intent = ResumeIntent::Use("id-1".to_string());
         let mut by_observed = Instance::new("b", "/p");
         by_observed.agent_session_id = Some("id-2".to_string());
-        let fresh = Instance::new("c", "/p");
-        let instances = vec![by_resume, by_observed, fresh];
+        let mut by_structured = Instance::new("c", "/p");
+        by_structured.acp_session_id = Some("id-3".to_string());
+        let fresh = Instance::new("d", "/p");
+        let instances = vec![by_resume, by_observed, by_structured, fresh];
 
-        assert!(already_imported(&instances, "id-1"));
-        assert!(already_imported(&instances, "id-2"));
-        assert!(!already_imported(&instances, "id-3"));
+        for (id, claimed) in [
+            ("id-1", true),
+            ("id-2", true),
+            ("id-3", true),
+            ("id-4", false),
+        ] {
+            assert_eq!(already_imported(&instances, id), claimed, "{id}");
+        }
     }
 }
 
