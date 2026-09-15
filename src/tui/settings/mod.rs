@@ -419,6 +419,7 @@ impl SettingsView {
         push_tab(&mut rows, SettingsCategory::Interaction);
         push_tab(&mut rows, SettingsCategory::Diff);
         push_tab(&mut rows, SettingsCategory::Acp);
+        push_tab(&mut rows, SettingsCategory::ModelGateway);
 
         push_section(&mut rows, "Hooks");
         push_tab(&mut rows, SettingsCategory::Hooks);

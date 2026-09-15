@@ -972,8 +972,8 @@ pub async fn discover_gateway_models(
             Ok(c) => c,
             Err(e) => return (None, Some(format!("Failed to load settings: {e}"))),
         };
-        let acp = &config.acp;
-        if acp.gateway_base_url.trim().is_empty() {
+        let gw = &config.model_gateway;
+        if gw.gateway_base_url.trim().is_empty() {
             return (
                 None,
                 Some("Enter a model gateway URL in settings.".to_string()),
@@ -981,10 +981,10 @@ pub async fn discover_gateway_models(
         }
         (
             Some(crate::acp::model_gateway::ModelGatewaySettings {
-                base_url: acp.gateway_base_url.clone(),
-                api_key: acp.gateway_api_key.clone(),
+                base_url: gw.gateway_base_url.clone(),
+                api_key: gw.gateway_api_key.clone(),
                 discovery_path: {
-                    let p = acp.gateway_discovery_path.trim();
+                    let p = gw.gateway_discovery_path.trim();
                     (!p.is_empty()).then(|| p.to_string())
                 },
             }),

@@ -47,6 +47,7 @@ export type TabId =
   | "security"
   | "devices"
   | "structured-view"
+  | "model-gateway"
   | "mcp"
   | "skills"
   | "logging"
@@ -97,6 +98,7 @@ export function buildSidebar(): SidebarItem[] {
     { kind: "divider", label: "Sessions" },
     { kind: "tab", id: "session", label: "Session" },
     { kind: "tab", id: "structured-view", label: "Structured view" },
+    { kind: "tab", id: "model-gateway", label: "Model gateway" },
     { kind: "tab", id: "mcp", label: "MCP servers" },
     { kind: "tab", id: "skills", label: "Skills" },
     { kind: "divider", label: "Environment" },
@@ -193,6 +195,7 @@ const ALL_TAB_IDS = new Set<TabId>([
   "security",
   "devices",
   "structured-view",
+  "model-gateway",
   "mcp",
   "skills",
   "logging",
@@ -220,6 +223,7 @@ const SCHEMA_BACKED_TABS = new Set<TabId>([
   "logging",
   "notifications",
   "structured-view",
+  "model-gateway",
 ]);
 
 /// Resolves the value `selectedProfile` should take when the mount-time
@@ -458,6 +462,7 @@ export function SettingsView({
       activeTab !== "security" &&
       activeTab !== "devices" &&
       activeTab !== "structured-view" &&
+      activeTab !== "model-gateway" &&
       activeTab !== "mcp" &&
       activeTab !== "skills" &&
       activeTab !== "plugins" &&
@@ -715,6 +720,31 @@ export function SettingsView({
               // save so those surfaces pick up the change without a reload.
               onAfterSave={() => onServerAboutRefresh()}
               advancedSubtitle="Replay retention caps and daemon watchdog tuning. Touch only when triaging a specific failure mode."
+            />
+          </div>
+        );
+      }
+      case "model-gateway": {
+        if (!settings) {
+          return <div className="text-sm text-text-dim">Loading settings...</div>;
+        }
+        const modelGateway = (settings.model_gateway ?? {}) as Record<string, unknown>;
+        return (
+          <div className="space-y-4">
+            <p className="text-xs text-text-dim">
+              One gateway root serving every agent harness (Claude, Codex, Copilot): when the URL
+              below is set, each harness's own routing env vars are pointed at the gateway's
+              provider-specific routes and the resolved key is forwarded, so one model catalogue and
+              one credential back per-session model switching across agents. Discovery runs
+              daemon-side; the credential is resolved there too and never logged or echoed. Leave
+              the URL empty to disable the gateway entirely.
+            </p>
+            <SchemaSection
+              section="model_gateway"
+              schema={schema}
+              focusRequest={focusRequest}
+              values={modelGateway}
+              onSaveField={saveSubField}
             />
           </div>
         );

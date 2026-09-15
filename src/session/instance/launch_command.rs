@@ -595,12 +595,12 @@ impl Instance {
                 let gw_config = crate::session::config::profile_config::resolve_config_or_warn(
                     &self.effective_profile(),
                 );
-                if !gw_config.acp.gateway_base_url.trim().is_empty() {
+                if !gw_config.model_gateway.gateway_base_url.trim().is_empty() {
                     let gw_settings = crate::acp::model_gateway::ModelGatewaySettings {
-                        base_url: gw_config.acp.gateway_base_url.clone(),
-                        api_key: gw_config.acp.gateway_api_key.clone(),
+                        base_url: gw_config.model_gateway.gateway_base_url.clone(),
+                        api_key: gw_config.model_gateway.gateway_api_key.clone(),
                         discovery_path: {
-                            let p = gw_config.acp.gateway_discovery_path.trim();
+                            let p = gw_config.model_gateway.gateway_discovery_path.trim();
                             (!p.is_empty()).then(|| p.to_string())
                         },
                     };

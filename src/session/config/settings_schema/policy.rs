@@ -373,23 +373,38 @@ mod tests {
         // `local_only`, so `strip_local_only` must leave all three in a
         // bundled patch, and a non-elevated PATCH must be refused with
         // NeedsElevation naming the field.
-        let mut body = json!({"acp": {
+        let mut body = json!({"model_gateway": {
             "gateway_base_url": "https://bifrost.example",
             "gateway_api_key": "${env:BIFROST_VK}",
             "gateway_discovery_path": "",
-            "node_path": "/tmp/evil-node",
         }});
         strip_local_only(&mut body);
-        assert!(body["acp"].get("node_path").is_none());
         assert_eq!(
-            body["acp"]["gateway_base_url"],
+            body["model_gateway"]["gateway_base_url"],
             json!("https://bifrost.example")
         );
-        assert_eq!(body["acp"]["gateway_api_key"], json!("${env:BIFROST_VK}"));
-        assert_eq!(body["acp"]["gateway_discovery_path"], json!(""));
+        assert_eq!(
+            body["model_gateway"]["gateway_api_key"],
+            json!("${env:BIFROST_VK}")
+        );
+        assert_eq!(body["model_gateway"]["gateway_discovery_path"], json!(""));
         assert!(validate_patch(&body, Scope::Global, true).is_ok());
         let err = validate_patch(&body, Scope::Global, false).unwrap_err();
         assert!(matches!(err, PatchRejection::NeedsElevation { .. }));
+    }
+
+    #[test]
+    fn gateway_fields_are_not_reachable_via_acp_section() {
+        // The fields moved out of `acp` into their own `model_gateway`
+        // section; the old path must now be an unknown-field rejection, not a
+        // silent write into a section nothing reads.
+        let err = validate_patch(
+            &json!({"acp": {"gateway_base_url": "https://bifrost.example"}}),
+            Scope::Global,
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(err, PatchRejection::UnknownField(_)));
     }
 
     #[test]

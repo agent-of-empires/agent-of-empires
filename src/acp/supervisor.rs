@@ -1901,12 +1901,18 @@ impl<S: BroadcastSink> Supervisor<S> {
         // nothing, never a partial credential. Values ride
         // `host_environment` only — never argv — and are applied last by the
         // spawn paths.
-        if sandbox_info.is_none() && !resolved_cfg.acp.gateway_base_url.trim().is_empty() {
+        if sandbox_info.is_none()
+            && !resolved_cfg
+                .model_gateway
+                .gateway_base_url
+                .trim()
+                .is_empty()
+        {
             let gw_settings = crate::acp::model_gateway::ModelGatewaySettings {
-                base_url: resolved_cfg.acp.gateway_base_url.clone(),
-                api_key: resolved_cfg.acp.gateway_api_key.clone(),
+                base_url: resolved_cfg.model_gateway.gateway_base_url.clone(),
+                api_key: resolved_cfg.model_gateway.gateway_api_key.clone(),
                 discovery_path: {
-                    let p = resolved_cfg.acp.gateway_discovery_path.trim();
+                    let p = resolved_cfg.model_gateway.gateway_discovery_path.trim();
                     (!p.is_empty()).then(|| p.to_string())
                 },
             };
