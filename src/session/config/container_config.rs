@@ -1226,7 +1226,7 @@ fn seed_content_roles(
             let mut boundary = NativeStateBoundary::new(source, mount, home, session, destination)?;
             let stopped = matches!(mode, ContentSeedMode::StoppedOriginal);
             let files = if stopped {
-                boundary = boundary.for_stopped_original(&root.host);
+                boundary = boundary.for_stopped_original(&root.host, mount)?;
                 let mut files = mount.copy_files.to_vec();
                 files.extend(mount.home_seed_files.iter().map(|(name, _)| *name));
                 files.extend(mount.shared_credential_files.iter().copied());
