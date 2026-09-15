@@ -382,6 +382,28 @@ export function toolCallCompleted(fields: { tool_call_id: string; is_error: bool
   };
 }
 
+export function backgroundAgentLaunched(fields: {
+  agent_id: string;
+  tool_call_id: string;
+  description: string;
+  prompt: string;
+  model: string;
+}) {
+  return {
+    BackgroundAgentLaunched: { ...fields, started_at: new Date().toISOString() },
+  };
+}
+
+export function backgroundAgentCompleted(fields: { agent_id: string; status?: string }) {
+  return {
+    BackgroundAgentCompleted: {
+      agent_id: fields.agent_id,
+      status: fields.status ?? "completed",
+      ended_at: new Date().toISOString(),
+    },
+  };
+}
+
 export function configOptionsUpdated(options: unknown[]) {
   return { ConfigOptionsUpdated: { options } };
 }

@@ -525,7 +525,11 @@ pub struct AcpState {
 
     /// Whether a turn is in flight. Server-observed edges: opened by
     /// `UserPromptSent` / `UserDiffCommentsPrompt` / `ThinkingStarted`, closed
-    /// by `Stopped`, startup error, runtime error, or rejection.
+    /// by `Stopped`, startup error, runtime error, or rejection. Dispatch
+    /// (`acp::dispatch::decide`) and the queue drain
+    /// (`session_service::drain_queued_prompts_once`) gate on this directly,
+    /// so it must track only the main turn, never a background sub-agent's
+    /// lifecycle; use [`Self::is_visibly_busy`] for a display-only signal.
     #[serde(default)]
     pub turn_active: bool,
     /// Whether the running turn is steerable (a mid-turn prompt is injected
@@ -1164,6 +1168,23 @@ pub enum Event {
 }
 
 impl AcpState {
+    /// Whether any background sub-agent is still in flight. Keyed on
+    /// `ended_at` rather than `status`: the tailer's own terminal
+    /// `BackgroundAgentCompleted` can carry `status: Stalled` (its abort
+    /// timeout gives up without a clean `end_turn`), and that record must
+    /// count as done like any other terminal one, not wedge this on forever
+    /// (#3900).
+    pub fn has_active_background_agent(&self) -> bool {
+        self.background_agents.iter().any(|a| a.ended_at.is_none())
+    }
+
+    /// Display-only busy signal: the main turn or an outstanding background
+    /// sub-agent. Distinct from `turn_active`, which gates prompt dispatch
+    /// and the queue drain and must track only the main turn.
+    pub fn is_visibly_busy(&self) -> bool {
+        self.turn_active || self.has_active_background_agent()
+    }
+
     /// Apply a single event. Returns the new `last_seq` on success.
     pub fn apply_event(&mut self, event: Event) -> Result<u64, StateError> {
         match event {
@@ -1360,6 +1381,13 @@ impl AcpState {
                 // and for an adapter that ends a turn without completing its
                 // tool call or emitting `ThinkingEnded`, either of which would
                 // otherwise leak a spinner into the next turn (#1213).
+                //
+                // A background sub-agent the main turn handed work off to
+                // keeps running past its parent's `Stopped`, but `turn_active`
+                // gates prompt dispatch and the queue drain, not just display
+                // (#3900): it must clear unconditionally here. Use
+                // `is_visibly_busy` at display boundaries for the combined
+                // signal.
                 self.turn_active = false;
                 self.cancelling = false;
                 self.compacting = false;
@@ -1567,13 +1595,19 @@ impl AcpState {
                     .iter_mut()
                     .find(|a| a.agent_id == agent_id)
                 {
-                    // A terminal record never reopens to running.
-                    if !matches!(
-                        a.status,
-                        BackgroundAgentStatus::Completed
-                            | BackgroundAgentStatus::Detached
-                            | BackgroundAgentStatus::Error
-                    ) {
+                    // A terminal record never reopens to running. Guarded on
+                    // `ended_at` too: a terminal `Stalled` (the tailer's own
+                    // abort timeout, see `has_active_background_agent`'s doc
+                    // comment) also carries `ended_at`, and the status match
+                    // alone would let a late Progress reopen it.
+                    if a.ended_at.is_none()
+                        && !matches!(
+                            a.status,
+                            BackgroundAgentStatus::Completed
+                                | BackgroundAgentStatus::Detached
+                                | BackgroundAgentStatus::Error
+                        )
+                    {
                         a.status = status;
                         a.tool_count = tool_count;
                         if !tools.is_empty() {
@@ -1840,6 +1874,237 @@ mod tests {
             BackgroundAgentStatus::Completed
         );
         assert_eq!(s.background_agents[0].tool_count, 3, "must not overwrite");
+    }
+
+    /// #3925: a terminal `Stalled` record (the tailer's own abort timeout,
+    /// not one of the `status`-matched terminal variants) still carries
+    /// `ended_at`, so a late Progress must not reopen it either — the
+    /// progress guard has to key on `ended_at`, not just `status`, to match
+    /// `has_active_background_agent`'s own `ended_at`-keyed read.
+    #[test]
+    fn background_agent_progress_does_not_reopen_a_stalled_terminal_record() {
+        let mut s = fresh_state();
+        s.apply_event(Event::BackgroundAgentLaunched {
+            agent_id: "a1".into(),
+            tool_call_id: "tc1".into(),
+            description: "map backend".into(),
+            prompt: "do the thing".into(),
+            model: "claude-opus-4-8".into(),
+            output_file: "/tmp/a1.output".into(),
+            started_at: Utc::now(),
+        })
+        .unwrap();
+        s.apply_event(Event::BackgroundAgentCompleted {
+            agent_id: "a1".into(),
+            status: BackgroundAgentStatus::Stalled,
+            tools: vec![],
+            result: None,
+            warning: Some("idle timeout".into()),
+            ended_at: Utc::now(),
+        })
+        .unwrap();
+        assert_eq!(
+            s.background_agents[0].status,
+            BackgroundAgentStatus::Stalled
+        );
+        assert!(s.background_agents[0].ended_at.is_some());
+        assert!(!s.has_active_background_agent());
+
+        s.apply_event(Event::BackgroundAgentProgress {
+            agent_id: "a1".into(),
+            status: BackgroundAgentStatus::Running,
+            tool_count: 9,
+            tools: vec![],
+            last_tool: None,
+            last_text: None,
+            at: Utc::now(),
+        })
+        .unwrap();
+        assert_eq!(
+            s.background_agents[0].status,
+            BackgroundAgentStatus::Stalled,
+            "a terminal Stalled record must not reopen to Running"
+        );
+        assert!(s.background_agents[0].ended_at.is_some());
+        assert!(!s.has_active_background_agent());
+    }
+
+    /// A non-terminal `Progress{stalled}` (no `ended_at` yet, only the
+    /// eventual `BackgroundAgentCompleted` sets that) still resumes normally
+    /// on the next `Progress{running}`.
+    #[test]
+    fn background_agent_progress_stalled_without_ended_at_still_resumes() {
+        let mut s = fresh_state();
+        s.apply_event(Event::BackgroundAgentLaunched {
+            agent_id: "a1".into(),
+            tool_call_id: "tc1".into(),
+            description: "map backend".into(),
+            prompt: "do the thing".into(),
+            model: "claude-opus-4-8".into(),
+            output_file: "/tmp/a1.output".into(),
+            started_at: Utc::now(),
+        })
+        .unwrap();
+        s.apply_event(Event::BackgroundAgentProgress {
+            agent_id: "a1".into(),
+            status: BackgroundAgentStatus::Stalled,
+            tool_count: 4,
+            tools: vec![],
+            last_tool: None,
+            last_text: None,
+            at: Utc::now(),
+        })
+        .unwrap();
+        assert_eq!(
+            s.background_agents[0].status,
+            BackgroundAgentStatus::Stalled
+        );
+        assert!(s.background_agents[0].ended_at.is_none());
+        assert!(s.has_active_background_agent());
+
+        s.apply_event(Event::BackgroundAgentProgress {
+            agent_id: "a1".into(),
+            status: BackgroundAgentStatus::Running,
+            tool_count: 5,
+            tools: vec![],
+            last_tool: None,
+            last_text: None,
+            at: Utc::now(),
+        })
+        .unwrap();
+        assert_eq!(
+            s.background_agents[0].status,
+            BackgroundAgentStatus::Running
+        );
+    }
+
+    /// #3900: `Stopped` must clear `turn_active` unconditionally, even while
+    /// a background sub-agent it spawned is still running. `turn_active`
+    /// gates prompt dispatch and the queue drain, not just display; the busy
+    /// *display* signal is the separate `is_visibly_busy`.
+    #[test]
+    fn stopped_clears_turn_active_regardless_of_a_running_background_agent() {
+        let mut s = fresh_state();
+        s.apply_event(Event::UserPromptSent {
+            prompt_id: None,
+            text: "go".into(),
+            attachments: Vec::new(),
+        })
+        .unwrap();
+        s.apply_event(Event::BackgroundAgentLaunched {
+            agent_id: "a1".into(),
+            tool_call_id: "tc1".into(),
+            description: "map backend".into(),
+            prompt: "do the thing".into(),
+            model: "claude-opus-4-8".into(),
+            output_file: "/tmp/a1.output".into(),
+            started_at: Utc::now(),
+        })
+        .unwrap();
+        s.apply_event(Event::Stopped {
+            reason: "prompt_complete".into(),
+        })
+        .unwrap();
+        assert!(
+            !s.turn_active,
+            "turn_active must clear on Stopped so dispatch sends the next prompt \
+             instead of queuing it behind a background agent"
+        );
+        assert!(
+            s.is_visibly_busy(),
+            "the background agent is still running, so the display signal stays busy"
+        );
+
+        s.apply_event(Event::BackgroundAgentCompleted {
+            agent_id: "a1".into(),
+            status: BackgroundAgentStatus::Completed,
+            tools: vec![],
+            result: Some("done".into()),
+            warning: None,
+            ended_at: Utc::now(),
+        })
+        .unwrap();
+        assert!(
+            !s.turn_active,
+            "BackgroundAgentCompleted must not touch turn_active"
+        );
+        assert!(
+            !s.is_visibly_busy(),
+            "the last background agent finished, so the display signal goes idle"
+        );
+    }
+
+    /// A background agent that stalls out (the tailer's own abort timeout,
+    /// not a clean `end_turn`) still reaches `BackgroundAgentCompleted` with
+    /// `ended_at` set. `has_active_background_agent` must treat that as
+    /// terminal like any other completion, not wedge the busy signal on
+    /// forever (#3900 permanent-latch regression).
+    #[test]
+    fn a_stalled_terminal_record_does_not_wedge_the_busy_signal_on() {
+        let mut s = fresh_state();
+        s.apply_event(Event::BackgroundAgentLaunched {
+            agent_id: "a1".into(),
+            tool_call_id: "tc1".into(),
+            description: "map backend".into(),
+            prompt: "do the thing".into(),
+            model: "claude-opus-4-8".into(),
+            output_file: "/tmp/a1.output".into(),
+            started_at: Utc::now(),
+        })
+        .unwrap();
+        assert!(s.has_active_background_agent());
+
+        s.apply_event(Event::BackgroundAgentCompleted {
+            agent_id: "a1".into(),
+            status: BackgroundAgentStatus::Stalled,
+            tools: vec![],
+            result: None,
+            warning: Some("no transcript growth".into()),
+            ended_at: Utc::now(),
+        })
+        .unwrap();
+        assert!(
+            !s.has_active_background_agent(),
+            "a terminal Stalled completion (ended_at set) must not count as active"
+        );
+        assert!(!s.is_visibly_busy());
+    }
+
+    /// A background agent finishing while the main turn is still genuinely
+    /// producing output (its own `Stopped` has not fired yet) must not
+    /// clobber the live turn.
+    #[test]
+    fn background_agent_completion_does_not_clobber_a_live_turn() {
+        let mut s = fresh_state();
+        s.apply_event(Event::UserPromptSent {
+            prompt_id: None,
+            text: "go".into(),
+            attachments: Vec::new(),
+        })
+        .unwrap();
+        s.apply_event(Event::BackgroundAgentLaunched {
+            agent_id: "a1".into(),
+            tool_call_id: "tc1".into(),
+            description: "map backend".into(),
+            prompt: "do the thing".into(),
+            model: "claude-opus-4-8".into(),
+            output_file: "/tmp/a1.output".into(),
+            started_at: Utc::now(),
+        })
+        .unwrap();
+        s.apply_event(Event::BackgroundAgentCompleted {
+            agent_id: "a1".into(),
+            status: BackgroundAgentStatus::Completed,
+            tools: vec![],
+            result: Some("done".into()),
+            warning: None,
+            ended_at: Utc::now(),
+        })
+        .unwrap();
+        assert!(
+            s.turn_active,
+            "the main turn's own Stopped never fired, so it is still live"
+        );
     }
 
     #[test]
