@@ -200,6 +200,10 @@ impl DockerContainer {
         self.runtime.carries_shared_credential_label(&self.name)
     }
 
+    pub fn agent_tool_matches(&self, tool: &str) -> Result<Option<bool>> {
+        self.runtime.agent_tool_matches(&self.name, tool)
+    }
+
     pub fn mount_fingerprint_matches(&self, config: &ContainerConfig) -> Result<Option<bool>> {
         self.runtime
             .mount_fingerprint_matches(&self.name, &config.mount_fingerprint())

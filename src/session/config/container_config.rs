@@ -2773,6 +2773,7 @@ pub(crate) fn build_container_config(
         selinux_relabel: sandbox_config.selinux_relabel,
         identity_publisher_installed,
         shared_credential_mounts,
+        agent_tool: agent_selection.tool.to_string(),
         run_policy: RunPolicy {
             privileged: sandbox_config.privileged,
             cap_add: sandbox_config.cap_add.clone(),
