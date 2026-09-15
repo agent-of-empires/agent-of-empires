@@ -228,6 +228,19 @@ function TableWithScroll({ children, ...rest }: React.ComponentPropsWithoutRef<"
 function ShikiSyntaxHighlighter({ language, code }: SyntaxHighlighterProps) {
   const [html, setHtml] = useState<string | null>(null);
   const shiki = useShikiTheme();
+
+  // Drop stale highlighted markup when the rendered input changes, so a
+  // language-tagged block reused for unfenced text (no language) can't keep
+  // painting the previous block's html. Synced at render time (not in an
+  // effect) to satisfy the set-state-in-effect lint, mirroring
+  // FullFileViewer's syncKey pattern.
+  const inputKey = `${language ?? ""} ${code}`;
+  const [handledKey, setHandledKey] = useState(inputKey);
+  if (inputKey !== handledKey) {
+    setHandledKey(inputKey);
+    setHtml(null);
+  }
+
   useEffect(() => {
     let cancelled = false;
     if (!language) return;

@@ -166,6 +166,31 @@ describe("DiffCommentsUserCard", () => {
     expect(container.querySelector("pre.shiki")?.textContent).toContain("const y = 2;");
   });
 
+  it("clears highlighted output when the same comment slot is reused with an unresolved language (#3974)", async () => {
+    highlighterMock.loaded = true;
+    const { container, rerender } = render(
+      <DiffCommentsUserCard
+        payload={payload({
+          comments: [comment({ id: "c1", capturedSnippet: "const y = 2;", language: "typescript" })],
+        })}
+      />,
+    );
+    await waitFor(() => expect(container.querySelector("pre.shiki")).toBeTruthy());
+
+    highlighterMock.loaded = false;
+    rerender(
+      <DiffCommentsUserCard
+        payload={payload({
+          comments: [comment({ id: "c1", capturedSnippet: "plain text body", language: undefined, filePath: "NOTES" })],
+        })}
+      />,
+    );
+
+    expect(container.querySelector("pre.shiki")).toBeNull();
+    const pre = container.querySelector("pre");
+    expect(pre?.textContent).toBe("plain text body");
+  });
+
   it("renders an empty list with a zero-comment count", () => {
     const { container } = render(<DiffCommentsUserCard payload={payload({ comments: [] })} />);
     expect(container.textContent).toContain("0 comments");
