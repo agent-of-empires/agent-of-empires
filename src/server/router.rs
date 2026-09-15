@@ -184,6 +184,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/plugins/discover", get(api::plugin_discover))
         .route("/api/plugins/details", get(api::plugin_details))
         .route("/api/plugins/{id}/enabled", post(api::set_plugin_enabled))
+        .route(
+            "/api/plugins/{id}/worker/restart",
+            post(api::restart_plugin_worker),
+        )
         .route("/api/plugins/{id}/action", post(api::invoke_plugin_action))
         .route(
             "/api/plugins/{id}/settings/options/resolve",

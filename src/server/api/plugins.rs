@@ -508,10 +508,13 @@ pub async fn apply_plugin_update(
     }
     let plugin_id = id.clone();
     let fingerprint = body.expected_fingerprint;
+    let host = state.plugin_host.clone();
     start_job(state, PluginJobKind::Update, id, move |log| async move {
-        plugin::install::apply_update(&plugin_id, fingerprint, &log)
-            .await
-            .map(|_| ())
+        plugin::install::apply_update(&plugin_id, fingerprint, &log).await?;
+        if let Some(host) = host {
+            host.restart_worker(&plugin_id, &plugin::registry()).await;
+        }
+        Ok(())
     })
 }
 
@@ -579,6 +582,30 @@ pub async fn set_plugin_enabled(
         Ok(Err(e)) => error_response(StatusCode::BAD_REQUEST, "plugin_error", format!("{e:#}")),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
     }
+}
+
+/// `POST /api/plugins/{id}/worker/restart`: reload plugins from disk and
+/// replace this plugin's worker, so an update applied outside the daemon (CLI,
+/// TUI) runs the new build without a daemon restart.
+pub async fn restart_plugin_worker(
+    State(state): State<std::sync::Arc<AppState>>,
+    session: Option<axum::Extension<AuthenticatedSession>>,
+    loopback: Option<axum::Extension<LoopbackTrusted>>,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.is_some()).await {
+        return resp;
+    }
+    let registry = match tokio::task::spawn_blocking(plugin::reload_registry).await {
+        Ok(registry) => registry,
+        Err(e) => {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string())
+        }
+    };
+    if let Some(host) = state.plugin_host.clone() {
+        host.restart_worker(&id, &registry).await;
+    }
+    (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
 }
 
 // Plugin lifecycle jobs: install, update, and uninstall.
