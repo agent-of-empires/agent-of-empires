@@ -98,3 +98,17 @@ export function canOfferEarlier(canRevealLoaded: boolean, hasMoreOlder: boolean)
 export function anchorIsStale(loading: boolean, anchor: number | null, scrollHeight: number): boolean {
   return !loading && anchor != null && anchor === scrollHeight;
 }
+
+/** Id of the newest user-authored row (`user_prompt` or `user_diff_comments`),
+ *  or null when the transcript holds none. StructuredView watches this so a
+ *  freshly submitted prompt re-engages stick-to-bottom, the way the CLI does:
+ *  typing grows the composer, the interim resize scroll flips the pinned
+ *  intent to false (always-sample on fine pointers), and without a re-pin the
+ *  reply then streams below the fold until the user scrolls. */
+export function latestUserPromptId(rows: readonly { id: string; kind: string }[]): string | null {
+  for (let i = rows.length - 1; i >= 0; i -= 1) {
+    const k = rows[i]!.kind;
+    if (k === "user_prompt" || k === "user_diff_comments") return rows[i]!.id;
+  }
+  return null;
+}

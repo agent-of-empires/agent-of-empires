@@ -2493,6 +2493,13 @@
       ]
     },
     {
+      "id": "acp.submit-repins-transcript",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/lib/historyScroll.test.ts"],
+      "components": ["web/src/lib/historyScroll.ts", "web/src/components/acp/StructuredView.tsx"]
+    },
+    {
       "id": "acp.mobile-jump-to-bottom",
       "kind": "mocked-playwright",
       "risk": "medium",

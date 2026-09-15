@@ -33,7 +33,13 @@ import { ApprovalCard } from "./ApprovalCard";
 import { AskUserQuestionCard } from "./AskUserQuestionCard";
 import { AcpFileRefContext } from "./AcpFileRefContext";
 import type { FileRef, FileRefSession } from "../../lib/fileRef";
-import { anchorIsStale, autoLoadDecision, isPinnedToBottom, scrollRestoreDelta } from "../../lib/historyScroll";
+import {
+  anchorIsStale,
+  autoLoadDecision,
+  isPinnedToBottom,
+  latestUserPromptId,
+  scrollRestoreDelta,
+} from "../../lib/historyScroll";
 import { lastClearIndex } from "../../lib/acpHistoryWindow";
 import { loadScrollState, restoredScrollTop, saveScrollState } from "../../lib/acpScrollState";
 import { repinOnResize } from "../../lib/repinOnResize";
@@ -415,17 +421,41 @@ function AcpChrome({
   // Soft-keyboard state, so we can hold the bottom pin across the keyboard
   // open/close animation (see the effect below).
   const { keyboardOpen } = useMobileKeyboard();
-  const scrollToBottom = useCallback(() => {
+  // An explicit "stick again": set the pinned intent directly and re-pin. The
+  // programmatic scroll fires no gesture, so the sampler would not pick it up.
+  const pinToBottom = useCallback((behavior: ScrollBehavior) => {
     const vp = viewportRef.current;
     if (!vp) return;
-    // Tapping the jump-to-bottom button is an explicit "stick again" intent. The
-    // smooth scroll fires no gesture, so the sampler won't pick it up; set the
-    // pinned state directly and re-pin.
     wasAtBottomRef.current = true;
     lastAtBottomAtRef.current = performance.now();
     setAtBottom(true);
-    vp.scrollTo({ top: vp.scrollHeight, behavior: "smooth" });
+    vp.scrollTo({ top: vp.scrollHeight, behavior });
   }, []);
+  // Tapping the jump-to-bottom button.
+  const scrollToBottom = useCallback(() => pinToBottom("smooth"), [pinToBottom]);
+  // A submitted prompt re-engages stick-to-bottom, as the CLI does. Typing
+  // grows the composer; on a fine pointer the interim resize scroll is sampled
+  // as "the user scrolled up" and the pinned intent drops, so the reply to the
+  // prompt just sent streams below the fold. The new user row is the one
+  // signal every submit path shares (composer send, mid-turn steer, queued
+  // delivery, EmptyState pick, retry), so key the re-pin on it rather than on
+  // any one button. The optimistic overlay carries the row from the moment of
+  // the click (same id the server echo later reconciles to, so the echo is not
+  // a second change); the activity leg covers prompts that arrive echoed
+  // without an overlay. The mount pass is skipped: the scroll-state restore
+  // below owns the first pin, and a reader who reopened scrolled up must stay
+  // there.
+  const latestPromptId = latestUserPromptId(state.optimisticRows) ?? latestUserPromptId(state.activity);
+  const seenPromptIdRef = useRef<string | null | undefined>(undefined);
+  useEffect(() => {
+    if (seenPromptIdRef.current === undefined) {
+      seenPromptIdRef.current = latestPromptId;
+      return;
+    }
+    if (latestPromptId === seenPromptIdRef.current) return;
+    seenPromptIdRef.current = latestPromptId;
+    if (latestPromptId !== null) pinToBottom("auto");
+  }, [latestPromptId, pinToBottom]);
   // Stable mirrors so the [] scroll effect always sees the latest
   // load-earlier wiring without re-subscribing. Updated in an effect
   // (not during render) per react-hooks/refs. See #2236.
