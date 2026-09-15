@@ -1015,18 +1015,8 @@ rl.on('line', (line) => {
     async fn restart_worker_replaces_the_running_worker() {
         use crate::session::{update_config, CapabilityGrant, PluginConfig};
 
-        /// Runs after `_env` restores the env, re-taking the env lock so the
-        /// reload never reads a peer test's dirs.
-        struct ReloadRegistryOnDrop;
-        impl Drop for ReloadRegistryOnDrop {
-            fn drop(&mut self) {
-                let _lock = crate::session::test_support::EnvGuard::unset(&[]);
-                crate::plugin::reload_registry();
-            }
-        }
-
         let temp = tempfile::tempdir().unwrap();
-        let _reload = ReloadRegistryOnDrop;
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
         let _env = crate::session::test_support::EnvGuard::set(&[
             ("XDG_CONFIG_HOME", temp.path().to_path_buf()),
             ("HOME", temp.path().to_path_buf()),

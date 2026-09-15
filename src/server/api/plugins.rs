@@ -1018,23 +1018,6 @@ mod tests {
         assert_eq!(content_type_for_icon(std::path::Path::new("a")), None);
     }
 
-    /// Reloads the process-global plugin registry on Drop. Ordered as a field
-    /// AFTER `AppDirEnvGuard::_env` so it runs once the env has been restored
-    /// (matching the pre-consolidation Drop, which reloaded after restoring).
-    struct ReloadRegistryOnDrop;
-
-    impl Drop for ReloadRegistryOnDrop {
-        fn drop(&mut self) {
-            // Re-acquire the process-global env lock (released when the sibling
-            // `_env` field dropped just before this) so the registry reload
-            // reads a HOME/XDG that no peer test is concurrently mutating.
-            // `reload_registry` resolves the app dir from those vars, so an
-            // unlocked reload here could otherwise read a racing test's dirs.
-            let _lock = crate::session::test_support::EnvGuard::unset(&[]);
-            crate::plugin::reload_registry();
-        }
-    }
-
     struct AppDirEnvGuard {
         // Field drop order is load-bearing: `_env` restores HOME / XDG /
         // USERPROFILE (and releases the shared env lock) first, then
@@ -1042,7 +1025,7 @@ mod tests {
         // `_temp` deletes the tempdir. `_env` also holds the process-global
         // env lock for the guard's whole lifetime (issues #2864, #2600).
         _env: crate::session::test_support::EnvGuard,
-        _reload: ReloadRegistryOnDrop,
+        _reload: crate::plugin::ReloadRegistryOnDrop,
         _temp: tempfile::TempDir,
     }
 
@@ -1057,7 +1040,7 @@ mod tests {
             crate::plugin::reload_registry();
             Self {
                 _env: env,
-                _reload: ReloadRegistryOnDrop,
+                _reload: crate::plugin::ReloadRegistryOnDrop,
                 _temp: temp,
             }
         }

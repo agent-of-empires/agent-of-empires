@@ -970,10 +970,9 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     }
 
     // Opt-in clean-only plugin auto-update sweep (off by default). Spawned
-    // non-blocking so daemon startup never waits on git/network; freshly applied
-    // updates are picked up on the next daemon restart. The plugin host (when
-    // running) is passed as the notifier so a consent-needed skip surfaces as a
-    // dashboard notification, not just a log line.
+    // non-blocking so daemon startup never waits on git/network. The plugin host
+    // (when running) is the notifier: it restarts workers onto applied updates
+    // and surfaces consent-needed skips as dashboard notifications.
     let update_notifier = state
         .plugin_host
         .clone()

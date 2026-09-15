@@ -139,11 +139,12 @@ pub async fn set_enabled_live(plugin_id: &str, enabled: bool) -> Result<LiveTogg
 pub enum LiveRestart {
     /// A running daemon reloaded the plugin and replaced its worker.
     Daemon,
-    /// No daemon is running; the next one launches the new build.
+    /// No daemon runs plugin workers (none running, or a read-only one); the
+    /// next daemon launches the new build.
     NoDaemon,
     /// A daemon appears to be running but the request failed (unreachable,
-    /// read-only, auth, or a daemon too old for the endpoint), so its worker
-    /// keeps the previous build until it restarts.
+    /// auth, or a daemon too old for the endpoint), so its worker keeps the
+    /// previous build until it restarts.
     DaemonStale { reason: String },
 }
 
@@ -160,6 +161,7 @@ pub async fn restart_worker_live(plugin_id: &str) -> LiveRestart {
     .await;
     match result {
         Ok(()) => LiveRestart::Daemon,
+        Err(crate::acp::client::HttpError::ReadOnly) => LiveRestart::NoDaemon,
         Err(e) => LiveRestart::DaemonStale {
             reason: format!("{e}"),
         },
