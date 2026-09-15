@@ -5,7 +5,7 @@ use std::fs::{self, File, Permissions};
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use anyhow::{Context, Result};
 
@@ -16,12 +16,18 @@ use crate::session::config::SessionConfig;
 use super::{AgentConfigMount, AGENT_CONFIG_MOUNTS, SANDBOX_PRIVATE_SUBDIR, SANDBOX_SUBDIR};
 
 mod guard;
+mod hermes;
+mod policy;
+use policy::{NativeRule, ReadAccess, StateOrigin};
 pub(super) struct NativeStateBoundary {
     source_root: guard::SourceRoot,
+    origin_root: PathBuf,
     private_stage: guard::PrivateStage,
     stopped_original: Option<PathBuf>,
-    paths: Vec<(PathBuf, bool)>,
-    patterns: Vec<(PathBuf, glob::Pattern)>,
+    paths: Vec<(PathBuf, StateOrigin)>,
+    patterns: Vec<(PathBuf, Arc<NativeRule>, StateOrigin)>,
+    routes: Vec<(PathBuf, PathBuf)>,
+    hermes: hermes::Scopes,
 }
 
 impl NativeStateBoundary {
@@ -29,10 +35,13 @@ impl NativeStateBoundary {
         let private_stage = guard::PrivateStage::new(destination)?;
         Ok(Self {
             source_root: guard::SourceRoot::new(source)?,
+            origin_root: source.to_path_buf(),
             private_stage,
             stopped_original: None,
             paths: Vec::new(),
             patterns: Vec::new(),
+            routes: Vec::new(),
+            hermes: hermes::Scopes::default(),
         })
     }
     #[cfg(test)]
@@ -42,7 +51,11 @@ impl NativeStateBoundary {
         mount: &AgentConfigMount,
     ) -> Result<Self> {
         let mut boundary = Self::for_source(source, destination)?;
-        boundary.add_root(source, mount)?;
+        if mount.tool_name == "hermes" {
+            hermes::register_source(&mut boundary, source)?;
+        } else {
+            boundary.add_root(source, mount)?;
+        }
         Ok(boundary)
     }
     pub(super) fn new(
@@ -53,6 +66,7 @@ impl NativeStateBoundary {
         destination: &Path,
     ) -> Result<Self> {
         let mut boundary = Self::for_source(source, destination)?;
+        boundary.hermes.default_root = Some(canonical_expected_path(&home.join(".hermes"))?);
         for registered in AGENT_CONFIG_MOUNTS {
             boundary.add_root(&home.join(registered.host_rel), registered)?;
         }
@@ -61,11 +75,13 @@ impl NativeStateBoundary {
             let registered = crate::session::config::profile_config::resolve_config(&profile)?;
             boundary.add_declared_roots(&registered.session, home)?;
         }
-        // Declared config roots retain the same native-state exclusions as
-        // defaults; a declaration is not provenance for an existing history.
-        boundary.add_root(source, mount)?;
-        // Kiro's mixed native database is outside its existing .kiro mount.
+        if mount.tool_name == "hermes" {
+            hermes::register_source(&mut boundary, source)?;
+        } else {
+            boundary.add_root(source, mount)?;
+        }
         boundary.add_path(home.join(".local/share/kiro-cli"));
+        boundary.add_path(home.join(".hermes/heapdumps"));
         if let Ok(app_dir) = crate::session::get_app_dir() {
             boundary.add_path(app_dir);
         }
@@ -74,33 +90,52 @@ impl NativeStateBoundary {
         Ok(boundary)
     }
 
-    pub(super) fn for_stopped_original(mut self, host: &Path) -> Self {
-        // Carry every old role's state boundaries into the stopped original,
-        // but only storage ancestors may be traversed under this capability.
+    pub(super) fn for_stopped_original(
+        mut self,
+        host: &Path,
+        mount: &AgentConfigMount,
+    ) -> Result<Self> {
+        self.add_root(host, mount)?;
+        let scopes = hermes::original_scope_map(&mut self, host)?;
+        let mapped_origin = |origin| match origin {
+            StateOrigin::Hermes { scope, marker } => StateOrigin::Hermes {
+                scope: scopes.get(&scope).copied().unwrap_or(scope),
+                marker,
+            },
+            other => other,
+        };
         let mapped_paths: Vec<_> = self
             .paths
             .iter()
-            .filter_map(|(path, storage)| {
-                path.strip_prefix(host)
-                    .ok()
-                    .map(|relative| (self.source_root.path().join(relative), *storage))
+            .filter_map(|(path, origin)| {
+                path.strip_prefix(host).ok().map(|relative| {
+                    (
+                        self.source_root.path().join(relative),
+                        mapped_origin(*origin),
+                    )
+                })
             })
             .collect();
         let mapped_patterns: Vec<_> = self
             .patterns
             .iter()
-            .filter_map(|(root, pattern)| {
-                root.strip_prefix(host)
-                    .ok()
-                    .map(|relative| (self.source_root.path().join(relative), pattern.clone()))
+            .filter_map(|(root, rule, origin)| {
+                root.strip_prefix(host).ok().map(|relative| {
+                    (
+                        self.source_root.path().join(relative),
+                        Arc::clone(rule),
+                        mapped_origin(*origin),
+                    )
+                })
             })
             .collect();
-        for (path, storage) in mapped_paths {
-            self.add_classified_path(path, storage);
+        for (path, origin) in mapped_paths {
+            self.add_classified_path(path, origin);
         }
         self.patterns.extend(mapped_patterns);
+        self.origin_root = host.to_path_buf();
         self.stopped_original = Some(self.source_root.path().to_path_buf());
-        self
+        Ok(self)
     }
     fn add_declared_roots(&mut self, config: &SessionConfig, home: &Path) -> Result<()> {
         for tool in config.agent_config_dir.keys() {
@@ -121,74 +156,127 @@ impl NativeStateBoundary {
         Ok(())
     }
     fn add_root(&mut self, root: &Path, mount: &AgentConfigMount) -> Result<()> {
-        let canonical_root = canonical_expected_path(root)?;
-        if let Some(parent) = canonical_root.parent() {
+        self.add_route(root)?;
+        if mount.tool_name == "hermes" {
+            hermes::register_home(self, root)?;
+            return Ok(());
+        }
+        self.add_storage_root(root)?;
+        for name in mount.native_state_paths {
+            self.add_state_rule(
+                root,
+                Arc::new(NativeRule::new(name, None)?),
+                StateOrigin::Native,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn add_storage_root(&mut self, root: &Path) -> Result<()> {
+        let canonical = canonical_expected_path(root)?;
+        for parent in [root.parent(), canonical.parent()].into_iter().flatten() {
             self.add_classified_path(
                 parent.join(crate::migrations::v030_isolate_sandbox_content::RECOVERY),
-                true,
+                StateOrigin::Storage,
             );
         }
-        for name in [SANDBOX_SUBDIR, SANDBOX_PRIVATE_SUBDIR]
-            .into_iter()
-            .chain(mount.native_state_paths.iter().copied())
-        {
-            if name.contains(['*', '?', '[']) {
-                let pattern = glob::Pattern::new(name)?;
-                let lexical_root = lexical_normalize(root);
-                if lexical_root != canonical_root {
-                    self.patterns.push((lexical_root, pattern.clone()));
+        for name in [SANDBOX_SUBDIR, SANDBOX_PRIVATE_SUBDIR] {
+            self.add_classified_path(root.join(name), StateOrigin::Storage);
+            self.add_classified_path(canonical.join(name), StateOrigin::Storage);
+        }
+        Ok(())
+    }
+
+    fn add_state_rule(
+        &mut self,
+        root: &Path,
+        rule: Arc<NativeRule>,
+        origin: StateOrigin,
+    ) -> Result<()> {
+        let canonical = canonical_expected_path(root)?;
+        let name = rule.pattern.as_str();
+        if name.contains(['*', '?', '[']) {
+            for entry in state_glob(root, name)? {
+                let entry =
+                    entry.context("inspecting a native-state alias before config seeding")?;
+                if entry
+                    .strip_prefix(root)
+                    .is_ok_and(|relative| rule.matches(relative))
+                {
+                    self.add_classified_path(entry, origin);
                 }
-                self.patterns.push((canonical_root.clone(), pattern));
-                for entry in state_glob(root, name)? {
-                    self.add_path(
-                        entry.context("inspecting a native-state alias before config seeding")?,
-                    );
-                }
-            } else {
-                let storage = matches!(name, SANDBOX_SUBDIR | SANDBOX_PRIVATE_SUBDIR);
-                self.add_classified_path(root.join(name), storage);
-                self.add_classified_path(canonical_root.join(name), storage);
             }
+            let lexical = lexical_normalize(root);
+            if lexical != canonical {
+                self.patterns.push((lexical, Arc::clone(&rule), origin));
+            }
+            self.patterns.push((canonical, rule, origin));
+        } else {
+            self.add_classified_path(root.join(name), origin);
+            self.add_classified_path(canonical.join(name), origin);
         }
         Ok(())
     }
 
     fn add_path(&mut self, path: PathBuf) {
-        self.add_classified_path(path, false);
+        self.add_classified_path(path, StateOrigin::Native);
     }
 
-    fn add_classified_path(&mut self, path: PathBuf, storage: bool) {
+    fn add_classified_path(&mut self, path: PathBuf, origin: StateOrigin) {
         if let Ok(canonical) = canonical_expected_path(&path) {
-            self.paths.push((canonical, storage));
+            self.paths.push((canonical, origin));
         }
-        self.paths.push((lexical_normalize(&path), storage));
+        self.paths.push((lexical_normalize(&path), origin));
     }
 
-    fn rejects_path(&self, candidate: &Path, state: &Path, directory: bool, storage: bool) -> bool {
-        let admitted_ancestor = storage
+    /// Pin a declared spelling. Deduplicating native scopes must never drop the
+    /// route the caller declared, or a later retarget of that spelling would go
+    /// unnoticed and its recorded rules would quietly describe another store.
+    fn add_route(&mut self, spelling: &Path) -> Result<()> {
+        if self.routes.iter().any(|(recorded, _)| recorded == spelling) {
+            return Ok(());
+        }
+        let canonical = canonical_expected_path(spelling)?;
+        self.routes.push((spelling.to_path_buf(), canonical));
+        Ok(())
+    }
+
+    fn rejects_path(
+        &self,
+        candidate: &Path,
+        state: &Path,
+        directory: bool,
+        origin: StateOrigin,
+        access: ReadAccess<'_>,
+    ) -> bool {
+        let admitted_ancestor = origin == StateOrigin::Storage
             && self.stopped_original.as_ref().is_some_and(|original| {
                 candidate.starts_with(original) && original.starts_with(state) && original != state
             });
         !admitted_ancestor
             && (candidate.starts_with(state) || (directory && state.starts_with(candidate)))
+            && !access.allows(candidate, state, directory, origin)
     }
 
-    fn rejects(&self, candidate: &Path, directory: bool) -> bool {
+    fn rejects(&self, candidate: &Path, directory: bool, access: ReadAccess<'_>) -> bool {
         self.paths
             .iter()
-            .any(|(state, storage)| self.rejects_path(candidate, state, directory, *storage))
-            || self.patterns.iter().any(|(root, pattern)| {
+            .any(|(state, origin)| self.rejects_path(candidate, state, directory, *origin, access))
+            || self.patterns.iter().any(|(root, rule, origin)| {
                 candidate.strip_prefix(root).is_ok_and(|relative| {
                     relative.ancestors().any(|ancestor| {
-                        pattern.matches_path_with(
-                            ancestor,
-                            glob::MatchOptions {
-                                require_literal_separator: true,
-                                ..glob::MatchOptions::new()
-                            },
-                        )
+                        rule.matches(ancestor)
+                            && self.rejects_path(
+                                candidate,
+                                &root.join(ancestor),
+                                directory,
+                                *origin,
+                                access,
+                            )
                     })
-                }) || (directory && root.starts_with(candidate))
+                }) || (directory
+                    && root.starts_with(candidate)
+                    && self.rejects_path(candidate, root, true, *origin, access))
             })
     }
 }
@@ -202,12 +290,23 @@ fn canonical_expected_path(path: &Path) -> std::io::Result<PathBuf> {
     match fs::canonicalize(path) {
         Ok(canonical) => Ok(canonical),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let Some(parent) = path.parent() else {
-                return Err(error);
-            };
-            let Some(leaf) = path.file_name() else {
-                return Err(error);
-            };
+            let parent = path
+                .parent()
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+            match fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    let target = fs::read_link(path)?;
+                    return canonical_expected_path(&if target.is_absolute() {
+                        target
+                    } else {
+                        parent.join(target)
+                    });
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            let leaf = path.file_name().ok_or(error)?;
             Ok(canonical_expected_path(parent)?.join(leaf))
         }
         Err(error) => Err(error),
@@ -228,19 +327,20 @@ fn canonical_source(
     path: &Path,
     boundary: &NativeStateBoundary,
     directory: bool,
+    access: ReadAccess<'_>,
 ) -> Result<Option<PathBuf>> {
     let canonical = match fs::canonicalize(path) {
         Ok(path) => path,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             tracing::warn!(target: "session.profile", path = %path.display(), %error,
-                "Skipping unreadable configuration source");
+            "Skipping unreadable configuration source");
             return Ok(None);
         }
     };
-    if boundary.rejects(&canonical, directory) {
+    if boundary.rejects(&canonical, directory, access) {
         tracing::warn!(target: "session.profile", path = %path.display(),
-            "Skipping configuration resource overlapping native session state");
+        "Skipping configuration resource overlapping native session state");
         return Ok(None);
     }
     Ok(Some(canonical))
@@ -275,27 +375,39 @@ fn publish_source_file(
     leaf: &Path,
     boundary: &NativeStateBoundary,
     replace: bool,
+    access: ReadAccess<'_>,
 ) -> Result<bool> {
-    let Some(canonical) = canonical_source(path, boundary, false)? else {
+    let Some(canonical) = canonical_source(path, boundary, false, access)? else {
         return Ok(false);
     };
     let Some(mut file) = open_canonical_file(&canonical)? else {
         return Ok(false);
     };
-    let mut guard = guard::ReadGuard::new(boundary)?;
+    let mut guard = guard::ReadGuard::new(boundary, access)?;
+    guard.record_route(path, &canonical)?;
     if !guard.record_file(&canonical, &file)? {
         return Ok(false);
     }
-    let private = &boundary.private_stage;
-    let validate = || guard.validate();
     let permissions = file.metadata()?.permissions();
+    publish_guarded_file(&mut file, &guard, destination, leaf, permissions, replace)
+}
+
+fn publish_guarded_file(
+    file: &mut File,
+    guard: &guard::ReadGuard<'_>,
+    destination: &AnchoredDir,
+    leaf: &Path,
+    permissions: Permissions,
+    replace: bool,
+) -> Result<bool> {
+    let validate = || guard.validate();
     destination.publish_file(
         leaf,
-        &mut file,
+        file,
         permissions,
         replace,
         Some(crate::session::anchored_fs::FilePublication {
-            staging: &private.anchor,
+            staging: &guard.boundary.private_stage.anchor,
             validate: &validate,
         }),
     )
@@ -334,7 +446,14 @@ pub(super) fn sync_agent_config(
         if preserve && parent.regular_lookup(leaf)?.is_some() {
             continue;
         }
-        publish_source_file(&host_dir.join(relative), &parent, leaf, boundary, !preserve)?;
+        publish_source_file(
+            &host_dir.join(relative),
+            &parent,
+            leaf,
+            boundary,
+            !preserve,
+            ReadAccess::default(),
+        )?;
     }
     for &name in copy_dirs {
         let relative = Path::new(name);
@@ -344,7 +463,14 @@ pub(super) fn sync_agent_config(
                 .file_name()
                 .context("resource directory has no leaf")?,
         );
-        seed_directory(&host_dir.join(relative), &parent, leaf, boundary, true)?;
+        seed_directory(
+            &host_dir.join(relative),
+            &parent,
+            leaf,
+            boundary,
+            true,
+            ReadAccess::default(),
+        )?;
     }
     Ok(())
 }
@@ -355,13 +481,15 @@ fn seed_directory(
     leaf: &Path,
     boundary: &NativeStateBoundary,
     discovery_links: bool,
+    access: ReadAccess<'_>,
 ) -> Result<()> {
     if destination.regular_lookup(leaf)?.is_some() {
         return Ok(());
     }
-    let Some(canonical) = canonical_source(source, boundary, true)? else {
+    let Some(canonical) = canonical_source(source, boundary, true, access)? else {
         return Ok(());
     };
+    let lookup = source;
     let source = match open_canonical_dir(&canonical) {
         Ok(source) => source,
         Err(error) => {
@@ -370,9 +498,10 @@ fn seed_directory(
         }
     };
     let mut copy = ResourceCopy {
-        guard: guard::ReadGuard::new(boundary)?,
+        guard: guard::ReadGuard::new(boundary, access)?,
         ancestors: HashSet::new(),
     };
+    copy.guard.record_route(lookup, &canonical)?;
     copy.guard.record_directory(&source)?;
     let entries = match source.read_dir(Path::new(""), usize::MAX) {
         Ok(entries) => entries,
@@ -419,9 +548,12 @@ impl ResourceCopy<'_> {
         for name in entries {
             let input = relative.join(&name);
             let spelling = source.path().join(&input);
-            let Some(canonical) = canonical_source(&spelling, self.guard.boundary, false)? else {
+            let Some(canonical) =
+                canonical_source(&spelling, self.guard.boundary, false, self.guard.access)?
+            else {
                 continue;
             };
+            self.guard.record_route(&spelling, &canonical)?;
             let within = match canonical.strip_prefix(source.path()) {
                 Ok(within) => within,
                 Err(_) => {
@@ -453,7 +585,11 @@ impl ResourceCopy<'_> {
                     continue;
                 }
             }
-            if self.guard.boundary.rejects(&canonical, true) {
+            if self
+                .guard
+                .boundary
+                .rejects(&canonical, true, self.guard.access)
+            {
                 continue;
             }
             let child = match source.child(within) {
@@ -478,7 +614,7 @@ impl ResourceCopy<'_> {
             };
             let target = destination.create_child(Path::new(&name))?;
             self.entries(source, within, &target, children, false)?;
-            target.sync()?;
+            publish_or_prune(&target, destination, Path::new(&name))?;
             self.ancestors.remove(&identity);
         }
         Ok(())
@@ -495,7 +631,11 @@ impl ResourceCopy<'_> {
                 let permissions = file.metadata()?.permissions();
                 destination.publish_file(leaf, &mut file, permissions, false, None)?;
             }
-        } else if !self.guard.boundary.rejects(canonical, true) {
+        } else if !self
+            .guard
+            .boundary
+            .rejects(canonical, true, self.guard.access)
+        {
             let source = open_canonical_dir(canonical)?;
             let identity = source.identity()?;
             if !self.ancestors.insert(identity) {
@@ -505,11 +645,22 @@ impl ResourceCopy<'_> {
             let entries = source.read_dir(Path::new(""), usize::MAX)?;
             let target = destination.create_child(leaf)?;
             self.entries(&source, Path::new(""), &target, entries, false)?;
-            target.sync()?;
+            publish_or_prune(&target, destination, leaf)?;
             self.ancestors.remove(&identity);
         }
         Ok(())
     }
+}
+
+/// Publish a copied subtree, or drop it when nothing crossed. A directory
+/// whose every entry was native state carries only a state name, and the
+/// sandbox must not learn that name.
+fn publish_or_prune(target: &AnchoredDir, destination: &AnchoredDir, leaf: &Path) -> Result<()> {
+    if target.read_dir(Path::new(""), 1)?.is_empty() {
+        destination.remove_staged_dir(leaf)?;
+        return Ok(());
+    }
+    target.sync()
 }
 
 /// Both public credential paths remain unreadable until the complete pair's
@@ -521,6 +672,7 @@ pub(super) fn seed_credential_pairs(
     pairs: &[(&str, &str)],
     boundary: &NativeStateBoundary,
 ) -> Result<()> {
+    let access = ReadAccess::default();
     if pairs.is_empty() {
         return Ok(());
     }
@@ -553,10 +705,22 @@ pub(super) fn seed_credential_pairs(
         if local {
             continue;
         }
-        let Some(data_path) = canonical_source(&source.join(data_name), boundary, false)? else {
+        let Some(data_path) = canonical_source(
+            &source.join(data_name),
+            boundary,
+            false,
+            ReadAccess::default(),
+        )?
+        else {
             continue;
         };
-        let Some(key_path) = canonical_source(&source.join(key_name), boundary, false)? else {
+        let Some(key_path) = canonical_source(
+            &source.join(key_name),
+            boundary,
+            false,
+            ReadAccess::default(),
+        )?
+        else {
             continue;
         };
         let Some(mut data) = open_canonical_file(&data_path)? else {
@@ -565,7 +729,9 @@ pub(super) fn seed_credential_pairs(
         let Some(mut key) = open_canonical_file(&key_path)? else {
             continue;
         };
-        let mut guard = guard::ReadGuard::new(boundary)?;
+        let mut guard = guard::ReadGuard::new(boundary, access)?;
+        guard.record_route(&source.join(data_name), &data_path)?;
+        guard.record_route(&source.join(key_name), &key_path)?;
         if !guard.record_file(&data_path, &data)? || !guard.record_file(&key_path, &key)? {
             continue;
         }
@@ -624,7 +790,9 @@ pub(super) fn seed_sqlite_files(
         if parent.regular_lookup(leaf)?.is_some() {
             continue;
         }
-        if let Some(snapshot) = snapshot_config_database(&source.join(relative), boundary)? {
+        if let Some(snapshot) =
+            snapshot_config_database(&source.join(relative), boundary, ReadAccess::default())?
+        {
             snapshot.publish(&parent, leaf)?;
         }
     }
@@ -660,15 +828,16 @@ impl ConfigSnapshot<'_> {
 fn snapshot_config_database<'a>(
     path: &Path,
     boundary: &'a NativeStateBoundary,
+    access: ReadAccess<'a>,
 ) -> Result<Option<ConfigSnapshot<'a>>> {
-    let Some(canonical) = canonical_source(path, boundary, false)? else {
+    let Some(canonical) = canonical_source(path, boundary, false, access)? else {
         return Ok(None);
     };
     let private = &boundary.private_stage;
     let directory = private
         .anchor
         .create_child(Path::new(&format!(".sqlite-{}", uuid::Uuid::new_v4())))?;
-    let mut guard = guard::ReadGuard::new(boundary)?;
+    let mut guard = guard::ReadGuard::new(boundary, access)?;
     for suffix in ["", "-wal"] {
         let mut spelling = canonical.as_os_str().to_os_string();
         spelling.push(suffix);
@@ -680,12 +849,13 @@ fn snapshot_config_database<'a>(
             }
             Err(error) => return Err(error).context("inspecting native SQLite source"),
         }
-        let Some(input) = canonical_source(&spelling, boundary, false)? else {
+        let Some(input) = canonical_source(&spelling, boundary, false, access)? else {
             return Ok(None);
         };
         let Some(mut file) = open_canonical_file(&input)? else {
             anyhow::bail!("native SQLite source is not a readable regular file");
         };
+        guard.record_route(if suffix.is_empty() { path } else { &spelling }, &input)?;
         if !guard.record_file(&input, &file)? {
             return Ok(None);
         }
@@ -873,6 +1043,24 @@ pub(super) fn seed_configured_resources(
                 }
             }
         }
+        "hermes" => {
+            // Native Hermes configuration lives beside conversation state, so
+            // only the declared projections and authored collections cross.
+            if let Some(scope) = boundary.hermes.source {
+                let retained =
+                    hermes::seed_skills(boundary, scope, &boundary.source_root, &destination)?;
+                hermes::seed_plugins(boundary, scope, &boundary.source_root, &destination)?;
+                hermes::seed_nodes(boundary, scope, &boundary.source_root, &destination)?;
+                hermes::seed_projects(boundary, scope, &boundary.source_root, &destination)?;
+                hermes::seed_skill_controls(
+                    boundary,
+                    scope,
+                    &boundary.source_root,
+                    &destination,
+                    &retained,
+                )?;
+            }
+        }
         "claude" => {
             resources.follow_file_imports(Path::new("CLAUDE.md"), 0, &mut HashSet::new())?
         }
@@ -963,8 +1151,23 @@ impl ResourceSeed<'_> {
             return Ok(());
         }
         let input = self.source.join(relative);
-        if !publish_source_file(&input, &parent, leaf, self.boundary, false)? && directory_allowed {
-            seed_directory(&input, &parent, leaf, self.boundary, false)?;
+        if !publish_source_file(
+            &input,
+            &parent,
+            leaf,
+            self.boundary,
+            false,
+            ReadAccess::default(),
+        )? && directory_allowed
+        {
+            seed_directory(
+                &input,
+                &parent,
+                leaf,
+                self.boundary,
+                false,
+                ReadAccess::default(),
+            )?;
         }
         Ok(())
     }
@@ -1102,6 +1305,164 @@ mod tests {
         );
         assert_eq!(fs::read(history).unwrap(), b"FOREIGN_NATIVE_CONTEXT");
     }
+    #[test]
+    fn a_dangling_native_directory_alias_cannot_export_state_names() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let active = temporary.path().join("active");
+        let native = temporary.path().join("native-home");
+        fs::create_dir_all(source.join("plugins")).unwrap();
+        fs::create_dir_all(&active).unwrap();
+        fs::create_dir_all(&native).unwrap();
+        std::os::unix::fs::symlink(source.join("plugins/native-state"), native.join("sessions"))
+            .unwrap();
+        let mut boundary = NativeStateBoundary::for_source(&source, &active).unwrap();
+        let mount = AGENT_CONFIG_MOUNTS
+            .iter()
+            .find(|mount| mount.tool_name == "hermes")
+            .unwrap();
+        boundary.add_root(&native, mount).unwrap();
+        fs::create_dir_all(source.join("plugins/native-state/PRIVATE_SESSION_TITLE")).unwrap();
+        fs::write(
+            source.join("plugins/native-state/PRIVATE_SESSION_TITLE/transcript.jsonl"),
+            b"PRIVATE_NATIVE_CONTEXT",
+        )
+        .unwrap();
+        seed_directory(
+            &source.join("plugins"),
+            &AnchoredDir::open(&active).unwrap(),
+            Path::new("plugins"),
+            &boundary,
+            true,
+            ReadAccess::default(),
+        )
+        .unwrap();
+        assert!(
+            !active.join("plugins").exists(),
+            "a resource overlapping a native state directory must not export even its names"
+        );
+    }
+
+    #[test]
+    fn a_descendant_state_alias_change_blocks_publication() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let native = temporary.path().join("native");
+        let external = temporary.path().join("external");
+        let active = temporary.path().join("active");
+        for path in [&source, &external, &active] {
+            fs::create_dir(path).unwrap();
+        }
+        fs::create_dir_all(native.join("sessions")).unwrap();
+        let input = source.join("auth.json");
+        fs::write(&input, b"BECOMES_NATIVE_HISTORY").unwrap();
+        fs::hard_link(&input, external.join("candidate")).unwrap();
+        fs::write(external.join("benign"), b"other state").unwrap();
+        std::os::unix::fs::symlink("benign", external.join("alias")).unwrap();
+        std::os::unix::fs::symlink(external.join("alias"), native.join("sessions/ref")).unwrap();
+        fs::write(active.join("auth.json"), b"LOCAL_AUTH").unwrap();
+        let mut boundary = NativeStateBoundary::for_source(&source, &active).unwrap();
+        let mount = AGENT_CONFIG_MOUNTS
+            .iter()
+            .find(|mount| mount.tool_name == "hermes")
+            .unwrap();
+        boundary.add_root(&native, mount).unwrap();
+        let mut guard = guard::ReadGuard::new(&boundary, ReadAccess::default()).unwrap();
+        let mut file = open_canonical_file(&input).unwrap().unwrap();
+        assert!(guard.record_file(&input, &file).unwrap());
+        fs::remove_file(external.join("alias")).unwrap();
+        std::os::unix::fs::symlink("candidate", external.join("alias")).unwrap();
+        let result = publish_guarded_file(
+            &mut file,
+            &guard,
+            &AnchoredDir::open(&active).unwrap(),
+            Path::new("auth.json"),
+            Permissions::from_mode(0o600),
+            true,
+        );
+        assert!(
+            result.is_err(),
+            "a newly forbidden inode must not be published through the cached inventory"
+        );
+        assert_eq!(fs::read(active.join("auth.json")).unwrap(), b"LOCAL_AUTH");
+    }
+
+    #[test]
+    fn a_deduplicated_declared_home_alias_keeps_its_epoch() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let native = temporary.path().join("native");
+        let other = temporary.path().join("other");
+        let alias = temporary.path().join("declared");
+        let active = temporary.path().join("active");
+        for path in [&source, &native, &active] {
+            fs::create_dir(path).unwrap();
+        }
+        fs::create_dir_all(other.join("sessions")).unwrap();
+        let input = source.join("auth.json");
+        fs::write(&input, b"BECOMES_DECLARED_NATIVE_HISTORY").unwrap();
+        fs::hard_link(&input, other.join("sessions/foreign")).unwrap();
+        std::os::unix::fs::symlink(&native, &alias).unwrap();
+        fs::write(active.join("auth.json"), b"LOCAL_AUTH").unwrap();
+        let mut boundary = NativeStateBoundary::for_source(&source, &active).unwrap();
+        let mount = AGENT_CONFIG_MOUNTS
+            .iter()
+            .find(|mount| mount.tool_name == "hermes")
+            .unwrap();
+        boundary.add_root(&native, mount).unwrap();
+        boundary.add_root(&alias, mount).unwrap();
+        fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&other, &alias).unwrap();
+        let result = publish_source_file(
+            &input,
+            &AnchoredDir::open(&active).unwrap(),
+            Path::new("auth.json"),
+            &boundary,
+            true,
+            ReadAccess::default(),
+        );
+        assert!(
+            result.is_err(),
+            "deduplicated native scope rules must not discard the declared route"
+        );
+        assert_eq!(fs::read(active.join("auth.json")).unwrap(), b"LOCAL_AUTH");
+    }
+
+    #[test]
+    fn a_stopped_original_does_not_exempt_its_nested_private_stores() {
+        let temporary = tempfile::tempdir().unwrap();
+        let host = temporary.path().join("host");
+        let original = temporary
+            .path()
+            .join(".aoe-sandbox-recovery/receipt/original");
+        let active = temporary.path().join("active");
+        fs::create_dir(&host).unwrap();
+        fs::create_dir(&active).unwrap();
+        let nested = original.join(SANDBOX_PRIVATE_SUBDIR).join("other");
+        fs::create_dir_all(nested.join("sessions")).unwrap();
+        let input = original.join("auth.json");
+        fs::write(&input, b"OTHER_INSTANCE_CONTEXT").unwrap();
+        fs::hard_link(&input, nested.join("sessions/foreign.json")).unwrap();
+        let mount = AGENT_CONFIG_MOUNTS
+            .iter()
+            .find(|mount| mount.tool_name == "hermes")
+            .unwrap();
+        let boundary = NativeStateBoundary::for_fixture(&original, &active, mount)
+            .unwrap()
+            .for_stopped_original(&host, mount)
+            .unwrap();
+        let published = publish_source_file(
+            &input,
+            &AnchoredDir::open(&active).unwrap(),
+            Path::new("auth.json"),
+            &boundary,
+            false,
+            ReadAccess::default(),
+        )
+        .unwrap();
+        assert!(!published, "waiving the retained original's storage ancestor must not waive nested other-instance stores");
+        assert!(!active.join("auth.json").exists());
+    }
 
     #[test]
     fn directory_publication_filters_state_hardlinks_under_literal_root_names() {
@@ -1133,6 +1494,7 @@ mod tests {
             Path::new("plugins"),
             &boundary,
             true,
+            ReadAccess::default(),
         )
         .unwrap();
         assert_eq!(
@@ -1163,7 +1525,7 @@ mod tests {
             .find(|mount| mount.tool_name == "hermes")
             .unwrap();
         boundary.add_root(&native, mount).unwrap();
-        let mut guard = guard::ReadGuard::new(&boundary).unwrap();
+        let mut guard = guard::ReadGuard::new(&boundary, ReadAccess::default()).unwrap();
         let mut file = open_canonical_file(&input).unwrap().unwrap();
         assert!(guard.record_file(&input, &file).unwrap());
         let output = AnchoredDir::open(&active).unwrap();

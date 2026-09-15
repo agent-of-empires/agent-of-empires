@@ -7,8 +7,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
-use super::{canonical_expected_path, NativeStateBoundary};
+use super::{canonical_expected_path, NativeStateBoundary, ReadAccess, StateOrigin};
 use crate::session::anchored_fs::AnchoredDir;
+
+mod inventory;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Fingerprint {
@@ -60,7 +62,7 @@ impl SourceRoot {
         self.anchor.path()
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(super) fn validate(&self) -> Result<()> {
         if fs::canonicalize(&self.lookup)? != self.anchor.path()
             || Fingerprint::from(&fs::metadata(&self.lookup)?) != self.fingerprint
         {
@@ -83,11 +85,11 @@ impl PrivateStage {
         let temporary = tempfile::Builder::new()
             .prefix(".aoe-config-stage-")
             .tempdir_in(parent)?;
-        let anchor = AnchoredDir::open(temporary.path())?;
-        Ok(Self {
-            path: temporary.keep(),
-            anchor,
-        })
+        // Native-state routes are compared in canonical spelling, so pin the
+        // resolved spelling of the stage instead of the lexical one.
+        let path = fs::canonicalize(temporary.keep())?;
+        let anchor = AnchoredDir::open(&path)?;
+        Ok(Self { path, anchor })
     }
 }
 
@@ -103,7 +105,8 @@ impl Drop for PrivateStage {
 
 pub(super) struct ReadGuard<'a> {
     pub(super) boundary: &'a NativeStateBoundary,
-    aliases: Vec<(PathBuf, bool)>,
+    pub(super) access: ReadAccess<'a>,
+    aliases: Vec<(PathBuf, StateOrigin)>,
     routes: Vec<(PathBuf, PathBuf)>,
     directories: BTreeMap<PathBuf, Fingerprint>,
     files: BTreeMap<PathBuf, Fingerprint>,
@@ -112,10 +115,13 @@ pub(super) struct ReadGuard<'a> {
 }
 
 impl<'a> ReadGuard<'a> {
-    pub(super) fn new(boundary: &'a NativeStateBoundary) -> Result<Self> {
+    pub(super) fn new(boundary: &'a NativeStateBoundary, access: ReadAccess<'a>) -> Result<Self> {
         boundary.source_root.validate()?;
+        boundary.hermes.validate()?;
+        access.validate()?;
         let mut guard = Self {
             boundary,
+            access,
             aliases: Vec::new(),
             routes: Vec::new(),
             directories: BTreeMap::new(),
@@ -123,15 +129,17 @@ impl<'a> ReadGuard<'a> {
             state_inodes: None,
             entries: BTreeMap::new(),
         };
-        for (path, storage) in &boundary.paths {
-            guard.add_alias(path, *storage)?;
+        for (path, origin) in &boundary.paths {
+            guard.add_alias(path, *origin)?;
         }
-        for (root, pattern) in &boundary.patterns {
-            // Seal every actual directory prefix used by glob expansion. A new
-            // intermediate directory or symlink must invalidate this snapshot.
-            for ancestor in Path::new(pattern.as_str()).ancestors().skip(1) {
+        for (spelling, expected) in &boundary.routes {
+            watch_entry(&mut guard.entries, spelling)?;
+            guard.routes.push((spelling.clone(), expected.clone()));
+        }
+        for (root, rule, origin) in &boundary.patterns {
+            for ancestor in Path::new(rule.pattern.as_str()).ancestors().skip(1) {
                 let prefix = root.join(ancestor);
-                guard.watch_entry(&prefix)?;
+                watch_entry(&mut guard.entries, &prefix)?;
                 for entry in super::state_glob(
                     root,
                     ancestor
@@ -140,104 +148,79 @@ impl<'a> ReadGuard<'a> {
                 )? {
                     let path = entry.context("inspecting native-state pattern parent")?;
                     if path.is_dir() {
-                        guard.seal_directory(&path)?;
+                        seal_directory(&mut guard.directories, &path)?;
                     }
                 }
             }
-            for entry in super::state_glob(root, pattern.as_str())? {
-                guard.add_alias(&entry.context("inspecting native-state pattern")?, false)?;
+            for entry in super::state_glob(root, rule.pattern.as_str())? {
+                let entry = entry.context("inspecting native-state pattern")?;
+                if entry
+                    .strip_prefix(root)
+                    .is_ok_and(|relative| rule.matches(relative))
+                {
+                    guard.add_alias(&entry, *origin)?;
+                }
             }
         }
         Ok(guard)
     }
 
-    fn add_alias(&mut self, path: &Path, storage: bool) -> Result<()> {
-        self.watch_entry(path)?;
+    fn add_alias(&mut self, path: &Path, origin: StateOrigin) -> Result<()> {
+        watch_entry(&mut self.entries, path)?;
         let canonical = canonical_expected_path(path)
             .with_context(|| format!("resolving native-state boundary {}", path.display()))?;
         self.routes.push((path.to_path_buf(), canonical.clone()));
-        self.aliases.push((canonical, storage));
+        self.aliases.push((canonical, origin));
         Ok(())
     }
 
-    fn watch_entry(&mut self, path: &Path) -> Result<()> {
-        // Watch the relevant entry or first missing component, not the mtime of
-        // an unrelated ancestor such as /tmp or HOME.
-        let mut cursor = Some(path);
-        let mut missing = None;
-        while let Some(candidate) = cursor {
-            match fs::symlink_metadata(candidate) {
-                Ok(metadata) => {
-                    self.entries.entry(candidate.to_path_buf()).or_insert(Some((
-                        metadata.dev(),
-                        metadata.ino(),
-                        metadata.mode(),
-                    )));
-                    if let Some(missing) = missing {
-                        self.entries.entry(missing).or_insert(None);
-                    }
-                    return Ok(());
-                }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                    ) =>
-                {
-                    missing = Some(candidate.to_path_buf());
-                    cursor = candidate.parent();
-                }
-                Err(error) => return Err(error).context("inspecting native-state namespace entry"),
-            }
+    pub(super) fn record_route(&mut self, lookup: &Path, canonical: &Path) -> Result<()> {
+        if fs::canonicalize(lookup)? != canonical {
+            bail!("configuration source alias changed before reading");
         }
-        bail!("native-state boundary has no existing ancestor")
-    }
-
-    fn seal_directory(&mut self, path: &Path) -> Result<()> {
-        let metadata = fs::metadata(path)?;
-        if !metadata.is_dir() {
-            bail!("native-state directory changed type");
+        if lookup != canonical {
+            self.routes
+                .push((lookup.to_path_buf(), canonical.to_path_buf()));
         }
-        self.directories
-            .entry(path.to_path_buf())
-            .or_insert_with(|| Fingerprint::from(&metadata));
         Ok(())
     }
 
     pub(super) fn record_directory(&mut self, directory: &AnchoredDir) -> Result<()> {
-        let metadata = fs::metadata(directory.path())?;
-        let (device, inode) = directory.identity()?;
-        #[cfg(target_os = "macos")]
-        let device = device as u64;
-        if metadata.dev() != device || metadata.ino() != inode {
-            bail!("configuration source directory changed before reading");
+        if self.aliases.iter().any(|(state, origin)| {
+            self.boundary
+                .rejects_path(directory.path(), state, true, *origin, self.access)
+        }) {
+            bail!("configuration resource overlaps native state after source resolution");
         }
-        self.seal_directory(directory.path())
+        pin_anchored_directory(&mut self.directories, directory)
+    }
+
+    pub(super) fn pin_directory(&mut self, directory: &AnchoredDir) -> Result<()> {
+        pin_anchored_directory(&mut self.directories, directory)
     }
 
     pub(super) fn record_file(&mut self, path: &Path, file: &File) -> Result<bool> {
         let metadata = file.metadata()?;
-        if self
-            .aliases
-            .iter()
-            .any(|(state, storage)| self.boundary.rejects_path(path, state, false, *storage))
-        {
+        if self.aliases.iter().any(|(state, origin)| {
+            self.boundary
+                .rejects_path(path, state, false, *origin, self.access)
+        }) {
             return Ok(false);
         }
         let fingerprint = Fingerprint::from(&metadata);
         if metadata.nlink() > 1 {
             if self.state_inodes.is_none() {
                 let mut inodes = HashSet::new();
-                let mut visited = HashSet::new();
-                for (path, storage) in &self.aliases {
-                    Self::inventory(
+                for (state, origin) in &self.aliases {
+                    let mut walk = inventory::Inventory::new(
                         self.boundary,
+                        self.access,
                         &mut self.directories,
-                        path,
-                        *storage,
-                        &mut visited,
-                        &mut inodes,
-                    )?;
+                        &mut self.routes,
+                        &mut self.entries,
+                    );
+                    walk.root(state, *origin)?;
+                    inodes.extend(walk.finish());
                 }
                 self.state_inodes = Some(inodes);
             }
@@ -257,55 +240,12 @@ impl<'a> ReadGuard<'a> {
         } else {
             self.files.insert(path.to_path_buf(), fingerprint);
         }
-        self.seal_directory(
+        seal_directory(
+            &mut self.directories,
             path.parent()
                 .context("configuration source has no parent")?,
         )?;
         Ok(true)
-    }
-
-    fn inventory(
-        boundary: &NativeStateBoundary,
-        directories: &mut BTreeMap<PathBuf, Fingerprint>,
-        path: &Path,
-        storage: bool,
-        visited: &mut HashSet<(u64, u64, bool)>,
-        inodes: &mut HashSet<(u64, u64)>,
-    ) -> Result<()> {
-        if storage
-            && (boundary
-                .stopped_original
-                .as_ref()
-                .is_some_and(|original| path.starts_with(original))
-                || path.starts_with(&boundary.private_stage.path))
-        {
-            return Ok(());
-        }
-        let metadata = match fs::metadata(path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error).context("inventorying native-state hardlinks"),
-        };
-        if metadata.is_file() {
-            if metadata.nlink() > 1 {
-                inodes.insert((metadata.dev(), metadata.ino()));
-            }
-        } else if metadata.is_dir() && visited.insert((metadata.dev(), metadata.ino(), storage)) {
-            directories
-                .entry(path.to_path_buf())
-                .or_insert_with(|| Fingerprint::from(&metadata));
-            for entry in fs::read_dir(path)? {
-                Self::inventory(
-                    boundary,
-                    directories,
-                    &entry?.path(),
-                    storage,
-                    visited,
-                    inodes,
-                )?;
-            }
-        }
-        Ok(())
     }
 
     pub(super) fn validate(&self) -> Result<()> {
@@ -327,6 +267,8 @@ impl<'a> ReadGuard<'a> {
             }
         }
         self.boundary.source_root.validate()?;
+        self.boundary.hermes.validate()?;
+        self.access.validate()?;
         for (path, expected) in &self.routes {
             if canonical_expected_path(path)? != *expected {
                 bail!("native-state boundary changed during configuration seeding");
@@ -342,4 +284,65 @@ impl<'a> ReadGuard<'a> {
         }
         Ok(())
     }
+}
+
+fn watch_entry(
+    entries: &mut BTreeMap<PathBuf, Option<(u64, u64, u32)>>,
+    path: &Path,
+) -> Result<()> {
+    // Watch the relevant entry or first missing component, not the mtime of
+    // an unrelated ancestor such as /tmp or HOME.
+    let mut cursor = Some(path);
+    let mut missing = None;
+    while let Some(candidate) = cursor {
+        match fs::symlink_metadata(candidate) {
+            Ok(metadata) => {
+                entries.entry(candidate.to_path_buf()).or_insert(Some((
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.mode(),
+                )));
+                if let Some(missing) = missing {
+                    entries.entry(missing).or_insert(None);
+                }
+                return Ok(());
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                missing = Some(candidate.to_path_buf());
+                cursor = candidate.parent();
+            }
+            Err(error) => return Err(error).context("inspecting native-state namespace entry"),
+        }
+    }
+    bail!("native-state boundary has no existing ancestor")
+}
+
+fn seal_directory(directories: &mut BTreeMap<PathBuf, Fingerprint>, path: &Path) -> Result<()> {
+    let metadata = fs::metadata(path)?;
+    if !metadata.is_dir() {
+        bail!("native-state directory changed type");
+    }
+    directories
+        .entry(path.to_path_buf())
+        .or_insert_with(|| Fingerprint::from(&metadata));
+    Ok(())
+}
+
+fn pin_anchored_directory(
+    directories: &mut BTreeMap<PathBuf, Fingerprint>,
+    directory: &AnchoredDir,
+) -> Result<()> {
+    let metadata = fs::metadata(directory.path())?;
+    let (device, inode) = directory.identity()?;
+    #[cfg(target_os = "macos")]
+    let device = device as u64;
+    if metadata.dev() != device || metadata.ino() != inode {
+        bail!("configuration source directory changed before reading");
+    }
+    seal_directory(directories, directory.path())
 }

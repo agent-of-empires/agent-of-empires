@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use nix::dir::Dir;
 use nix::errno::Errno;
 use nix::fcntl::{open, openat, renameat, AtFlags, OFlag};
-use nix::sys::stat::{fstat, fstatat, mkdirat, Mode};
+use nix::sys::stat::{fstat, fstatat, mkdirat, FileStat, Mode};
 use nix::unistd::{linkat, unlinkat, UnlinkatFlags};
 use std::ffi::OsString;
 use std::fs::File;
@@ -275,6 +275,19 @@ impl AnchoredDir {
         };
         self.remove_file(from)?;
         Ok(published)
+    }
+    /// Stat one direct child without following a link at its leaf, so a caller
+    /// sees the entry the directory holds rather than what it resolves to.
+    pub(crate) fn entry_stat(&self, leaf: &Path) -> Result<Option<FileStat>> {
+        let components = normal_components(leaf)?;
+        let [name] = components.as_slice() else {
+            bail!("anchored entry is not a single component");
+        };
+        match fstatat(&self.fd, name.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Ok(stat) => Ok(Some(stat)),
+            Err(Errno::ENOENT) => Ok(None),
+            Err(error) => Err(error).context("inspecting anchored entry"),
+        }
     }
 
     pub(crate) fn remove_file(&self, relative: &Path) -> Result<()> {
