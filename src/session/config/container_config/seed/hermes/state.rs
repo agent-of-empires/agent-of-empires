@@ -438,6 +438,20 @@ pub(super) const HOME_STATE: &[StateSpec] = &[
         exact: Some(r"^skills/\.usage_[a-z0-9_]{8}\.tmp$"),
     },
     StateSpec {
+        pattern: "skills/.bundled_manifest",
+        exact: None,
+    },
+    StateSpec {
+        pattern: "skills/.bundled_manifest_????????.tmp",
+        exact: Some(r"^skills/\.bundled_manifest_[a-z0-9_]{8}\.tmp$"),
+    },
+    // The hub's own bookkeeping (installed paths, content hashes, scan
+    // verdicts, lock file) is host state, not an authored skill.
+    StateSpec {
+        pattern: "skills/.hub",
+        exact: None,
+    },
+    StateSpec {
         pattern: "skills/.hub/audit.log",
         exact: None,
     },

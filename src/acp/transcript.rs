@@ -422,17 +422,19 @@ impl TranscriptModel {
                 ))]
             }
             Event::SessionContextReset { reason } => {
-                // Suppress the divider on a session that never saw a prompt:
-                // session/load failing on a 0-prompt session is expected, not an
-                // incident. Events arrive in seq order, so a scan captures every
-                // earlier prompt.
+                // Suppress the divider on a session that never saw a prompt and
+                // carries no reason: session/load failing on a 0-prompt session
+                // is expected, not an incident. A reason is a message for the
+                // user (an isolated native history, a refused fork), so it is
+                // shown even before the first prompt. Events arrive in seq
+                // order, so a scan captures every earlier prompt.
                 let has_prior_prompt = self.rows.iter().any(|r| {
                     matches!(
                         r.kind,
                         TranscriptRowKind::UserPrompt | TranscriptRowKind::UserDiffComments
                     )
                 });
-                if !has_prior_prompt {
+                if !has_prior_prompt && reason.is_empty() {
                     return Vec::new();
                 }
                 let text = if reason.is_empty() {
@@ -1847,13 +1849,19 @@ mod tests {
     }
 
     #[test]
-    fn context_reset_divider_suppressed_without_a_prior_prompt() {
+    fn context_reset_divider_needs_a_reason_or_a_prior_prompt() {
         // A 0-prompt session's session/load failure is expected, not an
-        // incident; no divider. With a prior prompt, the reason is rendered.
-        let none = fold(vec![Event::SessionContextReset {
-            reason: "load failed".into(),
+        // incident, so it carries no reason and no divider. A reason is a
+        // message for the user and is shown even before the first prompt.
+        let silent = fold(vec![Event::SessionContextReset { reason: "".into() }]);
+        assert!(silent.rows().is_empty());
+
+        let announced = fold(vec![Event::SessionContextReset {
+            reason: "Sandbox native history was isolated".into(),
         }]);
-        assert!(none.rows().is_empty());
+        let row = announced.rows().last().unwrap();
+        assert_eq!(row.kind, TranscriptRowKind::ContextReset);
+        assert!(row.text.contains("isolated"));
 
         let with_prompt = fold(vec![
             prompt("hi"),

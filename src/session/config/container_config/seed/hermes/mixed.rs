@@ -348,6 +348,21 @@ mod tests {
         .unwrap();
         fs::create_dir_all(source.join("skills/.hub")).unwrap();
         fs::write(source.join("skills/.hub/audit.log"), b"PRIVATE_AUDIT").unwrap();
+        fs::write(
+            source.join("skills/.hub/lock.json"),
+            br#"{"installed":{"install_path":"/host/private"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            source.join("skills/.bundled_manifest"),
+            b"bundled:0123456789abcdef\n",
+        )
+        .unwrap();
+        fs::write(
+            source.join("skills/.bundled_manifest_aplgomqo.tmp"),
+            b"bundled:0123456789abcdef\n",
+        )
+        .unwrap();
         let destination = temporary.path().join("active");
         let boundary = boundary(&source, &destination);
         let output = AnchoredDir::open(&destination).unwrap();
@@ -364,6 +379,11 @@ mod tests {
         );
         assert!(!destination.join("skills/.usage.json").exists());
         assert!(!destination.join("skills/.hub/audit.log").exists());
+        assert!(!destination.join("skills/.hub/lock.json").exists());
+        assert!(!destination.join("skills/.bundled_manifest").exists());
+        assert!(!destination
+            .join("skills/.bundled_manifest_aplgomqo.tmp")
+            .exists());
         assert!(
             !destination.join("skills/.hub").exists(),
             "a state container name must not be exported"
