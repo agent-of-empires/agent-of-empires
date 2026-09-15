@@ -62,7 +62,24 @@ impl Instance {
         skip_on_launch: bool,
         resume_policy: ResumeAttemptPolicy,
     ) -> Result<StartOutcome> {
-        self.orchestrate_resume_launch(size, skip_on_launch, resume_policy, true)
+        self.orchestrate_resume_launch(size, skip_on_launch, resume_policy, true, false)
+    }
+
+    /// Restart, first removing the sandbox container when `discard_sandbox_container`
+    /// is set so the launch recreates it with the current tool's mounts (#3959).
+    /// Removal happens only once this restart owns the Launch reservation.
+    pub fn restart_discarding_sandbox_container(
+        &mut self,
+        size: Option<(u16, u16)>,
+        discard_sandbox_container: bool,
+    ) -> Result<StartOutcome> {
+        self.orchestrate_resume_launch(
+            size,
+            false,
+            ResumeAttemptPolicy::HonorAutoResumeSetting,
+            true,
+            discard_sandbox_container,
+        )
     }
 
     /// Settle-based pane probe used by the resume-fallback cascade.
@@ -167,7 +184,7 @@ impl Instance {
         skip_on_launch: bool,
         resume_policy: ResumeAttemptPolicy,
     ) -> Result<StartOutcome> {
-        self.orchestrate_resume_launch(size, skip_on_launch, resume_policy, false)
+        self.orchestrate_resume_launch(size, skip_on_launch, resume_policy, false, false)
     }
 
     fn orchestrate_resume_launch(
@@ -176,6 +193,7 @@ impl Instance {
         skip_on_launch: bool,
         resume_policy: ResumeAttemptPolicy,
         restart: bool,
+        discard_sandbox_container: bool,
     ) -> Result<StartOutcome> {
         crate::session::validate_instance_id(&self.id)
             .context("refusing to start: AOE_INSTANCE_ID failed validation")?;
@@ -211,6 +229,12 @@ impl Instance {
         if restart {
             self.stop_and_flush_poller_lifecycle_locked();
             self.capture_omp_before_restart(&profile);
+        }
+        if discard_sandbox_container {
+            if let Err(error) = self.discard_stale_sandbox_container() {
+                self.fail_reserved_launch(&storage, &error, false);
+                return Err(error);
+            }
         }
 
         // Keep the generation reservation durable, but allow hooks to invoke
@@ -250,6 +274,33 @@ impl Instance {
             return Err(error);
         }
         result
+    }
+
+    /// A failure fails the restart: relaunching into the old container would run
+    /// the new tool against the previous tool's config store. The swap is already
+    /// persisted, so later restarts do not retry the removal; the error names the
+    /// container to remove by hand.
+    fn discard_stale_sandbox_container(&self) -> Result<()> {
+        if !self.is_sandboxed() {
+            return Ok(());
+        }
+        let container = DockerContainer::from_session_id(&self.id);
+        match container.discard() {
+            crate::containers::Teardown::Removed => {
+                tracing::info!(
+                    target: "containers.runtime",
+                    session = %self.id,
+                    "removed sandbox container built for the previous tool; it will be recreated on start"
+                );
+                Ok(())
+            }
+            crate::containers::Teardown::AlreadyGone => Ok(()),
+            crate::containers::Teardown::Failed(e) => anyhow::bail!(
+                "failed to remove sandbox container {} built for the previous tool; remove it \
+                 before restarting, or the new tool reuses its config: {e}",
+                container.name
+            ),
+        }
     }
 
     fn apply_resume_policy(&mut self, resume_policy: ResumeAttemptPolicy) -> Option<String> {
