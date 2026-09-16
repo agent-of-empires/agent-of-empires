@@ -1223,12 +1223,18 @@ fn stage_receipt(
 fn discard_stage(app: &Path, receipt: &mut Receipt, path: &Path) -> Result<()> {
     // A part renamed into place but not certified is mid-publication, not a
     // fresh seed, and its stage is what the resume path needs. A certificate is
-    // what tells the two apart: a part that was already owned keeps its own,
-    // while a part this transaction renamed has none yet.
+    // what tells the two apart for a part that was already owned; for a part
+    // this transaction renamed, the root holding the staged identity says the
+    // rename happened even when the crash landed before the journal recorded it.
     let mut mid_publication = false;
     for part in &receipt.roots {
-        if part.published.is_some()
-            && owned_root(app, &receipt.instance, &part.root.path)?.is_none()
+        let renamed_into_place = part.original.is_some()
+            && part.published.is_none()
+            && part.staged.is_some()
+            && identity(&part.root.path)? == part.staged;
+        if renamed_into_place
+            || (part.published.is_some()
+                && owned_root(app, &receipt.instance, &part.root.path)?.is_none())
         {
             mid_publication = true;
             break;
@@ -2652,6 +2658,54 @@ mod tests {
         assert_eq!(read_receipt(&path).unwrap().unwrap().phase, Phase::Planned);
     }
 
+    /// Death between `publish_receipt`'s rename and its journal write leaves the
+    /// root holding the staged identity with nothing recorded: the stage is
+    /// still what the resume path needs, so it must not be discarded.
+    #[test]
+    #[serial_test::serial]
+    fn a_stage_renamed_into_place_is_not_discarded() {
+        let temporary = tempfile::tempdir().unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let home = dirs::home_dir().unwrap();
+        let app = crate::session::get_app_dir().unwrap();
+        let instance = crate::session::Instance::new("codex", temporary.path().to_str().unwrap());
+        let config = crate::session::Config::default();
+        let roots = container_config::sandbox_content_roots(
+            "codex",
+            None,
+            &config.session,
+            &home,
+            &instance.id,
+        )
+        .unwrap();
+        let root = &roots[0].path;
+        fs::create_dir_all(root.join("sessions")).unwrap();
+        fs::write(root.join("sessions/original.jsonl"), b"PRIVATE").unwrap();
+        let mut row = serde_json::to_value(&instance).unwrap();
+        row["sandbox_info"] = serde_json::json!({
+            "enabled": true,
+            "image": "img",
+            "container_name": "aoe-sandbox-fixture",
+        });
+        let (path, mut receipt) = checked_receipt(&app, &row, "codex", &roots).unwrap();
+        record_retirement(&mut receipt, &row, &home, &config).unwrap();
+        stage_receipt(&app, &mut receipt, &path, &home, &config, temporary.path()).unwrap();
+        let stage = receipt.roots[0].stage.clone();
+        // What the rename leaves behind: the root holds the seeded content and
+        // the journal still says nothing about it.
+        fs::remove_dir_all(root).unwrap();
+        fs::rename(&stage, root).unwrap();
+        assert_eq!(identity(root).unwrap(), receipt.roots[0].staged);
+        assert!(receipt.roots[0].published.is_none());
+
+        discard_stage(&app, &mut receipt, &path).unwrap();
+        assert_eq!(
+            read_receipt(&path).unwrap().unwrap().phase,
+            Phase::Staged,
+            "a rename the journal has not recorded is still mid-publication"
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn stopped_original_is_preserved_before_fresh_content_is_certified() {
@@ -2844,14 +2898,12 @@ mod tests {
         )
         .unwrap();
         let row = serde_json::json!({"id":instance.id,"tool":"omp"});
-        match new_receipt(&app, &row, "omp", &requested) {
-            Ok(mut receipt) => {
-                let path = receipt_path(&app, &instance.id, "omp").unwrap();
-                stage_receipt(&app, &mut receipt, &path, &home, &config, temporary.path()).unwrap();
-                publish_receipt(&mut receipt, &path).unwrap();
-            }
-            Err(_) => {}
-        }
+        let mut receipt = new_receipt(&app, &row, "omp", &requested)
+            .expect("an owned root the alias shares must plan, not refuse");
+        let path = receipt_path(&app, &instance.id, "omp").unwrap();
+        stage_receipt(&app, &mut receipt, &path, &home, &config, temporary.path())
+            .expect("a role extension of an owned root must stage");
+        publish_receipt(&mut receipt, &path).expect("and publish");
         assert_eq!(fs::read(&owned).unwrap(), b"OWNED_CONTEXT_MUST_STAY");
     }
 
