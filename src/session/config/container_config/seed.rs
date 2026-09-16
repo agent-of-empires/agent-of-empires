@@ -426,6 +426,10 @@ pub(super) fn sync_agent_config(
     preserve_files: &[&str],
     boundary: &NativeStateBoundary,
 ) -> Result<()> {
+    // A retained original is content a container wrote, so a link inside it
+    // must not reach the host. A host config directory is the user's own, where
+    // following their links is what they asked for.
+    let discovery_links = boundary.stopped_original.is_none();
     let destination = AnchoredDir::open(sandbox_dir)?;
     for &(name, content) in seed_files {
         let relative = Path::new(name);
@@ -472,7 +476,7 @@ pub(super) fn sync_agent_config(
             &parent,
             leaf,
             boundary,
-            true,
+            discovery_links,
             ReadAccess::default(),
         )?;
     }
@@ -924,6 +928,7 @@ pub(super) fn seed_configured_resources(
     workspace: &Path,
     boundary: &NativeStateBoundary,
 ) -> Result<()> {
+    let discovery_links = boundary.stopped_original.is_none();
     let destination = AnchoredDir::open(destination)?;
     let resources = ResourceSeed {
         mount,
@@ -1081,9 +1086,20 @@ pub(super) fn seed_configured_resources(
             // Native Hermes configuration lives beside conversation state, so
             // only the declared projections and authored collections cross.
             if let Some(scope) = boundary.hermes.source {
-                let retained =
-                    hermes::seed_skills(boundary, scope, &boundary.source_root, &destination)?;
-                hermes::seed_plugins(boundary, scope, &boundary.source_root, &destination)?;
+                let retained = hermes::seed_skills(
+                    boundary,
+                    scope,
+                    &boundary.source_root,
+                    &destination,
+                    discovery_links,
+                )?;
+                hermes::seed_plugins(
+                    boundary,
+                    scope,
+                    &boundary.source_root,
+                    &destination,
+                    discovery_links,
+                )?;
                 hermes::seed_nodes(boundary, scope, &boundary.source_root, &destination)?;
                 hermes::seed_projects(boundary, scope, &boundary.source_root, &destination)?;
                 hermes::seed_skill_controls(
@@ -1398,6 +1414,56 @@ mod tests {
         assert!(
             !active.join("plugins/keep.json").exists(),
             "not even an authored file in that directory crosses"
+        );
+    }
+
+    #[test]
+    fn an_original_does_not_lend_a_link_to_the_host() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let outside = temporary.path().join("outside");
+        let active = temporary.path().join("active");
+        for path in [&source, &outside, &active] {
+            fs::create_dir_all(path).unwrap();
+        }
+        fs::write(outside.join("secret"), b"HOST_BYTES").unwrap();
+        fs::create_dir_all(source.join("plugins")).unwrap();
+        std::os::unix::fs::symlink(outside.join("secret"), source.join("plugins/leak.json"))
+            .unwrap();
+        let mount = AGENT_CONFIG_MOUNTS
+            .iter()
+            .find(|mount| mount.tool_name == "claude")
+            .unwrap();
+        let host = temporary.path().join("host");
+        fs::create_dir_all(&host).unwrap();
+        let boundary = NativeStateBoundary::for_fixture(&source, &active, mount)
+            .unwrap()
+            .for_stopped_original(&host, mount)
+            .unwrap();
+        sync_agent_config(&source, &active, &[], &[], &["plugins"], &[], &boundary).unwrap();
+        assert!(
+            !active.join("plugins/leak.json").exists(),
+            "a link a container could leave in its own store must not reach the host"
+        );
+
+        // The host's own directory is the user's, and following their link is
+        // what they asked for.
+        let host_active = temporary.path().join("host-active");
+        fs::create_dir_all(&host_active).unwrap();
+        let host_boundary = NativeStateBoundary::for_fixture(&source, &host_active, mount).unwrap();
+        sync_agent_config(
+            &source,
+            &host_active,
+            &[],
+            &[],
+            &["plugins"],
+            &[],
+            &host_boundary,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(host_active.join("plugins/leak.json")).unwrap(),
+            b"HOST_BYTES"
         );
     }
 

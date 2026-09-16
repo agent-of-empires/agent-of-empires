@@ -323,15 +323,18 @@ isolated and names the retained originals; nothing is replayed from them
 automatically, so copy back whatever you still want.
 
 Sessions created before this layout shared one agent store per agent (for
-example `~/.claude/sandbox`). Each one moves when you start it: AoE copies the
-shared store into that session's private directory, removes its stopped
-container so the next launch mounts the copy, and once every session that used
-it has moved, the shared store itself is moved whole into
+example `~/.claude/sandbox`). Each one moves when you start it: AoE gives the
+session its private directory, removes its stopped container so the next launch
+mounts that copy, and once every session that used the shared store has moved,
+the shared store itself is moved whole into
 `.aoe-sandbox-recovery/v027-<transaction>/original` rather than deleted, so
-nothing it held is lost and nothing is replicated into every session. AoE
-names the retained original when the move finishes; that copy is the data from
-then on, and you remove it yourself once you no longer want it. A large store
-takes a while, so the first start of a
+nothing it held is lost. A session that already had a private store of its own
+takes only the shared store's top-level files (its credentials, config and
+state); the shared store's directories, which are caches, logs, plugin trees and
+conversation history belonging to no one session, are not replicated into every
+session. AoE names the retained original when the move finishes; that copy is
+the data from then on, and you remove it yourself once you no longer want it. A
+large store takes a while, so the first start of a
 session is slower than usual; the TUI shows the copy's progress on its status
 line and opens the session once it is done, and a plain `aoe` start says how
 many sessions still
