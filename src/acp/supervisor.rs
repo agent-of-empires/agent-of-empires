@@ -43,7 +43,7 @@ use super::runner_lifecycle::{
     AdmitError, InstallError, Lease, LifecycleTable, ProcessControl, RunnerIdentity, Settlement,
     StopDecision, SystemProcessControl, WorkerPhase,
 };
-use super::state::{AcpSessionId, Event, RateLimitInfo};
+use super::state::{AcpSessionId, BackgroundAgentStatus, Event, RateLimitInfo};
 use crate::daemon::AcpWorkerState;
 use crate::session::SandboxInfo;
 
@@ -280,6 +280,15 @@ pub trait BroadcastSink: Send + Sync + 'static {
     /// Default returns empty so test sinks without an event store opt out
     /// cleanly.
     fn unresolved_elicitation_nonces(&self, _session_id: &str) -> Vec<Nonce> {
+        Vec::new()
+    }
+    /// Agent ids of `BackgroundAgentLaunched` events on disk with no
+    /// matching `BackgroundAgentCompleted`. Used by
+    /// `Supervisor::shutdown_with_reason`'s teardown path to detach sub-
+    /// agents the dying worker's tailer will never report on again.
+    /// Default returns empty so test sinks without an event store opt out
+    /// cleanly, mirroring `unresolved_approval_nonces`.
+    fn unresolved_background_agent_ids(&self, _session_id: &str) -> Vec<String> {
         Vec::new()
     }
     /// Persist one prompt attachment blob keyed to the seq of the
@@ -3178,6 +3187,28 @@ impl<S: BroadcastSink> Supervisor<S> {
                     WorkerKind::Stdio => false,
                 };
                 if should_publish {
+                    // The worker's tailer just died with it, so any
+                    // background sub-agent still `Running`/`Stalled` on disk
+                    // will never get its own terminal event: without this,
+                    // `has_active_background_agent` stays true forever and
+                    // every later `Stopped`, even after a daemon restart,
+                    // keeps deriving Running (#4001). Scan the durable log
+                    // directly rather than the control cache, which may be
+                    // cold for a session no reader has hydrated since a
+                    // restart and would under-report what needs detaching.
+                    for agent_id in self.sink.unresolved_background_agent_ids(session_id) {
+                        self.publish_next(
+                            session_id,
+                            &Event::BackgroundAgentCompleted {
+                                agent_id,
+                                status: BackgroundAgentStatus::Detached,
+                                tools: Vec::new(),
+                                result: None,
+                                warning: None,
+                                ended_at: chrono::Utc::now(),
+                            },
+                        );
+                    }
                     self.publish_next(
                         session_id,
                         &Event::Stopped {
@@ -4212,6 +4243,10 @@ impl BroadcastSink for ChannelSink {
         self.event_store.unresolved_elicitation_nonces(session_id)
     }
 
+    fn unresolved_background_agent_ids(&self, session_id: &str) -> Vec<String> {
+        self.event_store.unresolved_background_agent_ids(session_id)
+    }
+
     fn record_attachment(
         &self,
         session_id: &str,
@@ -4646,6 +4681,7 @@ mod tests {
         frames: std::sync::Mutex<Vec<(String, u64, Event)>>,
         stale_nonces: std::sync::Mutex<Vec<Nonce>>,
         stale_elicitation_nonces: std::sync::Mutex<Vec<Nonce>>,
+        stale_background_agent_ids: std::sync::Mutex<Vec<String>>,
     }
     impl VecSink {
         fn new() -> Arc<Self> {
@@ -4653,6 +4689,7 @@ mod tests {
                 frames: std::sync::Mutex::new(Vec::new()),
                 stale_nonces: std::sync::Mutex::new(Vec::new()),
                 stale_elicitation_nonces: std::sync::Mutex::new(Vec::new()),
+                stale_background_agent_ids: std::sync::Mutex::new(Vec::new()),
             })
         }
         fn with_stale_nonces(nonces: Vec<Nonce>) -> Arc<Self> {
@@ -4660,6 +4697,7 @@ mod tests {
                 frames: std::sync::Mutex::new(Vec::new()),
                 stale_nonces: std::sync::Mutex::new(nonces),
                 stale_elicitation_nonces: std::sync::Mutex::new(Vec::new()),
+                stale_background_agent_ids: std::sync::Mutex::new(Vec::new()),
             })
         }
         fn with_stale_elicitation_nonces(nonces: Vec<Nonce>) -> Arc<Self> {
@@ -4667,6 +4705,15 @@ mod tests {
                 frames: std::sync::Mutex::new(Vec::new()),
                 stale_nonces: std::sync::Mutex::new(Vec::new()),
                 stale_elicitation_nonces: std::sync::Mutex::new(nonces),
+                stale_background_agent_ids: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+        fn with_stale_background_agent_ids(ids: Vec<String>) -> Arc<Self> {
+            Arc::new(Self {
+                frames: std::sync::Mutex::new(Vec::new()),
+                stale_nonces: std::sync::Mutex::new(Vec::new()),
+                stale_elicitation_nonces: std::sync::Mutex::new(Vec::new()),
+                stale_background_agent_ids: std::sync::Mutex::new(ids),
             })
         }
     }
@@ -4682,6 +4729,9 @@ mod tests {
         }
         fn unresolved_elicitation_nonces(&self, _session_id: &str) -> Vec<Nonce> {
             self.stale_elicitation_nonces.lock().unwrap().clone()
+        }
+        fn unresolved_background_agent_ids(&self, _session_id: &str) -> Vec<String> {
+            self.stale_background_agent_ids.lock().unwrap().clone()
         }
     }
     #[tokio::test]
@@ -5830,45 +5880,10 @@ cursor-acp-bridge = "agent acp"
         let _home = crate::session::test_support::isolate_home(tmp.path());
         let sink = VecSink::new();
         let sup = Supervisor::new(sink.clone());
-        let dummy_spec = AgentSpec {
-            command: "/bin/true".into(),
-            args: vec![],
-            description: "test fixture".into(),
-            env_allowlist: None,
-        };
-        let dummy_config = SpawnConfig {
-            wrapper_substitution: None,
-            agent_key: "claude".into(),
-            tool: "claude".into(),
-            spec: dummy_spec,
-            cwd: std::env::temp_dir(),
-            additional_dirs: vec![],
-            provider_env: vec![],
-            host_environment: vec![],
-            default_effort: None,
-            default_effort_explicit: false,
-            default_mode: None,
-            socket_path: Some(tmp.path().join("dummy.sock")),
-            stored_acp_session_id: None,
-            fork_from: None,
-            seed_history_replay: false,
-            generation: 0,
-            artifact_dir: None,
-            sandbox_info: None,
-            source_profile: None,
-            mcp_servers: Vec::new(),
-        };
         {
             let (client, _tx) = AcpClient::fake_for_test(AcpSessionId("s-stop".into()));
-            sup.test_install_handle(
-                "s-stop",
-                client,
-                WorkerKind::Runner {
-                    spawn_config: Box::new(dummy_config),
-                },
-                None,
-            )
-            .await;
+            sup.test_install_handle("s-stop", client, dummy_runner_kind(&tmp), None)
+                .await;
         }
 
         sup.shutdown("s-stop")
@@ -5886,6 +5901,253 @@ cursor-acp-bridge = "agent acp"
             }
             other => panic!("expected Event::Stopped, got {other:?}"),
         }
+    }
+
+    fn dummy_runner_kind(tmp: &tempfile::TempDir) -> WorkerKind {
+        let dummy_spec = AgentSpec {
+            command: "/bin/true".into(),
+            args: vec![],
+            description: "test fixture".into(),
+            env_allowlist: None,
+        };
+        WorkerKind::Runner {
+            spawn_config: Box::new(SpawnConfig {
+                wrapper_substitution: None,
+                agent_key: "claude".into(),
+                tool: "claude".into(),
+                spec: dummy_spec,
+                cwd: std::env::temp_dir(),
+                additional_dirs: vec![],
+                provider_env: vec![],
+                host_environment: vec![],
+                default_effort: None,
+                default_effort_explicit: false,
+                default_mode: None,
+                socket_path: Some(tmp.path().join("dummy.sock")),
+                stored_acp_session_id: None,
+                fork_from: None,
+                seed_history_replay: false,
+                generation: 0,
+                artifact_dir: None,
+                sandbox_info: None,
+                source_profile: None,
+                mcp_servers: Vec::new(),
+            }),
+        }
+    }
+
+    /// #4001: `Supervisor::shutdown`'s teardown path must detach every
+    /// background agent the dying worker's tailer will never report on
+    /// again, and it must do so BEFORE the `Stopped` it already published:
+    /// a reader folding the log in order needs `has_active_background_agent`
+    /// cleared no later than the turn-end event that used to leave it stuck.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn shutdown_detaches_outstanding_background_agents_before_stopped() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(tmp.path());
+        let sink = VecSink::with_stale_background_agent_ids(vec!["bg-1".into(), "bg-2".into()]);
+        let sup = Supervisor::new(sink.clone());
+        {
+            let (client, _tx) = AcpClient::fake_for_test(AcpSessionId("s-detach".into()));
+            sup.test_install_handle("s-detach", client, dummy_runner_kind(&tmp), None)
+                .await;
+        }
+
+        sup.shutdown("s-detach")
+            .await
+            .expect("shutdown should succeed");
+
+        let frames = sink.frames.lock().unwrap();
+        let mine: Vec<&(String, u64, Event)> = frames
+            .iter()
+            .filter(|(id, _, _)| id == "s-detach")
+            .collect();
+        assert_eq!(mine.len(), 3, "two detach completions plus the Stopped");
+        for (idx, expected_agent) in [(0, "bg-1"), (1, "bg-2")] {
+            match &mine[idx].2 {
+                Event::BackgroundAgentCompleted {
+                    agent_id, status, ..
+                } => {
+                    assert_eq!(agent_id, expected_agent);
+                    assert_eq!(*status, BackgroundAgentStatus::Detached);
+                }
+                other => panic!("expected a Detached completion, got {other:?}"),
+            }
+        }
+        match &mine[2].2 {
+            Event::Stopped { reason } => assert_eq!(reason, "user_stopped"),
+            other => panic!("expected Event::Stopped last, got {other:?}"),
+        }
+        assert!(
+            mine[0].1 < mine[1].1 && mine[1].1 < mine[2].1,
+            "detach completions must be seq-ordered ahead of Stopped"
+        );
+    }
+
+    /// The common case: nothing outstanding, so teardown publishes only the
+    /// `Stopped` it always has. `unresolved_background_agent_ids` already
+    /// excludes an agent that completed on its own (event_store test); this
+    /// pins the supervisor side of the same guarantee, that an empty scan
+    /// adds nothing to the log.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn shutdown_publishes_no_synthetic_completion_when_no_agents_are_outstanding() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(tmp.path());
+        let sink = VecSink::new();
+        let sup = Supervisor::new(sink.clone());
+        {
+            let (client, _tx) = AcpClient::fake_for_test(AcpSessionId("s-clean".into()));
+            sup.test_install_handle("s-clean", client, dummy_runner_kind(&tmp), None)
+                .await;
+        }
+
+        sup.shutdown("s-clean")
+            .await
+            .expect("shutdown should succeed");
+
+        let frames = sink.frames.lock().unwrap();
+        let mine: Vec<&(String, u64, Event)> =
+            frames.iter().filter(|(id, _, _)| id == "s-clean").collect();
+        assert_eq!(mine.len(), 1, "only the Stopped, no synthetic completion");
+        assert!(matches!(mine[0].2, Event::Stopped { .. }));
+    }
+
+    /// `StopDecision::NotOwned` (no lifecycle entry at all, e.g. a session
+    /// id nothing ever spawned): the detach scan lives inside the `TearDown`
+    /// arm, so it must never run here.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn shutdown_on_an_unknown_session_publishes_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(tmp.path());
+        let sink = VecSink::with_stale_background_agent_ids(vec!["bg-1".into()]);
+        let sup = Supervisor::new(sink.clone());
+
+        let result = sup.shutdown("s-never-existed").await;
+        assert!(matches!(result, Err(SupervisorError::UnknownSession(_))));
+        assert!(
+            sink.frames.lock().unwrap().is_empty(),
+            "an unowned session must publish nothing, detach included"
+        );
+    }
+
+    /// `StopDecision::CancelRequested` (a resume is still in flight, no
+    /// worker handle installed yet): the detach scan and the `Stopped` it
+    /// rides with both live inside `TearDown`, so a shutdown that lands
+    /// before the resume finishes building must publish neither.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn shutdown_during_an_in_flight_resume_publishes_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(tmp.path());
+        let sink = VecSink::with_stale_background_agent_ids(vec!["bg-1".into()]);
+        let sup = Supervisor::new(sink.clone());
+        let _reservation = reserve(sup.begin_resume("s-resuming", ResumeKind::Spawn).await);
+
+        sup.shutdown("s-resuming")
+            .await
+            .expect("a cancel-in-flight shutdown does not error");
+
+        assert!(
+            sink.frames.lock().unwrap().is_empty(),
+            "a resume-in-flight cancel must publish nothing, detach included"
+        );
+    }
+
+    /// #4001, end to end: the four detach tests above all go through
+    /// `VecSink`, a canned stand-in that never exercises `ChannelSink`'s own
+    /// `unresolved_background_agent_ids` override or the real SQL scan
+    /// behind it, so a wrong json path or session key there would pass the
+    /// whole suite. Build a real disk-backed `EventStore`, record a launch
+    /// through it exactly as a live worker would, tear the session down
+    /// through a real `ChannelSink`, then read the same store back: the
+    /// maintainer's Stop -> resume/prompt -> completion scenario, minus the
+    /// resume (already covered by the fold-only tests in `state.rs` and
+    /// `acp_events.rs`).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn shutdown_detaches_through_a_real_channel_sink_and_event_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(tmp.path());
+
+        let event_store = Arc::new(
+            crate::acp::event_store::EventStore::open(&tmp.path().join("acp.db"), 1000).unwrap(),
+        );
+        event_store
+            .record(
+                "s-real-teardown",
+                1,
+                &Event::BackgroundAgentLaunched {
+                    agent_id: "bg-real".into(),
+                    tool_call_id: "tc-real".into(),
+                    description: "map backend".into(),
+                    prompt: "do it".into(),
+                    model: "claude-opus-4-8".into(),
+                    output_file: "/tmp/bg-real.output".into(),
+                    started_at: chrono::Utc::now(),
+                },
+            )
+            .unwrap();
+
+        let (tx, _rx) = tokio::sync::broadcast::channel(16);
+        let sink = Arc::new(ChannelSink {
+            tx,
+            event_store: event_store.clone(),
+            control_cache: Arc::new(crate::acp::control_cache::ControlStateCache::new()),
+        });
+        let sup = Supervisor::new(sink);
+        // The pre-existing seq=1 was written straight to the store, not
+        // through the supervisor, so next_seqs needs the same hydrate a
+        // real daemon restart performs, or teardown's seq=1 publish would
+        // collide with it and the synthetic completion would be silently
+        // dropped (INSERT OR IGNORE on the (session_id, seq) primary key).
+        sup.hydrate_seqs([("s-real-teardown".to_string(), 1)]);
+        {
+            let (client, _tx) = AcpClient::fake_for_test(AcpSessionId("s-real-teardown".into()));
+            sup.test_install_handle("s-real-teardown", client, dummy_runner_kind(&tmp), None)
+                .await;
+        }
+
+        assert_eq!(
+            event_store.unresolved_background_agent_ids("s-real-teardown"),
+            vec!["bg-real".to_string()],
+            "precondition: the launch is genuinely outstanding before teardown"
+        );
+
+        sup.shutdown("s-real-teardown")
+            .await
+            .expect("shutdown should succeed");
+
+        // Replay the disk log back, independent of the supervisor: this is
+        // what the WS-on-connect drain and /acp/replay actually read.
+        let replayed = event_store.replay_from("s-real-teardown", 0);
+        assert_eq!(replayed.len(), 3, "launch, detach completion, stopped");
+        assert_eq!(replayed[0].0, 1);
+        assert!(matches!(
+            replayed[0].1,
+            Event::BackgroundAgentLaunched { .. }
+        ));
+        assert_eq!(replayed[1].0, 2);
+        match &replayed[1].1 {
+            Event::BackgroundAgentCompleted {
+                agent_id, status, ..
+            } => {
+                assert_eq!(agent_id, "bg-real");
+                assert_eq!(*status, BackgroundAgentStatus::Detached);
+            }
+            other => panic!("expected a Detached completion at seq 2, got {other:?}"),
+        }
+        assert_eq!(replayed[2].0, 3);
+        assert!(matches!(replayed[2].1, Event::Stopped { .. }));
+
+        assert!(
+            event_store
+                .unresolved_background_agent_ids("s-real-teardown")
+                .is_empty(),
+            "the real ChannelSink override must reach the real scan and close it out"
+        );
     }
 
     /// Drain task must short-circuit `restart_decision` when the

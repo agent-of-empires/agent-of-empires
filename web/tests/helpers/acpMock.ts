@@ -382,6 +382,18 @@ export function toolCallCompleted(fields: { tool_call_id: string; is_error: bool
   };
 }
 
+export function backgroundAgentLaunched(fields: {
+  agent_id: string;
+  tool_call_id: string;
+  description: string;
+  prompt: string;
+  model: string;
+}) {
+  return {
+    BackgroundAgentLaunched: { ...fields, started_at: new Date().toISOString() },
+  };
+}
+
 export function configOptionsUpdated(options: unknown[]) {
   return { ConfigOptionsUpdated: { options } };
 }

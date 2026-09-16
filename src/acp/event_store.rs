@@ -1592,6 +1592,55 @@ impl EventStore {
         rows.filter_map(|r| r.ok()).collect()
     }
 
+    /// Agent ids of `BackgroundAgentLaunched` events for the session that
+    /// lack a later `BackgroundAgentCompleted` with the same id. Used by
+    /// `Supervisor::shutdown_with_reason`'s teardown path to detach sub-
+    /// agents the dying worker's tailer will never report on again: it
+    /// scans the durable log directly rather than the control cache, so it
+    /// stays correct for a session no reader has hydrated since a daemon
+    /// restart. See `BackgroundAgentStatus::Detached`.
+    ///
+    /// Both `agent_id` extractions are `IS NOT NULL`-guarded: SQLite's
+    /// `NOT IN` evaluates to `NULL` (never true) for every row once the
+    /// subquery yields even one `NULL`, so an unextractable id on a single
+    /// `BackgroundAgentCompleted` row would otherwise blank the whole
+    /// result rather than just miscount that one row.
+    pub fn unresolved_background_agent_ids(&self, session_id: &str) -> Vec<String> {
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let mut stmt = match conn.prepare(
+            "SELECT json_extract(event_json, '$.BackgroundAgentLaunched.agent_id') AS agent_id
+             FROM acp_events
+             WHERE session_id = ?1
+               AND discriminant = 'BackgroundAgentLaunched'
+               AND json_extract(event_json, '$.BackgroundAgentLaunched.agent_id') IS NOT NULL
+               AND json_extract(event_json, '$.BackgroundAgentLaunched.agent_id') NOT IN (
+                   SELECT json_extract(event_json, '$.BackgroundAgentCompleted.agent_id')
+                   FROM acp_events
+                   WHERE session_id = ?1
+                     AND discriminant = 'BackgroundAgentCompleted'
+                     AND json_extract(event_json, '$.BackgroundAgentCompleted.agent_id') IS NOT NULL
+               )
+             ORDER BY seq ASC",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(target: "acp.event_store", "prepare unresolved_background_agent_ids for {session_id}: {e}");
+                return Vec::new();
+            }
+        };
+        let rows = match stmt.query_map(params![session_id], |row| row.get::<_, String>(0)) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(target: "acp.event_store", "query unresolved_background_agent_ids for {session_id}: {e}");
+                return Vec::new();
+            }
+        };
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
     /// True iff the session has a `UserPromptSent` whose turn never
     /// terminated (no later `Stopped` or `AgentStartupError`). Used at
     /// daemon startup to decide whether to synthesize a `Stopped` event
@@ -4477,6 +4526,106 @@ mod tests {
         assert_eq!(store.unresolved_elicitation_nonces("s-1"), vec![nonce_b]);
         // Unrelated session must not bleed into the query.
         assert!(store.unresolved_elicitation_nonces("s-2").is_empty());
+    }
+
+    fn background_agent_launched(agent_id: &str) -> Event {
+        Event::BackgroundAgentLaunched {
+            agent_id: agent_id.into(),
+            tool_call_id: format!("tc-{agent_id}"),
+            description: "map backend".into(),
+            prompt: "do it".into(),
+            model: "claude-opus-4-8".into(),
+            output_file: format!("/tmp/{agent_id}.output"),
+            started_at: Utc::now(),
+        }
+    }
+
+    fn background_agent_completed(
+        agent_id: &str,
+        status: crate::acp::state::BackgroundAgentStatus,
+    ) -> Event {
+        Event::BackgroundAgentCompleted {
+            agent_id: agent_id.into(),
+            status,
+            tools: Vec::new(),
+            result: None,
+            warning: None,
+            ended_at: Utc::now(),
+        }
+    }
+
+    /// Background-agent parallel of `unresolved_approval_nonces`: a
+    /// `BackgroundAgentLaunched` whose id never saw a matching
+    /// `BackgroundAgentCompleted` is reported as orphaned. Used to detach
+    /// sub-agents on worker teardown so they don't stay outstanding forever.
+    #[test]
+    fn unresolved_background_agent_ids_finds_orphaned_launches() {
+        use crate::acp::state::BackgroundAgentStatus;
+
+        let (_tmp, store) = open_store(1000);
+        // bg-a is launched and completes cleanly. bg-b and bg-c are
+        // launched but never completed (orphans).
+        store
+            .record("s-1", 1, &background_agent_launched("bg-a"))
+            .unwrap();
+        store
+            .record(
+                "s-1",
+                2,
+                &background_agent_completed("bg-a", BackgroundAgentStatus::Completed),
+            )
+            .unwrap();
+        store
+            .record("s-1", 3, &background_agent_launched("bg-b"))
+            .unwrap();
+        store
+            .record("s-1", 4, &background_agent_launched("bg-c"))
+            .unwrap();
+
+        assert_eq!(
+            store.unresolved_background_agent_ids("s-1"),
+            vec!["bg-b".to_string(), "bg-c".to_string()]
+        );
+        // Unrelated session must not bleed into the query.
+        assert!(store.unresolved_background_agent_ids("s-2").is_empty());
+    }
+
+    /// A `BackgroundAgentCompleted` row whose `agent_id` is not extractable
+    /// (truncated payload, schema drift) must not hide every other orphan:
+    /// SQLite's `NOT IN` goes `NULL` for the whole result once the subquery
+    /// yields one `NULL`, silently no-opping the detach scan. Insert such a
+    /// row directly (the store itself never produces one; this stands in
+    /// for a shape survived by `replay_page_cursor_advances_past_corrupt_row`).
+    #[test]
+    fn unresolved_background_agent_ids_survives_an_unextractable_completed_row() {
+        let (_tmp, store) = open_store(1000);
+        store
+            .record("s-1", 1, &background_agent_launched("bg-real-orphan"))
+            .unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO acp_events (session_id, seq, event_json, created_at, discriminant)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    "s-1",
+                    2_i64,
+                    // Valid JSON, but the object carries no `agent_id` key,
+                    // so `json_extract(..., '$.BackgroundAgentCompleted.agent_id')`
+                    // returns NULL rather than erroring.
+                    "{\"BackgroundAgentCompleted\":{}}",
+                    0_i64,
+                    "BackgroundAgentCompleted",
+                ],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            store.unresolved_background_agent_ids("s-1"),
+            vec!["bg-real-orphan".to_string()],
+            "an unextractable Completed row must not blank the whole scan"
+        );
     }
 
     fn rate_limit_event(secs_until_reset: i64) -> Event {

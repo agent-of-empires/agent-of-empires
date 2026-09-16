@@ -99,6 +99,39 @@ impl ControlStateCache {
         cached.last_seq = seq;
     }
 
+    /// Whether the session's cached state has an outstanding background
+    /// sub-agent, or `false` if nothing is cached. Used right after
+    /// `apply_if_cached` folds a `Stopped` or `BackgroundAgentCompleted`
+    /// event, to tell the sidebar status derivation whether a background
+    /// sub-agent is still keeping the session busy (#4001), and by live lag
+    /// recovery to override a stale seed event. This accessor itself never
+    /// hydrates: the live listener checks `is_hydrated` and calls
+    /// `SessionService::fold_control_state` on a miss before calling this, so
+    /// by the time it reads, a session the listener has seen an event for is
+    /// always hydrated. Lag recovery stays read-only and asks arbitrary
+    /// sessions, so a miss there may just mean the session was never opened.
+    /// Either way `false` is the same conservative verdict the derivation
+    /// fell back to before any of this existed.
+    pub fn has_active_background_agent(&self, session_id: &str) -> bool {
+        let slot = self.slot(session_id);
+        let guard = lock(&slot);
+        guard
+            .as_ref()
+            .is_some_and(|c| c.state.has_active_background_agent())
+    }
+
+    /// Whether the session's cached state has an active main turn, or
+    /// `false` if nothing is cached. Same rationale as
+    /// `has_active_background_agent`: this accessor never hydrates; the live
+    /// listener hydrates a cold session before calling it, lag recovery
+    /// stays read-only, and either way a miss reads as the same
+    /// quiet-session verdict as boot.
+    pub fn turn_active(&self, session_id: &str) -> bool {
+        let slot = self.slot(session_id);
+        let guard = lock(&slot);
+        guard.as_ref().is_some_and(|c| c.state.turn_active)
+    }
+
     /// Drop a session's fold. Used when the event log behind it is deleted and
     /// when a persist fails, since a projection of a log that is missing an
     /// event is not a projection of that log.
@@ -133,8 +166,11 @@ impl ControlStateCache {
         state
     }
 
-    #[cfg(test)]
-    fn is_cached(&self, session_id: &str) -> bool {
+    /// Whether the session has a hydrated fold, with no locking beyond the
+    /// check itself. Lets a caller that can hydrate on demand (the live
+    /// listener, via `SessionService::fold_control_state`) skip that work on
+    /// every event and only pay for it on a cold session.
+    pub fn is_hydrated(&self, session_id: &str) -> bool {
         let slot = self.slot(session_id);
         let guard = lock(&slot);
         guard.is_some()
@@ -172,7 +208,7 @@ mod tests {
     fn a_session_nothing_hydrated_stays_uncached() {
         let cache = ControlStateCache::new();
         cache.apply_if_cached("s-1", 42, &prompt());
-        assert!(!cache.is_cached("s-1"));
+        assert!(!cache.is_hydrated("s-1"));
 
         let mut hydrated = 0;
         let state = cache.get_or_hydrate("s-1", || {
@@ -235,7 +271,7 @@ mod tests {
             cache.get_or_hydrate("s-1", || (seed(), first - 1));
             cache.apply_if_cached("s-1", first, &prompt());
             cache.apply_if_cached("s-1", second, &stopped());
-            assert_eq!(cache.is_cached("s-1"), still_cached, "{name}");
+            assert_eq!(cache.is_hydrated("s-1"), still_cached, "{name}");
         }
     }
 
@@ -283,7 +319,7 @@ mod tests {
         assert!(cache.get_or_hydrate("s-1", || (seed(), 0)).turn_active);
 
         cache.forget("s-1");
-        assert!(!cache.is_cached("s-1"));
+        assert!(!cache.is_hydrated("s-1"));
         assert!(!cache.get_or_hydrate("s-1", || (seed(), 0)).turn_active);
     }
 }
