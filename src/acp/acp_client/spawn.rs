@@ -255,14 +255,18 @@ pub(super) fn inherited_host_env_pairs(config: &SpawnConfig) -> Vec<(String, Str
 /// credential. They are legitimate on the two host spawn paths and must not
 /// cross into a container: the path names nothing there, so forwarding it
 /// points the adapter away from the config dir `AGENT_CONFIG_MOUNTS` mounts
-/// at the canonical container location. `CLAUDE_CONFIG_DIR` is the case that
-/// established the rule; the other two arrived with the per-adapter allowlists
-/// in #3238. Adding a path-valued key to `env_allowlist_for` means adding it
-/// here too.
+/// at the canonical container location. Adding a path-valued key to
+/// `env_allowlist_for` means adding it here too.
 pub(super) fn is_host_only_path_env(key: &str) -> bool {
     matches!(
         key,
-        "CLAUDE_CONFIG_DIR" | "CODEX_HOME" | "GOOGLE_APPLICATION_CREDENTIALS"
+        "CLAUDE_CONFIG_DIR"
+            | "CODEX_HOME"
+            | "GOOGLE_APPLICATION_CREDENTIALS"
+            | "AWS_CONFIG_FILE"
+            | "AWS_SHARED_CREDENTIALS_FILE"
+            | "AWS_WEB_IDENTITY_TOKEN_FILE"
+            | "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE"
     )
 }
 
@@ -732,6 +736,8 @@ mod tests {
             ("OPENAI_API_KEY", "sk-openai"),
             ("GOOGLE_GENERATIVE_AI_API_KEY", "ai-google"),
             ("GEMINI_API_KEY", "ai-gemini-cli-key"),
+            ("PRIME_API_KEY", "pk-prime"),
+            ("AOE_TEST_UNLISTED_SENTINEL", "leak"),
         ]);
 
         let mut config = env_test_spawn_config(tmp.path().to_path_buf());
@@ -790,6 +796,29 @@ mod tests {
         assert!(
             !codex_env.contains_key("ANTHROPIC_API_KEY"),
             "Codex must not receive another adapter's ambient credential, got {codex_env:#?}"
+        );
+
+        // #3702: Prime Agent receives its own key and nothing unlisted.
+        config.spec = reg.get("prime-agent").expect("prime-agent default").clone();
+        let mut prime_cmd = std::process::Command::new("/bin/true");
+        prime_cmd.env_clear();
+        apply_env_filter(&mut prime_cmd, &config);
+        let prime_env: std::collections::HashMap<String, String> = prime_cmd
+            .get_envs()
+            .filter_map(|(key, value)| {
+                Some((
+                    key.to_string_lossy().into_owned(),
+                    value?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        assert_eq!(
+            prime_env.get("PRIME_API_KEY").map(String::as_str),
+            Some("pk-prime")
+        );
+        assert!(
+            !prime_env.contains_key("AOE_TEST_UNLISTED_SENTINEL"),
+            "Prime Agent must not receive an unlisted variable, got {prime_env:#?}"
         );
 
         // A custom `agent_acp_cmd` adapter carries no allowlist at all, so it

@@ -79,12 +79,6 @@ impl TokenManager {
         self.state.read().await.lifetime.as_secs()
     }
 
-    /// How long a rotated-out token stays valid. The rotation loop reads it
-    /// here so its cleanup deadline cannot drift from what `validate` accepts.
-    pub(super) async fn grace(&self) -> Duration {
-        self.state.read().await.grace
-    }
-
     /// Clear the previous token once its grace window has closed.
     pub async fn clear_previous(&self) {
         let mut state = self.state.write().await;
@@ -100,14 +94,17 @@ impl TokenManager {
     }
 
     /// Rotate: generate new token, move current to previous with grace period.
-    pub async fn rotate(&self) {
+    /// Returns the instant the previous token stops validating, which is when
+    /// its state must be cleared.
+    pub async fn rotate(&self) -> tokio::time::Instant {
         let mut state = self.state.write().await;
         let new_token = generate_token();
         let grace = state.grace;
+        let grace_expires = tokio::time::Instant::now() + grace;
 
         state.previous = state.current.take();
         state.current = Some(new_token.clone());
-        state.grace_expires = Some(tokio::time::Instant::now() + grace);
+        state.grace_expires = Some(grace_expires);
 
         // Persist to disk
         if let Ok(app_dir) = crate::session::get_app_dir() {
@@ -119,6 +116,7 @@ impl TokenManager {
             grace_secs = grace.as_secs(),
             "auth token rotated"
         );
+        grace_expires
     }
 
     /// Spawn a background rotation task. Production paths only call this
@@ -129,20 +127,11 @@ impl TokenManager {
         let manager = Arc::clone(self);
         tokio::spawn(async move {
             loop {
-                let (lifetime, grace) = {
-                    let state = manager.state.read().await;
-                    (state.lifetime, state.grace)
-                };
+                let lifetime = manager.state.read().await.lifetime;
                 tokio::time::sleep(lifetime).await;
-                manager.rotate().await;
-
-                // After grace period, clear previous
-                tokio::time::sleep(grace).await;
-                {
-                    let mut state = manager.state.write().await;
-                    state.previous = None;
-                    state.grace_expires = None;
-                }
+                let grace_expires = manager.rotate().await;
+                tokio::time::sleep_until(grace_expires).await;
+                manager.clear_previous().await;
             }
         });
     }

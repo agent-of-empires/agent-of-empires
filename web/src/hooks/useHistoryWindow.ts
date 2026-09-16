@@ -6,6 +6,7 @@ import {
   HISTORY_WINDOW_STEP,
   canLoadEarlierFrom,
   historyWindow,
+  initialHistoryWindow,
 } from "../lib/acpHistoryWindow";
 
 export interface HistoryWindowState {
@@ -29,6 +30,10 @@ export interface HistoryWindowState {
  * head) so rows already on screen stay put. Without this the end-anchored
  * `length - visibleRows` start would slide forward on every new turn and
  * fold visible older rows back behind "Load earlier". See #2236.
+ *
+ * The window opens on at least the whole last turn (`initialHistoryWindow`):
+ * the default row count applies to the backlog before it, not to the prompt
+ * the user most recently sent and its reply.
  */
 export function useHistoryWindow(
   sessionId: string,
@@ -45,11 +50,16 @@ export function useHistoryWindow(
   const [anchorRowId, setAnchorRowId] = useState<string | null>(null);
   if (windowSessionId !== sessionId) {
     setWindowSessionId(sessionId);
-    setVisibleRows(DEFAULT_HISTORY_WINDOW);
+    setVisibleRows(initialHistoryWindow(activity));
     setAnchorLen(activity.length > 0 ? activity.length : null);
     setAnchorRowId(null);
   } else if (anchorLen === null) {
-    if (activity.length > 0) setAnchorLen(activity.length);
+    if (activity.length > 0) {
+      // First populate (the recent-first tail landing): size the window to the
+      // transcript that actually arrived, not to a default chosen blind.
+      setAnchorLen(activity.length);
+      setVisibleRows(initialHistoryWindow(activity));
+    }
   } else if (activity.length !== anchorLen) {
     // Grow the window by exactly the rows added so the start index holds
     // and on-screen rows don't fold. A shrink (retention trim) just

@@ -590,6 +590,11 @@ pub struct HomeView {
     /// Suppresses the StatusPoller's missing-tmux Error transition until the
     /// worker reports back via `apply_restart_results`.
     pub(super) restart_in_flight: std::collections::HashSet<String>,
+    /// Sessions to attach once their in-flight restart launches the agent.
+    pub(super) attach_after_restart: std::collections::HashSet<String>,
+    /// Restarted sessions ready for the event loop to attach; see
+    /// `take_restarted_attaches`.
+    pub(super) restarted_attaches: Vec<String>,
 
     // Performance: background sandbox store move. A session still on the
     // shared store copies it before its first launch, which can take

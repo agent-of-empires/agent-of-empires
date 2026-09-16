@@ -796,14 +796,23 @@ fn retain_legacy_original_with(
 }
 
 fn read_registries(app: &Path) -> Result<Vec<(PathBuf, Value)>> {
-    layout::registry_paths(app)?
-        .into_iter()
-        .map(|path| {
-            let value = serde_json::from_slice(&fs::read(&path)?)
-                .with_context(|| format!("parsing {}", path.display()))?;
-            Ok((path, value))
-        })
-        .collect()
+    let mut registries = Vec::new();
+    for path in layout::registry_paths(app)? {
+        match serde_json::from_slice(&fs::read(&path)?) {
+            Ok(value) => registries.push((path, value)),
+            // A registry AoE cannot parse is a pre-existing anomaly it cannot
+            // reason about; skipping it with a warning keeps one corrupt file
+            // from bricking every launch and migration, matching the reuse path
+            // that already tolerates a failed reload.
+            Err(error) => tracing::warn!(
+                target: "session.store",
+                registry = %path.display(),
+                error = %error,
+                "skipping unparseable session registry",
+            ),
+        }
+    }
+    Ok(registries)
 }
 
 fn lock_registries(app: &Path) -> Result<Vec<crate::session::StorageFlock>> {
