@@ -226,14 +226,9 @@ function TableWithScroll({ children, ...rest }: React.ComponentPropsWithoutRef<"
  * language is loading or for unknown languages.
  */
 function ShikiSyntaxHighlighter({ language, code }: SyntaxHighlighterProps) {
-  // Cache the highlighted html together with the input identity that
-  // produced it, and render it only while that identity matches the current
-  // inputs. A request that resolves after its inputs were superseded (its
-  // effect cleanup may not have run when the new render commits) writes an
-  // entry whose key no longer matches, so it renders inert instead of
-  // overwriting the new content. The theme stays out of the key: on a theme
-  // switch the old palette keeps painting until the re-highlight lands,
-  // which beats flashing unstyled text.
+  // Keyed by the inputs that produced it, so a superseded request resolving
+  // before its effect cleanup renders nothing. Theme is left out of the key
+  // so a theme switch keeps the old palette until the re-highlight lands.
   const inputKey = `${language ?? ""} ${code}`;
   const [result, setResult] = useState<{ key: string; html: string } | null>(null);
   const shiki = useShikiTheme();
@@ -251,8 +246,7 @@ function ShikiSyntaxHighlighter({ language, code }: SyntaxHighlighterProps) {
         if (cancelled || !out) return;
         setResult({ key: inputKey, html: out });
       } catch {
-        // Unknown lang → fall through to plain rendering: the cached entry's
-        // key no longer matches, so nothing needs clearing.
+        // Unknown lang → fall through to plain rendering.
       }
     })();
     return () => {

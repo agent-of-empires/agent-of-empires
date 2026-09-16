@@ -10,16 +10,14 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, waitFor } from "@testing-library/react";
-import { startTransition, useLayoutEffect, useState } from "react";
-import { createRoot } from "react-dom/client";
-import { flushSync } from "react-dom";
 
 import { DiffCommentsUserCard } from "../../comments/DiffCommentsUserCard";
 import type { DiffCommentsCardPayload } from "../../comments/buildPrompt";
 import type { DiffComment } from "../../comments/types";
+import { renderWithLateResolution } from "../../../../__tests__/lateResolution";
 
 // Test-controlled highlighter behavior. By default `highlightSnippet`
-// resolves to null, so HighlightedSnippet bails before setHtml and renders
+// resolves to null, so HighlightedSnippet caches nothing and renders
 // the plain <pre> fallback branch. Flipping `highlighterMock.loaded` on
 // exercises the resolved-HTML (dangerouslySetInnerHTML) branch. Setting
 // `highlighterMock.deferred` hands the next call a manually-resolved promise
@@ -208,57 +206,17 @@ describe("DiffCommentsUserCard", () => {
     highlighterMock.deferred = new Promise<string | null>((res) => {
       resolveA = res;
     });
+    const card = (c: DiffComment) => <DiffCommentsUserCard payload={payload({ comments: [c] })} />;
 
-    // Render B in a transition and resolve A's request in B's commit phase
-    // (layout effect), before A's passive effect cleanup has run — the
-    // window where A's `cancelled` flag is still false and only the
-    // input-key check can reject the stale write. Runs outside the act
-    // environment on a raw root: act flushes the passive cleanup before the
-    // resolution's microtask and closes the window artificially.
-    let setStage!: (s: "a" | "b") => void;
-    function Harness() {
-      const [stage, set] = useState<"a" | "b">("a");
-      useLayoutEffect(() => {
-        setStage = set;
-      }, [set]);
-      useLayoutEffect(() => {
-        if (stage === "b") resolveA('<pre class="shiki">OLD_A</pre>');
-      }, [stage]);
-      const c =
-        stage === "a"
-          ? comment({ id: "c1", capturedSnippet: "const a = 1;", language: "typescript" })
-          : comment({ id: "c1", capturedSnippet: "plain b body", language: undefined, filePath: "NOTES" });
-      return <DiffCommentsUserCard payload={payload({ comments: [c] })} />;
-    }
+    const { html, text } = await renderWithLateResolution({
+      a: card(comment({ id: "c1", capturedSnippet: "const a = 1;", language: "typescript" })),
+      b: card(comment({ id: "c1", capturedSnippet: "plain b body", language: undefined, filePath: "NOTES" })),
+      bText: "plain b body",
+      resolveStale: () => resolveA('<pre class="shiki">OLD_A</pre>'),
+    });
 
-    const g = globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean };
-    const prevActEnv = g.IS_REACT_ACT_ENVIRONMENT;
-    g.IS_REACT_ACT_ENVIRONMENT = false;
-    const host = document.createElement("div");
-    document.body.appendChild(host);
-    const root = createRoot(host);
-    const macrotask = () => new Promise<void>((r) => setTimeout(r, 0));
-    try {
-      flushSync(() => {
-        root.render(<Harness />);
-      });
-      await macrotask(); // A's effect has run; its request is pending.
-
-      startTransition(() => setStage("b"));
-      for (let i = 0; i < 20 && !host.innerHTML.includes("plain b body"); i++) {
-        await Promise.resolve();
-      }
-      await macrotask();
-      await macrotask();
-
-      expect(host.textContent).toContain("plain b body");
-      expect(host.innerHTML).not.toContain("OLD_A");
-      expect(host.querySelector("pre.shiki")).toBeNull();
-    } finally {
-      flushSync(() => root.unmount());
-      host.remove();
-      g.IS_REACT_ACT_ENVIRONMENT = prevActEnv;
-    }
+    expect(text).toContain("plain b body");
+    expect(html).not.toContain("OLD_A");
   });
 
   it("renders an empty list with a zero-comment count", () => {

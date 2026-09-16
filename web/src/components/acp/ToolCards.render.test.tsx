@@ -14,9 +14,6 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
-import { startTransition, useLayoutEffect, useState } from "react";
-import { createRoot } from "react-dom/client";
-import { flushSync } from "react-dom";
 import type { ReactNode } from "react";
 
 vi.mock("../../lib/snippetHighlighter", () => ({
@@ -35,6 +32,7 @@ import { AgentProfileProvider } from "../../lib/agentProfileContext";
 import { AcpFileRefContext } from "./AcpFileRefContext";
 import type { FileRefSession } from "../../lib/fileRef";
 import { fixtures, makeCompletion, makeError, makeStopped, makeToolCall } from "./__fixtures__/toolCalls";
+import { renderWithLateResolution } from "../../__tests__/lateResolution";
 
 function Wrap({ toolKey, children }: { toolKey?: string; children: ReactNode }) {
   return <AgentProfileProvider toolKey={toolKey ?? null}>{children}</AgentProfileProvider>;
@@ -1172,65 +1170,25 @@ describe("HighlightedBlock stale-content transitions (#3974)", () => {
         resolveA = res;
       }),
     );
+    const readCard = (path: string, body: string) => (
+      <Wrap>
+        <ToolCard
+          tool={makeToolCall({ kind: "read", args_preview: JSON.stringify({ file_path: path }) })}
+          result={makeCompletion({ text: body })}
+        />
+      </Wrap>
+    );
 
-    // Render B in a transition and resolve A's request in B's commit phase
-    // (layout effect), before A's passive effect cleanup has run — the
-    // window where A's `cancelled` flag is still false and only the
-    // input-key check can reject the stale write. Runs outside the act
-    // environment on a raw root: act flushes the passive cleanup before the
-    // resolution's microtask and closes the window artificially.
-    let setStage!: (s: "a" | "b") => void;
-    function Harness() {
-      const [stage, set] = useState<"a" | "b">("a");
-      useLayoutEffect(() => {
-        setStage = set;
-      }, [set]);
-      useLayoutEffect(() => {
-        if (stage === "b") resolveA('<pre class="shiki">OLD_A</pre>');
-      }, [stage]);
-      const tool =
-        stage === "a"
-          ? makeToolCall({ kind: "read", args_preview: JSON.stringify({ file_path: "/tmp/a.rs" }) })
-          : makeToolCall({ kind: "read", args_preview: JSON.stringify({ file_path: "/tmp/README" }) });
-      const result =
-        stage === "a" ? makeCompletion({ text: "fn a() {}" }) : makeCompletion({ text: "plain readme text" });
-      return (
-        <Wrap>
-          <ToolCard tool={tool} result={result} />
-        </Wrap>
-      );
-    }
+    const { html, text } = await renderWithLateResolution({
+      a: readCard("/tmp/a.rs", "fn a() {}"),
+      b: readCard("/tmp/README", "plain readme text"),
+      bText: "plain readme text",
+      resolveStale: () => resolveA('<pre class="shiki">OLD_A</pre>'),
+      // Expand the card so the highlighted body renders.
+      afterMount: (host) => host.querySelector("button")!.dispatchEvent(new MouseEvent("click", { bubbles: true })),
+    });
 
-    const g = globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean };
-    const prevActEnv = g.IS_REACT_ACT_ENVIRONMENT;
-    g.IS_REACT_ACT_ENVIRONMENT = false;
-    const host = document.createElement("div");
-    document.body.appendChild(host);
-    const root = createRoot(host);
-    const macrotask = () => new Promise<void>((r) => setTimeout(r, 0));
-    try {
-      flushSync(() => {
-        root.render(<Harness />);
-      });
-      // Expand the card so the highlighted body renders; the discrete click
-      // commits synchronously even outside act.
-      host.querySelector("button")!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-      await macrotask(); // A's effect has run; its request is pending.
-
-      startTransition(() => setStage("b"));
-      for (let i = 0; i < 20 && !host.innerHTML.includes("plain readme text"); i++) {
-        await Promise.resolve();
-      }
-      await macrotask();
-      await macrotask();
-
-      expect(host.textContent).toContain("plain readme text");
-      expect(host.innerHTML).not.toContain("OLD_A");
-      expect(host.querySelector("pre.shiki")).toBeNull();
-    } finally {
-      flushSync(() => root.unmount());
-      host.remove();
-      g.IS_REACT_ACT_ENVIRONMENT = prevActEnv;
-    }
+    expect(text).toContain("plain readme text");
+    expect(html).not.toContain("OLD_A");
   });
 });

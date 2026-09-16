@@ -54,14 +54,9 @@ export function DiffCommentsUserCard({ payload }: Props) {
  *  block style. Falls back to plain `<pre>` while loading or when the
  *  language can't be resolved. See `lib/snippetHighlighter.ts`. */
 function HighlightedSnippet({ code, language, filePath }: { code: string; language?: string; filePath: string }) {
-  // Cache the highlighted html together with the input identity that
-  // produced it, and render it only while that identity matches the current
-  // inputs. This component is reused across the comment list, and a request
-  // that resolves after its inputs were superseded (its effect cleanup may
-  // not have run when the new render commits) writes an entry whose key no
-  // longer matches, so it renders inert instead of overwriting the new
-  // snippet. The theme stays out of the key so a theme switch keeps the old
-  // palette until the re-highlight lands.
+  // Keyed by the inputs that produced it, so a superseded request resolving
+  // before its effect cleanup renders nothing. Theme is left out of the key
+  // so a theme switch keeps the old palette until the re-highlight lands.
   const inputKey = `${code} ${language ?? ""} ${filePath}`;
   const [result, setResult] = useState<{ key: string; html: string } | null>(null);
   const shiki = useShikiTheme();
@@ -76,8 +71,7 @@ function HighlightedSnippet({ code, language, filePath }: { code: string; langua
         if (cancelled || !out) return;
         setResult({ key: inputKey, html: out });
       } catch {
-        // Unknown lang → fall through to plain rendering: the cached entry's
-        // key no longer matches, so nothing needs clearing.
+        // Unknown lang → fall through to plain rendering.
       }
     })();
     return () => {

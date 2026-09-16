@@ -654,14 +654,9 @@ function unwrapMarkdownFence(text: string): {
 }
 
 function HighlightedBlock({ text, language, maxLines = 20 }: { text: string; language?: string; maxLines?: number }) {
-  // Cache the highlighted html together with the input identity that
-  // produced it, and render it only while that identity matches the current
-  // inputs. A request that resolves after its inputs were superseded (its
-  // effect cleanup may not have run when the new render commits) writes an
-  // entry whose key no longer matches, so it renders inert instead of
-  // overwriting the new content (e.g. a Read card reused for an
-  // extensionless file). The theme stays out of the key so a theme switch
-  // keeps the old palette until the re-highlight lands.
+  // Keyed by the inputs that produced it, so a superseded request resolving
+  // before its effect cleanup renders nothing. Theme is left out of the key
+  // so a theme switch keeps the old palette until the re-highlight lands.
   const [result, setResult] = useState<{ key: string; html: string } | null>(null);
   const [showAll, setShowAll] = useState(false);
   const shiki = useShikiTheme();
@@ -692,8 +687,7 @@ function HighlightedBlock({ text, language, maxLines = 20 }: { text: string; lan
         if (cancelled || !out) return;
         setResult({ key: inputKey, html: out });
       } catch {
-        // Unknown language → fall back to plain: the cached entry's key no
-        // longer matches, so nothing needs clearing.
+        // Unknown language → fall back to plain.
       }
     })();
     return () => {
