@@ -878,14 +878,21 @@ fn can_prove_mounts(
 }
 
 /// The host path an `extra_volumes` entry contributes to the exposure scan, or
-/// `None` for a named volume ("cache:/data") or a relative source: neither is a
-/// host path, so neither can alias the absolute recovery namespace, and feeding
-/// one to `canonical_expected_path` would wrongly fail every launch and
-/// migration.
+/// `None` for a named volume ("cache:/data"): a name is not a host path and
+/// feeding it to `canonical_expected_path` would wrongly fail every launch and
+/// migration. A source that starts with `.` is not a name: the runtime resolves
+/// it against this process's current directory and binds that path, so it is a
+/// host path and can reach the recovery namespace.
 fn extra_volume_host_source(entry: &str) -> Option<PathBuf> {
     let (source, _) = entry.split_once(':')?;
     let source = PathBuf::from(source);
-    source.is_absolute().then_some(source)
+    if source.is_absolute() {
+        return Some(source);
+    }
+    if !source.as_os_str().as_encoded_bytes().starts_with(b".") {
+        return None;
+    }
+    std::env::current_dir().ok().map(|cwd| cwd.join(&source))
 }
 
 fn live_bind_sources(id: &str) -> Result<Vec<PathBuf>> {
@@ -1221,21 +1228,23 @@ fn stage_receipt(
 /// journal to `Planned`, so the next pass seeds from a source it has proven
 /// stopped instead of publishing content a container may have written to.
 fn discard_stage(app: &Path, receipt: &mut Receipt, path: &Path) -> Result<()> {
-    // A part renamed into place but not certified is mid-publication, not a
-    // fresh seed, and its stage is what the resume path needs. A certificate is
-    // what tells the two apart for a part that was already owned; for a part
-    // this transaction renamed, the root holding the staged identity says the
-    // rename happened even when the crash landed before the journal recorded it.
+    // A part whose root no longer holds what it was planned from, or whose
+    // owned root is no longer certified, has already begun publishing: the
+    // retention rename, the stage rename, and the journal write that records
+    // them are three steps a crash can separate, and the stage is what the
+    // resume path needs in every one of those states.
     let mut mid_publication = false;
     for part in &receipt.roots {
-        let renamed_into_place = part.original.is_some()
-            && part.published.is_none()
-            && part.staged.is_some()
-            && identity(&part.root.path)? == part.staged;
-        if renamed_into_place
-            || (part.published.is_some()
-                && owned_root(app, &receipt.instance, &part.root.path)?.is_none())
-        {
+        let renamed = match &part.original {
+            Some(original) => {
+                part.published.is_none() && identity(&part.root.path)?.as_ref() != Some(original)
+            }
+            None => {
+                part.published.is_some()
+                    && owned_root(app, &receipt.instance, &part.root.path)?.is_none()
+            }
+        };
+        if renamed {
             mid_publication = true;
             break;
         }
@@ -2091,14 +2100,21 @@ mod tests {
     /// check. Feeding a named volume to `canonical_expected_path` used to fail
     /// every launch and migration.
     #[test]
-    fn only_absolute_extra_volume_sources_enter_the_exposure_scan() {
+    fn only_host_path_extra_volume_sources_enter_the_exposure_scan() {
         assert_eq!(extra_volume_host_source("cache:/data"), None);
-        assert_eq!(extra_volume_host_source("./rel:/data"), None);
         assert_eq!(extra_volume_host_source("no-colon"), None);
         assert_eq!(
             extra_volume_host_source("/abs/host:/data:ro"),
             Some(PathBuf::from("/abs/host"))
         );
+        // A dot-prefixed source is not a named volume: the runtime resolves it
+        // against this process's directory, so it belongs in the overlap check.
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            extra_volume_host_source("./rel:/data"),
+            Some(cwd.join("./rel"))
+        );
+        assert_eq!(extra_volume_host_source(".:/data"), Some(cwd.join(".")));
     }
 
     /// A side row that resolves the moved store through its ACP session id
@@ -2703,6 +2719,52 @@ mod tests {
             read_receipt(&path).unwrap().unwrap().phase,
             Phase::Staged,
             "a rename the journal has not recorded is still mid-publication"
+        );
+    }
+
+    /// The window's other sub-state: the retention rename has already moved the
+    /// root into the recovery namespace while the stage is still there.
+    /// Discarding the stage would leave every later pass refusing the store with
+    /// "native content root changed before staging".
+    #[test]
+    #[serial_test::serial]
+    fn a_root_already_retained_is_not_a_fresh_seed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let home = dirs::home_dir().unwrap();
+        let app = crate::session::get_app_dir().unwrap();
+        let instance = crate::session::Instance::new("codex", temporary.path().to_str().unwrap());
+        let config = crate::session::Config::default();
+        let roots = container_config::sandbox_content_roots(
+            "codex",
+            None,
+            &config.session,
+            &home,
+            &instance.id,
+        )
+        .unwrap();
+        let root = &roots[0].path;
+        fs::create_dir_all(root.join("sessions")).unwrap();
+        fs::write(root.join("sessions/original.jsonl"), b"PRIVATE").unwrap();
+        let mut row = serde_json::to_value(&instance).unwrap();
+        row["sandbox_info"] = serde_json::json!({
+            "enabled": true,
+            "image": "img",
+            "container_name": "aoe-sandbox-fixture",
+        });
+        let (path, mut receipt) = checked_receipt(&app, &row, "codex", &roots).unwrap();
+        record_retirement(&mut receipt, &row, &home, &config).unwrap();
+        stage_receipt(&app, &mut receipt, &path, &home, &config, temporary.path()).unwrap();
+        // The retention rename has run and the journal has not recorded it.
+        fs::remove_dir_all(root).unwrap();
+        assert!(receipt.roots[0].original.is_some());
+        assert!(receipt.roots[0].published.is_none());
+
+        discard_stage(&app, &mut receipt, &path).unwrap();
+        assert_eq!(
+            read_receipt(&path).unwrap().unwrap().phase,
+            Phase::Staged,
+            "the publish already began, so the stage stays for the resume path"
         );
     }
 
