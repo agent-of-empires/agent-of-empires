@@ -2500,6 +2500,13 @@
       "components": ["web/src/lib/promptRepin.ts", "web/src/components/acp/StructuredView.tsx"]
     },
     {
+      "id": "acp.submit-repins-transcript-browser",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/acp-submit-repin.spec.ts"],
+      "components": ["web/src/components/acp/StructuredView.tsx"]
+    },
+    {
       "id": "acp.mobile-jump-to-bottom",
       "kind": "mocked-playwright",
       "risk": "medium",

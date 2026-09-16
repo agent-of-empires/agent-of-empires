@@ -753,8 +753,8 @@ export interface AcpState {
    *  this prompt" as `(sessionId, promptSeq)` so the next prompt's first Stop
    *  is graceful again (#2237), the `SessionContextReset` arm treats zero
    *  as "this session never had a prompt to lose" and suppresses the re-prime
-   *  offer, and `usePromptRepin` re-engages the transcript's stick-to-bottom
-   *  on each bump seen after the socket opened (#3993). Deliberately not turn
+   *  offer, and `StructuredView` re-pins the transcript to the bottom on each
+   *  bump (`promptRepinDecision`, #3993). Deliberately not turn
    *  truth: see {@link deriveTurnActive}. */
   promptSeq: number;
   /** Real ACP-advertised modes from the agent's NewSessionResponse,

@@ -428,14 +428,9 @@ function AcpChrome({
   }, []);
   /** Tapping the mobile jump-to-bottom button: a smooth re-pin. */
   const scrollToBottom = useCallback(() => pinToBottom("smooth"), [pinToBottom]);
-  // A submitted prompt re-engages stick-to-bottom, as the CLI does. Typing
-  // grows the composer; on a fine pointer the interim resize scroll is sampled
-  // as "the user scrolled up" and the pinned intent drops, so the reply to the
-  // prompt just sent streams below the fold. Keyed on the reducer's prompt
-  // counter (one bump per prompt from any path or device) and gated on the
-  // socket having opened, so the cold-open replay is not read as a submit.
-  // The decision is the pure `promptRepinDecision` (unit-tested); this effect
-  // only carries the observed counter and performs the scroll.
+  // A new prompt re-engages stick-to-bottom, as the CLI does: on a fine pointer
+  // the composer growing while typing can drop the pinned intent. See
+  // `promptRepinDecision` for why replayed prompts do not count.
   const seenPromptSeqRef = useRef<number | null>(null);
   const localInflight = state.inflightPromptIds.length > 0;
   useEffect(() => {
