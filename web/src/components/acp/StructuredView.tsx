@@ -421,8 +421,8 @@ function AcpChrome({
   // Soft-keyboard state, so we can hold the bottom pin across the keyboard
   // open/close animation (see the effect below).
   const { keyboardOpen } = useMobileKeyboard();
-  // An explicit "stick again": set the pinned intent directly and re-pin. The
-  // programmatic scroll fires no gesture, so the sampler would not pick it up.
+  /** An explicit "stick again": set the pinned intent directly and re-pin. The
+   *  programmatic scroll fires no gesture, so the sampler would not pick it up. */
   const pinToBottom = useCallback((behavior: ScrollBehavior) => {
     const vp = viewportRef.current;
     if (!vp) return;
@@ -431,7 +431,7 @@ function AcpChrome({
     setAtBottom(true);
     vp.scrollTo({ top: vp.scrollHeight, behavior });
   }, []);
-  // Tapping the jump-to-bottom button.
+  /** Tapping the mobile jump-to-bottom button: a smooth re-pin. */
   const scrollToBottom = useCallback(() => pinToBottom("smooth"), [pinToBottom]);
   // A submitted prompt re-engages stick-to-bottom, as the CLI does. Typing
   // grows the composer; on a fine pointer the interim resize scroll is sampled
