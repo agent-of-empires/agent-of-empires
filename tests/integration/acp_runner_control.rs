@@ -277,12 +277,8 @@ fn runner_proxies_agent_requests_over_the_control_channel() {
 
 /// Read control frames until one is not a `notify`.
 ///
-/// Since #2977 the control channel carries the agent's whole event stream
-/// alongside the typed frames, in agent-stdout order. An adapter that emits
-/// `session/update` while answering a handshake step (history replay on
-/// `session/load`, for instance) therefore puts those notifications ahead of
-/// the reply, which is the ordering guarantee working as intended. Tests that
-/// want the typed frame skip past them.
+/// The control channel interleaves the agent's `session/update` stream with
+/// typed frames. Tests that want the typed frame skip past them.
 fn read_typed_frame(stream: &mut UnixStream) -> serde_json::Value {
     loop {
         let frame = read_frame(stream);
@@ -1489,7 +1485,8 @@ async fn streaming_during_reattach_does_not_overflow_pending_replay() {
     let agent = scratch.0.join("agent.py");
     // On session/new the agent mints its id and blocks until the test has
     // detached, then floods a full detached backlog and keeps streaming one
-    // update every ~2ms across the reattach handshake.
+    // update every ~2ms across the reattach handshake. The detached reverse
+    // call is answered only after the runner has read the whole backlog.
     std::fs::write(
         &agent,
         r#"import json, sys, pathlib, time
@@ -1509,6 +1506,8 @@ for line in sys.stdin:
         send({"jsonrpc":"2.0","id":msg["id"],"result":{"sessionId":sid}})
         while not trigger.exists(): time.sleep(0.01)
         for _ in range(5000): chunk("backlog")
+        send({"jsonrpc":"2.0","id":"barrier","method":"x/barrier","params":{}})
+        sys.stdin.readline()
         flooded.write_text("flooded")
         while True:
             chunk("live")
@@ -1590,8 +1589,7 @@ for line in sys.stdin:
     // With no daemon attached, flood a full detached backlog and keep
     // streaming, so the reattach faces backlog plus live traffic.
     std::fs::write(&trigger, "go").unwrap();
-    wait_for(&flooded, "detached backlog");
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for(&flooded, "runner consumed detached backlog");
 
     let mut resumed = AcpClient::attach(
         socket,

@@ -1339,14 +1339,8 @@ impl RunnerShared {
         if channel.active_attachment != Some(attachment_id) || channel.in_flight.is_some() {
             return None;
         }
-        // Announce the session identity ahead of the detached backlog. Handshake
-        // replies (including SessionReady) jump ahead of everything; otherwise
-        // hold the Persistent frames (the buffered session/update backlog and its
-        // completion) until the session is announced while attachment-scoped
-        // frames (reverse calls, prompt starts) still flow. This keeps the
-        // daemon's pre-identity buffer empty, so a reattach mid-stream commits
-        // identity before any session/update and routes the backlog plus live
-        // traffic directly instead of overflowing the replay bound. See #3937.
+        // Handshake frames go first, and Persistent frames wait for SessionReady,
+        // so the daemon never buffers unbounded pre-identity session updates.
         let announced = channel.session_announced;
         let index = channel
             .queue
