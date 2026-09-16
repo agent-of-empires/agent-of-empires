@@ -1050,6 +1050,7 @@ fn run_pass(
         .filter(|target| target.disposition == Disposition::Move)
         .count();
     let mut copied_targets = 0usize;
+    let mut announced = false;
     // Cohorts this pass copied, to be asked about once more before publishing.
     let mut copied_cohorts: Vec<&PathBuf> = Vec::new();
     for (shared, cohort) in &cohorts {
@@ -1092,9 +1093,11 @@ fn run_pass(
                 continue;
             }
             let ordinal = copied_targets + 1;
-            if ordinal == 1 {
-                // Said once, right before the first copy: this is the part
-                // that can take minutes, and the one a user may want to skip.
+            if !announced && target.disposition == Disposition::Move {
+                // Said once per pass, right before the first attempt: this is
+                // the part that can take minutes, and the one a user may want
+                // to skip. A deferred attempt does not re-announce it.
+                announced = true;
                 progress::notice(format!(
                     "Isolating agent stores for {} sandboxed session(s): each gets its own copy of the \
                      shared agent store under sandbox-v2/. Large stores take a while. To start without \
@@ -1904,6 +1907,64 @@ fn copy_tree_no_links(
     )
 }
 
+#[cfg(not(unix))]
+fn copy_tree_no_links(
+    source: &Path,
+    destination: &Path,
+    excluded_children: Option<&BTreeSet<std::ffi::OsString>>,
+    overwrite_newer: bool,
+    files_only: bool,
+    copied: &mut CopyState,
+) -> Result<()> {
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        if excluded_children.is_some_and(|excluded| excluded.contains(&entry.file_name())) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "v027 cannot safely copy source symlink on this platform: {}",
+                entry.path().display()
+            );
+        }
+        if files_only && !metadata.is_file() {
+            continue;
+        }
+        let target = destination.join(entry.file_name());
+        if metadata.is_dir() {
+            match fs::create_dir(&target) {
+                Ok(()) => {}
+                Err(error)
+                    if overwrite_newer && error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+            copy_tree_no_links(&entry.path(), &target, None, overwrite_newer, false, copied)?;
+            fs::set_permissions(&target, metadata.permissions())?;
+        } else if metadata.is_file() {
+            let should_copy = match fs::symlink_metadata(&target) {
+                Ok(existing) if overwrite_newer && existing.is_file() => {
+                    metadata.modified()? > existing.modified()?
+                }
+                // Conflicting types are not evidence that the required
+                // configuration reached the destination. Fail closed.
+                Ok(_) => bail!(
+                    "v027 copy destination has conflicting type: {}",
+                    target.display()
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Err(error) => return Err(error.into()),
+            };
+            if should_copy {
+                copied.copied_file(fs::copy(entry.path(), &target)?);
+                fs::set_permissions(&target, metadata.permissions())?;
+                super::store_fs::sync_to_drive(&fs::File::open(&target)?)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn copy_tree_from_fd(
     fd: std::os::fd::OwnedFd,
@@ -2104,64 +2165,6 @@ fn relative_symlink_stays_in_root(parent: &Path, link: &Path) -> bool {
         }
     }
     true
-}
-
-#[cfg(not(unix))]
-fn copy_tree_no_links(
-    source: &Path,
-    destination: &Path,
-    excluded_children: Option<&BTreeSet<std::ffi::OsString>>,
-    overwrite_newer: bool,
-    files_only: bool,
-    copied: &mut CopyState,
-) -> Result<()> {
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        if excluded_children.is_some_and(|excluded| excluded.contains(&entry.file_name())) {
-            continue;
-        }
-        let metadata = fs::symlink_metadata(entry.path())?;
-        if metadata.file_type().is_symlink() {
-            bail!(
-                "v027 cannot safely copy source symlink on this platform: {}",
-                entry.path().display()
-            );
-        }
-        if files_only && !metadata.is_file() {
-            continue;
-        }
-        let target = destination.join(entry.file_name());
-        if metadata.is_dir() {
-            match fs::create_dir(&target) {
-                Ok(()) => {}
-                Err(error)
-                    if overwrite_newer && error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error.into()),
-            }
-            copy_tree_no_links(&entry.path(), &target, None, overwrite_newer, false, copied)?;
-            fs::set_permissions(&target, metadata.permissions())?;
-        } else if metadata.is_file() {
-            let should_copy = match fs::symlink_metadata(&target) {
-                Ok(existing) if overwrite_newer && existing.is_file() => {
-                    metadata.modified()? > existing.modified()?
-                }
-                // Conflicting types are not evidence that the required
-                // configuration reached the destination. Fail closed.
-                Ok(_) => bail!(
-                    "v027 copy destination has conflicting type: {}",
-                    target.display()
-                ),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-                Err(error) => return Err(error.into()),
-            };
-            if should_copy {
-                copied.copied_file(fs::copy(entry.path(), &target)?);
-                fs::set_permissions(&target, metadata.permissions())?;
-                super::store_fs::sync_to_drive(&fs::File::open(&target)?)?;
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Push every directory of the staged tree to the drive. Its regular files
@@ -3833,13 +3836,12 @@ gemini = "{}"
         run_in(&app, &home, &|_| Ok(false)).unwrap();
         let rows: Value =
             serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
-        assert!(
+        assert_eq!(
             rows[0]
                 .get("sandbox_store_generation")
-                .and_then(Value::as_u64)
-                .unwrap_or(0)
-                < 2,
-            "a deferred retirement keeps its cohort pending: {rows}"
+                .and_then(Value::as_u64),
+            Some(1),
+            "a deferred retirement keeps its cohort on the pending generation: {rows}"
         );
         assert!(app.join(JOURNAL).is_file(), "the root stays pending");
         assert!(root.join(id).is_dir(), "nothing moved while it was exposed");
@@ -3911,13 +3913,12 @@ gemini = "{}"
         assert!(root.join("auth.json").is_file());
         let rows: Value =
             serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
-        assert!(
+        assert_eq!(
             rows[0]
                 .get("sandbox_store_generation")
-                .and_then(Value::as_u64)
-                .unwrap_or(0)
-                < 2,
-            "a deferred publish keeps its row pending: {rows}"
+                .and_then(Value::as_u64),
+            Some(1),
+            "a deferred publish keeps its row on the pending generation: {rows}"
         );
         assert!(app.join(JOURNAL).is_file(), "the root stays pending");
 

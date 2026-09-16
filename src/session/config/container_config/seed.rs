@@ -1365,6 +1365,16 @@ mod tests {
         fs::create_dir_all(&native).unwrap();
         std::os::unix::fs::symlink(source.join("plugins/native-state"), native.join("sessions"))
             .unwrap();
+        // A directory that does not overlap native state proves the same walk
+        // still publishes what it may, so the absence asserted below cannot be
+        // "nothing ran": the refusal is about the overlap, not about the walk.
+        // It is created before the boundary pins the source root.
+        fs::create_dir_all(source.join("authored-plugins")).unwrap();
+        fs::write(
+            source.join("authored-plugins/keep.json"),
+            b"AUTHORED_PLUGIN",
+        )
+        .unwrap();
         let mut boundary = NativeStateBoundary::for_source(&source, &active).unwrap();
         let mount = AGENT_CONFIG_MOUNTS
             .iter()
@@ -1378,14 +1388,19 @@ mod tests {
         )
         .unwrap();
         seed_directory(
-            &source.join("plugins"),
+            &source.join("authored-plugins"),
             &AnchoredDir::open(&active).unwrap(),
-            Path::new("plugins"),
+            Path::new("authored-plugins"),
             &boundary,
             true,
             ReadAccess::default(),
         )
         .unwrap();
+        assert_eq!(
+            fs::read(active.join("authored-plugins/keep.json")).unwrap(),
+            b"AUTHORED_PLUGIN",
+            "a directory clear of native state still publishes"
+        );
         assert!(
             !active.join("plugins").exists(),
             "a resource overlapping a native state directory must not export even its names"
