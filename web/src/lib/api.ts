@@ -240,6 +240,32 @@ export interface SettingsResponse {
   [key: string]: unknown;
 }
 
+export interface SystemHealthAgent {
+  id: string;
+  title: string;
+  cpu_fraction: number | null;
+  memory_bytes: number | null;
+  procs: number | null;
+  sandboxed: boolean;
+}
+
+export interface SystemHealth {
+  status: "ok" | "warn" | "critical";
+  cpu_fraction: number | null;
+  memory_used_bytes: number;
+  memory_total_bytes: number;
+  load_average: [number, number, number] | null;
+  swap_used_bytes: number;
+  swap_total_bytes: number;
+  agent_count: number;
+  proc_count: number;
+  agents: SystemHealthAgent[];
+}
+
+export function fetchSystemHealth(): Promise<SystemHealth | null> {
+  return fetchJson<SystemHealth>("/api/system/health");
+}
+
 export function fetchSettings(profile?: string): Promise<SettingsResponse | null> {
   const params = profile ? `?profile=${encodeURIComponent(profile)}` : "";
   return fetchJson<SettingsResponse>(`/api/settings${params}`);

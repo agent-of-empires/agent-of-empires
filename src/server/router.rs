@@ -156,6 +156,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             patch(api::update_project).delete(api::delete_project),
         )
         .route("/api/docker/status", get(api::docker_status))
+        .route("/api/system/health", get(api::system_health))
         // Settings + themes
         .route(
             "/api/settings",

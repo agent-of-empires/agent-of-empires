@@ -201,6 +201,10 @@ pub struct AppState {
     /// race where a candidate waiting on a `STARTUP_RECOVERY_CONCURRENCY`
     /// permit ages out of suppression and trips a phantom `Status::Error`.
     pub recovery_pending: crate::session::recovery::RecoveryPending,
+    /// Host and per-agent resource sampler behind the system-health endpoint.
+    /// Held across requests because CPU is a delta against the previous
+    /// sample: a fresh sampler reports CPU as unknown until its second tick.
+    pub(crate) metrics_sampler: tokio::sync::Mutex<crate::process::metrics::MetricsSampler>,
     /// Cached per-profile cleanup defaults for the delete dialog, with a
     /// timestamp so we re-resolve after config changes (see
     /// `CLEANUP_DEFAULTS_TTL`).

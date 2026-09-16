@@ -1340,6 +1340,78 @@ pub async fn list_groups(State(state): State<Arc<AppState>>) -> impl IntoRespons
     Json(groups)
 }
 
+/// One agent row on the health readout. Every figure is optional for the same
+/// reason as on `AgentMetric`: a sandboxed agent's numbers come from the
+/// container runtime, which may have no sample to give.
+#[derive(Serialize)]
+pub struct SystemHealthAgent {
+    pub id: String,
+    pub title: String,
+    pub cpu_fraction: Option<f64>,
+    pub memory_bytes: Option<u64>,
+    pub procs: Option<usize>,
+    pub sandboxed: bool,
+}
+
+/// Host headroom plus per-agent usage, as the system-health strip reads it.
+/// `status` is the server's own worst-of classification, so both dashboards
+/// band a reading identically rather than each re-deriving the thresholds.
+#[derive(Serialize)]
+pub struct SystemHealth {
+    pub status: &'static str,
+    pub cpu_fraction: Option<f64>,
+    pub memory_used_bytes: u64,
+    pub memory_total_bytes: u64,
+    pub load_average: Option<[f64; 3]>,
+    pub swap_used_bytes: u64,
+    pub swap_total_bytes: u64,
+    pub agent_count: usize,
+    pub proc_count: usize,
+    pub agents: Vec<SystemHealthAgent>,
+}
+
+pub async fn system_health(State(state): State<Arc<AppState>>) -> Json<SystemHealth> {
+    use crate::process::metrics::pressure_band;
+
+    let instances = state.instances.read().await.clone();
+    // Sampling walks the host process table, shells out to tmux, and may read
+    // container stats, so it runs off the async workers: a tmux stall would
+    // otherwise hold one for as long as its timeout. The sampler's lock is
+    // taken inside that work, not around it, so two concurrent polls still
+    // cannot interleave their CPU deltas and report nonsense to both.
+    let sampler_state = Arc::clone(&state);
+    let snapshot = tokio::task::spawn_blocking(move || {
+        let mut sampler = sampler_state.metrics_sampler.blocking_lock();
+        sampler.sample(&instances)
+    })
+    .await
+    .unwrap_or_default();
+
+    Json(SystemHealth {
+        status: pressure_band(&snapshot.memory).as_str(),
+        cpu_fraction: snapshot.system.cpu_fraction,
+        memory_used_bytes: snapshot.memory.used_bytes(),
+        memory_total_bytes: snapshot.memory.total_bytes,
+        load_average: snapshot.system.load_average,
+        swap_used_bytes: snapshot.system.swap_used_bytes,
+        swap_total_bytes: snapshot.system.swap_total_bytes,
+        agent_count: snapshot.counts.agents,
+        proc_count: snapshot.counts.procs,
+        agents: snapshot
+            .agents
+            .into_iter()
+            .map(|a| SystemHealthAgent {
+                id: a.id,
+                title: a.title,
+                cpu_fraction: a.cpu_fraction,
+                memory_bytes: a.rss_bytes,
+                procs: a.procs,
+                sandboxed: a.sandboxed,
+            })
+            .collect(),
+    })
+}
+
 #[derive(Serialize)]
 pub struct DockerStatus {
     pub available: bool,

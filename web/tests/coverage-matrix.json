@@ -1224,6 +1224,23 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.system-health",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/lib/__tests__/systemHealth.test.ts",
+        "src/lib/__tests__/appSettings.test.ts",
+        "src/components/__tests__/SystemHealthStrip.test.tsx"
+      ],
+      "components": [
+        "web/src/lib/systemHealth.ts",
+        "web/src/lib/sessionFlagGate.ts",
+        "web/src/lib/appSettings.ts",
+        "web/src/hooks/useSystemHealth.ts",
+        "web/src/components/SystemHealthStrip.tsx"
+      ]
+    },
+    {
       "id": "sidebar.session-color-toggle",
       "kind": "vitest",
       "risk": "low",
