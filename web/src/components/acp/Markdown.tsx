@@ -229,7 +229,9 @@ function ShikiSyntaxHighlighter({ language, code }: SyntaxHighlighterProps) {
   // Keyed by the inputs that produced it, so a superseded request resolving
   // before its effect cleanup renders nothing. Theme is left out of the key
   // so a theme switch keeps the old palette until the re-highlight lands.
-  const inputKey = `${language ?? ""} ${code}`;
+  // NUL-delimited (as the escape sequence: a raw NUL byte in source makes
+  // git treat the file as binary) so field concatenations cannot collide.
+  const inputKey = `${language ?? ""}\u0000${code}`;
   const [result, setResult] = useState<{ key: string; html: string } | null>(null);
   const shiki = useShikiTheme();
 

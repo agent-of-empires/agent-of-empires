@@ -657,6 +657,8 @@ function HighlightedBlock({ text, language, maxLines = 20 }: { text: string; lan
   // Keyed by the inputs that produced it, so a superseded request resolving
   // before its effect cleanup renders nothing. Theme is left out of the key
   // so a theme switch keeps the old palette until the re-highlight lands.
+  // NUL-delimited (as the escape sequence: a raw NUL byte in source makes
+  // git treat the file as binary) so field concatenations cannot collide.
   const [result, setResult] = useState<{ key: string; html: string } | null>(null);
   const [showAll, setShowAll] = useState(false);
   const shiki = useShikiTheme();
@@ -664,7 +666,7 @@ function HighlightedBlock({ text, language, maxLines = 20 }: { text: string; lan
   const effectiveText = unwrapped.text;
   const effectiveLang = unwrapped.lang ?? language;
   const { shown, truncated } = truncateLines(effectiveText, showAll ? 1_000_000 : maxLines);
-  const inputKey = `${effectiveLang ?? ""} ${shown}`;
+  const inputKey = `${effectiveLang ?? ""}\u0000${shown}`;
 
   // ANSI fast path: when the text carries SGR escape sequences (e.g.
   // `gls --color=always`, `git status --color=always`), Shiki's bash
