@@ -175,6 +175,7 @@ it.skipIf(process.platform !== "linux")(
           "-e",
           `const fs = require("node:fs");
 process.title = ${JSON.stringify(title)};
+fs.writeFileSync(${JSON.stringify(join(root, "runner-ready"))}, "");
 const path = ${JSON.stringify(recordPath)};
 let saved, resaved = false, missing = 0;
 setInterval(() => {
@@ -187,6 +188,11 @@ setInterval(() => {
         { detached: true, stdio: "ignore" },
       );
       runnerPid = runner.pid!;
+      // The harness matches the runner by its `ps` command line, so the record
+      // must not exist before the child has renamed itself.
+      await expect
+        .poll(() => existsSync(join(root, "runner-ready")), { timeout: 10_000, message: "fake runner renamed itself" })
+        .toBe(true);
       writeFileSync(
         recordPath,
         JSON.stringify({ pid: runnerPid, session_id: sessionId, socket_path: socketPath, generation: 7 }),
