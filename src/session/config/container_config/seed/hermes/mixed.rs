@@ -138,6 +138,9 @@ pub(in super::super) fn seed_nodes(
         }
         Err(error) => return Err(error).context("resolving native workspace configuration"),
     };
+    if super::super::original_escapes(boundary, &canonical) {
+        return Ok(());
+    }
     let workspace = open_canonical_dir(&canonical)?;
     let Some(meetings) = optional_child(&workspace, Path::new("meetings"))? else {
         return Ok(());

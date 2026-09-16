@@ -327,6 +327,14 @@ fn open_canonical_dir(path: &Path) -> Result<AnchoredDir> {
     )
 }
 
+/// Whether a resolved path leaves the store a container wrote. A retained
+/// original is that store, so a link inside it must not reach the host; a host
+/// config directory is the user's own, where their links are what they asked
+/// for and are followed as before.
+fn original_escapes(boundary: &NativeStateBoundary, canonical: &Path) -> bool {
+    boundary.stopped_original.is_some() && !canonical.starts_with(boundary.source_root.path())
+}
+
 fn canonical_source(
     path: &Path,
     boundary: &NativeStateBoundary,
@@ -342,6 +350,11 @@ fn canonical_source(
             return Ok(None);
         }
     };
+    if original_escapes(boundary, &canonical) {
+        tracing::warn!(target: "session.profile", path = %path.display(),
+        "Skipping configuration source that leaves the store it was retained from");
+        return Ok(None);
+    }
     if boundary.rejects(&canonical, directory, access) {
         tracing::warn!(target: "session.profile", path = %path.display(),
         "Skipping configuration resource overlapping native session state");
@@ -1464,6 +1477,81 @@ mod tests {
         assert_eq!(
             fs::read(host_active.join("plugins/leak.json")).unwrap(),
             b"HOST_BYTES"
+        );
+    }
+
+    #[test]
+    fn an_original_lends_no_link_out_of_itself() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let outside = temporary.path().join("outside");
+        let active = temporary.path().join("active");
+        let host = temporary.path().join("host");
+        for path in [&source, &outside, &active, &host] {
+            fs::create_dir_all(path).unwrap();
+        }
+        fs::write(outside.join("secret"), b"HOST_BYTES").unwrap();
+        fs::create_dir_all(outside.join("tree/meetings")).unwrap();
+        fs::write(outside.join("tree/inside"), b"HOST_TREE_BYTES").unwrap();
+        fs::write(
+            outside.join("tree/meetings/nodes.json"),
+            b"HOST_NODES_BYTES",
+        )
+        .unwrap();
+        fs::create_dir_all(source.join("agent")).unwrap();
+        // A declared config file, a declared directory, and the projection
+        // Hermes reads out of its own store, each pointing at the host.
+        std::os::unix::fs::symlink(outside.join("secret"), source.join("CLAUDE.md")).unwrap();
+        std::os::unix::fs::symlink(outside.join("tree"), source.join("plugins")).unwrap();
+        std::os::unix::fs::symlink(outside.join("tree"), source.join("workspace")).unwrap();
+        let mount = AGENT_CONFIG_MOUNTS
+            .iter()
+            .find(|mount| mount.tool_name == "claude")
+            .unwrap();
+        let boundary = NativeStateBoundary::for_fixture(&source, &active, mount)
+            .unwrap()
+            .for_stopped_original(&host, mount)
+            .unwrap();
+        sync_agent_config(
+            &source,
+            &active,
+            &["CLAUDE.md"],
+            &[],
+            &["plugins"],
+            &[],
+            &boundary,
+        )
+        .unwrap();
+        assert!(
+            !active.join("CLAUDE.md").exists(),
+            "a declared file that leaves the store must not be published"
+        );
+        assert!(
+            !active.join("plugins").exists(),
+            "a declared directory that leaves the store must not be walked"
+        );
+
+        let hermes = AGENT_CONFIG_MOUNTS
+            .iter()
+            .find(|mount| mount.tool_name == "hermes")
+            .unwrap();
+        let hermes_active = temporary.path().join("hermes-active");
+        fs::create_dir_all(&hermes_active).unwrap();
+        let hermes_boundary = NativeStateBoundary::for_fixture(&source, &hermes_active, hermes)
+            .unwrap()
+            .for_stopped_original(&host, hermes)
+            .unwrap();
+        let scope = hermes_boundary.hermes.source.unwrap();
+        hermes::seed_nodes(
+            &hermes_boundary,
+            scope,
+            &hermes_boundary.source_root,
+            &AnchoredDir::open(&hermes_active).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !hermes_active.join("workspace").exists(),
+            "a projection that leaves the store must not be published"
         );
     }
 
