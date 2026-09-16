@@ -866,6 +866,28 @@ fn row_roots(
     container_config::sandbox_content_roots(tool, detect, &config.session, home, id)
 }
 
+/// Whether the same-kernel inode proof can authenticate a running container's
+/// mounts. It needs a running container on a kernel-sharing host with no VM
+/// runtime handler; otherwise the declared bind sources are the overlap
+/// evidence and the proof is skipped rather than failing the caller.
+fn can_prove_mounts(
+    inspected: &crate::containers::InspectedContainer,
+    host_shares_kernel: bool,
+) -> bool {
+    inspected.running && inspected.runtime_handler.is_none() && host_shares_kernel
+}
+
+/// The host path an `extra_volumes` entry contributes to the exposure scan, or
+/// `None` for a named volume ("cache:/data") or a relative source: neither is a
+/// host path, so neither can alias the absolute recovery namespace, and feeding
+/// one to `canonical_expected_path` would wrongly fail every launch and
+/// migration.
+fn extra_volume_host_source(entry: &str) -> Option<PathBuf> {
+    let (source, _) = entry.split_once(':')?;
+    let source = PathBuf::from(source);
+    source.is_absolute().then_some(source)
+}
+
 fn live_bind_sources(id: &str) -> Result<Vec<PathBuf>> {
     use std::os::unix::fs::MetadataExt;
     let mut container = crate::containers::DockerContainer::from_session_id(id);
@@ -875,15 +897,24 @@ fn live_bind_sources(id: &str) -> Result<Vec<PathBuf>> {
     let inspected = container
         .inspect()?
         .context("runtime cannot establish recovery mount isolation")?;
-    if inspected.runtime_handler.is_some() {
-        bail!("Apple VM mount lifetime is unproven; native content isolation remains pending");
-    }
     let sources: Vec<_> = inspected
         .bind_mounts
         .iter()
         .map(|mount| PathBuf::from(&mount.host_path))
         .collect();
     if !inspected.running {
+        return Ok(sources);
+    }
+    // The inode proof below authenticates a mount only when the container
+    // shares the host kernel. A VM-backed runtime (Docker Desktop, OrbStack, a
+    // Podman machine) or Apple `container` runs its own kernel, so its boot_id
+    // can never match the host's, and a non-Linux host cannot share a kernel
+    // with any container. In those cases the declared bind sources are the
+    // authoritative overlap evidence, which the caller still canonicalizes
+    // against the recovery namespace.
+    if sources.is_empty()
+        || !can_prove_mounts(&inspected, crate::process::host_shares_container_kernel())
+    {
         return Ok(sources);
     }
     if !inspected.opaque_mounts.is_empty() {
@@ -907,9 +938,6 @@ fn live_bind_sources(id: &str) -> Result<Vec<PathBuf>> {
             .iter()
             .map(|mount| mount.container_path.clone()),
     );
-    if sources.is_empty() {
-        return Ok(sources);
-    }
     let argv = container.build_exec_argv("", &command);
     let (program, arguments) = argv
         .split_first()
@@ -927,14 +955,16 @@ fn live_bind_sources(id: &str) -> Result<Vec<PathBuf>> {
     let text = std::str::from_utf8(&output.stdout)?;
     let mut lines = text.lines();
     // A bind-mounted echo of the host UUID must not authenticate a VM. The
-    // UUID must be read from genuine procfs in this same execution envelope.
+    // UUID must be read from genuine procfs in this same execution envelope. A
+    // mismatch means a VM or remote daemon sat behind a local-looking socket
+    // after all, so fall back to the declared sources rather than refusing.
     if lines.next() != Some("9fa0")
         || lines
             .next()
             .and_then(|value| uuid::Uuid::parse_str(value).ok())
             != Some(boot)
     {
-        bail!("live sandbox {id} is not proven to share the host kernel; defer native content isolation");
+        return Ok(sources);
     }
     for (source, expected) in sources.iter().zip(before) {
         let observed =
@@ -995,8 +1025,8 @@ fn recovery_exposure(
                 }
             };
             for entry in &config.sandbox.extra_volumes {
-                if let Some((source, _)) = entry.split_once(':') {
-                    sources.push(PathBuf::from(source));
+                if let Some(source) = extra_volume_host_source(entry) {
+                    sources.push(source);
                 }
             }
             if let Some(project) = row.get("project_path").and_then(Value::as_str) {
@@ -1497,7 +1527,7 @@ fn record_reset_in(
     if resolves_same_store != roots.iter().map(|root| root.path.clone()).collect() {
         return Ok(());
     }
-    let Some(receipt) = retired_receipt(app, id, tool, current)? else {
+    let Some(receipt) = retired_receipt(app, id, tool, current, &current_roots)? else {
         return Ok(());
     };
     let before = current.clone();
@@ -1510,7 +1540,13 @@ fn record_reset_in(
 
 /// The journal entry that retired this row's context, read from beside the live
 /// receipt because a completed transaction archives its own.
-fn retired_receipt(app: &Path, instance: &str, tool: &str, row: &Value) -> Result<Option<Receipt>> {
+fn retired_receipt(
+    app: &Path,
+    instance: &str,
+    tool: &str,
+    row: &Value,
+    roots: &[ContentRoot],
+) -> Result<Option<Receipt>> {
     let path = receipt_path(app, instance, tool)?;
     let mut receipts = Vec::new();
     if let Some(receipt) = read_receipt(&path)? {
@@ -1540,20 +1576,43 @@ fn retired_receipt(app: &Path, instance: &str, tool: &str, row: &Value) -> Resul
             receipts.push(receipt);
         }
     }
+    let expected: BTreeSet<_> = roots.iter().map(|root| root.path.clone()).collect();
     Ok(receipts.into_iter().find(|receipt| {
-        receipt.phase == Phase::Committed
-            && !receipt.retired_tools.is_empty()
-            && receipt.retired_identity.get("id") == row.get("id")
-            && row
-                .get("agent_session_id")
+        if receipt.phase != Phase::Committed
+            || receipt.retired_tools.is_empty()
+            || receipt.retired_identity.get("id") != row.get("id")
+        {
+            return false;
+        }
+        // The archived receipt must belong to the roots this row resolves now:
+        // once a store changes to other already-certified roots, an older
+        // receipt would otherwise attach the wrong transaction's recovery paths.
+        let receipt_roots: BTreeSet<_> = receipt
+            .roots
+            .iter()
+            .map(|part| part.root.path.clone())
+            .collect();
+        if receipt_roots != expected {
+            return false;
+        }
+        // The terminal lane keys on the native session id; the structured lane
+        // keys on the ACP session id and fork state. Match either identity
+        // independently so an ACP-only side row (no native id) still resets.
+        let matches_field = |field: &str| {
+            row.get(field)
                 .filter(|value| !value.is_null())
                 .is_some_and(|current| {
                     receipt
                         .retired_identity
-                        .get("agent_session_id")
+                        .get(field)
                         .filter(|value| !value.is_null())
                         == Some(current)
                 })
+        };
+        let terminal = matches_field("agent_session_id");
+        let structured = matches_field("acp_session_id")
+            && row.get("fork_pending") == receipt.retired_identity.get("fork_pending");
+        terminal || structured
     }))
 }
 
@@ -1996,6 +2055,201 @@ pub(crate) fn guard_preparation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The same-kernel mount proof runs only for a running container on a
+    /// kernel-sharing host with no VM runtime handler. A VM-backed runtime
+    /// (Docker Desktop, OrbStack, a Podman machine), Apple `container`, or a
+    /// non-Linux host cannot be proven, so its declared bind sources are trusted
+    /// rather than failing a new session because a sibling sandbox exists.
+    #[test]
+    fn mounts_are_provable_only_on_a_kernel_sharing_native_runtime() {
+        use crate::containers::InspectedContainer;
+        let inspected = |running: bool, handler: Option<&str>| InspectedContainer {
+            id: "c".into(),
+            running,
+            bind_mounts: Vec::new(),
+            opaque_mounts: Vec::new(),
+            runtime_handler: handler.map(str::to_owned),
+        };
+        assert!(can_prove_mounts(&inspected(true, None), true));
+        assert!(!can_prove_mounts(
+            &inspected(true, Some("container-runtime-linux")),
+            true
+        ));
+        assert!(!can_prove_mounts(&inspected(true, None), false));
+        assert!(!can_prove_mounts(&inspected(false, None), true));
+    }
+
+    /// A named volume or a relative source is not a host path, so it is dropped
+    /// from the exposure scan; an absolute host source is kept for the overlap
+    /// check. Feeding a named volume to `canonical_expected_path` used to fail
+    /// every launch and migration.
+    #[test]
+    fn only_absolute_extra_volume_sources_enter_the_exposure_scan() {
+        assert_eq!(extra_volume_host_source("cache:/data"), None);
+        assert_eq!(extra_volume_host_source("./rel:/data"), None);
+        assert_eq!(extra_volume_host_source("no-colon"), None);
+        assert_eq!(
+            extra_volume_host_source("/abs/host:/data:ro"),
+            Some(PathBuf::from("/abs/host"))
+        );
+    }
+
+    /// A side row that resolves the moved store through its ACP session id
+    /// alone, with no native session id, must still be reset: the structured
+    /// identity is matched independently of the terminal one, or that row keeps
+    /// resuming the retired adapter context.
+    #[test]
+    #[serial_test::serial]
+    fn an_acp_only_side_row_records_the_retired_structured_context() {
+        let temporary = tempfile::tempdir().unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let home = dirs::home_dir().unwrap();
+        let app = crate::session::get_app_dir().unwrap();
+        let project = temporary.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let mut instance = crate::session::Instance::new("codex", project.to_str().unwrap());
+        instance.tool = "codex".to_owned();
+        // ACP-only: a structured lane with no native session id.
+        instance.acp_session_id = Some("retired-adapter-context".to_owned());
+        let config = crate::session::Config::default();
+        let roots = container_config::sandbox_content_roots(
+            "codex",
+            None,
+            &config.session,
+            &home,
+            &instance.id,
+        )
+        .unwrap();
+        let root = &roots[0].path;
+        fs::create_dir_all(root.join("sessions")).unwrap();
+        fs::write(
+            root.join("sessions/original.jsonl"),
+            b"PRIVATE_ORIGINAL_CONTEXT",
+        )
+        .unwrap();
+        let mut row = serde_json::to_value(&instance).unwrap();
+        row["sandbox_info"] = serde_json::json!({
+            "enabled": true,
+            "image": "img",
+            "container_name": "aoe-sandbox-fixture",
+        });
+        let main = app.join("sessions.json");
+        fs::write(&main, serde_json::to_vec(&vec![row.clone()]).unwrap()).unwrap();
+        let side = app.join("profiles/side/sessions.json");
+        fs::create_dir_all(side.parent().unwrap()).unwrap();
+        fs::write(&side, serde_json::to_vec(&vec![row]).unwrap()).unwrap();
+
+        for registry in [&main, &side] {
+            assert!(
+                migrate_target(
+                    &app,
+                    &home,
+                    (registry, &instance.id, "codex"),
+                    &|_| Ok(false),
+                    &|_| Ok(true),
+                    &|_| Ok(Vec::new()),
+                )
+                .unwrap(),
+                "each row of a moved store completes"
+            );
+        }
+        let rows: Value = serde_json::from_slice(&fs::read(&side).unwrap()).unwrap();
+        let row = &rows[0];
+        assert_eq!(
+            row.get("sandbox_content_policy").and_then(Value::as_u64),
+            Some(u64::from(CONTENT_POLICY)),
+            "the ACP-only side row was not reset: {row}"
+        );
+        let retired_structured: Vec<&str> = row
+            .get("sandbox_content_resets")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|reset| reset.get("retired_structured").and_then(Value::as_array))
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            retired_structured.contains(&"retired-adapter-context"),
+            "the retired adapter context is not recorded on the side row: {row}"
+        );
+    }
+
+    /// With more than one archived transaction for the same identity, the reset
+    /// must bind to the receipt whose roots the row resolves now, or a store
+    /// change to other already-certified roots would attach the wrong
+    /// transaction's recovery paths.
+    #[test]
+    #[serial_test::serial]
+    fn a_retired_receipt_binds_to_the_current_content_roots() {
+        let temporary = tempfile::tempdir().unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let home = dirs::home_dir().unwrap();
+        let app = crate::session::get_app_dir().unwrap();
+        let instance = crate::session::Instance::new("codex", temporary.path().to_str().unwrap());
+        let mut row = serde_json::to_value(&instance).unwrap();
+        row["tool"] = "codex".into();
+        row["agent_session_id"] = "old-native-context".into();
+        let config = crate::session::Config::default();
+        let current = container_config::sandbox_content_roots(
+            "codex",
+            None,
+            &config.session,
+            &home,
+            &instance.id,
+        )
+        .unwrap();
+        let other = vec![ContentRoot {
+            path: temporary.path().join("other-roots"),
+            host: temporary.path().to_path_buf(),
+            roles: current[0].roles.clone(),
+        }];
+        let make = |transaction: &str, roots: &[ContentRoot]| Receipt {
+            policy: CONTENT_POLICY,
+            instance: instance.id.clone(),
+            tool: "codex".to_owned(),
+            transaction: transaction.to_owned(),
+            roots: roots
+                .iter()
+                .map(|root| RootTransition {
+                    root: root.clone(),
+                    stage: root.path.join("stage"),
+                    recovery: root.path.join("recovery"),
+                    original: Some(Identity {
+                        device: 1,
+                        inode: 2,
+                    }),
+                    staged: None,
+                    published: None,
+                })
+                .collect(),
+            phase: Phase::Committed,
+            retired_identity: row.clone(),
+            retired_tools: std::collections::BTreeMap::from([(
+                "codex".to_owned(),
+                "codex".to_owned(),
+            )]),
+        };
+        let base = receipt_path(&app, &instance.id, "codex").unwrap();
+        archive_receipt(&base, &make("txn-other", &other)).unwrap();
+        archive_receipt(&base, &make("txn-current", &current)).unwrap();
+
+        assert_eq!(
+            retired_receipt(&app, &instance.id, "codex", &row, &current)
+                .unwrap()
+                .map(|receipt| receipt.transaction),
+            Some("txn-current".to_owned()),
+            "the receipt bound to the current roots is selected"
+        );
+        assert_eq!(
+            retired_receipt(&app, &instance.id, "codex", &row, &other)
+                .unwrap()
+                .map(|receipt| receipt.transaction),
+            Some("txn-other".to_owned()),
+            "each roots set selects only its own archive"
+        );
+    }
 
     /// A live mount that reaches the recovery namespace defers retention, and
     /// the caller has to be able to tell that from "nothing to retain", or the

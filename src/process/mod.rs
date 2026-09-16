@@ -355,6 +355,15 @@ pub fn boot_id() -> Option<String> {
     }
 }
 
+/// Whether a locally launched container can run on this host's own kernel, so
+/// the boot_id/inode mount proof in the sandbox content migration can be
+/// established. Only a Linux host runs containers on its own kernel; macOS and
+/// every other platform run them inside a VM whose kernel identity never
+/// matches the host's, so the proof is skipped and declared mounts are trusted.
+pub fn host_shares_container_kernel() -> bool {
+    cfg!(target_os = "linux")
+}
+
 /// The parent pid and `argv[0]` of `pid`, or `None` when it cannot be read.
 pub fn parent_and_argv0(pid: u32) -> Option<(u32, String)> {
     #[cfg(target_os = "linux")]
