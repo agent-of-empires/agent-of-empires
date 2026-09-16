@@ -1497,7 +1497,9 @@ export async function acpEnable(sessionId: string): Promise<ViewSwitchResponse |
 }
 
 /** Switch a session back to a terminal (POST /acp/disable). A claude session's
- *  conversation continues via `claude --resume`; other agents restart fresh.
+ *  conversation continues via `claude --resume` when AoE resolves the shared
+ *  native store; an unresolvable or worker-mismatched store returns 409 with
+ *  `set-session-id --store` recovery guidance. Other agents restart fresh.
  *  Resolves with the updated view or null on non-2xx. */
 export async function acpDisable(sessionId: string): Promise<ViewSwitchResponse | null> {
   return fetchJson<ViewSwitchResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/acp/disable`, {

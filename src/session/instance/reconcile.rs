@@ -125,7 +125,9 @@ impl Instance {
             SidWrite::Applied => {
                 self.set_agent_conversation(Some(observation.sid), binding, None);
             }
-            SidWrite::Skipped => {
+            // A pinned-foreign publication is a deliberate non-write; like a
+            // divergence skip, it carries no update worth reconciling.
+            SidWrite::Skipped | SidWrite::PinnedForeign => {
                 // Peer wrote between reconcile and CAS; reload to converge.
                 self.reconcile_from_disk();
             }

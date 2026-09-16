@@ -544,9 +544,14 @@ impl Instance {
     /// a store the worker never wrote to, so it needs the user to name the
     /// store explicitly.
     fn resolved_handoff_binding(&self, sid: &str) -> Option<ConversationBinding> {
-        let execution = self
-            .resolve_native_execution(Some((sid, None, true)))
-            .ok()?;
+        let execution = match self.resolve_native_execution(Some((sid, None, true))) {
+            Ok(execution) => execution,
+            Err(error) => {
+                tracing::debug!(target: "session.store", instance = %self.id, sid = %sid,
+                    "structured-view handoff cannot resolve its native execution: {error:#}");
+                return None;
+            }
+        };
         if execution.binding.agent != "claude" {
             return None;
         }

@@ -492,3 +492,55 @@ impl ContainerExecutionSnapshot {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::ContainerRuntimeName;
+
+    fn snapshot(local_mounts: bool) -> ContainerExecutionSnapshot {
+        ContainerExecutionSnapshot {
+            runtime: RuntimeExecutionSnapshot {
+                kind: ContainerRuntimeName::Docker,
+                program: std::path::PathBuf::from("docker"),
+                cwd: std::path::PathBuf::from("/tmp"),
+                endpoint: String::new(),
+                local_mounts,
+                routing: Vec::new(),
+            },
+            name: "aoe-test".into(),
+            id: "container-id".into(),
+            mounts: vec![super::super::VolumeMount {
+                host_path: "/host/project".into(),
+                container_path: "/workspace/project".into(),
+                read_only: false,
+            }],
+            shadow_mounts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn host_path_requires_local_mounts() {
+        let target = std::path::Path::new("/workspace/project/src/main.rs");
+        assert_eq!(
+            snapshot(true).host_path(target, false),
+            Some(std::path::PathBuf::from("/host/project/src/main.rs"))
+        );
+        assert_eq!(snapshot(false).host_path(target, false), None);
+    }
+
+    #[test]
+    fn physical_path_names_remote_and_local_projections() {
+        let (domain, _) =
+            snapshot(true).physical_path(std::path::Path::new("/workspace/project/src/main.rs"));
+        assert_eq!(domain, "host");
+        let (domain, path) =
+            snapshot(false).physical_path(std::path::Path::new("/workspace/project/src/main.rs"));
+        assert!(domain.starts_with("runtime:"));
+        assert_eq!(path, std::path::PathBuf::from("/host/project/src/main.rs"));
+        let (domain, path) =
+            snapshot(true).physical_path(std::path::Path::new("/unmapped/file.txt"));
+        assert!(domain.starts_with("container:"));
+        assert_eq!(path, std::path::PathBuf::from("/unmapped/file.txt"));
+    }
+}

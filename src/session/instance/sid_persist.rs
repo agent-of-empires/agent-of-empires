@@ -1,7 +1,6 @@
 //! CAS-guarded persistence of `agent_session_id` and `resume_intent`.
 
 use super::*;
-
 /// Outcome of a CAS-guarded `agent_session_id` or `resume_intent` write.
 #[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,6 +12,30 @@ pub(crate) enum SidWrite {
     Skipped,
     /// I/O failure or row gone from disk; in-memory mirror is unchanged.
     Failed,
+    /// Deterministic refusal, not a race: the row pins a different
+    /// conversation (`ResumeIntent::Use`), so this publication must not
+    /// overwrite it. Teardown may proceed without touching the pin.
+    PinnedForeign,
+}
+
+impl SidWrite {
+    /// Reclassify a deterministic pin refusal as a non-fatal flush outcome.
+    /// Only a `Skipped` against a row whose explicit pin names a different
+    /// conversation qualifies: a failed write, a CAS divergence, a fork
+    /// intent, an exclusion or a peer conflict stays untouched.
+    pub(crate) fn or_pinned_foreign_publication(
+        self,
+        sid: &str,
+        row: &Instance,
+    ) -> Option<SidWrite> {
+        if self != SidWrite::Skipped {
+            return Some(self);
+        }
+        match &row.resume_intent {
+            ResumeIntent::Use(pinned) if pinned != sid => Some(SidWrite::PinnedForeign),
+            _ => Some(SidWrite::Skipped),
+        }
+    }
 }
 
 /// Caller contract for `persist_session_id`: whether to publish the
@@ -371,7 +394,10 @@ impl Instance {
                 }
                 SidPersistOutcome::Published
             }
-            Ok(SidWrite::Skipped) => match storage.load() {
+            // PinnedForeign can only be produced by or_pinned_foreign_publication;
+            // these storage-update closures never emit it, so it shares the
+            // divergence path without changing behavior.
+            Ok(SidWrite::Skipped) | Ok(SidWrite::PinnedForeign) => match storage.load() {
                 Ok(insts) => match insts.into_iter().find(|i| i.id == self.id) {
                     Some(disk) => {
                         self.adopt_conversation_state(disk.conversation_state());

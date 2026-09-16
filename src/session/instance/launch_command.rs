@@ -481,7 +481,32 @@ impl Instance {
                     Some(execution)
                 }
                 Err(error) if managed => return Err(error),
-                Err(_) => None,
+                Err(_) => {
+                    // Fail fast on argv alone: an unsupported user argument is
+                    // known before any native I/O or namespace attestation, so
+                    // surface it at creation instead of discovering it only at
+                    // the first managed restart. Only a resolvable agent gets
+                    // this check: an undeclared wrapper has nothing managed to
+                    // validate against, and stays swallowed for its host
+                    // single-shot launch. Namespace and auth errors stay
+                    // swallowed as well: they govern managed resume and fork.
+                    // The check returns `()` on purpose: it must not feed the
+                    // `execution` used below, or a namespace refusal would
+                    // poison a launch the namespace gates deliberately leave
+                    // unmanaged.
+                    if let Ok(agent) = Self::execution_agent_for(
+                        &self.tool,
+                        self.get_tool_command(),
+                        &crate::session::config::repo_config::resolve_config_with_repo(
+                            &self.effective_profile(),
+                            std::path::Path::new(&self.project_path),
+                        )?
+                        .session,
+                    ) {
+                        self.managed_user_argv(agent)?;
+                    }
+                    None
+                }
             };
             let prior_canonical = if let Some(target) = execution
                 .as_ref()
@@ -2371,5 +2396,35 @@ mod tests {
         assert!(!cmd_str.contains("env -u NO_COLOR"));
         assert!(!cmd_str.contains("TERM=xterm-256color"));
         assert!(!cmd_str.contains("COLORTERM=truecolor"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn unsupported_managed_argument_fails_before_first_managed_restart() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let _isolation = crate::session::test_support::isolate_app_dir_at(home.path());
+        let program = home.path().join("claude");
+        std::fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut instance = Instance::new("argv-fail-fast", home.path().to_str().unwrap());
+        instance.tool = "claude".into();
+        instance.command = "claude".into();
+        instance.extra_args = "--add-dir /tmp/elsewhere".into();
+        instance.pending_host_env = vec![
+            (
+                "PATH".into(),
+                format!("{}:/usr/bin:/bin", home.path().display()),
+            ),
+            ("HOME".into(), home.path().display().to_string()),
+        ];
+        let error = match instance.prepare_launch_command(instance.conversation_state()) {
+            Ok(_) => panic!("unsupported argv must fail at creation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("argument --add-dir is not supported for a managed"),
+            "unsupported argv must fail at creation, got: {error}"
+        );
     }
 }

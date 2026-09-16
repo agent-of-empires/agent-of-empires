@@ -354,8 +354,7 @@ fn drain_and_persist_session_ids_inner(
                 acknowledge_poller_observation_for(instances, &update.id, &update.observation);
                 to_apply.push(update);
             }
-            SidWrite::Skipped => {
-                request_poller_retry(instances, &update.id);
+            SidWrite::Skipped | SidWrite::PinnedForeign => {
                 if let Some(rb) = reload_skipped_from_disk(&update.profile, &update.id, file_watch)
                 {
                     if !update.confirms_omp_pin

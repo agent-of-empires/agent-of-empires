@@ -1205,6 +1205,10 @@ impl Instance {
                 vec![root]
             }
             "codex" => {
+                // A host single-shot launch is deliberately left unmanaged:
+                // the refusal below only governs managed resume and fork, where
+                // an unattested preference surface could redirect the
+                // conversation this pin claims to continue.
                 anyhow::ensure!(inputs.container.is_some() || !crate::process::HAS_CODEX_MANAGED_PREFERENCES, "Codex managed preferences cannot be attested by the local file contract");
                 for key in ["CODEX_EXEC_SERVER_URL", "OPENAI_FEDERATION_RULE_ID", "OPENAI_IDENTITY_TOKEN_FILE", "OPENAI_WORKLOAD_IDENTITY_CONTEXT"] {
                     anyhow::ensure!(value(key).is_none(), "managed Codex does not support {key}");
@@ -1766,10 +1770,6 @@ impl Instance {
         // yet, so a launch whose context moved (a worktree or workspace
         // conversion) rebinds it instead of failing. A known conversation still
         // has to match this launch exactly.
-        // An id AoE preallocated for this session has no conversation behind it
-        // yet, so a launch whose context moved (a worktree or workspace
-        // conversion) rebinds it instead of failing. A known conversation still
-        // has to match this launch exactly.
         anyhow::ensure!(
             binding
                 .execution
@@ -1806,6 +1806,7 @@ pub(super) fn validate_managed_arguments(
                 &[
                     "--dangerously-skip-permissions",
                     "--allow-dangerously-skip-permissions",
+                    "--verbose",
                 ],
             ),
             "codex" => (
@@ -1825,11 +1826,17 @@ pub(super) fn validate_managed_arguments(
                     "--yolo",
                     "--search",
                     "--no-alt-screen",
+                    "--verbose",
                 ],
             ),
             "opencode" => (
                 &["--model", "-m", "--agent", "--prompt"],
-                &["--auto", "--yolo", "--dangerously-skip-permissions"],
+                &[
+                    "--auto",
+                    "--yolo",
+                    "--dangerously-skip-permissions",
+                    "--verbose",
+                ],
             ),
             "omp" => (
                 &[
@@ -1843,7 +1850,7 @@ pub(super) fn validate_managed_arguments(
                     "--profile",
                     "--cwd",
                 ],
-                &["--yolo", "--dangerously-skip-permissions"],
+                &["--yolo", "--dangerously-skip-permissions", "--verbose"],
             ),
             "prime-agent" => (
                 &[
@@ -1860,6 +1867,7 @@ pub(super) fn validate_managed_arguments(
                     "--dangerously-skip-permissions",
                     "--allow-all-tools",
                     "--trust-all-tools",
+                    "--verbose",
                 ],
             ),
             _ => (
@@ -1876,6 +1884,7 @@ pub(super) fn validate_managed_arguments(
                     "--dangerously-skip-permissions",
                     "--allow-all-tools",
                     "--trust-all-tools",
+                    "--verbose",
                 ],
             ),
         };
@@ -2342,5 +2351,20 @@ mod tests {
         let cycle = root.path().join("cycle");
         std::os::unix::fs::symlink(&cycle, &cycle).unwrap();
         assert!(inputs.canonical_path(&cycle).is_err());
+    }
+
+    #[test]
+    fn managed_verbose_flag_is_allowed_without_namespace_effect() {
+        for name in ["claude", "codex", "opencode", "omp", "prime-agent", "kimi"] {
+            let agent = crate::agents::get_agent(name).unwrap();
+            assert!(
+                validate_managed_arguments(agent, &[String::from("--verbose")]).is_ok(),
+                "{name} must accept a bare verbosity flag"
+            );
+            assert!(
+                validate_managed_arguments(agent, &[String::from("--verbose=x")]).is_err(),
+                "{name} must refuse a valued verbosity override"
+            );
+        }
     }
 }

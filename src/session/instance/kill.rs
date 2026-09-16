@@ -51,7 +51,7 @@ impl Instance {
         // `Skipped` reports a peer write between the caller's read and the CAS.
         // Retry once against the row as it now stands: a peer that committed
         // the same final observation makes this publication durable, while a
-        // pin, a fork intent or another conversation skips again.
+        // fork intent or another conversation skips again.
         // A retry that cannot read the row leaves the publication in doubt, so
         // it must fail the flush: `None` would read as "nothing to publish" and
         // let teardown delete the evidence.
@@ -61,12 +61,13 @@ impl Instance {
         let Some(retry) = rows.into_iter().find(|row| row.id == self.id) else {
             return Some(SidWrite::Failed);
         };
-        Some(super::sid_persist::persist_session_with_storage(
+        super::sid_persist::persist_session_with_storage(
             storage,
             &self.id,
             &observation,
             &retry.conversation_state(),
-        ))
+        )
+        .or_pinned_foreign_publication(observation.sid.as_str(), &retry)
     }
 
     /// The conversation this pane published last, for the final flush.
@@ -364,14 +365,25 @@ impl Instance {
                 .context("session disappeared during stop")?;
             current.source_profile = profile.clone();
             let flushed = current.flush_published_conversation(&storage);
-            anyhow::ensure!(
-                !matches!(flushed, Some(SidWrite::Failed | SidWrite::Skipped)),
-                "could not persist final conversation publication; hook evidence retained"
-            );
-            crate::session::worktree_edit::stop_sandbox_container(
+            // A pinned-foreign publication is an explicit refusal, not a
+            // doubtful write: the user pinned another conversation and this
+            // pane's id must not overwrite it. Any other failure still keeps
+            // the hook evidence, but the sandbox container always stops: the
+            // store is a host bind, not container state.
+            let container_result = crate::session::worktree_edit::stop_sandbox_container(
                 &current.id,
                 current.is_sandboxed(),
-            )
+            );
+            match flushed {
+                Some(SidWrite::PinnedForeign) => container_result,
+                Some(SidWrite::Applied) | None => container_result,
+                Some(SidWrite::Failed) | Some(SidWrite::Skipped) => {
+                    container_result?;
+                    anyhow::bail!(
+                        "could not persist final conversation publication; hook evidence retained"
+                    )
+                }
+            }
         });
         match teardown {
             Ok(()) => {
@@ -544,6 +556,138 @@ mod tests {
             storage.load().unwrap()[0].agent_session_id.as_deref(),
             Some(sid)
         );
+    }
+    #[test]
+    #[serial_test::serial]
+    fn stop_with_pinned_foreign_publication_stops_container_and_keeps_pin() {
+        // A row pinned to another conversation deterministically skips the
+        // final flush: teardown must not fail, must not overwrite the pin,
+        // and must still release the sandbox container.
+        use super::super::execution::{ActiveExecution, CaptureContext};
+        use crate::session::{ConversationBinding, ConversationProvenance, ExecutionBinding};
+        let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(home.path());
+        let profile = "hook-stop-pinned";
+        let mut inst = Instance::new("hook-pinned", home.path().to_str().unwrap());
+        inst.source_profile = profile.into();
+        inst.tool = "claude".into();
+        let pinned = "22f13307-461c-4161-908e-95a247fac760";
+        let published = "22f13307-461c-4161-908e-95a247fac761";
+        let launch = uuid::Uuid::new_v4().to_string();
+        let source = crate::hooks::ensure_instance_dir_path(&inst.id)
+            .unwrap()
+            .join(
+                crate::hooks::session_id_leaf(Some(&launch))
+                    .unwrap()
+                    .as_ref(),
+            );
+        let binding = ExecutionBinding {
+            agent: "claude".into(),
+            stores: vec![home.path().join("store")],
+            configuration: Vec::new(),
+            cwd: home.path().into(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+        };
+        inst.resume_intent = ResumeIntent::Use(pinned.into());
+        inst.resume_binding = Some(ConversationBinding {
+            session_id: pinned.into(),
+            execution: Some(binding.clone()),
+            provenance: ConversationProvenance::Asserted,
+            transcript_path: None,
+        });
+        inst.agent_session_id = Some(published.into());
+        inst.active_execution = Some(ActiveExecution {
+            launch_id: launch.clone(),
+            binding: binding.clone(),
+            capture: Some(CaptureContext::Hooks(source.clone())),
+            container: None,
+        });
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|rows, _| {
+                *rows = vec![inst.clone()];
+                Ok(())
+            })
+            .unwrap();
+        crate::hooks::write_session_id_via_guard(&inst.id, published, Some(&launch)).unwrap();
+        assert_eq!(
+            inst.flush_published_conversation(&storage),
+            Some(SidWrite::PinnedForeign)
+        );
+        let rows = storage.load().unwrap();
+        assert!(matches!(
+            &rows[0].resume_intent,
+            ResumeIntent::Use(pin) if pin == pinned
+        ));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn stop_with_pinned_binding_mismatch_stays_error() {
+        // The same pin with the observation's own sid but a divergent
+        // execution binding stays a namespace doubt: stop must fail and keep
+        // the evidence.
+        use super::super::execution::{ActiveExecution, CaptureContext};
+        use crate::session::{ConversationBinding, ConversationProvenance, ExecutionBinding};
+        let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(home.path());
+        let profile = "hook-stop-pinned-mismatch";
+        let mut inst = Instance::new("hook-pinned-mismatch", home.path().to_str().unwrap());
+        inst.source_profile = profile.into();
+        inst.tool = "claude".into();
+        let sid = "22f13307-461c-4161-908e-95a247fac770";
+        let launch = uuid::Uuid::new_v4().to_string();
+        let source = crate::hooks::ensure_instance_dir_path(&inst.id)
+            .unwrap()
+            .join(
+                crate::hooks::session_id_leaf(Some(&launch))
+                    .unwrap()
+                    .as_ref(),
+            );
+        let mut binding = ExecutionBinding {
+            agent: "claude".into(),
+            stores: vec![home.path().join("store")],
+            configuration: Vec::new(),
+            cwd: home.path().into(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+        };
+        inst.resume_intent = ResumeIntent::Use(sid.into());
+        inst.resume_binding = Some(ConversationBinding {
+            session_id: sid.into(),
+            execution: Some(binding.clone()),
+            provenance: ConversationProvenance::Asserted,
+            transcript_path: None,
+        });
+        binding.cwd = home.path().join("elsewhere");
+        inst.agent_session_id = Some(sid.into());
+        inst.agent_session_binding = Some(ConversationBinding {
+            session_id: sid.into(),
+            execution: Some(binding.clone()),
+            provenance: ConversationProvenance::Observed,
+            transcript_path: None,
+        });
+        inst.active_execution = Some(ActiveExecution {
+            launch_id: launch.clone(),
+            binding: binding.clone(),
+            capture: Some(CaptureContext::Hooks(source.clone())),
+            container: None,
+        });
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|rows, _| {
+                *rows = vec![inst.clone()];
+                Ok(())
+            })
+            .unwrap();
+        crate::hooks::write_session_id_via_guard(&inst.id, sid, Some(&launch)).unwrap();
+        assert!(matches!(
+            inst.flush_published_conversation(&storage),
+            Some(SidWrite::Skipped)
+        ));
     }
 
     #[test]

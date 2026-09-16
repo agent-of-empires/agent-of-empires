@@ -91,7 +91,7 @@ aoe session set-session-id <session-name-or-id> ""
 
 This is one-shot. The next launch starts fresh, then automatic capture takes over again when the matrix supports that environment. The abandoned conversation stays excluded in its recorded agent, store, and filesystem namespace, not in unrelated stores that happen to reuse the same ID. Legacy exclusions without a known namespace remain ID-wide.
 
-Structured-view conversations remain managed by ACP. `set-session-id` does not change their ACP ID. For a Claude terminal handoff, AoE records the native execution it resolves for the current ACP ID, so switching to terminal consumes that store; an explicit `--store` assertion names a different store instead. A handoff whose store cannot be resolved, or that the structured-view worker does not share, is refused before worker teardown, with recovery guidance. Other structured resume-target changes are rejected.
+Structured-view conversations remain managed by ACP. `set-session-id` does not change their ACP ID. For a Claude terminal handoff, AoE records the native execution it resolves for the current ACP ID, so switching to terminal consumes that store; an explicit `--store` assertion names a different store instead. A handoff whose store cannot be resolved, or that the structured-view worker does not share, is refused before worker teardown, with recovery guidance. A refusal reports only that no shared store could be proven; the underlying resolution error is logged at debug level, not in the 409. Other structured resume-target changes are rejected.
 
 ## Importing existing Claude Code sessions (web dashboard)
 

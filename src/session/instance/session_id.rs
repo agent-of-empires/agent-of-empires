@@ -1105,7 +1105,9 @@ impl Instance {
             &self.resolve_file_watch(),
         ) {
             SidWrite::Applied => self.apply_conversation_observation(&observation),
-            SidWrite::Skipped => self.reconcile_from_disk(),
+            // A pinned-foreign publication is a deliberate non-write; like a
+            // divergence skip, it carries no update worth reconciling.
+            SidWrite::Skipped | SidWrite::PinnedForeign => self.reconcile_from_disk(),
             SidWrite::Failed => {}
         }
     }
@@ -1630,7 +1632,10 @@ impl Instance {
         });
 
         match outcome {
-            Ok(write @ (SidWrite::Applied | SidWrite::Skipped)) => {
+            // PinnedForeign can only be produced by or_pinned_foreign_publication;
+            // these storage-update closures never emit it, so it shares the
+            // divergence path without changing behavior.
+            Ok(write @ (SidWrite::Applied | SidWrite::Skipped | SidWrite::PinnedForeign)) => {
                 if let Ok(insts) = storage.load() {
                     if let Some(disk) = insts.into_iter().find(|i| i.id == self.id) {
                         self.adopt_conversation_state(disk.conversation_state());
