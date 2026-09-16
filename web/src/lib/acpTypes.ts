@@ -749,11 +749,13 @@ export interface AcpState {
    *  no matching outstanding optimistic id (a replay, another device, a
    *  drained queue entry), so an echo of this client's own prompt counts once.
    *
-   *  Two readers: `useCancelEscalation` tokenises "already pressed Stop for
+   *  Three readers: `useCancelEscalation` tokenises "already pressed Stop for
    *  this prompt" as `(sessionId, promptSeq)` so the next prompt's first Stop
-   *  is graceful again (#2237), and the `SessionContextReset` arm treats zero
+   *  is graceful again (#2237), the `SessionContextReset` arm treats zero
    *  as "this session never had a prompt to lose" and suppresses the re-prime
-   *  offer. Deliberately not turn truth: see {@link deriveTurnActive}. */
+   *  offer, and `usePromptRepin` re-engages the transcript's stick-to-bottom
+   *  on each bump seen after the socket opened (#3993). Deliberately not turn
+   *  truth: see {@link deriveTurnActive}. */
   promptSeq: number;
   /** Real ACP-advertised modes from the agent's NewSessionResponse,
    *  plus the agent's currently-active mode id. Empty until the

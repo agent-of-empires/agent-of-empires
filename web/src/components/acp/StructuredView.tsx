@@ -33,16 +33,11 @@ import { ApprovalCard } from "./ApprovalCard";
 import { AskUserQuestionCard } from "./AskUserQuestionCard";
 import { AcpFileRefContext } from "./AcpFileRefContext";
 import type { FileRef, FileRefSession } from "../../lib/fileRef";
-import {
-  anchorIsStale,
-  autoLoadDecision,
-  isPinnedToBottom,
-  latestUserPromptId,
-  scrollRestoreDelta,
-} from "../../lib/historyScroll";
+import { anchorIsStale, autoLoadDecision, isPinnedToBottom, scrollRestoreDelta } from "../../lib/historyScroll";
 import { lastClearIndex } from "../../lib/acpHistoryWindow";
 import { loadScrollState, restoredScrollTop, saveScrollState } from "../../lib/acpScrollState";
 import { repinOnResize } from "../../lib/repinOnResize";
+import { promptRepinDecision } from "../../lib/promptRepin";
 import { ToolDensityToggle, ToolDisplayModeProvider, useToolDensityPref } from "./ToolDisplayMode";
 import { AcpRuntime, SUBAGENT_TASK_NAME, TODO_GROUP_NAME, TOOL_GROUP_NAME, type AcpContext } from "./AcpRuntime";
 import { Composer } from "./Composer";
@@ -436,26 +431,17 @@ function AcpChrome({
   // A submitted prompt re-engages stick-to-bottom, as the CLI does. Typing
   // grows the composer; on a fine pointer the interim resize scroll is sampled
   // as "the user scrolled up" and the pinned intent drops, so the reply to the
-  // prompt just sent streams below the fold. The new user row is the one
-  // signal every submit path shares (composer send, mid-turn steer, queued
-  // delivery, EmptyState pick, retry), so key the re-pin on it rather than on
-  // any one button. The optimistic overlay carries the row from the moment of
-  // the click (same id the server echo later reconciles to, so the echo is not
-  // a second change); the activity leg covers prompts that arrive echoed
-  // without an overlay. The mount pass is skipped: the scroll-state restore
-  // below owns the first pin, and a reader who reopened scrolled up must stay
-  // there.
-  const latestPromptId = latestUserPromptId(state.optimisticRows) ?? latestUserPromptId(state.activity);
-  const seenPromptIdRef = useRef<string | null | undefined>(undefined);
+  // prompt just sent streams below the fold. Keyed on the reducer's prompt
+  // counter (one bump per prompt from any path or device) and gated on the
+  // socket having opened, so the cold-open replay is not read as a submit.
+  // The decision is the pure `promptRepinDecision` (unit-tested); this effect
+  // only carries the observed counter and performs the scroll.
+  const seenPromptSeqRef = useRef<number | null>(null);
   useEffect(() => {
-    if (seenPromptIdRef.current === undefined) {
-      seenPromptIdRef.current = latestPromptId;
-      return;
-    }
-    if (latestPromptId === seenPromptIdRef.current) return;
-    seenPromptIdRef.current = latestPromptId;
-    if (latestPromptId !== null) pinToBottom("auto");
-  }, [latestPromptId, pinToBottom]);
+    const d = promptRepinDecision({ seen: seenPromptSeqRef.current, promptSeq: state.promptSeq, live: hasEverOpened });
+    seenPromptSeqRef.current = d.seen;
+    if (d.pin) pinToBottom("auto");
+  }, [state.promptSeq, hasEverOpened, pinToBottom]);
   // Stable mirrors so the [] scroll effect always sees the latest
   // load-earlier wiring without re-subscribing. Updated in an effect
   // (not during render) per react-hooks/refs. See #2236.

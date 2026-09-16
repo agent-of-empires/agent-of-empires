@@ -2496,8 +2496,8 @@
       "id": "acp.submit-repins-transcript",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/lib/historyScroll.test.ts"],
-      "components": ["web/src/lib/historyScroll.ts", "web/src/components/acp/StructuredView.tsx"]
+      "specs": ["src/lib/promptRepin.test.ts"],
+      "components": ["web/src/lib/promptRepin.ts", "web/src/components/acp/StructuredView.tsx"]
     },
     {
       "id": "acp.mobile-jump-to-bottom",

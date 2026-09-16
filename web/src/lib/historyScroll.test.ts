@@ -10,7 +10,6 @@ import {
   isPinnedToBottom,
   PINNED_BOTTOM_SLOP_PX,
   scrollRestoreDelta,
-  latestUserPromptId,
 } from "./historyScroll";
 
 const base = {
@@ -125,36 +124,5 @@ describe("anchorIsStale", () => {
   });
   it("is not stale with no anchor set", () => {
     expect(anchorIsStale(false, null, 1000)).toBe(false);
-  });
-});
-
-describe("latestUserPromptId", () => {
-  const rows = [
-    { id: "u0", kind: "user_prompt" },
-    { id: "m0", kind: "message" },
-    { id: "u1", kind: "user_prompt" },
-    { id: "t1", kind: "tool_start" },
-    { id: "m1", kind: "message" },
-  ];
-
-  it("returns the newest user-authored row, not the newest row", () => {
-    expect(latestUserPromptId(rows)).toBe("u1");
-  });
-
-  it("counts typed diff comments as a prompt", () => {
-    expect(latestUserPromptId([...rows, { id: "d2", kind: "user_diff_comments" }, { id: "m2", kind: "message" }])).toBe(
-      "d2",
-    );
-  });
-
-  it("is null for an empty or prompt-less transcript", () => {
-    expect(latestUserPromptId([])).toBeNull();
-    expect(latestUserPromptId([{ id: "m0", kind: "message" }])).toBeNull();
-  });
-
-  it("changes exactly when a new prompt lands, which is what re-engages the bottom pin", () => {
-    const before = latestUserPromptId(rows);
-    expect(latestUserPromptId([...rows, { id: "m3", kind: "message" }])).toBe(before);
-    expect(latestUserPromptId([...rows, { id: "u2", kind: "user_prompt" }])).not.toBe(before);
   });
 });
