@@ -62,7 +62,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         tool_name: "claude",
         host_rel: ".claude",
         container_suffix: ".claude",
-        copy_files: &["settings.json", "CLAUDE.md"],
+        copy_files: &["settings.json", "CLAUDE.md", "keybindings.json"],
         seed_files: &[],
         copy_dirs: &["plugins", "skills", "hooks"],
         // Keychain credentials seed the existing shared OAuth-token mount.
@@ -156,6 +156,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
             "a2a-oauth-tokens.json",
             "keybindings.json",
             "GEMINI.md",
+            ".env",
         ],
         seed_files: &[],
         copy_dirs: &[],
@@ -344,6 +345,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
             ".env",
             "auth.json",
             "shell-hooks-allowlist.json",
+            "SOUL.md",
         ],
         seed_files: &[],
         copy_dirs: &[],
@@ -1201,6 +1203,32 @@ pub(crate) fn extend_owned_content(
     )
 }
 
+/// The bytes to publish when a JSON seed default meets a file carried forward
+/// from a retired original: the default's keys win, the carried file's other
+/// keys stay. `None` when the file is absent or either side is not a JSON
+/// object, so the caller keeps the seed-once publish.
+fn merged_json_seed(
+    output: &crate::session::anchored_fs::AnchoredDir,
+    path: &Path,
+    default: &str,
+) -> Result<Option<Vec<u8>>> {
+    let Some(existing) = output.read_regular(path, 8 << 20)? else {
+        return Ok(None);
+    };
+    let (Ok(serde_json::Value::Object(mut carried)), Ok(serde_json::Value::Object(seed))) = (
+        serde_json::from_slice::<serde_json::Value>(&existing),
+        serde_json::from_str::<serde_json::Value>(default),
+    ) else {
+        return Ok(None);
+    };
+    for (key, value) in seed {
+        carried.insert(key, value);
+    }
+    Ok(Some(serde_json::to_vec(&serde_json::Value::Object(
+        carried,
+    ))?))
+}
+
 fn seed_content_roles(
     source: &Path,
     root: &crate::migrations::v031_isolate_sandbox_content::ContentRoot,
@@ -1256,13 +1284,29 @@ fn seed_content_roles(
         for &(name, content) in mount.seed_files.iter().chain(mount.home_seed_files) {
             let path = Path::new(name);
             output.create_child(path.parent().unwrap_or(Path::new("")))?;
-            output.publish_file(
-                path,
-                &mut content.as_bytes(),
-                std::fs::Permissions::from_mode(0o600),
-                false,
-                None,
-            )?;
+            // A retired original is carried forward with its old `.claude.json`,
+            // whose `hasCompletedOnboarding` main may have written false; left as
+            // is it strands the sandbox on the login picker. A JSON seed default
+            // therefore enforces its own keys over a carried file, the default
+            // winning for its keys while the file's other keys stay. A non-JSON
+            // default or an absent file keeps the seed-once publish.
+            if let Some(merged) = merged_json_seed(&output, path, content)? {
+                output.publish_file(
+                    path,
+                    &mut merged.as_slice(),
+                    std::fs::Permissions::from_mode(0o600),
+                    true,
+                    None,
+                )?;
+            } else {
+                output.publish_file(
+                    path,
+                    &mut content.as_bytes(),
+                    std::fs::Permissions::from_mode(0o600),
+                    false,
+                    None,
+                )?;
+            }
         }
     }
     output.sync()
@@ -3733,6 +3777,7 @@ mod tests {
         fs::create_dir_all(&host).unwrap();
         fs::write(host.join("config.yaml"), "model: claude-opus\n").unwrap();
         fs::write(host.join(".env"), "API_KEY=token\n").unwrap();
+        fs::write(host.join("SOUL.md"), "# soul\n").unwrap();
 
         let runtime_dirs = [
             "sandbox",
@@ -3766,6 +3811,7 @@ mod tests {
 
         assert!(sandbox.join("config.yaml").exists());
         assert!(sandbox.join(".env").exists());
+        assert!(sandbox.join("SOUL.md").exists());
 
         for runtime_dir in runtime_dirs {
             assert!(
@@ -3898,6 +3944,75 @@ mod tests {
 
         let content = fs::read_to_string(sandbox.join(".claude.json")).unwrap();
         assert_eq!(content, r#"{"hasCompletedOnboarding":true}"#);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dropped_config_files_cross_into_the_sandbox() {
+        // #3981 review: keybindings.json (claude) and .env (gemini) were dropped.
+        let (_hook_guard, _, _application) = BaseGuard::ready();
+        for (tool, file, content) in [
+            ("claude", "keybindings.json", "{}\n"),
+            ("gemini", ".env", "GEMINI_API_KEY=token\n"),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let mount = AGENT_CONFIG_MOUNTS
+                .iter()
+                .find(|m| m.tool_name == tool)
+                .unwrap();
+            let host = dir.path().join(mount.host_rel);
+            fs::create_dir_all(&host).unwrap();
+            fs::write(host.join(file), content).unwrap();
+            let sandbox = prepare_owned_fixture(
+                mount,
+                dir.path(),
+                None,
+                CredentialFold::Freshest,
+                &crate::session::config::SessionConfig::default(),
+                dir.path(),
+            )
+            .unwrap();
+            assert!(
+                sandbox.join(file).exists(),
+                "{tool} must cross {file} into the sandbox"
+            );
+        }
+    }
+
+    #[test]
+    fn a_json_seed_default_enforces_its_keys_over_a_carried_file() {
+        // #3981 review: retirement carries the old `.claude.json` forward; its
+        // onboarding flag must not linger false while other keys stay.
+        let dir = TempDir::new().unwrap();
+        let output = crate::session::anchored_fs::AnchoredDir::open(dir.path()).unwrap();
+        fs::write(
+            dir.path().join(".claude.json"),
+            r#"{"hasCompletedOnboarding":false,"mcpServers":{"x":1}}"#,
+        )
+        .unwrap();
+        let merged = merged_json_seed(
+            &output,
+            Path::new(".claude.json"),
+            r#"{"hasCompletedOnboarding":true}"#,
+        )
+        .unwrap()
+        .expect("a carried JSON file merges the seed default");
+        let value: serde_json::Value = serde_json::from_slice(&merged).unwrap();
+        assert_eq!(value["hasCompletedOnboarding"], serde_json::json!(true));
+        assert_eq!(value["mcpServers"]["x"], serde_json::json!(1));
+        // An absent file keeps the seed-once publish.
+        assert!(
+            merged_json_seed(&output, Path::new("absent.json"), r#"{"a":1}"#)
+                .unwrap()
+                .is_none()
+        );
+        // A non-JSON default is never merged (e.g. the gitconfig home seed).
+        fs::write(dir.path().join("gitconfig"), "[user]\n").unwrap();
+        assert!(
+            merged_json_seed(&output, Path::new("gitconfig"), "[credential]\n")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
