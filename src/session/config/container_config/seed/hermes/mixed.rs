@@ -53,6 +53,7 @@ pub(in super::super) fn seed_skills(
     scope: usize,
     source: &guard::SourceRoot,
     destination: &AnchoredDir,
+    discovery_links: bool,
 ) -> Result<HashSet<String>> {
     let access = ReadAccess {
         root: Some(source),
@@ -67,7 +68,7 @@ pub(in super::super) fn seed_skills(
         destination,
         Path::new("skills"),
         boundary,
-        true,
+        discovery_links,
         access,
     )?;
     let Some(local) = optional_child(destination, Path::new("skills"))? else {
@@ -92,6 +93,7 @@ pub(in super::super) fn seed_plugins(
     scope: usize,
     source: &guard::SourceRoot,
     destination: &AnchoredDir,
+    discovery_links: bool,
 ) -> Result<()> {
     let access = ReadAccess {
         root: Some(source),
@@ -106,7 +108,7 @@ pub(in super::super) fn seed_plugins(
         destination,
         Path::new("plugins"),
         boundary,
-        true,
+        discovery_links,
         access,
     )
 }
@@ -371,6 +373,7 @@ mod tests {
             boundary.hermes.source.unwrap(),
             &boundary.source_root,
             &output,
+            true,
         )
         .unwrap();
         assert_eq!(
