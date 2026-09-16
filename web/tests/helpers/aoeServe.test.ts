@@ -179,7 +179,14 @@ fs.writeFileSync(${JSON.stringify(join(root, "runner-ready"))}, "");
 const path = ${JSON.stringify(recordPath)};
 let saved, resaved = false, missing = 0;
 setInterval(() => {
-  if (fs.existsSync(path)) { saved ??= fs.readFileSync(path); missing = 0; return; }
+  if (fs.existsSync(path)) {
+    if (!saved) {
+      saved = fs.readFileSync(path);
+      fs.writeFileSync(${JSON.stringify(join(root, "runner-record-loaded"))}, "");
+    }
+    missing = 0;
+    return;
+  }
   if (saved && !resaved) { resaved = true; fs.writeFileSync(path + ".tmp", saved); fs.renameSync(path + ".tmp", path); return; }
   if (saved && ++missing >= 2) process.exit(0);
 }, 20);`,
@@ -197,6 +204,13 @@ setInterval(() => {
         recordPath,
         JSON.stringify({ pid: runnerPid, session_id: sessionId, socket_path: socketPath, generation: 7 }),
       );
+      // The resave only happens if the runner read the record before teardown revokes it.
+      await expect
+        .poll(() => existsSync(join(root, "runner-record-loaded")), {
+          timeout: 10_000,
+          message: "fake runner loaded its record",
+        })
+        .toBe(true);
       const exited = once(runner, "exit");
 
       const stop = serve.stop();
