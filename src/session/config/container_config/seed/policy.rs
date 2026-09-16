@@ -58,6 +58,10 @@ pub(super) enum Exception<'a> {
         root: &'a Path,
         kind: CollectionKind,
     },
+    /// A retired original lends a never-host-copied state tree back to the
+    /// fresh store it seeds: native content under `root` crosses, while the
+    /// escape and hardlink guards still refuse anything reaching outside it.
+    Carried { root: &'a Path },
 }
 
 #[derive(Clone, Copy, Default)]
@@ -78,6 +82,9 @@ impl ReadAccess<'_> {
         directory: bool,
         origin: StateOrigin,
     ) -> bool {
+        if let Exception::Carried { root } = self.exception {
+            return origin == StateOrigin::Native && candidate.starts_with(root);
+        }
         if !directory && self.allows_file(candidate, origin) {
             return true;
         }
