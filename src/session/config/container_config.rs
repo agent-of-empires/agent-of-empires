@@ -1154,6 +1154,26 @@ pub(crate) fn content_role_agent(role: &str) -> Option<&'static str> {
         .map(|mount| mount.tool_name)
 }
 
+/// Native state the pre-v031 denylist already kept sandbox-only, so it was
+/// never host-copied and holds the session's own resume. A retired original
+/// lends it back to the fresh store it seeds instead of isolating it, so the
+/// rows resolving that store keep their session ids.
+fn carried_state(mount: &AgentConfigMount) -> &'static [&'static str] {
+    match (mount.tool_name, mount.container_suffix) {
+        ("claude", ".claude") => &["projects"],
+        ("opencode", ".local/share/opencode") => &["opencode.db*"],
+        _ => &[],
+    }
+}
+
+/// Whether a retired store keeps `agent`'s own resume state in place, so
+/// isolating that store must not clear the row's session ids.
+pub(crate) fn agent_retains_native_resume(agent: &str) -> bool {
+    AGENT_CONFIG_MOUNTS
+        .iter()
+        .any(|mount| mount.tool_name == agent && !carried_state(mount).is_empty())
+}
+
 enum ContentSeedMode {
     Fresh,
     StoppedOriginal,
@@ -1280,6 +1300,9 @@ fn seed_content_roles(
                 workspace,
                 &boundary,
             )?;
+            if stopped {
+                seed::carry_sandbox_state(source, destination, carried_state(mount), &boundary)?;
+            }
         }
         for &(name, content) in mount.seed_files.iter().chain(mount.home_seed_files) {
             let path = Path::new(name);

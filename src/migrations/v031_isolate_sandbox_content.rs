@@ -1128,7 +1128,11 @@ fn record_retirement(
                     .iter()
                     .find_map(|role| container_config::content_role_agent(role))
                 {
-                    receipt.retired_tools.insert(tool.clone(), agent.to_owned());
+                    // A store whose own resume state is carried forward is not
+                    // reset, so the row keeps its session ids.
+                    if !container_config::agent_retains_native_resume(agent) {
+                        receipt.retired_tools.insert(tool.clone(), agent.to_owned());
+                    }
                 }
             }
         }
@@ -1387,6 +1391,7 @@ fn reset_row(row: &mut Value, receipt: &Receipt) -> Result<()> {
         .filter(|part| part.original.is_some())
         .flat_map(|part| part.root.roles.iter())
         .filter_map(|role| container_config::content_role_agent(role))
+        .filter(|agent| !container_config::agent_retains_native_resume(agent))
         .collect();
     let mut additions = Vec::new();
     for tool in row_tools(snapshot) {
@@ -2497,6 +2502,81 @@ mod tests {
         }
     }
 
+    /// A retired store keeps the resume the old denylist already held
+    /// sandbox-only: Claude `projects/` crosses into the fresh store and the row
+    /// keeps its session id, while host-importable `history.jsonl` is still
+    /// isolated and a link out of `projects/` never smuggles it back.
+    #[test]
+    #[serial_test::serial]
+    fn a_retired_store_carries_its_own_resume_and_keeps_session_ids() {
+        let temporary = tempfile::tempdir().unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let home = dirs::home_dir().unwrap();
+        let app = crate::session::get_app_dir().unwrap();
+        let project = temporary.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let mut instance = crate::session::Instance::new("claude", project.to_str().unwrap());
+        instance.tool = "claude".to_owned();
+        instance.agent_session_id = Some("kept-native-context".to_owned());
+        let config = crate::session::Config::default();
+        let roots = container_config::sandbox_content_roots(
+            "claude",
+            None,
+            &config.session,
+            &home,
+            &instance.id,
+        )
+        .unwrap();
+        let root = &roots[0].path;
+        fs::create_dir_all(root.join("projects/proj")).unwrap();
+        fs::write(root.join("projects/proj/session.jsonl"), b"RESUME_STATE").unwrap();
+        fs::write(root.join("history.jsonl"), b"HOST_IMPORTABLE_HISTORY").unwrap();
+        fs::write(root.join("settings.json"), b"{}").unwrap();
+        // A link out of the carried tree must not smuggle the retired history back.
+        std::os::unix::fs::symlink("../history.jsonl", root.join("projects/leak")).unwrap();
+        let mut row = serde_json::to_value(&instance).unwrap();
+        row["sandbox_info"] = serde_json::json!({
+            "enabled": true,
+            "image": "img",
+            "container_name": "aoe-sandbox-fixture",
+        });
+        let registry = app.join("sessions.json");
+        fs::write(&registry, serde_json::to_vec(&vec![row]).unwrap()).unwrap();
+
+        assert!(
+            migrate_target(
+                &app,
+                &home,
+                (&registry, &instance.id, "claude"),
+                &|_| Ok(false),
+                &|_| Ok(true),
+                &|_| Ok(Vec::new()),
+            )
+            .unwrap(),
+            "the store migrates"
+        );
+        assert_eq!(
+            fs::read(root.join("projects/proj/session.jsonl")).unwrap(),
+            b"RESUME_STATE",
+            "the sandbox's own resume state is carried into the fresh store"
+        );
+        assert!(
+            !root.join("history.jsonl").exists(),
+            "host-importable history must stay isolated"
+        );
+        assert!(
+            !root.join("projects/leak").exists(),
+            "a link out of projects must not carry the retired history back"
+        );
+        let rows: Value = serde_json::from_slice(&fs::read(&registry).unwrap()).unwrap();
+        assert_eq!(
+            rows[0].get("agent_session_id").and_then(Value::as_str),
+            Some("kept-native-context"),
+            "a carried resume must keep its session id: {}",
+            rows[0]
+        );
+    }
+
     /// An adapter that names no native agent still has to answer for a pending
     /// structured lane, or that row keeps resuming the retired conversation.
     #[test]
@@ -3110,8 +3190,8 @@ mod tests {
         )
         .unwrap();
         let root = &roots[0].path;
-        fs::create_dir_all(root.join("projects")).unwrap();
-        fs::write(root.join("projects/original.jsonl"), b"ORIGINAL_CONTEXT").unwrap();
+        fs::create_dir_all(root).unwrap();
+        fs::write(root.join("history.jsonl"), b"ORIGINAL_CONTEXT").unwrap();
         let row = serde_json::json!({"id":instance.id,"tool":"claude"});
         let (path, mut receipt) = checked_receipt(&app, &row, "claude", &roots).unwrap();
         stage_receipt(&app, &mut receipt, &path, &home, &config, temporary.path()).unwrap();
@@ -3132,16 +3212,16 @@ mod tests {
         .unwrap();
         assert!(checked_receipt(&app, &row, "omp", &other).is_err());
         assert_eq!(
-            fs::read(root.join("projects/original.jsonl")).unwrap(),
+            fs::read(root.join("history.jsonl")).unwrap(),
             b"ORIGINAL_CONTEXT"
         );
         let (resumed_path, mut resumed) = checked_receipt(&app, &row, "claude", &roots).unwrap();
         publish_receipt(&mut resumed, &resumed_path).unwrap();
         assert_eq!(
-            fs::read(resumed.roots[0].recovery.join("projects/original.jsonl")).unwrap(),
+            fs::read(resumed.roots[0].recovery.join("history.jsonl")).unwrap(),
             b"ORIGINAL_CONTEXT"
         );
-        assert!(!root.join("projects/original.jsonl").exists());
+        assert!(!root.join("history.jsonl").exists());
     }
 
     #[test]

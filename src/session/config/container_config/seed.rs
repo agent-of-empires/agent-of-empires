@@ -17,7 +17,7 @@ use super::{AgentConfigMount, AGENT_CONFIG_MOUNTS, SANDBOX_PRIVATE_SUBDIR, SANDB
 mod guard;
 mod hermes;
 mod policy;
-use policy::{NativeRule, ReadAccess, StateOrigin};
+use policy::{Exception, NativeRule, ReadAccess, StateOrigin};
 pub(super) struct NativeStateBoundary {
     source_root: guard::SourceRoot,
     origin_root: PathBuf,
@@ -492,6 +492,52 @@ pub(super) fn sync_agent_config(
             discovery_links,
             ReadAccess::default(),
         )?;
+    }
+    Ok(())
+}
+
+/// Carry a retired original's never-host-copied state (its own resume) into the
+/// fresh store, so isolating the original does not reset resume. Only a stopped
+/// original lends it; the `Exception::Carried` scope admits native content
+/// under each matched entry while the escape and hardlink guards still refuse
+/// anything that resolves outside it (a link out of the store, or to another
+/// native path such as the retired history).
+pub(super) fn carry_sandbox_state(
+    source: &Path,
+    destination: &Path,
+    patterns: &[&str],
+    boundary: &NativeStateBoundary,
+) -> Result<()> {
+    if patterns.is_empty() || boundary.stopped_original.is_none() {
+        return Ok(());
+    }
+    let destination = AnchoredDir::open(destination)?;
+    for &pattern in patterns {
+        for entry in state_glob(source, pattern)? {
+            let entry = entry.context("expanding a carried native-state pattern")?;
+            let Ok(relative) = entry.strip_prefix(source) else {
+                continue;
+            };
+            let canonical = match fs::canonicalize(&entry) {
+                Ok(canonical) => canonical,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    tracing::warn!(target: "session.profile", path = %entry.display(), %error, "Skipping unreadable carried state");
+                    continue;
+                }
+            };
+            let leaf = Path::new(relative.file_name().context("carried state has no leaf")?);
+            let parent = destination.create_child(relative.parent().unwrap_or(Path::new("")))?;
+            let access = ReadAccess {
+                root: Some(&boundary.source_root),
+                exception: Exception::Carried { root: &canonical },
+            };
+            if entry.is_dir() {
+                seed_directory(&entry, &parent, leaf, boundary, false, access)?;
+            } else {
+                publish_source_file(&entry, &parent, leaf, boundary, true, access)?;
+            }
+        }
     }
     Ok(())
 }
