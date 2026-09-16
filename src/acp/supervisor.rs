@@ -1966,12 +1966,12 @@ impl<S: BroadcastSink> Supervisor<S> {
             let id = session_id.clone();
             let generation = lease.epoch();
             let context = tokio::task::spawn_blocking(move || {
-                crate::migrations::v030_isolate_sandbox_content::prepare_acp_context(
+                crate::migrations::v031_isolate_sandbox_content::prepare_acp_context(
                     &profile,
                     &id,
                     native_agent,
                     generation,
-                    crate::migrations::v030_isolate_sandbox_content::AcpContextUse::Launch,
+                    crate::migrations::v031_isolate_sandbox_content::AcpContextUse::Launch,
                 )
             })
             .await
@@ -2363,9 +2363,9 @@ impl<S: BroadcastSink> Supervisor<S> {
                                 let assigned = acp_session_id.clone();
                                 let generation = lease.epoch();
                                 let acknowledged = tokio::task::spawn_blocking(move ||
-                                    crate::migrations::v030_isolate_sandbox_content::acknowledge_context_reset(
+                                    crate::migrations::v031_isolate_sandbox_content::acknowledge_context_reset(
                                         &pending.profile, &id,
-                                        crate::migrations::v030_isolate_sandbox_content::NativeContextView::Structured,
+                                        crate::migrations::v031_isolate_sandbox_content::NativeContextView::Structured,
                                         generation, &pending.transactions, Some(&assigned),
                                     )
                                 ).await;
@@ -3596,12 +3596,12 @@ impl<S: BroadcastSink> Supervisor<S> {
                 super::agent_profiles::resolve(&attach_agent_key).native_config_agent;
             let generation = lease.epoch();
             let context = tokio::task::spawn_blocking(move || {
-                crate::migrations::v030_isolate_sandbox_content::prepare_acp_context(
+                crate::migrations::v031_isolate_sandbox_content::prepare_acp_context(
                     &profile,
                     &id,
                     native_agent,
                     generation,
-                    crate::migrations::v030_isolate_sandbox_content::AcpContextUse::Attach,
+                    crate::migrations::v031_isolate_sandbox_content::AcpContextUse::Attach,
                 )
             })
             .await

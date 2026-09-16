@@ -175,7 +175,7 @@ impl NativeStateBoundary {
         let canonical = canonical_expected_path(root)?;
         for parent in [root.parent(), canonical.parent()].into_iter().flatten() {
             self.add_classified_path(
-                parent.join(crate::migrations::v030_isolate_sandbox_content::RECOVERY),
+                parent.join(crate::migrations::v031_isolate_sandbox_content::RECOVERY),
                 StateOrigin::Storage,
             );
         }

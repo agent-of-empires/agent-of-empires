@@ -38,13 +38,13 @@ mod v025_reenable_confirm_delete;
 mod v026_repoint_acp_default_agent;
 pub(crate) mod v027_isolate_sandbox_stores;
 mod v028_clear_archived_live_status;
-pub(crate) mod v030_isolate_sandbox_content;
+pub(crate) mod v031_isolate_sandbox_content;
 
 use anyhow::Result;
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 30;
+const CURRENT_VERSION: u32 = 31;
 const VERSION_FILE: &str = ".schema_version";
 
 struct Migration {
@@ -195,9 +195,9 @@ const MIGRATIONS: &[Migration] = &[
         run: v028_clear_archived_live_status::run,
     },
     Migration {
-        version: 30,
+        version: 31,
         name: "isolate_sandbox_content",
-        run: v030_isolate_sandbox_content::run,
+        run: v031_isolate_sandbox_content::run,
     },
 ];
 
@@ -234,7 +234,7 @@ pub fn migrate_sandbox_store_for_with(
     }
     let _installed = progress::install(reporter);
     v027_isolate_sandbox_stores::migrate_instance(id)?;
-    v030_isolate_sandbox_content::migrate_instance(id)
+    v031_isolate_sandbox_content::migrate_instance(id)
 }
 
 /// [`migrate_sandbox_store_for_with`] with the container probes injected, for
@@ -287,7 +287,7 @@ fn run_migrations_inner(reporter: Option<progress::Reporter>, announce: bool) ->
         // the same reason: a host that cannot name a home has no content root
         // to reconcile and must still start.
         if dirs::home_dir().is_some() {
-            return v030_isolate_sandbox_content::reconcile_pending(announce);
+            return v031_isolate_sandbox_content::reconcile_pending(announce);
         }
         return Ok(());
     }

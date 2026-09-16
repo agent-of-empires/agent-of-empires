@@ -453,7 +453,7 @@ pub(crate) fn transition_in_flight(app_dir: &Path) -> Result<bool> {
 /// session start` and the HTTP start/send handlers all launch a trashed or
 /// archived session without unparking it first, and skipping it there leaves
 /// it on a shared store no later pass will move, so the launch bails forever.
-fn row_is_parked(row: &Value) -> bool {
+pub(super) fn row_is_parked(row: &Value) -> bool {
     ["trashed_at", "archived_at"]
         .iter()
         .any(|key| row.get(key).is_some_and(|value| !value.is_null()))
@@ -1752,7 +1752,7 @@ fn publish_store(
     }
     fs::rename(stage, destination)?;
     fs::File::open(parent)?.sync_all()?;
-    let retained = super::v030_isolate_sandbox_content::retain_legacy_original(
+    let retained = super::v031_isolate_sandbox_content::retain_legacy_original(
         &publication.quarantine,
         parent.parent().context("private layout has no parent")?,
     )?;
@@ -1761,7 +1761,7 @@ fn publish_store(
     // so the publish is not finished and the target is retried with it.
     Ok(!matches!(
         retained,
-        super::v030_isolate_sandbox_content::Retained::Deferred
+        super::v031_isolate_sandbox_content::Retained::Deferred
     ))
 }
 
@@ -1803,8 +1803,8 @@ impl Publication {
         // on: a quarantine the retention cannot move is one the destination
         // cannot be renamed onto either.
         if matches!(
-            super::v030_isolate_sandbox_content::retain_legacy_original(&quarantine, layout_root)?,
-            super::v030_isolate_sandbox_content::Retained::Deferred
+            super::v031_isolate_sandbox_content::retain_legacy_original(&quarantine, layout_root)?,
+            super::v031_isolate_sandbox_content::Retained::Deferred
         ) {
             return Ok(None);
         }
@@ -1869,14 +1869,14 @@ fn relocate_store(source: &Path, destination: &Path) -> Result<bool> {
         return publish_store(source, destination, &BTreeSet::new(), None, false);
     }
     fs::File::open(parent)?.sync_all()?;
-    let retained = super::v030_isolate_sandbox_content::retain_legacy_original(
+    let retained = super::v031_isolate_sandbox_content::retain_legacy_original(
         &publication.quarantine,
         parent.parent().context("private layout has no parent")?,
     )?;
     fs::File::open(parent)?.sync_all()?;
     Ok(!matches!(
         retained,
-        super::v030_isolate_sandbox_content::Retained::Deferred
+        super::v031_isolate_sandbox_content::Retained::Deferred
     ))
 }
 
@@ -2203,8 +2203,8 @@ fn retire_legacy(source: &Path) -> Result<bool> {
     let mut deferred = false;
     for candidate in [&quarantine, source] {
         if matches!(
-            super::v030_isolate_sandbox_content::retain_legacy_original(candidate, host)?,
-            super::v030_isolate_sandbox_content::Retained::Deferred
+            super::v031_isolate_sandbox_content::retain_legacy_original(candidate, host)?,
+            super::v031_isolate_sandbox_content::Retained::Deferred
         ) {
             deferred = true;
         }
@@ -3782,7 +3782,7 @@ gemini = "{}"
         assert!(!root.join(orphan).exists());
         assert!(!root.join("common").exists());
         let recovered: Vec<_> =
-            fs::read_dir(home.join(crate::migrations::v030_isolate_sandbox_content::RECOVERY))
+            fs::read_dir(home.join(crate::migrations::v031_isolate_sandbox_content::RECOVERY))
                 .unwrap()
                 .map(|entry| entry.unwrap().path())
                 .filter(|path| {
@@ -3829,7 +3829,7 @@ gemini = "{}"
         .unwrap();
 
         let expose = |sources: Option<Vec<std::path::PathBuf>>| {
-            super::super::v030_isolate_sandbox_content::EXPOSED_SOURCES
+            super::super::v031_isolate_sandbox_content::EXPOSED_SOURCES
                 .with(|hook| *hook.borrow_mut() = sources);
         };
         expose(Some(vec![home.clone()]));
@@ -3892,7 +3892,7 @@ gemini = "{}"
         .unwrap();
 
         let expose = |sources: Option<Vec<std::path::PathBuf>>| {
-            super::super::v030_isolate_sandbox_content::EXPOSED_SOURCES
+            super::super::v031_isolate_sandbox_content::EXPOSED_SOURCES
                 .with(|hook| *hook.borrow_mut() = sources);
         };
         expose(Some(vec![home.clone()]));
@@ -3934,7 +3934,7 @@ gemini = "{}"
         assert!(!root.exists(), "the next pass retires the shared store");
         assert!(!app.join(JOURNAL).exists());
         let mut retained = Vec::new();
-        let recovery = home.join(crate::migrations::v030_isolate_sandbox_content::RECOVERY);
+        let recovery = home.join(crate::migrations::v031_isolate_sandbox_content::RECOVERY);
         for transaction in fs::read_dir(recovery).unwrap() {
             for original in fs::read_dir(transaction.unwrap().path().join("original")).unwrap() {
                 retained.push(original.unwrap().file_name().to_string_lossy().into_owned());
@@ -3981,7 +3981,7 @@ gemini = "{}"
         .unwrap();
 
         let expose = |sources: Option<Vec<std::path::PathBuf>>| {
-            super::super::v030_isolate_sandbox_content::EXPOSED_SOURCES
+            super::super::v031_isolate_sandbox_content::EXPOSED_SOURCES
                 .with(|hook| *hook.borrow_mut() = sources);
         };
         expose(Some(vec![home.clone()]));
@@ -4019,7 +4019,7 @@ gemini = "{}"
         assert!(!root.exists(), "the next pass retires the emptied root");
         assert!(!app.join(JOURNAL).exists());
         let mut retained = Vec::new();
-        let recovery = home.join(crate::migrations::v030_isolate_sandbox_content::RECOVERY);
+        let recovery = home.join(crate::migrations::v031_isolate_sandbox_content::RECOVERY);
         for transaction in fs::read_dir(recovery).unwrap() {
             for original in fs::read_dir(transaction.unwrap().path().join("original")).unwrap() {
                 retained.push(original.unwrap().file_name().to_string_lossy().into_owned());
@@ -4044,8 +4044,8 @@ gemini = "{}"
         fs::write(root.join("sessions/other"), b"other").unwrap();
         fs::write(root.join("auth.json"), b"secret").unwrap();
         std::os::unix::fs::symlink("/outside-do-not-follow", root.join("latest")).unwrap();
-        let super::super::v030_isolate_sandbox_content::Retained::Original(kept) =
-            super::super::v030_isolate_sandbox_content::retain_legacy_original(&root, &host)
+        let super::super::v031_isolate_sandbox_content::Retained::Original(kept) =
+            super::super::v031_isolate_sandbox_content::retain_legacy_original(&root, &host)
                 .unwrap()
         else {
             panic!("the complete original is retained")
@@ -4059,9 +4059,9 @@ gemini = "{}"
             Path::new("/outside-do-not-follow")
         );
         assert!(matches!(
-            super::super::v030_isolate_sandbox_content::retain_legacy_original(&root, &host)
+            super::super::v031_isolate_sandbox_content::retain_legacy_original(&root, &host)
                 .unwrap(),
-            super::super::v030_isolate_sandbox_content::Retained::Absent
+            super::super::v031_isolate_sandbox_content::Retained::Absent
         ));
     }
 

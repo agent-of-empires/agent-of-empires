@@ -1063,8 +1063,8 @@ pub(crate) fn sandbox_content_roots(
     session: &super::SessionConfig,
     home: &Path,
     instance: &str,
-) -> Result<Vec<crate::migrations::v030_isolate_sandbox_content::ContentRoot>> {
-    use crate::migrations::v030_isolate_sandbox_content::{canonical_expected_path, ContentRoot};
+) -> Result<Vec<crate::migrations::v031_isolate_sandbox_content::ContentRoot>> {
+    use crate::migrations::v031_isolate_sandbox_content::{canonical_expected_path, ContentRoot};
     crate::session::validate_instance_id(instance)?;
     let Some(agent) = resolve_active_agent(tool, detect_as, session) else {
         return Ok(Vec::new());
@@ -1102,11 +1102,11 @@ pub(crate) fn sandbox_content_roots(
 /// Complete shared-host policy only while planning a transition. Capture and
 /// admission checks retain their small, requested role subsets.
 pub(crate) fn expand_content_roles(
-    roots: &mut [crate::migrations::v030_isolate_sandbox_content::ContentRoot],
+    roots: &mut [crate::migrations::v031_isolate_sandbox_content::ContentRoot],
     home: &Path,
     session: &super::SessionConfig,
 ) -> Result<()> {
-    use crate::migrations::v030_isolate_sandbox_content::canonical_expected_path;
+    use crate::migrations::v031_isolate_sandbox_content::canonical_expected_path;
     let mut add_tool = |tool: &str| -> Result<()> {
         let Some(agent) = resolve_active_agent(tool, None, session) else {
             return Ok(());
@@ -1159,8 +1159,8 @@ enum ContentSeedMode {
 }
 
 pub(crate) fn seed_content_stage(
-    input: &crate::migrations::v030_isolate_sandbox_content::ContentSeed<'_>,
-    root: &crate::migrations::v030_isolate_sandbox_content::ContentRoot,
+    input: &crate::migrations::v031_isolate_sandbox_content::ContentSeed<'_>,
+    root: &crate::migrations::v031_isolate_sandbox_content::ContentRoot,
     destination: &Path,
     home: &Path,
     session: &super::SessionConfig,
@@ -1185,7 +1185,7 @@ pub(crate) fn seed_content_stage(
 /// Add only absent configuration for newly required roles. This does not
 /// construct a fresh-stage capability or replace an owned native store.
 pub(crate) fn extend_owned_content(
-    root: &crate::migrations::v030_isolate_sandbox_content::ContentRoot,
+    root: &crate::migrations::v031_isolate_sandbox_content::ContentRoot,
     home: &Path,
     session: &super::SessionConfig,
     workspace: &Path,
@@ -1203,7 +1203,7 @@ pub(crate) fn extend_owned_content(
 
 fn seed_content_roles(
     source: &Path,
-    root: &crate::migrations::v030_isolate_sandbox_content::ContentRoot,
+    root: &crate::migrations::v031_isolate_sandbox_content::ContentRoot,
     destination: &Path,
     home: &Path,
     session: &super::SessionConfig,
@@ -1329,7 +1329,7 @@ fn prepare_sandbox_dir_from(
     session_config: &super::SessionConfig,
     workspace: &Path,
 ) -> Result<PathBuf> {
-    let _admission = crate::migrations::v030_isolate_sandbox_content::guard_preparation(
+    let _admission = crate::migrations::v031_isolate_sandbox_content::guard_preparation(
         &host_dir,
         &sandbox_dir,
         mount.container_suffix,
@@ -2543,7 +2543,7 @@ pub(crate) fn build_container_config(
         &home,
         instance_id,
     )?;
-    let _content_admission = crate::migrations::v030_isolate_sandbox_content::ensure_fresh_content(
+    let _content_admission = crate::migrations::v031_isolate_sandbox_content::ensure_fresh_content(
         &crate::session::get_app_dir()?,
         &home,
         instance_id,
@@ -3644,7 +3644,7 @@ mod tests {
     fn certify_fixture_content(path: &Path, role: &str) -> Result<()> {
         fs::create_dir_all(path)?;
         let instance = path.file_name().and_then(|value| value.to_str()).unwrap();
-        crate::migrations::v030_isolate_sandbox_content::certify_test_content(
+        crate::migrations::v031_isolate_sandbox_content::certify_test_content(
             &crate::session::get_app_dir()?,
             instance,
             path,

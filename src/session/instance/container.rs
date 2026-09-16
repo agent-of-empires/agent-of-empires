@@ -86,7 +86,7 @@ impl Instance {
     /// container launch first copies that store; see [`Self::move_sandbox_store`].
     pub fn sandbox_store_move_pending(&self) -> bool {
         self.is_sandboxed()
-            && !crate::migrations::v030_isolate_sandbox_content::instance_ready(self)
+            && !crate::migrations::v031_isolate_sandbox_content::instance_ready(self)
                 .unwrap_or(false)
     }
 
@@ -159,7 +159,7 @@ impl Instance {
         // Admit the reconciled tool: reconciliation above may have replaced it,
         // and the isolated store is seeded for the agent the launch will run.
         let _transition_lock =
-            crate::migrations::v030_isolate_sandbox_content::admit_fresh_instance(self)?;
+            crate::migrations::v031_isolate_sandbox_content::admit_fresh_instance(self)?;
 
         // Direct is_running()? / exists()? here rather than probe_running():
         // this function already returns Result, so `?` correctly propagates

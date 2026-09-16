@@ -1470,11 +1470,11 @@ mod tests {
     /// the same path.
     fn admit_sandbox_fixture(inst: &Instance) {
         let app = crate::session::get_app_dir().unwrap();
-        let roots = crate::migrations::v030_isolate_sandbox_content::instance_roots(inst).unwrap();
+        let roots = crate::migrations::v031_isolate_sandbox_content::instance_roots(inst).unwrap();
         for root in roots {
             std::fs::create_dir_all(&root.path).unwrap();
             let roles: Vec<&str> = root.roles.iter().map(String::as_str).collect();
-            crate::migrations::v030_isolate_sandbox_content::certify_test_content(
+            crate::migrations::v031_isolate_sandbox_content::certify_test_content(
                 &app, &inst.id, &root.path, &roles,
             )
             .unwrap();

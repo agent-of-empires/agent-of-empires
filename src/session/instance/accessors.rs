@@ -441,7 +441,7 @@ impl Instance {
 
     pub(super) fn sandbox_capture_store_dir(&self) -> Option<std::path::PathBuf> {
         if !self.is_sandboxed()
-            || !crate::migrations::v030_isolate_sandbox_content::instance_ready(self).ok()?
+            || !crate::migrations::v031_isolate_sandbox_content::instance_ready(self).ok()?
         {
             return None;
         }

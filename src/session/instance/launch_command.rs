@@ -369,7 +369,7 @@ impl Instance {
     pub(super) fn prepare_launch_command(&mut self) -> Result<PreparedLaunch> {
         let sandbox_context_reset = match self.resolved_agent() {
             Some(agent) => {
-                crate::migrations::v030_isolate_sandbox_content::prepare_terminal_launch_context(
+                crate::migrations::v031_isolate_sandbox_content::prepare_terminal_launch_context(
                     self, agent.name,
                 )?
             }
@@ -722,10 +722,10 @@ mod tests {
     /// admission proves.
     fn admit_fixture_content(inst: &Instance) {
         let app = crate::session::get_app_dir().unwrap();
-        for root in crate::migrations::v030_isolate_sandbox_content::instance_roots(inst).unwrap() {
+        for root in crate::migrations::v031_isolate_sandbox_content::instance_roots(inst).unwrap() {
             std::fs::create_dir_all(&root.path).unwrap();
             let roles: Vec<&str> = root.roles.iter().map(String::as_str).collect();
-            crate::migrations::v030_isolate_sandbox_content::certify_test_content(
+            crate::migrations::v031_isolate_sandbox_content::certify_test_content(
                 &app, &inst.id, &root.path, &roles,
             )
             .unwrap();

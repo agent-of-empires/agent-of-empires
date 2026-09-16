@@ -325,10 +325,10 @@ impl Instance {
             &prepared.launch_env.container,
         )?;
         if let Some((_, transactions)) = prepared.sandbox_context_reset.as_ref() {
-            crate::migrations::v030_isolate_sandbox_content::acknowledge_context_reset(
+            crate::migrations::v031_isolate_sandbox_content::acknowledge_context_reset(
                 profile,
                 &self.id,
-                crate::migrations::v030_isolate_sandbox_content::NativeContextView::Terminal,
+                crate::migrations::v031_isolate_sandbox_content::NativeContextView::Terminal,
                 self.lifecycle_generation,
                 transactions,
                 None,

@@ -1057,7 +1057,18 @@ fn recovery_exposure(
                 );
             }
             for source in sources {
-                let canonical = canonical_expected_path(&source)?;
+                let canonical = match canonical_expected_path(&source) {
+                    Ok(canonical) => canonical,
+                    // A declared mount AoE cannot resolve is not proof of
+                    // privacy, and one unanswerable entry must not stop every
+                    // other session from moving.
+                    Err(error) => {
+                        return Ok(Some(format!(
+                            "sandbox {id} declares the mount {} that cannot be resolved ({error}); remove it and retry",
+                            source.display()
+                        )))
+                    }
+                };
                 if targets.iter().any(|target| {
                     target.starts_with(&source)
                         || source.starts_with(target)
@@ -1137,7 +1148,7 @@ fn new_receipt(app: &Path, row: &Value, tool: &str, roots: &[ContentRoot]) -> Re
             .context("private content store has no parent")?;
         parts.push(RootTransition {
             root: root.clone(),
-            stage: parent.join(format!(".v030-stage-{transaction}-{index}")),
+            stage: parent.join(format!(".v031-stage-{transaction}-{index}")),
             recovery: recovery_root(&root.host)?
                 .join(&transaction)
                 .join(index.to_string())
@@ -1235,10 +1246,12 @@ fn discard_stage(app: &Path, receipt: &mut Receipt, path: &Path) -> Result<()> {
     // resume path needs in every one of those states.
     let mut mid_publication = false;
     for part in &receipt.roots {
+        // A part that was planned from an original has begun publishing the
+        // moment its root stops holding that original, whether or not the
+        // journal has recorded the publish; a part that was already owned has
+        // begun once its certificate no longer matches the root.
         let renamed = match &part.original {
-            Some(original) => {
-                part.published.is_none() && identity(&part.root.path)?.as_ref() != Some(original)
-            }
+            Some(original) => identity(&part.root.path)?.as_ref() != Some(original),
             None => {
                 part.published.is_some()
                     && owned_root(app, &receipt.instance, &part.root.path)?.is_none()
@@ -1670,7 +1683,7 @@ fn checked_receipt(
                 .path
                 .parent()
                 .context("root has no parent")?
-                .join(format!(".v030-stage-{}-{index}", receipt.transaction));
+                .join(format!(".v031-stage-{}-{index}", receipt.transaction));
             let expected_recovery = recovery_root(&part.root.host)?
                 .join(&receipt.transaction)
                 .join(index.to_string())
@@ -1874,6 +1887,12 @@ fn reconcile_in(
                 &layout::profile_for_registry(app, &path),
             )?;
             if let Some(row) = read_row(&path, &id)? {
+                // A parked row cannot be acted on by a bare start, and v027 is
+                // deliberately silent for a backlog it only holds; the startup
+                // pass must not narrate work no start can do.
+                if super::v027_isolate_sandbox_stores::row_is_parked(&row) {
+                    continue;
+                }
                 let roots = row_roots(&row, &tool, home, &config)?;
                 if !roots_ready(app, &id, &tool, &roots)? {
                     progress::notice(format!("sandbox {id}: native content isolation pending; originals will be preserved before a fresh native session starts"));
