@@ -1365,16 +1365,6 @@ mod tests {
         fs::create_dir_all(&native).unwrap();
         std::os::unix::fs::symlink(source.join("plugins/native-state"), native.join("sessions"))
             .unwrap();
-        // A directory that does not overlap native state proves the same walk
-        // still publishes what it may, so the absence asserted below cannot be
-        // "nothing ran": the refusal is about the overlap, not about the walk.
-        // It is created before the boundary pins the source root.
-        fs::create_dir_all(source.join("authored-plugins")).unwrap();
-        fs::write(
-            source.join("authored-plugins/keep.json"),
-            b"AUTHORED_PLUGIN",
-        )
-        .unwrap();
         let mut boundary = NativeStateBoundary::for_source(&source, &active).unwrap();
         let mount = AGENT_CONFIG_MOUNTS
             .iter()
@@ -1387,23 +1377,27 @@ mod tests {
             b"PRIVATE_NATIVE_CONTEXT",
         )
         .unwrap();
+        // An authored file inside the same directory: the walk refuses the
+        // whole directory when it overlaps native state, so this file must not
+        // cross either. Without it the absence below is also true when the walk
+        // simply had nothing to publish.
+        fs::write(source.join("plugins/keep.json"), b"AUTHORED_PLUGIN").unwrap();
         seed_directory(
-            &source.join("authored-plugins"),
+            &source.join("plugins"),
             &AnchoredDir::open(&active).unwrap(),
-            Path::new("authored-plugins"),
+            Path::new("plugins"),
             &boundary,
             true,
             ReadAccess::default(),
         )
         .unwrap();
-        assert_eq!(
-            fs::read(active.join("authored-plugins/keep.json")).unwrap(),
-            b"AUTHORED_PLUGIN",
-            "a directory clear of native state still publishes"
-        );
         assert!(
             !active.join("plugins").exists(),
             "a resource overlapping a native state directory must not export even its names"
+        );
+        assert!(
+            !active.join("plugins/keep.json").exists(),
+            "not even an authored file in that directory crosses"
         );
     }
 
