@@ -654,13 +654,22 @@ function unwrapMarkdownFence(text: string): {
 }
 
 function HighlightedBlock({ text, language, maxLines = 20 }: { text: string; language?: string; maxLines?: number }) {
-  const [html, setHtml] = useState<string | null>(null);
+  // Cache the highlighted html together with the input identity that
+  // produced it, and render it only while that identity matches the current
+  // inputs. A request that resolves after its inputs were superseded (its
+  // effect cleanup may not have run when the new render commits) writes an
+  // entry whose key no longer matches, so it renders inert instead of
+  // overwriting the new content (e.g. a Read card reused for an
+  // extensionless file). The theme stays out of the key so a theme switch
+  // keeps the old palette until the re-highlight lands.
+  const [result, setResult] = useState<{ key: string; html: string } | null>(null);
   const [showAll, setShowAll] = useState(false);
   const shiki = useShikiTheme();
   const unwrapped = unwrapMarkdownFence(text);
   const effectiveText = unwrapped.text;
   const effectiveLang = unwrapped.lang ?? language;
   const { shown, truncated } = truncateLines(effectiveText, showAll ? 1_000_000 : maxLines);
+  const inputKey = `${effectiveLang ?? ""} ${shown}`;
 
   // ANSI fast path: when the text carries SGR escape sequences (e.g.
   // `gls --color=always`, `git status --color=always`), Shiki's bash
@@ -668,18 +677,6 @@ function HighlightedBlock({ text, language, maxLines = 20 }: { text: string; lan
   // `[01;34m` noise or fail to highlight at all. Render the styled
   // segments directly instead.
   const ansi = hasAnsi(shown);
-
-  // Drop stale highlighted markup when the rendered input changes, so a
-  // language-tagged block reused for unfenced text (no language, e.g. a Read
-  // card on an extensionless file) can't keep painting the previous block's
-  // html. Synced at render time (not in an effect) to satisfy the
-  // set-state-in-effect lint, mirroring FullFileViewer's syncKey pattern.
-  const inputKey = `${effectiveLang ?? ""} ${shown}`;
-  const [handledKey, setHandledKey] = useState(inputKey);
-  if (inputKey !== handledKey) {
-    setHandledKey(inputKey);
-    setHtml(null);
-  }
 
   useEffect(() => {
     if (ansi) return;
@@ -692,17 +689,19 @@ function HighlightedBlock({ text, language, maxLines = 20 }: { text: string; lan
           theme: shiki.theme,
           appearance: shiki.appearance,
         });
-        if (cancelled) return;
-        setHtml(out);
+        if (cancelled || !out) return;
+        setResult({ key: inputKey, html: out });
       } catch {
-        // unknown language; fall back to plain
-        if (!cancelled) setHtml(null);
+        // Unknown language → fall back to plain: the cached entry's key no
+        // longer matches, so nothing needs clearing.
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [effectiveLang, shown, shiki.theme, shiki.appearance, ansi]);
+  }, [effectiveLang, shown, inputKey, shiki.theme, shiki.appearance, ansi]);
+
+  const html = result && result.key === inputKey ? result.html : null;
 
   return (
     <div className="border-t border-surface-800 bg-surface-950">

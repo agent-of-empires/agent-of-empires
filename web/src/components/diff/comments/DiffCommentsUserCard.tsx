@@ -54,19 +54,17 @@ export function DiffCommentsUserCard({ payload }: Props) {
  *  block style. Falls back to plain `<pre>` while loading or when the
  *  language can't be resolved. See `lib/snippetHighlighter.ts`. */
 function HighlightedSnippet({ code, language, filePath }: { code: string; language?: string; filePath: string }) {
-  const [html, setHtml] = useState<string | null>(null);
-  const shiki = useShikiTheme();
-
-  // Drop stale highlighted markup when the snippet changes, so a switch to an
-  // unknown-language or load-failing snippet can't keep painting the previous
-  // one's html. Synced at render time (not in an effect) to satisfy the
-  // set-state-in-effect lint, mirroring FullFileViewer's syncKey pattern.
+  // Cache the highlighted html together with the input identity that
+  // produced it, and render it only while that identity matches the current
+  // inputs. This component is reused across the comment list, and a request
+  // that resolves after its inputs were superseded (its effect cleanup may
+  // not have run when the new render commits) writes an entry whose key no
+  // longer matches, so it renders inert instead of overwriting the new
+  // snippet. The theme stays out of the key so a theme switch keeps the old
+  // palette until the re-highlight lands.
   const inputKey = `${code} ${language ?? ""} ${filePath}`;
-  const [handledKey, setHandledKey] = useState(inputKey);
-  if (inputKey !== handledKey) {
-    setHandledKey(inputKey);
-    setHtml(null);
-  }
+  const [result, setResult] = useState<{ key: string; html: string } | null>(null);
+  const shiki = useShikiTheme();
 
   useEffect(() => {
     let cancelled = false;
@@ -75,17 +73,19 @@ function HighlightedSnippet({ code, language, filePath }: { code: string; langua
     (async () => {
       try {
         const out = await highlightSnippet(code, { langHint: hint, theme: shiki.theme, appearance: shiki.appearance });
-        if (cancelled) return;
-        setHtml(out);
+        if (cancelled || !out) return;
+        setResult({ key: inputKey, html: out });
       } catch {
-        // Unknown lang → fall through to plain rendering.
-        if (!cancelled) setHtml(null);
+        // Unknown lang → fall through to plain rendering: the cached entry's
+        // key no longer matches, so nothing needs clearing.
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [code, language, filePath, shiki.theme, shiki.appearance]);
+  }, [code, language, filePath, inputKey, shiki.theme, shiki.appearance]);
+
+  const html = result && result.key === inputKey ? result.html : null;
 
   if (html) {
     // Shiki HTML-escapes the user-supplied `code` before tokenizing, so

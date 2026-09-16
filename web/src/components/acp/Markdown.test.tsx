@@ -16,6 +16,9 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { startTransition, useLayoutEffect, useState } from "react";
+import { createRoot } from "react-dom/client";
+import { flushSync } from "react-dom";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 
@@ -518,5 +521,66 @@ describe("ShikiSyntaxHighlighter stale-content transitions (#3974)", () => {
     });
     expect(container.querySelector("pre.shiki")).toBeNull();
     expect(container.textContent).not.toContain("fn main");
+  });
+
+  it("ignores a late resolution from a superseded request (pending A → committed B → late A)", async () => {
+    let resolveA!: (v: string | null) => void;
+    vi.mocked(highlightSnippet).mockReturnValueOnce(
+      new Promise<string | null>((res) => {
+        resolveA = res;
+      }),
+    );
+    const Comp = getSyntaxHighlighter();
+
+    // Render B in a transition and resolve A's request in B's commit phase
+    // (layout effect), before A's passive effect cleanup has run — the
+    // window where A's `cancelled` flag is still false and only the
+    // input-key check can reject the stale write. Runs outside the act
+    // environment on a raw root: act flushes the passive cleanup before the
+    // resolution's microtask and closes the window artificially.
+    let setStage!: (s: "a" | "b") => void;
+    function Harness() {
+      const [stage, set] = useState<"a" | "b">("a");
+      useLayoutEffect(() => {
+        setStage = set;
+      }, [set]);
+      useLayoutEffect(() => {
+        if (stage === "b") resolveA('<pre class="shiki">OLD_A</pre>');
+      }, [stage]);
+      return stage === "a" ? (
+        <Comp language="rust" code="fn a() {}" />
+      ) : (
+        <Comp language={undefined} code="plain b text" />
+      );
+    }
+
+    const g = globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean };
+    const prevActEnv = g.IS_REACT_ACT_ENVIRONMENT;
+    g.IS_REACT_ACT_ENVIRONMENT = false;
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const root = createRoot(host);
+    const macrotask = () => new Promise<void>((r) => setTimeout(r, 0));
+    try {
+      flushSync(() => {
+        root.render(<Harness />);
+      });
+      await macrotask(); // A's effect has run; its request is pending.
+
+      startTransition(() => setStage("b"));
+      for (let i = 0; i < 20 && !host.innerHTML.includes("plain b text"); i++) {
+        await Promise.resolve();
+      }
+      await macrotask();
+      await macrotask();
+
+      expect(host.textContent).toContain("plain b text");
+      expect(host.innerHTML).not.toContain("OLD_A");
+      expect(host.querySelector("pre.shiki")).toBeNull();
+    } finally {
+      flushSync(() => root.unmount());
+      host.remove();
+      g.IS_REACT_ACT_ENVIRONMENT = prevActEnv;
+    }
   });
 });
