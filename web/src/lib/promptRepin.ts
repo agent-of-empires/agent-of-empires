@@ -15,8 +15,14 @@ export interface PromptRepinInput {
   /** Whether the session socket has opened. `fetchReplay` lands the
    *  transcript (and its prompt bumps) before the WebSocket dials and
    *  `hasEverOpened` flips only in `onopen`, so a bump seen while this is
-   *  false is hydration, not a submit. */
+   *  false is hydration, not a submit — unless it is this client's own. */
   live: boolean;
+  /** Whether this client has an optimistic prompt in flight
+   *  (`inflightPromptIds` non-empty). A bump that arrives with one is a local
+   *  submit whatever the socket state: `sendPrompt` dispatches the optimistic
+   *  row before the POST, even before the first open, and that submit deserves
+   *  its re-pin too. Replay bumps never carry an in-flight id. */
+  localInflight: boolean;
 }
 
 export interface PromptRepinDecision {
@@ -26,12 +32,12 @@ export interface PromptRepinDecision {
   pin: boolean;
 }
 
-/** Re-pin exactly once per prompt dispatched after mount while the socket is
- *  live. The mount pass never pins (the scroll-state restore owns the first
- *  pin, and a reader who reopened scrolled up must stay there); a reset that
- *  lowers the counter never pins either. */
+/** Re-pin exactly once per prompt dispatched after mount, when the socket is
+ *  live or the prompt is this client's own. The mount pass never pins (the
+ *  scroll-state restore owns the first pin, and a reader who reopened scrolled
+ *  up must stay there); a reset that lowers the counter never pins either. */
 export function promptRepinDecision(i: PromptRepinInput): PromptRepinDecision {
   if (i.seen === null) return { seen: i.promptSeq, pin: false };
   const advanced = i.promptSeq > i.seen;
-  return { seen: i.promptSeq, pin: advanced && i.live };
+  return { seen: i.promptSeq, pin: advanced && (i.live || i.localInflight) };
 }
