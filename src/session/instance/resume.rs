@@ -71,11 +71,12 @@ impl Instance {
     pub fn restart_discarding_sandbox_container(
         &mut self,
         size: Option<(u16, u16)>,
+        skip_on_launch: bool,
         discard_sandbox_container: bool,
     ) -> Result<StartOutcome> {
         self.orchestrate_resume_launch(
             size,
-            false,
+            skip_on_launch,
             ResumeAttemptPolicy::HonorAutoResumeSetting,
             true,
             discard_sandbox_container,

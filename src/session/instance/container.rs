@@ -155,26 +155,30 @@ impl Instance {
                 None
             };
 
-        // A container built for another agent mounts that agent's config, so
-        // the row decides the identity, not this process's copy: a peer can
-        // change the tool while the instance is cached, and a stale copy that
-        // still matches the label would reuse the wrong mounts.
+        // A container built for another agent mounts that agent's config.
+        // Decide on the disk row and a resolved profile: a stale in-memory copy
+        // can match an old container or mismatch one a peer rebuilt, and a
+        // defaulted config would misread a valid one. A failed reload still
+        // permits reuse, never removal.
         if container.exists()? {
-            self.reconcile_from_disk();
-        }
-        if container.exists()?
-            && container.agent_tool_matches(&self.container_agent_identity()?)? == Some(false)
-        {
-            self.try_reconcile_from_disk().context(
-                "cannot confirm the session's tool before removing its sandbox container",
-            )?;
+            let reloaded = self.try_reconcile_from_disk();
             if container.agent_tool_matches(&self.container_agent_identity()?)? == Some(false) {
+                reloaded.context(
+                    "cannot confirm the session's tool before removing its sandbox container",
+                )?;
                 tracing::info!(
                     target: "containers.runtime",
                     session = %self.id,
                     "removing sandbox container built for another tool; it will be recreated"
                 );
                 container.remove(true)?;
+            } else if let Err(error) = reloaded {
+                tracing::warn!(
+                    target: "session.store",
+                    session = %self.id,
+                    error = %format_args!("{error:#}"),
+                    "failed to reload disk state before reusing the sandbox container; using in-memory value"
+                );
             }
         }
         // After every reload above, which may have replaced the tool.
@@ -861,6 +865,8 @@ claude-personal = "~/.claude-global"
             (("codex", ""), "codex", Disk::Absent, 0, Some(".codex")),
             (("codex", ""), "", Disk::Absent, 0, Some(".codex")),
             (("codex", ""), "claude", Disk::Corrupt, 0, None),
+            (("codex", ""), "codex", Disk::Corrupt, 0, Some(".codex")),
+            (("claude", ""), "claude", Disk::Row("codex", ""), 1, None),
             // A status-only alias is not an execution identity, so this row's
             // container label is its tool name and the reuse path refreshes no
             // store. A wrapper or a built-in tool is what carries a store.

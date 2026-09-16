@@ -84,11 +84,41 @@ fn acquire_env_lock() -> Option<MutexGuard<'static, ()>> {
     if ENV_LOCK_HELD.with(Cell::get) {
         None
     } else {
-        #[cfg(test)]
-        tests::observe_env_lock_contention();
-        let guard = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let guard = lock_reporting_contention(&ENV_LOCK, tests::report_env_lock_contention)
+            .unwrap_or_else(PoisonError::into_inner);
         ENV_LOCK_HELD.with(|held| held.set(true));
         Some(guard)
+    }
+}
+
+/// Take `lock`, calling `contended` first when another thread holds it, so a
+/// test can wait for a thread to reach the lock instead of sleeping.
+pub(crate) fn lock_reporting_contention<'a, T>(
+    lock: &'a std::sync::Mutex<T>,
+    contended: impl FnOnce(),
+) -> std::sync::LockResult<MutexGuard<'a, T>> {
+    match lock.try_lock() {
+        Ok(guard) => Ok(guard),
+        Err(std::sync::TryLockError::Poisoned(error)) => Err(error),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            contended();
+            lock.lock()
+        }
+    }
+}
+
+/// [`lock_reporting_contention`] for an `RwLock` writer.
+pub(crate) fn write_reporting_contention<'a, T>(
+    lock: &'a std::sync::RwLock<T>,
+    contended: impl FnOnce(),
+) -> std::sync::LockResult<std::sync::RwLockWriteGuard<'a, T>> {
+    match lock.try_write() {
+        Ok(guard) => Ok(guard),
+        Err(std::sync::TryLockError::Poisoned(error)) => Err(error),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            contended();
+            lock.write()
+        }
     }
 }
 
@@ -591,15 +621,10 @@ mod tests {
         static LOCK_WAITING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
     }
 
-    pub(super) fn observe_env_lock_contention() {
+    pub(super) fn report_env_lock_contention() {
         LOCK_WAITING.with_borrow_mut(|waiting| {
             if let Some(waiting) = waiting.take() {
-                if matches!(
-                    ENV_LOCK.try_lock(),
-                    Err(std::sync::TryLockError::WouldBlock)
-                ) {
-                    let _ = waiting.send(());
-                }
+                let _ = waiting.send(());
             }
         });
     }

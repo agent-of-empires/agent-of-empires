@@ -14,6 +14,28 @@ pub(crate) fn is_http_url(url: &str) -> bool {
     lower.starts_with("http://") || lower.starts_with("https://")
 }
 
+/// `path` with a leading `home` replaced by `~`, only when `path` is `home` or
+/// lies under it; a sibling that merely shares a string prefix is unchanged.
+pub(crate) fn collapse_home(path: &str, home: &str) -> String {
+    let home = match home.trim_end_matches('/') {
+        "" => home,
+        trimmed => trimmed,
+    };
+    match path.strip_prefix(home) {
+        Some("") => "~".to_string(),
+        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        _ => path.to_string(),
+    }
+}
+
+/// [`collapse_home`] against the user's home directory, for display.
+pub(crate) fn collapse_tilde(path: &str) -> String {
+    match dirs::home_dir() {
+        Some(home) => collapse_home(path, &home.to_string_lossy()),
+        None => path.to_string(),
+    }
+}
+
 /// Current Unix time in whole seconds, saturating to 0 if the clock is before
 /// the epoch (which should never happen on a sane system).
 pub(crate) fn now_secs() -> u64 {
@@ -42,6 +64,25 @@ pub(crate) fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn collapse_home_requires_a_separator_after_home() {
+        for (path, expect) in [
+            ("/home/u", "~"),
+            ("/home/u/projects/app", "~/projects/app"),
+            ("/home/u/projects/", "~/projects/"),
+            ("/home/uextra/not/home", "/home/uextra/not/home"),
+            ("/tmp/elsewhere", "/tmp/elsewhere"),
+            ("relative/path", "relative/path"),
+        ] {
+            assert_eq!(collapse_home(path, "/home/u"), expect, "{path}");
+            assert_eq!(
+                collapse_home(path, "/home/u/"),
+                expect,
+                "{path} (trailing /)"
+            );
+        }
+    }
 
     #[test]
     fn system_time_to_ms_at_epoch_is_zero() {
