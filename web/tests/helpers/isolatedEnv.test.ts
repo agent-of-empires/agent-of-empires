@@ -32,6 +32,7 @@ const NON_SUFFIX_HOST_STATE: Record<string, string> = {
   AOE_CITYHALL_BUNDLE_URL: "https://host.invalid/bundle",
   AOE_CITYHALL_MODE: "1",
   AOE_DEFER_SANDBOX_MIGRATION: "1",
+  AOE_DAEMON_PASSPHRASE: "host-passphrase",
   AOE_DAEMON_TOKEN: "host-token",
   AOE_DAEMON_URL: "http://a-real-daemon.internal:8080",
   AOE_E2E_INPUT_BARRIER: `${HOST}/input-barrier`,

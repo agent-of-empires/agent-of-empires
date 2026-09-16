@@ -12,7 +12,7 @@ Both surfaces consume the same `aoe serve` daemon over the same HTTP and WebSock
 - Terminal sessions work in both surfaces: the TUI attaches to the pane and the dashboard streams it (see [Terminal view](../guides/web/terminal.md)).
 - Switching views keeps the worktree, files, and commits. A **claude** session keeps its conversation in both directions; every other agent starts fresh under the new view.
 - A healthy structured session shows Idle or Active in the session list, observed through the ACP event stream rather than tmux pane probing.
-- The local TUI attaches to a same-host `--auth=passphrase` daemon without the passphrase exchange, since loopback callers are protected by the 0600 serve files. Adding `--behind-proxy` withdraws that carve-out and the TUI then cannot attach at all.
+- The local TUI attaches to a same-host `--auth=passphrase` daemon without the passphrase exchange, since loopback callers are protected by the 0600 serve files. Adding `--behind-proxy` withdraws that carve-out, since a request from the proxy's own loopback socket is otherwise indistinguishable from one it forwarded on behalf of a remote caller. In that case the TUI and every `aoe acp <verb>` CLI command fall back to the same `/api/login` handshake the web dashboard uses, reading the daemon's own `serve.passphrase` file to log in automatically and caching the resulting session (see [Cross-machine attach](../structured-view.md#cross-machine-attach) for the remote-endpoint equivalent, `AOE_DAEMON_PASSPHRASE`).
 
 ### TUI keybinds
 
