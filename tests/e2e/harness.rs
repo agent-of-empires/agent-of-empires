@@ -302,6 +302,11 @@ pub struct TuiTestHarness {
     acp_fork_fail: bool,
 }
 
+/// Raw ESC is a prefix byte: read together with the F12 fence, crossterm
+/// decodes `ESC ESC [24~` as Esc plus literal `[24~` and the fence is lost.
+/// The CSI-u encoding is self-delimiting and decodes to the same Esc press.
+const ESCAPE_CSI_U: &[&str] = &["1b", "5b", "32", "37", "75"];
+
 #[allow(dead_code)]
 impl TuiTestHarness {
     /// Create a new harness with an isolated `$HOME` and a fake `claude` stub
@@ -717,8 +722,28 @@ last_seen_version = "{}"
 
     /// Send one or more tmux key names (e.g. "Enter", "Escape", "q", "C-c").
     pub fn send_keys(&self, keys: &str) {
-        self.send_keys_unfenced(keys);
+        if matches!(keys, "Escape" | "C-[") {
+            self.send_hex_keys(ESCAPE_CSI_U);
+        } else {
+            self.send_keys_unfenced(keys);
+        }
         self.synchronize_input();
+    }
+
+    fn send_hex_keys<S: AsRef<std::ffi::OsStr>>(&self, bytes: &[S]) {
+        assert!(self.spawned, "must call spawn_tui() or spawn() first");
+        let output = Command::new("tmux")
+            .arg("-S")
+            .arg(&self.socket_path)
+            .args(["send-keys", "-t", &self.session_name, "-H"])
+            .args(bytes)
+            .output()
+            .expect("failed to send keys");
+        assert!(
+            output.status.success(),
+            "send-keys failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     /// Native terminal owners cannot receive an outer-TUI F12 fence.
@@ -816,21 +841,7 @@ last_seen_version = "{}"
         bytes.extend_from_slice(text.as_bytes());
         bytes.extend_from_slice(b"\x1b[201~");
         let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        let output = Command::new("tmux")
-            .arg("-S")
-            .arg(&self.socket_path)
-            .arg("send-keys")
-            .arg("-t")
-            .arg(&self.session_name)
-            .arg("-H")
-            .args(&hex)
-            .output()
-            .expect("failed to send paste");
-        assert!(
-            output.status.success(),
-            "send_paste failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        self.send_hex_keys(&hex);
         self.synchronize_input();
     }
 
@@ -860,10 +871,7 @@ last_seen_version = "{}"
         if !self.input_barrier || !self.session_alive() {
             return;
         }
-        let current: u64 = std::fs::read_to_string(self.home_dir.path().join("input-barrier"))
-            .expect("TUI startup acknowledged")
-            .parse()
-            .expect("input sequence");
+        let current = self.input_sequence();
         let output = Command::new("tmux")
             .arg("-S")
             .arg(&self.socket_path)
@@ -875,6 +883,13 @@ last_seen_version = "{}"
         }
         assert!(output.status.success(), "input barrier send failed");
         self.wait_for_input_ack(current + 1, Duration::from_secs(10));
+    }
+
+    fn input_sequence(&self) -> u64 {
+        std::fs::read_to_string(self.home_dir.path().join("input-barrier"))
+            .expect("TUI startup acknowledged")
+            .parse()
+            .expect("input sequence")
     }
 
     fn wait_for_input_ack(&self, sequence: u64, timeout: Duration) {
@@ -1258,6 +1273,25 @@ impl Drop for TuiTestHarness {
             }
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::parallel]
+fn tui_input_barrier_survives_escape_in_same_read() {
+    require_tmux!();
+    let mut harness = TuiTestHarness::new("escape_fence");
+    harness.spawn_tui();
+    harness.wait_for("No sessions yet");
+    harness.send_keys("n");
+    harness.wait_for("Title");
+
+    // One send-keys is one write, so the TUI reads Escape and the fence together.
+    let f12 = ["1b", "5b", "32", "34", "7e"];
+    let sequence = harness.input_sequence() + 1;
+    harness.send_hex_keys(&[ESCAPE_CSI_U, &f12].concat());
+    harness.wait_for_input_ack(sequence, Duration::from_secs(10));
+    assert!(!harness.capture_screen().contains("Title"));
 }
 
 #[cfg(unix)]

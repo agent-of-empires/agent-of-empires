@@ -989,12 +989,15 @@ pub(super) async fn run_connection_task<W, R>(
                     seed_history_replay,
                     fork_from,
                 } => {
-                    // Decide whether to resume the prior agent session or create
-                    // a fresh one. session/load is only attempted when the agent
-                    // advertises support AND we have a stored id to feed it. On
-                    // load failure (id GC'd, agent state lost, etc.) we fall
-                    // through to session/new and emit SessionContextReset so the
-                    // UI can show a notice and clear stale token-usage hints.
+                    // Announce lost resume context only once replacement succeeds.
+                    // Fork failures already report their own reset boundary.
+                    let fork_requested = fork_from.as_deref().is_some_and(|s| !s.is_empty());
+                    let mut context_reset_reason =
+                        if stored_acp_session_id.is_some() && !load_session_capable && !fork_requested {
+                            Some("session/load unavailable; started a new session with empty context".to_string())
+                        } else {
+                            None
+                        };
                     let mut acp_session_id: Option<SessionId> = None;
 
                     // Structured fork (when fork_pending is set and the agent
@@ -1116,15 +1119,9 @@ pub(super) async fn run_connection_task<W, R>(
                                 return Err(e);
                             }
                         }
-                    } else if fork_from.as_deref().is_some_and(|s| !s.is_empty()) {
-                        // A fork was requested but the connected agent does not
-                        // advertise the fork capability (e.g. a resume-only
-                        // adapter, or a claude-agent-acp build without fork).
-                        // The create-time surfaces gate on this, but a runtime
-                        // agent swap can still land here. Rather than silently
-                        // presenting an empty session/new that the user believes
-                        // is a fork, emit a reset so the marker clears (no retry
-                        // loop) and the dashboard can explain the downgrade.
+                    } else if fork_requested {
+                        // Clear the unsupported fork marker so retries do not
+                        // repeatedly present the same fallback as a new fork.
                         warn!(
                             target: "acp.protocol",
                             session = %session_label,
@@ -1258,11 +1255,9 @@ pub(super) async fn run_connection_task<W, R>(
                                         "session/load failed, falling back to session/new: {e}"
                                     );
                                     suppress_for_block.store(false, Ordering::Relaxed);
-                                    let _ = event_tx_for_block
-                                        .send(Event::SessionContextReset {
-                                            reason: format!("session/load failed: {e}"),
-                                        })
-                                        .await;
+                                    if !fork_requested {
+                                        context_reset_reason = Some(format!("session/load failed: {e}"));
+                                    }
                                 }
                             }
                         }
@@ -1286,6 +1281,11 @@ pub(super) async fn run_connection_task<W, R>(
                             connection.send_request(req).block_task().await?
                         };
                         let id = new_session.session_id.clone();
+                        if let Some(reason) = context_reset_reason {
+                            let _ = event_tx_for_block
+                                .send(Event::SessionContextReset { reason })
+                                .await;
+                        }
                         info!(
                             target: "acp.protocol",
                             session = %session_label,

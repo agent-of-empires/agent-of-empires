@@ -327,6 +327,14 @@ fn find_process_in_group(pgrp: u32) -> Option<u32> {
     None
 }
 
+pub(super) fn parent_and_argv0(pid: u32) -> Option<(u32, String)> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let ppid = u32::try_from(parse_stat_field(&stat, 3)?).ok()?;
+    let cmdline = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let argv0 = cmdline.split(|byte| *byte == 0).next().unwrap_or_default();
+    Some((ppid, String::from_utf8_lossy(argv0).into_owned()))
+}
+
 /// Parse a field from `/proc/[pid]/stat`; `comm` (field 2) may contain spaces.
 fn parse_stat_field(content: &str, field_idx: usize) -> Option<i64> {
     // Find the closing paren of comm field, then parse from there

@@ -309,7 +309,9 @@ pub const AOE_AGENT: AgentProfile = AgentProfile {
     parent_meta_namespaces: &[],
     clear_aliases: &["/clear"],
     // A forwarded /clear is ordinary model text. AoE creates a new native
-    // session instead; the adapter persists that identity before success.
+    // session instead; the adapter persists that identity best-effort, so a
+    // failed persist does not block the clear and a missing transcript resets
+    // context on load.
     clear_requires_driven_reset: true,
     // No ExitPlanMode tool and no mode channel; no ScheduleWakeup or cron
     // tools. Synthesising Plan or WakeupScheduled events here would fire on

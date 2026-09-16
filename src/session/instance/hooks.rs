@@ -13,11 +13,13 @@ pub(super) fn status_hook_env_prefix(
     if has_hooks {
         let hook_bin = std::env::current_exe()
             .expect("current executable is required for host identity hooks");
+        // `$$` is the launch shell, which `exec`s into the agent.
         format!(
-            "AOE_PROFILE={} AOE_INSTANCE_ID={} AOE_HOOK_BIN={} ",
+            "AOE_PROFILE={} AOE_INSTANCE_ID={} AOE_HOOK_BIN={} AOE_AGENT_PID=$$ AOE_AGENT_BIN={} ",
             shell_escape(profile),
             shell_escape(instance_id),
-            shell_escape(&hook_bin.to_string_lossy())
+            shell_escape(&hook_bin.to_string_lossy()),
+            shell_escape(agent.map_or("", |agent| agent.binary))
         )
     } else {
         String::new()
@@ -661,12 +663,13 @@ mod tests {
 
     use crate::session::test_support::EnvGuard;
 
-    fn expected_status_prefix(profile: &str, instance_id: &str) -> String {
+    fn expected_status_prefix(profile: &str, instance_id: &str, agent: &str) -> String {
         format!(
-            "AOE_PROFILE={} AOE_INSTANCE_ID={} AOE_HOOK_BIN={} ",
+            "AOE_PROFILE={} AOE_INSTANCE_ID={} AOE_HOOK_BIN={} AOE_AGENT_PID=$$ AOE_AGENT_BIN={} ",
             shell_escape(profile),
             shell_escape(instance_id),
-            shell_escape(&std::env::current_exe().unwrap().to_string_lossy())
+            shell_escape(&std::env::current_exe().unwrap().to_string_lossy()),
+            shell_escape(crate::agents::get_agent(agent).unwrap().binary)
         )
     }
 
@@ -895,7 +898,7 @@ mod tests {
         let agent = crate::agents::get_agent("codex");
         assert_eq!(
             status_hook_env_prefix("work", "abc123", agent),
-            expected_status_prefix("work", "abc123")
+            expected_status_prefix("work", "abc123", "codex")
         );
     }
 
@@ -1293,15 +1296,15 @@ agent_status_hooks = false
     fn test_status_hook_env_prefix_includes_hermes() {
         assert_eq!(
             status_hook_env_prefix("work", "abc123", crate::agents::get_agent("hermes")),
-            expected_status_prefix("work", "abc123")
+            expected_status_prefix("work", "abc123", "hermes")
         );
         assert_eq!(
             status_hook_env_prefix("work", "abc123", crate::agents::get_agent("settl")),
-            expected_status_prefix("work", "abc123")
+            expected_status_prefix("work", "abc123", "settl")
         );
         assert_eq!(
             status_hook_env_prefix("work", "abc123", crate::agents::get_agent("claude")),
-            expected_status_prefix("work", "abc123")
+            expected_status_prefix("work", "abc123", "claude")
         );
         assert_eq!(
             status_hook_env_prefix("work", "abc123", crate::agents::get_agent("opencode")),
@@ -1309,11 +1312,11 @@ agent_status_hooks = false
         );
         assert_eq!(
             status_hook_env_prefix("work", "abc123", crate::agents::get_agent("kiro")),
-            expected_status_prefix("work", "abc123")
+            expected_status_prefix("work", "abc123", "kiro")
         );
         assert_eq!(
             status_hook_env_prefix("work", "abc123", crate::agents::get_agent("kimi")),
-            expected_status_prefix("work", "abc123")
+            expected_status_prefix("work", "abc123", "kimi")
         );
     }
     #[test]

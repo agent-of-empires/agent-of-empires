@@ -67,6 +67,8 @@ pub struct PluginHost {
     sandbox: Arc<dyn SandboxBackend>,
     workers_dir: PathBuf,
     state: Mutex<WorkerTable>,
+    /// Worker concurrency cap: [`MAX_WORKERS`] outside tests.
+    max_workers: usize,
     /// Missing when the automation ledger could not open or in reduced tests.
     session_rpc: Option<Arc<crate::plugin::session_api::SessionRpcDeps>>,
 }
@@ -97,6 +99,7 @@ impl PluginHost {
                 crashed: HashSet::new(),
                 next_supervisor_id: 1,
             }),
+            max_workers: MAX_WORKERS,
             session_rpc,
         }))
     }
@@ -241,12 +244,12 @@ impl PluginHost {
 
             let running_ids: HashSet<String> = table.running.keys().cloned().collect();
             let (to_launch, teardown_ids, truncated) =
-                plan_reconcile(&desired, &running_ids, &table.crashed, MAX_WORKERS);
+                plan_reconcile(&desired, &running_ids, &table.crashed, self.max_workers);
 
             if truncated {
                 tracing::warn!(
                     target: "plugin.host",
-                    cap = MAX_WORKERS,
+                    cap = self.max_workers,
                     "plugin worker concurrency cap reached; some workers not launched"
                 );
             }
@@ -264,6 +267,53 @@ impl PluginHost {
         };
 
         self.teardown_workers(to_teardown).await;
+    }
+
+    /// Replace one plugin's worker so it runs the build now on disk, clearing its
+    /// crash tombstone so an update also retries a crashed worker. Reconcile
+    /// alone keeps a running worker. A placeholder holds the worker's slot
+    /// through teardown, so a plugin waiting on the worker cap cannot take it. A
+    /// plugin `registry` does not want running stays stopped.
+    pub async fn restart_worker(self: &Arc<Self>, plugin_id: &str, registry: &PluginRegistry) {
+        let replaced = {
+            let mut table = self.state.lock().await;
+            table.crashed.remove(plugin_id);
+            table.running.remove(plugin_id).map(|stale| {
+                let reservation = table.next_supervisor_id;
+                table.next_supervisor_id += 1;
+                table.running.insert(
+                    plugin_id.to_string(),
+                    RunningWorker {
+                        supervisor_id: reservation,
+                        pid: 0,
+                        task: tokio::spawn(async {}),
+                        inbound: None,
+                        ui_generation: None,
+                    },
+                );
+                (stale, reservation)
+            })
+        };
+        if let Some((stale, reservation)) = replaced {
+            self.teardown_workers(vec![(plugin_id.to_string(), stale)])
+                .await;
+            let mut table = self.state.lock().await;
+            // A concurrent reconcile or restart may have claimed the slot since.
+            if table
+                .running
+                .get(plugin_id)
+                .is_some_and(|w| w.supervisor_id == reservation)
+            {
+                table.running.remove(plugin_id);
+                if registry
+                    .get(plugin_id)
+                    .is_some_and(|p| p.active() && p.manifest.runtime.is_some())
+                {
+                    self.launch_locked(&mut table, plugin_id.to_string());
+                }
+            }
+        }
+        self.reconcile(registry).await;
     }
 
     /// Insert a placeholder entry and spawn its supervisor under the held table
@@ -295,11 +345,12 @@ impl PluginHost {
     /// Abort each supervisor, retire its UI generation, and reap its group.
     /// Reaps in parallel and off the table lock; each escalating reap awaits up
     /// to [`REAP_GRACE`] before SIGKILL, so join_all bounds the whole thing to
-    /// one grace period. Aborting the task first stops it from respawning the
-    /// worker we are about to reap.
+    /// one grace period. Aborting the task, and waiting for it to stop, keeps it
+    /// from respawning or signalling the worker we are about to reap.
     async fn teardown_workers(&self, workers: Vec<(String, RunningWorker)>) {
         futures_util::future::join_all(workers.into_iter().map(|(plugin_id, w)| async move {
             w.task.abort();
+            let _ = w.task.await;
             if let Some(generation) = w.ui_generation {
                 self.api.clear_ui(&plugin_id, generation);
             }
@@ -966,6 +1017,123 @@ rl.on('line', (line) => {
         let events = got["events"].as_array().unwrap();
         assert_eq!(events.len(), 1, "worker should react to the host push");
         assert_eq!(events[0]["payload"]["ok"], json!(true));
+    }
+
+    async fn worker_pid(host: &PluginHost, plugin_id: &str) -> Option<u32> {
+        let table = host.state.lock().await;
+        table
+            .running
+            .get(plugin_id)
+            .map(|w| w.pid)
+            .filter(|pid| *pid != 0)
+    }
+
+    async fn wait_until<F, Fut>(what: &str, mut done: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done().await {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Install and grant a plugin whose worker just sleeps.
+    fn install_sleeper(plugin_id: &str) {
+        use crate::session::{update_config, CapabilityGrant, PluginConfig};
+
+        let manifest = format!(
+            r#"
+id = "{plugin_id}"
+name = "Sleeper"
+version = "1.0.0"
+api_version = 8
+capabilities = ["runtime.worker"]
+
+[runtime]
+kind = "command"
+system = true
+command = ["sleep", "600"]
+"#
+        );
+        let dir = crate::plugin::plugins_dir().unwrap().join(plugin_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("aoe-plugin.toml"), &manifest).unwrap();
+        update_config(|config| {
+            config.plugins.insert(
+                plugin_id.to_string(),
+                PluginConfig {
+                    grant: Some(CapabilityGrant {
+                        manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
+                            manifest.as_bytes(),
+                        ),
+                        capabilities: vec!["runtime.worker".to_string()],
+                        granted_at: chrono::Utc::now(),
+                    }),
+                    ..PluginConfig::default()
+                },
+            );
+        })
+        .unwrap();
+    }
+
+    /// An update replaces a plugin's tree under its live worker (#3552).
+    /// Reconcile sees the plugin already running and keeps the old process;
+    /// `restart_worker` reaps it and launches a fresh one in the same slot, even
+    /// with another plugin waiting on the worker cap.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restart_worker_replaces_the_running_worker_in_its_slot() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("XDG_CONFIG_HOME", temp.path().to_path_buf()),
+            ("HOME", temp.path().to_path_buf()),
+            ("USERPROFILE", temp.path().to_path_buf()),
+        ]);
+        let plugin_id = "acme.sleeper";
+        install_sleeper(plugin_id);
+        let registry = crate::plugin::reload_registry();
+
+        let mut host = PluginHost::new(&temp.path().join("host"), "default", None).unwrap();
+        Arc::get_mut(&mut host).unwrap().max_workers = 1;
+        host.start(&registry).await;
+        wait_until("the first worker", || async {
+            worker_pid(&host, plugin_id).await.is_some()
+        })
+        .await;
+        let first = worker_pid(&host, plugin_id).await.unwrap();
+
+        host.reconcile(&registry).await;
+        assert_eq!(worker_pid(&host, plugin_id).await, Some(first));
+
+        // Sorts before the target, so it would win a slot the restart freed.
+        let waiting = "acme.aaa";
+        install_sleeper(waiting);
+        let registry = crate::plugin::reload_registry();
+        host.reconcile(&registry).await;
+        assert!(!host.state.lock().await.running.contains_key(waiting));
+
+        host.restart_worker(plugin_id, &registry).await;
+        wait_until("a replacement worker", || async {
+            worker_pid(&host, plugin_id)
+                .await
+                .is_some_and(|pid| pid != first)
+        })
+        .await;
+        assert!(
+            !host.state.lock().await.running.contains_key(waiting),
+            "the waiting plugin must not take the restarted worker's slot"
+        );
+        wait_until("the old worker to exit", || async {
+            !worker::is_pid_alive(first)
+        })
+        .await;
+
+        host.shutdown().await;
     }
 
     fn set(ids: &[&str]) -> HashSet<String> {

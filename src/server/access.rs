@@ -433,6 +433,7 @@ pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     ("POST", "/api/plugins/install/preview"),
     ("POST", "/api/plugins/{id}/action"),
     ("POST", "/api/plugins/{id}/enabled"),
+    ("POST", "/api/plugins/{id}/worker/restart"),
     ("POST", "/api/plugins/{id}/uninstall"),
     ("POST", "/api/plugins/{id}/update/apply"),
     ("POST", "/api/plugins/{id}/update/dismiss"),

@@ -6,7 +6,6 @@
 //! for seconds. Running it on the TUI event loop froze the whole UI, so the TUI
 //! drives this off the UI thread via `RestartPoller`, mirroring `StopPoller`.
 
-use crate::containers::{DockerContainer, Teardown};
 use crate::session::{Instance, StartOutcome};
 
 pub struct RestartRequest {
@@ -18,9 +17,15 @@ pub struct RestartRequest {
     /// Keys to send once the pane is live again. Empty disables the wake-up
     /// (the documented opt-out via `session.restart_wake_message`).
     pub wake_message: String,
+    /// Skip on_launch hooks that already ran in the background creation poller.
+    pub skip_on_launch: bool,
+    /// Kill a hook that outlives the recovery hook timeout, so a hung hook
+    /// cannot wedge the worker. Unset for the launch behind Enter or a new
+    /// session, whose hooks have always run unbounded.
+    pub bound_hooks: bool,
     /// Remove the sandbox container before relaunching, so the next start
-    /// creates a fresh one. Set on a tool swap: agent config mounts are chosen
-    /// per tool at create time and a restart reuses the container (#3959).
+    /// creates a fresh one. Set on a tool swap: launch recreates a container
+    /// labelled for another tool, but not one created before that label (#3959).
     pub discard_sandbox_container: bool,
 }
 
@@ -43,6 +48,8 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
         mut instance,
         size,
         wake_message,
+        skip_on_launch,
+        bound_hooks,
         discard_sandbox_container,
     } = request;
 
@@ -50,23 +57,26 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
     let tool = instance.tool.clone();
     let before = instance.clone();
 
-    // Honor the same on_launch / before_start hook timeout the startup-recovery
-    // worker installs (`run_recovery_for_instance`). Without it, a hanging
-    // before_start hook (e.g. a `mint` script waiting on the network) runs with
-    // no kill timer and wedges this serial worker thread forever, taking every
-    // future restart down with it.
+    // With `bound_hooks`, honor the on_launch / before_start hook timeout the
+    // startup-recovery worker installs (`run_recovery_for_instance`), so a
+    // hanging hook (e.g. a `mint` script waiting on the network) cannot wedge
+    // this serial worker. Enter and new-session launches opt out to keep their
+    // hooks unbounded; a hang there stalls later restarts until the hook exits.
     let outcome = {
-        let _scope = crate::session::recovery::HookTimeoutScope::new(
-            crate::session::recovery::recovery_hook_timeout(),
-        );
-        discard_stale_sandbox_container(&instance, discard_sandbox_container)
-            .and_then(|()| instance.restart_with_size(size).map_err(|e| e.to_string()))
+        let _scope = bound_hooks.then(|| {
+            crate::session::recovery::HookTimeoutScope::new(
+                crate::session::recovery::recovery_hook_timeout(),
+            )
+        });
+        instance
+            .restart_discarding_sandbox_container(size, skip_on_launch, discard_sandbox_container)
+            .map_err(|e| e.to_string())
     };
 
     // On a successful restart, send the wake-up keys on a detached thread so
     // the result (and the row's status update) propagate back immediately
     // rather than waiting out the up-to-3s pane-readiness probe.
-    let should_wake = should_send_restart_wake(&outcome);
+    let should_wake = launched_agent(&outcome);
     if should_wake && !wake_message.is_empty() {
         spawn_wake_worker(session_id.clone(), title, tool, wake_message);
     }
@@ -79,34 +89,8 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
     }
 }
 
-/// A failure fails the restart: relaunching into the old container would run
-/// the new tool against the previous tool's config store. The swap is already
-/// persisted, so later restarts do not retry the removal; the error names the
-/// container to remove by hand.
-fn discard_stale_sandbox_container(instance: &Instance, discard: bool) -> Result<(), String> {
-    if !discard || !instance.is_sandboxed() {
-        return Ok(());
-    }
-    let container = DockerContainer::from_session_id(&instance.id);
-    match container.discard() {
-        Teardown::Removed => {
-            tracing::info!(
-                target: "containers.runtime",
-                session = %instance.id,
-                "removed sandbox container built for the previous tool; it will be recreated on start"
-            );
-            Ok(())
-        }
-        Teardown::AlreadyGone => Ok(()),
-        Teardown::Failed(e) => Err(format!(
-            "failed to remove sandbox container {} built for the previous tool; remove it \
-             before restarting, or the new tool reuses its config: {e}",
-            container.name
-        )),
-    }
-}
-
-fn should_send_restart_wake(outcome: &Result<StartOutcome, String>) -> bool {
+/// Whether the restart left the agent running in a live pane.
+pub(crate) fn launched_agent(outcome: &Result<StartOutcome, String>) -> bool {
     matches!(
         outcome,
         Ok(StartOutcome::Fresh
@@ -175,6 +159,8 @@ mod tests {
             instance,
             size: None,
             wake_message: String::new(),
+            skip_on_launch: false,
+            bound_hooks: true,
             discard_sandbox_container: false,
         });
         // The cascade may create a real tmux session; tear it down so the test
@@ -186,12 +172,102 @@ mod tests {
         assert_eq!(result.instance.id, id);
     }
 
+    /// A tool-swap restart must not remove a container whose session a peer
+    /// lifecycle operation still owns (#3972).
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn tool_swap_restart_removes_container_only_after_owning_launch_reservation() {
+        use crate::session::{LifecycleOperation, LifecycleReservation, SandboxInfo};
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let calls = temp.path().join("runtime-calls");
+        // Record every runtime call; only removal succeeds, so an owned
+        // relaunch stops at container creation instead of reaching tmux.
+        for binary in ["docker", "podman", "container"] {
+            let script = bin.join(binary);
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n\
+                     if [ \"$1\" = rm ]; then exit 0; fi\n\
+                     echo 'permission denied' >&2\nexit 1\n",
+                    calls.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _path = crate::session::test_support::path_prepended(&bin);
+
+        let profile = "restart-discard-reservation";
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        for (peer_reserved, expected_removals) in [(true, 0), (false, 1)] {
+            let mut instance = test_instance();
+            instance.source_profile = profile.to_string();
+            instance.tool = "codex".to_string();
+            instance.sandbox_info = Some(SandboxInfo {
+                enabled: true,
+                container_id: None,
+                image: "ubuntu:latest".to_string(),
+                container_name: "test-container".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                container_workdir: None,
+            });
+            if peer_reserved {
+                instance.lifecycle_generation = 1;
+                instance.lifecycle_reservation = Some(LifecycleReservation {
+                    op: LifecycleOperation::Launch,
+                    generation: 1,
+                    at: chrono::Utc::now(),
+                });
+            }
+            storage
+                .update(|instances, _groups| {
+                    instances.push(instance.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let container = crate::containers::DockerContainer::from_session_id(&instance.id).name;
+
+            let result = perform_restart(RestartRequest {
+                session_id: instance.id.clone(),
+                instance,
+                size: None,
+                wake_message: String::new(),
+                skip_on_launch: false,
+                bound_hooks: true,
+                discard_sandbox_container: true,
+            });
+
+            let error = result
+                .outcome
+                .expect_err("the fake runtime fails every launch");
+            assert_eq!(error.contains("busy"), peer_reserved, "{error}");
+            let removals = std::fs::read_to_string(&calls)
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| line.starts_with("rm ") && line.ends_with(&container))
+                .count();
+            assert_eq!(
+                removals, expected_removals,
+                "peer_reserved={peer_reserved}: {error}"
+            );
+        }
+    }
+
     #[test]
     fn restart_wake_is_suppressed_for_resume_failed() {
         let outcome = Ok(StartOutcome::ResumeFailed {
             sid: "11111111-2222-3333-4444-555555555555".to_string(),
         });
 
-        assert!(!should_send_restart_wake(&outcome));
+        assert!(!launched_agent(&outcome));
     }
 }

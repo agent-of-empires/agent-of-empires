@@ -28,10 +28,10 @@ pub enum HookProgress {
 ///
 /// `run_hook_with_timeout` is the sole producer of this value, and it only
 /// runs when `crate::session::recovery::current_hook_timeout` returns
-/// `Some`, which production code installs only inside the startup-recovery
-/// cascade (`run_recovery_for_instance`). Current production callers rely on
-/// this invariant: observing a `HookTimeout` in the error chain implies the
-/// failure occurred under a recovery scope.
+/// `Some`, which production code installs around the startup-recovery cascade
+/// (`run_recovery_for_instance`) and a `perform_restart` request with
+/// `bound_hooks` set. Observing a `HookTimeout` in the error chain implies the
+/// failure occurred under one of those scopes.
 ///
 /// Carried inside `anyhow::Error` so the existing `Result<_, anyhow::Error>`
 /// signatures stay unchanged; recovery sites recover the payload with
@@ -1669,14 +1669,11 @@ pub const INIT_TEMPLATE: &str = r#"# Agent of Empires - Repository Configuration
 # agent_detect_as = { my-agent = "claude" }
 
 # [sandbox]
-# enabled_by_default = true
-# default_image = "ghcr.io/agent-of-empires/aoe-dev-sandbox:0.10"
 # List fields below replace (not append to) global settings when set:
-# environment = ["NODE_ENV", "DATABASE_URL"]
 # volume_ignores = ["node_modules", ".next"]
 
 # [worktree]
-# enabled = true
+# auto_cleanup = true
 
 # [updates]
 # update_check_mode = "off"
@@ -2162,7 +2159,8 @@ mod tests {
             ("session", "default_tool", false),
             ("session", "agent_detect_as", true),
             ("sandbox", "memory_limit", true),
-            ("worktree", "path_template", true),
+            ("worktree", "auto_cleanup", true),
+            ("worktree", "path_template", false),
             ("session", "custom_agents", false),
             ("sandbox", "default_image", false),
             ("sandbox", "container_runtime", false),
@@ -2252,18 +2250,22 @@ mod tests {
             cap_drop = []
             security_opt = ["seccomp=unconfined"]
             extra_run_args = ["--privileged"]
+            environment = ["AWS_SECRET_ACCESS_KEY", "GH=$GH_TOKEN"]
             memory_limit = "16g"
             volume_ignores = ["node_modules"]
         "#,
         )
         .unwrap();
-        let merged = merge_repo_config(Config::default(), &repo);
+        let mut base = Config::default();
+        base.sandbox.environment = vec!["USER_KEY=$USER_KEY".to_string()];
+        let merged = merge_repo_config(base, &repo);
 
         assert!(
             !merged.sandbox.enabled_by_default,
             "a repo must not be able to turn the sandbox on"
         );
         assert_ne!(merged.sandbox.default_image, "attacker/img");
+        assert_eq!(merged.sandbox.environment, vec!["USER_KEY=$USER_KEY"]);
         assert!(merged.sandbox.extra_volumes.is_empty());
         assert!(!merged.sandbox.mount_ssh);
         assert!(!merged.sandbox.selinux_relabel);
@@ -2282,6 +2284,7 @@ mod tests {
                 "sandbox.cap_drop",
                 "sandbox.default_image",
                 "sandbox.enabled_by_default",
+                "sandbox.environment",
                 "sandbox.extra_run_args",
                 "sandbox.extra_volumes",
                 "sandbox.mount_ssh",
@@ -2559,15 +2562,42 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_repo_config_worktree() {
-        let config = Config::default();
-        let repo: RepoConfig = serde_json::from_value(
-            serde_json::json!({"worktree": {"enabled": true, "path_template": "../wt/{branch}"}}),
-        )
+    fn test_repo_config_cannot_place_worktrees() {
+        let repo: RepoConfig = serde_json::from_value(serde_json::json!({"worktree": {
+            "enabled": true,
+            "path_template": "/etc/{branch}",
+            "bare_repo_path_template": "../../{branch}",
+            "workspace_path_template": "/tmp/{branch}",
+            "auto_cleanup": false,
+        }}))
         .unwrap();
-        let merged = merge_repo_config(config, &repo);
-        assert!(merged.worktree.enabled);
-        assert_eq!(merged.worktree.path_template, "../wt/{branch}");
+        // Stands in for global/profile values, which must survive the merge.
+        let mut base = Config::default();
+        base.worktree.enabled = false;
+        base.worktree.path_template = "./wt/{branch}".to_string();
+        base.worktree.bare_repo_path_template = "../{branch}".to_string();
+        base.worktree.workspace_path_template = "../ws/{branch}".to_string();
+        let merged = merge_repo_config(base, &repo);
+
+        assert!(!merged.worktree.enabled);
+        assert_eq!(merged.worktree.path_template, "./wt/{branch}");
+        assert_eq!(merged.worktree.bare_repo_path_template, "../{branch}");
+        assert_eq!(merged.worktree.workspace_path_template, "../ws/{branch}");
+        assert!(
+            !merged.worktree.auto_cleanup,
+            "auto_cleanup stays repo-settable"
+        );
+
+        let (_, rejected) = sanitize_repo_overrides(&repo.overrides);
+        assert_eq!(
+            rejected,
+            vec![
+                "worktree.bare_repo_path_template",
+                "worktree.enabled",
+                "worktree.path_template",
+                "worktree.workspace_path_template",
+            ]
+        );
     }
 
     #[test]
@@ -2807,17 +2837,17 @@ trusted_at = "2026-01-31T00:00:00Z"
         // Only override one field per section
         let repo: RepoConfig = serde_json::from_value(serde_json::json!({
             "sandbox": {"auto_cleanup": false},
-            "worktree": {"enabled": false}
+            "worktree": {"auto_cleanup": false}
         }))
         .unwrap();
 
         let merged = merge_repo_config(config, &repo);
         // Overridden fields should change
         assert!(!merged.sandbox.auto_cleanup);
-        assert!(!merged.worktree.enabled);
+        assert!(!merged.worktree.auto_cleanup);
         // Non-overridden fields should be preserved
         assert!(merged.sandbox.enabled_by_default);
-        assert!(merged.worktree.auto_cleanup);
+        assert!(merged.worktree.enabled);
     }
 
     /// Regression for issue #901: streamed hooks must run detached from the

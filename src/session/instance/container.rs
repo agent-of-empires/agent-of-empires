@@ -111,7 +111,6 @@ impl Instance {
     }
 
     pub fn get_container_for_instance(&mut self) -> Result<containers::DockerContainer> {
-        let detect_as = self.effective_detect_as().into_owned();
         let image = self
             .sandbox_info
             .as_ref()
@@ -148,6 +147,35 @@ impl Instance {
             } else {
                 None
             };
+
+        // A container built for another agent mounts that agent's config.
+        // Decide on the disk row and a resolved profile: a stale in-memory copy
+        // can match an old container or mismatch one a peer rebuilt, and a
+        // defaulted config would misread a valid one. A failed reload still
+        // permits reuse, never removal.
+        if container.exists()? {
+            let reloaded = self.try_reconcile_from_disk();
+            if container.agent_tool_matches(&self.container_agent_identity()?)? == Some(false) {
+                reloaded.context(
+                    "cannot confirm the session's tool before removing its sandbox container",
+                )?;
+                tracing::info!(
+                    target: "containers.runtime",
+                    session = %self.id,
+                    "removing sandbox container built for another tool; it will be recreated"
+                );
+                container.remove(true)?;
+            } else if let Err(error) = reloaded {
+                tracing::warn!(
+                    target: "session.store",
+                    session = %self.id,
+                    error = %format_args!("{error:#}"),
+                    "failed to reload disk state before reusing the sandbox container; using in-memory value"
+                );
+            }
+        }
+        // After every reload above, which may have replaced the tool.
+        let detect_as = self.effective_detect_as().into_owned();
 
         // Direct is_running()? / exists()? here rather than probe_running():
         // this function already returns Result, so `?` correctly propagates
@@ -291,6 +319,15 @@ impl Instance {
         }
 
         Ok(container)
+    }
+
+    fn container_agent_identity(&self) -> Result<String> {
+        container_config::container_agent_identity(
+            &self.tool,
+            Some(&self.effective_detect_as()),
+            &self.source_profile,
+        )
+        .context("cannot resolve the session's agent to check its sandbox container")
     }
 
     /// Whether the session's container was created before its agent shared a
@@ -747,5 +784,205 @@ claude-personal = "~/.claude-global"
             fs::read_to_string(legacy.join(".claude.json")).unwrap(),
             legacy_json
         );
+    }
+
+    /// A container built for another tool is recreated rather than reused (#3976).
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn container_built_for_another_tool_is_removed_before_reuse() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let calls_path = temp.path().join("runtime-calls");
+        let label_path = temp.path().join("tool-label");
+        let removed_path = temp.path().join("removed");
+        // A stopped container carrying the tool label read from `label_path`.
+        // Removal makes it absent; every other call fails, so the launch stops
+        // before tmux.
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{calls}'\n\
+             if [ \"$1\" = rm ]; then touch '{removed}'; exit 0; fi\n\
+             if [ \"$1\" = container ] && [ \"$2\" = inspect ]; then\n\
+             if [ -e '{removed}' ]; then echo 'Error: No such container: c' >&2; exit 1; fi\n\
+             case \"$*\" in\n\
+             *agent-tool*) cat '{label}' ;;\n\
+             *sandbox-store-generation*) echo 2 ;;\n\
+             *State.Running*) echo false ;;\n\
+             esac\n\
+             exit 0\n\
+             fi\n\
+             echo 'permission denied' >&2\nexit 1\n",
+            calls = calls_path.display(),
+            removed = removed_path.display(),
+            label = label_path.display(),
+        );
+        for binary in ["docker", "podman", "container"] {
+            let path = bin.join(binary);
+            std::fs::write(&path, &script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _path = crate::session::test_support::path_prepended(&bin);
+        let profile = "agent-tool-label";
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(profile);
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        // `alias-c` is aliased only in config, never on the session row.
+        std::fs::write(
+            crate::session::get_app_dir().unwrap().join("config.toml"),
+            "[session.agent_detect_as]\nalias-c = \"claude\"\n",
+        )
+        .unwrap();
+        let profile_config =
+            crate::session::config::profile_config::get_profile_config_path(profile).unwrap();
+
+        enum Disk {
+            Absent,
+            Corrupt,
+            /// A peer persisted this `(tool, detect_as)` after the in-memory copy.
+            Row(&'static str, &'static str),
+            /// A persisted row whose profile config cannot be parsed.
+            RowBrokenProfile(&'static str, &'static str),
+        }
+        // `store` is the agent config root the reuse path refreshed, if any.
+        let cases = [
+            (("codex", ""), "claude", Disk::Absent, 1, None),
+            (
+                ("codex", ""),
+                "claude",
+                Disk::Row("claude", ""),
+                0,
+                Some(".claude"),
+            ),
+            (("codex", ""), "codex", Disk::Absent, 0, Some(".codex")),
+            (("codex", ""), "", Disk::Absent, 0, Some(".codex")),
+            (("codex", ""), "claude", Disk::Corrupt, 0, None),
+            (("codex", ""), "codex", Disk::Corrupt, 0, Some(".codex")),
+            (("claude", ""), "claude", Disk::Row("codex", ""), 1, None),
+            (
+                ("alias-a", "claude"),
+                "alias-b:codex",
+                Disk::Row("alias-b", "codex"),
+                0,
+                Some(".codex"),
+            ),
+            (("alias-a", "codex"), "alias-a", Disk::Absent, 1, None),
+            (
+                ("alias-c", ""),
+                "alias-c:claude",
+                Disk::Row("alias-c", ""),
+                0,
+                Some(".claude"),
+            ),
+            (
+                ("alias-c", ""),
+                "alias-c:claude",
+                Disk::RowBrokenProfile("alias-c", ""),
+                0,
+                None,
+            ),
+        ];
+        for ((tool, detect_as), built_for, disk, expected_removals, expected_store) in cases {
+            let _ = std::fs::remove_file(&calls_path);
+            let _ = std::fs::remove_file(&removed_path);
+            std::fs::write(&label_path, built_for).unwrap();
+            let mut instance = Instance::new("tool label", temp.path().to_str().unwrap());
+            instance.tool = tool.to_string();
+            instance.detect_as = detect_as.to_string();
+            instance.source_profile = profile.to_string();
+            instance.sandbox_info = Some(SandboxInfo {
+                enabled: true,
+                container_id: None,
+                image: "test:latest".to_string(),
+                container_name: "tool-label".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                container_workdir: None,
+            });
+            let _ = std::fs::remove_file(storage.sessions_path());
+            let _ = std::fs::remove_file(&profile_config);
+            storage
+                .update(|instances, _groups| {
+                    instances.clear();
+                    if let Disk::Row(tool, detect_as) | Disk::RowBrokenProfile(tool, detect_as) =
+                        disk
+                    {
+                        let mut row = instance.clone();
+                        row.tool = tool.to_string();
+                        row.detect_as = detect_as.to_string();
+                        instances.push(row);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            match disk {
+                Disk::Corrupt => std::fs::write(storage.sessions_path(), "not json").unwrap(),
+                Disk::RowBrokenProfile(..) => {
+                    std::fs::create_dir_all(profile_config.parent().unwrap()).unwrap();
+                    std::fs::write(&profile_config, "not toml [").unwrap();
+                    // A failed resolve elsewhere leaves the alias registry empty.
+                    crate::session::config::profile_config::resolve_config_or_warn(profile);
+                }
+                Disk::Absent | Disk::Row(..) => {}
+            }
+            let container = DockerContainer::from_session_id(&instance.id).name;
+
+            let error = instance
+                .get_container_for_instance()
+                .err()
+                .expect("the fake runtime fails every launch");
+
+            let calls = std::fs::read_to_string(&calls_path).unwrap_or_default();
+            let removals = calls
+                .lines()
+                .filter(|line| line.starts_with("rm -f") && line.ends_with(&container))
+                .count();
+            let case = format!("{tool}/{detect_as} built_for={built_for:?}: {error:#}\n{calls}");
+            assert_eq!(removals, expected_removals, "{case}");
+            let stores: Vec<_> = [".claude", ".codex"]
+                .into_iter()
+                .filter(|root| {
+                    temp.path()
+                        .join(root)
+                        .join("sandbox-v2")
+                        .join(&instance.id)
+                        .exists()
+                })
+                .collect();
+            assert_eq!(stores, Vec::from_iter(expected_store), "{case}");
+            if let Disk::RowBrokenProfile(..) = disk {
+                assert!(
+                    format!("{error:#}").contains("cannot resolve the session's agent"),
+                    "{case}"
+                );
+            }
+        }
+        let _ = std::fs::remove_file(&profile_config);
+
+        // The label written at create is the identity the check compares.
+        for (tool, detect_as) in [("codex", ""), ("alias-b", "codex")] {
+            let mut instance = Instance::new("tool label", temp.path().to_str().unwrap());
+            instance.tool = tool.to_string();
+            instance.detect_as = detect_as.to_string();
+            instance.source_profile = profile.to_string();
+            instance.sandbox_info = Some(SandboxInfo {
+                enabled: true,
+                container_id: None,
+                image: "test:latest".to_string(),
+                container_name: "tool-label".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                container_workdir: None,
+            });
+            assert_eq!(
+                instance.build_container_config().unwrap().agent_tool,
+                instance.container_agent_identity().unwrap(),
+                "{tool}/{detect_as}"
+            );
+        }
     }
 }

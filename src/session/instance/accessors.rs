@@ -834,8 +834,9 @@ mod tests {
         assert_eq!(
             status_hook_env_prefix(&inst.effective_profile(), "abc123", inst.resolved_agent()),
             format!(
-                "AOE_PROFILE='{PROFILE}' AOE_INSTANCE_ID='abc123' AOE_HOOK_BIN={} ",
-                shell_escape(&std::env::current_exe().unwrap().to_string_lossy())
+                "AOE_PROFILE='{PROFILE}' AOE_INSTANCE_ID='abc123' AOE_HOOK_BIN={} AOE_AGENT_PID=$$ AOE_AGENT_BIN={} ",
+                shell_escape(&std::env::current_exe().unwrap().to_string_lossy()),
+                shell_escape("claude")
             ),
         );
     }

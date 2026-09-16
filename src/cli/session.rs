@@ -1597,12 +1597,36 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
             );
         }
         println!("  Profile: {}", storage.profile());
-        if let Some(parent_id) = &inst.parent_session_id {
-            println!("  Parent:  {}", parent_id);
+        for line in relationship_lines(&inst, &instances) {
+            println!("{line}");
         }
     }
 
     Ok(())
+}
+
+/// `session show` lines naming `inst`'s parent and children (`aoe add -P`),
+/// by title when the related session is in `instances`.
+fn relationship_lines(
+    inst: &crate::session::Instance,
+    instances: &[crate::session::Instance],
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(parent_id) = &inst.parent_session_id {
+        lines.push(match instances.iter().find(|i| &i.id == parent_id) {
+            Some(parent) => format!("  Parent:  {} ({parent_id})", parent.title),
+            None => format!("  Parent:  {parent_id}"),
+        });
+    }
+    let mut children = instances
+        .iter()
+        .filter(|i| i.parent_session_id.as_deref() == Some(inst.id.as_str()))
+        .peekable();
+    if children.peek().is_some() {
+        lines.push("  Children:".to_string());
+        lines.extend(children.map(|child| format!("    {} ({})", child.title, child.id)));
+    }
+    lines
 }
 
 async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
@@ -3700,24 +3724,70 @@ mod import_tests {
         assert_eq!(inst.resume_intent, ResumeIntent::Default);
     }
 
+    /// A row claims a conversation in one of three places, and a re-import
+    /// must see all of them: a terminal import pins `resume_intent`, the
+    /// poller writes `agent_session_id`, and a structured import seeds
+    /// `acp_session_id` while leaving `resume_intent` at `Default`. Missing
+    /// any one of them creates a second row claiming a conversation that is
+    /// already claimed.
     #[test]
-    fn already_imported_matches_resume_and_observed_ids() {
+    fn already_imported_matches_every_spelling_of_a_claim() {
         let mut by_resume = Instance::new("a", "/p");
         by_resume.resume_intent = ResumeIntent::Use("id-1".to_string());
         let mut by_observed = Instance::new("b", "/p");
         by_observed.agent_session_id = Some("id-2".to_string());
-        let fresh = Instance::new("c", "/p");
-        let instances = vec![by_resume, by_observed, fresh];
+        let mut by_structured = Instance::new("c", "/p");
+        by_structured.acp_session_id = Some("id-3".to_string());
+        let fresh = Instance::new("d", "/p");
+        let instances = vec![by_resume, by_observed, by_structured, fresh];
 
-        assert!(already_imported(&instances, "id-1"));
-        assert!(already_imported(&instances, "id-2"));
-        assert!(!already_imported(&instances, "id-3"));
+        for (id, claimed) in [
+            ("id-1", true),
+            ("id-2", true),
+            ("id-3", true),
+            ("id-4", false),
+        ] {
+            assert_eq!(already_imported(&instances, id), claimed, "{id}");
+        }
     }
 }
 
 #[cfg(test)]
 mod show_json_tests {
     use super::*;
+
+    /// #3472: plain `session show` names a parent by title and lists children.
+    #[test]
+    fn relationship_lines_name_parent_and_children() {
+        let parent = Instance::new("orchestrator", "/repo");
+        let mut child = Instance::new("worker", "/repo");
+        child.parent_session_id = Some(parent.id.clone());
+        let mut orphan = Instance::new("stray", "/repo");
+        orphan.parent_session_id = Some("gone".to_string());
+        let instances = vec![parent.clone(), child.clone(), orphan.clone()];
+
+        for (inst, expected) in [
+            (
+                &parent,
+                vec![
+                    "  Children:".to_string(),
+                    format!("    worker ({})", child.id),
+                ],
+            ),
+            (
+                &child,
+                vec![format!("  Parent:  orchestrator ({})", parent.id)],
+            ),
+            (&orphan, vec!["  Parent:  gone".to_string()]),
+        ] {
+            assert_eq!(
+                relationship_lines(inst, &instances),
+                expected,
+                "{}",
+                inst.title
+            );
+        }
+    }
 
     /// #3350 gave `aoe list --json` a `state` tag and both timestamps;
     /// `session show --json` was left behind, so a scripted consumer that

@@ -134,6 +134,40 @@ pub async fn set_enabled_live(plugin_id: &str, enabled: bool) -> Result<LiveTogg
     }
 }
 
+/// Whether a running daemon picked up a plugin's changed tree.
+#[derive(Debug)]
+pub enum LiveRestart {
+    /// A running daemon reloaded the plugin and replaced its worker.
+    Daemon,
+    /// No daemon runs plugin workers (none running, or a read-only one); the
+    /// next daemon launches the new build.
+    NoDaemon,
+    /// A daemon appears to be running but the request failed (unreachable,
+    /// auth, or a daemon too old for the endpoint), so its worker keeps the
+    /// previous build until it restarts.
+    DaemonStale { reason: String },
+}
+
+/// Ask a running local daemon to reload `plugin_id` after an update replaced
+/// its tree. Its plugin host otherwise keeps supervising the old worker.
+pub async fn restart_worker_live(plugin_id: &str) -> LiveRestart {
+    let Ok(endpoint) = crate::acp::client::discovery::discover_local() else {
+        return LiveRestart::NoDaemon;
+    };
+    let result = async {
+        let client = crate::acp::client::HttpClient::new(endpoint)?;
+        client.restart_plugin_worker(plugin_id).await
+    }
+    .await;
+    match result {
+        Ok(()) => LiveRestart::Daemon,
+        Err(crate::acp::client::HttpError::ReadOnly) => LiveRestart::NoDaemon,
+        Err(e) => LiveRestart::DaemonStale {
+            reason: format!("{e}"),
+        },
+    }
+}
+
 fn enable_in_config(plugin_id: &str, enabled: bool) -> Result<()> {
     update_config(|config| {
         config

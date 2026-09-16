@@ -1837,6 +1837,63 @@ fn test_non_strict_w_on_running_jumps_to_idle_in_attention_sort() {
 
 #[test]
 #[serial]
+fn test_non_strict_w_cycles_through_all_idle_sessions_in_attention_sort() {
+    use crate::session::config::{GroupByMode, SortOrder};
+    use crate::session::Status;
+
+    let mut env = create_test_env_empty();
+    env.view.strict_hotkeys = false;
+    env.view.group_by = GroupByMode::Manual;
+    env.view.sort_order = SortOrder::Attention;
+    env.view.idle_decay_window = std::time::Duration::ZERO;
+
+    for (index, minutes_ago) in [5, 10, 15, 20].into_iter().enumerate() {
+        let title = format!("idle-{index}");
+        let path = format!("/tmp/idle-{index}");
+        let mut inst = Instance::new(&title, &path);
+        inst.source_profile = "test".to_string();
+        inst.status = Status::Idle;
+        inst.last_accessed_at = Some(chrono::Utc::now() - chrono::Duration::minutes(minutes_ago));
+        env.view.add_instance(inst);
+    }
+    env.view.flat_items = env.view.build_flat_items();
+    env.view.update_selected();
+
+    let session_ids: Vec<String> = env
+        .view
+        .flat_items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Session { id, .. } => Some(id.clone()),
+            Item::Group { .. } => None,
+        })
+        .collect();
+    assert_eq!(session_ids.len(), 4);
+
+    let start = session_ids[0].clone();
+    env.view.select_session_by_id(&start);
+    let mut expected = session_ids[1..].to_vec();
+    expected.push(start);
+
+    let mut visited = Vec::new();
+    for _ in 0..expected.len() {
+        env.view.handle_key(key(KeyCode::Char('w')), None);
+        visited.push(
+            env.view
+                .selected_session
+                .clone()
+                .expect("w should select an idle session"),
+        );
+    }
+
+    assert_eq!(
+        visited, expected,
+        "repeated w presses must walk idle rows in list order"
+    );
+}
+
+#[test]
+#[serial]
 fn test_non_strict_w_on_collapsed_project_group_reveals_idle_in_attention_sort() {
     use crate::session::config::{GroupByMode, SortOrder};
     use crate::session::Status;

@@ -1282,8 +1282,15 @@ async fn auto_update_applies_clean_github_update() {
 
     // A clean (no consent change) newer version on the remote.
     push_new_commit(base.path(), "acme", "upd", &[("aoe-plugin.toml", &v2)]);
-    let summary = auto_update::sweep(None).await;
+    let rec = std::sync::Arc::new(RecordingNotifier::default());
+    let notifier: std::sync::Arc<dyn auto_update::UpdateNotifier> = rec.clone();
+    let summary = auto_update::sweep(Some(&notifier)).await;
     assert_eq!(summary.applied, vec!["acme.upd".to_string()], "{summary:?}");
+    assert_eq!(
+        rec.applied.lock().unwrap().as_slice(),
+        ["acme.upd".to_string()],
+        "the host restarts the updated plugin's worker",
+    );
     assert_eq!(
         Lockfile::load().unwrap().get("acme.upd").unwrap().version,
         "2.0.0",
@@ -1475,11 +1482,24 @@ async fn declining_keeps_the_prior_version_and_stops_nagging() {
 }
 
 #[derive(Default)]
-struct RecordingNotifier(std::sync::Mutex<Vec<String>>);
+struct RecordingNotifier {
+    needs_approval: std::sync::Mutex<Vec<String>>,
+    applied: std::sync::Mutex<Vec<String>>,
+}
 
 impl auto_update::UpdateNotifier for RecordingNotifier {
     fn needs_approval(&self, plugin_id: &str, _reason: &str) {
-        self.0.lock().unwrap().push(plugin_id.to_string());
+        self.needs_approval
+            .lock()
+            .unwrap()
+            .push(plugin_id.to_string());
+    }
+
+    fn update_applied(
+        self: std::sync::Arc<Self>,
+        plugin_id: String,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Box::pin(async move { self.applied.lock().unwrap().push(plugin_id) })
     }
 }
 
@@ -1499,9 +1519,13 @@ async fn sweep_notifies_then_respects_a_dismissal() {
     let notifier: std::sync::Arc<dyn auto_update::UpdateNotifier> = rec.clone();
     auto_update::sweep(Some(&notifier)).await;
     assert_eq!(
-        rec.0.lock().unwrap().as_slice(),
+        rec.needs_approval.lock().unwrap().as_slice(),
         ["acme.upd".to_string()],
         "an undismissed consent-needed skip notifies",
+    );
+    assert!(
+        rec.applied.lock().unwrap().is_empty(),
+        "a skipped update restarts nothing",
     );
 
     // After dismissing this exact version, a later sweep stays silent.
@@ -1510,8 +1534,12 @@ async fn sweep_notifies_then_respects_a_dismissal() {
     let notifier2: std::sync::Arc<dyn auto_update::UpdateNotifier> = rec2.clone();
     auto_update::sweep(Some(&notifier2)).await;
     assert!(
-        rec2.0.lock().unwrap().is_empty(),
+        rec2.needs_approval.lock().unwrap().is_empty(),
         "a dismissed version does not re-notify",
+    );
+    assert!(
+        rec2.applied.lock().unwrap().is_empty(),
+        "a dismissed update restarts nothing",
     );
 
     std::env::remove_var("AOE_GITHUB_CLONE_BASE");

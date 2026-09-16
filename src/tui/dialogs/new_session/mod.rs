@@ -1993,7 +1993,7 @@ impl NewSessionDialog {
         {
             let cwd = std::env::current_dir()
                 .map(|p| {
-                    let mut s = path_input::collapse_tilde(&p.to_string_lossy());
+                    let mut s = crate::util::collapse_tilde(&p.to_string_lossy());
                     if !s.ends_with('/') {
                         s.push('/');
                     }

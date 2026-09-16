@@ -473,9 +473,11 @@ fn init_git_repo_for_project(path: &std::path::Path) {
 fn test_new_session_from_saved_project_prefills_path() {
     require_tmux!();
 
-    let mut h = TuiTestHarness::new("new_from_project");
+    // Rooted at `/tmp/.tmpXXXXXX` whatever TMPDIR is, so the path segments are
+    // alphanumeric and cannot match the `-app` filter below.
+    let mut h = TuiTestHarness::new_in_tmp("new_from_project");
     // Seed several projects so the picker's filter has something to narrow.
-    for name in ["frontend", "backend", "mobile"] {
+    for name in ["frontend", "backend", "mobile-app"] {
         let repo = h.home_path().join(name);
         init_git_repo_for_project(&repo);
         let add = h.run_cli(&["project", "add", repo.to_str().unwrap()]);
@@ -496,17 +498,18 @@ fn test_new_session_from_saved_project_prefills_path() {
     h.wait_for("New Session from Project");
     h.assert_screen_contains("frontend");
     h.assert_screen_contains("backend");
-    h.assert_screen_contains("mobile");
+    h.assert_screen_contains("mobile-app");
 
-    // Typing filters the list; "mob" narrows to the single "mobile" project.
+    // Typing filters the list; "-app" narrows to the single "mobile-app" project.
+    // Labels embed the project path, so an all-letter filter could match it.
     // Send one char at a time: `type_text`'s literal (`-l`) mode arrives as a
     // bracketed paste, which the picker's filter input doesn't capture.
-    h.send_keys("m");
-    h.send_keys("o");
-    h.send_keys("b");
+    for key in ["-", "a", "p", "p"] {
+        h.send_keys(key);
+    }
     h.wait_for_absent("frontend", std::time::Duration::from_secs(5));
     h.assert_screen_not_contains("backend");
-    h.assert_screen_contains("mobile");
+    h.assert_screen_contains("mobile-app");
 
     // Selecting the filtered match opens the new-session dialog pre-filled
     // with that project's path.

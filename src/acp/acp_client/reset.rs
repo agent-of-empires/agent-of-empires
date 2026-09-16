@@ -194,6 +194,186 @@ done
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn unavailable_resume_reports_durable_context_reset() {
+        use crate::acp::event_store::EventStore;
+        use crate::acp::transcript::{TranscriptModel, TranscriptRowKind};
+
+        for (name, stored, load_capable, load_fails, new_fails, fork, expected_resets) in [
+            ("unavailable", true, false, false, false, false, 1),
+            ("initial", false, false, false, false, false, 0),
+            ("loaded", true, true, false, false, false, 0),
+            ("load_failed", true, true, true, false, false, 1),
+            ("unavailable_new_failed", true, false, false, true, false, 0),
+            ("load_and_new_failed", true, true, true, true, false, 0),
+            ("fork_unsupported", true, false, false, false, true, 1),
+            (
+                "fork_unsupported_load_failed",
+                true,
+                true,
+                true,
+                false,
+                true,
+                1,
+            ),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let script = tmp.path().join("resume-agent.sh");
+            let capture = tmp.path().join("capture.ndjson");
+            let error = r#""error":{"code":-32603,"message":"fixture refused establishment"}"#;
+            let script_body = r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> '__CAPTURE__'
+  id=$(printf '%s' "$line" | sed -En 's/.*"id":("[^"]*"|[0-9]+).*/\1/p')
+  case $line in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":__LOAD_CAPABLE__}}}\n' "$id" ;;
+    *'"method":"session/load"'*)
+      printf '{"jsonrpc":"2.0","id":%s,__LOAD_REPLY__}\n' "$id" ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,__NEW_REPLY__}\n' "$id" ;;
+    *'"method":"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id" ;;
+  esac
+done
+"#
+            .replace("__CAPTURE__", capture.to_str().unwrap())
+            .replace("__LOAD_CAPABLE__", if load_capable { "true" } else { "false" })
+            .replace("__LOAD_REPLY__", if load_fails { error } else { r#""result":{}"# })
+            .replace("__NEW_REPLY__", if new_fails { error } else { r#""result":{"sessionId":"replacement-session"}"# });
+            std::fs::write(&script, script_body).unwrap();
+            let mut config = reset_fake_spawn_config(&script, tmp.path());
+            config.stored_acp_session_id = stored.then(|| "previous-session".into());
+            config.fork_from = fork.then(|| "parent-session".into());
+            let mut client = AcpClient::spawn(config, AcpSessionId(name.into()))
+                .await
+                .unwrap();
+            let mut events = Vec::new();
+            if stored {
+                events.push(Event::UserPromptSent {
+                    prompt_id: None,
+                    text: "prior user turn".into(),
+                    attachments: vec![],
+                });
+                events.push(Event::AgentMessageChunk {
+                    text: "prior assistant turn".into(),
+                });
+            }
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while let Some(event) = tokio::time::timeout_at(deadline, client.next_event())
+                .await
+                .expect(name)
+            {
+                let assigned = matches!(event, Event::AcpSessionAssigned { .. });
+                let stopped = matches!(event, Event::Stopped { .. });
+                events.push(event);
+                if assigned {
+                    client.send_prompt("continue", &[]).await.unwrap();
+                }
+                if stopped {
+                    client.shutdown().await.unwrap();
+                }
+            }
+            client.shutdown().await.unwrap();
+            let assignment = events
+                .iter()
+                .position(|event| matches!(event, Event::AcpSessionAssigned { .. }));
+            assert_eq!(assignment.is_some(), !new_fails, "{name}");
+            assert_eq!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, Event::AgentStartupError { .. })),
+                new_fails,
+                "{name}"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, Event::Stopped { .. })),
+                !new_fails,
+                "{name}"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, Event::SessionContextReset { .. }))
+                    .count(),
+                expected_resets,
+                "{name}"
+            );
+            if expected_resets > 0 {
+                let reset = events
+                    .iter()
+                    .position(|event| matches!(event, Event::SessionContextReset { .. }))
+                    .unwrap();
+                assert!(
+                    reset < assignment.unwrap(),
+                    "{name}: reset must precede assignment"
+                );
+            }
+
+            let db = tmp.path().join("events.db");
+            let store = EventStore::open(&db, 100).unwrap();
+            for (index, event) in events.iter().enumerate() {
+                store.record(name, index as u64 + 1, event).unwrap();
+            }
+            drop(store);
+            let store = EventStore::open(&db, 100).unwrap();
+            let mut transcript = TranscriptModel::new();
+            for (seq, event) in store.replay_from(name, 0) {
+                transcript.apply_event(seq, &event);
+            }
+            assert_eq!(
+                transcript
+                    .rows()
+                    .iter()
+                    .filter(|row| row.kind == TranscriptRowKind::ContextReset)
+                    .count(),
+                expected_resets,
+                "{name}"
+            );
+            if stored {
+                assert!(
+                    transcript
+                        .rows()
+                        .iter()
+                        .any(|row| row.text == "prior user turn"),
+                    "{name}"
+                );
+                assert!(
+                    transcript
+                        .rows()
+                        .iter()
+                        .any(|row| row.text == "prior assistant turn"),
+                    "{name}"
+                );
+            }
+            let requests: Vec<serde_json::Value> = std::fs::read_to_string(capture)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let loads: Vec<_> = requests
+                .iter()
+                .filter(|request| request["method"] == "session/load")
+                .collect();
+            assert_eq!(loads.len(), usize::from(stored && load_capable), "{name}");
+            if let Some(load) = loads.first() {
+                assert_eq!(load["params"]["sessionId"], "previous-session", "{name}");
+            }
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request["method"] == "session/new")
+                    .count(),
+                usize::from(!(stored && load_capable && !load_fails)),
+                "{name}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
     async fn reset_with_deadline_for_test(
         client: &AcpClient,
         deadline: tokio::time::Instant,

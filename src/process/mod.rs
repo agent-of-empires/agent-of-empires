@@ -332,6 +332,25 @@ pub fn boot_id() -> Option<String> {
     }
 }
 
+/// The parent pid and `argv[0]` of `pid`, or `None` when it cannot be read.
+pub fn parent_and_argv0(pid: u32) -> Option<(u32, String)> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::parent_and_argv0(pid)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        macos::parent_and_argv0(pid)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 /// Get the foreground process group leader PID for a given shell PID
 /// This finds the actual process that has the terminal foreground
 pub fn get_foreground_pid(shell_pid: u32) -> Option<u32> {
@@ -676,6 +695,32 @@ mod tests {
             "a live process carrying the marker in argv must match"
         );
         assert!(!flags[1], "a marker no live process carries must not match");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn parent_and_argv0_reads_a_live_child() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        // Until exec completes, argv is empty or still the parent's.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let read = loop {
+            let read = parent_and_argv0(child.id());
+            if read.as_ref().is_some_and(|(_, argv0)| argv0 == "sleep")
+                || Instant::now() >= deadline
+            {
+                break read;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(read, Some((std::process::id(), "sleep".to_string())));
     }
 
     /// The environment signal: a live process with `AOE_INSTANCE_ID=<marker>`

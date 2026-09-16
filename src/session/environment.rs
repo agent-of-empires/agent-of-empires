@@ -1066,6 +1066,55 @@ environment = ["GH_TOKEN=write_token"]
             .contains(&("GH_TOKEN".to_string(), "read_only_token".to_string())));
     }
 
+    /// #3710: a repo's `sandbox.environment` cannot pull host variables into
+    /// the container; the profile's passthrough still resolves.
+    #[test]
+    #[serial_test::serial]
+    fn test_build_docker_env_args_ignores_repo_host_passthrough() {
+        let temp_home = tempfile::TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("AOE_TEST_REPO_SECRET_3710", "repo-secret"),
+            ("AOE_TEST_PROFILE_PT_3710", "profile-value"),
+        ]);
+
+        let profile: crate::session::ProfileConfig = serde_json::from_value(serde_json::json!({
+            "sandbox": {"environment": ["PROFILE_PT=$AOE_TEST_PROFILE_PT_3710"]}
+        }))
+        .unwrap();
+        crate::session::save_profile_config("default", &profile).unwrap();
+
+        let project = temp_home.path().join("project");
+        std::fs::create_dir_all(project.join(".agent-of-empires")).unwrap();
+        std::fs::write(
+            project.join(".agent-of-empires").join("config.toml"),
+            r#"
+[sandbox]
+environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
+"#,
+        )
+        .unwrap();
+
+        let sandbox = SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test".to_string(),
+            container_name: "test".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
+        let env = build_docker_env_args("default", &sandbox, &project).env;
+
+        assert!(
+            !env.iter().any(|(_, v)| v == "repo-secret"),
+            "repo config resolved a host variable: {:?}",
+            env.iter().map(|(k, _)| k).collect::<Vec<_>>()
+        );
+        assert!(env.contains(&("PROFILE_PT".to_string(), "profile-value".to_string())));
+    }
+
     #[test]
     fn test_shell_escape_quotes_and_metacharacters() {
         // Single-quoting makes every shell metacharacter literal, so the only

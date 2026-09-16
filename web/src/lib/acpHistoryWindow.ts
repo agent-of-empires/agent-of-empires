@@ -17,6 +17,35 @@ function isUserTurnBoundary(row: ActivityRow): boolean {
   return row.kind === "user_prompt" || row.kind === "user_diff_comments";
 }
 
+/** Index of the newest user turn boundary, or -1 when there is none. */
+export function lastUserBoundaryIndex(rows: readonly ActivityRow[]): number {
+  for (let i = rows.length - 1; i >= 0; i -= 1) {
+    if (isUserTurnBoundary(rows[i]!)) return i;
+  }
+  return -1;
+}
+
+/**
+ * Rows the window should open with: `defaultWindow`, widened so the whole
+ * last turn is on screen when that turn alone is longer than the default.
+ *
+ * The user's most recent prompt and everything the agent did in reply
+ * are the context that is always relevant on (re)opening a session; with
+ * the flat default a tool-heavy turn came up cut mid-way and took several
+ * "Load earlier" clicks to reach its own prompt. Older turns keep the
+ * default treatment (windowed out, revealed on demand), so a long backlog
+ * still does not block first paint. Bounded by what is loaded: rows beyond
+ * the recent-first tail page are reached via the server fetch as before.
+ */
+export function initialHistoryWindow(
+  rows: readonly ActivityRow[],
+  defaultWindow: number = DEFAULT_HISTORY_WINDOW,
+): number {
+  const boundary = lastUserBoundaryIndex(rows);
+  if (boundary < 0) return defaultWindow;
+  return Math.max(defaultWindow, rows.length - boundary);
+}
+
 /** Pull `start` back so the window never opens strictly between a
  *  sub-agent `Task` row and its child tool calls. The child rows carry
  *  `tool.parent_tool_call_id` (the parent Task's `tool.id`); when `start`

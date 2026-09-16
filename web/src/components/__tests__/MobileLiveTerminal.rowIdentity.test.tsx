@@ -1,8 +1,10 @@
 // @vitest-environment jsdom
 //
-// Select-to-copy on a streaming pane depends on the row DOM nodes surviving
-// the frames that arrive while the selection is being made: a remounted row
-// collapses the browser selection, and on iOS also dismisses the Copy callout.
+// Rows rendered across streaming frames. Select-to-copy depends on row DOM
+// nodes surviving the frames that arrive while the selection is being made: a
+// remounted row collapses the browser selection, and on iOS also dismisses the
+// Copy callout. The trimmed row count must also hold still while an agent's
+// bottom row oscillates, or the bottom-aligned block flutters (#2087).
 
 import { createRef } from "react";
 import { afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
@@ -19,6 +21,7 @@ vi.mock("../../hooks/useWebSettings", () => ({
 const WIDTH = 240;
 const COLS = Math.floor(WIDTH / (14 * 0.6));
 const RESIZE_DEBOUNCE_MS = 150;
+const SHRINK_DELAY_MS = 1500;
 let roCallbacks: Array<() => void> = [];
 
 beforeAll(() => {
@@ -121,4 +124,28 @@ it("keeps row nodes when the window slides past wrapped lines", () => {
   rerender(terminal(frame(["alpha", "beta", "gamma", "delta", "$ "], 3, 4)));
 
   expect(screen.getByText("alpha").parentElement).toBe(alpha);
+});
+
+it("holds the trimmed row count while the bottom row oscillates, then trims once quiet", () => {
+  const body = ["HEADER", ...Array.from({ length: 16 }, (_, i) => `body ${i + 1}`), "INPUTBOX>", ""];
+  const spinnerOn = frame([...body, "spinner working..."], body.length + 1);
+  const spinnerOff = frame([...body, ""], body.length + 1);
+  const full = body.length + 1;
+  const trimmed = body.indexOf("INPUTBOX>") + 1;
+  const { container, rerender } = render(terminal(spinnerOn));
+  expect(rowCount(container)).toBe(full);
+
+  // Longer than the shrink delay, so a shrink that fires between redraws shows.
+  for (let elapsed = 0; elapsed < 2 * SHRINK_DELAY_MS; elapsed += 240) {
+    rerender(terminal(spinnerOff));
+    act(() => vi.advanceTimersByTime(120));
+    expect(rowCount(container)).toBe(full);
+    rerender(terminal(spinnerOn));
+    act(() => vi.advanceTimersByTime(120));
+    expect(rowCount(container)).toBe(full);
+  }
+
+  rerender(terminal(spinnerOff));
+  act(() => vi.advanceTimersByTime(SHRINK_DELAY_MS));
+  expect(rowCount(container)).toBe(trimmed);
 });

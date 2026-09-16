@@ -11,27 +11,29 @@ impl Instance {
     /// `set-session-id` would otherwise be silently overwritten. No-op on
     /// storage error or if the row is gone from disk.
     pub(super) fn reconcile_from_disk(&mut self) {
-        let Ok(storage) = crate::session::storage::Storage::new(
-            &self.effective_profile(),
-            self.resolve_file_watch(),
-        ) else {
+        if let Err(error) = self.try_reconcile_from_disk() {
             tracing::warn!(target: "session.store",
                 session = %self.id,
-                "failed to open storage to reload disk state before launch; using in-memory value");
-            return;
-        };
-        let mut disk = match storage.load() {
-            Ok(instances) => match instances.into_iter().find(|i| i.id == self.id) {
-                Some(d) => d,
-                None => return,
-            },
-            Err(e) => {
-                tracing::warn!(target: "session.store",
-                    session = %self.id,
-                    error = %e,
-                    "failed to load disk state before launch; using in-memory value");
-                return;
-            }
+                error = %format_args!("{error:#}"),
+                "failed to reload disk state before launch; using in-memory value");
+        }
+    }
+
+    /// [`Self::reconcile_from_disk`] that reports a storage failure. `Ok(false)`
+    /// means the row is gone from disk and `self` is unchanged.
+    pub(super) fn try_reconcile_from_disk(&mut self) -> Result<bool> {
+        let storage = crate::session::storage::Storage::new(
+            &self.effective_profile(),
+            self.resolve_file_watch(),
+        )
+        .context("failed to open storage")?;
+        let Some(mut disk) = storage
+            .load()
+            .context("failed to load sessions")?
+            .into_iter()
+            .find(|i| i.id == self.id)
+        else {
+            return Ok(false);
         };
 
         // Carry runtime-only fields (`#[serde(skip)]`) and locally-mutated
@@ -72,6 +74,7 @@ impl Instance {
         }
 
         *self = disk;
+        Ok(true)
     }
 
     /// Closes the data-loss window where `/clear` writes the sidecar but

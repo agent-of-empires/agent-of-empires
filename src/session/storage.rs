@@ -1323,16 +1323,10 @@ impl Storage {
         F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
     {
         #[cfg(test)]
-        let _mu = match self.save_lock.try_lock() {
-            Ok(guard) => guard,
-            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                report_lock_contention_for_test(&self.sessions_path);
-                self.save_lock
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-            }
-        };
+        let _mu = crate::session::test_support::lock_reporting_contention(&self.save_lock, || {
+            report_lock_contention_for_test(&self.sessions_path)
+        })
+        .unwrap_or_else(|error| error.into_inner());
         #[cfg(not(test))]
         let _mu = self
             .save_lock

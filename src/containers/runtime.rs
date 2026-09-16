@@ -382,6 +382,21 @@ impl ContainerRuntime {
         ))
     }
 
+    /// Whether `name` was created for the agent `identity`. A container created
+    /// before the label existed matches, since its identity is unknown.
+    pub fn agent_tool_matches(&self, name: &str, identity: &str) -> Result<Option<bool>> {
+        if !self.base.supports_labels {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.inspect_container_label(
+                name,
+                crate::containers::container_interface::AGENT_TOOL_LABEL,
+            )?
+            .is_none_or(|value| value == identity),
+        ))
+    }
+
     /// Whether `name` was created with the shared credential mounts `config`
     /// carries. An agent that shares none matches every container.
     pub fn shared_credential_mounts_match(

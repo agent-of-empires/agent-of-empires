@@ -495,18 +495,13 @@ pub fn drain_recovery_pending(
     id: &str,
 ) {
     #[cfg(test)]
-    let lock = match pending.try_write() {
-        Ok(guard) => Ok(guard),
-        Err(std::sync::TryLockError::Poisoned(error)) => Err(error),
-        Err(std::sync::TryLockError::WouldBlock) => {
-            DRAIN_CONTENTION_OBSERVER.with(|slot| {
-                if let Some(sender) = slot.borrow_mut().take() {
-                    let _ = sender.send(());
-                }
-            });
-            pending.write()
-        }
-    };
+    let lock = crate::session::test_support::write_reporting_contention(pending, || {
+        DRAIN_CONTENTION_OBSERVER.with(|slot| {
+            if let Some(sender) = slot.borrow_mut().take() {
+                let _ = sender.send(());
+            }
+        })
+    });
     #[cfg(not(test))]
     let lock = pending.write();
     if let Ok(mut guard) = lock {
@@ -604,8 +599,9 @@ pub(crate) fn current_hook_timeout() -> Option<Duration> {
 
 /// RAII guard for the per-thread on_launch hook deadline. Restores the
 /// previous value on drop, so nested scopes behave LIFO.
-// ponytail: save/restore covers LIFO nesting only; production installs a
-// single scope (recovery), so out-of-order drops never occur.
+// Save/restore covers LIFO nesting only; production installs at most one scope
+// per thread (recovery, or a bounded `perform_restart`), so out-of-order drops
+// never occur.
 pub struct HookTimeoutScope {
     previous: Option<Duration>,
 }

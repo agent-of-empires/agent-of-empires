@@ -135,11 +135,17 @@ pub struct ContainerConfig {
     /// shares, one bind mount each. Labelled at create, so a container built
     /// before a file was shared, which mounts only the store, can be told apart.
     pub shared_credential_mounts: Vec<String>,
+    /// The agent identity whose config this container mounts; see
+    /// `container_agent_identity`. Labelled at create, so a container reused
+    /// after a tool swap can be told apart.
+    pub agent_tool: String,
     pub run_policy: RunPolicy,
 }
 
 pub(crate) const SHARED_CREDENTIAL_MOUNTS_LABEL: &str =
     "com.agent-of-empires.shared-credential-mounts";
+
+pub(crate) const AGENT_TOOL_LABEL: &str = "com.agent-of-empires.agent-tool";
 
 impl ContainerConfig {
     pub(crate) fn mount_fingerprint(&self) -> String {

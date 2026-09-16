@@ -1311,7 +1311,8 @@ environment = ["THING=$REPO_THING"]
 
     dialog.set_path(repo.path().to_string_lossy().to_string());
 
-    assert_eq!(dialog.extra_env, vec!["THING=$REPO_THING".to_string()]);
+    // A repo cannot set `sandbox.environment` (#3710).
+    assert_eq!(dialog.extra_env, vec!["THING=$OLD_THING".to_string()]);
     assert!(!dialog.extra_env_overridden);
     match dialog.build_submit_result() {
         DialogResult::Submit(data) => {
@@ -1373,7 +1374,8 @@ environment = ["THING=$REPO_THING"]
 
     assert!(matches!(result, DialogResult::Continue));
     assert!(dialog.sandbox_config_mode);
-    assert_eq!(dialog.extra_env, vec!["THING=$REPO_THING".to_string()]);
+    // A repo cannot set `sandbox.environment` (#3710).
+    assert_eq!(dialog.extra_env, vec!["THING=$OLD_THING".to_string()]);
     assert!(!dialog.extra_env_overridden);
     match dialog.build_submit_result() {
         DialogResult::Submit(data) => {

@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
 
 import type { ActivityRow } from "./acpTypes";
-import { DEFAULT_HISTORY_WINDOW, historyWindow, historyWindowStart } from "./acpHistoryWindow";
+import {
+  DEFAULT_HISTORY_WINDOW,
+  historyWindow,
+  historyWindowStart,
+  initialHistoryWindow,
+  lastUserBoundaryIndex,
+} from "./acpHistoryWindow";
 
 function row(kind: ActivityRow["kind"], i: number): ActivityRow {
   return { id: `${kind}-${i}`, kind, text: `${kind} ${i}` };
@@ -174,5 +180,40 @@ describe("historyWindow", () => {
     expect(historyWindow(rows, 30, false).canLoadEarlier).toBe(true);
     // Folding off (showClearedTurns): clear is ignored, gate is start > 0.
     expect(historyWindow(rows, 30, true).canLoadEarlier).toBe(true);
+  });
+});
+
+describe("initialHistoryWindow", () => {
+  it("keeps the default when the last turn fits inside it", () => {
+    const rows = transcript(100, 1); // 200 rows, last turn = 2 rows
+    expect(initialHistoryWindow(rows)).toBe(DEFAULT_HISTORY_WINDOW);
+  });
+
+  it("widens to the whole last turn when that turn alone is longer than the default", () => {
+    // 3 short turns, then one prompt followed by 400 tool rows.
+    const rows = transcript(3, 2);
+    const promptIdx = rows.length;
+    rows.push(row("user_prompt", 99));
+    for (let i = 0; i < 400; i += 1) rows.push(row("tool_complete", i));
+    expect(lastUserBoundaryIndex(rows)).toBe(promptIdx);
+    const visible = initialHistoryWindow(rows);
+    expect(visible).toBe(401);
+    // Rendering with that window starts exactly on the prompt: no cut mid-turn.
+    expect(historyWindowStart(rows, visible)).toBe(promptIdx);
+  });
+
+  it("counts typed diff comments as the last turn's boundary", () => {
+    const rows: ActivityRow[] = transcript(2, 1);
+    rows.push(row("user_diff_comments", 7));
+    for (let i = 0; i < 200; i += 1) rows.push(row("message", i));
+    expect(initialHistoryWindow(rows)).toBe(201);
+  });
+
+  it("falls back to the default when the transcript has no user turn", () => {
+    const rows: ActivityRow[] = [];
+    for (let i = 0; i < 500; i += 1) rows.push(row("message", i));
+    expect(lastUserBoundaryIndex(rows)).toBe(-1);
+    expect(initialHistoryWindow(rows)).toBe(DEFAULT_HISTORY_WINDOW);
+    expect(initialHistoryWindow([])).toBe(DEFAULT_HISTORY_WINDOW);
   });
 });

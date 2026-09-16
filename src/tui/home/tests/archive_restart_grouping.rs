@@ -847,6 +847,82 @@ fn apply_restart_results_propagates_worker_sid_without_peer_write() {
     assert!(env.view.restart_in_flight.is_empty());
 }
 
+/// Enter on a stopped session queues the start cascade, which can pull a
+/// sandbox image for minutes, on the restart worker instead of running it on
+/// the event loop, and attaches only once the agent launched (#3630).
+#[test]
+#[serial]
+fn restart_then_attach_queues_the_cascade_and_attaches_after_launch() {
+    use crate::session::{StartOutcome, Status};
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    let before = env.view.instance_at(0).clone();
+    let disk_generation = |view: &HomeView| {
+        view.storages["test"]
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap()
+            .lifecycle_generation
+    };
+    let generation = disk_generation(&env.view);
+
+    for (case, outcome, attaches, dialog) in [
+        ("fresh", Ok(StartOutcome::Fresh), true, None),
+        (
+            "fresh after failed resume",
+            Ok(StartOutcome::FreshAfterFailedResume { sid: "s".into() }),
+            true,
+            Some("Restarted"),
+        ),
+        (
+            "resume failed",
+            Ok(StartOutcome::ResumeFailed { sid: "s".into() }),
+            false,
+            Some("Restart Failed"),
+        ),
+        (
+            "cascade error",
+            Err("pull failed".to_string()),
+            false,
+            Some("Restart Failed"),
+        ),
+    ] {
+        // A seeded worker ignores requests, so a cascade could only run inline.
+        env.view.restart_poller = crate::tui::restart_poller::RestartPoller::with_result_for_test(
+            crate::session::restart::RestartResult {
+                session_id: id.clone(),
+                before: Box::new(before.clone()),
+                instance: Box::new(before.clone()),
+                outcome,
+            },
+        );
+
+        env.view.restart_then_attach(&id, None, false);
+        assert!(env.view.restart_in_flight.contains(&id), "{case}");
+        assert_eq!(env.view.get_instance(&id).unwrap().status, Status::Starting);
+        assert_eq!(
+            disk_generation(&env.view),
+            generation,
+            "{case}: the launch cascade ran on the caller"
+        );
+
+        assert!(env.view.apply_restart_results(), "{case}");
+        let expected = if attaches { vec![id.clone()] } else { vec![] };
+        assert_eq!(env.view.take_restarted_attaches(), expected, "{case}");
+        assert!(env.view.attach_after_restart.is_empty(), "{case}");
+        // The attach no longer waits on the cascade, so a failure must still
+        // reach the user.
+        assert_eq!(
+            env.view.info_dialog.take().map(|d| d.title().to_string()),
+            dialog.map(str::to_string),
+            "{case}"
+        );
+    }
+}
+
 #[test]
 #[serial]
 fn execute_send_message_missing_session_shows_send_failed() {

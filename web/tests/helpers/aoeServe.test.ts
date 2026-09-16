@@ -1,12 +1,38 @@
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type * as NativeTimers from "node:timers/promises";
 import { expect, it, vi } from "vitest";
 import { appDirFor, spawnAoeServe, type ServeHandle } from "./aoeServe";
+
+/** A stand-in `aoe` that only answers the harness readiness probe. */
+function writeFakeAoe(root: string): string {
+  const binary = join(root, "aoe");
+  writeFileSync(
+    binary,
+    `#!${process.execPath}
+const http = require("node:http");
+const port = Number(process.argv[process.argv.indexOf("--port") + 1]);
+http.createServer((_, response) => response.end("{}")).listen(port, "127.0.0.1", () => {
+  console.log("http://127.0.0.1:" + port + "/");
+});
+`,
+    { mode: 0o700 },
+  );
+  return binary;
+}
 
 vi.mock("node:timers/promises", async (importOriginal) => {
   const timers = await importOriginal<typeof NativeTimers>();
@@ -17,19 +43,8 @@ it.skipIf(process.platform === "win32")(
   "stop retains a leaderless runner group until descendants exit, including after a deadline",
   async () => {
     const root = mkdtempSync(join(tmpdir(), "aoe-stop-test-"));
-    const binary = join(root, "aoe");
+    const binary = writeFakeAoe(root);
     const release = join(root, "release");
-    writeFileSync(
-      binary,
-      `#!${process.execPath}
-const http = require("node:http");
-const port = Number(process.argv[process.argv.indexOf("--port") + 1]);
-http.createServer((_, response) => response.end("{}")).listen(port, "127.0.0.1", () => {
-  console.log("http://127.0.0.1:" + port + "/");
-});
-`,
-      { mode: 0o700 },
-    );
     const descendant = `
 const fs = require("node:fs");
 setInterval(() => { if (fs.existsSync(${JSON.stringify(release)})) process.exit(0); }, 10);
@@ -128,6 +143,83 @@ child.stdout.once("data", data => process.stdout.write(data, () => process.exit(
       vi.unstubAllEnvs();
       await expect.poll(liveMembers, { timeout: 5000 }).toEqual([]);
       if (serve && existsSync(serve.home)) await serve.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  20_000,
+);
+
+// A runner can load its record just before teardown revokes it and save it back
+// just after (a late `mark_detached`). Its watchdog then keeps matching the record
+// and never exits unless the harness revokes the resaved record too.
+it.skipIf(process.platform !== "linux")(
+  "stop revokes a runner record saved back after revocation",
+  async () => {
+    const root = mkdtempSync(join(tmpdir(), "aoe-stop-test-"));
+    const binary = writeFakeAoe(root);
+    let serve: ServeHandle | undefined;
+    let runnerPid: number | undefined;
+    try {
+      vi.stubEnv("AOE_E2E_BINARY", binary);
+      serve = await spawnAoeServe({ workerIndex: 0, parallelIndex: 0 });
+      const workers = join(appDirFor(serve.home, join(serve.home, "config"), binary), "acp-workers");
+      mkdirSync(workers);
+      const sessionId = "resaved-runner";
+      const recordPath = join(workers, `${sessionId}.json`);
+      const socketPath = join(workers, `${sessionId}.sock`);
+      // Titled like `aoe __acp-runner` so the harness accepts it as this record's live runner.
+      const title = `${realpathSync(binary)} __acp-runner --socket ${socketPath} --session-id ${sessionId} --generation 7 -- agent`;
+      const runner = spawn(
+        process.execPath,
+        [
+          "-e",
+          `const fs = require("node:fs");
+process.title = ${JSON.stringify(title)};
+fs.writeFileSync(${JSON.stringify(join(root, "runner-ready"))}, "");
+const path = ${JSON.stringify(recordPath)};
+let saved, resaved = false, missing = 0;
+setInterval(() => {
+  if (fs.existsSync(path)) { saved ??= fs.readFileSync(path); missing = 0; return; }
+  if (saved && !resaved) { resaved = true; fs.writeFileSync(path + ".tmp", saved); fs.renameSync(path + ".tmp", path); return; }
+  if (saved && ++missing >= 2) process.exit(0);
+}, 20);`,
+          "x".repeat(title.length),
+        ],
+        { detached: true, stdio: "ignore" },
+      );
+      runnerPid = runner.pid!;
+      // The harness matches the runner by its `ps` command line, so the record
+      // must not exist before the child has renamed itself.
+      await expect
+        .poll(() => existsSync(join(root, "runner-ready")), { timeout: 10_000, message: "fake runner renamed itself" })
+        .toBe(true);
+      writeFileSync(
+        recordPath,
+        JSON.stringify({ pid: runnerPid, session_id: sessionId, socket_path: socketPath, generation: 7 }),
+      );
+      const exited = once(runner, "exit");
+
+      const stop = serve.stop();
+      await expect(
+        Promise.race([
+          stop,
+          delay(10_000).then(() => {
+            throw new Error("stop did not revoke the resaved record");
+          }),
+        ]),
+      ).resolves.toBeUndefined();
+      await exited;
+      expect(existsSync(serve.home)).toBe(false);
+    } finally {
+      if (runnerPid) {
+        try {
+          process.kill(-runnerPid, "SIGKILL");
+        } catch {
+          // already exited
+        }
+      }
+      vi.unstubAllEnvs();
+      if (serve && existsSync(serve.home)) await serve.stop().catch(() => {});
       rmSync(root, { recursive: true, force: true });
     }
   },
