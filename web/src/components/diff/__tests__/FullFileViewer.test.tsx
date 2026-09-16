@@ -42,6 +42,21 @@ describe("FullFileViewer", () => {
     expect(container.textContent).toContain("just text");
   });
 
+  it("numbers every line in a copy-excluded gutter, without a trailing-newline phantom", async () => {
+    const { container } = render(<FullFileViewer content={"a\nb\nc\n"} filePath="notes.unknownext" />);
+    const gutter = container.querySelector('pre[aria-hidden="true"]');
+    expect(gutter?.textContent).toBe("1\n2\n3");
+    expect(gutter?.className).toContain("select-none");
+  });
+
+  it("keeps the gutter alongside highlighted markup", async () => {
+    const { container } = render(<FullFileViewer content={"const a = 1;\nconst b = 2;"} filePath="src/a.ts" />);
+    await waitFor(() => {
+      expect(container.querySelector("pre.shiki")).toBeTruthy();
+    });
+    expect(container.querySelector('pre[aria-hidden="true"]')?.textContent).toBe("1\n2");
+  });
+
   it("drops stale highlighted markup when the file changes", async () => {
     const { container, rerender } = render(<FullFileViewer content="export const a = 1;\n" filePath="src/a.ts" />);
     await waitFor(() => {
