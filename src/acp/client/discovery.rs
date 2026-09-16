@@ -39,6 +39,11 @@ pub struct DaemonEndpoint {
     /// `AOE_DAEMON_URL` is set without `AOE_DAEMON_TOKEN`.
     token: Arc<RwLock<Option<String>>>,
     local_token_path: Option<PathBuf>,
+    /// `<app_dir>/serve.passphrase`, set only for a loopback local daemon.
+    /// Read fresh on every [`resolved_passphrase`](Self::resolved_passphrase)
+    /// call rather than cached: unlike the bearer token there is no rotation
+    /// path to race, so a plain re-read keeps this simple.
+    local_passphrase_path: Option<PathBuf>,
     pub source: Source,
 }
 
@@ -48,12 +53,18 @@ impl DaemonEndpoint {
             base_url,
             token: Arc::new(RwLock::new(token)),
             local_token_path: None,
+            local_passphrase_path: None,
             source,
         }
     }
 
     pub(crate) fn with_local_token_path(mut self, token_path: PathBuf) -> Self {
         self.local_token_path = Some(token_path);
+        self
+    }
+
+    pub(crate) fn with_local_passphrase_path(mut self, passphrase_path: PathBuf) -> Self {
+        self.local_passphrase_path = Some(passphrase_path);
         self
     }
 
@@ -105,6 +116,51 @@ impl DaemonEndpoint {
     pub(crate) fn cached_token(&self) -> Option<String> {
         self.token.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
+
+    /// Passphrase to present to `/api/login` when no bearer token resolves
+    /// (a `--auth=passphrase` daemon never mints one). `AOE_DAEMON_PASSPHRASE`
+    /// always wins when set, so an explicit override works against a remote
+    /// `AOE_DAEMON_URL` target too; otherwise only a loopback local daemon
+    /// consults `serve.passphrase` (the file the daemon itself writes for its
+    /// own `--restart` recall, see `cli::serve::recall_serve_passphrase`).
+    pub(crate) fn resolved_passphrase(&self) -> Option<String> {
+        if let Some(env_value) = env_passphrase_override() {
+            return transport_is_safe_for_passphrase(&self.base_url).then_some(env_value);
+        }
+        if self.source != Source::LocalDaemon || !is_loopback(&self.base_url) {
+            return None;
+        }
+        let path = self.local_passphrase_path.as_deref()?;
+        let raw = std::fs::read_to_string(path).ok()?;
+        let trimmed = raw.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    }
+
+    /// Directory used to cache the CLI's own passphrase-login session
+    /// (device-binding secret + `aoe_session` cookie) so a same-host CLI
+    /// invocation reuses one long-lived login instead of minting a fresh
+    /// device session on every process. `None` for anything but a loopback
+    /// local daemon: an explicit remote endpoint gets no on-disk cache.
+    pub(crate) fn local_session_dir(&self) -> Option<&Path> {
+        if self.source != Source::LocalDaemon || !is_loopback(&self.base_url) {
+            return None;
+        }
+        self.local_passphrase_path.as_deref().and_then(Path::parent)
+    }
+}
+
+fn env_passphrase_override() -> Option<String> {
+    let value = env::var("AOE_DAEMON_PASSPHRASE").ok()?;
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// A passphrase may only travel to an endpoint that can't be read in
+/// transit: `https://`, or loopback (never leaves the host). Anything
+/// else — a plaintext `http://` URL to a non-loopback host — would hand
+/// the shared secret to an on-path attacker.
+fn transport_is_safe_for_passphrase(base_url: &str) -> bool {
+    base_url.starts_with("https://") || is_loopback(base_url)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,7 +227,9 @@ pub fn discover_local() -> Result<DaemonEndpoint, DiscoveryError> {
     let endpoint = DaemonEndpoint::new(base_url, token, Source::LocalDaemon);
     let endpoint = if is_loopback(&endpoint.base_url) {
         match crate::session::get_app_dir() {
-            Ok(app_dir) => endpoint.with_local_token_path(app_dir.join("serve.token")),
+            Ok(app_dir) => endpoint
+                .with_local_token_path(app_dir.join("serve.token"))
+                .with_local_passphrase_path(app_dir.join("serve.passphrase")),
             Err(_) => endpoint,
         }
     } else {
@@ -441,5 +499,124 @@ mod tests {
         assert_eq!(endpoint.base_url, "https://remote.example.com:9000");
         assert_eq!(endpoint.cached_token().as_deref(), Some("real-token"));
         assert_eq!(endpoint.source, Source::Env);
+    }
+
+    fn passphrase_endpoint(source: Source, passphrase_path: Option<PathBuf>) -> DaemonEndpoint {
+        let mut endpoint = DaemonEndpoint::new("http://127.0.0.1:8080".into(), None, source);
+        if let Some(path) = passphrase_path {
+            endpoint = endpoint.with_local_passphrase_path(path);
+        }
+        endpoint
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolved_passphrase_reads_local_file_for_loopback_daemon() {
+        let _env = crate::session::test_support::EnvGuard::unset(&["AOE_DAEMON_PASSPHRASE"]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.passphrase");
+        std::fs::write(&path, "correct horse battery staple\n").unwrap();
+
+        let endpoint = passphrase_endpoint(Source::LocalDaemon, Some(path));
+        assert_eq!(
+            endpoint.resolved_passphrase().as_deref(),
+            Some("correct horse battery staple")
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolved_passphrase_env_override_wins_over_local_file() {
+        let _env =
+            crate::session::test_support::EnvGuard::set(&[("AOE_DAEMON_PASSPHRASE", "from-env")]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.passphrase");
+        std::fs::write(&path, "from-file").unwrap();
+
+        let endpoint = passphrase_endpoint(Source::LocalDaemon, Some(path));
+        assert_eq!(endpoint.resolved_passphrase().as_deref(), Some("from-env"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolved_passphrase_env_override_works_for_remote_endpoint() {
+        let _env =
+            crate::session::test_support::EnvGuard::set(&[("AOE_DAEMON_PASSPHRASE", "from-env")]);
+        let endpoint = passphrase_endpoint(Source::Env, None);
+        assert_eq!(endpoint.resolved_passphrase().as_deref(), Some("from-env"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolved_passphrase_env_override_rejects_plaintext_remote_endpoint() {
+        // A plaintext http:// URL to a non-loopback host would send the
+        // shared passphrase to /api/login in the clear; an on-path
+        // attacker could read it, so the override must not apply.
+        let _env =
+            crate::session::test_support::EnvGuard::set(&[("AOE_DAEMON_PASSPHRASE", "from-env")]);
+        let endpoint =
+            DaemonEndpoint::new("http://remote.example.com:8080".into(), None, Source::Env);
+        assert_eq!(endpoint.resolved_passphrase(), None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolved_passphrase_env_override_allows_https_remote_endpoint() {
+        let _env =
+            crate::session::test_support::EnvGuard::set(&[("AOE_DAEMON_PASSPHRASE", "from-env")]);
+        let endpoint = DaemonEndpoint::new("https://remote.example.com".into(), None, Source::Env);
+        assert_eq!(endpoint.resolved_passphrase().as_deref(), Some("from-env"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolved_passphrase_none_without_env_or_local_file() {
+        let _env = crate::session::test_support::EnvGuard::unset(&["AOE_DAEMON_PASSPHRASE"]);
+        let endpoint = passphrase_endpoint(Source::LocalDaemon, None);
+        assert_eq!(endpoint.resolved_passphrase(), None);
+
+        let remote = passphrase_endpoint(Source::Env, None);
+        assert_eq!(remote.resolved_passphrase(), None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolved_passphrase_ignores_empty_local_file() {
+        let _env = crate::session::test_support::EnvGuard::unset(&["AOE_DAEMON_PASSPHRASE"]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.passphrase");
+        std::fs::write(&path, "  \n").unwrap();
+
+        let endpoint = passphrase_endpoint(Source::LocalDaemon, Some(path));
+        assert_eq!(endpoint.resolved_passphrase(), None);
+    }
+
+    #[test]
+    fn local_session_dir_is_the_passphrase_files_parent_for_loopback_local_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.passphrase");
+        let endpoint = passphrase_endpoint(Source::LocalDaemon, Some(path));
+        assert_eq!(endpoint.local_session_dir(), Some(dir.path()));
+    }
+
+    #[test]
+    fn local_session_dir_none_for_remote_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.passphrase");
+        let endpoint = passphrase_endpoint(Source::Env, Some(path));
+        assert_eq!(endpoint.local_session_dir(), None);
+    }
+
+    #[test]
+    fn local_session_dir_none_for_non_loopback_local_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.passphrase");
+        let endpoint = DaemonEndpoint::new(
+            "https://old-tunnel.example.com".into(),
+            None,
+            Source::LocalDaemon,
+        )
+        .with_local_passphrase_path(path);
+        assert_eq!(endpoint.local_session_dir(), None);
     }
 }

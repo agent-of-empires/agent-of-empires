@@ -36,12 +36,16 @@ stay in sync.
   rather than tmux pane probing.
 - **`--auth=passphrase` daemons**: the local TUI attaches to a same-host
   daemon without the passphrase exchange (loopback callers are protected
-  by the 0600 serve files on disk). Remote callers proxied through a
-  tunnel still hit the passphrase wall. Adding `--behind-proxy` withdraws
-  the same-host carve-out (see
+  by the 0600 serve files on disk). Adding `--behind-proxy` withdraws that
+  same-host carve-out (see
   [Behind a reverse proxy](../guides/web-dashboard.md#behind-a-reverse-proxy)),
-  and the TUI has no passphrase exchange to fall back on, so it cannot
-  attach to that daemon.
+  since a request from the proxy's own loopback socket is otherwise
+  indistinguishable from one it forwarded on behalf of a remote caller. In
+  that case the TUI and every `aoe acp <verb>` CLI command fall back to the
+  same `/api/login` handshake the web dashboard uses, reading the daemon's
+  own `serve.passphrase` file to log in automatically and caching the
+  resulting session (see [Cross-machine attach](../structured-view.md#cross-machine-attach)
+  for the remote-endpoint equivalent, `AOE_DAEMON_PASSPHRASE`).
 
 ### TUI structured view keybinds
 

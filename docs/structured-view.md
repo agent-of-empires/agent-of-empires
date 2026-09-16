@@ -160,6 +160,8 @@ When `AOE_DAEMON_URL` is set, the TUI swaps the local home view for a remote ses
 
 The session list is read with a bearer token only over HTTPS or a loopback URL. With `AOE_DAEMON_TOKEN` set and a plaintext `http://` URL on another host, the picker reports that refusal instead of listing sessions. The other daemon requests do not apply this check yet (#3839), so use HTTPS or a tunnel for a remote daemon.
 
+A remote daemon running `--auth=passphrase` never mints a bearer token, so `AOE_DAEMON_TOKEN` has nothing to carry. Set `AOE_DAEMON_PASSPHRASE` instead; the CLI logs in via the same `/api/login` handshake the web dashboard uses and caches the resulting session for the process. A local daemon needs neither: the CLI already reads its own `serve.passphrase` file (the same one `aoe serve --restart` recalls from) to log in automatically.
+
 ## Headless CLI verbs
 
 Every structured-view operation has a matching `aoe acp <verb>` against the same daemon:
