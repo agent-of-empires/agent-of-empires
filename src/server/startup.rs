@@ -1120,7 +1120,6 @@ async fn remote_rotation_loop(
 ) {
     loop {
         let lifetime = token_manager.lifetime_secs().await;
-        let grace = token_manager.grace().await;
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(lifetime)) => {}
             _ = shutdown.cancelled() => break,
@@ -1130,7 +1129,7 @@ async fn remote_rotation_loop(
         // BEFORE rotating, so we know which owner-hashes are still valid in
         // the store.
         let pre_rotate_current = token_manager.current_token().await;
-        token_manager.rotate().await;
+        let grace_expires = token_manager.rotate().await;
         let post_rotate_current = token_manager.current_token().await;
 
         // Refresh `serve.url` so the TUI display and the QR-code URL stay in
@@ -1171,7 +1170,9 @@ async fn remote_rotation_loop(
         }
 
         tokio::select! {
-            _ = tokio::time::sleep(grace) => {}
+            // The deadline `validate` enforces, not a fresh grace after the
+            // work above.
+            _ = tokio::time::sleep_until(grace_expires) => {}
             _ = shutdown.cancelled() => break,
         }
         token_manager.clear_previous().await;
@@ -1257,14 +1258,15 @@ mod tests {
         assert_eq!(resolve_auth_mode(&no_token, &no_passphrase).await, "none");
     }
 
-    /// The post-rotation cleanup must run on the configured grace period, not
-    /// a hardcoded default, so a token stops being accepted and stops owning
-    /// push subscriptions at the same moment.
+    /// Post-rotation cleanup runs at the deadline `rotate()` set, the one
+    /// `validate` enforces: on the configured grace rather than a default, and
+    /// however long the work after rotating takes (#3731).
     #[tokio::test(start_paused = true)]
-    async fn rotation_cleanup_honors_the_configured_grace() {
+    async fn rotation_cleanup_runs_at_the_validation_deadline() {
         let _app_dir = crate::session::test_support::isolate_app_dir();
         let lifetime = Duration::from_secs(60);
-        let grace = Duration::from_secs(7);
+        let grace = Duration::from_secs(8);
+        let stall = grace / 2;
         let manager = Arc::new(TokenManager::with_grace(
             Some("old_token".to_string()),
             lifetime,
@@ -1287,6 +1289,10 @@ mod tests {
             .await
             .unwrap();
 
+        // Stands in for slow push-store I/O: the loop's first post-rotation
+        // prune cannot finish before the test releases this at `stall`.
+        let store_lock = push.store.hold_for_test().await;
+        let deadline = tokio::time::Instant::now() + lifetime + grace;
         let shutdown = CancellationToken::new();
         let rotation = tokio::spawn(remote_rotation_loop(
             manager.clone(),
@@ -1296,20 +1302,27 @@ mod tests {
             8080,
         ));
 
-        // Mid-grace: the rotated-out token is still accepted, and its
-        // subscription still belongs to a valid owner.
-        tokio::time::sleep(lifetime + grace / 2).await;
+        tokio::time::sleep(lifetime + stall).await;
+        assert!(manager.holds_previous().await, "rotation has happened");
+        drop(store_lock);
+
+        // Just before the deadline: the rotated-out token is still accepted,
+        // and its subscription still belongs to a valid owner.
+        tokio::time::sleep_until(deadline - Duration::from_secs(1)).await;
         assert!(manager.validate("old_token").await.0);
         assert!(manager.holds_previous().await);
         assert_eq!(push.store.snapshot().await.len(), 1);
 
-        // Past the configured grace: validation and cleanup agree. With the
-        // hardcoded 300s sleep the token was rejected here while its state and
-        // subscription lingered.
-        tokio::time::sleep(grace).await;
+        // Validation and cleanup agree. Sleeping a fresh grace after the
+        // stalled prune would clear the state only at `deadline + stall`.
+        tokio::time::timeout_at(deadline + stall / 2, async {
+            while manager.holds_previous().await || !push.store.snapshot().await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("previous-token cleanup must run at the validation deadline");
         assert!(!manager.validate("old_token").await.0);
-        assert!(!manager.holds_previous().await);
-        assert!(push.store.snapshot().await.is_empty());
 
         shutdown.cancel();
         rotation

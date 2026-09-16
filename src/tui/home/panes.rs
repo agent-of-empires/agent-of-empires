@@ -114,16 +114,41 @@ impl HomeView {
         Ok(())
     }
 
-    pub fn restart_instance_with_size_opts(
+    /// Restart `id` on the restart worker and attach once it launches the
+    /// agent (see `take_restarted_attaches`). The cascade can pull a sandbox
+    /// image for minutes, so it must stay off the event loop. A restart
+    /// already in flight is joined rather than queued twice.
+    pub fn restart_then_attach(
         &mut self,
         id: &str,
         size: Option<(u16, u16)>,
         skip_on_launch: bool,
-    ) -> anyhow::Result<crate::session::StartOutcome> {
-        let outcome = self.try_mutate_instance_writeback_on_err(id, |inst| {
-            inst.restart_with_size_opts(size, skip_on_launch)
-        })?;
-        outcome.ok_or_else(|| anyhow::anyhow!("session not found: {}", id))
+    ) {
+        if self.get_instance(id).is_none() {
+            return;
+        }
+        self.attach_after_restart.insert(id.to_string());
+        if !self.restart_in_flight.insert(id.to_string()) {
+            return;
+        }
+        self.mutate_instance(id, |inst| {
+            inst.status = crate::session::Status::Starting;
+            inst.last_error = None;
+            inst.last_start_time = Some(std::time::Instant::now());
+        });
+        let Some(instance) = self.get_instance(id).cloned() else {
+            return;
+        };
+        self.restart_poller
+            .request_restart(crate::session::restart::RestartRequest {
+                session_id: id.to_string(),
+                instance,
+                size,
+                wake_message: String::new(),
+                skip_on_launch,
+                bound_hooks: false,
+                discard_sandbox_container: false,
+            });
     }
 
     /// Get the terminal mode for a session (uses config default if not set)

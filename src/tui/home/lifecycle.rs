@@ -373,6 +373,8 @@ impl HomeView {
             reconcile_reload_retry_at: None,
             restart_poller: RestartPoller::new(),
             restart_in_flight: std::collections::HashSet::new(),
+            attach_after_restart: std::collections::HashSet::new(),
+            restarted_attaches: Vec::new(),
             store_move_poller: crate::tui::store_move_poller::StoreMovePoller::new(),
             store_move_in_flight: None,
             store_move_bypass: None,

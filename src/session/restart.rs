@@ -17,6 +17,12 @@ pub struct RestartRequest {
     /// Keys to send once the pane is live again. Empty disables the wake-up
     /// (the documented opt-out via `session.restart_wake_message`).
     pub wake_message: String,
+    /// Skip on_launch hooks that already ran in the background creation poller.
+    pub skip_on_launch: bool,
+    /// Kill a hook that outlives the recovery hook timeout, so a hung hook
+    /// cannot wedge the worker. Unset for the launch behind Enter or a new
+    /// session, whose hooks have always run unbounded.
+    pub bound_hooks: bool,
     /// Remove the sandbox container before relaunching, so the next start
     /// creates a fresh one. Set on a tool swap: launch recreates a container
     /// labelled for another tool, but not one created before that label (#3959).
@@ -42,6 +48,8 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
         mut instance,
         size,
         wake_message,
+        skip_on_launch,
+        bound_hooks,
         discard_sandbox_container,
     } = request;
 
@@ -49,24 +57,26 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
     let tool = instance.tool.clone();
     let before = instance.clone();
 
-    // Honor the same on_launch / before_start hook timeout the startup-recovery
-    // worker installs (`run_recovery_for_instance`). Without it, a hanging
-    // before_start hook (e.g. a `mint` script waiting on the network) runs with
-    // no kill timer and wedges this serial worker thread forever, taking every
-    // future restart down with it.
+    // With `bound_hooks`, honor the on_launch / before_start hook timeout the
+    // startup-recovery worker installs (`run_recovery_for_instance`), so a
+    // hanging hook (e.g. a `mint` script waiting on the network) cannot wedge
+    // this serial worker. Enter and new-session launches opt out to keep their
+    // hooks unbounded; a hang there stalls later restarts until the hook exits.
     let outcome = {
-        let _scope = crate::session::recovery::HookTimeoutScope::new(
-            crate::session::recovery::recovery_hook_timeout(),
-        );
+        let _scope = bound_hooks.then(|| {
+            crate::session::recovery::HookTimeoutScope::new(
+                crate::session::recovery::recovery_hook_timeout(),
+            )
+        });
         instance
-            .restart_discarding_sandbox_container(size, discard_sandbox_container)
+            .restart_discarding_sandbox_container(size, skip_on_launch, discard_sandbox_container)
             .map_err(|e| e.to_string())
     };
 
     // On a successful restart, send the wake-up keys on a detached thread so
     // the result (and the row's status update) propagate back immediately
     // rather than waiting out the up-to-3s pane-readiness probe.
-    let should_wake = should_send_restart_wake(&outcome);
+    let should_wake = launched_agent(&outcome);
     if should_wake && !wake_message.is_empty() {
         spawn_wake_worker(session_id.clone(), title, tool, wake_message);
     }
@@ -79,7 +89,8 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
     }
 }
 
-fn should_send_restart_wake(outcome: &Result<StartOutcome, String>) -> bool {
+/// Whether the restart left the agent running in a live pane.
+pub(crate) fn launched_agent(outcome: &Result<StartOutcome, String>) -> bool {
     matches!(
         outcome,
         Ok(StartOutcome::Fresh
@@ -148,6 +159,8 @@ mod tests {
             instance,
             size: None,
             wake_message: String::new(),
+            skip_on_launch: false,
+            bound_hooks: true,
             discard_sandbox_container: false,
         });
         // The cascade may create a real tmux session; tear it down so the test
@@ -228,6 +241,8 @@ mod tests {
                 instance,
                 size: None,
                 wake_message: String::new(),
+                skip_on_launch: false,
+                bound_hooks: true,
                 discard_sandbox_container: true,
             });
 
@@ -253,6 +268,6 @@ mod tests {
             sid: "11111111-2222-3333-4444-555555555555".to_string(),
         });
 
-        assert!(!should_send_restart_wake(&outcome));
+        assert!(!launched_agent(&outcome));
     }
 }

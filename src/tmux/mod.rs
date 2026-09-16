@@ -2673,13 +2673,10 @@ thread_local! {
 fn lock_agent_probe() -> std::sync::MutexGuard<'static, ()> {
     #[cfg(test)]
     if let Some(contended) = AGENT_PROBE_LOCK_CONTENDED.with(|slot| slot.borrow_mut().take()) {
-        match AGENT_PROBE_LOCK.try_lock() {
-            Ok(guard) => return guard,
-            Err(std::sync::TryLockError::Poisoned(error)) => return error.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                contended.send(()).expect("contention observer alive");
-            }
-        }
+        return crate::session::test_support::lock_reporting_contention(&AGENT_PROBE_LOCK, || {
+            contended.send(()).expect("contention observer alive")
+        })
+        .unwrap_or_else(|e| e.into_inner());
     }
     AGENT_PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }

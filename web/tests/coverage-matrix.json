@@ -299,11 +299,7 @@
       "id": "terminal.live-size-owner",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/live-size-owner-takeover.spec.ts",
-        "src/hooks/useLiveTerminal.sizeOwner.test.ts",
-        "tests/live/mobile-live-no-flutter.spec.ts"
-      ],
+      "specs": ["tests/live/live-size-owner-takeover.spec.ts", "src/hooks/useLiveTerminal.sizeOwner.test.ts"],
       "components": ["web/src/components/LiveTerminalView.tsx", "web/src/hooks/useLiveTerminal.ts"]
     },
     {
@@ -357,7 +353,10 @@
       "id": "terminal.mobile-live-align",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/components/__tests__/MobileLiveTerminal.align.test.tsx"],
+      "specs": [
+        "src/components/__tests__/MobileLiveTerminal.align.test.tsx",
+        "src/components/__tests__/MobileLiveTerminal.rowIdentity.test.tsx"
+      ],
       "components": ["web/src/components/MobileLiveTerminal.tsx", "web/src/components/LiveTerminalView.tsx"]
     },
     {

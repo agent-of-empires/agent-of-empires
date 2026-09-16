@@ -68,7 +68,7 @@ async fn list_worktrees() -> Result<()> {
             "worktree"
         };
 
-        let shortened_path = shorten_path(&wt.path);
+        let shortened_path = crate::util::collapse_tilde(&wt.path.to_string_lossy());
 
         println!("{:<40} {:<30} {:<10}", shortened_path, branch, wt_type);
     }
@@ -326,18 +326,6 @@ async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
     println!("\n✓ Cleanup complete: {} items removed", removed_count);
 
     Ok(())
-}
-
-fn shorten_path(path: &Path) -> String {
-    let path_str = path.to_string_lossy();
-    if let Some(home) = dirs::home_dir() {
-        if let Some(home_str) = home.to_str() {
-            if let Some(stripped) = path_str.strip_prefix(home_str) {
-                return format!("~{}", stripped);
-            }
-        }
-    }
-    path_str.to_string()
 }
 
 #[cfg(test)]

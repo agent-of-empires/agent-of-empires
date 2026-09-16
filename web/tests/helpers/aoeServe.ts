@@ -4,7 +4,18 @@
 // Failed teardown retains HOME and registry evidence rather than reporting success.
 
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { existsSync, mkdtempSync, writeFileSync, chmodSync, mkdirSync, realpathSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  writeFileSync,
+  chmodSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -365,7 +376,6 @@ function processSnapshot(env: NodeJS.ProcessEnv): ProcessSnapshot[] {
 
 /** Revoke the private lease; the runner watchdog terminates its own process group. */
 async function stopOrphanRunners(appDir: string, binary: string, env: NodeJS.ProcessEnv): Promise<void> {
-  const { readdirSync, readFileSync, renameSync } = await import("node:fs");
   const workersDir = join(appDir, "acp-workers");
   if (!existsSync(workersDir)) return;
   const executable = realpathSync(binary);
@@ -378,6 +388,8 @@ async function stopOrphanRunners(appDir: string, binary: string, env: NodeJS.Pro
       .map((p) => p.group),
   );
   const records = readdirSync(workersDir).filter((name) => name.endsWith(".json") || name.endsWith(".json.stopping"));
+  // A runner that read its record just before the rename can save it back.
+  const revoked = new Map<string, { pid: number; generation: string }>();
   for (const name of records) {
     const path = join(workersDir, name);
     let raw: string;
@@ -415,6 +427,7 @@ async function stopOrphanRunners(appDir: string, binary: string, env: NodeJS.Pro
     ) {
       throw new Error(`runner ${pid} no longer matches ${name}; retaining ${appDir}`);
     }
+    revoked.set(recordName, { pid, generation });
     // Preserve recovery evidence until exit is observed. Never signal this numeric PID.
     if (name === recordName) {
       try {
@@ -433,7 +446,26 @@ async function stopOrphanRunners(appDir: string, binary: string, env: NodeJS.Pro
   const deadline = performance.now() + 25_000;
   while (processSnapshot(env).some((p) => groups.has(p.group))) {
     if (performance.now() >= deadline) throw new Error(`runner groups did not exit; retaining ${appDir}`);
+    for (const [recordName, owner] of revoked) revokeAgain(join(workersDir, recordName), owner);
     await delay(50);
+  }
+}
+
+/** Rename a record the runner saved back after revocation, if it still names that runner. */
+function revokeAgain(path: string, owner: { pid: number; generation: string }): void {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  const { pid } = JSON.parse(raw);
+  if (pid !== owner.pid || raw.match(/"generation"\s*:\s*(\d+)/)?.[1] !== owner.generation) return;
+  try {
+    renameSync(path, `${path}.stopping`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
 }
 
