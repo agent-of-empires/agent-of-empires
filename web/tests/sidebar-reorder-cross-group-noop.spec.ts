@@ -9,7 +9,7 @@
 //   - zero PUTs flew (handleDragEnd short-circuits at the `over.id`
 //     check, no `onReorderWorkspaces` call)
 
-import { test, expect } from "./helpers/mockedTest";
+import { test, expect, publishedRequests, observeFor } from "./helpers/mockedTest";
 import { installSidebarMocks, workspaceId, type MockSessionInput } from "./helpers/sidebarMocks";
 
 test("dragging a row onto a different repo group is a no-op", async ({ page }) => {
@@ -47,7 +47,10 @@ test("dragging a row onto a different repo group is a no-op", async ({ page }) =
 
   // Wait a frame so handleDragEnd has had a chance to fire on a
   // regression that doesn't short-circuit cross-group.
-  await page.waitForTimeout(300);
+  await observeFor(page, 300, async () => {
+    expect(await publishedRequests(page, "/api/workspace-ordering", "PUT")).toEqual([]);
+    expect(handle.puts).toEqual([]);
+  });
 
   const afterOrder = await wrappers.evaluateAll((els) =>
     els.map((el) => el.querySelector("span.truncate[title]")?.getAttribute("title") ?? ""),

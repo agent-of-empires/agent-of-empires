@@ -117,6 +117,7 @@ fn test_delete_dialog_respects_sandbox_auto_cleanup_false() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn test_default_config_has_auto_cleanup_true() {
     let config = Config::default();
     assert!(
@@ -152,6 +153,7 @@ fn test_config_roundtrip_preserves_auto_cleanup() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn test_all_worktree_config_fields_accessible() {
     let config = WorktreeConfig::default();
     let _ = config.enabled;
@@ -160,6 +162,7 @@ fn test_all_worktree_config_fields_accessible() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn test_all_sandbox_config_fields_accessible() {
     let config = SandboxConfig::default();
     let _ = config.enabled_by_default;
@@ -202,6 +205,7 @@ fn test_agent_command_override_roundtrip() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn test_parse_key_value_list_via_field_apply() {
     // Simulate the settings TUI flow: list of "key=value" strings -> HashMap -> TOML -> load back
     let mut config = Config::default();

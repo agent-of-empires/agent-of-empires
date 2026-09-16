@@ -1343,6 +1343,7 @@ mod tests {
 
     #[test]
     fn test_deletion_result_success_when_no_worktree_or_sandbox() {
+        let _app_guard = crate::session::test_support::isolate_app_dir();
         let instance = create_test_instance();
         let request = DeletionRequest {
             session_id: instance.id.clone(),
@@ -1527,6 +1528,7 @@ mod tests {
 
     #[test]
     fn test_deletion_result_success_even_with_delete_worktree_flag_when_no_worktree() {
+        let _app_guard = crate::session::test_support::isolate_app_dir();
         let instance = create_test_instance();
         let request = DeletionRequest {
             session_id: instance.id.clone(),
@@ -1826,6 +1828,7 @@ mod tests {
 
     #[test]
     fn test_deletion_request_preserves_session_id() {
+        let _app_guard = crate::session::test_support::isolate_app_dir();
         let instance = create_test_instance();
         let custom_id = "custom-session-id-123".to_string();
 
@@ -1961,6 +1964,7 @@ mod tests {
         /// failures.
         #[test]
         fn sandboxed_with_worktree_kills_tmux_and_container_before_worktree() {
+            let _app_guard = crate::session::test_support::isolate_app_dir();
             // Synthesize an instance with both worktree_info and an
             // (enabled) sandbox_info pointing at a non-existent
             // container. The container ops will no-op (container does
@@ -2036,6 +2040,7 @@ mod tests {
         /// container runtime.
         #[test]
         fn e2e_real_worktree_is_removed_on_disk() {
+            let _app_guard = crate::session::test_support::isolate_app_dir();
             let tmp = tempfile::TempDir::new().unwrap();
             let main_repo = tmp.path().join("main");
             let worktree_path = tmp.path().join("worktree");
@@ -2139,6 +2144,7 @@ mod tests {
         /// existing protection.
         #[test]
         fn default_branch_worktree_survives_a_forced_delete() {
+            let _app_guard = crate::session::test_support::isolate_app_dir();
             let tmp = tempfile::TempDir::new().unwrap();
             let bare = tmp.path().join("project/.bare");
             let worktree_path = tmp.path().join("project/main");
@@ -2265,6 +2271,7 @@ mod tests {
         /// surfaced as an error rather than silently skipped.
         #[test]
         fn e2e_workspace_dir_that_is_not_aoe_owned_is_refused() {
+            let _app_guard = crate::session::test_support::isolate_app_dir();
             let tmp = tempfile::TempDir::new().unwrap();
             let user_checkout = tmp.path().join("backend");
             init_repo(&user_checkout);
@@ -2331,6 +2338,7 @@ mod tests {
         /// message rather than a hard error, and the trash row still clears.
         #[test]
         fn e2e_workspace_ancestor_with_unrelated_content_is_not_recursively_removed() {
+            let _app_guard = crate::session::test_support::isolate_app_dir();
             let tmp = tempfile::TempDir::new().unwrap();
             let user_checkout = tmp.path().join("backend");
             init_repo(&user_checkout);
@@ -2401,6 +2409,7 @@ mod tests {
         /// tangled would either strand worktrees or delete someone's branch.
         #[test]
         fn e2e_workspace_repo_keeps_a_branch_aoe_did_not_create() {
+            let _app_guard = crate::session::test_support::isolate_app_dir();
             let tmp = tempfile::TempDir::new().unwrap();
             let workspace = tmp.path().join("ws");
             let main_repo = tmp.path().join("frontend");
@@ -2469,6 +2478,7 @@ mod tests {
         // `perform_deletion` over an already-torn-down worktree still succeeds.
         #[test]
         fn perform_deletion_is_idempotent_on_worktree() {
+            let _app_guard = crate::session::test_support::isolate_app_dir();
             let tmp = tempfile::TempDir::new().unwrap();
             let main_repo = tmp.path().join("main");
             let worktree_path = tmp.path().join("worktree");
@@ -2538,6 +2548,7 @@ mod tests {
         /// and the worktree + branch survive intact.
         #[test]
         fn e2e_preserved_worktree_keeps_its_branch() {
+            let _app_guard = crate::session::test_support::isolate_app_dir();
             let tmp = tempfile::TempDir::new().unwrap();
             let main_repo = tmp.path().join("main");
             let worktree_path = tmp.path().join("worktree");
@@ -2638,6 +2649,7 @@ mod tests {
         /// delete" after a normal delete failed.
         #[test]
         fn e2e_real_worktree_with_untracked_files_force_removed() {
+            let _app_guard = crate::session::test_support::isolate_app_dir();
             let tmp = tempfile::TempDir::new().unwrap();
             let main_repo = tmp.path().join("main");
             let worktree_path = tmp.path().join("worktree");
@@ -2797,6 +2809,7 @@ mod tests {
         /// describe what's dirty so the user can choose to force.
         #[test]
         fn sandboxed_with_dirty_worktree_skips_preclean_and_preserves_changes() {
+            let _app_guard = crate::session::test_support::isolate_app_dir();
             let (_tmp, main_repo, worktree_path, instance) =
                 build_sandboxed_worktree("feature/dirty-no-force");
 
@@ -2868,6 +2881,7 @@ mod tests {
         /// untracked file.
         #[test]
         fn sandboxed_with_dirty_worktree_force_runs_preclean_and_removes() {
+            let _app_guard = crate::session::test_support::isolate_app_dir();
             let (_tmp, main_repo, worktree_path, instance) =
                 build_sandboxed_worktree("feature/dirty-force");
 
@@ -2910,6 +2924,7 @@ mod tests {
         /// tmux still gets killed before worktree work.
         #[test]
         fn unsandboxed_kills_tmux_before_worktree() {
+            let _app_guard = crate::session::test_support::isolate_app_dir();
             let instance = Instance::new("Test", "/tmp/aoe-deletion-test-nonexistent");
             let request = DeletionRequest {
                 session_id: instance.id.clone(),
@@ -2945,6 +2960,7 @@ mod tests {
         /// refusal that never converges (#3215).
         #[test]
         fn e2e_workspace_dir_with_stray_file_is_kept_not_failed() {
+            let _app_guard = crate::session::test_support::isolate_app_dir();
             let tmp = tempfile::TempDir::new().unwrap();
             let workspace = tmp.path().join("ws");
             let main_repo = tmp.path().join("frontend");

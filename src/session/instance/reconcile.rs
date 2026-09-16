@@ -11,27 +11,29 @@ impl Instance {
     /// `set-session-id` would otherwise be silently overwritten. No-op on
     /// storage error or if the row is gone from disk.
     pub(super) fn reconcile_from_disk(&mut self) {
-        let Ok(storage) = crate::session::storage::Storage::new(
-            &self.effective_profile(),
-            self.resolve_file_watch(),
-        ) else {
+        if let Err(error) = self.try_reconcile_from_disk() {
             tracing::warn!(target: "session.store",
                 session = %self.id,
-                "failed to open storage to reload disk state before launch; using in-memory value");
-            return;
-        };
-        let mut disk = match storage.load() {
-            Ok(instances) => match instances.into_iter().find(|i| i.id == self.id) {
-                Some(d) => d,
-                None => return,
-            },
-            Err(e) => {
-                tracing::warn!(target: "session.store",
-                    session = %self.id,
-                    error = %e,
-                    "failed to load disk state before launch; using in-memory value");
-                return;
-            }
+                error = %format_args!("{error:#}"),
+                "failed to reload disk state before launch; using in-memory value");
+        }
+    }
+
+    /// [`Self::reconcile_from_disk`] that reports a storage failure. `Ok(false)`
+    /// means the row is gone from disk and `self` is unchanged.
+    pub(super) fn try_reconcile_from_disk(&mut self) -> Result<bool> {
+        let storage = crate::session::storage::Storage::new(
+            &self.effective_profile(),
+            self.resolve_file_watch(),
+        )
+        .context("failed to open storage")?;
+        let Some(mut disk) = storage
+            .load()
+            .context("failed to load sessions")?
+            .into_iter()
+            .find(|i| i.id == self.id)
+        else {
+            return Ok(false);
         };
 
         // Carry runtime-only fields (`#[serde(skip)]`) and locally-mutated
@@ -72,6 +74,7 @@ impl Instance {
         }
 
         *self = disk;
+        Ok(true)
     }
 
     /// Closes the data-loss window where `/clear` writes the sidecar but
@@ -136,9 +139,7 @@ mod tests {
     #[serial]
     fn reconcile_from_disk_picks_up_peer_persist() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let storage = crate::session::storage::Storage::new_unwatched("reconcile-test").unwrap();
         let mut inst = Instance::new("title", "/tmp/x");
@@ -202,9 +203,7 @@ mod tests {
     #[serial]
     fn reconcile_from_disk_preserves_publisher_launch_proof() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
         let storage =
             crate::session::storage::Storage::new_unwatched("reconcile-publisher").unwrap();
         let mut inst = Instance::new("publisher proof", "/tmp/test");
@@ -234,9 +233,7 @@ mod tests {
         // the live host-minted cache forward, or an already-running
         // container would re-mint on every relaunch.
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let storage =
             crate::session::storage::Storage::new_unwatched("reconcile-before-start").unwrap();
@@ -287,9 +284,7 @@ mod tests {
         // tolerance window and drop back to the short never-present one
         // on every relaunch.
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let storage =
             crate::session::storage::Storage::new_unwatched("reconcile-unknown-since").unwrap();
@@ -329,9 +324,7 @@ mod tests {
     #[serial]
     fn reconcile_from_disk_picks_up_peer_clear() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let storage = crate::session::storage::Storage::new_unwatched("reconcile-clear").unwrap();
         let mut inst = Instance::new("title", "/tmp/x");
@@ -363,9 +356,7 @@ mod tests {
     #[serial]
     fn reconcile_from_disk_picks_up_peer_resume_intent() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let storage = crate::session::storage::Storage::new_unwatched("intent-reconcile").unwrap();
         let mut inst = Instance::new("title", "/tmp/x");
@@ -401,9 +392,7 @@ mod tests {
     #[serial]
     fn reconcile_sidecar_adopts_fresh_sid_for_claude_default() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let profile = "sidecar-adopt";
         let mut inst = Instance::new("title", "/tmp/x");
@@ -439,9 +428,7 @@ mod tests {
     #[serial]
     fn reconcile_sidecar_adopts_published_cursor_conversation() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let profile = "cursor-sidecar-adopt";
         let mut inst = Instance::new("title", "/tmp/x");
@@ -472,9 +459,7 @@ mod tests {
     #[serial]
     fn reconcile_sidecar_noop_without_identity_sidecar_backend() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let profile = "sidecar-noop-tool";
         let mut inst = Instance::new("title", "/tmp/x");
@@ -504,9 +489,7 @@ mod tests {
     #[serial]
     fn reconcile_sidecar_noop_when_intent_use() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let profile = "sidecar-noop-use";
         let mut inst = Instance::new("title", "/tmp/x");
@@ -536,9 +519,7 @@ mod tests {
     #[serial]
     fn reconcile_sidecar_noop_when_intent_cleared() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let profile = "sidecar-noop-cleared";
         let mut inst = Instance::new("title", "/tmp/x");
@@ -568,9 +549,7 @@ mod tests {
     #[serial]
     fn reconcile_sidecar_noop_when_sid_in_retroactive_excludes() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let profile = "sidecar-noop-excluded";
         let mut inst = Instance::new("title", "/tmp/x");
@@ -602,9 +581,7 @@ mod tests {
     #[serial]
     fn reconcile_sidecar_noop_when_sidecar_absent() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let profile = "sidecar-absent";
         let mut inst = Instance::new("title", "/tmp/x");
@@ -631,9 +608,7 @@ mod tests {
     #[serial]
     fn reconcile_sidecar_reloads_on_cas_skip() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
         let profile = "sidecar-cas-skip";
         let mut inst = Instance::new("title", "/tmp/x");

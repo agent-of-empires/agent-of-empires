@@ -22,11 +22,9 @@ test.describe("Desktop live terminal input", () => {
     await expect(page.locator('textarea[aria-label="Live terminal input"]').first()).toBeFocused();
 
     // Typing now produces input bytes on the live WS (binary frames).
-    const before = handle.liveMessages.filter((m) => m instanceof Buffer && m.length > 0).length;
+    const before = handle.liveInput.length;
     await page.keyboard.type("ls");
-    await expect
-      .poll(() => handle.liveMessages.filter((m) => m instanceof Buffer && m.length > 0).length)
-      .toBeGreaterThan(before);
+    await expect.poll(() => Buffer.concat(handle.liveInput.slice(before)).toString()).toBe("ls");
   });
 
   test("the focused pane is marked selected, like the TUI's active border", async ({ page }) => {
@@ -146,7 +144,7 @@ test.describe("Desktop live terminal input", () => {
     await clickSidebarSession(page, "pinch-test");
     const scroller = page.locator("[data-live-terminal] > div").first();
     await scroller.waitFor({ state: "visible", timeout: 10_000 });
-    handle.pushLiveFrame({
+    await handle.pushLiveFrame({
       content: "OpenCode selection\n",
       rows: 24,
       history: 0,
@@ -207,6 +205,7 @@ test.describe("Desktop live terminal input", () => {
     await page.goto("/");
     await clickSidebarSession(page, "pinch-test");
     await page.locator("[data-live-terminal]").first().waitFor({ state: "visible", timeout: 10_000 });
+    await handle.waitForLiveReady();
     await expect.poll(() => page.locator("[data-live-content]").innerText()).toContain("$ ready");
 
     const scroller = page.locator("[data-live-terminal] > div").first();
@@ -216,7 +215,7 @@ test.describe("Desktop live terminal input", () => {
     });
     await expect.poll(() => scroller.evaluate((el) => el.scrollHeight), { timeout: 3_000 }).toBeGreaterThan(8000);
 
-    await page.waitForTimeout(300);
+    await expect(page.locator("[data-live-content]")).toContainText("history line");
     await page.evaluate(() => {
       const state = window as typeof window & {
         __BOTTOM_TRANSITION_SAMPLES__?: Array<{

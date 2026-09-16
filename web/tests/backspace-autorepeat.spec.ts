@@ -1,4 +1,4 @@
-import { test, expect } from "./helpers/mockedTest";
+import { test, expect, observeFor } from "./helpers/mockedTest";
 import { devices, type Page } from "@playwright/test";
 import { mockTerminalApis, type MockHandle } from "./helpers/terminal-mocks";
 import { clickSidebarSession, openMobileSidebar } from "./helpers/sidebar";
@@ -82,24 +82,28 @@ test.describe("Mobile soft-keyboard Backspace autorepeat", () => {
     const start = handle.liveMessages.length;
     await fireDeleteBackward(page, 1);
 
-    // Regression guard: if preventDefault failed to suppress xterm's own
-    // decode, a single tap would emit two DELs. Settle, then assert exactly 1.
+    // A single native edit must not be forwarded twice.
     await expect.poll(() => delCount(handle, start), { timeout: 5_000 }).toBe(1);
-    await page.waitForTimeout(200);
-    expect(delCount(handle, start)).toBe(1);
+    await observeFor(page, 200, async () => {
+      expect(delCount(handle, start)).toBe(1);
+    });
   });
 
-  test("Backspace during IME composition is left to xterm", async ({ page }) => {
+  test("Backspace during IME composition is not forwarded", async ({ page }) => {
     const handle = await mockTerminalApis(page);
     await openSession(page, handle);
 
     const start = handle.liveMessages.length;
     await fireDeleteBackward(page, 3, true);
+    // A subsequent real input byte crosses the same ordered socket, proving
+    // delivery of anything the composing events could have published.
+    await page.locator('textarea[aria-label="Live terminal input"]').press("ArrowRight");
+    await expect.poll(() => handle.liveInput.map((input) => input.toString())).toContain("\x1b[C");
 
-    // isComposing ticks belong to xterm's composition path; our handler must
-    // not inject DELs.
-    await page.waitForTimeout(200);
-    expect(delCount(handle, start)).toBe(0);
+    // The IME owns composing edits; the terminal must not inject DELs.
+    await observeFor(page, 200, async () => {
+      expect(delCount(handle, start)).toBe(0);
+    });
   });
 });
 

@@ -120,6 +120,21 @@ struct SessionResources {
 }
 
 impl AcpClient {
+    #[cfg(test)]
+    pub(crate) async fn test_flush_commands(&self) {
+        let (done, flushed) = oneshot::channel();
+        self.cmd_tx
+            .as_ref()
+            .expect("command recorder")
+            .send(ClientCmd::FlushForTest(done))
+            .await
+            .expect("recorder running");
+        tokio::time::timeout(std::time::Duration::from_secs(5), flushed)
+            .await
+            .expect("recorder drain")
+            .expect("recorder acknowledgement");
+    }
+
     /// Pid of the runner this client spawned, if any. Attached and
     /// stdio clients have none; their identity comes from the registry.
     pub fn runner_pid(&self) -> Option<u32> {
@@ -241,6 +256,10 @@ impl AcpClient {
                             new_acp_session_id: "fresh-id".into(),
                         });
                         "reset_session"
+                    }
+                    ClientCmd::FlushForTest(done) => {
+                        let _ = done.send(());
+                        continue;
                     }
                     ClientCmd::Shutdown => "shutdown",
                 };

@@ -20,7 +20,7 @@ use super::{centered_rect, DialogResult};
 use crate::plugin::changelog::{ChangelogEntry, UpdateChangelog};
 use crate::plugin::discover::{DiscoveryBadge, DiscoveryResult};
 use crate::plugin::install::{
-    InstallConsent, LiveToggle, ReapproveConsent, UpdateConsent, UpdatePreview,
+    InstallConsent, LiveRestart, LiveToggle, ReapproveConsent, UpdateConsent, UpdatePreview,
 };
 use crate::plugin::update_check::UpdateStatus;
 use crate::tui::styles::Theme;
@@ -910,10 +910,19 @@ impl PluginManagerDialog {
             let result = async {
                 let log = crate::plugin::install::OperationLog::file(&task_log)
                     .map_err(|e| format!("{e:#}"))?;
-                crate::plugin::install::apply_update(&apply_id, fingerprint, &log)
+                let report = crate::plugin::install::apply_update(&apply_id, fingerprint, &log)
                     .await
-                    .map(|report| format!("Updated {} to {}.", report.id, report.version))
-                    .map_err(|e| format!("{e:#}"))
+                    .map_err(|e| format!("{e:#}"))?;
+                let updated = format!("Updated {} to {}", report.id, report.version);
+                Ok(
+                    match crate::plugin::install::restart_worker_live(&apply_id).await {
+                        LiveRestart::Daemon => format!("{updated}; the daemon reloaded it."),
+                        LiveRestart::NoDaemon => format!("{updated}."),
+                        LiveRestart::DaemonStale { reason } => format!(
+                            "{updated}. Daemon not reloaded ({reason}); restart it to run the new build."
+                        ),
+                    },
+                )
             }
             .await;
             let _ = tx.send(result);

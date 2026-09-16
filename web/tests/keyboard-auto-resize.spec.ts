@@ -1,4 +1,4 @@
-import { test, expect } from "./helpers/mockedTest";
+import { test, expect, observeFor } from "./helpers/mockedTest";
 import { devices, type Page } from "@playwright/test";
 import { clickSidebarSession, openMobileSidebar } from "./helpers/sidebar";
 import { mockTerminalApis, type MockHandle } from "./helpers/terminal-mocks";
@@ -91,7 +91,7 @@ async function openSession(page: Page, handle: MockHandle) {
   await openMobileSidebar(page);
   await clickSidebarSession(page, "pinch-test");
   await page.locator('[data-term="agent"] [data-live-terminal]').waitFor({ state: "visible", timeout: 10_000 });
-  await expect.poll(() => handle.liveMessages.length, { timeout: 5_000 }).toBeGreaterThan(0);
+  await handle.waitForLiveReady();
 }
 
 test.describe("Keyboard auto-resize (#1432)", () => {
@@ -99,7 +99,6 @@ test.describe("Keyboard auto-resize (#1432)", () => {
     const handle = await mockTerminalApis(page);
     await page.goto("/");
     await openSession(page, handle);
-    await page.waitForTimeout(1000);
 
     const baselineCount = extractResizes(handle).length;
     const baselineRows = lastResize(handle)?.rows ?? 0;
@@ -112,26 +111,27 @@ test.describe("Keyboard auto-resize (#1432)", () => {
     // no-keyboard height, so tmux must NOT be resized: the scroller
     // pins to the live content and simply shows fewer rows.
     await setKeyboard(page, { open: true, px: 320, pwa: false });
-    await page.waitForTimeout(800);
+    await expect.poll(() => paneHeight(page)).toBeLessThan(paneHeightBefore);
 
     expect(await paneHeight(page), "pane should shrink under the keyboard inset").toBeLessThan(paneHeightBefore);
-    expect(extractResizes(handle).length, "keyboard open must not emit a tmux resize (rows are latched)").toBe(
-      baselineCount,
-    );
+    await observeFor(page, 800, async () => {
+      expect(extractResizes(handle).length, "keyboard open must not resize tmux").toBe(baselineCount);
+    });
 
     // Close: inset releases, still no tmux resize.
     await setKeyboard(page, { open: false, pwa: false });
-    await page.waitForTimeout(800);
+    await expect.poll(() => paneHeight(page)).toBeGreaterThanOrEqual(paneHeightBefore - 2);
 
     expect(await paneHeight(page)).toBeGreaterThanOrEqual(paneHeightBefore - 2);
-    expect(extractResizes(handle).length, "keyboard close must not emit a tmux resize").toBe(baselineCount);
+    await observeFor(page, 800, async () => {
+      expect(extractResizes(handle).length, "keyboard close must not resize tmux").toBe(baselineCount);
+    });
   });
 
   test("Safari mode: opening the keyboard returns a scrollback reader to the visible prompt", async ({ page }) => {
     const handle = await mockTerminalApis(page);
     await page.goto("/");
     await openSession(page, handle);
-    await page.waitForTimeout(1000);
 
     // Leave the live edge first. Keyboard-open is an explicit intent to type,
     // so it must return to the prompt rather than retain this reading position.
@@ -149,7 +149,7 @@ test.describe("Keyboard auto-resize (#1432)", () => {
     // screen row, blank rows below. With rows latched, the live target must
     // anchor that prompt near the keyboard rather than the literal tail.
     await setKeyboard(page, { open: true, px: 320, pwa: false });
-    await page.waitForTimeout(800);
+    await expect(page.getByRole("button", { name: "Back to live" })).toHaveCount(0);
 
     const m = await page.evaluate(() => {
       const el = document.querySelector<HTMLElement>("[data-live-terminal] > div");
@@ -167,7 +167,6 @@ test.describe("Keyboard auto-resize (#1432)", () => {
     const handle = await mockTerminalApis(page);
     await page.goto("/");
     await openSession(page, handle);
-    await page.waitForTimeout(1000);
 
     const baselineCount = extractResizes(handle).length;
 
@@ -178,7 +177,12 @@ test.describe("Keyboard auto-resize (#1432)", () => {
     // here (it tracks the real viewport, not the patched innerHeight);
     // what is testable is that the legacy machinery stays quiet.
     await setKeyboard(page, { open: true, px: 320, pwa: true });
-    await page.waitForTimeout(800);
+    await observeFor(page, 800, async () => {
+      expect(extractResizes(handle).length).toBe(baselineCount);
+      expect(await page.locator('[data-term="agent"]').evaluate((el) => (el as HTMLElement).style.paddingBottom)).toBe(
+        "",
+      );
+    });
 
     const padding = await page.evaluate(() => {
       const pane = document.querySelector<HTMLElement>('[data-term="agent"]');
@@ -192,7 +196,6 @@ test.describe("Keyboard auto-resize (#1432)", () => {
     const handle = await mockTerminalApis(page);
     await page.goto("/");
     await openSession(page, handle);
-    await page.waitForTimeout(1000);
 
     const rootInlineHeight = await page.evaluate(() => {
       const root = document.querySelector<HTMLElement>("div.h-dvh.flex.flex-col");
@@ -220,7 +223,6 @@ test.describe("Keyboard auto-resize (#1432)", () => {
     });
     await page.goto("/");
     await openSession(page, handle);
-    await page.waitForTimeout(1000);
 
     const rootPaddingBottom = await page.evaluate(() => {
       const panel = document.querySelector('[data-term="agent"]');

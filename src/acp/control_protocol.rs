@@ -258,7 +258,27 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, body: &ControlBody) -
 /// disconnect rather than an error.
 pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<ControlBody>> {
     let mut len_buf = [0u8; 4];
-    match r.read_exact(&mut len_buf).await {
+    #[cfg(feature = "test-support")]
+    let length_read = async {
+        let mut consumed = 0;
+        while consumed < len_buf.len() {
+            let n = r.read(&mut len_buf[consumed..]).await?;
+            if n == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+            }
+            consumed += n;
+            if consumed < len_buf.len() {
+                if let Some(path) = std::env::var_os("AOE_E2E_PARTIAL_FRAME_FILE") {
+                    std::fs::write(path, consumed.to_string())?;
+                }
+            }
+        }
+        Ok(consumed)
+    }
+    .await;
+    #[cfg(not(feature = "test-support"))]
+    let length_read = r.read_exact(&mut len_buf).await;
+    match length_read {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e.into()),

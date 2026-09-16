@@ -11,28 +11,20 @@
 // the `aoe acp prompt` path, which had no client-side queue to fall back
 // on and so just failed before this.
 
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, expect } from "@playwright/test";
 import { spawnAoeServe, listSessions, seedSessionViaAoeAdd } from "../helpers/aoeServe";
 import { enableStructuredViewAndWait, waitForReplayContains } from "../helpers/acp";
 
-// One turn that stays open long enough for a second prompt to land
-// inside it. `wait_ms` is the fake agent's hold primitive; it sleeps in
-// slices so a cancel is still observed promptly.
-//
-// The hold also has to outlast the assertions made inside the turn, not
-// just the prompt that lands in it: the queued spec reads `/queue` back
-// while the turn is still running, and a turn that ends first drains the
-// queue to empty. Neither spec waits for the turn to end, so a generous
-// hold costs no wall time; 4s lost that race on a loaded runner.
+// Hold the turn until cancellation or explicit test release.
 const HELD_TURN_SCRIPT = {
   turns: [
     {
       updates: [
         { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "working" } },
-        { sessionUpdate: "wait_ms", ms: 30_000 },
+        { sessionUpdate: "wait_for_release" },
       ],
       stopReason: "end_turn",
     },
@@ -80,7 +72,7 @@ test("a mid-turn prompt is steered into the running turn instead of rejected", a
     await postPrompt(serve.baseUrl, sessionId, "start the turn");
     await waitForReplayContains(serve.baseUrl, sessionId, "working");
 
-    // Lands while the turn is held open by `wait_ms`.
+    // Lands while the turn is held open by the release gate.
     const second = await postPrompt(serve.baseUrl, sessionId, "also check the tests");
     expect(second.ok).toBe(true);
 
@@ -93,6 +85,7 @@ test("a mid-turn prompt is steered into the running turn instead of rejected", a
     expect(json).not.toContain("agent_busy");
   } finally {
     await serve.stop();
+    rmSync(scriptDir, { recursive: true, force: true });
   }
 });
 
@@ -140,5 +133,6 @@ test("a mid-turn prompt is queued, not rejected, when the agent cannot be steere
     expect(await replayJson(serve.baseUrl, sessionId)).not.toContain("agent_busy");
   } finally {
     await serve.stop();
+    rmSync(scriptDir, { recursive: true, force: true });
   }
 });

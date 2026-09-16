@@ -44,7 +44,7 @@ import {
   Trash2,
 } from "lucide-react";
 
-import { ensureThemeLoaded, getHighlighter, langKeyForExt, loadLanguage } from "../../lib/highlighter";
+import { highlightSnippet } from "../../lib/snippetHighlighter";
 import { useShikiTheme } from "../../hooks/useShikiTheme";
 import { hasAnsi, parseAnsi, type AnsiStyle } from "../../lib/ansi";
 import { parseJsonObject, pickFirst, pickStr, todoItemsFromArgs } from "../../lib/acpArgs";
@@ -675,16 +675,13 @@ function HighlightedBlock({ text, language, maxLines = 20 }: { text: string; lan
     if (!effectiveLang) return;
     (async () => {
       try {
-        const langKey = langKeyForExt(effectiveLang) ?? effectiveLang;
-        await loadLanguage(langKey);
-        const resolvedTheme = await ensureThemeLoaded(shiki.theme, shiki.appearance);
-        const hl = await getHighlighter();
-        if (cancelled) return;
-        const out = hl.codeToHtml(shown, {
-          lang: langKey,
-          theme: resolvedTheme,
+        const out = await highlightSnippet(shown, {
+          langHint: effectiveLang,
+          theme: shiki.theme,
+          appearance: shiki.appearance,
         });
-        setHtml(out);
+        if (cancelled) return;
+        if (out) setHtml(out);
       } catch {
         // unknown language; fall back to plain
       }

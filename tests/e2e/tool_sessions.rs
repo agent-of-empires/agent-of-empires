@@ -315,9 +315,10 @@ hotkey = "Alt+t"
     // return errors when invoked from inside the harness's existing
     // tmux session ("sessions should be nested with care"), but that
     // error is swallowed and the tool tmux session itself is created.
-    // After the failed attach, the TUI redraws and the preview cache
-    // picks up the tool's stdout on its next 250ms refresh.
-    h.send_keys("Enter");
+    // Observe the recreated outer EventStream before sending its render fence.
+    let resume = h.terminal_resume_sequence();
+    h.send_keys_unfenced("Enter");
+    h.wait_for_terminal_resume(resume);
 
     // Wait for the preview cache to pick up the tool's output. The cache
     // refreshes only when the TUI redraws (every 120ms when there's an

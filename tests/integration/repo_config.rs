@@ -25,6 +25,7 @@ fn setup_legacy_repo_config(content: &str) -> TempDir {
 }
 
 #[test]
+#[serial_test::parallel]
 fn test_load_repo_config_from_temp_dir() {
     let tmp = setup_repo_config(
         r#"
@@ -49,6 +50,7 @@ default_tool = "claude"
 }
 
 #[test]
+#[serial_test::parallel]
 fn test_load_repo_config_empty_file() {
     let tmp = setup_repo_config("");
     let config =
@@ -57,6 +59,7 @@ fn test_load_repo_config_empty_file() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn test_load_repo_config_comments_only() {
     let tmp = setup_repo_config(agent_of_empires::session::config::repo_config::INIT_TEMPLATE);
     let config = agent_of_empires::session::config::repo_config::load_repo_config(tmp.path())
@@ -72,7 +75,7 @@ fn test_load_repo_config_comments_only() {
 #[serial]
 fn test_trust_untrust_cycle() {
     let temp_home = TempDir::new().unwrap();
-    set_temp_home(temp_home.path());
+    let _home = set_temp_home(temp_home.path());
 
     let project_dir = TempDir::new().unwrap();
     let project_path = project_dir.path();
@@ -99,6 +102,7 @@ fn test_trust_untrust_cycle() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn test_hook_execution_simple_echo() {
     let tmp = TempDir::new().unwrap();
     let marker = tmp.path().join("hook_ran");
@@ -110,6 +114,7 @@ fn test_hook_execution_simple_echo() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn test_hook_execution_failure() {
     let tmp = TempDir::new().unwrap();
     let result = agent_of_empires::session::config::repo_config::execute_hooks(
@@ -121,6 +126,7 @@ fn test_hook_execution_failure() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn test_changed_hooks_invalidate_trust() {
     use agent_of_empires::session::config::repo_config::{compute_hooks_hash, HooksConfig};
 
@@ -149,7 +155,7 @@ fn test_hook_trust_invalidated_on_config_change() {
     };
 
     let temp_home = TempDir::new().unwrap();
-    set_temp_home(temp_home.path());
+    let _home = set_temp_home(temp_home.path());
 
     // Create a repo with hooks
     let repo = setup_repo_config(
@@ -203,7 +209,7 @@ fn test_hook_re_trust_after_change() {
     };
 
     let temp_home = TempDir::new().unwrap();
-    set_temp_home(temp_home.path());
+    let _home = set_temp_home(temp_home.path());
 
     let repo = setup_repo_config(
         r#"
@@ -246,22 +252,28 @@ on_create = ["echo v2"]
     );
 }
 
-/// Regression test for #557: repo-level sandbox config (environment,
-/// volume_ignores) must be included in the resolved config, not silently
-/// dropped. `extra_volumes` and `mount_ssh` are the exception since #3154: they
-/// hand repo-chosen code the host filesystem and the user's SSH keys, so they
-/// are global/profile only.
+/// Regression test for #557: repo-level sandbox config (volume_ignores) must be
+/// included in the resolved config, not silently dropped. `extra_volumes` and
+/// `mount_ssh` (#3154) and `environment` (#3710) are global/profile only: they
+/// hand repo-chosen code the host filesystem, SSH keys, or host env vars.
 #[test]
 #[serial]
 fn test_repo_sandbox_config_merged_into_resolved_config() {
     let temp_home = TempDir::new().unwrap();
-    set_temp_home(temp_home.path());
+    let _home = set_temp_home(temp_home.path());
+
+    let profile: agent_of_empires::session::ProfileConfig =
+        serde_json::from_value(serde_json::json!({
+            "sandbox": {"environment": ["GH_TOKEN=$AOE_GH_TOKEN"]}
+        }))
+        .unwrap();
+    agent_of_empires::session::save_profile_config("default", &profile).unwrap();
 
     let repo = setup_repo_config(
         r#"
 [sandbox]
 volume_ignores = [".venv", "node_modules"]
-environment = ["CI=true", "MY_VAR=hello"]
+environment = ["AWS_SECRET_ACCESS_KEY", "CI=$HOME"]
 extra_volumes = ["/data:/data:ro"]
 mount_ssh = true
 "#,
@@ -280,8 +292,8 @@ mount_ssh = true
     );
     assert_eq!(
         config.sandbox.environment,
-        vec!["CI=true", "MY_VAR=hello"],
-        "environment from repo config should be present"
+        vec!["GH_TOKEN=$AOE_GH_TOKEN"],
+        "environment must come from the profile, not the repo (#3710)"
     );
     assert!(
         config.sandbox.extra_volumes.is_empty(),
@@ -293,18 +305,29 @@ mount_ssh = true
     );
 }
 
-/// Regression test for #568: repo-level bare_repo_path_template must be included
-/// in the resolved config, not silently dropped.
+/// #3711: a repo cannot enable worktrees or choose where they are created; the
+/// profile's templates (the #568 layout) still reach the resolved config.
 #[test]
 #[serial]
-fn test_repo_worktree_config_merged_into_resolved_config() {
+fn test_repo_worktree_placement_comes_from_profile() {
     let temp_home = TempDir::new().unwrap();
-    set_temp_home(temp_home.path());
+    let _home = set_temp_home(temp_home.path());
+
+    let profile: agent_of_empires::session::ProfileConfig =
+        serde_json::from_value(serde_json::json!({
+            "worktree": {"bare_repo_path_template": "../{branch}"}
+        }))
+        .unwrap();
+    agent_of_empires::session::save_profile_config("default", &profile).unwrap();
 
     let repo = setup_repo_config(
         r#"
 [worktree]
-bare_repo_path_template = "../{branch}"
+enabled = true
+path_template = "/tmp/{branch}"
+bare_repo_path_template = "../../{branch}"
+workspace_path_template = "/tmp/ws-{branch}"
+auto_cleanup = false
 "#,
     );
 
@@ -313,10 +336,18 @@ bare_repo_path_template = "../{branch}"
         repo.path(),
     )
     .unwrap();
+    let defaults = agent_of_empires::session::config::WorktreeConfig::default();
 
+    assert_eq!(config.worktree.bare_repo_path_template, "../{branch}");
+    assert!(!config.worktree.enabled);
+    assert_eq!(config.worktree.path_template, defaults.path_template);
     assert_eq!(
-        config.worktree.bare_repo_path_template, "../{branch}",
-        "bare_repo_path_template from repo config should override the default"
+        config.worktree.workspace_path_template,
+        defaults.workspace_path_template
+    );
+    assert!(
+        !config.worktree.auto_cleanup,
+        "auto_cleanup stays repo-settable"
     );
 }
 
@@ -340,7 +371,7 @@ fn test_project_path_that_resolves_to_global_config_is_not_a_repo_config() {
     };
 
     let temp_home = TempDir::new().unwrap();
-    set_temp_home(temp_home.path());
+    let _home = set_temp_home(temp_home.path());
 
     let app_dir = agent_of_empires::session::get_app_dir().unwrap();
     let global_config = app_dir.join("config.toml");
@@ -372,6 +403,7 @@ fn test_project_path_that_resolves_to_global_config_is_not_a_repo_config() {
 
 /// Legacy `.aoe/config.toml` should still be loaded via backwards compat fallback.
 #[test]
+#[serial_test::parallel]
 fn test_legacy_aoe_path_still_loads() {
     let repo = setup_legacy_repo_config(
         r#"
@@ -390,6 +422,7 @@ on_create = ["echo legacy"]
 
 /// New `.agent-of-empires/config.toml` takes priority over legacy `.aoe/config.toml`.
 #[test]
+#[serial_test::parallel]
 fn test_new_path_takes_priority_over_legacy() {
     let tmp = TempDir::new().unwrap();
 
@@ -437,11 +470,10 @@ on_create = ["echo legacy"]
 #[serial]
 fn test_empty_project_path_ignores_the_launch_directory() {
     let tmp = setup_repo_config("[session]\ndefault_tool = \"codex\"\n");
-    let original_dir = std::env::current_dir().unwrap();
-    std::env::set_current_dir(tmp.path()).unwrap();
+    let cwd = crate::common::CwdGuard::set(tmp.path());
     let loaded =
         agent_of_empires::session::config::repo_config::load_repo_config(std::path::Path::new(""));
-    std::env::set_current_dir(original_dir).unwrap();
+    drop(cwd);
 
     assert!(
         loaded.unwrap().is_none(),
@@ -461,13 +493,12 @@ fn test_empty_project_path_ignores_the_launch_directory() {
     )
     .unwrap();
 
-    let original_dir = std::env::current_dir().unwrap();
-    std::env::set_current_dir(worktree.path()).unwrap();
+    let cwd = crate::common::CwdGuard::set(worktree.path());
     let source = agent_of_empires::session::config::repo_config::repo_config_source_path(
         std::path::Path::new(""),
     );
     let loaded = agent_of_empires::session::config::repo_config::load_repo_config(&source);
-    std::env::set_current_dir(original_dir).unwrap();
+    drop(cwd);
 
     assert_eq!(
         source,

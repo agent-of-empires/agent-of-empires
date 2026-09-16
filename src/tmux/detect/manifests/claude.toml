@@ -180,6 +180,19 @@ priority = 250
 region = "osc_title"
 regex = ['^\x{2733}']
 
+# A `waiting` write stands until the screen contradicts it. The shared rule
+# lets any unrecognised pane release it, but a question pushed past the recent
+# window by later output is still open (#3441). Claude redraws its input box
+# once a prompt is answered or cancelled, so the box, the interrupt banner or
+# live work clears it, not the menu's absence. Above the static title glyph,
+# which also shows while `AskUserQuestion` blocks.
+[[rules]]
+id = "hook_waiting"
+state = "waiting"
+priority = 300
+region = "hook"
+hook_status = "waiting"
+
 # A footer wrapped mid-phrase by a narrow pane, where the hint is split across
 # lines and no per-line rule can see it. Below `completed_turn`, because this
 # match cannot tell a live footer from a turn that echoed the phrase, and above

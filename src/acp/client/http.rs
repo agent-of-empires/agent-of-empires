@@ -379,6 +379,18 @@ impl HttpClient {
         Ok(())
     }
 
+    /// `POST /api/plugins/{id}/worker/restart`: the daemon reloads plugins from
+    /// disk and replaces this plugin's worker after its tree changed.
+    pub async fn restart_plugin_worker(&self, plugin_id: &str) -> Result<(), HttpError> {
+        let url = format!(
+            "{}/api/plugins/{}/worker/restart",
+            self.endpoint.base_url, plugin_id
+        );
+        let res = self.auth(self.http.post(&url)).send().await?;
+        check_global_status(res).await?;
+        Ok(())
+    }
+
     /// `POST /api/sessions/{id}/acp/cancel`.
     pub async fn cancel(&self, session_id: &str) -> Result<(), HttpError> {
         let url = format!(

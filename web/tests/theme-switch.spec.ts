@@ -7,7 +7,7 @@
 // useResolvedTheme / applyResolvedTheme / the pre-React bootstrap
 // would only surface in manual QA.
 
-import { test, expect } from "@playwright/test";
+import { test, expect, waitForResponseBody, observeFor } from "./helpers/mockedTest";
 
 interface ResolvedThemePayload {
   name: string;
@@ -240,8 +240,7 @@ test.describe("Theme picker runtime palette swap (#1189)", () => {
     // pending, the eventual mount response (Empire) used to win the
     // last-write race. useResolvedTheme now tags each fetch with a
     // monotonic seq and discards responses older than the last
-    // applied one. Stall /api/theme/current for ~1.5s; the picker
-    // event resolves immediately. Final palette must be Dracula.
+    // applied one. Hold the mount until the picker palette is visible.
     const empire: ResolvedThemePayload = {
       name: "empire",
       source: "builtin",
@@ -250,8 +249,14 @@ test.describe("Theme picker runtime palette swap (#1189)", () => {
       terminal: { cssVars: { "--term-bg": "#0f172a" } },
       syntax: { shikiTheme: "github-dark" },
     };
+    let releaseMount!: () => void;
+    const mountGate = new Promise<void>((resolve) => {
+      releaseMount = resolve;
+    });
+    let mountRequested = false;
     await page.route("**/api/theme/current", async (route) => {
-      await new Promise((r) => setTimeout(r, 1500));
+      mountRequested = true;
+      await mountGate;
       await route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -267,6 +272,7 @@ test.describe("Theme picker runtime palette swap (#1189)", () => {
     );
 
     await page.goto("/");
+    await expect.poll(() => mountRequested).toBe(true);
     await page.evaluate(() => {
       window.dispatchEvent(
         new CustomEvent("aoe:theme-picker-changed", {
@@ -276,9 +282,10 @@ test.describe("Theme picker runtime palette swap (#1189)", () => {
     });
 
     await expect.poll(() => readCssVar(page, "--color-surface-900")).toBe("#282a36");
-    // Wait past the stalled mount response so we can assert Dracula
-    // is sticky after both fetches have settled.
-    await page.waitForTimeout(2000);
-    expect(await readCssVar(page, "--color-surface-900")).toBe("#282a36");
+    releaseMount();
+    await waitForResponseBody(page, "/api/theme/current");
+    await observeFor(page, 300, async () => {
+      expect(await readCssVar(page, "--color-surface-900")).toBe("#282a36");
+    });
   });
 });

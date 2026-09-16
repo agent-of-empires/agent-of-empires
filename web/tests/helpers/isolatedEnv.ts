@@ -67,11 +67,16 @@ export const HOST_STATE_VARS = new Set([
   // daemon outright.
   "AOE_CITYHALL_BUNDLE_TOKEN",
   "AOE_CITYHALL_BUNDLE_URL",
-  // `discovery::discover()` prefers these over the local daemon, so every
-  // `aoe` call the harness makes with this env, teardown's `acp stop --all`
-  // included, would hit the developer's own daemon and kill its workers.
+  // Discovery must not prefer a host endpoint over the private daemon.
   "AOE_DAEMON_TOKEN",
   "AOE_DAEMON_URL",
+  // Private fixture files and subprocess controls cannot come from the host.
+  "AOE_E2E_INPUT_BARRIER",
+  "AOE_E2E_PARTIAL_FRAME_FILE",
+  "AOE_E2E_PROMPT_COMPLETED_FILE",
+  "AOE_E2E_STORAGE_LOCK_CONTENDED",
+  "AOE_TUI_TEST_CHILD",
+  "AOE_TUI_TEST_ENTERED",
   "AOE_GITHUB_CLONE_BASE", // redirects plugin clones at a host path or tree
   "AOE_OPEN_URL_TO", // appends every URL the TUI opens to a host file
   "AOE_SERVE_INSTANCE_ID", // identifies a host daemon process as this one
@@ -82,8 +87,11 @@ export const HOST_STATE_VARS = new Set([
   "AOE_UPDATE_BASE_URL",
   // The session the test runner was launched from: `aoe` resolves "the
   // current session" from `TMUX_PANE`, `AOE_INSTANCE_ID` names a host session
-  // directly, and the capture markers `aoe` writes into a pane make the
+  // directly, `AOE_AGENT_PID` and `AOE_AGENT_BIN` name that session's agent
+  // process, and the capture markers `aoe` writes into a pane make the
   // daemon read a host launch as its own.
+  "AOE_AGENT_BIN",
+  "AOE_AGENT_PID",
   "AOE_CAPTURED_SESSION_ID",
   "AOE_INSTANCE_ID",
   "AOE_OMP_CAPTURE_META",

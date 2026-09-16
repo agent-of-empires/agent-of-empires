@@ -98,6 +98,19 @@ impl<Req: Send + 'static, Res: Send + 'static> Worker<Req, Res> {
         self.result_rx.try_recv()
     }
 
+    #[cfg(test)]
+    pub(crate) fn finish_for_test(self) -> thread::Result<()> {
+        let Self {
+            request_tx,
+            result_rx,
+            _handle,
+            ..
+        } = self;
+        drop(request_tx);
+        let result = _handle.join();
+        drop(result_rx);
+        result
+    }
     /// Test-only worker with one pre-seeded result and no handler; requests
     /// are drained and ignored. Lets consumer tests exercise the
     /// result-application path without running real side effects.

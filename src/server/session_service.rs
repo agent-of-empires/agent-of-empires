@@ -198,6 +198,13 @@ pub struct SessionService {
     /// reaches `prompt_locks`. See [`SessionService::watch_submission_claims`].
     #[cfg(test)]
     submission_claims: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<String>>,
+    #[cfg(test)]
+    pub(super) created_instance_gate: std::sync::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
 }
 
 /// Who is asking the session service to act. Constructed only by the
@@ -308,6 +315,8 @@ impl SessionService {
             prompt_locks: RwLock::new(HashMap::new()),
             #[cfg(test)]
             submission_claims: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            created_instance_gate: std::sync::Mutex::new(None),
         }
     }
 
@@ -1939,18 +1948,16 @@ mod tests {
             panic!("same key with a different payload must conflict");
         };
 
-        let notified = tokio::spawn(async move { notify.notified().await });
-        // Let the waiter task register on the notify before the guard fires
-        // notify_waiters (deterministic on the current-thread test runtime).
-        tokio::task::yield_now().await;
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        assert!(futures_util::poll!(&mut notified).is_pending());
         drop(InFlightGuard {
             service: Arc::clone(&service),
             scope: scope.clone(),
         });
         tokio::time::timeout(std::time::Duration::from_secs(1), notified)
             .await
-            .expect("guard drop must wake waiters")
-            .expect("waiter task");
+            .expect("guard drop must wake waiters");
 
         let ClaimOutcome::Claimed = service.try_claim_in_flight(&scope, "hash-a") else {
             panic!("released scope must be claimable again");
@@ -2098,6 +2105,7 @@ mod tests {
     /// holding a queue, so the agent subprocess was never reaped.
     #[tokio::test]
     async fn an_undeliverable_queue_row_is_retired_instead_of_wedging_the_queue() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
         let mut inst = Instance::new("queue", "/tmp/aoe-queue-husk");
         inst.id = "sess-husk".to_string();
         inst.view = crate::session::View::Structured;
@@ -2180,6 +2188,7 @@ mod tests {
     /// the mid-turn session's row survives untouched.
     #[tokio::test]
     async fn a_queued_prompt_is_not_drained_into_a_turn_status_has_not_caught_up_with() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
         use crate::acp::state::Event;
         use crate::acp::supervisor::BroadcastSink;
 
@@ -2306,14 +2315,19 @@ mod tests {
             ResumeReservationOutcome::AlreadyPresent => panic!("expected a fresh reservation"),
         };
 
+        let mut waits = service.acp_supervisor.watch_worker_waits();
         let drain = tokio::spawn({
             let service = Arc::clone(&service);
             async move { service.drain_queued_prompts_once("sess-3621").await }
         });
 
-        // Let the drain reach its parked readiness wait. It cannot return
-        // until the reservation drops, so anything past delivery is enough.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), waits.recv())
+                .await
+                .expect("worker readiness reached")
+                .expect("worker wait observation"),
+            "sess-3621"
+        );
 
         // The 2s budget is far under the 10s `WORKER_READY_TIMEOUT` the
         // pre-fix drain holds the lock for, and far over what the fixed one
@@ -2349,6 +2363,7 @@ mod tests {
     /// already serialized for this reason; `edit` and `clear` were not.
     #[tokio::test]
     async fn queue_mutations_wait_for_an_in_flight_delivery() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
         use std::time::Duration;
 
         let mut inst = Instance::new("queue-mut", "/tmp/aoe-queue-mutations");
@@ -2372,43 +2387,55 @@ mod tests {
 
         // Stand in for a drain holding the session across snapshot -> send.
         let delivering = service.prompt_submission("sess-mut").await;
-        let edit = tokio::spawn({
+        let mut claims = service.watch_submission_claims();
+        let edit = {
             let service = Arc::clone(&service);
             async move {
                 service
                     .edit_queued_prompt("sess-mut", "q1".into(), "edited".into())
                     .await
             }
-        });
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+        tokio::pin!(edit);
         assert!(
-            !edit.is_finished(),
+            futures_util::poll!(&mut edit).is_pending(),
             "an edit must not rewrite a row a delivery has already snapshotted"
+        );
+        assert_eq!(
+            claims
+                .try_recv()
+                .expect("contender reached submission claim"),
+            "sess-mut"
         );
         drop(delivering);
         assert!(matches!(
             tokio::time::timeout(Duration::from_secs(10), edit)
                 .await
-                .expect("the edit lands once the delivery releases the session")
-                .expect("edit task must not panic"),
+                .expect("the edit lands once the delivery releases the session"),
             EditQueuedOutcome::Updated
         ));
 
         let delivering = service.prompt_submission("sess-mut").await;
-        let clear = tokio::spawn({
+        assert_eq!(claims.try_recv().expect("holder claim"), "sess-mut");
+        let clear = {
             let service = Arc::clone(&service);
             async move { service.clear_queued_prompts("sess-mut").await }
-        });
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+        tokio::pin!(clear);
         assert!(
-            !clear.is_finished(),
+            futures_util::poll!(&mut clear).is_pending(),
             "a clear must not empty the queue out from under a delivery"
+        );
+        assert_eq!(
+            claims
+                .try_recv()
+                .expect("contender reached submission claim"),
+            "sess-mut"
         );
         drop(delivering);
         tokio::time::timeout(Duration::from_secs(10), clear)
             .await
-            .expect("the clear lands once the delivery releases the session")
-            .expect("clear task must not panic");
+            .expect("the clear lands once the delivery releases the session");
         assert!(service.queued_prompts_snapshot("sess-mut").await.is_empty());
     }
 
@@ -2673,6 +2700,7 @@ mod tests {
 
     #[tokio::test]
     async fn queue_store_enqueue_edit_remove_clear() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
         let mut inst = Instance::new("queue", "/tmp/aoe-queue-project");
         inst.id = "sess-q".to_string();
         inst.view = crate::session::View::Structured;
@@ -2787,6 +2815,7 @@ mod tests {
 
     #[tokio::test]
     async fn wake_dormant_for_queue_drain_clears_only_when_dormant() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
         // A session the idle reaper auto-stopped: dormant, so the resume pass
         // skips it. Wake-on-drain must clear the marker so the queue can drain.
         let mut dormant = Instance::new("queue", "/tmp/aoe-queue-dormant");

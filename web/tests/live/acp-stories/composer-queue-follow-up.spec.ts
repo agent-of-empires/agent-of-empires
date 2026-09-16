@@ -22,16 +22,8 @@ const QUEUE_SCRIPT = {
           sessionUpdate: "agent_message_chunk",
           content: { type: "text", text: "First turn response." },
         },
-        // Long enough that the queued follow-up always lands before
-        // turn 1 ends on slow CI runners, but well under any 10s
-        // idle/watchdog window in the structured view supervisor (see
-        // `RESUME_IDLE_GRACE_DEFAULT` in src/acp/acp_client/connection.rs).
-        // Earlier rounds bounced between 600ms (raced on slow CI) and
-        // 10s (hit the idle watchdog and the worker was torn down
-        // before turn 2 could fire). 4s gives the spec ~3.5s of slack
-        // to fill+click after observing the first chunk while keeping
-        // the total turn well clear of any supervisor watchdog.
-        { sessionUpdate: "wait_ms", ms: 4_000 },
+        // The test releases this turn after its competing action.
+        { sessionUpdate: "wait_for_release" },
       ],
       stopReason: "end_turn",
     },
@@ -102,8 +94,8 @@ base("queued follow-up fires when first turn ends", async ({ page }, testInfo) =
     await composer.fill("second please");
     await queueBtn.click();
 
-    // Turn 1 wait_ms elapses → end_turn → drain effect fires the
-    // queued prompt → turn 2 starts and emits its distinct text.
+    await expect(page.getByText(/Queued \(1\)/i)).toBeVisible();
+    writeFileSync(`${scriptPath}.release`, "release");
     await expect(page.getByText("Second turn response.")).toBeVisible({
       timeout: 15_000,
     });

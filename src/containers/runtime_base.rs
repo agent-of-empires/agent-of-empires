@@ -469,6 +469,14 @@ impl RuntimeBase {
                     config.shared_credential_label()
                 ));
             }
+            if !config.agent_tool.is_empty() {
+                args.push("--label".to_string());
+                args.push(format!(
+                    "{}={}",
+                    crate::containers::container_interface::AGENT_TOOL_LABEL,
+                    config.agent_tool
+                ));
+            }
         }
 
         for vol in &config.volumes {
@@ -1813,12 +1821,14 @@ mod tests {
         let config = ContainerConfig::default();
         let shared = ContainerConfig {
             shared_credential_mounts: vec!["/root/.claude/.credentials.json".to_string()],
+            agent_tool: "claude".to_string(),
             ..Default::default()
         };
         let credential_label = [
             "--label",
             "com.agent-of-empires.shared-credential-mounts=/root/.claude/.credentials.json",
         ];
+        let tool_label = ["--label", "com.agent-of-empires.agent-tool=claude"];
         for base in [
             RuntimeBase::DOCKER,
             RuntimeBase::PODMAN,
@@ -1829,8 +1839,12 @@ mod tests {
                 pair == ["--label", "com.agent-of-empires.sandbox-store-generation=2"]
             }));
             assert!(!args.windows(2).any(|pair| pair == credential_label));
+            assert!(!args
+                .iter()
+                .any(|arg| arg.starts_with("com.agent-of-empires.agent-tool")));
             let args = base.build_create_args("c", "image", &shared);
             assert!(args.windows(2).any(|pair| pair == credential_label));
+            assert!(args.windows(2).any(|pair| pair == tool_label));
         }
     }
 

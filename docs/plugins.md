@@ -73,6 +73,11 @@ the default branch behind the same confirmation. The recorded source stays
 ref-less, so `aoe plugin update` keeps tracking the latest release; an `@ref`
 install keeps following that ref.
 
+Every plugin update, including the opt-in auto-update, restarts the plugin's
+worker in a running `aoe serve` daemon. If the CLI or TUI cannot reach that
+daemon it warns, and the worker keeps the previous build until the daemon
+restarts.
+
 A plugin lands under `<app_dir>/plugins/<id>/`. A GitHub source is cloned and
 pinned to the exact commit; if the plugin ships a compiled worker as a release
 binary, the asset for your platform is downloaded into the plugin directory. To

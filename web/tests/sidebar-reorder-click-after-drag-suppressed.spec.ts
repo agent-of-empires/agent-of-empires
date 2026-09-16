@@ -7,7 +7,7 @@
 // URL does NOT change to /session/s-a (alpha's id) even though the
 // click would have landed there.
 
-import { test, expect } from "./helpers/mockedTest";
+import { test, expect, observeFor } from "./helpers/mockedTest";
 import { installSidebarMocks, threeSessionsInOneRepo } from "./helpers/sidebarMocks";
 
 test("click-after-drag suppression keeps the URL on the source row", async ({ page }) => {
@@ -39,6 +39,8 @@ test("click-after-drag suppression keeps the URL on the source row", async ({ pa
   // try to activate alpha (the row under the cursor); the suppressor
   // swallows it so the URL stays on /.
   await expect.poll(() => handle.puts.length, { timeout: 3_000 }).toBe(1);
-  await page.waitForTimeout(400);
+  await observeFor(page, 400, async () => {
+    expect(new URL(page.url()).pathname).toBe("/");
+  });
   expect(new URL(page.url()).pathname).toBe("/");
 });

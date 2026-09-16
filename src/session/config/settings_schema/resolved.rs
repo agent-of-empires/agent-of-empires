@@ -246,6 +246,7 @@ mod tests {
 
     #[test]
     fn core_field_falls_back_to_schema_default() {
+        let _app = crate::session::test_support::isolate_app_dir();
         // With no user override and no plugin setting_defaults, a core field
         // resolves to its schema default.
         let r = resolve("acp.default_agent").expect("known core key");

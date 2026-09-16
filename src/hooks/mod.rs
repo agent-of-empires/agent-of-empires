@@ -436,6 +436,8 @@ fn hook_command_session_id_sandbox(base: &str, field: crate::agents::HookIdentit
     };
     // jq performs structural top-level extraction like the host path. The
     // POSIX guards then enforce the shared shell-safe session-id contract.
+    // As on the host, a second `AOE_AGENT_BIN` ancestor marks a nested agent;
+    // the container has no launch pid, so the walk runs to its root.
     format!(
         "sh -c 'unset IFS; set -f; umask 077; \
          [ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
@@ -444,6 +446,13 @@ fn hook_command_session_id_sandbox(base: &str, field: crate::agents::HookIdentit
          LS=$(LC_ALL=C ls -ldn \"$D\" 2>/dev/null) || exit 0; \
          set -- $LS; M=\"$1\"; \
          case \"$M\" in drwx------|drwx------.|drwx------+|drwx------@) ;; *) exit 0 ;; esac; \
+         B=\"${{AOE_AGENT_BIN:-}}\"; N=0; P=$PPID; \
+         while [ -n \"$B\" ] && [ \"${{P:-0}}\" -gt 0 ]; do \
+         A=$(tr \"\\0\" \"\\n\" < /proc/$P/cmdline 2>/dev/null | head -n 1); \
+         [ \"${{A##*/}}\" = \"$B\" ] && N=$((N + 1)); \
+         P=$(sed -n \"s/^PPid:[[:space:]]*//p\" /proc/$P/status 2>/dev/null); \
+         done; \
+         [ \"$N\" -le 1 ] || exit 0; \
          command -v jq >/dev/null 2>&1 || exit 0; \
          SID=$(jq -r '\\''{selector}'\\'' 2>/dev/null); \
          case \"$SID\" in \"\"|-*|*[!0-9a-zA-Z._-]*) exit 0 ;; esac; \
@@ -3059,7 +3068,7 @@ mod tests {
     fn test_codex_config_path_for_host_environment_ignores_empty_codex_home() {
         let tmp = TempDir::new().unwrap();
         let _guard = EnvGuard::unset(&["CODEX_HOME"]);
-        std::env::set_var("HOME", tmp.path());
+        let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
 
         // An empty `CODEX_HOME=` must not resolve to a bare relative
         // `config.toml`; it should fall back to the home-relative default.
@@ -3083,7 +3092,7 @@ mod tests {
         // An empty `CODEX_HOME` in AoE's own process env must fall back to the
         // home-relative default rather than a bare relative `config.toml`.
         let _guard = EnvGuard::set(&[("CODEX_HOME", Path::new(""))]);
-        std::env::set_var("HOME", tmp.path());
+        let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
 
         let path = codex_config_path().unwrap();
         assert_eq!(path, tmp.path().join(".codex").join("config.toml"));
@@ -3098,9 +3107,7 @@ mod tests {
     fn test_iter_hook_targets_includes_profile_codex_home() {
         let tmp = TempDir::new().unwrap();
         let _guard = EnvGuard::unset(&["CODEX_HOME"]);
-        std::env::set_var("HOME", tmp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
 
         let codex_home = tmp.path().join("profile-codex-home");
         let profile_dir = crate::session::get_profile_dir("codex-profile").unwrap();
@@ -3423,10 +3430,13 @@ trust_level = "trusted"
 
         disable_gemini_folder_trust(&settings_path).unwrap();
         let first = std::fs::read_to_string(&settings_path).unwrap();
-        let mtime = std::fs::metadata(&settings_path)
-            .unwrap()
-            .modified()
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&settings_path)
             .unwrap();
+        file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000))
+            .unwrap();
+        let mtime = file.metadata().unwrap().modified().unwrap();
 
         disable_gemini_folder_trust(&settings_path).unwrap();
         let second = std::fs::read_to_string(&settings_path).unwrap();
@@ -3511,7 +3521,13 @@ trust_level = "trusted"
         )
         .unwrap();
         let first = std::fs::read_to_string(&config_path).unwrap();
-        let mtime = std::fs::metadata(&config_path).unwrap().modified().unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&config_path)
+            .unwrap();
+        file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000))
+            .unwrap();
+        let mtime = file.metadata().unwrap().modified().unwrap();
 
         trust_codex_project(
             &config_path,
@@ -3642,7 +3658,13 @@ trust_level = "trusted"
 
         // Idempotent: a second call must not rewrite the file.
         let first = std::fs::read_to_string(&config_path).unwrap();
-        let mtime = std::fs::metadata(&config_path).unwrap().modified().unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&config_path)
+            .unwrap();
+        file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000))
+            .unwrap();
+        let mtime = file.metadata().unwrap().modified().unwrap();
         trust_claude_project(
             &config_path,
             "/workspace/my-worktree",
@@ -5089,6 +5111,54 @@ hooks_auto_accept: false
         assert!(output.status.success());
         let path = tmp.path().join("no_sid").join("session_id");
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn test_hook_command_session_id_skips_nested_agent() {
+        if skip_if_no_jq() || !Path::new("/proc/self/cmdline").exists() {
+            return;
+        }
+        use std::io::Write;
+        let tmp = TempDir::new().unwrap();
+        let agent = tmp.path().join("aoe-fake-agent");
+        std::os::unix::fs::symlink("/bin/sh", &agent).unwrap();
+        let hook = hook_command_session_id_sandbox(
+            tmp.path().to_str().unwrap(),
+            crate::agents::HookIdentityField::SessionId,
+        );
+        let payload = r#"{"session_id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}"#;
+        for (instance_id, script, writes) in [
+            ("pane_agent", r#"eval "$HOOK"; true"#, true),
+            (
+                "nested_agent",
+                r#""$AGENT" -c 'eval "$HOOK"; true'; true"#,
+                false,
+            ),
+        ] {
+            let mut child = std::process::Command::new(&agent)
+                .args(["-c", script])
+                .env("AGENT", &agent)
+                .env("HOOK", &hook)
+                .env("AOE_AGENT_BIN", "aoe-fake-agent")
+                .env("AOE_INSTANCE_ID", instance_id)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn fake agent");
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(payload.as_bytes())
+                .unwrap();
+            assert!(child.wait_with_output().unwrap().status.success());
+            assert_eq!(
+                tmp.path().join(instance_id).join("session_id").exists(),
+                writes,
+                "{instance_id}"
+            );
+        }
     }
 
     /// End-to-end check against a Claude `PreToolUse` shape: pretty-printed

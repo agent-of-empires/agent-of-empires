@@ -508,10 +508,13 @@ pub async fn apply_plugin_update(
     }
     let plugin_id = id.clone();
     let fingerprint = body.expected_fingerprint;
+    let host = state.plugin_host.clone();
     start_job(state, PluginJobKind::Update, id, move |log| async move {
-        plugin::install::apply_update(&plugin_id, fingerprint, &log)
-            .await
-            .map(|_| ())
+        plugin::install::apply_update(&plugin_id, fingerprint, &log).await?;
+        if let Some(host) = host {
+            host.restart_worker(&plugin_id, &plugin::registry()).await;
+        }
+        Ok(())
     })
 }
 
@@ -579,6 +582,30 @@ pub async fn set_plugin_enabled(
         Ok(Err(e)) => error_response(StatusCode::BAD_REQUEST, "plugin_error", format!("{e:#}")),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
     }
+}
+
+/// `POST /api/plugins/{id}/worker/restart`: reload plugins from disk and
+/// replace this plugin's worker, so an update applied outside the daemon (CLI,
+/// TUI) runs the new build without a daemon restart.
+pub async fn restart_plugin_worker(
+    State(state): State<std::sync::Arc<AppState>>,
+    session: Option<axum::Extension<AuthenticatedSession>>,
+    loopback: Option<axum::Extension<LoopbackTrusted>>,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.is_some()).await {
+        return resp;
+    }
+    let registry = match tokio::task::spawn_blocking(plugin::reload_registry).await {
+        Ok(registry) => registry,
+        Err(e) => {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string())
+        }
+    };
+    if let Some(host) = state.plugin_host.clone() {
+        host.restart_worker(&id, &registry).await;
+    }
+    (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
 }
 
 // Plugin lifecycle jobs: install, update, and uninstall.
@@ -991,23 +1018,6 @@ mod tests {
         assert_eq!(content_type_for_icon(std::path::Path::new("a")), None);
     }
 
-    /// Reloads the process-global plugin registry on Drop. Ordered as a field
-    /// AFTER `AppDirEnvGuard::_env` so it runs once the env has been restored
-    /// (matching the pre-consolidation Drop, which reloaded after restoring).
-    struct ReloadRegistryOnDrop;
-
-    impl Drop for ReloadRegistryOnDrop {
-        fn drop(&mut self) {
-            // Re-acquire the process-global env lock (released when the sibling
-            // `_env` field dropped just before this) so the registry reload
-            // reads a HOME/XDG that no peer test is concurrently mutating.
-            // `reload_registry` resolves the app dir from those vars, so an
-            // unlocked reload here could otherwise read a racing test's dirs.
-            let _lock = crate::session::test_support::EnvGuard::unset(&[]);
-            crate::plugin::reload_registry();
-        }
-    }
-
     struct AppDirEnvGuard {
         // Field drop order is load-bearing: `_env` restores HOME / XDG /
         // USERPROFILE (and releases the shared env lock) first, then
@@ -1015,7 +1025,7 @@ mod tests {
         // `_temp` deletes the tempdir. `_env` also holds the process-global
         // env lock for the guard's whole lifetime (issues #2864, #2600).
         _env: crate::session::test_support::EnvGuard,
-        _reload: ReloadRegistryOnDrop,
+        _reload: crate::plugin::ReloadRegistryOnDrop,
         _temp: tempfile::TempDir,
     }
 
@@ -1030,7 +1040,7 @@ mod tests {
             crate::plugin::reload_registry();
             Self {
                 _env: env,
-                _reload: ReloadRegistryOnDrop,
+                _reload: crate::plugin::ReloadRegistryOnDrop,
                 _temp: temp,
             }
         }

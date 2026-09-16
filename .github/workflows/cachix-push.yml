@@ -55,3 +55,97 @@ jobs:
 
       - name: Push to Cachix
         run: cachix push ${{ secrets.CACHIX_CACHE_NAME }} ./result
+
+  notify-on-failure:
+    name: Report a failed build on main
+    needs: cachix
+    # This is the only CI that compiles the Nix package on main, so a red run
+    # here otherwise goes unseen (#3217). A dispatch failure is already in
+    # front of whoever started it.
+    if: failure() && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Classify the failure
+        id: classify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          PREVIOUS=$(gh run list --repo "$REPO" --workflow cachix-push.yml --branch main \
+            --status completed --limit 5 --json databaseId,conclusion \
+            --jq "[.[] | select(.databaseId != $RUN_ID)][0].conclusion // \"\"")
+          # --build-step must match the build step's `name:` above.
+          gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" \
+            | python3 .github/scripts/classify-cachix-failure.py \
+                --build-step "Build aoe-with-web" --previous-conclusion "$PREVIOUS" \
+            | tee -a "$GITHUB_OUTPUT"
+
+      - name: Warn on a one-off infrastructure failure
+        if: steps.classify.outputs.alert == 'false'
+        run: echo "::warning::The Nix build did not fail; a setup or Cachix step did. Not opening an issue unless the next run on main fails too."
+
+      - name: Open or update the tracking issue
+        # Also runs when classification itself failed, so an API error still alerts.
+        if: ${{ !cancelled() && steps.classify.outputs.alert != 'false' }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          KIND: ${{ steps.classify.outputs.kind || 'unknown' }}
+        with:
+          script: |
+            const label = 'nix-build';
+            const { owner, repo } = context.repo;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const cause = {
+              build: '`nix build .#aoe-with-web` failed, so main does not build under Nix.',
+              infra: 'A setup or Cachix step failed, and the previous run on main also failed; check that run, the `CACHIX_*` secrets and Cachix status.',
+              unknown: 'The failing step could not be identified; read the run log.',
+            }[process.env.KIND];
+            const summary = `${cause}\n\nRun: ${runUrl}\nCommit: ${context.sha}`;
+
+            try {
+              await github.rest.issues.createLabel({
+                owner,
+                repo,
+                name: label,
+                color: 'b60205',
+                description: 'The post-merge Nix build of main is failing',
+              });
+            } catch (e) {
+              // Already exists.
+            }
+
+            // One open issue per outage; repeat failures comment on it.
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner,
+              repo,
+              state: 'open',
+              labels: label,
+            });
+
+            if (open.length > 0) {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: open[0].number,
+                body: `Failed again. ${summary}`,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner,
+                repo,
+                title: 'Nix build of main is failing',
+                labels: [label],
+                body: `${summary}\n\nClose this once a \`Push to Cachix\` run on main succeeds.`,
+              });
+            }

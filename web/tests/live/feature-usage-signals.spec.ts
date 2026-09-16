@@ -13,22 +13,19 @@ import { test, expect } from "../helpers/liveTest";
 import { spawnAoeServe, resolveAoeBinary } from "../helpers/aoeServe";
 import { commitAll, initWorkingRepo, writeFiles } from "../helpers/gitFixture";
 
-/** Capture every `POST /api/telemetry/seen` body, parsed into `{ surface }`.
- *  Attach before `page.goto` so the on-load pings are observed. */
-function captureSeenPings(page: import("@playwright/test").Page): Array<{ surface?: string }> {
-  const pings: Array<{ surface?: string }> = [];
-  page.on("request", (req) => {
-    if (req.method() === "POST" && req.url().includes("/api/telemetry/seen")) {
-      const body = req.postData();
-      if (!body) return;
-      try {
-        pings.push(JSON.parse(body));
-      } catch {
-        // Ignore unparseable bodies.
+async function captureSeenPings(page: import("@playwright/test").Page) {
+  await page.addInitScript(() => {
+    const w = window as unknown as { __seenPings: Array<{ surface?: string }> };
+    w.__seenPings = [];
+    const original = window.fetch;
+    window.fetch = (...args) => {
+      if (String(args[0]).endsWith("/api/telemetry/seen") && args[1]?.method === "POST") {
+        w.__seenPings.push(JSON.parse(String(args[1].body)));
       }
-    }
+      return original(...args);
+    };
   });
-  return pings;
+  return () => page.evaluate(() => (window as unknown as { __seenPings: Array<{ surface?: string }> }).__seenPings);
 }
 
 test("opening a session fires the diff_panel and web_terminal signals", async ({ page }, testInfo) => {
@@ -38,9 +35,9 @@ test("opening a session fires the diff_panel and web_terminal signals", async ({
     parallelIndex: testInfo.parallelIndex,
     seedFn: ({ home, env }) => {
       const projectDir = join(home, "project");
-      initWorkingRepo(projectDir);
+      initWorkingRepo(projectDir, env);
       writeFiles(projectDir, { "src/a.ts": "export const a = 1;\n" });
-      commitAll(projectDir, "baseline");
+      commitAll(projectDir, "baseline", env);
       // Uncommitted edit so the diff endpoint returns a file and the diff
       // panel has something to show.
       writeFiles(projectDir, { "src/a.ts": "export const a = 11;\n" });
@@ -51,7 +48,7 @@ test("opening a session fires the diff_panel and web_terminal signals", async ({
     },
   });
   try {
-    const pings = captureSeenPings(page);
+    const pings = await captureSeenPings(page);
     await page.goto(`${serve.baseUrl}/`);
     const sessionRow = page.getByRole("link").filter({ hasText: "usage-signals" }).first();
     await expect(sessionRow).toBeVisible({ timeout: 10_000 });
@@ -60,12 +57,12 @@ test("opening a session fires the diff_panel and web_terminal signals", async ({
     // Terminal connects on open -> web_terminal; diff panel mounts for the
     // session -> diff_panel. Both fire without any extra user action.
     await expect
-      .poll(() => pings.some((p) => p.surface === "web_terminal"), {
+      .poll(async () => (await pings()).some((p) => p.surface === "web_terminal"), {
         timeout: 10_000,
       })
       .toBe(true);
     await expect
-      .poll(() => pings.some((p) => p.surface === "diff_panel"), {
+      .poll(async () => (await pings()).some((p) => p.surface === "diff_panel"), {
         timeout: 10_000,
       })
       .toBe(true);
@@ -77,14 +74,14 @@ test("opening a session fires the diff_panel and web_terminal signals", async ({
 test("a read-only server fires no feature-usage signals", async ({ serveReadOnly, page }) => {
   // The seen-ping guard skips read-only servers (they cannot persist a
   // snapshot), so none of the feature signals leave the browser.
-  const pings = captureSeenPings(page);
+  const pings = await captureSeenPings(page);
 
   const aboutPromise = page.waitForResponse((r) => r.url().endsWith("/api/about") && r.status() === 200, {
     timeout: 10_000,
   });
   await page.goto(serveReadOnly.baseUrl);
   await aboutPromise;
-  await page.waitForTimeout(500);
+  await expect(page.getByText("This dashboard is in read-only mode.")).toBeVisible();
 
-  expect(pings).toHaveLength(0);
+  expect(await pings()).toHaveLength(0);
 });

@@ -5,9 +5,8 @@
 // batch flush over fetch and sendBeacon, the byte-budget trim path, and
 // the window/document listener wiring installed by installClientLogger.
 //
-// The module keeps process-global state (queue, token bucket, installed
-// flag), so each test resets the module registry via vi.resetModules and
-// re-imports a fresh copy to keep cases isolated.
+// Fresh modules own fresh queues and token buckets; the fixture removes their
+// DOM subscriptions before the next module instance is installed.
 
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 
@@ -27,8 +26,30 @@ function setHref(href: string): void {
 
 describe("logger", () => {
   let fetchMock: ReturnType<typeof vi.fn>;
+  let restoreFixture: () => void;
 
   beforeEach(() => {
+    const properties = [
+      [window, "location"],
+      [navigator, "sendBeacon"],
+      [navigator, "userAgent"],
+    ] as const;
+    const descriptors = properties.map(([target, key]) => Object.getOwnPropertyDescriptor(target, key));
+    const windowListeners = vi.spyOn(window, "addEventListener");
+    const documentListeners = vi.spyOn(document, "addEventListener");
+    restoreFixture = () => {
+      for (const [type, listener, options] of windowListeners.mock.calls) {
+        window.removeEventListener(type, listener, options);
+      }
+      for (const [type, listener, options] of documentListeners.mock.calls) {
+        document.removeEventListener(type, listener, options);
+      }
+      properties.forEach(([target, key], index) => {
+        const descriptor = descriptors[index];
+        if (descriptor) Object.defineProperty(target, key, descriptor);
+        else Reflect.deleteProperty(target, key);
+      });
+    };
     vi.useFakeTimers();
     vi.setSystemTime(0);
     fetchMock = vi.fn().mockResolvedValue(new Response("ok", { status: 200 }));
@@ -46,8 +67,10 @@ describe("logger", () => {
     });
   });
 
-  afterEach(() => {
-    vi.runOnlyPendingTimers();
+  afterEach(async () => {
+    restoreFixture();
+    await vi.runOnlyPendingTimersAsync();
+    vi.clearAllTimers();
     vi.useRealTimers();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
@@ -80,13 +103,13 @@ describe("logger", () => {
   });
 
   it("normalizes a string error", async () => {
-    const { reportError } = await freshLogger();
+    const { reportError, installClientLogger } = await freshLogger();
+    installClientLogger();
     reportError("plain string", { target: "t" });
     await vi.advanceTimersByTimeAsync(2000);
-    // No installClientLogger -> no flush interval; flush manually via size.
-    // Instead just assert nothing crashed; drive an explicit flush path
-    // by enqueuing to the batch threshold below in another test.
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const payload = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(payload.entries[0]).toMatchObject({ message: "plain string", target: "t" });
   });
 
   it("normalizes a non-error object and a circular object", async () => {
@@ -175,10 +198,7 @@ describe("logger", () => {
     // visibilityState defaults to "visible" in jsdom; flush only on hidden.
     expect(beacon).not.toHaveBeenCalled();
 
-    Object.defineProperty(document, "visibilityState", {
-      configurable: true,
-      value: "hidden",
-    });
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
     document.dispatchEvent(new Event("visibilitychange"));
     await vi.advanceTimersByTimeAsync(0);
 
@@ -274,11 +294,15 @@ describe("logger", () => {
 
   it("installClientLogger is idempotent", async () => {
     const { installClientLogger } = await freshLogger();
-    const addSpy = vi.spyOn(window, "addEventListener");
     installClientLogger();
-    const firstCount = addSpy.mock.calls.length;
     installClientLogger();
-    expect(addSpy.mock.calls.length).toBe(firstCount);
+    window.dispatchEvent(new ErrorEvent("error", { message: "one event" }));
+    window.dispatchEvent(new Event("pagehide"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const payload = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(payload.entries).toHaveLength(1);
+    expect(payload.entries[0].message).toBe("one event");
   });
 
   it("swallows a fetch rejection without throwing", async () => {

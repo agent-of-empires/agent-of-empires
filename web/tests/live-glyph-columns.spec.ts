@@ -21,19 +21,13 @@ test.describe("Live terminal glyph cell-width enforcement", () => {
     await clickSidebarSession(page, "pinch-test");
     const term = page.locator("[data-live-terminal]").first();
     await term.waitFor({ state: "visible", timeout: 10_000 });
-    // Let the mount settle: webfonts load, the component re-measures charW,
-    // and its final resize lands. The mocked live-ws answers every resize
-    // with a fresh default frame, so pushing before that settle races the
-    // overwrite.
-    await page.waitForFunction(() => document.fonts.status === "loaded", undefined, { timeout: 10_000 });
-    await term.locator("[data-live-content]").innerText(); // default frame rendered
-    await page.waitForTimeout(250);
+    await handle.waitForLiveReady();
 
     // Two lines with the SAME terminal cell count (20): one pure ASCII, one
     // mixing CJK + braille that no default stack covers. Pre-fix the mixed
     // line renders narrower because each missing glyph falls back to a
     // non-1-cell advance.
-    handle.pushLiveFrame({
+    await handle.pushLiveFrame({
       content: [ASCII_ROW, MIXED_ROW, ""].join("\n"),
       rows: 6,
       history: 0,

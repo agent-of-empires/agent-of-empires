@@ -68,6 +68,13 @@ Use table cases inside one test when setup is shared. Do not test constants,
 derived implementations, trivial getters, or rendering without an asserted
 behavior.
 
+Do not use fixed sleeps to assume another task has progressed. Use a channel,
+barrier, or an observable predicate with a deadline. A deadline bounds failure;
+it does not establish completion. Before negative assertions, establish the
+causal precondition and retain the relevant observation window.
+Use paused Tokio time only when every clock affecting the assertion is Tokio,
+and still await completion after advancing it.
+
 Choose the cheapest test that can catch the regression. Rust unit tests and
 Vitest are preferred; browser and full-binary tests are for behavior that needs
 those environments. Test code is a major part of Rust compile time, so avoid

@@ -1271,28 +1271,14 @@ mod tests {
 
     /// Session metadata round-trip against real session storage: set, get, a
     /// compare-and-swap that loses and one that wins, per-plugin namespace
-    /// isolation, and sessions.list. Isolated under a temp `XDG_CONFIG_HOME` so
-    /// it never touches real user state; serial because it mutates the env.
+    /// isolation, and sessions.list under a shared app-directory guard.
     #[test]
     #[serial_test::serial]
     fn session_meta_cas_namespace_and_list() {
         use crate::session::{Instance, Storage};
 
-        // Restore XDG_CONFIG_HOME on drop, so a failing assertion does not leak
-        // the override into the rest of the test process.
-        struct XdgGuard(Option<std::ffi::OsString>);
-        impl Drop for XdgGuard {
-            fn drop(&mut self) {
-                match self.0.take() {
-                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                    None => std::env::remove_var("XDG_CONFIG_HOME"),
-                }
-            }
-        }
-
         let tmp = tempfile::tempdir().unwrap();
-        let _xdg = XdgGuard(std::env::var_os("XDG_CONFIG_HOME"));
-        std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+        let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
 
         // Seed one session in the default profile's storage.
         let storage = Storage::new_unwatched("default").unwrap();
@@ -1383,19 +1369,8 @@ mod tests {
     fn sessions_list_exposes_archived_and_snoozed_flags() {
         use crate::session::{Instance, Storage};
 
-        struct XdgGuard(Option<std::ffi::OsString>);
-        impl Drop for XdgGuard {
-            fn drop(&mut self) {
-                match self.0.take() {
-                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                    None => std::env::remove_var("XDG_CONFIG_HOME"),
-                }
-            }
-        }
-
         let tmp = tempfile::tempdir().unwrap();
-        let _xdg = XdgGuard(std::env::var_os("XDG_CONFIG_HOME"));
-        std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+        let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
 
         let storage = Storage::new_unwatched("default").unwrap();
         let (archived_id, future_id, past_id) = storage
@@ -1447,19 +1422,8 @@ mod tests {
     fn sessions_list_exclude_filters_server_side() {
         use crate::session::{Instance, Storage};
 
-        struct XdgGuard(Option<std::ffi::OsString>);
-        impl Drop for XdgGuard {
-            fn drop(&mut self) {
-                match self.0.take() {
-                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                    None => std::env::remove_var("XDG_CONFIG_HOME"),
-                }
-            }
-        }
-
         let tmp = tempfile::tempdir().unwrap();
-        let _xdg = XdgGuard(std::env::var_os("XDG_CONFIG_HOME"));
-        std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+        let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
 
         let storage = Storage::new_unwatched("default").unwrap();
         let (active_id, archived_id, snoozed_id, trashed_id) = storage
@@ -1586,16 +1550,14 @@ mod tests {
     /// `config.get` reads the calling plugin's own persisted settings, gated by
     /// `runtime.worker`: a granted worker reads its value, an unset key returns
     /// null, a different plugin id cannot see it, and a worker without
-    /// `runtime.worker` is refused. Isolated under a temp `XDG_CONFIG_HOME` so it
-    /// never touches real user config; serial because it mutates the env.
+    /// `runtime.worker` is refused. The app-directory guard isolates user config.
     #[test]
     #[serial_test::serial]
     fn config_get_scopes_to_caller_and_requires_worker() {
         use crate::session::{update_config, PluginConfig};
 
         let tmp = tempfile::tempdir().unwrap();
-        let prev = std::env::var_os("XDG_CONFIG_HOME");
-        std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+        let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
 
         // Seed the global config with one setting under "acme.worker".
         update_config(|config| {
@@ -1649,11 +1611,6 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code, codes::FORBIDDEN);
-
-        match prev {
-            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
     }
 
     /// Build a context that declared a single `(slot, id)` UI contribution and

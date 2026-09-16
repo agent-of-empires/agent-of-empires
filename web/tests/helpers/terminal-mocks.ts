@@ -1,4 +1,4 @@
-import type { Page } from "@playwright/test";
+import { expect, type Page } from "@playwright/test";
 
 // Shared REST and WebSocket mocks for terminal browser tests.
 
@@ -8,7 +8,10 @@ export interface MockHandle {
   /** Messages the page sent on the capture-snapshot live-ws route
    *  (mobile live view): binary input bytes + JSON control messages. */
   liveMessages: Buffer[];
-  /** Push a live frame to every connected live-ws client. */
+  /** Binary input only, excluding JSON control traffic. */
+  liveInput: Buffer[];
+  waitForLiveReady: () => Promise<void>;
+  /** Switch to explicit frames and await the real reducer's debug frame counter. */
   pushLiveFrame: (frame: {
     content: string;
     rows: number;
@@ -17,7 +20,7 @@ export interface MockHandle {
     altScreen?: boolean;
     mouse?: boolean;
     mouseSgr?: boolean;
-  }) => void;
+  }) => Promise<void>;
   /** Push an OSC 52 clipboard event to every connected live-ws client. */
   pushLiveClipboard: (text: string) => void;
 }
@@ -56,19 +59,43 @@ export async function mockTerminalApis(
     onLiveMessage?: (url: string, message: Buffer) => void;
   } = {},
 ): Promise<MockHandle> {
-  const liveSockets: Array<{ send: (data: string) => void }> = [];
+  await page.addInitScript(() => {
+    const url = new URL(location.href);
+    url.searchParams.set("livedebug", "1");
+    history.replaceState(null, "", url);
+  });
+  const liveSockets: Array<{ send: (data: string) => void; frames: number }> = [];
+  let customFrames = false;
+  const consumedFrames = () =>
+    page
+      .locator("[data-live-debug]")
+      .first()
+      .textContent()
+      .then((text) => Number(text?.match(/ frames=(\d+)/)?.[1] ?? 0));
   const handle: MockHandle = {
     wsMessages: [],
     liveMessages: [],
-    pushLiveFrame: (frame) => {
+    liveInput: [],
+    waitForLiveReady: async () => {
+      await page.evaluate(() => document.fonts.ready.then(() => undefined));
+      await expect(page.locator("[data-live-content]").first()).toContainText("$ ready");
+      await expect.poll(() => handle.liveMessages.some((m) => m.toString().includes('"type":"resize"'))).toBe(true);
+      await expect.poll(async () => (await consumedFrames()) >= (liveSockets.at(-1)?.frames ?? Infinity)).toBe(true);
+    },
+    pushLiveFrame: async (frame) => {
+      customFrames = true;
       const payload = JSON.stringify({ type: "frame", cursor: null, ...frame });
       for (const ws of liveSockets) {
         try {
           ws.send(payload);
+          ws.frames++;
         } catch {
           // closed socket at test teardown; ignore
         }
       }
+      const expected = liveSockets.at(-1)?.frames;
+      expect(expected, "a live socket must be connected before publishing").toBeDefined();
+      await expect.poll(consumedFrames).toBe(expected);
     },
     pushLiveClipboard: (text) => {
       const payload = JSON.stringify({ type: "clipboard", text });
@@ -168,15 +195,18 @@ export async function mockTerminalApis(
   // messages with a frame sized accordingly so the component always has
   // content to render, mirroring src/server/live_ws.rs.
   await page.routeWebSocket(/\/sessions\/.*\/live-ws(\?.*)?$/, (ws) => {
-    liveSockets.push(ws);
+    const socket = { send: (data: string) => ws.send(data), frames: 0 };
+    liveSockets.push(socket);
     let rows = 24;
     let window = 24;
     const history = opts.liveHistory ?? 120;
     const reply = (responseRows = rows, responseWindow = window) => {
+      if (customFrames) return;
       try {
         ws.send(
           JSON.stringify({ type: "frame", ...makeLiveFrame({ rows: responseRows, history, window: responseWindow }) }),
         );
+        socket.frames++;
       } catch {
         // closed socket at test teardown; ignore
       }
@@ -185,7 +215,10 @@ export async function mockTerminalApis(
       const message = Buffer.isBuffer(msg) ? msg : Buffer.from(msg);
       handle.liveMessages.push(message);
       opts.onLiveMessage?.(ws.url(), message);
-      if (Buffer.isBuffer(msg)) return;
+      if (Buffer.isBuffer(msg)) {
+        handle.liveInput.push(msg);
+        return;
+      }
       try {
         const control = JSON.parse(String(msg)) as { type?: string; rows?: number; lines?: number };
         if (control.type === "claim_if_vacant") {
@@ -210,7 +243,7 @@ export async function mockTerminalApis(
         // non-JSON text; ignore
       }
     });
-    setTimeout(reply, 50);
+    reply();
   });
   return handle;
 }

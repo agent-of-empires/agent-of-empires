@@ -902,16 +902,15 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn cityhall_overrides_gate_on_the_env_flag() {
-        std::env::remove_var("AOE_CITYHALL_MODE");
+        let guard = crate::session::test_support::EnvGuard::unset(&["AOE_CITYHALL_MODE"]);
         let mut off = Config::default();
         off.worktree.enabled = false;
         apply_cityhall_overrides(&mut off);
         assert!(!off.worktree.enabled, "no override without the flag");
 
-        std::env::set_var("AOE_CITYHALL_MODE", "1");
+        let _guard = guard.and_set("AOE_CITYHALL_MODE", "1");
         let mut on = Config::default();
         apply_cityhall_overrides(&mut on);
-        std::env::remove_var("AOE_CITYHALL_MODE");
         assert_eq!(on.acp.max_concurrent_workers, 50);
         assert!(on.worktree.enabled);
     }

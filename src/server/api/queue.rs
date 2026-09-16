@@ -331,6 +331,7 @@ mod tests {
     /// and then retires the row, dropping what the client just posted.
     #[tokio::test]
     async fn a_re_enqueue_waits_for_an_in_flight_delivery() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
         let mut inst = Instance::new("queue-enq", "/tmp/aoe-3621-enqueue");
         inst.id = "sess-3621-enq".to_string();
         inst.view = crate::session::View::Structured;
@@ -340,7 +341,8 @@ mod tests {
 
         // Stand in for a drain holding the session across snapshot -> send.
         let delivering = state.session_service.prompt_submission(&id).await;
-        let enqueue = tokio::spawn({
+        let mut claims = state.session_service.watch_submission_claims();
+        let enqueue = {
             let state = Arc::clone(&state);
             let id = id.clone();
             async move {
@@ -358,17 +360,22 @@ mod tests {
                 .await
                 .into_response()
             }
-        });
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+        tokio::pin!(enqueue);
         assert!(
-            !enqueue.is_finished(),
+            futures_util::poll!(&mut enqueue).is_pending(),
             "an enqueue must not rewrite a row a delivery has already snapshotted"
+        );
+        assert_eq!(
+            claims
+                .try_recv()
+                .expect("contender reached submission claim"),
+            id
         );
         drop(delivering);
         let response = tokio::time::timeout(Duration::from_secs(10), enqueue)
             .await
-            .expect("the enqueue lands once the delivery releases the session")
-            .expect("enqueue task must not panic");
+            .expect("the enqueue lands once the delivery releases the session");
         assert_eq!(response.status(), StatusCode::OK);
     }
 }

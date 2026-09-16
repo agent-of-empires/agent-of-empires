@@ -24,8 +24,8 @@
 //!   the tool card the approval gates already sits in `server_rows`.
 //! - The two `resolve_*_locally` helpers are the only optimism left: they hide
 //!   a card the user just answered until the server's list catches up.
-//! - The "context lost, re-prime?" banner is derived from the rows rather than
-//!   latched from an event. See [`AcpTranscript::context_primer_pending`].
+//! - The context-loss notice is derived from the rows rather than latched
+//!   from an event. See [`AcpTranscript::context_primer_pending`].
 
 use crate::acp::elicitations::ElicitationQuestion;
 use crate::acp::state::{
@@ -692,8 +692,7 @@ mod tests {
         assert_eq!(t.pending_approvals.len(), 1, "the filter must not latch");
     }
 
-    /// Derived from the rows, so it survives a reconnect with no client-side
-    /// latch: a reset with no prompt after it means the context is gone.
+    /// A retained reset shows a notice until a later prompt dismisses it.
     #[test]
     fn context_primer_pending_tracks_the_newest_reset_or_prompt() {
         let prompt = || Event::UserPromptSent {
@@ -712,7 +711,11 @@ mod tests {
                 false,
             ),
             ("reset with nothing after", vec![prompt(), reset()], true),
-            ("prompt re-primed it", vec![reset(), prompt()], false),
+            (
+                "prompt dismisses the notice",
+                vec![prompt(), reset(), prompt()],
+                false,
+            ),
             (
                 "the newest reset wins",
                 vec![reset(), prompt(), reset()],

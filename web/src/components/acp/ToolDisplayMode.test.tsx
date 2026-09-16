@@ -15,13 +15,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, renderHook, screen } from "@testing-library/react";
 import type { ReactNode } from "react";
 
-vi.mock("../../lib/highlighter", () => ({
-  ensureThemeLoaded: vi.fn().mockResolvedValue("dark-plus"),
-  getHighlighter: vi.fn().mockResolvedValue({
-    codeToHtml: (code: string) => `<pre>${code}</pre>`,
-  }),
-  langKeyForExt: (s: string) => s,
-  loadLanguage: vi.fn().mockResolvedValue(undefined),
+vi.mock("../../lib/snippetHighlighter", () => ({
+  highlightSnippet: vi.fn().mockResolvedValue(null),
 }));
 
 vi.mock("../../hooks/useShikiTheme", () => ({

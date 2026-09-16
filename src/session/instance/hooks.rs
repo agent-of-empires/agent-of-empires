@@ -13,11 +13,13 @@ pub(super) fn status_hook_env_prefix(
     if has_hooks {
         let hook_bin = std::env::current_exe()
             .expect("current executable is required for host identity hooks");
+        // `$$` is the launch shell, which `exec`s into the agent.
         format!(
-            "AOE_PROFILE={} AOE_INSTANCE_ID={} AOE_HOOK_BIN={} ",
+            "AOE_PROFILE={} AOE_INSTANCE_ID={} AOE_HOOK_BIN={} AOE_AGENT_PID=$$ AOE_AGENT_BIN={} ",
             shell_escape(profile),
             shell_escape(instance_id),
-            shell_escape(&hook_bin.to_string_lossy())
+            shell_escape(&hook_bin.to_string_lossy()),
+            shell_escape(agent.map_or("", |agent| agent.binary))
         )
     } else {
         String::new()
@@ -661,12 +663,13 @@ mod tests {
 
     use crate::session::test_support::EnvGuard;
 
-    fn expected_status_prefix(profile: &str, instance_id: &str) -> String {
+    fn expected_status_prefix(profile: &str, instance_id: &str, agent: &str) -> String {
         format!(
-            "AOE_PROFILE={} AOE_INSTANCE_ID={} AOE_HOOK_BIN={} ",
+            "AOE_PROFILE={} AOE_INSTANCE_ID={} AOE_HOOK_BIN={} AOE_AGENT_PID=$$ AOE_AGENT_BIN={} ",
             shell_escape(profile),
             shell_escape(instance_id),
-            shell_escape(&std::env::current_exe().unwrap().to_string_lossy())
+            shell_escape(&std::env::current_exe().unwrap().to_string_lossy()),
+            shell_escape(crate::agents::get_agent(agent).unwrap().binary)
         )
     }
 
@@ -895,7 +898,7 @@ mod tests {
         let agent = crate::agents::get_agent("codex");
         assert_eq!(
             status_hook_env_prefix("work", "abc123", agent),
-            expected_status_prefix("work", "abc123")
+            expected_status_prefix("work", "abc123", "codex")
         );
     }
 
@@ -904,9 +907,7 @@ mod tests {
     fn test_custom_codex_detected_agent_uses_codex_hook_installer() {
         let tmp = tempfile::TempDir::new().unwrap();
         let _codex_home_guard = EnvGuard::unset(&["CODEX_HOME"]);
-        std::env::set_var("HOME", tmp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(tmp.path());
 
         acknowledge_hooks();
         let mut inst = Instance::new("wrapped", "/tmp/test");
@@ -927,9 +928,7 @@ mod tests {
     fn test_codex_hook_installer_uses_resolved_codex_home() {
         let tmp = tempfile::TempDir::new().unwrap();
         let _codex_home_guard = EnvGuard::unset(&["CODEX_HOME"]);
-        std::env::set_var("HOME", tmp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(tmp.path());
 
         let profile_codex_home = tmp.path().join("profile-codex-home");
         let resolved_codex_home = tmp.path().join("before-session-codex-home");
@@ -1003,9 +1002,7 @@ mod tests {
     fn test_codex_hook_installer_respects_profile_hooks_disabled() {
         let tmp = tempfile::TempDir::new().unwrap();
         let _codex_home_guard = EnvGuard::unset(&["CODEX_HOME"]);
-        std::env::set_var("HOME", tmp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(tmp.path());
 
         let profile_dir = crate::session::get_profile_dir("hooks-disabled").unwrap();
         std::fs::write(
@@ -1028,7 +1025,7 @@ mod tests {
     fn host_hook_mutation_requires_durable_acknowledgement() {
         let tmp = tempfile::TempDir::new().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
-        std::env::set_var("HOME", tmp.path());
+        let _home_guard = crate::session::test_support::isolate_home(tmp.path());
         let mut inst = Instance::new("cursor-unacknowledged", "/tmp/test");
         inst.tool = "cursor".to_string();
         inst.detect_as = "cursor".to_string();
@@ -1047,9 +1044,7 @@ mod tests {
     fn status_only_agent_needs_no_ack_when_status_hooks_are_disabled() {
         let tmp = tempfile::TempDir::new().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
-        std::env::set_var("HOME", tmp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(tmp.path());
         let profile_dir = crate::session::get_profile_dir("status-hooks-disabled").unwrap();
         std::fs::write(
             profile_dir.join("config.toml"),
@@ -1076,9 +1071,7 @@ agent_status_hooks = false
     fn identity_hooks_remain_when_status_hooks_are_disabled() {
         let tmp = tempfile::TempDir::new().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
-        std::env::set_var("HOME", tmp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(tmp.path());
         let profile_dir = crate::session::get_profile_dir("identity-only-hooks").unwrap();
         let custom_config = tmp.path().join("cursor-custom");
         std::fs::write(
@@ -1123,9 +1116,7 @@ agent_status_hooks = false
         for (profile, enabled, sandboxed, expected) in cases {
             let tmp = tempfile::TempDir::new().unwrap();
             let _guard = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
-            std::env::set_var("HOME", tmp.path());
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+            let _home_guard = crate::session::test_support::isolate_home(tmp.path());
 
             let profile_dir = crate::session::get_profile_dir(profile).unwrap();
             std::fs::write(
@@ -1167,9 +1158,7 @@ agent_status_hooks = false
     fn test_codex_hook_installer_respects_profile_hooks_enabled() {
         let tmp = tempfile::TempDir::new().unwrap();
         let _codex_home_guard = EnvGuard::unset(&["CODEX_HOME"]);
-        std::env::set_var("HOME", tmp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        let _home_guard = crate::session::test_support::isolate_home(tmp.path());
 
         crate::session::config::update_config(|global| {
             global.session.agent_status_hooks = false;
@@ -1307,15 +1296,15 @@ agent_status_hooks = false
     fn test_status_hook_env_prefix_includes_hermes() {
         assert_eq!(
             status_hook_env_prefix("work", "abc123", crate::agents::get_agent("hermes")),
-            expected_status_prefix("work", "abc123")
+            expected_status_prefix("work", "abc123", "hermes")
         );
         assert_eq!(
             status_hook_env_prefix("work", "abc123", crate::agents::get_agent("settl")),
-            expected_status_prefix("work", "abc123")
+            expected_status_prefix("work", "abc123", "settl")
         );
         assert_eq!(
             status_hook_env_prefix("work", "abc123", crate::agents::get_agent("claude")),
-            expected_status_prefix("work", "abc123")
+            expected_status_prefix("work", "abc123", "claude")
         );
         assert_eq!(
             status_hook_env_prefix("work", "abc123", crate::agents::get_agent("opencode")),
@@ -1323,11 +1312,11 @@ agent_status_hooks = false
         );
         assert_eq!(
             status_hook_env_prefix("work", "abc123", crate::agents::get_agent("kiro")),
-            expected_status_prefix("work", "abc123")
+            expected_status_prefix("work", "abc123", "kiro")
         );
         assert_eq!(
             status_hook_env_prefix("work", "abc123", crate::agents::get_agent("kimi")),
-            expected_status_prefix("work", "abc123")
+            expected_status_prefix("work", "abc123", "kimi")
         );
     }
     #[test]

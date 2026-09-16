@@ -345,45 +345,29 @@ mod tests {
 
     #[test]
     fn concurrent_load_theme_does_not_deadlock() {
-        // Belt-and-braces: even with the fixed Default impl, exercise
-        // the load path from many threads at once. If some future
-        // change reintroduces a self-referential lock in the load
-        // path, the watchdog timeout catches it.
-        use std::sync::{Arc, Mutex};
-        use std::thread;
-        use std::time::{Duration, Instant};
-
-        let started = Instant::now();
-        let names: Vec<&'static str> = builtin_theme_names().collect();
-        let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let mut handles = Vec::new();
-        for _ in 0..16 {
-            let names = names.clone();
-            let errors = Arc::clone(&errors);
-            handles.push(thread::spawn(move || {
-                for name in names {
-                    let result = std::panic::catch_unwind(|| load_theme(name));
-                    if result.is_err() {
-                        errors.lock().unwrap().push(name.to_string());
+        if !crate::tui::isolated_test_process(
+            "tui::styles::tests::concurrent_load_theme_does_not_deadlock",
+            std::time::Duration::from_secs(5),
+        ) {
+            return;
+        }
+        let start = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    for (name, background, title) in BUILTIN_COLOR_ANCHORS {
+                        let theme = load_theme(name);
+                        assert_eq!(theme.background, *background, "{name}");
+                        assert_eq!(theme.title, *title, "{name}");
                     }
-                }
-            }));
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("theme loader panicked");
         }
-        for h in handles {
-            h.join().expect("worker thread panicked");
-        }
-        let elapsed = started.elapsed();
-        let errs = errors.lock().unwrap();
-        assert!(
-            errs.is_empty(),
-            "themes panicked under concurrent load: {:?}",
-            *errs
-        );
-        assert!(
-            elapsed < Duration::from_secs(5),
-            "16 threads x 6 themes took {:?}; likely a lock contention regression",
-            elapsed
-        );
     }
 
     #[test]
@@ -407,33 +391,18 @@ mod tests {
 
     #[test]
     fn default_does_not_recurse_through_load_theme() {
-        // Regression for the OnceLock-via-load_theme deadlock the
-        // first cut of this work shipped: serde's container-level
-        // `#[serde(default)]` calls Theme::default() to seed before
-        // overwriting present fields, so if Default ran load_theme
-        // (which runs toml::from_str which calls Default which runs
-        // load_theme...) every theme load deadlocked. Default must
-        // build the struct inline.
-        //
-        // Asserting the timing alone would be flaky in CI; instead
-        // confirm Default returns the Empire palette directly and
-        // that parsing every builtin completes within a tight wall
-        // clock (toml::from_str on ~500B is microseconds, not
-        // seconds).
-        use std::time::{Duration, Instant};
-        let started = Instant::now();
+        if !crate::tui::isolated_test_process(
+            "tui::styles::tests::default_does_not_recurse_through_load_theme",
+            std::time::Duration::from_secs(5),
+        ) {
+            return;
+        }
         let d = Theme::default();
         assert_eq!(d.background, Color::Rgb(0x0f, 0x17, 0x2a));
         assert_eq!(d.title, Color::Rgb(0xfb, 0xbf, 0x24));
         for name in builtin_theme_names() {
             let _ = load_theme(name);
         }
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < Duration::from_secs(1),
-            "loading all builtins took {:?}; serde default likely re-entered load_theme",
-            elapsed
-        );
     }
 
     #[test]

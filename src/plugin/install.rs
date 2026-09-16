@@ -134,6 +134,40 @@ pub async fn set_enabled_live(plugin_id: &str, enabled: bool) -> Result<LiveTogg
     }
 }
 
+/// Whether a running daemon picked up a plugin's changed tree.
+#[derive(Debug)]
+pub enum LiveRestart {
+    /// A running daemon reloaded the plugin and replaced its worker.
+    Daemon,
+    /// No daemon runs plugin workers (none running, or a read-only one); the
+    /// next daemon launches the new build.
+    NoDaemon,
+    /// A daemon appears to be running but the request failed (unreachable,
+    /// auth, or a daemon too old for the endpoint), so its worker keeps the
+    /// previous build until it restarts.
+    DaemonStale { reason: String },
+}
+
+/// Ask a running local daemon to reload `plugin_id` after an update replaced
+/// its tree. Its plugin host otherwise keeps supervising the old worker.
+pub async fn restart_worker_live(plugin_id: &str) -> LiveRestart {
+    let Ok(endpoint) = crate::acp::client::discovery::discover_local() else {
+        return LiveRestart::NoDaemon;
+    };
+    let result = async {
+        let client = crate::acp::client::HttpClient::new(endpoint)?;
+        client.restart_plugin_worker(plugin_id).await
+    }
+    .await;
+    match result {
+        Ok(()) => LiveRestart::Daemon,
+        Err(crate::acp::client::HttpError::ReadOnly) => LiveRestart::NoDaemon,
+        Err(e) => LiveRestart::DaemonStale {
+            reason: format!("{e}"),
+        },
+    }
+}
+
 fn enable_in_config(plugin_id: &str, enabled: bool) -> Result<()> {
     update_config(|config| {
         config
@@ -1676,42 +1710,9 @@ fn write_lock(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::test_support::isolate_app_dir;
     use aoe_plugin_api::UiSlot;
     use serial_test::serial;
-    use std::ffi::OsString;
-
-    struct EnvVarGuard {
-        key: &'static str,
-        old: Option<OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &std::path::Path) -> Self {
-            let old = std::env::var_os(key);
-            std::env::set_var(key, value);
-            Self { key, old }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match &self.old {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
-
-    fn isolated_app_env() -> (tempfile::TempDir, EnvVarGuard, EnvVarGuard) {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join("home");
-        let xdg = tmp.path().join("xdg");
-        std::fs::create_dir_all(&home).unwrap();
-        std::fs::create_dir_all(&xdg).unwrap();
-        let home_guard = EnvVarGuard::set("HOME", &home);
-        let xdg_guard = EnvVarGuard::set("XDG_CONFIG_HOME", &xdg);
-        (tmp, home_guard, xdg_guard)
-    }
 
     fn ui(slot: UiSlot, id: &str) -> UiContribution {
         UiContribution {
@@ -1782,7 +1783,7 @@ mod tests {
     #[test]
     #[serial]
     fn uninstall_rejects_malformed_id_before_touching_plugin_dir() {
-        let (_tmp, _home, _xdg) = isolated_app_env();
+        let _home = isolate_app_dir();
         let plugins = super::super::plugins_dir().unwrap();
         let jobs = plugins.join("jobs");
         let keep = plugins.join("keepdir");
@@ -1801,7 +1802,7 @@ mod tests {
     #[test]
     #[serial]
     fn uninstall_requires_external_plugin_config_before_removing_dir() {
-        let (_tmp, _home, _xdg) = isolated_app_env();
+        let _home = isolate_app_dir();
         let plugins = super::super::plugins_dir().unwrap();
         let jobs = plugins.join("jobs");
         std::fs::create_dir_all(&jobs).unwrap();
@@ -1818,7 +1819,7 @@ mod tests {
     #[test]
     #[serial]
     fn uninstall_external_plugin_cleans_config_even_when_dir_is_missing() {
-        let (_tmp, _home, _xdg) = isolated_app_env();
+        let _home = isolate_app_dir();
         update_config(|config| {
             config.plugins.insert(
                 "acme.thing".to_string(),
@@ -1839,7 +1840,7 @@ mod tests {
     #[test]
     #[serial]
     fn dismiss_update_unknown_plugin_leaves_no_stray_config_entry() {
-        let (_tmp, _home, _xdg) = isolated_app_env();
+        let _home = isolate_app_dir();
 
         let err = dismiss_update("no.such.plugin", "abc123")
             .unwrap_err()
@@ -1856,7 +1857,7 @@ mod tests {
     #[test]
     #[serial]
     fn dismiss_update_uninstalled_plugin_leaves_entry_untouched() {
-        let (_tmp, _home, _xdg) = isolated_app_env();
+        let _home = isolate_app_dir();
         update_config(|config| {
             config
                 .plugins

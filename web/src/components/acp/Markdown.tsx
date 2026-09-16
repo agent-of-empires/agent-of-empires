@@ -20,7 +20,7 @@ import { useEffect, useMemo, useState } from "react";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 
-import { ensureThemeLoaded, getHighlighter, langKeyForExt, loadLanguage } from "../../lib/highlighter";
+import { highlightSnippet } from "../../lib/snippetHighlighter";
 import { useShikiTheme } from "../../hooks/useShikiTheme";
 import { parseFileRef, resolveArtifactUrl, resolveToRepoRelative } from "../../lib/fileRef";
 import { useAcpFileRef } from "./AcpFileRefContext";
@@ -233,12 +233,13 @@ function ShikiSyntaxHighlighter({ language, code }: SyntaxHighlighterProps) {
     if (!language) return;
     (async () => {
       try {
-        const langKey = langKeyForExt(language) ?? language;
-        await loadLanguage(langKey);
-        const resolvedTheme = await ensureThemeLoaded(shiki.theme, shiki.appearance);
-        const hl = await getHighlighter();
+        const out = await highlightSnippet(code, {
+          langHint: language,
+          theme: shiki.theme,
+          appearance: shiki.appearance,
+        });
         if (cancelled) return;
-        setHtml(hl.codeToHtml(code, { lang: langKey, theme: resolvedTheme }));
+        if (out) setHtml(out);
       } catch {
         // Unknown lang → fall through to plain rendering.
       }

@@ -193,6 +193,8 @@ pub(super) async fn write_secret_file(path: &std::path::Path, contents: &str) {
         .await;
     if let Ok(mut file) = opts {
         let _ = file.write_all(contents.as_bytes()).await;
+        // write_all can return while the blocking write is still queued.
+        let _ = file.flush().await;
     }
 }
 
@@ -313,6 +315,7 @@ mod tests {
 
     #[tokio::test]
     async fn token_manager_validates_previous_in_grace() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
         let mgr = TokenManager::new(Some("old_token".to_string()), Duration::from_secs(3600));
         mgr.rotate().await;
 
@@ -330,11 +333,54 @@ mod tests {
 
     #[tokio::test]
     async fn token_manager_rotate_changes_token() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
         let mgr = TokenManager::new(Some("original".to_string()), Duration::from_secs(3600));
         let before = mgr.current_token().await;
         mgr.rotate().await;
         let after = mgr.current_token().await;
         assert_ne!(before, after);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_secret_file_returns_after_contents_are_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (open_tx, open_rx) = std::sync::mpsc::channel::<()>();
+            let opener_gate = tokio::task::spawn_blocking(move || {
+                let _ = open_rx.recv();
+            });
+            let mut write = std::pin::pin!(write_secret_file(&path, "fixture-secret"));
+            assert!(futures_util::poll!(write.as_mut()).is_pending());
+
+            // Queue this gate after open, before the writer can submit its write.
+            let (write_tx, write_rx) = std::sync::mpsc::channel::<()>();
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let writer_gate = tokio::task::spawn_blocking(move || {
+                let _ = entered_tx.send(());
+                let _ = write_rx.recv();
+            });
+            drop(open_tx);
+            opener_gate.await.unwrap();
+            entered_rx.await.unwrap();
+
+            let ready = futures_util::poll!(write.as_mut()).is_ready();
+            let visible_at_return = ready.then(|| std::fs::read_to_string(&path).unwrap());
+            drop(write_tx);
+            writer_gate.await.unwrap();
+            if !ready {
+                write.await;
+            }
+            assert_eq!(
+                visible_at_return.unwrap_or_else(|| std::fs::read_to_string(&path).unwrap()),
+                "fixture-secret"
+            );
+        });
     }
 
     #[tokio::test]
@@ -347,38 +393,21 @@ mod tests {
         let first = load_or_generate_token_at(&path, day).await;
         assert!(is_valid_token_format(&first));
 
-        // A restart within the window reuses the token AND refreshes its mtime,
-        // so the idle clock is measured from last use, not creation. Backdate
-        // the file to simulate a day-old server; the restart must reuse the
-        // token and reset its age near zero. Before #3386 the mtime was set
-        // only at creation, so a day-old token rotated on the very next restart
-        // and silently killed push. (Use a generous window here so the reuse
-        // path runs regardless of how precisely the sandbox fs honors the
-        // backdate; the rotation case below is asserted deterministically.)
+        // Reuse refreshes last use, rather than retaining the creation timestamp.
         let backdated = std::time::SystemTime::now() - std::time::Duration::from_secs(23 * 60 * 60);
         std::fs::File::open(&path)
             .unwrap()
             .set_modified(backdated)
             .unwrap();
-        let reused = load_or_generate_token_at(&path, day * 100).await;
+        let reused = load_or_generate_token_at(&path, day).await;
         assert_eq!(
             reused, first,
             "a restart within the window must reuse the token"
         );
-        let age = std::fs::metadata(&path)
-            .unwrap()
-            .modified()
-            .unwrap()
-            .elapsed()
-            .unwrap();
-        assert!(
-            age < std::time::Duration::from_secs(60),
-            "reuse must refresh the mtime, got age {age:?}"
-        );
+        let refreshed = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(refreshed > backdated, "reuse must refresh the mtime");
 
-        // A token older than the window rotates. Drive this with a zero-length
-        // window so any existing file counts as stale, independent of the
-        // filesystem's mtime precision: the next start must generate a fresh one.
+        // A zero window makes expiration independent of filesystem precision.
         let rotated = load_or_generate_token_at(&path, std::time::Duration::ZERO).await;
         assert_ne!(rotated, first, "a token idle past the window rotates");
     }

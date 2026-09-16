@@ -2524,6 +2524,110 @@ mod rename_tests {
         assert_eq!(active.project_path, "/tmp/worktrees/main-branch");
     }
 
+    /// #3739: the live-status gate must consult the command's profile rules;
+    /// storage-loaded rows carry no `source_profile`, so without it a
+    /// profile-local rule is skipped and a running agent reads as Idle.
+    #[tokio::test]
+    #[serial]
+    async fn worktree_edit_consults_profile_status_rules() {
+        if crate::tmux::tmux_command().arg("-V").output().is_err() {
+            eprintln!("Skipping: tmux not available");
+            return;
+        }
+        const PROFILE: &str = "worktree-edit-profile-rules";
+        const AGENT: &str = "worktree-edit-rules-agent";
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let _tie_guard = crate::session::test_support::TieWorkdirToNameGuard::set(false);
+        // Otherwise an empty `source_profile` resolves to the only profile,
+        // which is this one, and the rule matches anyway.
+        crate::session::config::update_config(|config| {
+            config.default_profile = "main".to_string();
+        })
+        .unwrap();
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(PROFILE);
+        let profile_config =
+            crate::session::config::profile_config::get_profile_config_path(PROFILE).unwrap();
+        std::fs::create_dir_all(profile_config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &profile_config,
+            format!(
+                "[[agents.{AGENT}.status_rules]]\nstatus = \"running\"\ncontains = \"agent-busy\"\n"
+            ),
+        )
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join("agent-old");
+        std::fs::create_dir(&worktree).unwrap();
+        let mut target = Instance::new("Busy", worktree.to_str().unwrap());
+        target.tool = AGENT.to_string();
+        target.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "agent-old".into(),
+            main_repo_path: dir.path().join("repo").to_str().unwrap().into(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        });
+        let id = target.id.clone();
+        let tmux_name = crate::tmux::Session::generate_name(&target.id, &target.title);
+        let storage = Storage::new_unwatched(PROFILE).unwrap();
+        storage
+            .update(|instances, _| {
+                instances.push(target);
+                Ok(())
+            })
+            .unwrap();
+
+        let _kill = crate::tmux::test_helpers::TmuxTestSession::from_name(tmux_name.clone());
+        let created = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &tmux_name,
+                "printf 'agent-busy\\n'; sleep 300",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let captured = crate::tmux::tmux_command()
+                .args(["capture-pane", "-p", "-t", &tmux_name])
+                .output()
+                .unwrap();
+            if String::from_utf8_lossy(&captured.stdout).contains("agent-busy") {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "pane never painted");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let error = super::set_worktree_name(
+            PROFILE,
+            super::SetWorktreeNameArgs {
+                identifier: Some(id),
+                name: "agent-new".into(),
+                rename_branch: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("while the session is active"),
+            "{error}"
+        );
+        assert!(worktree.is_dir());
+        assert_eq!(
+            storage.load().unwrap()[0].project_path,
+            worktree.to_str().unwrap()
+        );
+    }
+
     #[test]
     fn group_only_success_uses_authoritative_committed_title() {
         assert_eq!(
@@ -2612,6 +2716,7 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
     // enforcing the guard. The holding entry point, for the reason
     // `rename_session` gives: an ambiguous frame must refuse the move.
     let mut live = inst.clone();
+    live.source_profile = profile.to_string();
     crate::tmux::refresh_session_cache();
     live.update_status_with_metadata(None, None);
     // A sandbox container keeps the worktree dir mounted even while the agent
@@ -3340,9 +3445,7 @@ mod set_session_id_tests {
     #[serial]
     async fn set_session_id_clears_resume_probe_failed_marker() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
 
         let storage = Storage::new_unwatched("set-sid-clear-marker").unwrap();
         let mut inst = Instance::new("marked_session", "/tmp/x");
@@ -3408,9 +3511,7 @@ mod set_color_tests {
     #[serial]
     async fn set_color_persists_palette_value_and_clears() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
 
         let (storage, id) = seed("set-color-ok").await;
 
@@ -3446,9 +3547,7 @@ mod set_color_tests {
     #[serial]
     async fn set_color_rejects_unknown_color() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
 
         let (storage, id) = seed("set-color-bad").await;
 
@@ -3506,9 +3605,7 @@ mod acp_reject_tests {
     #[serial]
     async fn set_session_id_rejects_structured_view_session() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
 
         let storage = Storage::new_unwatched("acp-reject").unwrap();
         let mut inst = Instance::new("acp_session", "/tmp/x");
@@ -3603,18 +3700,31 @@ mod import_tests {
         assert_eq!(inst.resume_intent, ResumeIntent::Default);
     }
 
+    /// A row claims a conversation in one of three places, and a re-import
+    /// must see all of them: a terminal import pins `resume_intent`, the
+    /// poller writes `agent_session_id`, and a structured import seeds
+    /// `acp_session_id` while leaving `resume_intent` at `Default`. Missing
+    /// any one of them creates a second row claiming a conversation that is
+    /// already claimed.
     #[test]
-    fn already_imported_matches_resume_and_observed_ids() {
+    fn already_imported_matches_every_spelling_of_a_claim() {
         let mut by_resume = Instance::new("a", "/p");
         by_resume.resume_intent = ResumeIntent::Use("id-1".to_string());
         let mut by_observed = Instance::new("b", "/p");
         by_observed.agent_session_id = Some("id-2".to_string());
-        let fresh = Instance::new("c", "/p");
-        let instances = vec![by_resume, by_observed, fresh];
+        let mut by_structured = Instance::new("c", "/p");
+        by_structured.acp_session_id = Some("id-3".to_string());
+        let fresh = Instance::new("d", "/p");
+        let instances = vec![by_resume, by_observed, by_structured, fresh];
 
-        assert!(already_imported(&instances, "id-1"));
-        assert!(already_imported(&instances, "id-2"));
-        assert!(!already_imported(&instances, "id-3"));
+        for (id, claimed) in [
+            ("id-1", true),
+            ("id-2", true),
+            ("id-3", true),
+            ("id-4", false),
+        ] {
+            assert_eq!(already_imported(&instances, id), claimed, "{id}");
+        }
     }
 }
 

@@ -25,9 +25,8 @@ const SCRIPT = {
           sessionUpdate: "agent_message_chunk",
           content: { type: "text", text: "First turn." },
         },
-        // Keep turn 1 in flight long enough to queue two follow-ups and
-        // navigate; well under the structured view supervisor idle watchdog.
-        { sessionUpdate: "wait_ms", ms: 6_000 },
+        // Keep the turn active through navigation and the badge assertion.
+        { sessionUpdate: "wait_for_release" },
       ],
       stopReason: "end_turn",
     },
