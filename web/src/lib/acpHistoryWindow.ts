@@ -29,7 +29,7 @@ export function lastUserBoundaryIndex(rows: readonly ActivityRow[]): number {
  * Rows the window should open with: `defaultWindow`, widened so the whole
  * last turn is on screen when that turn alone is longer than the default.
  *
- * The person's most recent prompt and everything the agent did in reply
+ * The user's most recent prompt and everything the agent did in reply
  * are the context that is always relevant on (re)opening a session; with
  * the flat default a tool-heavy turn came up cut mid-way and took several
  * "Load earlier" clicks to reach its own prompt. Older turns keep the

@@ -95,6 +95,32 @@ describe("useHistoryWindow", () => {
     expect(result.current.canLoadEarlier).toBe(false);
   });
 
+  it("holds a mid-turn cut when a prompt lands after a no-boundary open (pinnedWindowStart)", () => {
+    // The loaded tail holds no user row (the prompt is older than the page), so
+    // the window opens on the flat default and the cap cut lands mid-turn. A
+    // later prompt must not become a boundary the start snaps forward to: the
+    // pinned row stays the top and the start may only move earlier. This is
+    // the path the pinnedWindowStart clamp still guards after #3996.
+    const noBoundary: ActivityRow[] = [];
+    for (let r = 0; r < DEFAULT_HISTORY_WINDOW + 100; r += 1) {
+      noBoundary.push({ id: `m-${r}`, kind: "message", text: `part ${r}` });
+    }
+    const { result, rerender } = renderHook(({ a }) => useHistoryWindow("s1", a, false), {
+      initialProps: { a: noBoundary },
+    });
+    const topBefore = result.current.windowedActivity[0]!.id;
+    expect(topBefore).toBe(`m-100`);
+    expect(result.current.canLoadEarlier).toBe(true);
+    rerender({
+      a: noBoundary.concat([
+        { id: "u-1", kind: "user_prompt", text: "follow-up" },
+        { id: "m-1-0", kind: "message", text: "short answer" },
+      ]),
+    });
+    expect(result.current.windowedActivity[0]!.id).toBe(topBefore);
+    expect(result.current.windowedActivity.at(-1)!.id).toBe("m-1-0");
+  });
+
   it("drops the pin when its row is trimmed away", () => {
     const activity = transcript(100, 1);
     const { result, rerender } = renderHook(({ a }) => useHistoryWindow("s1", a, false), {

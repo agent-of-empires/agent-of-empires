@@ -33,7 +33,7 @@ export interface HistoryWindowState {
  *
  * The window opens on at least the whole last turn (`initialHistoryWindow`):
  * the default row count applies to the backlog before it, not to the prompt
- * the person most recently sent and its reply.
+ * the user most recently sent and its reply.
  */
 export function useHistoryWindow(
   sessionId: string,
