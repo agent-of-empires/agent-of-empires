@@ -191,10 +191,11 @@ impl Instance {
                 {
                     continue;
                 }
-                let Some(active) = &peer.active_execution else {
-                    return false;
+                let agent = match &peer.active_execution {
+                    Some(active) => crate::agents::get_agent(&active.binding.agent),
+                    None => peer.resolved_agent(),
                 };
-                let Some(agent) = crate::agents::get_agent(&active.binding.agent) else {
+                let Some(agent) = agent else {
                     return false;
                 };
                 let peer_backend = agent
@@ -204,6 +205,9 @@ impl Instance {
                     .map(|capture| capture.backend);
                 if peer_backend != Some(backend) {
                     continue;
+                }
+                if peer.active_execution.is_none() {
+                    return false;
                 }
                 let Some(peer_store) = peer.capture_store_dir() else {
                     return false;
@@ -1216,8 +1220,19 @@ mod tests {
             })
             .unwrap();
         assert!(
+            current.managed_capture_store_is_exclusive(backend),
+            "an unlocated Claude peer must not block Gemini capture"
+        );
+        peer.tool = "gemini".into();
+        peer_storage
+            .update(|instances, _| {
+                *instances = vec![peer.clone()];
+                Ok(())
+            })
+            .unwrap();
+        assert!(
             !current.managed_capture_store_is_exclusive(backend),
-            "an unlocated peer cannot prove exclusivity"
+            "an unlocated peer of the same backend cannot prove exclusivity"
         );
     }
 
