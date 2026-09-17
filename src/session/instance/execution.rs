@@ -1189,17 +1189,22 @@ impl Instance {
         let mut namespace_arguments = Vec::new();
         let mut roots = match agent.name {
             "claude" => {
-                // An explicit assertion names the store this conversation lives
-                // in, and wins over the configuration. An observed binding must
-                // instead match the resolved store, which
-                // `validate_conversation_target` enforces.
-                let asserted = target
-                    .and_then(|(_, binding, _)| binding)
-                    .filter(|binding| binding.provenance == ConversationProvenance::Asserted)
-                    .and_then(|binding| binding.execution.as_ref())
-                    .and_then(|execution| execution.stores.first())
-                    .cloned();
-                let root = absolute(asserted.or_else(|| declared.clone()).or_else(|| value("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty()).map(PathBuf::from))
+                // Assertions carry physical identities, not container-native paths.
+                let asserted = (inputs.container.is_none())
+                    .then(|| {
+                        target
+                            .and_then(|(_, binding, _)| binding)
+                            .filter(|binding| {
+                                binding.provenance == ConversationProvenance::Asserted
+                            })
+                            .and_then(|binding| binding.execution.as_ref())
+                            .and_then(|execution| execution.stores.first())
+                            .cloned()
+                    })
+                    .flatten();
+                let root = absolute(asserted
+                    .or_else(|| declared.clone())
+                    .or_else(|| value("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty()).map(PathBuf::from))
                     .unwrap_or_else(|| home.join(".claude")));
                 routing.push(("CLAUDE_CONFIG_DIR".into(), Some(root.to_str().context("native store is not UTF-8")?.to_owned())));
                 vec![root]
@@ -1726,7 +1731,10 @@ impl Instance {
     /// A symlinked app, temp or home root spells the same store or working
     /// directory two ways, so the paths are reduced to their identities before
     /// comparing; everything else must match exactly.
-    fn execution_identity_matches(left: &ExecutionBinding, right: &ExecutionBinding) -> bool {
+    pub(super) fn execution_identity_matches(
+        left: &ExecutionBinding,
+        right: &ExecutionBinding,
+    ) -> bool {
         fn identity(path: &std::path::Path) -> std::path::PathBuf {
             crate::session::capture::canonicalize_allowing_missing_leaf(path)
                 .unwrap_or_else(|| path.to_path_buf())

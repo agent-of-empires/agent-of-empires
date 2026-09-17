@@ -693,7 +693,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn stop_with_pinned_foreign_row_and_concurrent_divergence_keeps_evidence() {
+    fn cas_peer_sid_divergence_reports_generic_skipped_at_persist_layer() {
         // Direct unit coverage of the reviewer's scenario at the CAS layer:
         // the pin branch must only fire on its own verdict. Here the
         // divergent execution namespace makes the first attempt report a
@@ -830,6 +830,86 @@ mod tests {
             storage.load().unwrap()[0].agent_session_id.as_deref(),
             Some(published),
             "a stale sidecar is still the pane's own last word"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn stop_with_failed_publication_keeps_sidecar_evidence() {
+        // `stop()` must not delete the hook sidecar when the final
+        // conversation publication could not be persisted: the sidecar is
+        // the evidence a recovery needs. A Skipped flush (here: the pinned
+        // binding diverges from what the pane observed) still stops the
+        // sandbox container (a host bind, not container state) and the stop
+        // reports the publication failure instead of clearing the evidence.
+        let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(home.path());
+        let profile = "hook-stop-failed-publication";
+        let mut inst = Instance::new("hook-stop-evidence", home.path().to_str().unwrap());
+        inst.source_profile = profile.into();
+        inst.tool = "claude".into();
+        let sid = "22f13307-461c-4161-908e-95a247fac780";
+        let launch = uuid::Uuid::new_v4().to_string();
+        let source = crate::hooks::ensure_instance_dir_path(&inst.id)
+            .unwrap()
+            .join(
+                crate::hooks::session_id_leaf(Some(&launch))
+                    .unwrap()
+                    .as_ref(),
+            );
+        let mut binding = crate::session::ExecutionBinding {
+            agent: "claude".into(),
+            stores: vec![home.path().join("store")],
+            configuration: Vec::new(),
+            cwd: home.path().into(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+        };
+        inst.resume_intent = ResumeIntent::Use(sid.into());
+        inst.resume_binding = Some(crate::session::ConversationBinding {
+            session_id: sid.into(),
+            execution: Some(binding.clone()),
+            provenance: crate::session::ConversationProvenance::Asserted,
+            transcript_path: None,
+        });
+        // The observed namespace diverges from the pin: the flush must
+        // report Skipped, both on the first attempt and on its retry.
+        binding.cwd = home.path().join("elsewhere");
+        inst.agent_session_id = Some(sid.into());
+        inst.agent_session_binding = Some(crate::session::ConversationBinding {
+            session_id: sid.into(),
+            execution: Some(binding.clone()),
+            provenance: crate::session::ConversationProvenance::Observed,
+            transcript_path: None,
+        });
+        inst.active_execution = Some(ActiveExecution {
+            launch_id: launch.clone(),
+            binding: binding.clone(),
+            capture: Some(CaptureContext::Hooks(source.clone())),
+            container: None,
+        });
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|rows, _| {
+                *rows = vec![inst.clone()];
+                Ok(())
+            })
+            .unwrap();
+        crate::hooks::write_session_id_via_guard(&inst.id, sid, Some(&launch)).unwrap();
+        assert!(source.exists(), "the fixture must seed the sidecar");
+
+        let error = inst.stop().unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("could not persist final conversation publication"),
+            "the stop must report the publication failure: {error}"
+        );
+        assert!(
+            source.exists(),
+            "a failed publication must retain the hook evidence"
         );
     }
 

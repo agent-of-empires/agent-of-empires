@@ -13,6 +13,9 @@ pub(crate) struct RuntimeExecutionSnapshot {
     pub(crate) endpoint: String,
     pub(crate) local_mounts: bool,
     pub(crate) routing: Vec<(String, Option<String>)>,
+    /// Frozen transport flags for the inspected Docker endpoint.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) global_arguments: Vec<String>,
 }
 
 const RUNTIME_ROUTING_KEYS: &[&str] = &[
@@ -67,7 +70,10 @@ impl RuntimeExecutionSnapshot {
 
     pub(crate) fn command(&self, args: &[String]) -> std::process::Command {
         let mut command = std::process::Command::new(&self.program);
-        command.current_dir(&self.cwd).args(args);
+        command
+            .current_dir(&self.cwd)
+            .args(&self.global_arguments)
+            .args(args);
         for (key, value) in &self.routing {
             if let Some(value) = value {
                 command.env(key, value);
@@ -147,6 +153,7 @@ impl RuntimeExecutionSnapshot {
             endpoint: String::new(),
             local_mounts: false,
             routing,
+            global_arguments: Vec::new(),
         };
         match snapshot.kind {
             Name::Docker => {
@@ -166,36 +173,51 @@ impl RuntimeExecutionSnapshot {
                         snapshot.set("DOCKER_TLS", None);
                         snapshot.set("DOCKER_TLS_VERIFY", None);
                         snapshot.set("DOCKER_CERT_PATH", None);
-                        if context
-                            .pointer("/TLSMaterial/docker")
-                            .and_then(Value::as_array)
-                            .is_some_and(|files| !files.is_empty())
-                        {
-                            let directory = context
-                                .pointer("/Storage/TLSPath")
-                                .and_then(Value::as_str)
-                                .ok_or_else(|| {
-                                    anyhow::anyhow!("Docker context TLS material has no path")
-                                })?;
-                            snapshot.set(
-                                "DOCKER_CERT_PATH",
-                                Some(
-                                    std::path::Path::new(directory)
-                                        .join("docker")
-                                        .to_str()
+                        let material = context.pointer("/TLSMaterial/docker");
+                        let files = material.and_then(Value::as_array);
+                        let skip = context
+                            .pointer("/Endpoints/docker/SkipTLSVerify")
+                            .and_then(Value::as_bool)
+                            == Some(true);
+                        if material.is_some() || skip {
+                            snapshot.global_arguments.push("--tls".to_owned());
+                            snapshot
+                                .global_arguments
+                                .push(format!("--tlsverify={}", !skip));
+                            for (flag, file) in [
+                                ("--tlscacert", "ca.pem"),
+                                ("--tlscert", "cert.pem"),
+                                ("--tlskey", "key.pem"),
+                            ] {
+                                let declared = files.is_some_and(|files| {
+                                    files.iter().any(|entry| entry.as_str() == Some(file))
+                                });
+                                let path = if declared {
+                                    let directory = context
+                                        .pointer("/Storage/TLSPath")
+                                        .and_then(Value::as_str)
+                                        .ok_or_else(|| {
+                                            anyhow::anyhow!(
+                                                "Docker context has no TLS storage path"
+                                            )
+                                        })?;
+                                    let path =
+                                        std::path::Path::new(directory).join("docker").join(file);
+                                    anyhow::ensure!(
+                                        path.is_file(),
+                                        "Docker context TLS file is missing: {}",
+                                        path.display()
+                                    );
+                                    path.to_str()
                                         .ok_or_else(|| {
                                             anyhow::anyhow!("Docker TLS path is not UTF-8")
                                         })?
-                                        .to_owned(),
-                                ),
-                            );
-                            snapshot.set("DOCKER_TLS", Some("1".into()));
-                            if context
-                                .pointer("/Endpoints/docker/SkipTLSVerify")
-                                .and_then(Value::as_bool)
-                                != Some(true)
-                            {
-                                snapshot.set("DOCKER_TLS_VERIFY", Some("1".into()));
+                                        .to_owned()
+                                } else {
+                                    // Empty paths disable Docker's ambient certificate defaults.
+                                    String::new()
+                                };
+                                snapshot.global_arguments.push(format!("{flag}={path}"));
                             }
                         }
                     }
@@ -307,10 +329,14 @@ impl RuntimeExecutionSnapshot {
         let runtime = self.runtime();
         let command = runtime.exec_command(name, options, command);
         format!(
-            "{}{}",
+            "{}{}{}",
             crate::session::environment::shell_escape(
                 self.program.to_str().expect("validated runtime path")
             ),
+            self.global_arguments
+                .iter()
+                .map(|arg| format!(" {}", crate::session::environment::shell_escape(arg)))
+                .collect::<String>(),
             command
                 .strip_prefix(runtime.base.binary)
                 .expect("runtime command starts with its binary")
@@ -497,6 +523,7 @@ impl ContainerExecutionSnapshot {
 mod tests {
     use super::*;
     use crate::session::ContainerRuntimeName;
+    use std::os::unix::fs::PermissionsExt;
 
     fn snapshot(local_mounts: bool) -> ContainerExecutionSnapshot {
         ContainerExecutionSnapshot {
@@ -507,6 +534,7 @@ mod tests {
                 endpoint: String::new(),
                 local_mounts,
                 routing: Vec::new(),
+                global_arguments: Vec::new(),
             },
             name: "aoe-test".into(),
             id: "container-id".into(),
@@ -542,5 +570,173 @@ mod tests {
             snapshot(true).physical_path(std::path::Path::new("/unmapped/file.txt"));
         assert!(domain.starts_with("container:"));
         assert_eq!(path, std::path::PathBuf::from("/unmapped/file.txt"));
+    }
+
+    /// A fake `docker` binary plus a hermetic environment let `capture`
+    /// exercise the real probe path: a non-default context must freeze its
+    /// TLS setup into `global_arguments` instead of losing it to the
+    /// environment strip, and the flags must land on every command.
+    #[test]
+    #[serial_test::serial]
+    fn capture_freezes_tls_flags_for_a_non_default_context() {
+        use crate::session::test_support::EnvGuard;
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let docker = bin.join("docker");
+        std::fs::write(
+            &docker,
+            "#!/bin/sh\nif [ \"$1\" = context ]; then printf '%s' \"$FIXTURE_CONTEXT\"; else echo '{}'; fi\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let tls_dir = temp.path().join("metadata/docker");
+        std::fs::create_dir_all(&tls_dir).unwrap();
+        for file in ["ca.pem", "cert.pem", "key.pem"] {
+            std::fs::write(tls_dir.join(file), b"fixture").unwrap();
+        }
+        let context = serde_json::json!({
+            "Name": "tlsctx",
+            "Endpoints": {"docker": {"Host": "tcp://127.0.0.1:2375", "SkipTLSVerify": false}},
+            "TLSMaterial": {"docker": ["ca.pem", "cert.pem", "key.pem"]},
+            "Storage": {"TLSPath": temp.path().join("metadata")},
+        })
+        .to_string();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let _env = EnvGuard::set(&[
+            ("PATH", path.as_str()),
+            ("DOCKER_CONTEXT", "tlsctx"),
+            ("HOME", temp.path().to_str().unwrap()),
+            ("FIXTURE_CONTEXT", context.as_str()),
+        ]);
+        let _clear = EnvGuard::unset(&[
+            "DOCKER_HOST",
+            "DOCKER_CONFIG",
+            "DOCKER_TLS",
+            "DOCKER_TLS_VERIFY",
+            "DOCKER_CERT_PATH",
+        ]);
+
+        let snapshot = RuntimeExecutionSnapshot::capture(&ContainerRuntime::docker()).unwrap();
+        assert_eq!(
+            snapshot.global_arguments,
+            vec![
+                "--tls".to_owned(),
+                "--tlsverify=true".to_owned(),
+                format!("--tlscacert={}", expect_path(&tls_dir, "ca.pem")),
+                format!("--tlscert={}", expect_path(&tls_dir, "cert.pem")),
+                format!("--tlskey={}", expect_path(&tls_dir, "key.pem")),
+            ],
+            "the context's TLS setup must be frozen, not read from ambient env"
+        );
+        let command = snapshot.command(&["ps".to_owned()]);
+        assert_eq!(command.get_args().next().unwrap(), "--tls");
+    }
+
+    fn expect_path(tls_dir: &std::path::Path, file: &str) -> String {
+        tls_dir.join(file).to_str().unwrap().to_owned()
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn capture_keeps_tls_for_skip_tls_verify_without_material() {
+        use crate::session::test_support::EnvGuard;
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let docker = bin.join("docker");
+        std::fs::write(
+            &docker,
+            "#!/bin/sh\nif [ \"$1\" = context ]; then printf '%s' \"$FIXTURE_CONTEXT\"; else echo '{}'; fi\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let context = serde_json::json!({
+            "Name": "plain",
+            "Endpoints": {"docker": {"Host": "tcp://127.0.0.1:2375", "SkipTLSVerify": true}},
+            "Storage": {"TLSPath": temp.path().join("metadata")},
+        })
+        .to_string();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let _env = EnvGuard::set(&[
+            ("PATH", path.as_str()),
+            ("DOCKER_CONTEXT", "plain"),
+            ("HOME", temp.path().to_str().unwrap()),
+            ("FIXTURE_CONTEXT", context.as_str()),
+        ]);
+        let _clear = EnvGuard::unset(&[
+            "DOCKER_HOST",
+            "DOCKER_CONFIG",
+            "DOCKER_TLS",
+            "DOCKER_TLS_VERIFY",
+            "DOCKER_CERT_PATH",
+        ]);
+
+        let snapshot = RuntimeExecutionSnapshot::capture(&ContainerRuntime::docker()).unwrap();
+
+        assert_eq!(
+            snapshot.global_arguments,
+            vec![
+                "--tls".to_owned(),
+                "--tlsverify=false".to_owned(),
+                "--tlscacert=".to_owned(),
+                "--tlscert=".to_owned(),
+                "--tlskey=".to_owned(),
+            ],
+            "SkipTLSVerify must keep the endpoint on TLS instead of downgrading to HTTP"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn capture_rejects_a_declared_but_missing_tls_file() {
+        use crate::session::test_support::EnvGuard;
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let docker = bin.join("docker");
+        std::fs::write(
+            &docker,
+            "#!/bin/sh\nif [ \"$1\" = context ]; then printf '%s' \"$FIXTURE_CONTEXT\"; else echo '{}'; fi\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::create_dir_all(temp.path().join("metadata/docker")).unwrap();
+        std::fs::write(temp.path().join("metadata/docker/ca.pem"), b"fixture").unwrap();
+        let context = serde_json::json!({
+            "Name": "broken",
+            "Endpoints": {"docker": {"Host": "tcp://127.0.0.1:2375", "SkipTLSVerify": false}},
+            "TLSMaterial": {"docker": ["ca.pem", "cert.pem"]},
+            "Storage": {"TLSPath": temp.path().join("metadata")},
+        })
+        .to_string();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let _env = EnvGuard::set(&[
+            ("PATH", path.as_str()),
+            ("DOCKER_CONTEXT", "broken"),
+            ("HOME", temp.path().to_str().unwrap()),
+            ("FIXTURE_CONTEXT", context.as_str()),
+        ]);
+        let _clear = EnvGuard::unset(&["DOCKER_HOST", "DOCKER_CONFIG"]);
+
+        let error = RuntimeExecutionSnapshot::capture(&ContainerRuntime::docker())
+            .expect_err("a declared but missing certificate must fail the capture");
+
+        assert!(
+            error.to_string().contains("TLS file is missing"),
+            "the refusal must name the missing file: {error}"
+        );
     }
 }

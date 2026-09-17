@@ -495,12 +495,11 @@ impl Instance {
         self.view == View::Structured
     }
 
-    /// ACP IDs need a native-store binding before terminal handoff. A binding
-    /// already asserted for the current ID is used as-is; otherwise AoE records
-    /// the native execution this session's terminal launch resolves, so the
-    /// handoff stays available while the ID's conversation store stays
-    /// provable, and is refused when that resolution fails.
-    pub(crate) fn switch_to_terminal_keep_context(&mut self) -> Result<()> {
+    /// Keep only a store asserted by the user or captured from the live worker.
+    pub(crate) fn switch_to_terminal_keep_context(
+        &mut self,
+        worker: Option<&ExecutionBinding>,
+    ) -> Result<()> {
         let sid = self
             .acp_session_id
             .clone()
@@ -515,7 +514,7 @@ impl Instance {
                     && binding.execution.as_ref().is_some_and(|execution| execution.agent == "claude")
             })
             .cloned()
-            .or_else(|| self.resolved_handoff_binding(&sid))
+            .or_else(|| self.resolved_handoff_binding(&sid, worker?))
             .context("ACP does not prove a native conversation store; bind its current ID with aoe session set-session-id SESSION ID --store /absolute/claude-store before switching to terminal")?;
         self.adopt_conversation_state(ConversationState {
             session_id: Some(sid.clone()),
@@ -532,63 +531,24 @@ impl Instance {
         Ok(())
     }
 
-    /// The binding AoE can prove for an ACP ID without a user assertion: the
-    /// native execution this session's terminal launch resolves for that ID, so
-    /// the handoff cannot validate against one store and then launch against
-    /// another.
-    ///
-    /// A host structured-view worker resolves Claude's store from the host
-    /// environment, the same way the ACP transcript gate does, while this
-    /// execution also honours `session.agent_config_dir`. A declaration that
-    /// moves the store away from that resolution would hand the conversation to
-    /// a store the worker never wrote to, so it needs the user to name the
-    /// store explicitly.
-    fn resolved_handoff_binding(&self, sid: &str) -> Option<ConversationBinding> {
-        let execution = match self.resolve_native_execution(Some((sid, None, true))) {
-            Ok(execution) => execution,
-            Err(error) => {
-                tracing::debug!(target: "session.store", instance = %self.id, sid = %sid,
-                    "structured-view handoff cannot resolve its native execution: {error:#}");
-                return None;
-            }
-        };
-        if execution.binding.agent != "claude" {
+    fn resolved_handoff_binding(
+        &self,
+        sid: &str,
+        worker: &ExecutionBinding,
+    ) -> Option<ConversationBinding> {
+        if worker.agent != "claude" || self.is_sandboxed() || worker.filesystem != "host" {
             return None;
         }
-        if !self.is_sandboxed() {
-            // Resolve the worker's store the way the launch resolves Claude's
-            // root, minus `session.agent_config_dir`, which the worker never
-            // reads: the session's own HOME, not the daemon's.
-            let environment = crate::session::capture::host_launcher_environment(
-                &self.resolved_host_environment(),
-            );
-            let value = |key: &str| {
-                environment
-                    .get(key)
-                    .filter(|value| !value.is_empty())
-                    .cloned()
-            };
-            let home = std::path::PathBuf::from(value("HOME")?);
-            let worker = value("CLAUDE_CONFIG_DIR")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| home.join(".claude"));
-            // The two spellings can differ only by symlinks in the session's
-            // own root (a symlinked home or temp directory), so both sides are
-            // reduced to the same identity before comparing.
-            let worker = crate::session::capture::canonicalize_allowing_missing_leaf(&worker)?;
-            let terminal = crate::session::capture::canonicalize_allowing_missing_leaf(
-                execution.binding.stores.first()?,
-            )?;
-            if worker != terminal {
-                return None;
-            }
-        }
-        Some(ConversationBinding {
-            session_id: sid.to_string(),
-            execution: Some(execution.binding.clone()),
+        let binding = ConversationBinding {
+            session_id: sid.to_owned(),
+            execution: Some(worker.clone()),
             provenance: ConversationProvenance::Asserted,
             transcript_path: None,
-        })
+        };
+        let execution = self
+            .resolve_native_execution(Some((sid, Some(&binding), true)))
+            .ok()?;
+        Self::execution_identity_matches(worker, &execution.binding).then_some(binding)
     }
 }
 
@@ -614,7 +574,8 @@ mod tests {
         inst.acp_load_session_capable = Some(true);
         inst.pi_session_path = Some("/tmp/foreign.jsonl".into());
 
-        inst.switch_to_terminal_keep_context().unwrap();
+        let worker = inst.resolve_native_execution(None).unwrap().binding;
+        inst.switch_to_terminal_keep_context(Some(&worker)).unwrap();
 
         assert!(inst.fork_parent_binding().is_some());
         assert_eq!(inst.view, View::Terminal);
@@ -658,7 +619,7 @@ mod tests {
             }),
         });
 
-        inst.switch_to_terminal_keep_context().unwrap();
+        inst.switch_to_terminal_keep_context(None).unwrap();
 
         assert_eq!(
             inst.agent_session_binding
@@ -688,7 +649,8 @@ mod tests {
         inst.view = View::Structured;
         inst.acp_session_id = Some("sid-abc".to_string());
 
-        inst.switch_to_terminal_keep_context().unwrap();
+        let worker = inst.resolve_native_execution(None).unwrap().binding;
+        inst.switch_to_terminal_keep_context(Some(&worker)).unwrap();
 
         assert_eq!(
             inst.agent_session_binding
@@ -724,7 +686,7 @@ mod tests {
         inst.view = View::Structured;
         inst.acp_session_id = Some("sid-abc".to_string());
 
-        let error = inst.switch_to_terminal_keep_context().unwrap_err();
+        let error = inst.switch_to_terminal_keep_context(None).unwrap_err();
 
         assert!(
             error.to_string().contains("set-session-id"),
@@ -767,7 +729,7 @@ mod tests {
         // The declaration moves the pane, so the handoff alone is refused; the
         // documented recovery names the store the structured-view worker writes,
         // and the launch must then honour it.
-        assert!(inst.switch_to_terminal_keep_context().is_err());
+        assert!(inst.switch_to_terminal_keep_context(None).is_err());
         let worker_store = temp.path().join("worker-claude");
         std::fs::create_dir_all(&worker_store).unwrap();
         let binding = inst
@@ -776,7 +738,7 @@ mod tests {
         inst.resume_intent = ResumeIntent::Use("sid-abc".into());
         inst.resume_binding = Some(binding);
 
-        inst.switch_to_terminal_keep_context().unwrap();
+        inst.switch_to_terminal_keep_context(None).unwrap();
 
         let prepared = inst
             .prepare_launch_command(inst.conversation_state())
@@ -800,7 +762,7 @@ mod tests {
         inst.view = View::Structured;
         inst.acp_session_id = Some("sid-abc".to_string());
 
-        let error = inst.switch_to_terminal_keep_context().unwrap_err();
+        let error = inst.switch_to_terminal_keep_context(None).unwrap_err();
 
         assert!(
             error.to_string().contains("set-session-id"),

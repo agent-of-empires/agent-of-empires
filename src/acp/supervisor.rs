@@ -357,6 +357,7 @@ struct WorkerHandle {
     /// revalidates it against the table so a stale actor cannot drop a
     /// replacement.
     lease: Lease,
+    native_session_id: Option<String>,
 }
 /// Per-session monotonically-increasing seq counter. Lives at the
 /// supervisor level (not on `WorkerHandle`) so it survives shutdown
@@ -2050,6 +2051,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             session_id.clone(),
             WorkerHandle {
                 client,
+                native_session_id: None,
                 drain_task,
                 // Empty: the initial spawn doesn't count toward the
                 // restart budget.
@@ -2306,6 +2308,10 @@ impl<S: BroadcastSink> Supervisor<S> {
                                 established = true;
                                 let mut guard = workers.lock().await;
                                 if let Some(handle) = guard.get_mut(&session_id) {
+                                    if handle.lease.epoch() != lease.epoch() {
+                                        continue;
+                                    }
+                                    handle.native_session_id = Some(acp_session_id.clone());
                                     if let WorkerKind::Runner { spawn_config } = &mut handle.kind {
                                         info!(
                                             target: "acp.supervisor",
@@ -2322,6 +2328,10 @@ impl<S: BroadcastSink> Supervisor<S> {
                             Event::SessionContextReset { reason } => {
                                 let mut guard = workers.lock().await;
                                 if let Some(handle) = guard.get_mut(&session_id) {
+                                    if handle.lease.epoch() != lease.epoch() {
+                                        continue;
+                                    }
+                                    handle.native_session_id = None;
                                     if let WorkerKind::Runner { spawn_config } = &mut handle.kind {
                                         info!(
                                             target: "acp.supervisor",
@@ -2761,6 +2771,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                                 Some(handle) => {
                                     handle.client = Arc::clone(&new_client);
                                     handle.lease = respawn_lease.clone();
+                                    handle.native_session_id = None;
                                     None
                                 }
                                 None => Some(InstallError::Stale),
@@ -3533,6 +3544,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             session_id.clone(),
             WorkerHandle {
                 client,
+                native_session_id: None,
                 drain_task,
                 restart_history: vec![],
                 // Attached: if the worker dies, the drain task sees EOF and
@@ -3593,6 +3605,23 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// No-op when there are no stale nonces.
     fn cancel_orphaned_elicitations(&self, session_id: &str) {
         cancel_orphaned_elicitations_on(&*self.sink, &self.next_seqs, session_id);
+    }
+
+    /// The native store the running worker launched with, for an ACP
+    /// to terminal handoff; None unless the live worker owns `acp_session_id`.
+    pub(crate) async fn native_handoff_store(
+        &self,
+        session_id: &str,
+        acp_session_id: &str,
+    ) -> Option<crate::session::ExecutionBinding> {
+        let workers = self.workers.lock().await;
+        let handle = workers.get(session_id)?;
+        if !lock_recover(&self.lifecycle).is_running(session_id)
+            || handle.native_session_id.as_deref() != Some(acp_session_id)
+        {
+            return None;
+        }
+        handle.client.native_store.clone()
     }
 
     /// Whether this session has a structured view worker up or coming up.
@@ -3713,6 +3742,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             session_id.to_string(),
             WorkerHandle {
                 client: Arc::new(client),
+                native_session_id: None,
                 drain_task: tokio::spawn(async {}),
                 restart_history: vec![],
                 kind,

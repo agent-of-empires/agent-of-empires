@@ -2367,7 +2367,14 @@ pub async fn acp_disable(
             session = %id,
             "keeping context on disable: carrying acp_session_id into agent_session_id for claude --resume"
         );
-        if let Err(error) = instance.switch_to_terminal_keep_context() {
+        let worker = state
+            .acp_supervisor
+            .native_handoff_store(
+                &id,
+                instance.acp_session_id.as_deref().expect("keep-context ID"),
+            )
+            .await;
+        if let Err(error) = instance.switch_to_terminal_keep_context(worker.as_ref()) {
             return (StatusCode::CONFLICT, error.to_string()).into_response();
         }
     } else {

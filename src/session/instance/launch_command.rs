@@ -1193,6 +1193,77 @@ mod tests {
             "a managed fork must not substitute defaults for an unreadable execution configuration"
         );
     }
+    #[test]
+    #[serial_test::serial]
+    fn a_sandboxed_assertion_keeps_the_native_container_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let profile = "sandbox-asserted-store";
+        super::super::test_helpers::declare_execution_aliases(
+            profile,
+            &[("claude", "claude")],
+            temp.path(),
+        );
+        let mut inst = Instance::new("claude-sandbox", project.to_str().unwrap());
+        inst.tool = "claude".into();
+        inst.command = "claude".into();
+        inst.source_profile = profile.into();
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "fixture".into(),
+            container_name: "claude-sandbox".into(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: Some("/workspace/project".into()),
+            before_start_env: Vec::new(),
+        });
+        let config = inst.build_container_config().unwrap();
+        let _transport = super::super::test_helpers::install_container_transport(
+            temp.path(),
+            "claude-sandbox",
+            &config.volumes,
+        );
+        std::fs::copy(
+            temp.path().join("native-bin/prime-agent"),
+            temp.path().join("native-bin/claude"),
+        )
+        .unwrap();
+        let sid = "11111111-1111-4111-8111-111111111111";
+        let execution = inst.resolve_native_execution(None).unwrap();
+        let asserted = inst
+            .asserted_resume_binding(sid, None)
+            .expect("the resolved execution must provide the asserted identity");
+        inst.resume_intent = ResumeIntent::Use(sid.into());
+        inst.resume_binding = Some(asserted);
+        inst.prepare_launch_command(inst.conversation_state())
+            .expect("the assertion must keep the native store mounted");
+        let resumed = inst
+            .resolve_native_execution(inst.conversation_target())
+            .unwrap();
+        inst.validate_conversation_target(&resumed.binding, Some(sid))
+            .unwrap();
+        // The assertion pins the sandbox's own native store: the identity
+        // match proves it did not re-route, and the container routing keeps
+        // the mounted path instead of the host-side projection.
+        assert_eq!(resumed.binding, execution.binding);
+        assert_ne!(
+            resumed.binding.stores[0],
+            std::path::Path::new("/root/.claude")
+        );
+        assert_eq!(
+            resumed
+                .routing
+                .iter()
+                .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
+                .unwrap()
+                .1
+                .as_deref(),
+            Some("/root/.claude")
+        );
+    }
 
     #[test]
     #[serial_test::serial]

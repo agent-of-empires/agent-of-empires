@@ -106,6 +106,7 @@ pub struct AcpClient {
     /// Pid of the detached `aoe __acp-runner` this client launched, so the
     /// supervisor can identify the exact process its lease owns.
     runner_pid: Option<u32>,
+    pub(crate) native_store: Option<crate::session::ExecutionBinding>,
 }
 
 /// Per-session resources the connection task uses to handle ACP fs/* and
@@ -158,6 +159,7 @@ impl AcpClient {
             pending_responders: Arc::new(Mutex::new(HashMap::new())),
             _child: None,
             runner_pid: None,
+            native_store: None,
         };
         (client, event_tx)
     }
@@ -179,6 +181,7 @@ impl AcpClient {
             pending_responders: Arc::new(Mutex::new(HashMap::new())),
             _child: None,
             runner_pid: None,
+            native_store: None,
         }
     }
 
@@ -217,6 +220,7 @@ impl AcpClient {
             pending_responders: Arc::new(Mutex::new(HashMap::new())),
             _child: None,
             runner_pid: None,
+            native_store: None,
         };
         (client, event_tx, saw_delete)
     }
@@ -273,6 +277,7 @@ impl AcpClient {
             pending_responders: Arc::new(Mutex::new(HashMap::new())),
             _child: None,
             runner_pid: None,
+            native_store: None,
         };
         (client, event_tx, cmds)
     }
@@ -311,6 +316,7 @@ impl AcpClient {
             pending_responders: Arc::new(Mutex::new(HashMap::new())),
             _child: None,
             runner_pid: None,
+            native_store: None,
         };
         (client, event_tx)
     }
@@ -381,7 +387,7 @@ impl AcpClient {
             // before binding the replacement. No-op when there is no live
             // prior runner. See #1689.
             crate::process::worker_registry::terminate_and_wait(&session_id.0).await;
-            let runner_pid =
+            let (runner_pid, native_store) =
                 spawn_runner_detached(&config, &socket_path, session_id.0.clone(), runner_sandbox)?;
             return Self::connect_via_socket(
                 socket_path,
@@ -405,11 +411,12 @@ impl AcpClient {
             .await
             .map(|mut client| {
                 client.runner_pid = Some(runner_pid);
+                client.native_store = native_store;
                 client
             });
         }
 
-        let child = spawn_subprocess(&config)?;
+        let (child, native_store) = spawn_subprocess(&config)?;
         let child = Arc::new(Mutex::new(child));
         Self::start_with_stdio(
             config.cwd,
@@ -431,6 +438,10 @@ impl AcpClient {
             mcp_servers,
         )
         .await
+        .map(|mut client| {
+            client.native_store = native_store;
+            client
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -536,6 +547,7 @@ impl AcpClient {
             pending_responders,
             _child: Some(child),
             runner_pid: None,
+            native_store: None,
         })
     }
 
@@ -690,6 +702,7 @@ impl AcpClient {
             pending_responders,
             _child: None,
             runner_pid: None,
+            native_store: None,
         })
     }
 
