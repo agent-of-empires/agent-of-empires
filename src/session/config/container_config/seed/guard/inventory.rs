@@ -108,7 +108,11 @@ impl<'a> Inventory<'a> {
             // alias. Its entire resolution, including absent targets, is leased.
             self.resolve(lookup, origin)?;
         } else if mode == libc::S_IFREG {
-            if stat.st_nlink > 1 && !self.access.allows_file(lookup, origin) {
+            if stat.st_nlink > 1
+                && !self
+                    .access
+                    .allows_file(lookup, &directory.path().join(leaf), origin)
+            {
                 self.inodes.insert(identity(&stat));
             }
         } else if mode == libc::S_IFDIR {
@@ -134,7 +138,18 @@ impl<'a> Inventory<'a> {
         let (device, inode) = directory.identity()?;
         #[cfg(target_os = "macos")]
         let device = device as u64;
-        let exceptional_spelling = matches!(self.access.exception, Exception::Mixed { origin: allowed, leaves } if allowed == origin && leaves.iter().any(|leaf| leaf.starts_with(lookup)));
+        let exceptional_spelling = match self.access.exception {
+            Exception::Mixed {
+                origin: allowed,
+                leaves,
+            } => allowed == origin && leaves.iter().any(|leaf| leaf.starts_with(lookup)),
+            Exception::Carried { root } => {
+                origin == StateOrigin::Native
+                    && lookup.starts_with(root)
+                    && directory.path().starts_with(root)
+            }
+            _ => false,
+        };
         if !self
             .visited
             .insert((device, inode, origin, exceptional_spelling))

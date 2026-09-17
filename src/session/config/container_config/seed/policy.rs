@@ -71,8 +71,24 @@ pub(super) struct ReadAccess<'a> {
 }
 
 impl ReadAccess<'_> {
-    pub(super) fn allows_file(&self, candidate: &Path, origin: StateOrigin) -> bool {
-        matches!(self.exception, Exception::Mixed { origin: allowed, leaves } if origin == allowed && leaves.iter().any(|leaf| leaf == candidate))
+    pub(super) fn allows_file(
+        &self,
+        candidate: &Path,
+        physical: &Path,
+        origin: StateOrigin,
+    ) -> bool {
+        match self.exception {
+            Exception::Mixed {
+                origin: allowed,
+                leaves,
+            } => origin == allowed && leaves.iter().any(|leaf| leaf == candidate),
+            Exception::Carried { root } => {
+                origin == StateOrigin::Native
+                    && candidate.starts_with(root)
+                    && physical.starts_with(root)
+            }
+            _ => false,
+        }
     }
 
     pub(super) fn allows(
@@ -85,7 +101,7 @@ impl ReadAccess<'_> {
         if let Exception::Carried { root } = self.exception {
             return origin == StateOrigin::Native && candidate.starts_with(root);
         }
-        if !directory && self.allows_file(candidate, origin) {
+        if !directory && self.allows_file(candidate, candidate, origin) {
             return true;
         }
         // Collection traversal never admits a state node or its descendants.
