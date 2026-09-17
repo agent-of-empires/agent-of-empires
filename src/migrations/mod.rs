@@ -262,6 +262,7 @@ pub fn run_migrations_announced(reporter: Option<progress::Reporter>) -> Result<
 
 fn run_migrations_inner(reporter: Option<progress::Reporter>, announce: bool) -> Result<()> {
     let _installed = progress::install(reporter);
+    let _announced = progress::install_announced(announce);
     let current = get_current_version();
     debug!("Current schema version: {}", current);
 
