@@ -295,6 +295,21 @@ impl Conversion {
 /// The workspace directory comes from the same `workspace_path_template` and
 /// `compute_path` creation uses, seeded with the session id, so a converted
 /// session sits exactly where an equivalent created-multi-repo session would.
+/// Whether the session's recorded conversation is known to be bound to its
+/// current working directory.
+///
+/// A known conversation (`Observed`, `Asserted` or `Imported`, with its
+/// execution identity) fails the launch identity check after the working
+/// directory moves, so an attach that moves the session would strand it. A
+/// preallocated id has no conversation behind it, and an unknown-provenance
+/// id starts fresh, so neither blocks the move.
+fn conversation_cannot_follow(instance: &super::Instance) -> bool {
+    instance
+        .agent_session_binding
+        .as_ref()
+        .is_some_and(crate::session::ConversationBinding::is_known)
+}
+
 fn plan_conversion(
     instance: &super::Instance,
     profile: &str,
@@ -519,6 +534,23 @@ pub fn plan(
     // checkout, workspace path taken, branch already checked out) happens with
     // nothing created.
     let conversion = plan_conversion(instance, profile, on_existing)?;
+    // A conversation AoE observed (or the user asserted) is bound to the
+    // working directory it was recorded in, and the relaunch after a
+    // workspace conversion refuses that stale cwd. Refuse at plan time,
+    // before the session is stopped and its checkout moved: the attach
+    // must not leave a moved session whose conversation can never launch
+    // again. A preallocated id has no conversation behind it and rebinds
+    // at launch; an unknown-provenance id starts fresh. See #3933.
+    if !matches!(conversion, Conversion::Append { .. }) && conversation_cannot_follow(instance) {
+        bail!(
+            "'{}' carries a conversation bound to its current working directory; \
+             moving the session into '{}' would leave that conversation \
+             unresumable. Rebind it with `aoe session set-session-id`, or attach \
+             to a session whose conversation is not live.",
+            instance.title,
+            conversion.workspace_dir().display()
+        );
+    }
 
     let workspace_dir = conversion.workspace_dir().to_path_buf();
     let worktree_path = workspace_dir.join(&repo_name);
@@ -1536,6 +1568,72 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(session_wt.join("wip.txt")).unwrap(),
             "in progress"
+        );
+    }
+
+    /// A conversation AoE observed is bound to the working directory it was
+    /// recorded in, and the launch after a workspace move refuses that stale
+    /// cwd. The refusal has to happen at plan time, before the session is
+    /// stopped and its checkout moved, or the user is left with a moved
+    /// session whose conversation can never launch again.
+    #[test]
+    #[serial_test::serial]
+    fn a_known_conversation_refuses_the_attach_before_anything_moves() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _guard = isolated_profile(temp.path(), "attach-conv");
+
+        let backend = temp.path().join("src/backend");
+        let frontend = temp.path().join("src/frontend");
+        init_repo(&backend);
+        init_repo(&frontend);
+        let session_wt = temp.path().join("src/backend-featx");
+        git_in(
+            &backend,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "featx",
+                session_wt.to_str().unwrap(),
+            ],
+        );
+
+        let mut inst = Instance::new("Worktree Session", session_wt.to_str().unwrap());
+        inst.worktree_info = Some(WorktreeInfo {
+            branch: "featx".to_string(),
+            main_repo_path: backend.to_string_lossy().to_string(),
+            managed_by_aoe: true,
+            created_at: Utc::now(),
+            base_branch: None,
+        });
+        inst.tool = "claude".into();
+        let sid = "22222222-2222-4222-8222-222222222222";
+        inst.agent_session_id = Some(sid.into());
+        inst.agent_session_binding = Some(crate::session::ConversationBinding {
+            session_id: sid.into(),
+            execution: Some(crate::session::ExecutionBinding {
+                agent: "claude".into(),
+                stores: vec![temp.path().join("claude-store")],
+                configuration: Vec::new(),
+                cwd: session_wt.clone(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+            }),
+            provenance: crate::session::ConversationProvenance::Observed,
+            transcript_path: None,
+        });
+
+        let Err(err) = plan(&inst, "attach-conv", &frontend, ExistingBranch::Refuse) else {
+            panic!("a known conversation cannot follow the workspace move");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("conversation") && msg.contains("set-session-id"),
+            "the refusal has to name the conversation and the recovery: {msg}"
+        );
+        assert!(
+            session_wt.join("README.md").exists(),
+            "a refusal must not touch the session's checkout"
         );
     }
 
