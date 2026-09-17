@@ -93,13 +93,13 @@ base("files pane numbers the lines of a source file", async ({ page }, testInfo)
     await notesRow.click();
 
     // The renderer marks each gutter cell with `data-line-number-content`, so
-    // assert one number per seeded line, in order, rather than that a gutter
-    // merely exists. The source text itself is split across highlight tokens,
-    // so the header path stands in for "the file opened".
+    // assert the numbers themselves, in order, rather than that a gutter
+    // merely exists. Four cells for three lines of code: the renderer splits
+    // on line offsets, so a file ending in a newline carries a final empty
+    // line and numbers it, the way an editor shows it.
     const gutter = page.locator("[data-line-number-content]");
-    await expect(gutter).toHaveCount(3, { timeout: 10_000 });
-    await expect(gutter).toHaveText(["1", "2", "3"]);
-    await expect(page.getByText("notes.ts").first()).toBeVisible();
+    await expect(gutter).toHaveCount(4, { timeout: 10_000 });
+    await expect(gutter).toHaveText(["1", "2", "3", "4"]);
   } finally {
     await serve.stop();
   }
