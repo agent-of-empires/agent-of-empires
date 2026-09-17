@@ -1828,7 +1828,7 @@ mod tests {
     /// not count as replayed until the crate has applied that replay (#4016).
     #[tokio::test]
     async fn session_replayed_waits_for_replay_sent_after_the_reply() {
-        use agent_client_protocol::schema::v1::SessionNotification;
+        use super::super::session_identity::SessionIngressNotification;
         use agent_client_protocol::{ByteStreams, Client};
         use futures_util::FutureExt as _;
         use std::sync::atomic::AtomicBool;
@@ -1894,28 +1894,30 @@ mod tests {
             let (read, write) = tokio::io::split(crate_side);
             Client
                 .builder()
+                // One handler for both, as the connection registers them.
                 .on_receive_notification(
                     {
                         let applied = applied.clone();
-                        move |_: SessionNotification, _cx| {
+                        move |notification: SessionIngressNotification, _cx| {
                             let gate = gate.clone();
                             let applied = applied.clone();
+                            let control = marker_client.clone();
                             async move {
-                                if let Some((entered, release)) = gate.lock().await.take() {
-                                    entered.send(()).unwrap();
-                                    release.await.unwrap();
+                                match notification {
+                                    SessionIngressNotification::Replayed(marker) => {
+                                        control.mark_session_replayed(marker);
+                                    }
+                                    SessionIngressNotification::Update(_) => {
+                                        if let Some((entered, release)) = gate.lock().await.take() {
+                                            entered.send(()).unwrap();
+                                            release.await.unwrap();
+                                        }
+                                        applied.store(true, AtomicOrdering::Relaxed);
+                                    }
                                 }
-                                applied.store(true, AtomicOrdering::Relaxed);
                                 Ok(())
                             }
                         }
-                    },
-                    agent_client_protocol::on_receive_notification!(),
-                )
-                .on_receive_notification(
-                    move |marker: SessionReplayed, _cx| {
-                        marker_client.mark_session_replayed(marker);
-                        async { Ok(()) }
                     },
                     agent_client_protocol::on_receive_notification!(),
                 )

@@ -69,7 +69,6 @@ use super::watchdog::{
     OFF_PROTOCOL_WORK_GRACE_FLOOR,
 };
 use super::SessionResources;
-use crate::acp::control_protocol::SessionReplayed;
 
 /// Fully silent grace after reattaching to an in-flight turn. Any inbound
 /// notification disarms this watchdog because later silence may be reasoning.
@@ -723,20 +722,21 @@ pub(super) async fn run_connection_task<W, R>(
             move |notification: SessionIngressNotification, _cx| {
                 let ingress = ingress_for_notif.clone();
                 let apply = apply_for_notif.clone();
+                let control = control_for_replayed.clone();
                 async move {
-                    let (notification, wire_bytes) = notification.decode(control_notifications)?;
+                    let params = match notification {
+                        SessionIngressNotification::Replayed(marker) => {
+                            if let Some(control) = control.as_ref() {
+                                control.mark_session_replayed(marker);
+                            }
+                            return Ok(());
+                        }
+                        SessionIngressNotification::Update(params) => params,
+                    };
+                    let (notification, wire_bytes) = SessionIngressNotification::decode_update(params, control_notifications)?;
                     let Some((notification, _guard)) = ingress.notification(notification, wire_bytes).await? else { return Ok(()); };
                     apply(notification, true).await
                 }
-            },
-            agent_client_protocol::on_receive_notification!(),
-        )
-        .on_receive_notification(
-            move |marker: SessionReplayed, _cx| {
-                if let Some(control) = control_for_replayed.as_ref() {
-                    control.mark_session_replayed(marker);
-                }
-                async { Ok(()) }
             },
             agent_client_protocol::on_receive_notification!(),
         )
