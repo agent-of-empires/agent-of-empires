@@ -1309,6 +1309,13 @@ fn publish_receipt(receipt: &mut Receipt, path: &Path) -> Result<()> {
                     .context("recovery escaped its private root")?;
                 let parent = recovery.create_child(relative)?;
                 parent.sync()?;
+                recovery
+                    .child(
+                        relative
+                            .parent()
+                            .context("recovery index has no transaction")?,
+                    )?
+                    .sync()?;
                 recovery.sync()?;
                 rename_directory(&part.root.path, &part.recovery)?;
             } else if backup.as_ref() != Some(original) {
@@ -1898,6 +1905,9 @@ pub fn run() -> Result<()> {
     if dirs::home_dir().is_none() {
         return Ok(());
     }
+    if progress::announced() {
+        layout::reconcile_pending(true)?;
+    }
     reconcile_pending(progress::announced())
 }
 
@@ -2102,11 +2112,15 @@ pub(crate) fn guard_preparation(
 mod tests {
     use super::*;
 
-    struct TestReconcileGuard(Option<TestReconcileProbes>);
+    struct TestReconcileGuard {
+        content: Option<TestReconcileProbes>,
+        layout: Option<layout::TestReconcileProbes>,
+    }
 
     impl Drop for TestReconcileGuard {
         fn drop(&mut self) {
-            TEST_RECONCILE_PROBES.set(self.0);
+            TEST_RECONCILE_PROBES.set(self.content);
+            layout::TEST_RECONCILE_PROBES.set(self.layout);
         }
     }
 
@@ -2115,11 +2129,15 @@ mod tests {
         reap: fn(&str) -> Result<bool>,
         exposure: fn(&str) -> Result<Vec<PathBuf>>,
     ) -> TestReconcileGuard {
-        TestReconcileGuard(TEST_RECONCILE_PROBES.replace(Some(TestReconcileProbes {
-            running,
-            reap,
-            exposure,
-        })))
+        TestReconcileGuard {
+            content: TEST_RECONCILE_PROBES.replace(Some(TestReconcileProbes {
+                running,
+                reap,
+                exposure,
+            })),
+            layout: layout::TEST_RECONCILE_PROBES
+                .replace(Some(layout::TestReconcileProbes { running, reap })),
+        }
     }
 
     /// The same-kernel mount proof runs only for a running container on a
@@ -3241,6 +3259,322 @@ mod tests {
             Phase::Staged,
             "the publish already began, so the stage stays for the resume path"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn hermes_migration_seeds_single_link_controls_into_an_empty_private_store() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let home = dirs::home_dir().unwrap();
+        let app = crate::session::get_app_dir().unwrap();
+        let project = temporary.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let mut instance = crate::session::Instance::new("hermes", project.to_str().unwrap());
+        instance.tool = "hermes".to_owned();
+        let config = crate::session::Config::default();
+        let roots = container_config::sandbox_content_roots(
+            "hermes",
+            None,
+            &config.session,
+            &home,
+            &instance.id,
+        )
+        .unwrap();
+        let source = &roots[0].host;
+        let destination = &roots[0].path;
+        fs::create_dir_all(source.join("workspace/meetings")).unwrap();
+        fs::create_dir_all(source.join("skills/authored")).unwrap();
+        let nodes = br#"{"nodes":[{"id":"remote","token":"portable"}]}"#;
+        let curator = br#"{"paused":true}"#;
+        fs::write(source.join("workspace/meetings/nodes.json"), nodes).unwrap();
+        fs::write(source.join("skills/.curator_state"), curator).unwrap();
+        fs::write(source.join("skills/authored/SKILL.md"), b"AUTHORED_SKILL").unwrap();
+        assert_eq!(
+            fs::metadata(source.join("workspace/meetings/nodes.json"))
+                .unwrap()
+                .nlink(),
+            1
+        );
+        assert_eq!(
+            fs::metadata(source.join("skills/.curator_state"))
+                .unwrap()
+                .nlink(),
+            1
+        );
+        assert!(!destination.exists());
+        let mut row = serde_json::to_value(&instance).unwrap();
+        row["sandbox_info"] = serde_json::json!({"enabled": true, "image": "img", "container_name": "aoe-sandbox-fixture"});
+        fs::write(
+            app.join("sessions.json"),
+            serde_json::to_vec(&vec![row]).unwrap(),
+        )
+        .unwrap();
+        fs::write(app.join(".schema_version"), "28").unwrap();
+        let _probes =
+            install_test_reconcile_probes(|_| Ok(false), |_| Ok(true), |_| Ok(Vec::new()));
+
+        super::super::run_migrations_announced(None).unwrap();
+        assert!(roots_ready(&app, &instance.id, "hermes", &roots).unwrap());
+        assert_eq!(
+            fs::read(destination.join("workspace/meetings/nodes.json")).unwrap(),
+            nodes
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(
+                &fs::read(destination.join("skills/.curator_state")).unwrap()
+            )
+            .unwrap(),
+            serde_json::json!({"paused": true})
+        );
+        assert_eq!(
+            fs::read(destination.join("skills/authored/SKILL.md")).unwrap(),
+            b"AUTHORED_SKILL"
+        );
+        assert_eq!(
+            fs::read(source.join("workspace/meetings/nodes.json")).unwrap(),
+            nodes
+        );
+        assert_eq!(
+            fs::read(source.join("skills/.curator_state")).unwrap(),
+            curator
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn first_announced_run_from_schema_28_drains_generation_one_backlog() {
+        let temporary = tempfile::tempdir().unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let home = dirs::home_dir().unwrap();
+        let app = crate::session::get_app_dir().unwrap();
+        let project = temporary.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let mut instance = crate::session::Instance::new("codex", project.to_str().unwrap());
+        instance.tool = "codex".to_owned();
+        instance.agent_session_id = Some("old-native-context".to_owned());
+        let config = crate::session::Config::default();
+        let roots = container_config::sandbox_content_roots(
+            "codex",
+            None,
+            &config.session,
+            &home,
+            &instance.id,
+        )
+        .unwrap();
+        let legacy = home.join(".codex/sandbox").join(&instance.id);
+        fs::create_dir_all(legacy.join("sessions")).unwrap();
+        fs::write(
+            legacy.join("sessions/original.jsonl"),
+            b"LEGACY_PRIVATE_CONTEXT",
+        )
+        .unwrap();
+        fs::write(legacy.join("config.toml"), b"model = 'fixture-model'\n").unwrap();
+        let mut row = serde_json::to_value(&instance).unwrap();
+        row["sandbox_store_generation"] = serde_json::json!(1);
+        row["sandbox_info"] = serde_json::json!({"enabled": true, "image": "img", "container_name": "aoe-sandbox-fixture"});
+        fs::write(
+            app.join("sessions.json"),
+            serde_json::to_vec(&vec![row]).unwrap(),
+        )
+        .unwrap();
+        fs::write(app.join(".schema_version"), "28").unwrap();
+        let _probes =
+            install_test_reconcile_probes(|_| Ok(false), |_| Ok(true), |_| Ok(Vec::new()));
+
+        super::super::run_migrations_announced(None).unwrap();
+        let registry = fs::read(app.join("sessions.json")).unwrap();
+        let rows: Vec<Value> = serde_json::from_slice(&registry).unwrap();
+        assert_eq!(rows[0]["sandbox_store_generation"], 2);
+        assert!(roots_ready(&app, &instance.id, "codex", &roots).unwrap());
+        assert!(!legacy.exists());
+        assert!(!roots[0].path.join("sessions").exists());
+        assert_eq!(
+            fs::read(roots[0].path.join("config.toml")).unwrap(),
+            b"model = 'fixture-model'\n"
+        );
+        assert_eq!(fs::read(app.join(".schema_version")).unwrap(), b"31");
+        let receipt = receipt_path(&app, &instance.id, "codex").unwrap();
+        let archives: BTreeMap<_, _> = fs::read_dir(receipt.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "complete")
+            })
+            .map(|path| {
+                let bytes = fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect();
+        assert_eq!(archives.len(), 1);
+        let archive: Receipt = serde_json::from_slice(archives.values().next().unwrap()).unwrap();
+        assert_eq!(archive.phase, Phase::Committed);
+        let recovery = &archive.roots[0].recovery;
+        assert_eq!(
+            fs::read(recovery.join("sessions/original.jsonl")).unwrap(),
+            b"LEGACY_PRIVATE_CONTEXT"
+        );
+        let active_identity = identity(&roots[0].path).unwrap();
+        let recovery_identity = identity(recovery).unwrap();
+
+        super::super::run_migrations_announced(None).unwrap();
+        assert_eq!(identity(&roots[0].path).unwrap(), active_identity);
+        assert_eq!(identity(recovery).unwrap(), recovery_identity);
+        assert_eq!(fs::read(app.join("sessions.json")).unwrap(), registry);
+        assert!(roots_ready(&app, &instance.id, "codex", &roots).unwrap());
+        let retried: BTreeMap<_, _> = fs::read_dir(receipt.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "complete")
+            })
+            .map(|path| {
+                let bytes = fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect();
+        assert_eq!(retried, archives);
+        assert_eq!(
+            fs::read(recovery.join("sessions/original.jsonl")).unwrap(),
+            b"LEGACY_PRIVATE_CONTEXT"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn startup_from_schema_28_leaves_generation_one_backlog_untouched() {
+        let temporary = tempfile::tempdir().unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let home = dirs::home_dir().unwrap();
+        let app = crate::session::get_app_dir().unwrap();
+        let project = temporary.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let mut instance = crate::session::Instance::new("codex", project.to_str().unwrap());
+        instance.tool = "codex".to_owned();
+        let config = crate::session::Config::default();
+        let roots = container_config::sandbox_content_roots(
+            "codex",
+            None,
+            &config.session,
+            &home,
+            &instance.id,
+        )
+        .unwrap();
+        let legacy = home.join(".codex/sandbox").join(&instance.id);
+        fs::create_dir_all(legacy.join("sessions")).unwrap();
+        fs::write(
+            legacy.join("sessions/original.jsonl"),
+            b"LEGACY_PRIVATE_CONTEXT",
+        )
+        .unwrap();
+        let original_identity = identity(&legacy).unwrap();
+        let mut row = serde_json::to_value(&instance).unwrap();
+        row["sandbox_store_generation"] = serde_json::json!(1);
+        row["sandbox_info"] = serde_json::json!({"enabled": true, "image": "img", "container_name": "aoe-sandbox-fixture"});
+        let registry = serde_json::to_vec(&vec![row]).unwrap();
+        fs::write(app.join("sessions.json"), &registry).unwrap();
+        fs::write(app.join(".schema_version"), "28").unwrap();
+        let _probes = install_test_reconcile_probes(
+            |_| panic!("startup must not inspect pending containers"),
+            |_| panic!("startup must not reap pending containers"),
+            |_| panic!("startup must not inspect exposure"),
+        );
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let reporter: progress::Reporter =
+            std::sync::Arc::new(move |event| captured.lock().unwrap().push(event));
+
+        super::super::run_migrations_with(Some(reporter)).unwrap();
+        assert_eq!(fs::read(app.join(".schema_version")).unwrap(), b"31");
+        assert_eq!(fs::read(app.join("sessions.json")).unwrap(), registry);
+        assert_eq!(identity(&legacy).unwrap(), original_identity);
+        assert_eq!(
+            fs::read(legacy.join("sessions/original.jsonl")).unwrap(),
+            b"LEGACY_PRIVATE_CONTEXT"
+        );
+        assert!(!roots[0].path.exists());
+        assert!(!roots_ready(&app, &instance.id, "codex", &roots).unwrap());
+        assert!(
+            read_receipt(&receipt_path(&app, &instance.id, "codex").unwrap())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn recovery_parent_sync_failure_keeps_original_and_retryable_receipt() {
+        let temporary = tempfile::tempdir().unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let home = dirs::home_dir().unwrap();
+        let app = crate::session::get_app_dir().unwrap();
+        let mut instance =
+            crate::session::Instance::new("codex", temporary.path().to_str().unwrap());
+        instance.tool = "codex".to_owned();
+        let config = crate::session::Config::default();
+        let roots = container_config::sandbox_content_roots(
+            "codex",
+            None,
+            &config.session,
+            &home,
+            &instance.id,
+        )
+        .unwrap();
+        let root = &roots[0].path;
+        fs::create_dir_all(root.join("sessions")).unwrap();
+        fs::write(
+            root.join("sessions/original.jsonl"),
+            b"PRIVATE_ORIGINAL_CONTEXT",
+        )
+        .unwrap();
+        fs::write(root.join("config.toml"), b"model = 'fixture-model'\n").unwrap();
+        let row = serde_json::to_value(&instance).unwrap();
+        let (path, mut receipt) = checked_receipt(&app, &row, "codex", &roots).unwrap();
+        record_retirement(&mut receipt, &row, &home, &config).unwrap();
+        stage_receipt(&app, &mut receipt, &path, &home, &config, temporary.path()).unwrap();
+        let original = identity(root).unwrap();
+        let stage = receipt.roots[0].stage.clone();
+        let staged = identity(&stage).unwrap();
+        let recovery = receipt.roots[0].recovery.clone();
+        let transaction = recovery.parent().unwrap().parent().unwrap().to_path_buf();
+        crate::session::anchored_fs::FAIL_SYNC_ONCE.set(Some(transaction));
+        let result = publish_receipt(&mut receipt, &path);
+        crate::session::anchored_fs::FAIL_SYNC_ONCE.set(None);
+        assert!(
+            result.is_err(),
+            "retention requires a durable transaction directory"
+        );
+        assert_eq!(identity(root).unwrap(), original);
+        assert_eq!(identity(&stage).unwrap(), staged);
+        assert_eq!(
+            fs::read(root.join("sessions/original.jsonl")).unwrap(),
+            b"PRIVATE_ORIGINAL_CONTEXT"
+        );
+        assert_eq!(
+            fs::read(stage.join("config.toml")).unwrap(),
+            b"model = 'fixture-model'\n"
+        );
+        assert!(!recovery.exists());
+        assert_eq!(read_receipt(&path).unwrap().unwrap().phase, Phase::Staged);
+        assert!(!roots_ready(&app, &instance.id, "codex", &roots).unwrap());
+
+        publish_receipt(&mut receipt, &path).unwrap();
+        receipt.phase = Phase::Committed;
+        write_receipt(&path, &receipt).unwrap();
+        certify_receipt(&app, &receipt).unwrap();
+        archive_receipt(&path, &receipt).unwrap();
+        assert!(roots_ready(&app, &instance.id, "codex", &roots).unwrap());
+        assert_eq!(identity(&recovery).unwrap(), original);
+        assert_eq!(identity(root).unwrap(), staged);
+        assert_eq!(
+            fs::read(recovery.join("sessions/original.jsonl")).unwrap(),
+            b"PRIVATE_ORIGINAL_CONTEXT"
+        );
+        assert!(!root.join("sessions").exists());
     }
 
     #[test]

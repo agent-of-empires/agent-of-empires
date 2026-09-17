@@ -111,6 +111,7 @@ pub(super) struct ReadGuard<'a> {
     directories: BTreeMap<PathBuf, Fingerprint>,
     files: BTreeMap<PathBuf, Fingerprint>,
     state_inodes: Option<HashSet<(u64, u64)>>,
+    symlink_inodes: Option<HashSet<(u64, u64)>>,
     entries: BTreeMap<PathBuf, Option<(u64, u64, u32)>>,
 }
 
@@ -127,6 +128,7 @@ impl<'a> ReadGuard<'a> {
             directories: BTreeMap::new(),
             files: BTreeMap::new(),
             state_inodes: None,
+            symlink_inodes: None,
             entries: BTreeMap::new(),
         };
         for (path, origin) in &boundary.paths {
@@ -205,6 +207,27 @@ impl<'a> ReadGuard<'a> {
             self.boundary
                 .rejects_path(path, state, false, *origin, self.access)
         }) {
+            return Ok(false);
+        }
+        if self.symlink_inodes.is_none() {
+            let mut walk = inventory::Inventory::symlinks(
+                self.boundary,
+                self.access,
+                &mut self.directories,
+                &mut self.routes,
+                &mut self.entries,
+            );
+            for (state, origin) in &self.aliases {
+                walk.root(state, *origin)?;
+            }
+            self.symlink_inodes = Some(walk.finish());
+        }
+        if self
+            .symlink_inodes
+            .as_ref()
+            .is_some_and(|inodes| inodes.contains(&(metadata.dev(), metadata.ino())))
+        {
+            tracing::warn!(target: "session.profile", path = %path.display(), "Skipping native-state symlink target in configuration");
             return Ok(false);
         }
         let fingerprint = Fingerprint::from(&metadata);

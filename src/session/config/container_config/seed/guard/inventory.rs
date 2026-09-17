@@ -16,9 +16,10 @@ pub(super) struct Inventory<'a> {
     directories: &'a mut BTreeMap<PathBuf, Fingerprint>,
     routes: &'a mut Vec<(PathBuf, PathBuf)>,
     entries: &'a mut BTreeMap<PathBuf, Option<(u64, u64, u32)>>,
-    visited: HashSet<(u64, u64, StateOrigin, bool)>,
+    visited: HashSet<(u64, u64, StateOrigin, bool, bool)>,
     inodes: HashSet<(u64, u64)>,
     skip_original: bool,
+    symlinks_only: bool,
 }
 
 impl<'a> Inventory<'a> {
@@ -38,7 +39,20 @@ impl<'a> Inventory<'a> {
             visited: HashSet::new(),
             inodes: HashSet::new(),
             skip_original: false,
+            symlinks_only: false,
         }
+    }
+
+    pub(super) fn symlinks(
+        boundary: &'a NativeStateBoundary,
+        access: ReadAccess<'a>,
+        directories: &'a mut BTreeMap<PathBuf, Fingerprint>,
+        routes: &'a mut Vec<(PathBuf, PathBuf)>,
+        entries: &'a mut BTreeMap<PathBuf, Option<(u64, u64, u32)>>,
+    ) -> Self {
+        let mut inventory = Self::new(boundary, access, directories, routes, entries);
+        inventory.symlinks_only = true;
+        inventory
     }
 
     pub(super) fn root(&mut self, path: &Path, origin: StateOrigin) -> Result<()> {
@@ -48,7 +62,7 @@ impl<'a> Inventory<'a> {
                 .stopped_original
                 .as_ref()
                 .is_some_and(|original| original != path && original.starts_with(path));
-        self.resolve(path, origin)
+        self.resolve(path, origin, false)
     }
 
     pub(super) fn finish(self) -> HashSet<(u64, u64)> {
@@ -66,7 +80,7 @@ impl<'a> Inventory<'a> {
                         .is_some_and(|original| physical == original)))
     }
 
-    fn resolve(&mut self, lookup: &Path, origin: StateOrigin) -> Result<()> {
+    fn resolve(&mut self, lookup: &Path, origin: StateOrigin, linked: bool) -> Result<()> {
         let canonical = canonical_expected_path(lookup)?;
         if self.skip(&canonical, origin) {
             return Ok(());
@@ -75,6 +89,22 @@ impl<'a> Inventory<'a> {
         super::watch_entry(self.entries, &canonical)?;
         if lookup != canonical {
             self.routes.push((lookup.to_path_buf(), canonical.clone()));
+        }
+        if self.symlinks_only
+            && linked
+            && !canonical.starts_with(self.boundary.source_root.path())
+            && !self
+                .boundary
+                .paths
+                .iter()
+                .any(|(root, _)| canonical.starts_with(root))
+            && !self
+                .boundary
+                .patterns
+                .iter()
+                .any(|(root, _, _)| canonical.starts_with(root))
+        {
+            return Ok(());
         }
         let parent = canonical
             .parent()
@@ -89,7 +119,7 @@ impl<'a> Inventory<'a> {
                 .file_name()
                 .context("native state entry has no name")?,
         );
-        self.entry(&directory, lookup, leaf, origin)
+        self.entry(&directory, lookup, leaf, origin, linked)
     }
 
     fn entry(
@@ -98,6 +128,7 @@ impl<'a> Inventory<'a> {
         lookup: &Path,
         leaf: &Path,
         origin: StateOrigin,
+        linked: bool,
     ) -> Result<()> {
         let Some(stat) = directory.entry_stat(leaf)? else {
             return Ok(());
@@ -106,9 +137,14 @@ impl<'a> Inventory<'a> {
         if mode == libc::S_IFLNK {
             // A new symlink replaced the resolved leaf, or this is a descendant
             // alias. Its entire resolution, including absent targets, is leased.
-            self.resolve(lookup, origin)?;
+            self.resolve(lookup, origin, true)?;
         } else if mode == libc::S_IFREG {
-            if stat.st_nlink > 1
+            let eligible = if self.symlinks_only {
+                linked
+            } else {
+                stat.st_nlink > 1
+            };
+            if eligible
                 && !self
                     .access
                     .allows_file(lookup, &directory.path().join(leaf), origin)
@@ -121,7 +157,7 @@ impl<'a> Inventory<'a> {
             if device != stat.st_dev || inode != stat.st_ino {
                 bail!("native state directory changed before inventory");
             }
-            self.directory(&child, lookup, origin)?;
+            self.directory(&child, lookup, origin, linked)?;
         }
         Ok(())
     }
@@ -131,6 +167,7 @@ impl<'a> Inventory<'a> {
         directory: &AnchoredDir,
         lookup: &Path,
         origin: StateOrigin,
+        linked: bool,
     ) -> Result<()> {
         if self.skip(directory.path(), origin) {
             return Ok(());
@@ -150,15 +187,26 @@ impl<'a> Inventory<'a> {
             }
             _ => false,
         };
-        if !self
-            .visited
-            .insert((device, inode, origin, exceptional_spelling))
-        {
+        if !self.visited.insert((
+            device,
+            inode,
+            origin,
+            exceptional_spelling,
+            self.symlinks_only && linked,
+        )) {
             return Ok(());
         }
-        super::pin_anchored_directory(self.directories, directory)?;
+        if !self.symlinks_only {
+            super::pin_anchored_directory(self.directories, directory)?;
+        }
         for name in directory.read_dir(Path::new(""), usize::MAX)? {
-            self.entry(directory, &lookup.join(&name), Path::new(&name), origin)?;
+            self.entry(
+                directory,
+                &lookup.join(&name),
+                Path::new(&name),
+                origin,
+                linked,
+            )?;
         }
         Ok(())
     }

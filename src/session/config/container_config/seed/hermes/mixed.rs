@@ -471,6 +471,79 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn single_link_nodes_referenced_by_native_symlinks_are_not_projected() {
+        use std::os::unix::fs::MetadataExt;
+
+        for (alias, target) in [
+            ("sessions/ref", "../workspace/meetings/nodes.json"),
+            ("workspace/meetings/other", "nodes.json"),
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+            let source = temporary.path().join("source");
+            fs::create_dir_all(source.join("workspace/meetings")).unwrap();
+            fs::create_dir(source.join("sessions")).unwrap();
+            let nodes = source.join("workspace/meetings/nodes.json");
+            let content = br#"{"nodes":[{"id":"remote","token":"native-context"}]}"#;
+            fs::write(&nodes, content).unwrap();
+            symlink(target, source.join(alias)).unwrap();
+            assert_eq!(fs::metadata(&nodes).unwrap().nlink(), 1);
+            let destination = temporary.path().join("active");
+            let boundary = boundary(&source, &destination);
+            seed_nodes(
+                &boundary,
+                boundary.hermes.source.unwrap(),
+                &boundary.source_root,
+                &AnchoredDir::open(&destination).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                !destination.join("workspace").exists(),
+                "native alias {alias} must deny the projection"
+            );
+            assert_eq!(fs::read(&nodes).unwrap(), content);
+            assert_eq!(fs::read(source.join(alias)).unwrap(), content);
+            assert_eq!(
+                fs::read_link(source.join(alias)).unwrap(),
+                Path::new(target)
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn single_link_nodes_with_only_an_authored_symlink_are_projected() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let source = temporary.path().join("source");
+        fs::create_dir_all(source.join("workspace/meetings")).unwrap();
+        let nodes = source.join("workspace/meetings/nodes.json");
+        let content = br#"{"nodes":[{"id":"remote","token":"portable"}]}"#;
+        fs::write(&nodes, content).unwrap();
+        let authored = temporary.path().join("authored-node-config");
+        symlink(&nodes, &authored).unwrap();
+        assert_eq!(fs::metadata(&nodes).unwrap().nlink(), 1);
+        let destination = temporary.path().join("active");
+        let boundary = boundary(&source, &destination);
+        seed_nodes(
+            &boundary,
+            boundary.hermes.source.unwrap(),
+            &boundary.source_root,
+            &AnchoredDir::open(&destination).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(destination.join("workspace/meetings/nodes.json")).unwrap(),
+            content
+        );
+        assert_eq!(fs::read(&nodes).unwrap(), content);
+        assert_eq!(fs::read_link(&authored).unwrap(), nodes);
+    }
+
+    #[test]
     fn canonical_profile_aliases_cannot_borrow_each_others_mixed_exception() {
         let temporary = tempfile::tempdir().unwrap();
         let source = temporary.path().join("source");
