@@ -496,9 +496,12 @@ impl Instance {
         let preparation = (|| -> Result<_> {
             let mut fresh_notice = None;
             if matches!(self.resume_intent, ResumeIntent::Default) {
+                if let Some(observation) = self.capture_freshest_conversation() {
+                    self.apply_conversation_observation(&observation);
+                }
                 // Migrated IDs cannot authorize resume until their store is qualified.
                 if let Some((sid, binding, _)) = self.conversation_target() {
-                    if binding.is_some_and(|binding| {
+                    if binding.is_none_or(|binding| {
                         !binding.is_known() && binding.provenance == ConversationProvenance::Unknown
                     }) {
                         fresh_notice = Some(FreshLaunchNotice::UnqualifiedStoredConversation {
@@ -511,9 +514,6 @@ impl Instance {
                         );
                         self.set_agent_conversation(None, None, self.pi_session_path.clone());
                     }
-                }
-                if let Some(observation) = self.capture_freshest_conversation() {
-                    self.apply_conversation_observation(&observation);
                 }
             }
             // An unattested launch context (auth, container identity,
@@ -580,7 +580,14 @@ impl Instance {
             } else {
                 None
             };
-            let parts = self.build_launch_command(execution.as_ref())?;
+            let parts = if fresh_notice.is_some() {
+                self.resume_intent = ResumeIntent::Cleared;
+                let result = self.build_launch_command(execution.as_ref());
+                self.resume_intent = ResumeIntent::Default;
+                result?
+            } else {
+                self.build_launch_command(execution.as_ref())?
+            };
             if managed || parts.1 {
                 let execution = execution
                     .as_ref()
@@ -1135,36 +1142,46 @@ mod tests {
         let mut instance = Instance::new("migrated", home.path().to_str().unwrap());
         instance.tool = "claude".into();
         instance.command = "claude".into();
-        instance.set_agent_conversation(
-            Some(sid.into()),
+        for binding in [
+            None,
             Some(ConversationBinding {
                 session_id: sid.into(),
                 execution: None,
                 provenance: ConversationProvenance::Unknown,
                 transcript_path: None,
             }),
-            None,
-        );
-        for intent in [
-            ResumeIntent::Use(sid.into()),
-            ResumeIntent::Fork { from: sid.into() },
         ] {
-            let mut explicit = instance.clone();
-            explicit.resume_intent = intent;
-            explicit.resume_binding = explicit.agent_session_binding.clone();
-            let before = explicit.conversation_state();
-            assert!(explicit.prepare_launch_command(before.clone()).is_err());
-            assert!(before.matches(&explicit));
+            instance.set_agent_conversation(Some(sid.into()), binding, None);
+            let directory = crate::hooks::ensure_instance_dir_path(&instance.id).unwrap();
+            let legacy = directory.join("session_id");
+            std::fs::write(&legacy, sid).unwrap();
+            for intent in [
+                ResumeIntent::Use(sid.into()),
+                ResumeIntent::Fork { from: sid.into() },
+            ] {
+                let mut explicit = instance.clone();
+                explicit.resume_intent = intent;
+                explicit.resume_binding = explicit.agent_session_binding.clone();
+                let before = explicit.conversation_state();
+                assert!(explicit.prepare_launch_command(before.clone()).is_err());
+                assert!(before.matches(&explicit));
+            }
+            let prepared = instance
+                .prepare_launch_command(instance.conversation_state())
+                .expect("an upgraded default session must start fresh");
+            assert!(!prepared.is_existing);
+            assert!(matches!(
+                prepared.fresh_notice,
+                Some(FreshLaunchNotice::UnqualifiedStoredConversation { .. })
+            ));
+            assert_eq!(instance.resume_intent, ResumeIntent::Default);
+            assert_eq!(std::fs::read_to_string(&legacy).unwrap(), sid);
+            let command = prepared.command.expect("native launch command");
+            assert!(
+                !command.contains(sid),
+                "the unqualified id must not be resumed"
+            );
         }
-        let prepared = instance
-            .prepare_launch_command(instance.conversation_state())
-            .expect("an upgraded default session must start fresh");
-        assert!(!prepared.is_existing);
-        let command = prepared.command.expect("native launch command");
-        assert!(
-            !command.contains(sid),
-            "the unqualified id must not be resumed"
-        );
     }
 
     #[test]
