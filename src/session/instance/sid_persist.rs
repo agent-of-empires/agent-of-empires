@@ -379,9 +379,6 @@ impl Instance {
                 }
                 SidPersistOutcome::Published
             }
-            // PinnedForeign can only be produced by or_pinned_foreign_publication;
-            // these storage-update closures never emit it, so it shares the
-            // divergence path without changing behavior.
             Ok(SidWrite::Skipped) | Ok(SidWrite::PinnedForeign) => match storage.load() {
                 Ok(insts) => match insts.into_iter().find(|i| i.id == self.id) {
                     Some(disk) => {

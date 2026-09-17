@@ -339,9 +339,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 source.title
             );
         }
-        // The child must fork the SAME agent as the parent: a captured id is
-        // agent-shaped (a Claude UUID resumes only under Claude, etc.), so
-        // handing it to a different agent's `--resume` fails or resumes garbage.
         let user_chose_tool = args.tool.is_some() || args.command.is_some();
         if !user_chose_tool {
             resolved_tool = source.tool.clone();
