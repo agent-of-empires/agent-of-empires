@@ -828,6 +828,10 @@ impl NewSessionDialog {
         // Reset sandbox/yolo defaults
         self.yolo_mode_default = config.session.yolo_mode_default;
         self.yolo_mode = self.yolo_mode_default;
+        self.structured_default = matches!(
+            config.acp.default_new_session_view,
+            crate::session::config::NewSessionView::Structured
+        );
         self.sandbox_enabled = self.docker_available
             && config.sandbox.enabled_by_default
             && !self.selected_tool_host_only();

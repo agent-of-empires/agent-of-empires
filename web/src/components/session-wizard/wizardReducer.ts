@@ -59,8 +59,8 @@ export interface WizardData {
    *  scratch arm. Not part of the submit payload. */
   pathIsGitRepo: boolean;
   /** Per-session opt-in to structured view rendering for ACP-capable tools.
-   *  Seeded from `acp.default_new_session_view` once settings load, falling
-   *  back to true until then; the user can turn it off in AgentStep to
+   *  Seeded from `acp.default_new_session_view` once settings load, and held
+   *  behind `structuredOffered` until then; the user can turn it off in AgentStep to
    *  launch a tmux/terminal session. The submit path sends
    *  `view: "structured"` only when the tool is ACP-capable and this flag is
    *  set; the server re-validates capability
@@ -70,9 +70,16 @@ export interface WizardData {
   useStructuredView: boolean;
   /** Whether `acp.offer_structured_in_new_session` lets this wizard offer the
    *  structured view at all. When false the toggle is hidden and every create
-   *  goes to a terminal, matching the TUI dialog (#3517). Optimistically true
-   *  so the control does not flicker in while settings load. */
+   *  goes to a terminal, matching the TUI dialog (#3517). Starts false, like
+   *  the setting's own opt-in default, so a submit racing the settings fetch
+   *  lands on the terminal rather than on a view the config never offered. */
   structuredOffered: boolean;
+  /** Set once the user works the structured-view control, so the mount-time
+   *  settings seeder stops overwriting their choice. `SET_FIELD` deliberately
+   *  leaves `useStructuredView` out of `profileDirty`, so without this the
+   *  seeder would win a race it should lose. A profile change still resets
+   *  the view, because the user confirms that overwrite first. */
+  structuredViewDirty: boolean;
   agentModel: string;
   agentEffort: string;
   /** When non-empty, this create is importing an existing Claude Code
@@ -114,6 +121,8 @@ export type Action =
       agentEffort?: string;
       structuredOffered?: boolean;
       useStructuredView?: boolean;
+      /** Set by the profile picker, whose overwrite the user has confirmed. */
+      resetStructuredViewDirty?: boolean;
       /** When true, skip the apply if the user has already edited an
        *  agent-step field. The picker-driven path always sets this false
        *  (the user has already confirmed the overwrite); the mount-time
@@ -151,7 +160,8 @@ export const initialData: WizardData = {
   scratch: false,
   pathIsGitRepo: true,
   useStructuredView: true,
-  structuredOffered: true,
+  structuredOffered: false,
+  structuredViewDirty: false,
   agentModel: "",
   agentEffort: "",
   importAcpSessionId: "",
@@ -161,6 +171,9 @@ export function reducer(state: WizardState, action: Action): WizardState {
   switch (action.type) {
     case "SET_FIELD": {
       const newData = { ...state.data, [action.field]: action.value };
+      if (action.field === "useStructuredView") {
+        newData.structuredViewDirty = true;
+      }
       if (action.field === "title" && !state.data.worktreeBranchDirty) {
         newData.worktreeBranch = slugifyBranch(String(action.value));
       }
@@ -264,11 +277,15 @@ export function reducer(state: WizardState, action: Action): WizardState {
           agentModel: action.agentModel ?? "",
           agentEffort: action.agentEffort ?? "",
           structuredOffered: action.structuredOffered ?? state.data.structuredOffered,
-          // An import already picked the structured view for a session that
-          // is structured on disk, so leave that choice alone.
-          useStructuredView: state.data.importAcpSessionId
-            ? state.data.useStructuredView
-            : (action.useStructuredView ?? state.data.useStructuredView),
+          // Two choices outrank the seeded default: an import, which picked
+          // the structured view for a session that is structured on disk, and
+          // a view the user set themselves. A profile change clears the latter
+          // (`resetStructuredViewDirty`) because the user confirmed it.
+          useStructuredView:
+            state.data.importAcpSessionId || (state.data.structuredViewDirty && !action.resetStructuredViewDirty)
+              ? state.data.useStructuredView
+              : (action.useStructuredView ?? state.data.useStructuredView),
+          structuredViewDirty: action.resetStructuredViewDirty ? false : state.data.structuredViewDirty,
           profileDirty: false,
         },
       };

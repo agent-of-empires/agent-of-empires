@@ -38,6 +38,9 @@ interface Props {
     extraEnv: string[];
     agentModel?: string;
     agentEffort?: string;
+    structuredOffered?: boolean;
+    useStructuredView?: boolean;
+    resetStructuredViewDirty?: boolean;
     commandMaps?: CommandMaps;
   }) => void;
   /** Profile-resolved override / custom-agent maps, used to preview the
@@ -194,6 +197,11 @@ export function AgentOptions({
           const defaultTool = (session?.default_tool as string) || data.tool;
           const acpDefaults = session?.acp_defaults as Record<string, unknown> | undefined;
           const acpDefault = acpDefaults?.[defaultTool] as Record<string, unknown> | undefined;
+          // The view defaults travel with every other profile default (#3517);
+          // without them a profile switch would leave the previous profile's
+          // opening view in place.
+          const acp = settings.acp as Record<string, unknown> | undefined;
+          const structuredOffered = (acp?.offer_structured_in_new_session as boolean) ?? false;
           onApplyProfileDefaults({
             yoloMode: (session?.yolo_mode_default as boolean) ?? false,
             sandboxEnabled: (sandbox?.enabled_by_default as boolean) ?? false,
@@ -202,6 +210,11 @@ export function AgentOptions({
             extraEnv: env,
             agentModel: typeof acpDefault?.model === "string" ? acpDefault.model : "",
             agentEffort: typeof acpDefault?.effort === "string" ? acpDefault.effort : "",
+            structuredOffered,
+            useStructuredView: structuredOffered && (acp?.default_new_session_view as string) !== "terminal",
+            // The user confirmed this overwrite in the prompt above, so a view
+            // they had set by hand is reset along with everything else.
+            resetStructuredViewDirty: true,
             commandMaps: commandMapsFromSettings(settings),
           });
         }

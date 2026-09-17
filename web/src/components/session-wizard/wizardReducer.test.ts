@@ -219,9 +219,8 @@ describe("SessionWizard reducer / APPLY_PROFILE_DEFAULTS (#1142)", () => {
 });
 
 describe("SessionWizard reducer / useStructuredView (#1580)", () => {
-  it("falls back to true until settings load, so the control does not flicker in", () => {
-    expect(initialData.useStructuredView).toBe(true);
-    expect(initialData.structuredOffered).toBe(true);
+  it("holds the structured view behind the opt-in until settings load", () => {
+    expect(initialData.structuredOffered).toBe(false);
   });
 
   it("seeds the opening view and the offer gate from settings (#3517)", () => {
@@ -243,6 +242,50 @@ describe("SessionWizard reducer / useStructuredView (#1580)", () => {
       expect(next.data.structuredOffered).toBe(seed.structuredOffered);
       expect(next.data.useStructuredView).toBe(seed.useStructuredView);
     }
+  });
+
+  it("keeps a view the user set before settings landed (#3517)", () => {
+    // SET_FIELD deliberately leaves this field out of profileDirty, so the
+    // seeder's skipIfDirty guard does not cover it.
+    const edited = reducer(makeState(), {
+      type: "SET_FIELD",
+      field: "useStructuredView",
+      value: false,
+    });
+    expect(edited.data.structuredViewDirty).toBe(true);
+    const seeded = reducer(edited, {
+      type: "APPLY_PROFILE_DEFAULTS",
+      yoloMode: false,
+      sandboxEnabled: false,
+      worktreeEnabled: false,
+      tool: "claude",
+      extraEnv: [],
+      structuredOffered: true,
+      useStructuredView: true,
+      skipIfDirty: true,
+    });
+    expect(seeded.data.useStructuredView).toBe(false);
+  });
+
+  it("lets a confirmed profile change reset a view the user set (#3517)", () => {
+    const edited = reducer(makeState(), {
+      type: "SET_FIELD",
+      field: "useStructuredView",
+      value: false,
+    });
+    const switched = reducer(edited, {
+      type: "APPLY_PROFILE_DEFAULTS",
+      yoloMode: false,
+      sandboxEnabled: false,
+      worktreeEnabled: false,
+      tool: "claude",
+      extraEnv: [],
+      structuredOffered: true,
+      useStructuredView: true,
+      resetStructuredViewDirty: true,
+    });
+    expect(switched.data.useStructuredView).toBe(true);
+    expect(switched.data.structuredViewDirty).toBe(false);
   });
 
   it("leaves an imported session on the structured view the seeder would clear", () => {

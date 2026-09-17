@@ -419,19 +419,19 @@ fn default_show_spans() -> bool {
 pub struct AcpConfig {
     /// Show the "Structured view" toggle in the new-session dialog, and
     /// offer switching an existing terminal session into the structured
-    /// view. Turn this off to keep every new session on a terminal and hide
-    /// the toggle on both surfaces. Opening already-structured sessions, and
-    /// switching a structured session back to a terminal, are unaffected.
-    #[serde(default = "default_offer_structured")]
+    /// view. The structured view is still maturing, so both are hidden by
+    /// default; turn this on to opt in. Opening already-structured sessions,
+    /// and switching a structured session back to a terminal, are unaffected.
+    #[serde(default)]
     #[setting(
         label = "Offer structured view when creating a session",
         widget = "toggle"
     )]
     pub offer_structured_in_new_session: bool,
-    /// Which view the new-session dialog starts on for agents that can back a
-    /// structured session. Either way the dialog's own toggle still wins for
-    /// that one session. Ignored while the toggle above is off, which forces
-    /// every new session to a terminal.
+    /// Which view the new-session dialog starts on, once the toggle above has
+    /// opted in and the chosen agent can back a structured session. The
+    /// dialog's own toggle still wins for that one session either way.
+    /// Ignored while the toggle above is off: every new session is a terminal.
     #[serde(default)]
     #[setting(
         label = "Default view for new sessions",
@@ -644,7 +644,7 @@ fn default_silent_orphan_grace_secs() -> u32 {
 impl Default for AcpConfig {
     fn default() -> Self {
         Self {
-            offer_structured_in_new_session: default_offer_structured(),
+            offer_structured_in_new_session: false,
             default_new_session_view: NewSessionView::default(),
             default_agent: default_agent(),
             restrict_agents: false,
@@ -666,10 +666,6 @@ impl Default for AcpConfig {
 
 /// Built-in `acp.default_agent`.
 pub const DEFAULT_ACP_AGENT: &str = "claude-code";
-
-fn default_offer_structured() -> bool {
-    true
-}
 
 fn default_agent() -> String {
     DEFAULT_ACP_AGENT.to_string()

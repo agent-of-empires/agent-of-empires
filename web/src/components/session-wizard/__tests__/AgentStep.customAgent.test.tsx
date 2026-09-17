@@ -73,7 +73,9 @@ function renderAgentStep(overrides: { tool?: string; agents?: AgentInfo[] }) {
   const onChange = vi.fn();
   const utils = render(
     <AgentStep
-      data={{ ...initialData, tool: overrides.tool ?? "claude" }}
+      // The structured view is opt-in (#3517); these cases are about what the
+      // picker renders once you have opted in.
+      data={{ ...initialData, structuredOffered: true, tool: overrides.tool ?? "claude" }}
       onChange={onChange}
       agents={overrides.agents ?? [builtin, custom]}
       profiles={[] as ProfileInfo[]}
@@ -156,7 +158,7 @@ describe("AgentStep profile description (#949)", () => {
     const onApplyProfileDefaults = vi.fn();
     const utils = render(
       <AgentStep
-        data={{ ...initialData, tool: "claude", ...dataOverrides }}
+        data={{ ...initialData, structuredOffered: true, tool: "claude", ...dataOverrides }}
         onChange={onChange}
         agents={[builtin]}
         profiles={profiles}

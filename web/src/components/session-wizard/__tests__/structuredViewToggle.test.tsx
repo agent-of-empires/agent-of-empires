@@ -197,52 +197,62 @@ describe("SessionWizard structured_view payload", () => {
     return render(<SessionWizard onClose={() => {}} onCreated={() => {}} prefill={{ path: "/tmp/proj" }} />);
   }
 
+  /** The structured view is opt-in (#3517), so every wizard-level case that
+   *  expects the toggle to exist has to turn it on in settings first. */
+  function offerStructured(extra: Record<string, unknown> = {}) {
+    vi.mocked(fetchSettings).mockResolvedValueOnce({
+      session: {},
+      sandbox: {},
+      acp: { offer_structured_in_new_session: true, ...extra },
+    } as unknown as Awaited<ReturnType<typeof fetchSettings>>);
+  }
+
   it("sends the structured view for an ACP tool when the toggle is left on (default)", async () => {
-    const { getByText } = renderWizard();
+    offerStructured();
+    const { getByText, getByRole } = renderWizard();
+    await waitFor(() => {
+      fireEvent.click(getByText("More options"));
+      expect(getByRole("switch", { name: "Use structured view" }).getAttribute("aria-checked")).toBe("true");
+    });
     fireEvent.click(getByText(/Launch session/));
     await waitFor(() => expect(createSession).toHaveBeenCalled());
     expect(createSession).toHaveBeenCalledWith(expect.objectContaining({ tool: "claude", view: "structured" }));
   });
 
   it("sends the terminal view when the user opts out via the toggle", async () => {
+    offerStructured();
     const { getByText, getByRole } = renderWizard();
     // The structured-view switch lives under More options (#2210): expand,
     // flip it off, then launch.
-    fireEvent.click(getByText("More options"));
+    await waitFor(() => {
+      fireEvent.click(getByText("More options"));
+      expect(getByRole("switch", { name: "Use structured view" })).toBeTruthy();
+    });
     fireEvent.click(getByRole("switch", { name: "Use structured view" }));
     fireEvent.click(getByText(/Launch session/));
     await waitFor(() => expect(createSession).toHaveBeenCalled());
     expect(createSession).toHaveBeenCalledWith(expect.objectContaining({ tool: "claude", view: "terminal" }));
   });
 
-  it("opens on the terminal view, and sends it, when settings default that way (#3517)", async () => {
-    vi.mocked(fetchSettings).mockResolvedValueOnce({
-      session: {},
-      sandbox: {},
-      acp: { offer_structured_in_new_session: true, default_new_session_view: "terminal" },
-    } as unknown as Awaited<ReturnType<typeof fetchSettings>>);
-    const { getByText, getByRole } = renderWizard();
-    await waitFor(() => {
-      fireEvent.click(getByText("More options"));
-      expect(getByRole("switch", { name: "Use structured view" }).getAttribute("aria-checked")).toBe("false");
-    });
-    fireEvent.click(getByText(/Launch session/));
-    await waitFor(() => expect(createSession).toHaveBeenCalled());
-    expect(createSession).toHaveBeenCalledWith(expect.objectContaining({ view: "terminal" }));
-  });
-
-  it("hides the toggle and forces a terminal session when the view is not offered (#3517)", async () => {
-    vi.mocked(fetchSettings).mockResolvedValueOnce({
-      session: {},
-      sandbox: {},
-      acp: { offer_structured_in_new_session: false },
-    } as unknown as Awaited<ReturnType<typeof fetchSettings>>);
+  it("creates a terminal session, with no toggle, when nobody has opted in (#3517)", async () => {
     const { getByText, queryByRole } = renderWizard();
     await waitFor(() => {
       fireEvent.click(getByText("More options"));
       expect(getByText(/turned off in settings/)).toBeTruthy();
     });
     expect(queryByRole("switch", { name: "Use structured view" })).toBeNull();
+    fireEvent.click(getByText(/Launch session/));
+    await waitFor(() => expect(createSession).toHaveBeenCalled());
+    expect(createSession).toHaveBeenCalledWith(expect.objectContaining({ view: "terminal" }));
+  });
+
+  it("opens on the terminal view, and sends it, when settings default that way (#3517)", async () => {
+    offerStructured({ default_new_session_view: "terminal" });
+    const { getByText, getByRole } = renderWizard();
+    await waitFor(() => {
+      fireEvent.click(getByText("More options"));
+      expect(getByRole("switch", { name: "Use structured view" }).getAttribute("aria-checked")).toBe("false");
+    });
     fireEvent.click(getByText(/Launch session/));
     await waitFor(() => expect(createSession).toHaveBeenCalled());
     expect(createSession).toHaveBeenCalledWith(expect.objectContaining({ view: "terminal" }));
@@ -257,6 +267,9 @@ describe("SessionWizard structured_view payload", () => {
         },
       },
       sandbox: {},
+      // Model and effort only travel on a structured create, so this case
+      // has to opt in like any other (#3517).
+      acp: { offer_structured_in_new_session: true },
     } as never);
     const { getAllByText, getByText } = renderWizardWithoutToolPrefill();
     // The resolved launch command (#1911) lives in the agent options under
