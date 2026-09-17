@@ -886,10 +886,13 @@ pub enum Event {
         description: String,
         prompt: String,
         model: String,
-        /// Local transcript path the daemon tails. Never serialized (a
-        /// host fs path, useless and mildly sensitive to clients); read
-        /// by the notification handler to spawn the tailer, then dropped.
-        #[serde(default, skip_serializing)]
+        /// Local transcript path the daemon tails, read by the
+        /// notification handler to spawn the tailer. Persisted so a
+        /// daemon that restarts mid-run can re-tail a sub-agent that
+        /// survived it; a row from before this field existed
+        /// deserializes to the empty default, which the resume sweep
+        /// treats as untrackable and detaches instead.
+        #[serde(default)]
         output_file: String,
         started_at: DateTime<Utc>,
     },
