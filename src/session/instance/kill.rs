@@ -51,7 +51,9 @@ impl Instance {
         // `Skipped` reports a peer write between the caller's read and the CAS.
         // Retry once against the row as it now stands: a peer that committed
         // the same final observation makes this publication durable, while a
-        // fork intent or another conversation skips again.
+        // fork intent or another conversation skips again. The retry emits
+        // `PinnedForeign` itself when the pin is the cause, so no post-hoc
+        // inference is needed here: any remaining `Skipped` keeps the doubt.
         // A retry that cannot read the row leaves the publication in doubt, so
         // it must fail the flush: `None` would read as "nothing to publish" and
         // let teardown delete the evidence.
@@ -61,13 +63,12 @@ impl Instance {
         let Some(retry) = rows.into_iter().find(|row| row.id == self.id) else {
             return Some(SidWrite::Failed);
         };
-        super::sid_persist::persist_session_with_storage(
+        Some(super::sid_persist::persist_session_with_storage(
             storage,
             &self.id,
             &observation,
             &retry.conversation_state(),
-        )
-        .or_pinned_foreign_publication(observation.sid.as_str(), &retry)
+        ))
     }
 
     /// The conversation this pane published last, for the final flush.
@@ -687,6 +688,95 @@ mod tests {
         assert!(matches!(
             inst.flush_published_conversation(&storage),
             Some(SidWrite::Skipped)
+        ));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn stop_with_pinned_foreign_row_and_concurrent_divergence_keeps_evidence() {
+        // Direct unit coverage of the reviewer's scenario at the CAS layer:
+        // the pin branch must only fire on its own verdict. Here the
+        // divergent execution namespace makes the first attempt report a
+        // peer write, so the answer is the generic Skipped even though the
+        // row carries a foreign pin. `flush_published_conversation` would
+        // retry against the fresh row and reach the pin branch, so this
+        // asserts the classification at `persist_session_with_storage`
+        // level, where the cause is still provable.
+        use super::super::sid_persist::persist_session_with_storage;
+        use crate::session::{ConversationBinding, ConversationProvenance, ExecutionBinding};
+        let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(home.path());
+        let profile = "hook-stop-pinned-race";
+        let mut inst = Instance::new("hook-pinned-race", home.path().to_str().unwrap());
+        inst.source_profile = profile.into();
+        inst.tool = "claude".into();
+        let pinned = "22f13307-461c-4161-908e-95a247fac780";
+        let published = "22f13307-461c-4161-908e-95a247fac781";
+        let diverged = "22f13307-461c-4161-908e-95a247fac782";
+        let launch = uuid::Uuid::new_v4().to_string();
+        let binding = ExecutionBinding {
+            agent: "claude".into(),
+            stores: vec![home.path().join("store")],
+            configuration: Vec::new(),
+            cwd: home.path().into(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+        };
+        inst.resume_intent = ResumeIntent::Use(pinned.into());
+        inst.resume_binding = Some(ConversationBinding {
+            session_id: pinned.into(),
+            execution: Some(binding.clone()),
+            provenance: ConversationProvenance::Asserted,
+            transcript_path: None,
+        });
+        inst.agent_session_id = Some(published.into());
+        inst.agent_session_binding = Some(ConversationBinding {
+            session_id: published.into(),
+            execution: Some(binding.clone()),
+            provenance: ConversationProvenance::Observed,
+            transcript_path: None,
+        });
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|rows, _| {
+                *rows = vec![inst.clone()];
+                Ok(())
+            })
+            .unwrap();
+        crate::hooks::write_session_id_via_guard(&inst.id, published, Some(&launch)).unwrap();
+        // A peer sid diverges the stored `agent_session_id` after the
+        // caller's snapshot: the pin branch never runs (it only fires on its
+        // own sid mismatch), so the answer must be the generic Skipped even
+        // though the row carries a foreign pin.
+        storage
+            .update(|rows, _| {
+                let peer = rows.iter_mut().find(|row| row.id == inst.id).unwrap();
+                peer.agent_session_id = Some(diverged.into());
+                Ok(())
+            })
+            .unwrap();
+        let observation = crate::session::poller::SessionIdObservation {
+            sid: published.into(),
+            guard: crate::session::poller::SessionIdGuard::Unguarded,
+            execution: None,
+            source: None,
+            transcript_path: None,
+            pi_session_path: None,
+        };
+        assert_eq!(
+            persist_session_with_storage(
+                &storage,
+                &inst.id,
+                &observation,
+                &inst.conversation_state()
+            ),
+            SidWrite::Skipped
+        );
+        let rows = storage.load().unwrap();
+        assert!(matches!(
+            &rows[0].resume_intent,
+            ResumeIntent::Use(pin) if pin == pinned
         ));
     }
 

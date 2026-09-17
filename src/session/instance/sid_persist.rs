@@ -18,26 +18,6 @@ pub(crate) enum SidWrite {
     PinnedForeign,
 }
 
-impl SidWrite {
-    /// Reclassify a deterministic pin refusal as a non-fatal flush outcome.
-    /// Only a `Skipped` against a row whose explicit pin names a different
-    /// conversation qualifies: a failed write, a CAS divergence, a fork
-    /// intent, an exclusion or a peer conflict stays untouched.
-    pub(crate) fn or_pinned_foreign_publication(
-        self,
-        sid: &str,
-        row: &Instance,
-    ) -> Option<SidWrite> {
-        if self != SidWrite::Skipped {
-            return Some(self);
-        }
-        match &row.resume_intent {
-            ResumeIntent::Use(pinned) if pinned != sid => Some(SidWrite::PinnedForeign),
-            _ => Some(SidWrite::Skipped),
-        }
-    }
-}
-
 /// Caller contract for `persist_session_id`: whether to publish the
 /// post-CAS `agent_session_id` to the tmux hidden env.
 ///
@@ -109,15 +89,20 @@ pub(super) fn persist_session_with_storage(
             }
             _ => {}
         }
+        // A pin to another conversation is a deliberate refusal, not a race:
+        // report it distinctly so teardown can proceed without touching the
+        // pin. Only the sid mismatch qualifies; a divergent execution binding
+        // for the pinned sid stays a namespace doubt (`Skipped`).
         if let ResumeIntent::Use(pinned) = &instance.resume_intent {
-            if pinned != session_id
-                || instance.resume_binding.as_ref().is_some_and(|target| {
-                    target.execution.as_ref()
-                        != binding
-                            .as_ref()
-                            .and_then(|binding| binding.execution.as_ref())
-                })
-            {
+            if pinned != session_id {
+                return Ok(SidWrite::PinnedForeign);
+            }
+            if instance.resume_binding.as_ref().is_some_and(|target| {
+                target.execution.as_ref()
+                    != binding
+                        .as_ref()
+                        .and_then(|binding| binding.execution.as_ref())
+            }) {
                 return Ok(SidWrite::Skipped);
             }
         }
@@ -1418,7 +1403,7 @@ mod tests {
                 &pinned.conversation_state(),
                 &file_watch,
             );
-            assert_eq!(write, SidWrite::Skipped);
+            assert_eq!(write, SidWrite::PinnedForeign);
             assert_eq!(
                 load(profile)[0].agent_session_id.as_deref(),
                 Some(SID_X),
