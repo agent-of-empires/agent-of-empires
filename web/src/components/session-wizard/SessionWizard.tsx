@@ -47,13 +47,9 @@ const MORE_OPTIONS_OPEN_KEY = "aoe-new-session-more-options-open";
  *  #2614. */
 const LAST_USED_INSTRUCTION_KEY = "aoe-new-session-last-instruction";
 
-/** localStorage key remembering the project path of the last session the
- *  user launched, so a plain New session opens already pointed at it (a
- *  one-project user stops picking the same folder every time). Per-browser
- *  like the tool and instruction keys. Only a plain open reads it: a prefill
- *  (sidebar +, scratch, clone) brings its own path or none. Read as an
- *  absolute path or ignored; a folder that has since gone shows in the
- *  picker's selected-path box, where the user changes it. */
+/** localStorage key remembering the project path of the last launched
+ *  session, read only by a plain open (a prefill brings its own path or
+ *  none). Absolute paths only; anything else is ignored. */
 const LAST_USED_PROJECT_KEY = "aoe-new-session-last-project";
 
 function loadLastUsedTool(): string {
@@ -97,12 +93,11 @@ function saveMoreOptionsOpen(open: boolean): void {
 
 /** Layer the last-used tool over the shared `initialData` template so
  *  fresh wizard opens default to whatever the user picked last. The
- *  prefill path overrides this when `prefill.tool` is set, and brings its
- *  own path (or none) instead of the remembered project. */
-function buildInitialData(): WizardData {
+ *  prefill path overrides this when `prefill.tool` is set. */
+function buildInitialData(nameOnly: boolean): WizardData {
   return {
     ...initialData,
-    path: loadLastUsedProject(),
+    path: nameOnly ? "" : loadLastUsedProject(),
     tool: loadLastUsedTool(),
     customInstruction: loadLastUsedInstruction(),
   };
@@ -144,7 +139,7 @@ interface Props {
 }
 
 export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }: Props) {
-  const baseInitial = buildInitialData();
+  const baseInitial = buildInitialData(nameOnly);
   const prefillData: WizardData = prefill
     ? {
         ...baseInitial,
