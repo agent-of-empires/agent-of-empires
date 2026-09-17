@@ -284,11 +284,10 @@ pub trait BroadcastSink: Send + Sync + 'static {
     }
     /// Agent ids of `BackgroundAgentLaunched` events on disk with no
     /// matching `BackgroundAgentCompleted`: sub-agents a dead worker's
-    /// tailer will never report on again. Used by `spawn`/the drain
-    /// respawn path/`shutdown_with_reason`, which only ever see a dead or
-    /// fresh worker, to eagerly detach every one. Default returns empty
-    /// so test sinks without an event store opt out cleanly, mirroring
-    /// `unresolved_approval_nonces`.
+    /// tailer will never report on again. See
+    /// [`detach_orphaned_background_agents_on`] for its callers. Default
+    /// returns empty so test sinks without an event store opt out cleanly,
+    /// mirroring `unresolved_approval_nonces`.
     fn unresolved_background_agent_ids(&self, _session_id: &str) -> Vec<String> {
         Vec::new()
     }
@@ -3528,7 +3527,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             .take_inbound()
             .expect("freshly attached AcpClient always has inbound receiver");
         let client = Arc::new(client);
-        let workers = self.workers.lock().await;
+        let mut workers = self.workers.lock().await;
         let install = lock_recover(&self.lifecycle).install(&lease, Some(identity));
         if let Err(refusal) = install {
             drop(workers);
@@ -3538,22 +3537,30 @@ impl<S: BroadcastSink> Supervisor<S> {
                 .retire_refused_install(&lease, Some(identity), refusal)
                 .await);
         }
-        // `install` already claims this session's lifecycle slot, so a
-        // competing spawn/attach is refused there regardless of whether
-        // `workers` holds this entry yet; drop the guard before the async
-        // sweep below instead of holding it across the await.
-        drop(workers);
+        // Hold `workers` across install AND the insert below, as `spawn_inner`
+        // does. `shutdown_with_reason` takes this same lock before its
+        // `begin_stop` decision and removes whatever `workers.remove` finds
+        // there; if this guard were dropped between install and insert, a
+        // stop landing in that window would see no handle, settle the lease
+        // as `Proven`, and return `Ok` while the runner it never touched kept
+        // running, and then this insert would leave a live handle under a
+        // lease shutdown already considers resolved. `install` alone does not
+        // close that gap: it claims the lifecycle slot, but `begin_stop` acts
+        // on the `workers` map, not the lifecycle table.
         // Same pre-drain sweep as `spawn`, for entries the previous daemon
         // orphaned: after the drain starts, this worker's own approvals are
         // in the log and the sweep can no longer tell them apart. Background
         // sub-agents differ: the worker just attached is provably alive, so
-        // resume tailing instead of detaching outright.
+        // resume tailing instead of detaching outright. Only the query and
+        // the untrackable-launch publishes need to run before the drain; the
+        // actual resume send is a real await, so it runs after `workers` is
+        // dropped below, mirroring `client_for_mode` in `spawn_inner`.
         self.cancel_orphaned_approvals(&session_id);
         self.cancel_orphaned_elicitations(&session_id);
-        resume_or_detach_background_agents_on(&*self.sink, &self.next_seqs, &session_id, &client)
-            .await;
+        let resumable =
+            collect_resumable_background_agent_launches(&*self.sink, &self.next_seqs, &session_id);
         let drain_task = self.start_drain_task(session_id.clone(), lease.clone(), inbound);
-        let mut workers = self.workers.lock().await;
+        let client_for_resume = (!resumable.is_empty()).then(|| Arc::clone(&client));
         workers.insert(
             session_id.clone(),
             WorkerHandle {
@@ -3568,6 +3575,16 @@ impl<S: BroadcastSink> Supervisor<S> {
                 lease,
             },
         );
+        drop(workers);
+        if let Some(client) = client_for_resume {
+            info!(
+                target: "acp.supervisor",
+                session = %session_id,
+                resumed = resumable.len(),
+                "resuming background sub-agent tailing after daemon restart"
+            );
+            let _ = client.resume_background_tailing(resumable).await;
+        }
         info!(
             target: "acp.supervisor",
             session = %session_id,
@@ -3575,7 +3592,6 @@ impl<S: BroadcastSink> Supervisor<S> {
             pid = record.pid,
             "reattached to existing structured view worker"
         );
-        drop(workers);
         drop(reservation);
         self.worker_notify.notify_waiters();
         Ok(())
@@ -4183,10 +4199,11 @@ fn cancel_orphaned_elicitations_on<S: BroadcastSink>(
 /// its tailer died with the previous daemon and no fresh launch will be
 /// replayed for it. Publish a synthetic `BackgroundAgentCompleted { status:
 /// Detached }` per orphaned agent id so the panel stops showing it as
-/// running forever. Shared by `spawn`, the drain respawn path, and
-/// `shutdown_with_reason`, which only ever see a dead or fresh worker, so
-/// detaching is the only option. `attach` instead resumes tailing whatever
-/// it can; see [`resume_or_detach_background_agents_on`]. Mirrors
+/// running forever. Called by `spawn` and the drain respawn path, which
+/// only ever see a dead or fresh worker, so detaching is the only option;
+/// `shutdown_with_reason` inlines its own version with `warning: None`
+/// rather than sharing this one. `attach` instead resumes tailing whatever
+/// it can; see [`collect_resumable_background_agent_launches`]. Mirrors
 /// `cancel_orphaned_approvals_on`.
 fn detach_orphaned_background_agents_on<S: BroadcastSink>(
     sink: &S,
@@ -4211,8 +4228,8 @@ fn detach_orphaned_background_agents_on<S: BroadcastSink>(
 /// Publish the synthetic `BackgroundAgentCompleted { status: Detached }`
 /// for one orphaned agent id. Shared by
 /// [`detach_orphaned_background_agents_on`] (every id) and
-/// [`resume_or_detach_background_agents_on`] (only ids with no transcript
-/// path to resume from).
+/// [`collect_resumable_background_agent_launches`] (only ids with no
+/// transcript path to resume from).
 fn publish_background_agent_detached<S: BroadcastSink>(
     sink: &S,
     next_seqs: &SeqMap,
@@ -4238,35 +4255,26 @@ fn publish_background_agent_detached<S: BroadcastSink>(
 
 /// The attach-path counterpart of [`detach_orphaned_background_agents_on`]:
 /// the worker just attached is provably alive, so a sub-agent it launched
-/// may still be running. For each unresolved launch with a transcript path,
-/// resume tailing on the fresh connection instead of detaching; only a
-/// launch with no transcript path (untrackable either way) still gets the
-/// synthetic `Detached` completion.
-async fn resume_or_detach_background_agents_on<S: BroadcastSink>(
+/// may still be running. Publishes the synthetic `Detached` completion for
+/// every unresolved launch with no transcript path (untrackable either way)
+/// and returns the rest for the caller to hand to
+/// `AcpClient::resume_background_tailing`. Split into a sync half so the
+/// query and untrackable publishes can run before the drain starts, same as
+/// `cancel_orphaned_approvals_on`, while the actual resume send stays a real
+/// await outside any lock the caller may be holding.
+fn collect_resumable_background_agent_launches<S: BroadcastSink>(
     sink: &S,
     next_seqs: &SeqMap,
     session_id: &str,
-    client: &AcpClient,
-) {
+) -> Vec<crate::acp::event_store::UnresolvedBackgroundAgentLaunch> {
     let launches = sink.unresolved_background_agent_launches(session_id);
-    if launches.is_empty() {
-        return;
-    }
     let (resumable, untrackable): (Vec<_>, Vec<_>) = launches
         .into_iter()
         .partition(|l| !l.output_file.is_empty());
     for launch in untrackable {
         publish_background_agent_detached(sink, next_seqs, session_id, launch.agent_id);
     }
-    if !resumable.is_empty() {
-        info!(
-            target: "acp.supervisor",
-            session = %session_id,
-            resumed = resumable.len(),
-            "resuming background sub-agent tailing after daemon restart"
-        );
-        let _ = client.resume_background_tailing(resumable).await;
-    }
+    resumable
 }
 
 /// Increment and return the per-session seq counter. Lives at the
@@ -8614,11 +8622,13 @@ cursor-acp-bridge = "agent acp"
         sup.shutdown("s-startup").await.unwrap();
     }
 
-    /// Everything [`attach_with_orphaned_background_agent`] sets up, owned
-    /// by the caller so it controls cleanup order instead of the helper
-    /// tearing the connection down before a resumed tailer can finish with
-    /// it. `store`/`rx` are what the test polls; the rest exist only to be
-    /// cleaned up, via [`Self::cleanup`], once assertions are done.
+    /// Everything [`attach_with_orphaned_background_agent`] sets up. The
+    /// stand-in runner and its handshake task are reaped by `Drop`, so a
+    /// panicking assertion still cleans them up instead of leaking the
+    /// child process. `store`/`rx` are what the test polls; the rest exist
+    /// only to keep the connection alive until the fixture drops (see
+    /// `attach_with_orphaned_background_agent`'s trailing comment for why
+    /// that ordering matters).
     struct AttachBackgroundAgentFixture {
         store: Arc<crate::acp::event_store::EventStore>,
         rx: broadcast::Receiver<crate::acp::protocol::AcpBroadcastFrame>,
@@ -8629,15 +8639,8 @@ cursor-acp-bridge = "agent acp"
         _home: crate::session::test_support::AppDirGuard,
     }
 
-    impl AttachBackgroundAgentFixture {
-        /// Tear the connection down and reap the stand-in runner. Call
-        /// only after the test's assertions are done: dropping
-        /// `runner_handshake`'s peer socket or killing `fake_runner` any
-        /// earlier would end the attach connection before a resumed
-        /// tailer's completion event can reach the store. The rest
-        /// (`sup`, the tempdir, the app-dir guard) drop normally at the
-        /// end of this method.
-        fn cleanup(mut self) {
+    impl Drop for AttachBackgroundAgentFixture {
+        fn drop(&mut self) {
             self.runner_handshake.abort();
             let _ = self.fake_runner.kill();
             let _ = self.fake_runner.wait();
@@ -8775,9 +8778,7 @@ cursor-acp-bridge = "agent acp"
         .expect("attach must not hang")
         .expect("attach must succeed against the fake runner");
 
-        // Left running: a resumed tailer needs the connection alive to
-        // report through, and the caller decides when it is done needing
-        // it via `AttachBackgroundAgentFixture::cleanup`.
+        // Left running: see the fixture's doc comment for why.
         AttachBackgroundAgentFixture {
             store,
             rx,
@@ -8824,7 +8825,11 @@ cursor-acp-bridge = "agent acp"
                 {
                     return;
                 }
-                fixture.rx.recv().await.unwrap();
+                match fixture.rx.recv().await {
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(e) => panic!("broadcast channel closed: {e}"),
+                }
             }
         })
         .await
@@ -8844,7 +8849,12 @@ cursor-acp-bridge = "agent acp"
             BackgroundAgentStatus::Completed,
             "a survivor's resumed tailer must report its real outcome, not Detached"
         );
-        fixture.cleanup();
+        assert!(
+            state.background_agents[0].warning.is_none(),
+            "a real Completed must not carry the synthetic Detached sweep's warning; a \
+             spurious Detached-then-Completed sequence would fold to the same status but \
+             leave this set"
+        );
     }
 
     /// The untrackable counterpart: a launch with no transcript path can
@@ -8866,7 +8876,11 @@ cursor-acp-bridge = "agent acp"
                 {
                     return;
                 }
-                fixture.rx.recv().await.unwrap();
+                match fixture.rx.recv().await {
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(e) => panic!("broadcast channel closed: {e}"),
+                }
             }
         })
         .await
@@ -8885,6 +8899,5 @@ cursor-acp-bridge = "agent acp"
             state.background_agents[0].status,
             BackgroundAgentStatus::Detached
         );
-        fixture.cleanup();
     }
 }
