@@ -11,6 +11,17 @@ interface Props {
   filePath: string;
 }
 
+/** djb2 over the file text, as a 32-bit unsigned hex string. Not a checksum:
+ *  it only has to change when the content does, so an equal-length edit
+ *  remounts the renderer instead of keeping stale row measurements. */
+function hashContent(content: string): string {
+  let h = 5381;
+  for (let i = 0; i < content.length; i++) {
+    h = (h * 33) ^ content.charCodeAt(i);
+  }
+  return (h >>> 0).toString(16);
+}
+
 /**
  * Full-file viewer for a file with no diff against the base (#1810, #4003).
  * Renders through the same `@pierre/diffs` file renderer the diff pane drives,
@@ -29,10 +40,17 @@ export function FullFileViewer({ content, filePath }: Props) {
 
   const options = useMemo<FileOptions<undefined>>(() => ({ theme, disableFileHeader: true }), [theme]);
 
+  // Keyed on the path plus a content hash, standing in for DiffFileViewer's
+  // revision (the /file read carries no revision or etag to key on): the same
+  // path re-rendering with new content remeasures rows from scratch instead of
+  // reusing the previous file's layout. A length alone would miss an
+  // equal-length edit. See #4008 review.
+  const viewKey = useMemo(() => `${filePath}:${content.length}:${hashContent(content)}`, [filePath, content]);
+
   return (
     <div className="flex-1 min-h-0 flex flex-col">
       <DiffWorkerPoolProvider>
-        <Virtualizer key={filePath} className="flex-1 overflow-auto">
+        <Virtualizer key={viewKey} className="flex-1 overflow-auto">
           <File file={file} options={options} />
         </Virtualizer>
       </DiffWorkerPoolProvider>

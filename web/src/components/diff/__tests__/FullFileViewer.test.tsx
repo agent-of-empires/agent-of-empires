@@ -64,4 +64,25 @@ describe("FullFileViewer", () => {
     expect(second).not.toBe(first);
     expect(getByTestId("pierre-file").textContent).toBe("second");
   });
+
+  it("re-keys when the same path's content changes, so rows are remeasured", () => {
+    const { getByTestId, rerender } = render(<FullFileViewer content={"a\nb"} filePath="src/a.ts" />);
+    const first = getByTestId("virtualizer");
+    rerender(<FullFileViewer content={"a\nb\nc"} filePath="src/a.ts" />);
+    expect(getByTestId("virtualizer")).not.toBe(first);
+  });
+
+  it("re-keys on an equal-length edit, which a length-only key would miss", () => {
+    const { getByTestId, rerender } = render(<FullFileViewer content={"a\nb"} filePath="src/a.ts" />);
+    const first = getByTestId("virtualizer");
+    rerender(<FullFileViewer content={"ab\n"} filePath="src/a.ts" />);
+    expect(getByTestId("virtualizer")).not.toBe(first);
+  });
+
+  it("keeps the view mounted when nothing changed", () => {
+    const { getByTestId, rerender } = render(<FullFileViewer content={"a\nb"} filePath="src/a.ts" />);
+    const first = getByTestId("virtualizer");
+    rerender(<FullFileViewer content={"a\nb"} filePath="src/a.ts" />);
+    expect(getByTestId("virtualizer")).toBe(first);
+  });
 });
