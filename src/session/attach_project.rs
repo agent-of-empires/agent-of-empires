@@ -870,6 +870,20 @@ pub fn attach_planned(
     instance: &super::Instance,
     plan: AttachPlan,
 ) -> Result<AttachOutcome> {
+    // A publication that has not been drained yet would be flushed after the
+    // move with the stale cwd, re-qualifying the old directory after the
+    // commit. Flush it first so the durable recheck sees the row as it will
+    // stand at the commit.
+    if plan.moves_session {
+        match instance.flush_published_conversation(storage) {
+            Some(crate::session::SidWrite::Applied) | None => {}
+            Some(outcome) => anyhow::bail!(
+                "'{}' has an undrained conversation publication ({outcome:?}); drain it or \
+                 clear the resume target before converting",
+                instance.title
+            ),
+        }
+    }
     let prepared = execute(instance, plan)?;
 
     let id = session_id.to_string();
@@ -1672,9 +1686,48 @@ mod tests {
             disk.resume_intent,
             crate::session::ResumeIntent::Use(sid.into())
         );
-        assert_eq!(disk.resume_binding, pinned);
         assert!(session_wt.join("README.md").exists());
         assert!(!destination.exists());
+
+        let mut pending = disk;
+        pending.resume_intent = crate::session::ResumeIntent::Default;
+        pending.resume_binding = None;
+        let binding = pending.agent_session_binding.as_mut().unwrap();
+        binding.provenance = crate::session::ConversationProvenance::Preallocated;
+        let launch_id = uuid::Uuid::new_v4().to_string();
+        let hook_dir = crate::hooks::ensure_instance_dir_path(&pending.id).unwrap();
+        pending.active_execution = Some(crate::session::instance::ActiveExecution {
+            launch_id: launch_id.clone(),
+            binding: binding.execution.clone().unwrap(),
+            capture: Some(crate::session::instance::CaptureContext::Hooks(
+                hook_dir.join(format!("session_id.{launch_id}")),
+            )),
+            container: None,
+        });
+        let rotated = "33333333-3333-4333-8333-333333333333";
+        std::fs::write(hook_dir.join(format!("session_id.{launch_id}")), rotated).unwrap();
+        storage
+            .update(|rows, _| {
+                rows[0] = pending.clone();
+                Ok(())
+            })
+            .unwrap();
+        let pending_plan =
+            plan(&pending, "attach-conv", &frontend, ExistingBranch::Refuse).unwrap();
+        assert!(
+            attach_planned(&storage, &pending.id, &pending, pending_plan).is_err(),
+            "an undrained qualified publication must prevent conversion"
+        );
+        let observed = storage.load().unwrap().remove(0);
+        assert_eq!(observed.project_path, inst.project_path);
+        assert!(observed.workspace_info.is_none());
+        assert_eq!(
+            observed.agent_session_id.as_deref(),
+            Some(rotated),
+            "the drain lands the rotated conversation at the old cwd before the recheck refuses"
+        );
+        assert!(observed.agent_session_binding.as_ref().unwrap().is_known());
+        assert!(session_wt.join("README.md").exists());
 
         storage
             .update(|rows, _| {

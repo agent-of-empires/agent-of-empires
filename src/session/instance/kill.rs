@@ -31,7 +31,7 @@ impl Instance {
         }
     }
 
-    pub(super) fn flush_published_conversation(
+    pub(crate) fn flush_published_conversation(
         &self,
         storage: &crate::session::storage::Storage,
     ) -> Option<SidWrite> {
