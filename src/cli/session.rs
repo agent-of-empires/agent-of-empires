@@ -41,13 +41,11 @@ pub enum SessionCommands {
     /// Auto-detect current session
     Current(CurrentArgs),
 
-    /// Attach another repo to an existing session, so an agent that turns out
-    /// to need a second repo can keep working in the same conversation instead
-    /// of the session being recreated. Creates a worktree for the repo and
-    /// restarts the agent so it can see it; an implicitly preallocated ID is
-    /// re-linked across the move, but a known (observed or asserted)
-    /// conversation whose store or working directory moved is refused, rebind
-    /// it with `aoe session set-session-id --store`. See #3103.
+    /// Attach another repo to an existing session, creating a worktree for it
+    /// and restarting the agent. Moving the session's working directory is
+    /// refused while it carries a conversation bound to that directory; rebind
+    /// the conversation or attach before starting it. An implicitly
+    /// preallocated ID is re-linked across the move. See #3103.
     AddProject(AddProjectArgs),
 
     /// Set the resume target for a session; an agent whose exact native resume
