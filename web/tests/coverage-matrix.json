@@ -981,6 +981,20 @@
       ]
     },
     {
+      "id": "wizard.acp-default-view",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/session-wizard/__tests__/structuredViewToggle.test.tsx",
+        "src/components/session-wizard/wizardReducer.test.ts"
+      ],
+      "components": [
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/steps/AgentOptions.tsx",
+        "web/src/components/session-wizard/wizardReducer.ts"
+      ]
+    },
+    {
       "id": "wizard.agent-allowlist",
       "kind": "vitest",
       "risk": "high",

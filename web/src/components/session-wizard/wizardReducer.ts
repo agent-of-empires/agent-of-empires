@@ -59,15 +59,20 @@ export interface WizardData {
    *  scratch arm. Not part of the submit payload. */
   pathIsGitRepo: boolean;
   /** Per-session opt-in to structured view rendering for ACP-capable tools.
-   *  Defaults true so ACP-capable tools render in the structured view by
-   *  default ("ACP tools run in structured view" behavior); the user
-   *  can turn it off in AgentStep to launch a tmux/terminal session. The
-   *  submit path sends `view: "structured"` only when the tool is
-   *  ACP-capable and this flag is set; the server re-validates
-   *  capability (src/server/api/sessions/create.rs). Intentionally not
-   *  tracked in `profileDirty` (see SET_FIELD) and not persisted: a
-   *  remembered opt-out would silently override the per-session default. */
+   *  Seeded from `acp.default_new_session_view` once settings load, falling
+   *  back to true until then; the user can turn it off in AgentStep to
+   *  launch a tmux/terminal session. The submit path sends
+   *  `view: "structured"` only when the tool is ACP-capable and this flag is
+   *  set; the server re-validates capability
+   *  (src/server/api/sessions/create.rs). Intentionally not tracked in
+   *  `profileDirty` (see SET_FIELD) and never persisted per-browser: the
+   *  configured default is the only thing that survives a create. */
   useStructuredView: boolean;
+  /** Whether `acp.offer_structured_in_new_session` lets this wizard offer the
+   *  structured view at all. When false the toggle is hidden and every create
+   *  goes to a terminal, matching the TUI dialog (#3517). Optimistically true
+   *  so the control does not flicker in while settings load. */
+  structuredOffered: boolean;
   agentModel: string;
   agentEffort: string;
   /** When non-empty, this create is importing an existing Claude Code
@@ -107,6 +112,8 @@ export type Action =
       extraEnv: string[];
       agentModel?: string;
       agentEffort?: string;
+      structuredOffered?: boolean;
+      useStructuredView?: boolean;
       /** When true, skip the apply if the user has already edited an
        *  agent-step field. The picker-driven path always sets this false
        *  (the user has already confirmed the overwrite); the mount-time
@@ -144,6 +151,7 @@ export const initialData: WizardData = {
   scratch: false,
   pathIsGitRepo: true,
   useStructuredView: true,
+  structuredOffered: true,
   agentModel: "",
   agentEffort: "",
   importAcpSessionId: "",
@@ -255,6 +263,12 @@ export function reducer(state: WizardState, action: Action): WizardState {
           extraEnv: action.extraEnv,
           agentModel: action.agentModel ?? "",
           agentEffort: action.agentEffort ?? "",
+          structuredOffered: action.structuredOffered ?? state.data.structuredOffered,
+          // An import already picked the structured view for a session that
+          // is structured on disk, so leave that choice alone.
+          useStructuredView: state.data.importAcpSessionId
+            ? state.data.useStructuredView
+            : (action.useStructuredView ?? state.data.useStructuredView),
           profileDirty: false,
         },
       };

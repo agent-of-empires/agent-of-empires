@@ -219,8 +219,46 @@ describe("SessionWizard reducer / APPLY_PROFILE_DEFAULTS (#1142)", () => {
 });
 
 describe("SessionWizard reducer / useStructuredView (#1580)", () => {
-  it("defaults useStructuredView to true so ACP-capable tools use the structured view by default", () => {
+  it("falls back to true until settings load, so the control does not flicker in", () => {
     expect(initialData.useStructuredView).toBe(true);
+    expect(initialData.structuredOffered).toBe(true);
+  });
+
+  it("seeds the opening view and the offer gate from settings (#3517)", () => {
+    const cases = [
+      { structuredOffered: true, useStructuredView: false },
+      { structuredOffered: false, useStructuredView: false },
+      { structuredOffered: true, useStructuredView: true },
+    ];
+    for (const seed of cases) {
+      const next = reducer(makeState(), {
+        type: "APPLY_PROFILE_DEFAULTS",
+        yoloMode: false,
+        sandboxEnabled: false,
+        worktreeEnabled: false,
+        tool: "claude",
+        extraEnv: [],
+        ...seed,
+      });
+      expect(next.data.structuredOffered).toBe(seed.structuredOffered);
+      expect(next.data.useStructuredView).toBe(seed.useStructuredView);
+    }
+  });
+
+  it("leaves an imported session on the structured view the seeder would clear", () => {
+    const state = makeState();
+    state.data.importAcpSessionId = "abc";
+    state.data.useStructuredView = true;
+    const next = reducer(state, {
+      type: "APPLY_PROFILE_DEFAULTS",
+      yoloMode: false,
+      sandboxEnabled: false,
+      worktreeEnabled: false,
+      tool: "claude",
+      extraEnv: [],
+      useStructuredView: false,
+    });
+    expect(next.data.useStructuredView).toBe(true);
   });
 
   it("SET_FIELD useStructuredView updates the flag", () => {

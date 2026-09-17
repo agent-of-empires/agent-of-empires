@@ -203,6 +203,10 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
         const sandbox = s.sandbox as Record<string, unknown> | undefined;
         const session = s.session as Record<string, unknown> | undefined;
         const worktree = s.worktree as Record<string, unknown> | undefined;
+        const acp = s.acp as Record<string, unknown> | undefined;
+        // `offer_structured_in_new_session` off hides the toggle and forces
+        // every create to a terminal, the same gate the TUI dialog applies.
+        const structuredOffered = (acp?.offer_structured_in_new_session as boolean) ?? true;
         const img = (sandbox?.default_image as string) || "";
         if (img) dispatch({ type: "SET_FIELD", field: "sandboxImage", value: img });
         const env = Array.isArray(sandbox?.environment)
@@ -223,6 +227,8 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
           extraEnv: env,
           agentModel: acpDefaults.model,
           agentEffort: acpDefaults.effort,
+          structuredOffered,
+          useStructuredView: structuredOffered && (acp?.default_new_session_view as string) !== "terminal",
           skipIfDirty: true,
         });
       });

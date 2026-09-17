@@ -83,6 +83,7 @@ function renderAgentStep(overrides: {
   agents?: AgentInfo[];
   useStructuredView?: boolean;
   sandboxEnabled?: boolean;
+  structuredOffered?: boolean;
 }) {
   const onChange = vi.fn();
   const utils = render(
@@ -91,6 +92,7 @@ function renderAgentStep(overrides: {
         ...initialData,
         tool: overrides.tool ?? "claude",
         useStructuredView: overrides.useStructuredView ?? true,
+        structuredOffered: overrides.structuredOffered ?? true,
         sandboxEnabled: overrides.sandboxEnabled ?? false,
       }}
       onChange={onChange}
@@ -140,6 +142,15 @@ describe("AgentStep structured-view view card", () => {
       useStructuredView: false,
     });
     expect(getByRole("switch", { name: "Use structured view" }).getAttribute("aria-checked")).toBe("false");
+  });
+
+  it("shows no switch, and says why, when the structured view is not offered (#3517)", () => {
+    const { queryByRole, getByText } = renderAgentStep({
+      tool: "claude",
+      structuredOffered: false,
+    });
+    expect(queryByRole("switch", { name: "Use structured view" })).toBeNull();
+    expect(getByText(/turned off in settings/)).toBeTruthy();
   });
 
   it("shows no switch for a non-ACP built-in, only the terminal fallback notice", () => {
@@ -202,6 +213,39 @@ describe("SessionWizard structured_view payload", () => {
     fireEvent.click(getByText(/Launch session/));
     await waitFor(() => expect(createSession).toHaveBeenCalled());
     expect(createSession).toHaveBeenCalledWith(expect.objectContaining({ tool: "claude", view: "terminal" }));
+  });
+
+  it("opens on the terminal view, and sends it, when settings default that way (#3517)", async () => {
+    vi.mocked(fetchSettings).mockResolvedValueOnce({
+      session: {},
+      sandbox: {},
+      acp: { offer_structured_in_new_session: true, default_new_session_view: "terminal" },
+    } as unknown as Awaited<ReturnType<typeof fetchSettings>>);
+    const { getByText, getByRole } = renderWizard();
+    await waitFor(() => {
+      fireEvent.click(getByText("More options"));
+      expect(getByRole("switch", { name: "Use structured view" }).getAttribute("aria-checked")).toBe("false");
+    });
+    fireEvent.click(getByText(/Launch session/));
+    await waitFor(() => expect(createSession).toHaveBeenCalled());
+    expect(createSession).toHaveBeenCalledWith(expect.objectContaining({ view: "terminal" }));
+  });
+
+  it("hides the toggle and forces a terminal session when the view is not offered (#3517)", async () => {
+    vi.mocked(fetchSettings).mockResolvedValueOnce({
+      session: {},
+      sandbox: {},
+      acp: { offer_structured_in_new_session: false },
+    } as unknown as Awaited<ReturnType<typeof fetchSettings>>);
+    const { getByText, queryByRole } = renderWizard();
+    await waitFor(() => {
+      fireEvent.click(getByText("More options"));
+      expect(getByText(/turned off in settings/)).toBeTruthy();
+    });
+    expect(queryByRole("switch", { name: "Use structured view" })).toBeNull();
+    fireEvent.click(getByText(/Launch session/));
+    await waitFor(() => expect(createSession).toHaveBeenCalled());
+    expect(createSession).toHaveBeenCalledWith(expect.objectContaining({ view: "terminal" }));
   });
 
   it("sends profile-resolved agent model and effort defaults", async () => {

@@ -20,6 +20,7 @@ interface WizardData {
   extraArgs: string;
   commandOverride: string;
   useStructuredView: boolean;
+  structuredOffered: boolean;
   [key: string]: unknown;
 }
 
@@ -59,10 +60,12 @@ function ViewNotice({
   tool,
   customAgent,
   policyDenied,
+  notOffered,
 }: {
   tool: string;
   customAgent: boolean;
   policyDenied: boolean;
+  notOffered: boolean;
 }) {
   return (
     <div className="mb-5 rounded-lg border border-surface-700 bg-surface-950 px-3 py-2.5">
@@ -73,19 +76,21 @@ function ViewNotice({
         </span>
       </div>
       <p className="mt-1 text-xs text-text-dim leading-snug">
-        {policyDenied
-          ? `${tool} is not on the operator's allowed agents list, so this session runs in the terminal view. Pick a permitted agent to use the structured view.`
-          : customAgent
-            ? "Custom agents run in the terminal unless they define agent_acp_cmd in config or TUI settings."
-            : `${tool} has no ACP adapter yet, so this session runs in the terminal view. Pick a tool with an ACP adapter (e.g. claude, opencode, gemini) to use the structured view.`}
+        {notOffered
+          ? "The structured view is turned off in settings, so this session runs in the terminal view. Turn on \u201cOffer structured view when creating a session\u201d to choose per session."
+          : policyDenied
+            ? `${tool} is not on the operator's allowed agents list, so this session runs in the terminal view. Pick a permitted agent to use the structured view.`
+            : customAgent
+              ? "Custom agents run in the terminal unless they define agent_acp_cmd in config or TUI settings."
+              : `${tool} has no ACP adapter yet, so this session runs in the terminal view. Pick a tool with an ACP adapter (e.g. claude, opencode, gemini) to use the structured view.`}
       </p>
     </div>
   );
 }
 
-/** Interactive view picker shown when the selected tool is ACP-capable.
- *  Defaults on (the structured view is the default); turning it off launches a
- *  terminal-view session instead (see #1580). */
+/** Interactive view picker shown when the selected tool is ACP-capable and
+ *  the structured view is offered. Opens on `acp.default_new_session_view`;
+ *  turning it off launches a terminal-view session instead (see #1580). */
 function ViewPickerCard({
   checked,
   onChange,
@@ -146,7 +151,8 @@ export function AgentOptions({
 
   // Mirror SessionWizard.handleSubmit so the preview shows the view the
   // session will actually launch with (#1580).
-  const willUseStructuredView = acpCapable && data.useStructuredView;
+  const structuredOffered = data.structuredOffered !== false;
+  const willUseStructuredView = acpCapable && structuredOffered && data.useStructuredView;
   const resolvedCommand = resolveLaunchCommand({
     tool: data.tool,
     useStructuredView: willUseStructuredView,
@@ -312,7 +318,7 @@ export function AgentOptions({
       {/* View picker. ACP-capable tools get a per-session structured-view
           toggle (default on, see #1580); other tools show a read-only
           terminal fallback notice. Lives under More options (#2210). */}
-      {acpCapable ? (
+      {acpCapable && structuredOffered ? (
         <ViewPickerCard
           checked={data.useStructuredView}
           onChange={(v) => onChange("useStructuredView", v)}
@@ -323,6 +329,7 @@ export function AgentOptions({
           tool={data.tool}
           customAgent={selectedCustomAgent}
           policyDenied={selectedAgent?.acp_allowed === false}
+          notOffered={acpCapable && !structuredOffered}
         />
       )}
 

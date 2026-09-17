@@ -19,6 +19,7 @@ interface WizardData {
   extraArgs: string;
   commandOverride: string;
   useStructuredView: boolean;
+  structuredOffered: boolean;
   [key: string]: unknown;
 }
 
