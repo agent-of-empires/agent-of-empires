@@ -682,6 +682,7 @@ enum QueuedKind {
     Handshake,
     ServerCall,
     AgentReply,
+    // Not `Notify`: shedding it would leave the daemon's session/load waiting.
     SessionReplayed,
 }
 

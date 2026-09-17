@@ -338,6 +338,10 @@ async fn replay_completion_after_disconnect(session: &str, in_flight_turn: bool)
         ControlBody::SessionReady { acp_session_id, .. } => acp_session_id,
         frame => panic!("expected SessionReady, got {frame:?}"),
     };
+    assert!(matches!(
+        control_protocol::read_frame(&mut first).await.unwrap(),
+        Some(ControlBody::Notify { method, .. }) if method == "_aoe/session_replayed"
+    ));
     control_protocol::write_frame(
         &mut first,
         &ControlBody::Prompt {
