@@ -542,7 +542,7 @@ impl Instance {
         let binding = ConversationBinding {
             session_id: sid.to_owned(),
             execution: Some(worker.clone()),
-            provenance: ConversationProvenance::Asserted,
+            provenance: ConversationProvenance::Observed,
             transcript_path: None,
         };
         let execution = self
@@ -581,6 +581,11 @@ mod tests {
         assert_eq!(inst.view, View::Terminal);
         assert_eq!(inst.agent_session_id.as_deref(), Some("sid-abc"));
         assert_eq!(inst.resume_intent, ResumeIntent::Use("sid-abc".to_string()));
+        assert_eq!(
+            inst.fork_parent_binding().unwrap().provenance,
+            ConversationProvenance::Observed,
+            "a worker-derived conversation is not a user assertion"
+        );
         assert_eq!(
             inst.agent_session_binding
                 .as_ref()
