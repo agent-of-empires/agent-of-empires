@@ -90,22 +90,6 @@ impl<'a> Inventory<'a> {
         if lookup != canonical {
             self.routes.push((lookup.to_path_buf(), canonical.clone()));
         }
-        if self.symlinks_only
-            && linked
-            && !canonical.starts_with(self.boundary.source_root.path())
-            && !self
-                .boundary
-                .paths
-                .iter()
-                .any(|(root, _)| canonical.starts_with(root))
-            && !self
-                .boundary
-                .patterns
-                .iter()
-                .any(|(root, _, _)| canonical.starts_with(root))
-        {
-            return Ok(());
-        }
         let parent = canonical
             .parent()
             .context("native state entry has no parent")?;
@@ -135,8 +119,7 @@ impl<'a> Inventory<'a> {
         };
         let mode = stat.st_mode & libc::S_IFMT;
         if mode == libc::S_IFLNK {
-            // A new symlink replaced the resolved leaf, or this is a descendant
-            // alias. Its entire resolution, including absent targets, is leased.
+            // Lease descendant aliases, including absent targets.
             self.resolve(lookup, origin, true)?;
         } else if mode == libc::S_IFREG {
             let eligible = if self.symlinks_only {
@@ -196,7 +179,7 @@ impl<'a> Inventory<'a> {
         )) {
             return Ok(());
         }
-        if !self.symlinks_only {
+        if !self.symlinks_only || origin != StateOrigin::Storage {
             super::pin_anchored_directory(self.directories, directory)?;
         }
         for name in directory.read_dir(Path::new(""), usize::MAX)? {

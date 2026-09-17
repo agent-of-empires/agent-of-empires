@@ -132,26 +132,32 @@ impl AnchoredDir {
 
     fn ensure_dir_fd(&self, relative: &Path) -> Result<OwnedFd> {
         let components = normal_components(relative)?;
-        let mut current = openat(
-            &self.fd,
-            ".",
-            OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
-            Mode::empty(),
-        )?;
+        let mut current = Self {
+            root: self.root.clone(),
+            fd: openat(
+                &self.fd,
+                ".",
+                OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
+                Mode::empty(),
+            )?,
+        };
         for component in &components {
-            match mkdirat(&current, component.as_os_str(), Mode::S_IRWXU) {
+            match mkdirat(&current.fd, component.as_os_str(), Mode::S_IRWXU) {
                 Ok(()) | Err(Errno::EEXIST) => {}
                 Err(error) => return Err(error).context("creating anchored directory"),
             }
-            current = openat(
-                &current,
+            let child = openat(
+                &current.fd,
                 component.as_os_str(),
                 OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
                 Mode::empty(),
             )
             .context("opening anchored directory component")?;
+            current.sync()?;
+            current.root.push(component);
+            current.fd = child;
         }
-        Ok(current)
+        Ok(current.fd)
     }
 
     pub(crate) fn open_regular(&self, relative: &Path, max_bytes: usize) -> Result<Option<File>> {
@@ -495,6 +501,38 @@ fn normal_components(path: &Path) -> Result<Vec<std::ffi::OsString>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nested_directory_sync_failure_is_retryable() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                FAIL_SYNC_ONCE.set(None);
+            }
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let root = AnchoredDir::open(temporary.path()).unwrap();
+        std::fs::write(temporary.path().join("original"), b"UNCHANGED").unwrap();
+        let _reset = Reset;
+        for _ in 0..2 {
+            FAIL_SYNC_ONCE.set(Some(temporary.path().join("tree")));
+            assert!(root.create_child(Path::new("tree/nested/leaf")).is_err());
+            assert!(!temporary.path().join("tree/nested/leaf").exists());
+            assert_eq!(
+                std::fs::read(temporary.path().join("original")).unwrap(),
+                b"UNCHANGED"
+            );
+        }
+        FAIL_SYNC_ONCE.set(None);
+        let directory = root.create_child(Path::new("tree/nested/leaf")).unwrap();
+        assert_eq!(
+            directory.identity().unwrap(),
+            root.child(Path::new("tree/nested/leaf"))
+                .unwrap()
+                .identity()
+                .unwrap()
+        );
+    }
 
     /// A symlinked ancestor of the anchor is normal on macOS, where `/tmp`
     /// and the per-user temp root under `/var` both resolve through one, and

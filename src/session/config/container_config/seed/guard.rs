@@ -210,17 +210,14 @@ impl<'a> ReadGuard<'a> {
             return Ok(false);
         }
         if self.symlink_inodes.is_none() {
-            let mut walk = inventory::Inventory::symlinks(
+            self.symlink_inodes = Some(scan_symlinks(
                 self.boundary,
                 self.access,
+                &self.aliases,
                 &mut self.directories,
                 &mut self.routes,
                 &mut self.entries,
-            );
-            for (state, origin) in &self.aliases {
-                walk.root(state, *origin)?;
-            }
-            self.symlink_inodes = Some(walk.finish());
+            )?);
         }
         if self
             .symlink_inodes
@@ -272,31 +269,36 @@ impl<'a> ReadGuard<'a> {
     }
 
     pub(super) fn validate(&self) -> Result<()> {
-        for (path, expected) in &self.entries {
-            let current = match fs::symlink_metadata(path) {
-                Ok(metadata) => Some((metadata.dev(), metadata.ino(), metadata.mode())),
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                    ) =>
-                {
-                    None
+        if !self.files.is_empty() {
+            let mut directories = BTreeMap::new();
+            let mut routes = Vec::new();
+            let mut entries = BTreeMap::new();
+            let inodes = scan_symlinks(
+                self.boundary,
+                self.access,
+                &self.aliases,
+                &mut directories,
+                &mut routes,
+                &mut entries,
+            )?;
+            validate_namespace(&entries, &routes)?;
+            for (path, expected) in &directories {
+                if Fingerprint::from(&fs::metadata(path)?) != *expected {
+                    bail!("native-state inventory changed during validation");
                 }
-                Err(error) => return Err(error).context("validating native-state namespace entry"),
-            };
-            if current != *expected {
-                bail!("native-state namespace changed during configuration seeding");
+            }
+            if self
+                .files
+                .values()
+                .any(|file| inodes.contains(&(file.device, file.inode)))
+            {
+                bail!("configuration source became native state during seeding");
             }
         }
+        validate_namespace(&self.entries, &self.routes)?;
         self.boundary.source_root.validate()?;
         self.boundary.hermes.validate()?;
         self.access.validate()?;
-        for (path, expected) in &self.routes {
-            if canonical_expected_path(path)? != *expected {
-                bail!("native-state boundary changed during configuration seeding");
-            }
-        }
         for (path, expected) in self.directories.iter().chain(&self.files) {
             if Fingerprint::from(&fs::metadata(path)?) != *expected {
                 bail!(
@@ -307,6 +309,50 @@ impl<'a> ReadGuard<'a> {
         }
         Ok(())
     }
+}
+
+fn scan_symlinks(
+    boundary: &NativeStateBoundary,
+    access: ReadAccess<'_>,
+    aliases: &[(PathBuf, StateOrigin)],
+    directories: &mut BTreeMap<PathBuf, Fingerprint>,
+    routes: &mut Vec<(PathBuf, PathBuf)>,
+    entries: &mut BTreeMap<PathBuf, Option<(u64, u64, u32)>>,
+) -> Result<HashSet<(u64, u64)>> {
+    let mut walk = inventory::Inventory::symlinks(boundary, access, directories, routes, entries);
+    for (state, origin) in aliases {
+        walk.root(state, *origin)?;
+    }
+    Ok(walk.finish())
+}
+
+fn validate_namespace(
+    entries: &BTreeMap<PathBuf, Option<(u64, u64, u32)>>,
+    routes: &[(PathBuf, PathBuf)],
+) -> Result<()> {
+    for (path, expected) in entries {
+        let current = match fs::symlink_metadata(path) {
+            Ok(metadata) => Some((metadata.dev(), metadata.ino(), metadata.mode())),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                None
+            }
+            Err(error) => return Err(error).context("validating native-state namespace entry"),
+        };
+        if current != *expected {
+            bail!("native-state namespace changed during configuration seeding");
+        }
+    }
+    for (path, expected) in routes {
+        if canonical_expected_path(path)? != *expected {
+            bail!("native-state boundary changed during configuration seeding");
+        }
+    }
+    Ok(())
 }
 
 fn watch_entry(
@@ -368,4 +414,86 @@ fn pin_anchored_directory(
         bail!("configuration source directory changed before reading");
     }
     seal_directory(directories, directory.path())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn external_state_alias_identities_are_rejected() {
+        for directory_alias in [false, true] {
+            let temporary = tempfile::tempdir().unwrap();
+            let source = temporary.path().join("source");
+            let active = temporary.path().join("active");
+            let state = temporary.path().join("state");
+            let external = temporary.path().join("external");
+            for path in [&source, &active, &state, &external] {
+                fs::create_dir(path).unwrap();
+            }
+            let candidate = external.join("state.json");
+            let authored = external.join("authored.json");
+            fs::write(&candidate, b"SYNTHETIC_STATE").unwrap();
+            fs::write(&authored, b"AUTHORED_CONFIG").unwrap();
+            if directory_alias {
+                fs::create_dir(external.join("records")).unwrap();
+                symlink(&candidate, external.join("records/record")).unwrap();
+                symlink(external.join("records"), state.join("alias")).unwrap();
+            } else {
+                symlink(&candidate, state.join("alias")).unwrap();
+            }
+            let mut boundary = NativeStateBoundary::for_source(&source, &active).unwrap();
+            boundary.add_path(state);
+            let mut guard = ReadGuard::new(&boundary, ReadAccess::default()).unwrap();
+            assert!(!guard
+                .record_file(&candidate, &File::open(&candidate).unwrap())
+                .unwrap());
+            assert!(guard
+                .record_file(&authored, &File::open(&authored).unwrap())
+                .unwrap());
+            guard.validate().unwrap();
+            assert_eq!(fs::read(candidate).unwrap(), b"SYNTHETIC_STATE");
+            assert_eq!(fs::read(authored).unwrap(), b"AUTHORED_CONFIG");
+        }
+    }
+
+    #[test]
+    fn validation_rechecks_new_state_subdirectories() {
+        for (origin, conflict) in [
+            (StateOrigin::Native, true),
+            (StateOrigin::Storage, true),
+            (StateOrigin::Storage, false),
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let source = temporary.path().join("source");
+            let active = temporary.path().join("active");
+            let state = temporary.path().join("state");
+            for path in [&source, &active, &state] {
+                fs::create_dir(path).unwrap();
+            }
+            let candidate = source.join("config.json");
+            fs::write(&candidate, b"SYNTHETIC_CONFIG").unwrap();
+            fs::write(active.join("config.json"), b"LOCAL_CONFIG").unwrap();
+            let mut boundary = NativeStateBoundary::for_source(&source, &active).unwrap();
+            boundary.add_classified_path(state.clone(), origin);
+            let mut guard = ReadGuard::new(&boundary, ReadAccess::default()).unwrap();
+            assert!(guard
+                .record_file(&candidate, &File::open(&candidate).unwrap())
+                .unwrap());
+            fs::create_dir(state.join("new")).unwrap();
+            if conflict {
+                symlink(&candidate, state.join("new/record")).unwrap();
+                assert!(guard.validate().is_err());
+            } else {
+                fs::write(state.join("new/record"), b"UNRELATED_STATE").unwrap();
+                guard.validate().unwrap();
+            }
+            assert_eq!(fs::read(&candidate).unwrap(), b"SYNTHETIC_CONFIG");
+            assert_eq!(
+                fs::read(active.join("config.json")).unwrap(),
+                b"LOCAL_CONFIG"
+            );
+        }
+    }
 }
