@@ -47,6 +47,15 @@ const MORE_OPTIONS_OPEN_KEY = "aoe-new-session-more-options-open";
  *  #2614. */
 const LAST_USED_INSTRUCTION_KEY = "aoe-new-session-last-instruction";
 
+/** localStorage key remembering the project path of the last session the
+ *  user launched, so a plain New session opens already pointed at it (a
+ *  one-project user stops picking the same folder every time). Per-browser
+ *  like the tool and instruction keys. Only a plain open reads it: a prefill
+ *  (sidebar +, scratch, clone) brings its own path or none. Read as an
+ *  absolute path or ignored; a folder that has since gone shows in the
+ *  picker's selected-path box, where the user changes it. */
+const LAST_USED_PROJECT_KEY = "aoe-new-session-last-project";
+
 function loadLastUsedTool(): string {
   const stored = safeGetItem(LAST_USED_TOOL_KEY);
   if (stored && ACP_CAPABLE_TOOLS.has(stored)) {
@@ -68,6 +77,16 @@ function saveLastUsedInstruction(instruction: string): void {
   safeSetItem(LAST_USED_INSTRUCTION_KEY, instruction);
 }
 
+function loadLastUsedProject(): string {
+  const stored = safeGetItem(LAST_USED_PROJECT_KEY) ?? "";
+  return stored.startsWith("/") ? stored : "";
+}
+
+function saveLastUsedProject(path: string): void {
+  if (!path.startsWith("/")) return;
+  safeSetItem(LAST_USED_PROJECT_KEY, path);
+}
+
 function loadMoreOptionsOpen(): boolean {
   return safeGetItem(MORE_OPTIONS_OPEN_KEY) === "true";
 }
@@ -78,9 +97,15 @@ function saveMoreOptionsOpen(open: boolean): void {
 
 /** Layer the last-used tool over the shared `initialData` template so
  *  fresh wizard opens default to whatever the user picked last. The
- *  prefill path overrides this when `prefill.tool` is set. */
+ *  prefill path overrides this when `prefill.tool` is set, and brings its
+ *  own path (or none) instead of the remembered project. */
 function buildInitialData(): WizardData {
-  return { ...initialData, tool: loadLastUsedTool(), customInstruction: loadLastUsedInstruction() };
+  return {
+    ...initialData,
+    path: loadLastUsedProject(),
+    tool: loadLastUsedTool(),
+    customInstruction: loadLastUsedInstruction(),
+  };
 }
 
 function acpDefaultsFor(session: Record<string, unknown> | undefined, tool: string): { model: string; effort: string } {
@@ -355,6 +380,7 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
       dispatch({ type: "SUBMIT_SUCCESS" });
       saveLastUsedTool(tool);
       saveLastUsedInstruction(body.custom_instruction ?? "");
+      saveLastUsedProject(body.path);
       const warnings = result.session?.warnings;
       if (warnings && warnings.length > 0) {
         for (const w of warnings) toastBus.handler?.error(w);

@@ -26,6 +26,8 @@ The **New session** wizard walks four steps:
 
 Choosing a profile seeds the agent-step defaults. If you have already edited a field, switching profiles asks before overwriting it.
 
+A plain New session opens on the project you launched last, the way the wizard already remembers your last agent and instruction. Pick another project from the Recent tab to change it.
+
 ## Command palette
 
 The command palette (top-bar button or keyboard shortcut) is a fuzzy launcher for global actions: jump to a session, open settings, start a new session, toggle the right panel.

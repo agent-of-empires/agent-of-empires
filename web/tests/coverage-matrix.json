@@ -1113,6 +1113,13 @@
       "components": ["web/src/components/session-wizard/steps/ProjectStep.tsx"]
     },
     {
+      "id": "wizard.remember-last-project",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/session-wizard/__tests__/SessionWizard.lastProject.test.tsx"],
+      "components": ["web/src/components/session-wizard/SessionWizard.tsx"]
+    },
+    {
       "id": "wizard.scratch-shortcut",
       "kind": "mocked-playwright",
       "risk": "medium",
