@@ -290,26 +290,19 @@ impl Conversion {
     }
 }
 
+/// Whether the next launch resumes a known conversation that cannot move.
+fn conversation_cannot_follow(instance: &super::Instance) -> bool {
+    instance
+        .conversation_target()
+        .and_then(|(_, binding, _)| binding)
+        .is_some_and(crate::session::ConversationBinding::is_known)
+}
+
 /// Decide how to make room for the new repo, and where the workspace lands.
 ///
 /// The workspace directory comes from the same `workspace_path_template` and
 /// `compute_path` creation uses, seeded with the session id, so a converted
 /// session sits exactly where an equivalent created-multi-repo session would.
-/// Whether the session's recorded conversation is known to be bound to its
-/// current working directory.
-///
-/// A known conversation (`Observed`, `Asserted` or `Imported`, with its
-/// execution identity) fails the launch identity check after the working
-/// directory moves, so an attach that moves the session would strand it. A
-/// preallocated id has no conversation behind it, and an unknown-provenance
-/// id starts fresh, so neither blocks the move.
-fn conversation_cannot_follow(instance: &super::Instance) -> bool {
-    instance
-        .agent_session_binding
-        .as_ref()
-        .is_some_and(crate::session::ConversationBinding::is_known)
-}
-
 fn plan_conversion(
     instance: &super::Instance,
     profile: &str,
@@ -534,19 +527,14 @@ pub fn plan(
     // checkout, workspace path taken, branch already checked out) happens with
     // nothing created.
     let conversion = plan_conversion(instance, profile, on_existing)?;
-    // A conversation AoE observed (or the user asserted) is bound to the
-    // working directory it was recorded in, and the relaunch after a
-    // workspace conversion refuses that stale cwd. Refuse at plan time,
-    // before the session is stopped and its checkout moved: the attach
-    // must not leave a moved session whose conversation can never launch
-    // again. A preallocated id has no conversation behind it and rebinds
-    // at launch; an unknown-provenance id starts fresh. See #3933.
+    // A known resume target cannot follow a workspace conversion. Reject it
+    // before stopping the session or moving its checkout.
     if !matches!(conversion, Conversion::Append { .. }) && conversation_cannot_follow(instance) {
         bail!(
             "'{}' carries a conversation bound to its current working directory; \
              moving the session into '{}' would leave that conversation \
-             unresumable. Rebind it with `aoe session set-session-id`, or attach \
-             to a session whose conversation is not live.",
+             unresumable. Keep its current directory, or explicitly clear the \
+             resume target before attaching to start a new conversation.",
             instance.title,
             conversion.workspace_dir().display()
         );
@@ -1571,11 +1559,7 @@ mod tests {
         );
     }
 
-    /// A conversation AoE observed is bound to the working directory it was
-    /// recorded in, and the launch after a workspace move refuses that stale
-    /// cwd. The refusal has to happen at plan time, before the session is
-    /// stopped and its checkout moved, or the user is left with a moved
-    /// session whose conversation can never launch again.
+    // Admission must follow the selected resume target, not a stale observation.
     #[test]
     #[serial_test::serial]
     fn a_known_conversation_refuses_the_attach_before_anything_moves() {
@@ -1628,13 +1612,34 @@ mod tests {
         };
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("conversation") && msg.contains("set-session-id"),
-            "the refusal has to name the conversation and the recovery: {msg}"
+            msg.contains("conversation"),
+            "the refusal has to name the conversation: {msg}"
         );
         assert!(
             session_wt.join("README.md").exists(),
             "a refusal must not touch the session's checkout"
         );
+
+        inst.resume_binding = inst.agent_session_binding.take();
+        for intent in [
+            crate::session::ResumeIntent::Use(sid.into()),
+            crate::session::ResumeIntent::Fork { from: sid.into() },
+        ] {
+            inst.resume_intent = intent;
+            assert!(plan(&inst, "attach-conv", &frontend, ExistingBranch::Refuse).is_err());
+            assert!(session_wt.join("README.md").exists());
+        }
+        inst.agent_session_binding = inst.resume_binding.take();
+
+        inst.resume_intent = crate::session::ResumeIntent::Cleared;
+        let cleared = plan(&inst, "attach-conv", &frontend, ExistingBranch::Refuse)
+            .expect("an explicit fresh start must not resume the old conversation");
+        let prepared = execute(&inst, cleared).expect("the cleared session can move");
+        assert!(Path::new(prepared.project_path())
+            .join("backend/README.md")
+            .exists());
+        prepared.rollback();
+        assert!(session_wt.join("README.md").exists());
     }
 
     /// Converting a session into a workspace has to carry its diff base with it.

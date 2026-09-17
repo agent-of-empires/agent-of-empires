@@ -43,9 +43,9 @@ pub enum SessionCommands {
 
     /// Attach another repo to an existing session, creating a worktree for it
     /// and restarting the agent. Moving the session's working directory is
-    /// refused while it carries a conversation bound to that directory; rebind
-    /// the conversation or attach before starting it. An implicitly
-    /// preallocated ID is re-linked across the move. See #3103.
+    /// refused while its resume target is a known conversation bound to that
+    /// directory. Explicitly clear the resume target to start a new conversation
+    /// after attaching. An implicitly preallocated ID is re-linked. See #3103.
     AddProject(AddProjectArgs),
 
     /// Set the resume target for a session; an agent whose exact native resume

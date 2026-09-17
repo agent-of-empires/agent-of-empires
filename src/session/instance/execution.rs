@@ -1713,7 +1713,7 @@ impl Instance {
         })
     }
 
-    pub(super) fn conversation_target(&self) -> Option<(&str, Option<&ConversationBinding>, bool)> {
+    pub(crate) fn conversation_target(&self) -> Option<(&str, Option<&ConversationBinding>, bool)> {
         Some(match &self.resume_intent {
             ResumeIntent::Cleared => return None,
             ResumeIntent::Use(sid) => (sid.as_str(), self.resume_binding.as_ref(), true),
