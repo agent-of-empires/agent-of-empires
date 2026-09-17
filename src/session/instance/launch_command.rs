@@ -2585,7 +2585,6 @@ mod tests {
             ),
             ("HOME".into(), home.path().display().to_string()),
         ];
-        let binding = instance.resolve_native_execution(None).unwrap().binding;
         instance.extra_args = "--mcp-config /tmp/elsewhere.json".into();
         let prepared = instance
             .prepare_launch_command(instance.conversation_state())
