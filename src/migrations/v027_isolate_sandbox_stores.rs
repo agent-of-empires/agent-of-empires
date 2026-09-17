@@ -288,10 +288,26 @@ pub fn run() -> Result<()> {
     )
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(super) struct TestReconcileProbes {
+    pub(super) running: fn(&str) -> Result<bool>,
+    pub(super) reap: fn(&str) -> Result<bool>,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static TEST_RECONCILE_PROBES: std::cell::Cell<Option<TestReconcileProbes>> = const { std::cell::Cell::new(None) };
+}
+
 /// Retry cohorts that were live during the schema migration. This is called on
 /// every startup until no pre-v2 row remains, then becomes a cheap read.
 /// `announce` narrates pending rows.
 pub(crate) fn reconcile_pending(announce: bool) -> Result<()> {
+    #[cfg(test)]
+    if let Some(probes) = TEST_RECONCILE_PROBES.get() {
+        return reconcile_scoped(announce, None, &probes.running, &probes.reap);
+    }
     reconcile_scoped(
         announce,
         None,

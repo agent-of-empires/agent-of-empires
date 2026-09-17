@@ -1882,8 +1882,12 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn a_descendant_state_alias_change_blocks_publication() {
+        use std::os::unix::fs::MetadataExt;
+
         let temporary = tempfile::tempdir().unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
         let source = temporary.path().join("source");
         let native = temporary.path().join("native");
         let external = temporary.path().join("external");
@@ -1894,7 +1898,8 @@ mod tests {
         fs::create_dir_all(native.join("sessions")).unwrap();
         let input = source.join("auth.json");
         fs::write(&input, b"BECOMES_NATIVE_HISTORY").unwrap();
-        fs::hard_link(&input, external.join("candidate")).unwrap();
+        std::os::unix::fs::symlink(&input, external.join("candidate")).unwrap();
+        assert_eq!(fs::metadata(&input).unwrap().nlink(), 1);
         fs::write(external.join("benign"), b"other state").unwrap();
         std::os::unix::fs::symlink("benign", external.join("alias")).unwrap();
         std::os::unix::fs::symlink(external.join("alias"), native.join("sessions/ref")).unwrap();
@@ -1925,6 +1930,8 @@ mod tests {
             "a newly forbidden inode must not be published through the cached inventory"
         );
         assert_eq!(fs::read(active.join("auth.json")).unwrap(), b"LOCAL_AUTH");
+        assert_eq!(fs::read(&input).unwrap(), b"BECOMES_NATIVE_HISTORY");
+        assert_eq!(fs::read_link(external.join("candidate")).unwrap(), input);
     }
 
     #[test]

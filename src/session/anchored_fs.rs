@@ -23,6 +23,11 @@ pub(crate) struct FilePublication<'a> {
     pub(crate) validate: &'a dyn Fn() -> Result<()>,
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FAIL_SYNC_ONCE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
 impl AnchoredDir {
     /// Anchor at `path`, whose ancestors are resolved the way any other
     /// caller resolves them and whose own leaf may not be a symlink.
@@ -110,6 +115,18 @@ impl AnchoredDir {
     }
 
     pub(crate) fn sync(&self) -> Result<()> {
+        #[cfg(test)]
+        if FAIL_SYNC_ONCE.with(|path| {
+            let mut path = path.borrow_mut();
+            if path.as_deref() == Some(self.path()) {
+                path.take();
+                true
+            } else {
+                false
+            }
+        }) {
+            bail!("injected anchored directory sync failure");
+        }
         nix::unistd::fsync(&self.fd).context("syncing anchored directory")
     }
 
