@@ -743,7 +743,7 @@ pub(in super::super) fn seed_skill_controls(
         let Some(canonical) = canonical_source(&lookup, boundary, false, access)? else {
             continue;
         };
-        let Some(mut file) = open_canonical_file(&canonical)? else {
+        let Some(mut file) = open_canonical_file(&canonical, access)? else {
             continue;
         };
         let mut guard = guard::ReadGuard::new(boundary, access)?;
