@@ -2530,6 +2530,11 @@ mod tests {
         let root = &roots[0].path;
         fs::create_dir_all(root.join("projects/proj")).unwrap();
         fs::write(root.join("projects/proj/session.jsonl"), b"RESUME_STATE").unwrap();
+        fs::hard_link(
+            root.join("projects/proj/session.jsonl"),
+            root.join("projects/proj/backup.jsonl"),
+        )
+        .unwrap();
         fs::write(root.join("history.jsonl"), b"HOST_IMPORTABLE_HISTORY").unwrap();
         fs::write(root.join("settings.json"), b"{}").unwrap();
         // A link out of the carried tree must not smuggle the retired history back.
@@ -2559,6 +2564,11 @@ mod tests {
             fs::read(root.join("projects/proj/session.jsonl")).unwrap(),
             b"RESUME_STATE",
             "the sandbox's own resume state is carried into the fresh store"
+        );
+        assert_eq!(
+            fs::read(root.join("projects/proj/backup.jsonl")).unwrap(),
+            b"RESUME_STATE",
+            "an internal hardlink must keep both names and their resume bytes"
         );
         assert!(
             !root.join("history.jsonl").exists(),

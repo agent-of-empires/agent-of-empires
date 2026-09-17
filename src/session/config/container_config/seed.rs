@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::fs::{self, File, Permissions};
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
@@ -966,6 +967,36 @@ fn snapshot_config_database<'a>(
         .anchor
         .create_child(Path::new(&format!(".sqlite-{}", uuid::Uuid::new_v4())))?;
     let mut guard = guard::ReadGuard::new(boundary, access)?;
+    // Lease the namespace before inspecting optional sidecars, including absence.
+    let source_parent =
+        open_canonical_dir(canonical.parent().context("SQLite source has no parent")?)?;
+    guard.pin_directory(&source_parent)?;
+    let mut journal = canonical.as_os_str().to_os_string();
+    journal.push("-journal");
+    let journal = PathBuf::from(journal);
+    match fs::symlink_metadata(&journal) {
+        Ok(_) => {
+            let input = canonical_source(&journal, boundary, false, access)?
+                .context("native SQLite journal is not an admissible source")?;
+            let mut file = open_canonical_file(&input, access)?
+                .context("native SQLite journal is not a readable regular file")?;
+            guard.record_route(&journal, &input)?;
+            if !guard.record_file(&input, &file)? {
+                anyhow::bail!("native SQLite journal overlaps native state");
+            }
+            // TRUNCATE leaves an empty journal; PERSIST clears its 28-byte header.
+            if file.metadata()?.len() != 0 {
+                let mut header = [0; 28];
+                file.read_exact(&mut header)
+                    .context("reading native SQLite journal header")?;
+                if header != [0; 28] {
+                    anyhow::bail!("native SQLite source has an active rollback journal; retry after the transaction finishes");
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("inspecting native SQLite journal"),
+    }
     for suffix in ["", "-wal"] {
         let mut spelling = canonical.as_os_str().to_os_string();
         spelling.push(suffix);
@@ -1420,6 +1451,141 @@ impl ResourceSeed<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sqlite_seed_refuses_uncommitted_spilled_pages_and_retries_after_rollback() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let active = temporary.path().join("active");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&active).unwrap();
+        let database = source.join("config.db");
+        let journal = source.join("config.db-journal");
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode=DELETE;
+             PRAGMA page_size=1024;
+             PRAGMA cache_size=2;
+             PRAGMA cache_spill=ON;
+             CREATE TABLE config (id INTEGER PRIMARY KEY, value TEXT, padding BLOB);
+             WITH RECURSIVE rows(id) AS (VALUES(1) UNION ALL SELECT id+1 FROM rows WHERE id<128)
+             INSERT INTO config SELECT id, 'committed', zeroblob(900) FROM rows;",
+            )
+            .unwrap();
+        let committed = fs::read(&database).unwrap();
+        connection
+            .execute_batch("BEGIN IMMEDIATE; UPDATE config SET value='uncommitted';")
+            .unwrap();
+        let database_before = fs::read(&database).unwrap();
+        let journal_before = fs::read(&journal).unwrap();
+        assert_ne!(
+            database_before, committed,
+            "the open transaction must spill pages to the main file"
+        );
+        assert!(journal_before.len() >= 28 && journal_before[..28].iter().any(|byte| *byte != 0));
+        let boundary = NativeStateBoundary::for_source(&source, &active).unwrap();
+        let result = seed_sqlite_files(&source, &active, &["config.db"], &boundary);
+        assert_eq!(fs::read(&database).unwrap(), database_before);
+        assert_eq!(fs::read(&journal).unwrap(), journal_before);
+        assert!(
+            result.is_err(),
+            "an active rollback journal must prevent a snapshot: {result:?}"
+        );
+        assert!(!active.join("config.db").exists());
+
+        connection.execute_batch("ROLLBACK;").unwrap();
+        let boundary = NativeStateBoundary::for_source(&source, &active).unwrap();
+        seed_sqlite_files(&source, &active, &["config.db"], &boundary).unwrap();
+        let snapshot = rusqlite::Connection::open(active.join("config.db")).unwrap();
+        let rows: (i64, i64) = snapshot
+            .query_row(
+                "SELECT COUNT(*), SUM(value='committed') FROM config",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(rows, (128, 128));
+    }
+
+    #[test]
+    fn sqlite_seed_accepts_inactive_rollback_journals_without_changing_source() {
+        for mode in ["PERSIST", "TRUNCATE"] {
+            let temporary = tempfile::tempdir().unwrap();
+            let source = temporary.path().join("source");
+            let active = temporary.path().join("active");
+            fs::create_dir(&source).unwrap();
+            fs::create_dir(&active).unwrap();
+            let database = source.join("config.db");
+            let journal = source.join("config.db-journal");
+            let connection = rusqlite::Connection::open(&database).unwrap();
+            connection
+                .execute_batch(&format!(
+                    "PRAGMA journal_mode={mode};
+                 CREATE TABLE config (value TEXT);
+                 INSERT INTO config VALUES ('committed');"
+                ))
+                .unwrap();
+            let database_before = fs::read(&database).unwrap();
+            let journal_before = fs::read(&journal).unwrap();
+            if mode == "PERSIST" {
+                assert!(journal_before.len() >= 28);
+                assert_eq!(&journal_before[..28], &[0; 28]);
+            } else {
+                assert!(journal_before.is_empty());
+            }
+            let boundary = NativeStateBoundary::for_source(&source, &active).unwrap();
+            seed_sqlite_files(&source, &active, &["config.db"], &boundary).unwrap();
+            assert_eq!(fs::read(&database).unwrap(), database_before, "{mode}");
+            assert_eq!(fs::read(&journal).unwrap(), journal_before, "{mode}");
+            let snapshot = rusqlite::Connection::open(active.join("config.db")).unwrap();
+            let value: String = snapshot
+                .query_row("SELECT value FROM config", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(value, "committed", "{mode}");
+        }
+    }
+
+    #[test]
+    fn carried_hardlinks_keep_outside_directory_alias_witnesses() {
+        for outward in [true, false] {
+            let temporary = tempfile::tempdir().unwrap();
+            let source = temporary.path().join("source");
+            let active = temporary.path().join("active");
+            fs::create_dir_all(source.join("projects/proj")).unwrap();
+            fs::create_dir(&active).unwrap();
+            let candidate = source.join("projects/proj/session.jsonl");
+            fs::write(&candidate, b"OUTSIDE_STATE").unwrap();
+            if outward {
+                fs::create_dir(source.join("history-tree")).unwrap();
+                fs::hard_link(&candidate, source.join("history-tree/session.jsonl")).unwrap();
+                std::os::unix::fs::symlink("../history-tree", source.join("projects/leak"))
+                    .unwrap();
+            } else {
+                fs::hard_link(&candidate, source.join("projects/proj/backup.jsonl")).unwrap();
+                std::os::unix::fs::symlink("projects/proj", source.join("history-tree")).unwrap();
+            }
+            let mut boundary = NativeStateBoundary::for_source(&source, &active).unwrap();
+            boundary.stopped_original = Some(boundary.source_root.path().to_path_buf());
+            // The outward fixture discovers history only through the carried alias.
+            boundary.add_path(if outward {
+                source.join("projects")
+            } else {
+                source.clone()
+            });
+            carry_sandbox_state(&source, &active, &["projects"], &boundary).unwrap();
+            assert!(
+                !active.join("projects/proj/session.jsonl").exists(),
+                "outward={outward}"
+            );
+            assert!(
+                !active.join("projects/proj/backup.jsonl").exists(),
+                "outward={outward}"
+            );
+            assert!(!active.join("projects/leak").exists(), "outward={outward}");
+            assert_eq!(fs::read(&candidate).unwrap(), b"OUTSIDE_STATE");
+        }
+    }
 
     #[test]
     fn native_state_hardlinks_are_not_configuration_but_authored_hardlinks_are() {
