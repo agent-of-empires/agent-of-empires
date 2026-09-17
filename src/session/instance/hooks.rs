@@ -297,7 +297,7 @@ impl Instance {
             None
         };
         if let Some((disclosed, resolved)) = paths {
-            if disclosed != resolved {
+            if !same_hook_target(&disclosed, &resolved) {
                 bail!(
                     "before_session changed the agent hook path from {} to {}; declare the override in the profile environment before consenting",
                     disclosed.display(),
@@ -642,6 +642,36 @@ fn is_read_only_filesystem(error: &anyhow::Error) -> bool {
 /// The resolved target to report, or `None` when it has already been reported.
 /// Keyed on the target, so a replaced symlink reports once for its new file. A
 /// missing file resolves through its parent directory.
+/// Resolve `path` to the file it actually names, following symlinks. A file
+/// that does not exist yet resolves through its parent directory, so a hook
+/// file AoE has not written yet still compares by the directory it will land
+/// in. Falls back to the literal path when neither resolves.
+fn hook_target_identity(path: &std::path::Path) -> std::path::PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| {
+        path.parent()
+            .and_then(|parent| std::fs::canonicalize(parent).ok())
+            .zip(path.file_name())
+            .map(|(parent, file_name)| parent.join(file_name))
+            .unwrap_or_else(|| path.to_path_buf())
+    })
+}
+
+/// Whether the consented hook path and the resolved one name the same file.
+///
+/// Compared by resolved target rather than by literal path: an account
+/// switcher driven from `before_session` points `CLAUDE_CONFIG_DIR` (or
+/// `CODEX_HOME`) at a per-account directory whose `settings.json` /
+/// `config.toml` is a symlink back to the one shared file, so the two paths
+/// differ as strings while naming the same bytes on disk. Consent is about
+/// which file gets written, so that case must pass.
+///
+/// A `before_session` that redirects the install into a genuinely different
+/// file still resolves differently and is still refused, which is the property
+/// the consent gate exists for.
+fn same_hook_target(disclosed: &std::path::Path, resolved: &std::path::Path) -> bool {
+    disclosed == resolved || hook_target_identity(disclosed) == hook_target_identity(resolved)
+}
+
 fn first_read_only_report(path: &std::path::Path) -> Option<std::path::PathBuf> {
     let key = std::fs::canonicalize(path).unwrap_or_else(|_| {
         path.parent()
@@ -678,6 +708,71 @@ mod tests {
             state.has_acknowledged_agent_hooks = true;
         })
         .unwrap();
+    }
+
+    /// The consent gate compares which FILE gets written, not which string
+    /// names it. An account switcher driven from `before_session` points the
+    /// agent's config dir at a per-account directory whose settings file is a
+    /// symlink back to the shared one; those two paths differ as strings and
+    /// must still count as consented. A redirect onto a genuinely different
+    /// file must still be refused, which is the whole point of the gate.
+    #[test]
+    fn same_hook_target_follows_symlinks_but_not_distinct_files() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Identical paths never need to touch the filesystem.
+        let plain = dir.path().join("settings.json");
+        assert!(same_hook_target(&plain, &plain));
+
+        // Two distinct real files are distinct, existing or not.
+        let other = dir.path().join("other.json");
+        std::fs::write(&plain, "{}").unwrap();
+        std::fs::write(&other, "{}").unwrap();
+        assert!(!same_hook_target(&plain, &other));
+        assert!(!same_hook_target(
+            &dir.path().join("absent-a.json"),
+            &dir.path().join("absent-b.json")
+        ));
+
+        #[cfg(unix)]
+        {
+            // The switcher shape: <profile>/settings.json -> ~/.claude/settings.json.
+            let shared = dir.path().join("claude");
+            std::fs::create_dir(&shared).unwrap();
+            let real = shared.join("settings.json");
+            std::fs::write(&real, "{}").unwrap();
+
+            let profile = dir.path().join("profiles").join("acct");
+            std::fs::create_dir_all(&profile).unwrap();
+            let linked = profile.join("settings.json");
+            std::os::unix::fs::symlink(&real, &linked).unwrap();
+
+            assert!(
+                same_hook_target(&real, &linked),
+                "a per-account symlink onto the consented file is the same target"
+            );
+
+            // A symlinked config DIRECTORY resolves too, which is the other
+            // shape a switcher can take.
+            let alias = dir.path().join("alias");
+            std::os::unix::fs::symlink(&shared, &alias).unwrap();
+            assert!(same_hook_target(&real, &alias.join("settings.json")));
+
+            // A file that does not exist yet resolves through its parent, so a
+            // first launch (nothing written) still compares by directory.
+            assert!(same_hook_target(
+                &shared.join("absent.json"),
+                &alias.join("absent.json")
+            ));
+
+            // A redirect into an unrelated directory stays refused.
+            let elsewhere = dir.path().join("elsewhere");
+            std::fs::create_dir(&elsewhere).unwrap();
+            assert!(
+                !same_hook_target(&real, &elsewhere.join("settings.json")),
+                "the gate must still refuse a genuinely different file"
+            );
+        }
     }
 
     #[test]
