@@ -418,9 +418,8 @@ impl Instance {
                 (Some(sid), _) => StartOutcome::FreshAfterFailedResume { sid },
                 (None, Some(notice)) => {
                     let sid = match &notice {
-                        super::launch_command::FreshLaunchNotice::UnqualifiedStoredConversation {
-                            sid,
-                        } => sid.clone(),
+                        FreshLaunchNotice::UnqualifiedStoredConversation { sid }
+                        | FreshLaunchNotice::UnattestedContext { sid } => sid.clone(),
                     };
                     StartOutcome::FreshAfterUnavailableResume { sid, notice }
                 }

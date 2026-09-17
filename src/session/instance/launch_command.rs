@@ -21,6 +21,10 @@ pub enum FreshLaunchNotice {
     /// The stored conversation id could not be qualified for automatic
     /// resume after an upgrade; the conversation was not deleted.
     UnqualifiedStoredConversation { sid: String },
+    /// The stored conversation cannot be qualified because the launch
+    /// context itself is unattested (auth, container identity, channel
+    /// build); the conversation was not deleted.
+    UnattestedContext { sid: String },
 }
 
 impl FreshLaunchNotice {
@@ -31,6 +35,12 @@ impl FreshLaunchNotice {
                 "starting fresh; the stored conversation id {sid} has unknown provenance \
                  after upgrade and was not resumed. The previous conversation was not \
                  deleted; point `aoe session set-session-id` at its store to resume it."
+            ),
+            FreshLaunchNotice::UnattestedContext { sid } => format!(
+                "starting fresh; the stored conversation id {sid} cannot be resumed \
+                 from this launch context and was not resumed. The previous \
+                 conversation was not deleted; fix the launch context or point \
+                 `aoe session set-session-id` at its store to resume it."
             ),
         }
     }
@@ -505,6 +515,26 @@ impl Instance {
                 if let Some(observation) = self.capture_freshest_conversation() {
                     self.apply_conversation_observation(&observation);
                 }
+            }
+            // An unattested launch context (auth, container identity,
+            // channel build) cannot authorize resuming the stored
+            // conversation, but an ordinary start must not fail. Start fresh
+            // and say why; explicit Use/Fork still fail closed in
+            // validate_conversation_target.
+            let degraded = matches!(self.resume_intent, ResumeIntent::Default)
+                && self.agent_session_id.is_some()
+                && self
+                    .resolve_native_execution(self.conversation_target())
+                    .is_err();
+            if degraded {
+                let sid = self.agent_session_id.clone().unwrap_or_default();
+                let error = match self.resolve_native_execution(self.conversation_target()) {
+                    Err(error) => error,
+                    Ok(_) => unreachable!(),
+                };
+                fresh_notice = Some(FreshLaunchNotice::UnattestedContext { sid });
+                tracing::warn!(target: "session.store", error = %error, "stored conversation cannot be resumed from an unattested context; starting fresh");
+                self.set_agent_conversation(None, None, self.pi_session_path.clone());
             }
             let managed = !matches!(self.resume_intent, ResumeIntent::Cleared)
                 && (self.agent_session_id.is_some()
@@ -2538,7 +2568,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn unmanaged_creation_launches_with_unattested_flags_but_managed_restart_refuses() {
+    fn unmanaged_creation_launches_with_unattested_flags() {
         use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir().unwrap();
         let _isolation = crate::session::test_support::isolate_app_dir_at(home.path());
@@ -2566,6 +2596,29 @@ mod tests {
             .unwrap()
             .contains("--mcp-config"));
         assert!(!prepared.is_existing);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn unattested_managed_context_starts_default_fresh_but_fails_use() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let _isolation = crate::session::test_support::isolate_app_dir_at(home.path());
+        let program = home.path().join("claude");
+        std::fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut instance = Instance::new("argv-degrade", home.path().to_str().unwrap());
+        instance.tool = "claude".into();
+        instance.command = "claude".into();
+        instance.pending_host_env = vec![
+            (
+                "PATH".into(),
+                format!("{}:/usr/bin:/bin", home.path().display()),
+            ),
+            ("HOME".into(), home.path().display().to_string()),
+        ];
+        let binding = instance.resolve_native_execution(None).unwrap().binding;
+        instance.extra_args = "--mcp-config /tmp/elsewhere.json".into();
         instance.set_agent_conversation(
             Some("11111111-1111-4111-8111-111111111111".into()),
             Some(ConversationBinding {
@@ -2577,14 +2630,25 @@ mod tests {
             None,
         );
         let before = instance.conversation_state();
+        let prepared = instance
+            .prepare_launch_command(before.clone())
+            .expect("an ordinary restart must degrade to fresh on unattested argv");
+        let FreshLaunchNotice::UnattestedContext { sid } = prepared
+            .fresh_notice
+            .expect("degradation must carry a notice")
+        else {
+            panic!("expected the unattested-context notice");
+        };
+        assert_eq!(sid, "11111111-1111-4111-8111-111111111111");
+        assert!(instance.agent_session_id.is_none());
+        instance.resume_intent = ResumeIntent::Use("11111111-1111-4111-8111-111111111111".into());
         let error = match instance.prepare_launch_command(before.clone()) {
-            Ok(_) => panic!("a managed restart must still refuse unattested argv"),
+            Ok(_) => panic!("an explicit resume must still fail closed"),
             Err(error) => error.to_string(),
         };
         assert!(
             error.contains("argument --mcp-config is not supported for a managed"),
-            "managed restart must refuse unattested argv, got: {error}"
+            "explicit resume must refuse unattested argv, got: {error}"
         );
-        assert!(before.matches(&instance));
     }
 }
