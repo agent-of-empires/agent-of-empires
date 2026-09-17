@@ -1,10 +1,9 @@
 //! The v3 runner control socket: connecting, establishing a session, and
 //! routing ACP frames over it.
 
-use crate::acp::control_protocol::{self, ControlBody};
+use crate::acp::control_protocol::{self, ControlBody, SessionReplayed};
 use crate::acp::state::Event;
 use agent_client_protocol::schema::v1::PromptResponse;
-use agent_client_protocol::{JsonRpcMessage, JsonRpcNotification};
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -30,16 +29,6 @@ impl Drop for ShutdownControlOnDrop {
         }
     }
 }
-
-/// Daemon-private marker queued behind each handshake reply on the crate
-/// transport. SDK dispatch is ordered, so handling it proves every update the
-/// runner sent before that reply has been applied.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonRpcNotification)]
-#[notification(method = "_aoe/handshake_drained")]
-pub(super) struct HandshakeDrained {
-    seq: u64,
-}
-
 /// Bidirectional client for a v3 runner control socket. The runner owns the
 /// handshake and turn; the daemon drives them over this channel.
 ///
@@ -51,9 +40,9 @@ pub(super) struct HandshakeDrained {
 pub(super) struct DaemonControlClient {
     pub(super) ingress: Arc<SessionIngress>,
     write: Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
-    handshake_rx: Mutex<mpsc::Receiver<(ControlBody, u64)>>,
-    last_handshake_seq: AtomicU64,
-    drained_seq: watch::Sender<u64>,
+    handshake_rx: Mutex<mpsc::Receiver<ControlBody>>,
+    sessions_established: AtomicU64,
+    sessions_replayed: watch::Sender<u64>,
     completion: Arc<std::sync::Mutex<PromptCompletion>>,
     raw_fd: RawFd,
 }
@@ -160,8 +149,8 @@ impl DaemonControlClient {
             .await
             .map_err(|e| acp_internal_error(format!("control write failed: {e}")))?;
         match self.handshake_rx.lock().await.recv().await {
-            Some((ControlBody::Initialized { result }, _)) => Ok(result),
-            Some((ControlBody::HandshakeFailed { error }, _)) => Err(acp_error_from_value(error)),
+            Some(ControlBody::Initialized { result }) => Ok(result),
+            Some(ControlBody::HandshakeFailed { error }) => Err(acp_error_from_value(error)),
             _ => Err(acp_internal_error(
                 "control channel closed during initialize".into(),
             )),
@@ -182,15 +171,15 @@ impl DaemonControlClient {
         })
         .await
         .map_err(|e| acp_internal_error(format!("control write failed: {e}")))?;
-        let reply = self.handshake_rx.lock().await.recv().await;
-        if let Some((_, seq)) = &reply {
-            self.last_handshake_seq.store(*seq, AtomicOrdering::Relaxed);
-        }
-        match reply.map(|(frame, _)| frame) {
+        match self.handshake_rx.lock().await.recv().await {
             Some(ControlBody::SessionReady {
                 acp_session_id,
                 result,
-            }) => Ok((acp_session_id, result)),
+            }) => {
+                self.sessions_established
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                Ok((acp_session_id, result))
+            }
             Some(ControlBody::HandshakeFailed { error }) => Err(acp_error_from_value(error)),
             _ => Err(acp_internal_error(
                 "control channel closed during session establishment".into(),
@@ -204,27 +193,28 @@ impl DaemonControlClient {
             .await
             .map_err(|e| acp_internal_error(format!("control write failed: {e}")))?;
         match self.handshake_rx.lock().await.recv().await {
-            Some((ControlBody::SessionReady { acp_session_id, .. }, _)) => Ok(acp_session_id),
-            Some((ControlBody::HandshakeFailed { error }, _)) => Err(acp_error_from_value(error)),
+            Some(ControlBody::SessionReady { acp_session_id, .. }) => Ok(acp_session_id),
+            Some(ControlBody::HandshakeFailed { error }) => Err(acp_error_from_value(error)),
             _ => Err(acp_internal_error(
                 "control channel closed during resume".into(),
             )),
         }
     }
 
-    /// Wait until the crate has dispatched everything the runner sent before
-    /// the last session establishment reply.
-    pub(super) async fn handshake_drained(&self) {
-        let seq = self.last_handshake_seq.load(AtomicOrdering::Relaxed);
+    /// Wait until the crate has applied the updates the runner queued ahead of
+    /// every established session's replay barrier.
+    pub(super) async fn session_replayed(&self) {
+        let established = self.sessions_established.load(AtomicOrdering::Relaxed);
         let _ = self
-            .drained_seq
+            .sessions_replayed
             .subscribe()
-            .wait_for(|drained| *drained >= seq)
+            .wait_for(|replayed| *replayed >= established)
             .await;
     }
 
-    pub(super) fn mark_handshake_drained(&self, marker: HandshakeDrained) {
-        self.drained_seq.send_replace(marker.seq);
+    pub(super) fn mark_session_replayed(&self, _: SessionReplayed) {
+        self.sessions_replayed
+            .send_modify(|replayed| *replayed += 1);
     }
 
     /// Transfer terminal ownership before the command loop arms a local turn.
@@ -362,7 +352,7 @@ pub(super) async fn connect_runner_control_v3(
     let write_half = Arc::new(Mutex::new(write_half));
 
     let reader_prompt_in_flight = prompt_in_flight.clone();
-    let (hs_tx, hs_rx) = mpsc::channel::<(ControlBody, u64)>(8);
+    let (hs_tx, hs_rx) = mpsc::channel::<ControlBody>(8);
     let completion = Arc::new(std::sync::Mutex::new(PromptCompletion::Adopted));
     let reader_completion = completion.clone();
     let reader_session = session_label.clone();
@@ -371,7 +361,6 @@ pub(super) async fn connect_runner_control_v3(
     let ingress = Arc::new(SessionIngress::default());
     let reader_ingress = ingress.clone();
     tokio::spawn(async move {
-        let mut handshake_seq = 0;
         async {
             loop {
             match control_protocol::read_frame_with_size(&mut read_half).await {
@@ -384,17 +373,7 @@ pub(super) async fn connect_runner_control_v3(
                     if let ControlBody::SessionReady { acp_session_id, .. } = &frame {
                         reader_ingress.resolve(None, acp_session_id.clone().into());
                     }
-                    handshake_seq += 1;
-                    let marker = HandshakeDrained { seq: handshake_seq };
-                    let line = serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "method": marker.method(),
-                        "params": marker,
-                    });
-                    if !shim_write_line(&reader_shim_write, &line).await {
-                        return;
-                    }
-                    if hs_tx.send((frame, handshake_seq)).await.is_err() {
+                    if hs_tx.send(frame).await.is_err() {
                         return;
                     }
                 }
@@ -487,9 +466,6 @@ pub(super) async fn connect_runner_control_v3(
                         return;
                     }
                 }
-                // Only this reader may mint drain markers.
-                Ok(Some((ControlBody::Notify { method, .. }, _)))
-                    if HandshakeDrained::matches_method(&method) => {}
                 // Preserve producer bytes across the private SDK transport without
                 // adding nesting or trusting any native accounting claim.
                 Ok(Some((ControlBody::Notify { method, mut params }, wire_bytes))) => {
@@ -703,8 +679,8 @@ pub(super) async fn connect_runner_control_v3(
             ingress,
             write: write_half,
             handshake_rx: Mutex::new(hs_rx),
-            last_handshake_seq: AtomicU64::new(0),
-            drained_seq: watch::Sender::new(0),
+            sessions_established: AtomicU64::new(0),
+            sessions_replayed: watch::Sender::new(0),
             completion,
             raw_fd,
         }),
@@ -1848,11 +1824,10 @@ mod tests {
         assert!(!message.contains("timed out attaching"), "{message}");
     }
 
-    /// A session reply is observed before the replay the runner sent ahead of
-    /// it is dispatched; the drain barrier must hold until that replay applies,
-    /// and an agent cannot forge the barrier (#4016).
+    /// The runner's session reply precedes the replay it follows; a load must
+    /// not count as replayed until the crate has applied that replay (#4016).
     #[tokio::test]
-    async fn handshake_drain_waits_for_updates_sent_before_the_reply() {
+    async fn session_replayed_waits_for_replay_sent_after_the_reply() {
         use agent_client_protocol::schema::v1::SessionNotification;
         use agent_client_protocol::{ByteStreams, Client};
         use futures_util::FutureExt as _;
@@ -1861,7 +1836,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let control =
-            crate::process::worker::control_socket_sibling(&tmp.path().join("drain.sock"));
+            crate::process::worker::control_socket_sibling(&tmp.path().join("replayed.sock"));
         let listener = tokio::net::UnixListener::bind(&control).unwrap();
         let runner = async {
             let (mut peer, _) = listener.accept().await.unwrap();
@@ -1869,7 +1844,7 @@ mod tests {
                 &mut peer,
                 &ControlBody::Hello {
                     control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
-                    session_id: "drain".into(),
+                    session_id: "replayed".into(),
                 },
             )
             .await
@@ -1879,17 +1854,17 @@ mod tests {
                     ControlBody::Attach { .. } => {}
                     ControlBody::EstablishSession { .. } => {
                         for body in [
-                            ControlBody::Notify {
-                                method: "_aoe/handshake_drained".into(),
-                                params: serde_json::json!({"seq": u64::MAX}),
+                            ControlBody::SessionReady {
+                                acp_session_id: "s".into(),
+                                result: serde_json::json!({}),
                             },
                             ControlBody::Notify {
                                 method: "session/update".into(),
                                 params: serde_json::json!({"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"replayed"}}}),
                             },
-                            ControlBody::SessionReady {
-                                acp_session_id: "s".into(),
-                                result: serde_json::json!({}),
+                            ControlBody::Notify {
+                                method: "_aoe/session_replayed".into(),
+                                params: serde_json::json!({}),
                             },
                         ] {
                             control_protocol::write_frame(&mut peer, &body)
@@ -1905,7 +1880,7 @@ mod tests {
             let (client, crate_side) = connect_runner_control_v3(
                 &control,
                 mpsc::channel::<Event>(1).0,
-                "drain".into(),
+                "replayed".into(),
                 Arc::new(TerminalClaim::new()),
                 Arc::new(AtomicBool::new(false)),
             )
@@ -1938,8 +1913,8 @@ mod tests {
                     agent_client_protocol::on_receive_notification!(),
                 )
                 .on_receive_notification(
-                    move |marker: HandshakeDrained, _cx| {
-                        marker_client.mark_handshake_drained(marker);
+                    move |marker: SessionReplayed, _cx| {
+                        marker_client.mark_session_replayed(marker);
                         async { Ok(()) }
                     },
                     agent_client_protocol::on_receive_notification!(),
@@ -1951,16 +1926,15 @@ mod tests {
                             .establish_session("session/load", serde_json::json!({}))
                             .await
                             .unwrap();
-                        // Ordered dispatch: the forged marker ran before this.
                         entered_rx.await.unwrap();
-                        let drained = client.handshake_drained();
-                        tokio::pin!(drained);
+                        let replayed = client.session_replayed();
+                        tokio::pin!(replayed);
                         assert!(
-                            drained.as_mut().now_or_never().is_none(),
-                            "drain must wait for the replayed update"
+                            replayed.as_mut().now_or_never().is_none(),
+                            "a load must not count as replayed mid-replay"
                         );
                         release_tx.send(()).unwrap();
-                        drained.await;
+                        replayed.await;
                         assert!(applied.load(AtomicOrdering::Relaxed));
                         client.shutdown();
                         Ok(())

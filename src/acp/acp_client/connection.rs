@@ -32,9 +32,7 @@ use super::config_options::{
     config_options_event, dispatch_set_config_option, dispatch_set_mode, mode_config_id,
     thought_level_config_id, ConfigOptionDispatchPurpose,
 };
-use super::control::{
-    establish_session_v3, prompt_outcome_to_response, DaemonControlClient, HandshakeDrained,
-};
+use super::control::{establish_session_v3, prompt_outcome_to_response, DaemonControlClient};
 use super::delete::handle_delete_session_cmd;
 use super::errors::{acp_internal_error, AcpError, IncompatibleAgentError};
 use super::fs_handlers::{handle_read_text_file, handle_write_text_file};
@@ -71,6 +69,7 @@ use super::watchdog::{
     OFF_PROTOCOL_WORK_GRACE_FLOOR,
 };
 use super::SessionResources;
+use crate::acp::control_protocol::SessionReplayed;
 
 /// Fully silent grace after reattaching to an in-flight turn. Any inbound
 /// notification disarms this watchdog because later silence may be reasoning.
@@ -290,8 +289,8 @@ pub(super) async fn run_connection_task<W, R>(
     // transcript on the next reload; every prior assistant bubble
     // appears once from disk replay, then again from the agent's
     // history dump. Suppress transcript events from session/load until
-    // the first ClientCmd::Prompt below, which cannot run before the
-    // replay preceding the load reply has been applied.
+    // the first ClientCmd::Prompt below; a runner-hosted load waits for its
+    // replay to apply before the loop can take that prompt.
     let suppress_history_replay = Arc::new(AtomicBool::new(false));
     let suppress_for_notif = suppress_history_replay.clone();
     let suppress_for_block = suppress_history_replay.clone();
@@ -411,7 +410,7 @@ pub(super) async fn run_connection_task<W, R>(
     let agent_msg_dedup_for_block = agent_msg_dedup.clone();
     let control_notifications = control_client.is_some();
     let control_on_close = control_client.clone();
-    let control_for_drain = control_client.clone();
+    let control_for_replayed = control_client.clone();
     let control_on_exit = control_client.clone();
 
     let apply_notification = Arc::new(
@@ -733,9 +732,9 @@ pub(super) async fn run_connection_task<W, R>(
             agent_client_protocol::on_receive_notification!(),
         )
         .on_receive_notification(
-            move |marker: HandshakeDrained, _cx| {
-                if let Some(control) = control_for_drain.as_ref() {
-                    control.mark_handshake_drained(marker);
+            move |marker: SessionReplayed, _cx| {
+                if let Some(control) = control_for_replayed.as_ref() {
+                    control.mark_session_replayed(marker);
                 }
                 async { Ok(()) }
             },
@@ -1292,10 +1291,11 @@ pub(super) async fn run_connection_task<W, R>(
                                     &req,
                                 )
                                 .await;
-                                // The runner's reply reaches us ahead of the replay
-                                // it followed; a prompt must not end suppression
-                                // until that replay is applied (#4016).
-                                control.handshake_drained().await;
+                                // The runner sends SessionReady ahead of the replay;
+                                // a prompt must not end suppression mid-replay (#4016).
+                                if result.is_ok() {
+                                    control.session_replayed().await;
+                                }
                                 result
                             } else {
                                 connection.send_request(req).block_task().await
