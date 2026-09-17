@@ -319,6 +319,11 @@ fn fork_from_parent_without_agent_session_is_refused() {
         !child.status.success(),
         "fork from a session with no captured agent id must fail"
     );
+    let stderr = String::from_utf8_lossy(&child.stderr);
+    assert!(
+        stderr.contains("Nothing to fork") && stderr.contains("BareParent"),
+        "expected missing parent conversation, got: {stderr}"
+    );
     let sessions = read_sessions(&h);
     assert!(
         sessions
@@ -368,6 +373,11 @@ fn refused_scratch_fork_leaves_no_orphaned_dir() {
     assert!(
         !child.status.success(),
         "a scratch fork must be refused (scratch cwd cannot resume the parent)"
+    );
+    let stderr = String::from_utf8_lossy(&child.stderr);
+    assert!(
+        stderr.contains("cannot be combined with --scratch"),
+        "expected scratch incompatibility, got: {stderr}"
     );
     // Leak check: the denial fires before scratch provisioning, so no scratch
     // directory was created.
@@ -419,6 +429,11 @@ fn fork_from_unlaunched_fork_is_refused() {
     assert!(
         !child.status.success(),
         "fork from an unlaunched fork must fail"
+    );
+    let stderr = String::from_utf8_lossy(&child.stderr);
+    assert!(
+        stderr.contains("fork has not launched yet") && stderr.contains("PendingFork"),
+        "expected pending parent fork, got: {stderr}"
     );
     let sessions = read_sessions(&h);
     assert!(
@@ -472,6 +487,11 @@ fn fork_from_with_structured_view_is_refused() {
     assert!(
         !child.status.success(),
         "--fork-from --structured-view must fail"
+    );
+    let stderr = String::from_utf8_lossy(&child.stderr);
+    assert!(
+        stderr.contains("terminal fork") && stderr.contains("--structured-view"),
+        "structured-view incompatibility must win over scratch: {stderr}"
     );
     assert!(
         !scratch_root.exists()
@@ -547,6 +567,11 @@ fn fork_from_unforkable_agent_is_refused() {
     assert!(
         !child.status.success(),
         "fork with an unforkable agent must fail"
+    );
+    let stderr = String::from_utf8_lossy(&child.stderr);
+    assert!(
+        stderr.contains("does not support forking") && stderr.contains("'gemini'"),
+        "expected unsupported parent agent, got: {stderr}"
     );
 
     // The seed comes from the parent's own binding, so the refusal names the
