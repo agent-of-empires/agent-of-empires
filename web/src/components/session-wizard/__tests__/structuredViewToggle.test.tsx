@@ -15,13 +15,21 @@
 // AGENTS.md mandate calls for; the live persistence path stays in the
 // Playwright suite.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, fireEvent, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
 import { AgentStep } from "../steps/AgentStep";
 import { SessionWizard } from "../SessionWizard";
 import { initialData } from "../wizardReducer";
 import type { AgentInfo, ProfileInfo } from "../../../lib/types";
 import { fetchSettings } from "../../../lib/api";
+
+/** Launch is gated until the wizard's profile defaults have settled, the
+ *  way a real click is; wait for it the same way. */
+async function clickLaunch(getByText: (m: RegExp) => HTMLElement) {
+  const button = getByText(/Launch session/).closest("button") as HTMLButtonElement;
+  await waitFor(() => expect(button.disabled).toBe(false));
+  fireEvent.click(button);
+}
 
 const createSession = vi.fn();
 
@@ -188,7 +196,7 @@ describe("SessionWizard structured_view payload", () => {
 
   it("sends the structured view for an ACP tool when the toggle is left on (default)", async () => {
     const { getByText } = renderWizard();
-    fireEvent.click(getByText(/Launch session/));
+    await clickLaunch(getByText);
     await waitFor(() => expect(createSession).toHaveBeenCalled());
     expect(createSession).toHaveBeenCalledWith(expect.objectContaining({ tool: "claude", view: "structured" }));
   });
@@ -199,7 +207,7 @@ describe("SessionWizard structured_view payload", () => {
     // flip it off, then launch.
     fireEvent.click(getByText("More options"));
     fireEvent.click(getByRole("switch", { name: "Use structured view" }));
-    fireEvent.click(getByText(/Launch session/));
+    await clickLaunch(getByText);
     await waitFor(() => expect(createSession).toHaveBeenCalled());
     expect(createSession).toHaveBeenCalledWith(expect.objectContaining({ tool: "claude", view: "terminal" }));
   });
@@ -221,7 +229,7 @@ describe("SessionWizard structured_view payload", () => {
     // launch.
     fireEvent.click(getByText("More options"));
     await waitFor(() => expect(getAllByText(/opencode/).length).toBeGreaterThan(0));
-    fireEvent.click(getByText(/Launch session/));
+    await clickLaunch(getByText);
     await waitFor(() => expect(createSession).toHaveBeenCalled());
     expect(createSession).toHaveBeenCalledWith(
       expect.objectContaining({

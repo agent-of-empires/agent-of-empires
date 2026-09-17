@@ -6,9 +6,17 @@
 // user who reuses the same instruction on every session stops retyping it.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, fireEvent, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
 import { SessionWizard } from "../SessionWizard";
+
+/** Launch is gated until the wizard's profile defaults have settled, the
+ *  way a real click is; wait for it the same way. */
+async function clickLaunch(getByText: (m: RegExp) => HTMLElement) {
+  const button = getByText(/Launch session/).closest("button") as HTMLButtonElement;
+  await waitFor(() => expect(button.disabled).toBe(false));
+  fireEvent.click(button);
+}
 
 const createSession = vi.fn();
 
@@ -55,7 +63,7 @@ describe("SessionWizard last-instruction memory (#2614)", () => {
     const onCreated = vi.fn();
     const { getByText } = renderWizard(onCreated);
 
-    fireEvent.click(getByText(/Launch session/));
+    await clickLaunch(getByText);
 
     await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
     expect(createSession.mock.calls[0][0]).toMatchObject({ custom_instruction: "always be terse" });
@@ -70,7 +78,7 @@ describe("SessionWizard last-instruction memory (#2614)", () => {
     fireEvent.change(getByPlaceholderText("Custom instructions for this session..."), {
       target: { value: "review for security" },
     });
-    fireEvent.click(getByText(/Launch session/));
+    await clickLaunch(getByText);
 
     await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
     expect(createSession.mock.calls[0][0]).toMatchObject({ custom_instruction: "review for security" });
@@ -85,7 +93,7 @@ describe("SessionWizard last-instruction memory (#2614)", () => {
     fireEvent.change(getByPlaceholderText("Custom instructions for this session..."), {
       target: { value: "" },
     });
-    fireEvent.click(getByText(/Launch session/));
+    await clickLaunch(getByText);
 
     await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(localStorage.getItem(INSTRUCTION_KEY)).toBe(""));

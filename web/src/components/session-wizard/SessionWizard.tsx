@@ -198,6 +198,12 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
     body: CreateSessionRequest;
     tool: string;
   } | null>(null);
+  // Launch waits for the profile defaults below to settle. A remembered path
+  // satisfies the submit gate at mount, so without this a one-action launch
+  // could send initialData's sandbox/worktree/yolo values instead of the
+  // profile's. Set on every outcome of the chain, so a failed fetch leaves the
+  // form usable with the defaults it has.
+  const [defaultsReady, setDefaultsReady] = useState(false);
 
   useEffect(() => {
     fetchAgents().then((a) => dispatch({ type: "SET_AGENTS", agents: a }));
@@ -211,13 +217,16 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
     // `APPLY_PROFILE_DEFAULTS` path never fires and the wizard would
     // otherwise fall back to default permissions, ignoring the profile.
     // See #1142.
-    fetchProfiles().then((p) => {
-      dispatch({ type: "SET_PROFILES", profiles: p });
-      // Prefer an explicit prefill profile; otherwise use the server's active
-      // profile (`is_default: true`). If neither resolves, pass undefined so
-      // `fetchSettings` loads the unresolved global config.
-      const effectiveProfile = prefill?.profile || p.find((x) => x.is_default)?.name || "";
-      fetchSettings(effectiveProfile || undefined).then((s) => {
+    fetchProfiles()
+      .then((p) => {
+        dispatch({ type: "SET_PROFILES", profiles: p });
+        // Prefer an explicit prefill profile; otherwise use the server's active
+        // profile (`is_default: true`). If neither resolves, pass undefined so
+        // `fetchSettings` loads the unresolved global config.
+        const effectiveProfile = prefill?.profile || p.find((x) => x.is_default)?.name || "";
+        return fetchSettings(effectiveProfile || undefined);
+      })
+      .then((s) => {
         if (!s) return;
         setCommandMaps(commandMapsFromSettings(s));
         const sandbox = s.sandbox as Record<string, unknown> | undefined;
@@ -245,8 +254,9 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
           agentEffort: acpDefaults.effort,
           skipIfDirty: true,
         });
-      });
-    });
+      })
+      .catch(() => {})
+      .finally(() => setDefaultsReady(true));
     // prefill is captured at first render; we don't want to re-seed defaults
     // (and stomp on user edits) if the parent re-renders with a new object
     // identity.
@@ -516,6 +526,7 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
             error={state.error}
             onSubmit={handleSubmit}
             nameOnly={nameOnly}
+            defaultsReady={defaultsReady}
           />
         </div>
       </div>

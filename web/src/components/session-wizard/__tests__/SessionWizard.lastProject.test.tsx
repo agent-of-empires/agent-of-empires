@@ -4,22 +4,31 @@
 // the same per-browser way it remembers the last tool and instruction.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, fireEvent, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
 import { SessionWizard, type WizardPrefill } from "../SessionWizard";
 
+/** Launch is gated until the wizard's profile defaults have settled, the
+ *  way a real click is; wait for it the same way. */
+async function clickLaunch(getByText: (m: RegExp) => HTMLElement) {
+  const button = getByText(/Launch session/).closest("button") as HTMLButtonElement;
+  await waitFor(() => expect(button.disabled).toBe(false));
+  fireEvent.click(button);
+}
+
 const createSession = vi.fn();
+const fetchSettings = vi.fn();
 const fetchIsGitRepo = vi.fn().mockResolvedValue(true);
 const fetchRecentProjects = vi.fn();
 
 vi.mock("../../../lib/api", () => ({
-  fetchSettings: vi.fn().mockResolvedValue({}),
+  fetchSettings: (...args: unknown[]) => fetchSettings(...args),
   fetchAgents: vi.fn().mockResolvedValue([]),
   fetchIsGitRepo: (...args: unknown[]) => fetchIsGitRepo(...args),
   fetchGroups: vi.fn().mockResolvedValue([]),
   fetchDockerStatus: vi.fn().mockResolvedValue({ available: false }),
   fetchProfiles: vi.fn().mockResolvedValue([]),
-  fetchVolumeIgnoresPreview: vi.fn().mockResolvedValue([]),
+  fetchVolumeIgnoresPreview: vi.fn().mockResolvedValue({ acknowledged: true, globs: [] }),
   markVolumeIgnoresGlobsAcknowledged: vi.fn().mockResolvedValue(undefined),
   fetchSessions: vi.fn().mockResolvedValue({ sessions: [] }),
   fetchRecentProjects: (...args: unknown[]) => fetchRecentProjects(...args),
@@ -51,6 +60,7 @@ describe("SessionWizard last-project memory", () => {
     vi.clearAllMocks();
     localStorage.clear();
     createSession.mockResolvedValue({ ok: true, session: { id: "s1" } });
+    fetchSettings.mockResolvedValue({});
     fetchIsGitRepo.mockResolvedValue(true);
     fetchRecentProjects.mockResolvedValue(RECENTS);
   });
@@ -62,7 +72,7 @@ describe("SessionWizard last-project memory", () => {
 
     await waitFor(() => expect(launchButton(getByText).disabled).toBe(false));
     expect(fetchIsGitRepo).toHaveBeenCalledWith("/tmp/remembered");
-    fireEvent.click(getByText(/Launch session/));
+    await clickLaunch(getByText);
 
     await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
     expect(createSession.mock.calls[0][0]).toMatchObject({ path: "/tmp/remembered" });
@@ -77,7 +87,7 @@ describe("SessionWizard last-project memory", () => {
       if (c.stored) localStorage.setItem(PROJECT_KEY, c.stored);
       const { getByText } = renderWizard({ path: "/tmp/other", tool: "claude" });
 
-      fireEvent.click(getByText(/Launch session/));
+      await clickLaunch(getByText);
 
       await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
       expect(createSession.mock.calls[0][0]).toMatchObject({ path: c.expectedPath });
@@ -89,7 +99,7 @@ describe("SessionWizard last-project memory", () => {
     localStorage.setItem(PROJECT_KEY, "/tmp/remembered");
     const { getByText } = renderWizard({ scratch: true });
 
-    fireEvent.click(getByText(/Launch session/));
+    await clickLaunch(getByText);
 
     await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
     expect(createSession.mock.calls[0][0]).toMatchObject({ path: "" });
@@ -109,7 +119,7 @@ describe("SessionWizard last-project memory", () => {
     localStorage.setItem(PROJECT_KEY, "/tmp/remembered");
     const { getByText } = renderWizard(undefined, true);
 
-    fireEvent.click(getByText(/Launch session/));
+    await clickLaunch(getByText);
 
     await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
     expect(createSession.mock.calls[0][0]).toMatchObject({ path: "" });
@@ -126,5 +136,45 @@ describe("SessionWizard last-project memory", () => {
 
     await waitFor(() => expect(launchButton(getByText).disabled).toBe(false));
     expect(await findByText("/tmp/remembered")).toBeTruthy();
+  });
+
+  it("holds Launch until the profile defaults have landed, then submits them", async () => {
+    // A remembered path satisfies the submit gate at mount, before the chained
+    // profiles/settings fetch resolves; a launch in that window would send
+    // initialData's sandbox/worktree/yolo instead of the profile's. Reported
+    // by review; reproduction adapted from it.
+    localStorage.setItem(PROJECT_KEY, "/tmp/remembered");
+    let resolveSettings!: (settings: unknown) => void;
+    fetchSettings.mockReturnValue(new Promise((resolve) => (resolveSettings = resolve)));
+    const { getByText } = renderWizard();
+
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
+    expect(launchButton(getByText).disabled).toBe(true);
+    fireEvent.click(getByText(/Launch session/));
+    fireEvent.keyDown(window, { key: "Enter", metaKey: true });
+    expect(createSession).not.toHaveBeenCalled();
+
+    await act(async () => resolveSettings({ sandbox: { enabled_by_default: true }, worktree: { enabled: true } }));
+    await waitFor(() => expect(launchButton(getByText).disabled).toBe(false));
+    await clickLaunch(getByText);
+
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(createSession.mock.calls[0][0]).toMatchObject({
+      path: "/tmp/remembered",
+      sandbox: true,
+      worktree_enabled: true,
+    });
+  });
+
+  it("does not stay disabled when the settings fetch fails", async () => {
+    localStorage.setItem(PROJECT_KEY, "/tmp/remembered");
+    fetchSettings.mockRejectedValue(new Error("boom"));
+    const { getByText } = renderWizard();
+
+    await waitFor(() => expect(launchButton(getByText).disabled).toBe(false));
+    await clickLaunch(getByText);
+
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(createSession.mock.calls[0][0]).toMatchObject({ path: "/tmp/remembered" });
   });
 });
