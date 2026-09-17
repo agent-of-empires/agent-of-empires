@@ -881,12 +881,15 @@ pub fn attach_planned(
             .iter_mut()
             .find(|i| i.id == id)
             .with_context(|| format!("session not found: {id}"))?;
+        // Planning may precede a concurrent publication or explicit pin.
+        anyhow::ensure!(
+            !converted || !conversation_cannot_follow(inst),
+            "'{}' now resumes a conversation bound to its current working directory; \
+             conversion cannot be committed",
+            inst.title
+        );
         inst.workspace_info = Some(workspace);
         if converted {
-            // The session now works in the workspace directory, and its old
-            // single-repo worktree record is superseded by the entry for that
-            // same repo inside `workspace_info.repos`. Leaving `worktree_info`
-            // set would have the delete path handle the primary worktree twice.
             inst.project_path = new_project_path;
             inst.worktree_info = None;
         }
@@ -1640,6 +1643,64 @@ mod tests {
             .exists());
         prepared.rollback();
         assert!(session_wt.join("README.md").exists());
+
+        let storage = Storage::open_unwatched("attach-conv").unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(inst.clone());
+                Ok(())
+            })
+            .unwrap();
+        let stale_plan = plan(&inst, "attach-conv", &frontend, ExistingBranch::Refuse).unwrap();
+        let destination = stale_plan.workspace_dir().to_path_buf();
+        let pinned = inst.agent_session_binding.clone();
+        storage
+            .update(|rows, _| {
+                rows[0].resume_intent = crate::session::ResumeIntent::Use(sid.into());
+                rows[0].resume_binding = pinned.clone();
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            attach_planned(&storage, &inst.id, &inst, stale_plan).is_err(),
+            "a pin committed after planning must prevent the conversion commit"
+        );
+        let disk = storage.load().unwrap().remove(0);
+        assert_eq!(disk.project_path, inst.project_path);
+        assert!(disk.workspace_info.is_none());
+        assert_eq!(
+            disk.resume_intent,
+            crate::session::ResumeIntent::Use(sid.into())
+        );
+        assert_eq!(disk.resume_binding, pinned);
+        assert!(session_wt.join("README.md").exists());
+        assert!(!destination.exists());
+
+        storage
+            .update(|rows, _| {
+                rows[0].resume_intent = crate::session::ResumeIntent::Cleared;
+                rows[0].resume_binding = None;
+                Ok(())
+            })
+            .unwrap();
+        attach(
+            &storage,
+            "attach-conv",
+            &inst.id,
+            &frontend,
+            ExistingBranch::Refuse,
+        )
+        .unwrap();
+        let disk = storage.load().unwrap().remove(0);
+        let workspace = disk
+            .workspace_info
+            .expect("successful conversion must persist its workspace");
+        assert_eq!(disk.project_path, workspace.workspace_dir);
+        assert_eq!(workspace.repos.len(), 2);
+        for repo in workspace.repos {
+            assert!(Path::new(&repo.worktree_path).join("README.md").exists());
+        }
+        assert!(disk.worktree_info.is_none());
     }
 
     /// Converting a session into a workspace has to carry its diff base with it.
