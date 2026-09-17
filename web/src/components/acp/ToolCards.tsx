@@ -654,13 +654,19 @@ function unwrapMarkdownFence(text: string): {
 }
 
 function HighlightedBlock({ text, language, maxLines = 20 }: { text: string; language?: string; maxLines?: number }) {
-  const [html, setHtml] = useState<string | null>(null);
+  // Keyed by the inputs that produced it, so a superseded request resolving
+  // before its effect cleanup renders nothing. Theme is left out of the key
+  // so a theme switch keeps the old palette until the re-highlight lands.
+  // NUL-delimited (as the escape sequence: a raw NUL byte in source makes
+  // git treat the file as binary) so field concatenations cannot collide.
+  const [result, setResult] = useState<{ key: string; html: string } | null>(null);
   const [showAll, setShowAll] = useState(false);
   const shiki = useShikiTheme();
   const unwrapped = unwrapMarkdownFence(text);
   const effectiveText = unwrapped.text;
   const effectiveLang = unwrapped.lang ?? language;
   const { shown, truncated } = truncateLines(effectiveText, showAll ? 1_000_000 : maxLines);
+  const inputKey = `${effectiveLang ?? ""}\u0000${shown}`;
 
   // ANSI fast path: when the text carries SGR escape sequences (e.g.
   // `gls --color=always`, `git status --color=always`), Shiki's bash
@@ -680,16 +686,18 @@ function HighlightedBlock({ text, language, maxLines = 20 }: { text: string; lan
           theme: shiki.theme,
           appearance: shiki.appearance,
         });
-        if (cancelled) return;
-        if (out) setHtml(out);
+        if (cancelled || !out) return;
+        setResult({ key: inputKey, html: out });
       } catch {
-        // unknown language; fall back to plain
+        // Unknown language → fall back to plain.
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [effectiveLang, shown, shiki.theme, shiki.appearance, ansi]);
+  }, [effectiveLang, shown, inputKey, shiki.theme, shiki.appearance, ansi]);
+
+  const html = result && result.key === inputKey ? result.html : null;
 
   return (
     <div className="border-t border-surface-800 bg-surface-950">

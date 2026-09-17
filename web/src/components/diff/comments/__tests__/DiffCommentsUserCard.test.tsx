@@ -14,17 +14,26 @@ import { cleanup, render, waitFor } from "@testing-library/react";
 import { DiffCommentsUserCard } from "../../comments/DiffCommentsUserCard";
 import type { DiffCommentsCardPayload } from "../../comments/buildPrompt";
 import type { DiffComment } from "../../comments/types";
+import { renderWithLateResolution } from "../../../../__tests__/lateResolution";
 
 // Test-controlled highlighter behavior. By default `highlightSnippet`
-// resolves to null, so HighlightedSnippet bails before setHtml and renders
+// resolves to null, so HighlightedSnippet caches nothing and renders
 // the plain <pre> fallback branch. Flipping `highlighterMock.loaded` on
-// exercises the resolved-HTML (dangerouslySetInnerHTML) branch for one test.
-// No network or real Shiki involvement, so the suite stays deterministic.
-const highlighterMock = { loaded: false };
+// exercises the resolved-HTML (dangerouslySetInnerHTML) branch. Setting
+// `highlighterMock.deferred` hands the next call a manually-resolved promise
+// for the superseded-request ordering test. No network or real Shiki
+// involvement, so the suite stays deterministic.
+const highlighterMock = { loaded: false, deferred: null as Promise<string | null> | null };
 
 vi.mock("../../../../lib/snippetHighlighter", () => ({
-  highlightSnippet: (code: string) =>
-    Promise.resolve(highlighterMock.loaded ? `<pre class="shiki"><code>${code}</code></pre>` : null),
+  highlightSnippet: (code: string) => {
+    if (highlighterMock.deferred) {
+      const p = highlighterMock.deferred;
+      highlighterMock.deferred = null;
+      return p;
+    }
+    return Promise.resolve(highlighterMock.loaded ? `<pre class="shiki"><code>${code}</code></pre>` : null);
+  },
   DEFAULT_SHIKI_THEME: "github-dark",
 }));
 
@@ -55,6 +64,7 @@ function payload(overrides: Partial<DiffCommentsCardPayload> = {}): DiffComments
 
 beforeEach(() => {
   highlighterMock.loaded = false;
+  highlighterMock.deferred = null;
 });
 
 afterEach(() => {
@@ -164,6 +174,49 @@ describe("DiffCommentsUserCard", () => {
     );
     await waitFor(() => expect(container.querySelector("pre.shiki")).toBeTruthy());
     expect(container.querySelector("pre.shiki")?.textContent).toContain("const y = 2;");
+  });
+
+  it("clears highlighted output when the same comment slot is reused with an unresolved language (#3974)", async () => {
+    highlighterMock.loaded = true;
+    const { container, rerender } = render(
+      <DiffCommentsUserCard
+        payload={payload({
+          comments: [comment({ id: "c1", capturedSnippet: "const y = 2;", language: "typescript" })],
+        })}
+      />,
+    );
+    await waitFor(() => expect(container.querySelector("pre.shiki")).toBeTruthy());
+
+    highlighterMock.loaded = false;
+    rerender(
+      <DiffCommentsUserCard
+        payload={payload({
+          comments: [comment({ id: "c1", capturedSnippet: "plain text body", language: undefined, filePath: "NOTES" })],
+        })}
+      />,
+    );
+
+    expect(container.querySelector("pre.shiki")).toBeNull();
+    const pre = container.querySelector("pre");
+    expect(pre?.textContent).toBe("plain text body");
+  });
+
+  it("ignores a late resolution from a superseded request (pending A → committed B → late A)", async () => {
+    let resolveA!: (v: string | null) => void;
+    highlighterMock.deferred = new Promise<string | null>((res) => {
+      resolveA = res;
+    });
+    const card = (c: DiffComment) => <DiffCommentsUserCard payload={payload({ comments: [c] })} />;
+
+    const { html, text } = await renderWithLateResolution({
+      a: card(comment({ id: "c1", capturedSnippet: "const a = 1;", language: "typescript" })),
+      b: card(comment({ id: "c1", capturedSnippet: "plain b body", language: undefined, filePath: "NOTES" })),
+      bText: "plain b body",
+      resolveStale: () => resolveA('<pre class="shiki">OLD_A</pre>'),
+    });
+
+    expect(text).toContain("plain b body");
+    expect(html).not.toContain("OLD_A");
   });
 
   it("renders an empty list with a zero-comment count", () => {

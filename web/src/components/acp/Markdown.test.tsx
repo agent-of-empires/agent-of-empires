@@ -15,7 +15,7 @@
 // table-wrap container, copy-button click).
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 
@@ -56,6 +56,9 @@ vi.mock("@assistant-ui/react-markdown", () => ({
 
 import { Markdown } from "./Markdown";
 import { AcpFileRefContext } from "./AcpFileRefContext";
+import { highlightSnippet } from "../../lib/snippetHighlighter";
+import type { SyntaxHighlighterProps } from "@assistant-ui/react-markdown";
+import { renderWithLateResolution } from "../../__tests__/lateResolution";
 
 beforeEach(() => {
   primitiveCalls.length = 0;
@@ -469,5 +472,72 @@ describe("CodeHeader override", () => {
     const { getByText } = render(<Header language="js" code="alert('hi')" />);
     fireEvent.click(getByText("copy"));
     expect(writeText).toHaveBeenCalledWith("alert('hi')");
+  });
+});
+
+describe("ShikiSyntaxHighlighter stale-content transitions (#3974)", () => {
+  function getSyntaxHighlighter(): React.ComponentType<SyntaxHighlighterProps> {
+    render(<Markdown text="x" />);
+    return primitiveCalls.at(-1)!.components.SyntaxHighlighter as React.ComponentType<SyntaxHighlighterProps>;
+  }
+
+  afterEach(() => {
+    vi.mocked(highlightSnippet).mockReset();
+    vi.mocked(highlightSnippet).mockResolvedValue("<pre><code>highlighted</code></pre>");
+  });
+
+  it("clears highlighted output when a reused block transitions to unfenced text", async () => {
+    vi.mocked(highlightSnippet).mockResolvedValueOnce('<pre class="shiki">highlighted rust</pre>');
+    const Comp = getSyntaxHighlighter();
+
+    const { container, rerender } = render(<Comp language="rust" code="fn main() {}" />);
+    await waitFor(() => {
+      expect(container.querySelector("pre.shiki")).toBeTruthy();
+    });
+
+    rerender(<Comp language={undefined} code="plain paragraph text" />);
+
+    expect(container.querySelector("pre.shiki")).toBeNull();
+    expect(container.textContent).toContain("plain paragraph text");
+    expect(container.textContent).not.toContain("fn main");
+  });
+
+  it("clears highlighted output when a reused block's highlight rejects", async () => {
+    vi.mocked(highlightSnippet).mockResolvedValueOnce('<pre class="shiki">highlighted rust</pre>');
+    const Comp = getSyntaxHighlighter();
+
+    const { container, rerender } = render(<Comp language="rust" code="fn main() {}" />);
+    await waitFor(() => {
+      expect(container.querySelector("pre.shiki")).toBeTruthy();
+    });
+
+    vi.mocked(highlightSnippet).mockRejectedValueOnce(new Error("boom"));
+    rerender(<Comp language="unknownlang" code="fn other() {}" />);
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("fn other() {}");
+    });
+    expect(container.querySelector("pre.shiki")).toBeNull();
+    expect(container.textContent).not.toContain("fn main");
+  });
+
+  it("ignores a late resolution from a superseded request (pending A → committed B → late A)", async () => {
+    let resolveA!: (v: string | null) => void;
+    vi.mocked(highlightSnippet).mockReturnValueOnce(
+      new Promise<string | null>((res) => {
+        resolveA = res;
+      }),
+    );
+    const Comp = getSyntaxHighlighter();
+
+    const { html, text } = await renderWithLateResolution({
+      a: <Comp language="rust" code="fn a() {}" />,
+      b: <Comp language={undefined} code="plain b text" />,
+      bText: "plain b text",
+      resolveStale: () => resolveA('<pre class="shiki">OLD_A</pre>'),
+    });
+
+    expect(text).toContain("plain b text");
+    expect(html).not.toContain("OLD_A");
   });
 });

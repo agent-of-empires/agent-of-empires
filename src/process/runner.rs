@@ -32,9 +32,10 @@ use tokio::sync::{mpsc, watch, Mutex};
 use tracing::{debug, info, warn};
 
 use super::worker_registry::{self, WorkerRecord};
-use crate::acp::control_protocol::{self, ControlBody, PromptOutcome};
+use crate::acp::control_protocol::{self, ControlBody, PromptOutcome, SessionReplayed};
 use crate::process::worker::RunnerRecordState;
 use crate::util::now_secs;
+use agent_client_protocol::JsonRpcMessage;
 
 /// How often the abandonment watchdog inspects its own registry record.
 const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_secs(10);
@@ -617,7 +618,7 @@ struct RunnerShared {
     /// Sole JSON-RPC id allocator for requests sent to the agent.
     next_req_id: AtomicI64,
     /// Inline handshake request responders.
-    pending_client_responses: Mutex<HashMap<i64, tokio::sync::oneshot::Sender<serde_json::Value>>>,
+    pending_client_responses: Mutex<HashMap<i64, tokio::sync::oneshot::Sender<HandshakeResponse>>>,
     /// Agent-to-daemon calls awaiting an answer from their originating attach.
     pending_server_calls: Mutex<HashMap<u64, PendingServerCall>>,
     /// Monotonic allocator for reverse-lane call ids.
@@ -648,6 +649,12 @@ struct PendingAgentCall {
     method: String,
 }
 
+/// A handshake response whose following stdout dispatch waits for publication.
+struct HandshakeResponse {
+    value: serde_json::Value,
+    release: tokio::sync::oneshot::Sender<()>,
+}
+
 /// Runner-owned ACP handshake state.
 #[derive(Default)]
 struct RunnerHandshake {
@@ -675,6 +682,8 @@ enum QueuedKind {
     Handshake,
     ServerCall,
     AgentReply,
+    // Not `Notify`: shedding it would leave the daemon's session/load waiting.
+    SessionReplayed,
 }
 
 struct QueuedControl {
@@ -689,16 +698,12 @@ struct ControlChannel {
     queue: VecDeque<QueuedControl>,
     queued_bytes: usize,
     active_attachment: Option<u64>,
+    session_announced: bool,
     next_entry_id: u64,
     in_flight: Option<u64>,
     /// Last flushed prompt completion, replayed until a newer prompt starts.
     last_prompt_completion: Option<Arc<[u8]>>,
 }
-
-/// Bound both queue dimensions. One maximum-sized ACP frame must fit, while a
-/// detached runner must never retain an unbounded number of large JSON values.
-const MAX_CONTROL_QUEUE: usize = 4096;
-const MAX_CONTROL_QUEUE_BYTES: usize = 128 * 1024 * 1024;
 
 impl ControlChannel {
     fn remove_at(&mut self, index: usize) -> QueuedControl {
@@ -708,8 +713,9 @@ impl ControlChannel {
     }
 
     fn make_room(&mut self, incoming_bytes: usize) -> bool {
-        while self.queue.len() >= MAX_CONTROL_QUEUE
-            || self.queued_bytes.saturating_add(incoming_bytes) > MAX_CONTROL_QUEUE_BYTES
+        while self.queue.len() >= control_protocol::MAX_CONTROL_QUEUE_FRAMES
+            || self.queued_bytes.saturating_add(incoming_bytes)
+                > control_protocol::MAX_CONTROL_QUEUE_BYTES
         {
             let Some(index) = self.queue.iter().position(|frame| {
                 frame.kind == QueuedKind::Notify && self.in_flight != Some(frame.id)
@@ -899,7 +905,12 @@ impl RunnerShared {
             let responder = self.pending_client_responses.lock().await.remove(&id);
             if let Some(tx) = responder {
                 if let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) {
-                    let _ = tx.send(value);
+                    let (release, released) = tokio::sync::oneshot::channel();
+                    let _ = tx.send(HandshakeResponse { value, release });
+                    // Publish the authoritative handshake frame before parsing
+                    // an immediately following native callback. Control loss
+                    // drops the release sender too, so stdout cannot strand.
+                    let _ = released.await;
                 }
                 return;
             }
@@ -964,6 +975,9 @@ impl RunnerShared {
         }
 
         if let Some((method, params)) = parse_notification(line) {
+            if SessionReplayed::matches_method(&method) {
+                return;
+            }
             self.enqueue(
                 DeliveryScope::Persistent,
                 QueuedKind::Notify,
@@ -986,6 +1000,55 @@ impl RunnerShared {
             .ok()
             .and_then(|mut v| v.get_mut("params").map(std::mem::take))
             .unwrap_or(serde_json::Value::Null);
+        let Some(attachment_id) = self.control.lock().await.active_attachment else {
+            self.answer_agent(
+                agent_stdin,
+                &agent_id,
+                disconnected_server_call_outcome(&method),
+            )
+            .await;
+            return;
+        };
+        let cached_session = {
+            let handshake = self.handshake.lock().await;
+            handshake.initialized.is_some() && handshake.session.is_some()
+        };
+        // These v1 callbacks also accept positional params with the session ID
+        // first. Elicitation has a flattened object scope; request-scoped
+        // elicitation must remain independent of session announcement.
+        if cached_session
+            && (params.get("sessionId").is_some()
+                || (params.get(0).is_some()
+                    && matches!(
+                        method.as_str(),
+                        "session/request_permission"
+                            | "fs/read_text_file"
+                            | "fs/write_text_file"
+                            | "terminal/create"
+                            | "terminal/output"
+                            | "terminal/release"
+                            | "terminal/wait_for_exit"
+                            | "terminal/kill"
+                    )))
+        {
+            loop {
+                let changed = self.control_space.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                {
+                    let channel = self.control.lock().await;
+                    if channel.active_attachment != Some(attachment_id)
+                        || channel.session_announced
+                        || self.pending_resets.load(Ordering::Acquire) != 0
+                    {
+                        break;
+                    }
+                }
+                // Stable cached reattach needs no native response. A sent reset
+                // disables this wait so its response can still reach stdout.
+                changed.await;
+            }
+        }
         let call_id = self.next_call_id.fetch_add(1, Ordering::Relaxed);
         let body = ControlBody::ServerCall {
             call_id,
@@ -1010,7 +1073,7 @@ impl RunnerShared {
         };
 
         let mut channel = self.control.lock().await;
-        let Some(attachment_id) = channel.active_attachment else {
+        if channel.active_attachment != Some(attachment_id) {
             drop(channel);
             self.answer_agent(
                 agent_stdin,
@@ -1019,7 +1082,7 @@ impl RunnerShared {
             )
             .await;
             return;
-        };
+        }
         let mut pending = self.pending_server_calls.lock().await;
         if pending.len() >= MAX_OUTSTANDING_REQUESTS || !channel.make_room(wire.len()) {
             warn!(
@@ -1203,6 +1266,7 @@ impl RunnerShared {
     /// Encode once and admit by exact wire bytes. Notifications may be shed;
     /// correlation and completion frames apply backpressure instead.
     async fn enqueue(&self, scope: DeliveryScope, kind: QueuedKind, body: ControlBody) -> bool {
+        let announces_session = matches!(&body, ControlBody::SessionReady { .. });
         let wire: Arc<[u8]> = match control_protocol::encode_frame(&body) {
             Ok(frame) => frame.into(),
             Err(error) => {
@@ -1221,6 +1285,9 @@ impl RunnerShared {
                 }
                 if channel.make_room(wire.len()) {
                     channel.push(scope, kind, Arc::clone(&wire));
+                    if announces_session {
+                        channel.session_announced = true;
+                    }
                     #[cfg(feature = "test-support")]
                     if kind == QueuedKind::PromptCompleted {
                         if let Some(path) = std::env::var_os("AOE_E2E_PROMPT_COMPLETED_FILE") {
@@ -1228,6 +1295,9 @@ impl RunnerShared {
                         }
                     }
                     drop(channel);
+                    if announces_session {
+                        self.control_space.notify_waiters();
+                    }
                     self.control_wake.notify_one();
                     return true;
                 }
@@ -1239,9 +1309,32 @@ impl RunnerShared {
         }
     }
 
+    /// Queue a handshake reply; an established session is followed by its
+    /// replay barrier.
+    async fn enqueue_handshake(&self, attachment_id: u64, frame: ControlBody, established: bool) {
+        let scope = DeliveryScope::Attachment(attachment_id);
+        if self.enqueue(scope, QueuedKind::Handshake, frame).await && established {
+            let marker = SessionReplayed::default();
+            self.enqueue(
+                scope,
+                QueuedKind::SessionReplayed,
+                ControlBody::Notify {
+                    method: marker.method().into(),
+                    params: serde_json::json!({}),
+                },
+            )
+            .await;
+        }
+    }
+
     async fn begin_attachment(&self) -> u64 {
         let attachment_id = self.next_attachment_id.fetch_add(1, Ordering::Relaxed);
-        self.control.lock().await.active_attachment = Some(attachment_id);
+        {
+            let mut channel = self.control.lock().await;
+            channel.active_attachment = Some(attachment_id);
+            channel.session_announced = false;
+        }
+        self.control_space.notify_waiters();
         self.control_wake.notify_one();
         attachment_id
     }
@@ -1270,8 +1363,20 @@ impl RunnerShared {
         if channel.active_attachment != Some(attachment_id) || channel.in_flight.is_some() {
             return None;
         }
+        // Handshake frames go first, and Persistent frames wait for SessionReady,
+        // so the daemon never buffers unbounded pre-identity session updates.
+        let announced = channel.session_announced;
+        let index = channel
+            .queue
+            .iter()
+            .position(|frame| frame.kind == QueuedKind::Handshake)
+            .or_else(|| {
+                channel.queue.iter().position(|frame| {
+                    announced || !matches!(frame.scope, DeliveryScope::Persistent)
+                })
+            })?;
         let (id, wire) = {
-            let frame = channel.queue.front()?;
+            let frame = channel.queue.get(index)?;
             (frame.id, Arc::clone(&frame.wire))
         };
         channel.in_flight = Some(id);
@@ -1280,16 +1385,13 @@ impl RunnerShared {
 
     async fn commit_outbound(&self, attachment_id: u64, entry_id: u64) {
         let mut channel = self.control.lock().await;
-        if channel.active_attachment == Some(attachment_id)
-            && channel.in_flight == Some(entry_id)
-            && channel.queue.front().map(|frame| frame.id) == Some(entry_id)
-        {
-            if let Some(wire) = channel.queue.front().and_then(|frame| {
-                (frame.kind == QueuedKind::PromptCompleted).then(|| Arc::clone(&frame.wire))
-            }) {
-                channel.last_prompt_completion = Some(wire);
+        if channel.active_attachment == Some(attachment_id) && channel.in_flight == Some(entry_id) {
+            if let Some(index) = channel.queue.iter().position(|frame| frame.id == entry_id) {
+                if channel.queue[index].kind == QueuedKind::PromptCompleted {
+                    channel.last_prompt_completion = Some(Arc::clone(&channel.queue[index].wire));
+                }
+                channel.remove_at(index);
             }
-            channel.remove_at(0);
         }
         if channel.in_flight == Some(entry_id) {
             channel.in_flight = None;
@@ -1329,6 +1431,7 @@ impl RunnerShared {
         agent_stdin: &Mutex<tokio::process::ChildStdin>,
         method: &str,
         params: serde_json::Value,
+        dispatch_release: &mut Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Option<serde_json::Value> {
         let id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1343,7 +1446,12 @@ impl RunnerShared {
             self.pending_client_responses.lock().await.remove(&id);
             return None;
         }
-        rx.await.ok()
+        let HandshakeResponse {
+            value: response,
+            release,
+        } = rx.await.ok()?;
+        *dispatch_release = Some(release);
+        Some(response)
     }
 
     /// Issue a runner-owned `session/prompt` to the agent. The response is
@@ -1407,13 +1515,14 @@ impl RunnerShared {
         &self,
         agent_stdin: &Mutex<tokio::process::ChildStdin>,
         request: serde_json::Value,
+        dispatch_release: &mut Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<serde_json::Value, serde_json::Value> {
         let _gate = self.handshake_gate.lock().await;
         if let Some(cached) = self.handshake.lock().await.initialized.clone() {
             return Ok(cached);
         }
         let response = self
-            .agent_request(agent_stdin, "initialize", request)
+            .agent_request(agent_stdin, "initialize", request, dispatch_release)
             .await
             .ok_or_else(|| transport_error("agent closed before answering initialize"))?;
         let result = handshake_result(&response)?;
@@ -1431,13 +1540,14 @@ impl RunnerShared {
         agent_stdin: &Mutex<tokio::process::ChildStdin>,
         method: &str,
         request: serde_json::Value,
+        dispatch_release: &mut Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<(String, serde_json::Value), serde_json::Value> {
         let _gate = self.handshake_gate.lock().await;
         if let Some(cached) = self.handshake.lock().await.session.clone() {
             return Ok(cached);
         }
         let response = self
-            .agent_request(agent_stdin, method, request.clone())
+            .agent_request(agent_stdin, method, request.clone(), dispatch_release)
             .await
             .ok_or_else(|| transport_error(&format!("agent closed before answering {method}")))?;
         let result = handshake_result(&response)?;
@@ -1502,6 +1612,7 @@ impl RunnerShared {
         let req_id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
         if method == "session/new" {
             self.pending_resets.fetch_add(1, Ordering::AcqRel);
+            self.control_space.notify_waiters();
         }
         self.pending_agent_calls.lock().await.insert(
             req_id,
@@ -2002,11 +2113,17 @@ async fn handle_control_connection(
     let handshake_worker = tokio::spawn(async move {
         let mut control_closed = control_closed_rx;
         while let Some(command) = handshake_rx.recv().await {
+            let mut dispatch_release = None;
+            let mut established = false;
             let frame = match command {
                 HandshakeCommand::Initialize(request) => {
                     let Some(result) = await_handshake_or_control_loss(
                         &mut control_closed,
-                        handshake_shared.run_or_replay_initialize(&handshake_stdin, request),
+                        handshake_shared.run_or_replay_initialize(
+                            &handshake_stdin,
+                            request,
+                            &mut dispatch_release,
+                        ),
                     )
                     .await
                     else {
@@ -2040,7 +2157,12 @@ async fn handle_control_connection(
                 HandshakeCommand::EstablishSession { method, request } => {
                     let Some(result) = await_handshake_or_control_loss(
                         &mut control_closed,
-                        handshake_shared.run_or_replay_session(&handshake_stdin, &method, request),
+                        handshake_shared.run_or_replay_session(
+                            &handshake_stdin,
+                            &method,
+                            request,
+                            &mut dispatch_release,
+                        ),
                     )
                     .await
                     else {
@@ -2049,6 +2171,7 @@ async fn handle_control_connection(
                     match result {
                         Ok((acp_session_id, result)) => {
                             handshake_done.store(true, Ordering::Release);
+                            established = true;
                             ControlBody::SessionReady {
                                 acp_session_id,
                                 result,
@@ -2062,12 +2185,9 @@ async fn handle_control_connection(
                 }
             };
             handshake_shared
-                .enqueue(
-                    DeliveryScope::Attachment(attachment_id),
-                    QueuedKind::Handshake,
-                    frame,
-                )
+                .enqueue_handshake(attachment_id, frame, established)
                 .await;
+            drop(dispatch_release);
         }
     });
 
@@ -2980,7 +3100,7 @@ mod tests {
             wire(16),
         );
 
-        assert!(channel.make_room(MAX_CONTROL_QUEUE_BYTES - 32));
+        assert!(channel.make_room(control_protocol::MAX_CONTROL_QUEUE_BYTES - 32));
         assert_eq!(channel.queued_bytes, 32);
         assert_eq!(channel.queue.len(), 2);
         assert!(channel
@@ -2988,8 +3108,47 @@ mod tests {
             .iter()
             .all(|frame| frame.kind != QueuedKind::Notify));
         assert!(
-            !channel.make_room(MAX_CONTROL_QUEUE_BYTES - 31),
+            !channel.make_room(control_protocol::MAX_CONTROL_QUEUE_BYTES - 31),
             "correlation frames must apply backpressure rather than be evicted"
+        );
+    }
+
+    /// The replay barrier follows the updates an agent sent before its session
+    /// reply, which itself goes out first; an agent cannot forge it (#4016).
+    #[tokio::test]
+    async fn established_session_barrier_follows_its_replay() {
+        let (shared, stdin, _child) = shared_with_stdin().await;
+        let attachment = shared.begin_attachment().await;
+        for line in [
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"text":"replayed"}}"#,
+            r#"{"jsonrpc":"2.0","method":"_aoe/session_replayed","params":{}}"#,
+        ] {
+            shared.deliver_line(line.as_bytes(), &stdin).await;
+        }
+        let ready = ControlBody::SessionReady {
+            acp_session_id: "s".into(),
+            result: serde_json::json!({}),
+        };
+        shared
+            .enqueue_handshake(attachment, ready.clone(), true)
+            .await;
+
+        let mut sent = Vec::new();
+        while let Some((id, wire)) = shared.next_outbound(attachment).await {
+            sent.push(serde_json::from_slice::<ControlBody>(&wire[4..]).unwrap());
+            shared.commit_outbound(attachment, id).await;
+        }
+        let notify = |method: &str, params| ControlBody::Notify {
+            method: method.into(),
+            params,
+        };
+        assert_eq!(
+            sent,
+            [
+                ready,
+                notify("session/update", serde_json::json!({"text":"replayed"})),
+                notify("_aoe/session_replayed", serde_json::json!({})),
+            ]
         );
     }
 
@@ -3007,6 +3166,9 @@ mod tests {
             )
             .await;
         let first_attachment = shared.begin_attachment().await;
+        // A live completion arises in an established, announced session; the
+        // detached backlog is otherwise held until SessionReady.
+        shared.control.lock().await.session_announced = true;
         let (entry_id, first_wire) = shared
             .next_outbound(first_attachment)
             .await
@@ -3014,6 +3176,7 @@ mod tests {
 
         shared.release_outbound(entry_id).await;
         let second_attachment = shared.begin_attachment().await;
+        shared.control.lock().await.session_announced = true;
         let (retried_id, retried_wire) = shared
             .next_outbound(second_attachment)
             .await

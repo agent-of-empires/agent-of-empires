@@ -4184,7 +4184,11 @@ mod tests {
     /// checkouts as they are, uncommitted and untracked files included, since
     /// the `submodule deinit` route either refuses on them or discards them.
     #[test]
+    #[serial_test::serial]
     fn test_move_worktree_relocates_nested_submodules_and_keeps_local_changes() {
+        let home_dir = TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home_dir.path());
+
         let fixture = build_repo_with_nested_submodule_and_branch("test-move");
         let repo_path = fixture.repo_dir.path().to_path_buf();
 
@@ -4275,7 +4279,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_create_worktree_initializes_submodules() {
+        let home_dir = TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home_dir.path());
+
         let (_submodule_src, _submodule_bare, repo_dir) =
             build_repo_with_submodule_and_branch("test-feature");
 
@@ -4295,7 +4303,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_create_worktree_skips_submodules_when_disabled() {
+        let home_dir = TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home_dir.path());
+
         // with_init_submodules(false) must skip the `git submodule update`
         // step entirely so the worktree shows up before submodules clone.
         // No file-transport opt-in is needed because init is off, so the
@@ -4327,7 +4339,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_create_worktree_skips_blocked_local_submodules() {
+        let home_dir = TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home_dir.path());
+
         // Installs no file-transport opt-in (does not call
         // `allow_submodule_file_transport()`), so the production-side
         // `git submodule update` always observes git's default file-transport

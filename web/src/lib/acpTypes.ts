@@ -749,11 +749,13 @@ export interface AcpState {
    *  no matching outstanding optimistic id (a replay, another device, a
    *  drained queue entry), so an echo of this client's own prompt counts once.
    *
-   *  Two readers: `useCancelEscalation` tokenises "already pressed Stop for
+   *  Three readers: `useCancelEscalation` tokenises "already pressed Stop for
    *  this prompt" as `(sessionId, promptSeq)` so the next prompt's first Stop
-   *  is graceful again (#2237), and the `SessionContextReset` arm treats zero
+   *  is graceful again (#2237), the `SessionContextReset` arm treats zero
    *  as "this session never had a prompt to lose" and suppresses the re-prime
-   *  offer. Deliberately not turn truth: see {@link deriveTurnActive}. */
+   *  offer, and `StructuredView` re-pins the transcript to the bottom on each
+   *  bump (`promptRepinDecision`, #3993). Deliberately not turn
+   *  truth: see {@link deriveTurnActive}. */
   promptSeq: number;
   /** Real ACP-advertised modes from the agent's NewSessionResponse,
    *  plus the agent's currently-active mode id. Empty until the
@@ -1731,14 +1733,19 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     const e = event.BackgroundAgentProgress;
     next.backgroundAgents = next.backgroundAgents.map((a) => {
       if (a.agentId !== e.agent_id) return a;
-      // A terminal record never reopens to running.
-      if (a.status === "completed" || a.status === "detached" || a.status === "error") return a;
+      // A terminal record never reopens to running. Also guarded on endedAt:
+      // a terminal Stalled record (the tailer's own abort timeout) carries
+      // endedAt too, and the status check alone would let a late Progress
+      // reopen it, contradicting hasActiveBackgroundAgent's endedAt-keyed read.
+      if (a.endedAt || a.status === "completed" || a.status === "detached" || a.status === "error") return a;
       return {
         ...a,
         status: e.status,
         toolCount: e.tool_count,
         tools: e.tools && e.tools.length > 0 ? e.tools : a.tools,
-        endedAt: e.status === "stalled" ? (a.endedAt ?? e.at) : e.status === "running" ? null : a.endedAt,
+        // A Progress never ends an agent; only the terminal
+        // BackgroundAgentCompleted sets endedAt (#4001).
+        endedAt: null,
         lastTool: e.last_tool ?? a.lastTool,
         lastText: e.last_text ?? a.lastText,
       };
@@ -1924,6 +1931,22 @@ export function appendElicitationAnswerRow(
  *  prompt counters cannot derive this reliably. */
 export function deriveTurnActive(state: Pick<AcpState, "serverTurnActive" | "inflightPromptIds">): boolean {
   return state.serverTurnActive || state.inflightPromptIds.length > 0;
+}
+
+/** Whether a background sub-agent (async Task) is still outstanding, mirroring
+ *  `AcpState::has_active_background_agent` (`src/acp/state.rs`): keyed on
+ *  `endedAt` rather than status, since a stalled agent's own terminal
+ *  completion must still count as done. */
+export function hasActiveBackgroundAgent(state: Pick<AcpState, "backgroundAgents">): boolean {
+  return state.backgroundAgents.some((a) => a.endedAt === null);
+}
+
+/** Display-only busy signal for the runtime spinner: the main turn or an
+ *  outstanding background sub-agent. Distinct from `turnActive`, which must
+ *  keep tracking only the main turn (send-vs-queue composer gating reads it
+ *  directly; see `src/acp/state.rs`'s `turn_active` doc comment for why). */
+export function isVisiblyBusy(state: Pick<AcpState, "turnActive" | "backgroundAgents">): boolean {
+  return state.turnActive || hasActiveBackgroundAgent(state);
 }
 
 /** Close the turn from a raw event, mirroring `AcpState::apply_event`'s own

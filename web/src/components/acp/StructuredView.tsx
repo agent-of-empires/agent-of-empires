@@ -37,6 +37,7 @@ import { anchorIsStale, autoLoadDecision, isPinnedToBottom, scrollRestoreDelta }
 import { lastClearIndex } from "../../lib/acpHistoryWindow";
 import { loadScrollState, restoredScrollTop, saveScrollState } from "../../lib/acpScrollState";
 import { repinOnResize } from "../../lib/repinOnResize";
+import { promptRepinDecision } from "../../lib/promptRepin";
 import { ToolDensityToggle, ToolDisplayModeProvider, useToolDensityPref } from "./ToolDisplayMode";
 import { AcpRuntime, SUBAGENT_TASK_NAME, TODO_GROUP_NAME, TOOL_GROUP_NAME, type AcpContext } from "./AcpRuntime";
 import { Composer } from "./Composer";
@@ -415,17 +416,33 @@ function AcpChrome({
   // Soft-keyboard state, so we can hold the bottom pin across the keyboard
   // open/close animation (see the effect below).
   const { keyboardOpen } = useMobileKeyboard();
-  const scrollToBottom = useCallback(() => {
+  /** An explicit "stick again": set the pinned intent directly and re-pin. The
+   *  programmatic scroll fires no gesture, so the sampler would not pick it up. */
+  const pinToBottom = useCallback((behavior: ScrollBehavior) => {
     const vp = viewportRef.current;
     if (!vp) return;
-    // Tapping the jump-to-bottom button is an explicit "stick again" intent. The
-    // smooth scroll fires no gesture, so the sampler won't pick it up; set the
-    // pinned state directly and re-pin.
     wasAtBottomRef.current = true;
     lastAtBottomAtRef.current = performance.now();
     setAtBottom(true);
-    vp.scrollTo({ top: vp.scrollHeight, behavior: "smooth" });
+    vp.scrollTo({ top: vp.scrollHeight, behavior });
   }, []);
+  /** Tapping the mobile jump-to-bottom button: a smooth re-pin. */
+  const scrollToBottom = useCallback(() => pinToBottom("smooth"), [pinToBottom]);
+  // A new prompt re-engages stick-to-bottom, as the CLI does: on a fine pointer
+  // the composer growing while typing can drop the pinned intent. See
+  // `promptRepinDecision` for why replayed prompts do not count.
+  const seenPromptSeqRef = useRef<number | null>(null);
+  const localInflight = state.inflightPromptIds.length > 0;
+  useEffect(() => {
+    const d = promptRepinDecision({
+      seen: seenPromptSeqRef.current,
+      promptSeq: state.promptSeq,
+      live: hasEverOpened,
+      localInflight,
+    });
+    seenPromptSeqRef.current = d.seen;
+    if (d.pin) pinToBottom("auto");
+  }, [state.promptSeq, hasEverOpened, localInflight, pinToBottom]);
   // Stable mirrors so the [] scroll effect always sees the latest
   // load-earlier wiring without re-subscribing. Updated in an effect
   // (not during render) per react-hooks/refs. See #2236.

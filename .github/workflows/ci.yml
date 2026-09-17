@@ -20,6 +20,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Runs before the toolchain: no cargo needed, under a second, and it
+      # covers the failure class from #3974 (a raw NUL committed into a source
+      # file, which makes git call the file binary and hides its diff from
+      # review) on EVERY PR. Nothing else catches it: the code compiles and
+      # the tests pass.
+      - name: Check no source file carries a raw NUL byte
+        run: |
+          set -euo pipefail
+          python3 scripts/check-no-nul-in-source.py --self-test
+          python3 scripts/check-no-nul-in-source.py
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: rustfmt
