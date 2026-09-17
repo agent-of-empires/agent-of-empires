@@ -7,9 +7,11 @@
 // raw source. Exercises the git-agnostic /acp/files listing and the
 // provenance-confined /file read end to end.
 //
-// Also opens a non-Markdown file and asserts the real line-number gutter
-// (#4003): the viewer renders through @pierre/diffs, which cannot paint under
-// jsdom, so the numbers themselves are only observable in a browser.
+// A second case opens a non-Markdown file and asserts the real line-number
+// gutter (#4003). It seeds its own session rather than navigating back from
+// the first: the viewer's back control and the activity-bar pane toggle both
+// match an accessible name containing "Files", so a back-click is ambiguous
+// and closed the pane instead.
 
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
@@ -28,7 +30,6 @@ base("files pane renders a Markdown file in a scratch session", async ({ page },
       writeFiles(projectDir, {
         "plan.md": "# The Plan\n\n- step one\n- step two\n",
         "readme.txt": "not markdown\n",
-        "notes.ts": "const a = 1;\nconst b = 2;\nconst c = 3;\n",
       });
       const addRes = spawnSync(resolveAoeBinary(), ["add", projectDir, "-t", "rp-files-md", "-c", "claude"], { env });
       if (addRes.status !== 0) {
@@ -57,20 +58,48 @@ base("files pane renders a Markdown file in a scratch session", async ({ page },
       timeout: 10_000,
     });
     await expect(page.getByRole("listitem").filter({ hasText: "step one" }).first()).toBeVisible();
+  } finally {
+    await serve.stop();
+  }
+});
 
-    // A non-Markdown file renders as source with a line-number gutter. The
-    // renderer marks each gutter cell with `data-line-number-content`, so
-    // assert one number per seeded line, in order, rather than that a gutter
-    // merely exists.
-    await page.getByRole("button", { name: "Files" }).first().click();
+base("files pane numbers the lines of a source file", async ({ page }, testInfo) => {
+  const serve = await spawnAoeServe({
+    authMode: "none",
+    workerIndex: testInfo.workerIndex,
+    parallelIndex: testInfo.parallelIndex,
+    seedFn: ({ home, env }) => {
+      const projectDir = join(home, "gutter-project");
+      writeFiles(projectDir, { "notes.ts": "const a = 1;\nconst b = 2;\nconst c = 3;\n" });
+      const addRes = spawnSync(resolveAoeBinary(), ["add", projectDir, "-t", "rp-files-gutter", "-c", "claude"], {
+        env,
+      });
+      if (addRes.status !== 0) {
+        throw new Error(`aoe add failed: status=${addRes.status} stderr=${addRes.stderr?.toString() ?? "<none>"}`);
+      }
+    },
+  });
+
+  try {
+    await page.goto(`${serve.baseUrl}/`);
+    const sessionRow = page.getByRole("link").filter({ hasText: "rp-files-gutter" }).first();
+    await expect(sessionRow).toBeVisible({ timeout: 10_000 });
+    await sessionRow.click();
+
+    await page.getByRole("button", { name: "Toggle Files pane" }).first().click();
+
     const notesRow = page.getByRole("button", { name: "notes.ts" }).first();
     await expect(notesRow).toBeVisible({ timeout: 10_000 });
     await notesRow.click();
 
+    // The renderer marks each gutter cell with `data-line-number-content`, so
+    // assert one number per seeded line, in order, rather than that a gutter
+    // merely exists. The source text itself is split across highlight tokens,
+    // so the header path stands in for "the file opened".
     const gutter = page.locator("[data-line-number-content]");
     await expect(gutter).toHaveCount(3, { timeout: 10_000 });
     await expect(gutter).toHaveText(["1", "2", "3"]);
-    await expect(page.getByText("const b = 2;").first()).toBeVisible();
+    await expect(page.getByText("notes.ts").first()).toBeVisible();
   } finally {
     await serve.stop();
   }
