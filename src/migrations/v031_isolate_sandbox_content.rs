@@ -2577,6 +2577,121 @@ mod tests {
         );
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn unreadable_resume_state_leaves_the_store_pending_until_retry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for (tool, role, resume_path) in [
+            ("claude", ".claude", "projects/proj/session.jsonl"),
+            ("opencode", ".local/share/opencode", "opencode.db"),
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+            let home = dirs::home_dir().unwrap();
+            let app = crate::session::get_app_dir().unwrap();
+            let project = temporary.path().join("project");
+            fs::create_dir_all(&project).unwrap();
+            let mut instance = crate::session::Instance::new(tool, project.to_str().unwrap());
+            instance.tool = tool.to_owned();
+            instance.agent_session_id = Some("kept-native-context".to_owned());
+            instance.acp_session_id = Some("kept-structured-context".to_owned());
+            let config = crate::session::Config::default();
+            let roots = container_config::sandbox_content_roots(
+                tool,
+                None,
+                &config.session,
+                &home,
+                &instance.id,
+            )
+            .unwrap();
+            let root = &roots
+                .iter()
+                .find(|root| root.roles.iter().any(|candidate| candidate == role))
+                .unwrap()
+                .path;
+            let resume = root.join(resume_path);
+            fs::create_dir_all(resume.parent().unwrap()).unwrap();
+            fs::write(&resume, b"RESUME_STATE").unwrap();
+            let original_identity = identity(root).unwrap().unwrap();
+            let mut row = serde_json::to_value(&instance).unwrap();
+            row["sandbox_info"] = serde_json::json!({
+                "enabled": true,
+                "image": "img",
+                "container_name": "aoe-sandbox-fixture",
+            });
+            let registry = app.join("sessions.json");
+            let original_registry = serde_json::to_vec(&vec![row]).unwrap();
+            fs::write(&registry, &original_registry).unwrap();
+
+            // Keep a handle so permissions can be restored even if the store moves.
+            let resume_file = fs::File::open(&resume).unwrap();
+            let permissions = resume_file.metadata().unwrap().permissions();
+            resume_file
+                .set_permissions(fs::Permissions::from_mode(0o000))
+                .unwrap();
+            match fs::File::open(&resume) {
+                Ok(_) => {
+                    resume_file.set_permissions(permissions).unwrap();
+                    eprintln!(
+                        "skipping unreadable resume regression: privileges permit reading mode 000"
+                    );
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+                Err(error) => {
+                    resume_file.set_permissions(permissions).unwrap();
+                    panic!("expected PermissionDenied opening {tool} resume state: {error}");
+                }
+            }
+
+            let result = migrate_target(
+                &app,
+                &home,
+                (&registry, &instance.id, tool),
+                &|_| Ok(false),
+                &|_| Ok(true),
+                &|_| Ok(Vec::new()),
+            );
+            resume_file.set_permissions(permissions).unwrap();
+            assert!(result.is_err(), "{tool}: unreadable resume state must fail");
+            assert_eq!(
+                identity(root).unwrap(),
+                Some(original_identity),
+                "{tool}: the original store must remain in place"
+            );
+            assert_eq!(fs::read(&resume).unwrap(), b"RESUME_STATE");
+            assert_eq!(fs::read(&registry).unwrap(), original_registry);
+            assert!(!roots_ready(&app, &instance.id, tool, &roots).unwrap());
+
+            assert!(
+                migrate_target(
+                    &app,
+                    &home,
+                    (&registry, &instance.id, tool),
+                    &|_| Ok(false),
+                    &|_| Ok(true),
+                    &|_| Ok(Vec::new()),
+                )
+                .unwrap(),
+                "{tool}: restoring access must allow the complete retry"
+            );
+            assert!(roots_ready(&app, &instance.id, tool, &roots).unwrap());
+            assert_eq!(fs::read(&resume).unwrap(), b"RESUME_STATE");
+            let row = read_row(&registry, &instance.id).unwrap().unwrap();
+            assert_eq!(
+                row.get("agent_session_id").and_then(Value::as_str),
+                Some("kept-native-context"),
+                "{tool}: retry must preserve the native session id"
+            );
+            assert_eq!(
+                row.get("acp_session_id").and_then(Value::as_str),
+                Some("kept-structured-context"),
+                "{tool}: retry must preserve the structured session id"
+            );
+        }
+    }
+
     /// An adapter that names no native agent still has to answer for a pending
     /// structured lane, or that row keeps resuming the retired conversation.
     #[test]

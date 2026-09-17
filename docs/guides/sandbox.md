@@ -318,9 +318,12 @@ A session keeps the store it was given for as long as AoE can still prove it
 wrote that store. When it cannot, each of its content roots is moved intact
 under `.aoe-sandbox-recovery/<transaction>/<index>/original` beside the agent's
 config directory and a fresh store is seeded in its place, with the session's
-original left alone. The next start says the session's native history was
-isolated and names the retained originals; nothing is replayed from them
-automatically, so copy back whatever you still want.
+original left alone. AoE copies back native resume state that was already
+sandbox-only (Claude `projects/` and OpenCode `opencode.db*`) and keeps those
+agents' session IDs. Native history that could have been imported from the host
+stays in recovery. When an agent's native resume is isolated, its next start
+shows a notice naming the retained originals; that isolated history is not
+replayed automatically.
 
 Sessions created before this layout shared one agent store per agent (for
 example `~/.claude/sandbox`). Each one moves when you start it: AoE gives the

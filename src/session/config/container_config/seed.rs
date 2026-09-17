@@ -344,6 +344,9 @@ fn canonical_source(
     let canonical = match fs::canonicalize(path) {
         Ok(path) => path,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if matches!(access.exception, Exception::Carried { .. }) => {
+            return Err(error).context("resolving carried native state");
+        }
         Err(error) => {
             tracing::warn!(target: "session.profile", path = %path.display(), %error,
             "Skipping unreadable configuration source");
@@ -363,12 +366,15 @@ fn canonical_source(
     Ok(Some(canonical))
 }
 
-fn open_canonical_file(path: &Path) -> Result<Option<File>> {
+fn open_canonical_file(path: &Path, access: ReadAccess<'_>) -> Result<Option<File>> {
     let parent = path
         .parent()
         .context("configuration source has no parent")?;
     let anchor = match open_canonical_dir(parent) {
         Ok(anchor) => anchor,
+        Err(error) if matches!(access.exception, Exception::Carried { .. }) => {
+            return Err(error).context("opening carried native-state parent");
+        }
         Err(error) => {
             tracing::warn!(target: "session.profile", path = %path.display(), %error, "Skipping changed or unreadable configuration source parent");
             return Ok(None);
@@ -379,6 +385,9 @@ fn open_canonical_file(path: &Path) -> Result<Option<File>> {
         usize::MAX,
     ) {
         Ok(file) => Ok(file),
+        Err(error) if matches!(access.exception, Exception::Carried { .. }) => {
+            Err(error).context("opening carried native-state file")
+        }
         Err(error) => {
             tracing::warn!(target: "session.profile", path = %path.display(), %error, "Skipping unreadable configuration file");
             Ok(None)
@@ -397,7 +406,7 @@ fn publish_source_file(
     let Some(canonical) = canonical_source(path, boundary, false, access)? else {
         return Ok(false);
     };
-    let Some(mut file) = open_canonical_file(&canonical)? else {
+    let Some(mut file) = open_canonical_file(&canonical, access)? else {
         return Ok(false);
     };
     let mut guard = guard::ReadGuard::new(boundary, access)?;
@@ -521,10 +530,7 @@ pub(super) fn carry_sandbox_state(
             let canonical = match fs::canonicalize(&entry) {
                 Ok(canonical) => canonical,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => {
-                    tracing::warn!(target: "session.profile", path = %entry.display(), %error, "Skipping unreadable carried state");
-                    continue;
-                }
+                Err(error) => return Err(error).context("resolving carried native state"),
             };
             let leaf = Path::new(relative.file_name().context("carried state has no leaf")?);
             let parent = destination.create_child(relative.parent().unwrap_or(Path::new("")))?;
@@ -559,6 +565,9 @@ fn seed_directory(
     let lookup = source;
     let source = match open_canonical_dir(&canonical) {
         Ok(source) => source,
+        Err(error) if matches!(access.exception, Exception::Carried { .. }) => {
+            return Err(error).context("opening carried native-state directory");
+        }
         Err(error) => {
             tracing::warn!(target: "session.profile", path = %canonical.display(), %error, "Skipping unreadable resource directory");
             return Ok(());
@@ -572,6 +581,9 @@ fn seed_directory(
     copy.guard.record_directory(&source)?;
     let entries = match source.read_dir(Path::new(""), usize::MAX) {
         Ok(entries) => entries,
+        Err(error) if matches!(access.exception, Exception::Carried { .. }) => {
+            return Err(error).context("reading carried native-state directory");
+        }
         Err(error) => {
             tracing::warn!(target: "session.profile", path = %canonical.display(), %error, "Skipping unreadable resource directory");
             return Ok(());
@@ -647,6 +659,9 @@ impl ResourceCopy<'_> {
                     continue;
                 }
                 Ok(None) => {}
+                Err(error) if matches!(self.guard.access.exception, Exception::Carried { .. }) => {
+                    return Err(error).context("opening carried native-state file");
+                }
                 Err(error) => {
                     tracing::warn!(target: "session.profile", path = %spelling.display(), %error, "Skipping unreadable resource file");
                     continue;
@@ -661,6 +676,19 @@ impl ResourceCopy<'_> {
             }
             let child = match source.child(within) {
                 Ok(child) => child,
+                Err(error)
+                    if matches!(self.guard.access.exception, Exception::Carried { .. })
+                        && !matches!(
+                            error.downcast_ref::<nix::errno::Errno>(),
+                            Some(
+                                nix::errno::Errno::ENOENT
+                                    | nix::errno::Errno::ELOOP
+                                    | nix::errno::Errno::ENOTDIR
+                            )
+                        ) =>
+                {
+                    return Err(error).context("opening carried native-state directory");
+                }
                 Err(error) => {
                     tracing::warn!(target: "session.profile", path = %spelling.display(), %error, "Skipping unreadable resource entry");
                     continue;
@@ -673,6 +701,9 @@ impl ResourceCopy<'_> {
             self.guard.record_directory(&child)?;
             let children = match child.read_dir(Path::new(""), usize::MAX) {
                 Ok(children) => children,
+                Err(error) if matches!(self.guard.access.exception, Exception::Carried { .. }) => {
+                    return Err(error).context("reading carried native-state subtree");
+                }
                 Err(error) => {
                     self.ancestors.remove(&identity);
                     tracing::warn!(target: "session.profile", path = %spelling.display(), %error, "Skipping unreadable resource subtree");
@@ -693,7 +724,7 @@ impl ResourceCopy<'_> {
         destination: &AnchoredDir,
         leaf: &Path,
     ) -> Result<()> {
-        if let Some(mut file) = open_canonical_file(canonical)? {
+        if let Some(mut file) = open_canonical_file(canonical, self.guard.access)? {
             if self.guard.record_file(canonical, &file)? {
                 let permissions = file.metadata()?.permissions();
                 destination.publish_file(leaf, &mut file, permissions, false, None)?;
@@ -820,10 +851,10 @@ pub(super) fn seed_credential_pairs(
         else {
             continue;
         };
-        let Some(mut data) = open_canonical_file(&data_path)? else {
+        let Some(mut data) = open_canonical_file(&data_path, access)? else {
             continue;
         };
-        let Some(mut key) = open_canonical_file(&key_path)? else {
+        let Some(mut key) = open_canonical_file(&key_path, access)? else {
             continue;
         };
         let mut guard = guard::ReadGuard::new(boundary, access)?;
@@ -949,7 +980,7 @@ fn snapshot_config_database<'a>(
         let Some(input) = canonical_source(&spelling, boundary, false, access)? else {
             return Ok(None);
         };
-        let Some(mut file) = open_canonical_file(&input)? else {
+        let Some(mut file) = open_canonical_file(&input, access)? else {
             anyhow::bail!("native SQLite source is not a readable regular file");
         };
         guard.record_route(if suffix.is_empty() { path } else { &spelling }, &input)?;
@@ -1626,7 +1657,9 @@ mod tests {
             .unwrap();
         boundary.add_root(&native, mount).unwrap();
         let mut guard = guard::ReadGuard::new(&boundary, ReadAccess::default()).unwrap();
-        let mut file = open_canonical_file(&input).unwrap().unwrap();
+        let mut file = open_canonical_file(&input, ReadAccess::default())
+            .unwrap()
+            .unwrap();
         assert!(guard.record_file(&input, &file).unwrap());
         fs::remove_file(external.join("alias")).unwrap();
         std::os::unix::fs::symlink("candidate", external.join("alias")).unwrap();
@@ -1784,7 +1817,9 @@ mod tests {
             .unwrap();
         boundary.add_root(&native, mount).unwrap();
         let mut guard = guard::ReadGuard::new(&boundary, ReadAccess::default()).unwrap();
-        let mut file = open_canonical_file(&input).unwrap().unwrap();
+        let mut file = open_canonical_file(&input, ReadAccess::default())
+            .unwrap()
+            .unwrap();
         assert!(guard.record_file(&input, &file).unwrap());
         let output = AnchoredDir::open(&active).unwrap();
         fs::create_dir(temporary.path().join("unrelated-directory")).unwrap();
