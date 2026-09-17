@@ -464,10 +464,24 @@ fn read_receipt(path: &Path) -> Result<Option<Receipt>> {
     ))
 }
 
-fn write_receipt(path: &Path, receipt: &impl Serialize) -> Result<()> {
+fn receipt_directory(path: &Path) -> Result<AnchoredDir> {
     let parent = path.parent().context("content receipt has no parent")?;
-    fs::create_dir_all(parent)?;
-    let anchor = AnchoredDir::open(parent)?;
+    let Some(receipts) = parent
+        .ancestors()
+        .find(|ancestor| ancestor.file_name().is_some_and(|name| name == RECEIPTS))
+    else {
+        // A receipt outside the namespace (the legacy recovery journal) owns
+        // its durability: its caller syncs each level it creates.
+        return AnchoredDir::open(parent);
+    };
+    let app = receipts
+        .parent()
+        .context("receipt namespace has no parent")?;
+    AnchoredDir::open(app)?.create_child(parent.strip_prefix(app)?)
+}
+
+fn write_receipt(path: &Path, receipt: &impl Serialize) -> Result<()> {
+    let anchor = receipt_directory(path)?;
     let bytes = serde_json::to_vec_pretty(receipt)?;
     use std::os::unix::fs::PermissionsExt;
     anchor.publish_file(
@@ -477,7 +491,6 @@ fn write_receipt(path: &Path, receipt: &impl Serialize) -> Result<()> {
         true,
         None,
     )?;
-    fs::File::open(parent.parent().context("receipt directory has no parent")?)?.sync_all()?;
     Ok(())
 }
 
@@ -1163,6 +1176,22 @@ fn new_receipt(app: &Path, row: &Value, tool: &str, roots: &[ContentRoot]) -> Re
     })
 }
 
+fn durable_stage_parent(path: &Path) -> Result<AnchoredDir> {
+    let parent = path.parent().context("stage parent has no ancestor")?;
+    let leaf = Path::new(path.file_name().context("stage parent has no name")?);
+    match AnchoredDir::open(path) {
+        Ok(directory) => {
+            // Replay the publication barrier after an earlier mkdir sync failure.
+            AnchoredDir::open(parent)?.sync()?;
+            Ok(directory)
+        }
+        Err(error) if !path.try_exists()? => durable_stage_parent(parent)?
+            .create_child(leaf)
+            .with_context(|| format!("creating stage parent after {error}")),
+        Err(error) => Err(error),
+    }
+}
+
 fn stage_receipt(
     app: &Path,
     receipt: &mut Receipt,
@@ -1198,10 +1227,9 @@ fn stage_receipt(
             bail!("native content root changed before staging");
         }
         let parent = part.stage.parent().context("stage has no parent")?;
-        fs::create_dir_all(parent)?;
-        let anchor = AnchoredDir::open(parent)?;
+        let anchor = durable_stage_parent(parent)?;
         let leaf = Path::new(part.stage.file_name().context("stage has no leaf")?);
-        // Only this durable transaction owns this stage. Original data is never removed here.
+        // Only this transaction owns the stage.
         anchor.remove_staged_dir(leaf)?;
         let stage = anchor.create_child(leaf)?;
         let source = if part.original.is_some() {
@@ -1285,6 +1313,7 @@ fn publish_receipt(receipt: &mut Receipt, path: &Path) -> Result<()> {
     if receipt.phase != Phase::Staged {
         return Ok(());
     }
+    receipt_directory(path)?;
     for index in 0..receipt.roots.len() {
         let part = &mut receipt.roots[index];
         if let Some(published) = &part.published {
@@ -2111,6 +2140,145 @@ pub(crate) fn guard_preparation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct SyncFailureGuard;
+
+    impl Drop for SyncFailureGuard {
+        fn drop(&mut self) {
+            crate::session::anchored_fs::FAIL_SYNC_ONCE.set(None);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn receipt_namespace_sync_failure_preserves_original_until_retry() {
+        let temporary = tempfile::tempdir().unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let home = dirs::home_dir().unwrap();
+        let app = crate::session::get_app_dir().unwrap();
+        let mut instance =
+            crate::session::Instance::new("codex", temporary.path().to_str().unwrap());
+        instance.tool = "codex".to_owned();
+        let config = crate::session::Config::default();
+        let roots = container_config::sandbox_content_roots(
+            "codex",
+            None,
+            &config.session,
+            &home,
+            &instance.id,
+        )
+        .unwrap();
+        let root = &roots[0].path;
+        fs::create_dir_all(root.join("sessions")).unwrap();
+        fs::write(root.join("sessions/original.jsonl"), b"SYNTHETIC_ORIGINAL").unwrap();
+        fs::write(root.join("config.toml"), b"model = 'fixture'\n").unwrap();
+        let original = identity(root).unwrap();
+        let row = serde_json::to_value(&instance).unwrap();
+        let path = receipt_path(&app, &instance.id, "codex").unwrap();
+        let _failure = SyncFailureGuard;
+        for _ in 0..2 {
+            crate::session::anchored_fs::FAIL_SYNC_ONCE.set(Some(app.clone()));
+            assert!(checked_receipt(&app, &row, "codex", &roots).is_err());
+            assert_eq!(identity(root).unwrap(), original);
+            assert_eq!(
+                fs::read(root.join("sessions/original.jsonl")).unwrap(),
+                b"SYNTHETIC_ORIGINAL"
+            );
+            assert!(read_receipt(&path).unwrap().is_none());
+            assert!(!roots_ready(&app, &instance.id, "codex", &roots).unwrap());
+        }
+        crate::session::anchored_fs::FAIL_SYNC_ONCE.set(None);
+        let (path, mut receipt) = checked_receipt(&app, &row, "codex", &roots).unwrap();
+        stage_receipt(&app, &mut receipt, &path, &home, &config, temporary.path()).unwrap();
+        crate::session::anchored_fs::FAIL_SYNC_ONCE.set(Some(app.clone()));
+        assert!(publish_receipt(&mut receipt, &path).is_err());
+        assert_eq!(identity(root).unwrap(), original);
+        assert!(!receipt.roots[0].recovery.exists());
+        assert_eq!(read_receipt(&path).unwrap().unwrap().phase, Phase::Staged);
+        crate::session::anchored_fs::FAIL_SYNC_ONCE.set(None);
+        publish_receipt(&mut receipt, &path).unwrap();
+        receipt.phase = Phase::Committed;
+        write_receipt(&path, &receipt).unwrap();
+        certify_receipt(&app, &receipt).unwrap();
+        archive_receipt(&path, &receipt).unwrap();
+        assert!(roots_ready(&app, &instance.id, "codex", &roots).unwrap());
+        assert_eq!(identity(&receipt.roots[0].recovery).unwrap(), original);
+        assert_eq!(
+            fs::read(receipt.roots[0].recovery.join("sessions/original.jsonl")).unwrap(),
+            b"SYNTHETIC_ORIGINAL"
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn stage_parent_sync_failure_keeps_planned_original_and_retries() {
+        let temporary = tempfile::tempdir().unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let home = dirs::home_dir().unwrap();
+        let app = crate::session::get_app_dir().unwrap();
+        let mut instance =
+            crate::session::Instance::new("codex", temporary.path().to_str().unwrap());
+        instance.tool = "codex".to_owned();
+        let config = crate::session::Config::default();
+        let roots = container_config::sandbox_content_roots(
+            "codex",
+            None,
+            &config.session,
+            &home,
+            &instance.id,
+        )
+        .unwrap();
+        let root = &roots[0].path;
+        fs::create_dir_all(root.join("sessions")).unwrap();
+        fs::write(root.join("sessions/original.jsonl"), b"SYNTHETIC_ORIGINAL").unwrap();
+        fs::write(root.join("config.toml"), b"model = 'fixture'\n").unwrap();
+        let original = identity(root).unwrap();
+        let row = serde_json::to_value(&instance).unwrap();
+        let (path, mut receipt) = checked_receipt(&app, &row, "codex", &roots).unwrap();
+        let _failure = SyncFailureGuard;
+        crate::session::anchored_fs::FAIL_SYNC_ONCE.set(Some(root.parent().unwrap().to_path_buf()));
+        assert!(
+            stage_receipt(&app, &mut receipt, &path, &home, &config, temporary.path()).is_err()
+        );
+        assert_eq!(receipt.phase, Phase::Planned);
+        assert_eq!(read_receipt(&path).unwrap().unwrap().phase, Phase::Planned);
+        assert_eq!(identity(root).unwrap(), original);
+        assert_eq!(
+            fs::read(root.join("sessions/original.jsonl")).unwrap(),
+            b"SYNTHETIC_ORIGINAL"
+        );
+        assert!(!receipt.roots[0].recovery.exists());
+        crate::session::anchored_fs::FAIL_SYNC_ONCE.set(None);
+        stage_receipt(&app, &mut receipt, &path, &home, &config, temporary.path()).unwrap();
+        publish_receipt(&mut receipt, &path).unwrap();
+        receipt.phase = Phase::Committed;
+        write_receipt(&path, &receipt).unwrap();
+        certify_receipt(&app, &receipt).unwrap();
+        archive_receipt(&path, &receipt).unwrap();
+        assert!(roots_ready(&app, &instance.id, "codex", &roots).unwrap());
+        assert_eq!(identity(&receipt.roots[0].recovery).unwrap(), original);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn nested_stage_parent_sync_failure_retries_existing_components() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temporary.path()).unwrap();
+        let nested = root.join("new/parents/stages");
+        let _failure = SyncFailureGuard;
+        crate::session::anchored_fs::FAIL_SYNC_ONCE.set(Some(root.clone()));
+        assert!(durable_stage_parent(&nested).is_err());
+        assert!(!nested.exists());
+        crate::session::anchored_fs::FAIL_SYNC_ONCE.set(Some(root.clone()));
+        assert!(durable_stage_parent(&nested).is_err());
+        assert!(!nested.exists());
+        crate::session::anchored_fs::FAIL_SYNC_ONCE.set(None);
+        let parent = durable_stage_parent(&nested).unwrap();
+        assert_eq!(identity(parent.path()).unwrap(), identity(&nested).unwrap());
+        parent.create_child(Path::new("stage/tree/nested")).unwrap();
+        assert!(nested.join("stage/tree/nested").is_dir());
+    }
 
     struct TestReconcileGuard {
         content: Option<TestReconcileProbes>,
@@ -3541,6 +3709,7 @@ mod tests {
         let staged = identity(&stage).unwrap();
         let recovery = receipt.roots[0].recovery.clone();
         let transaction = recovery.parent().unwrap().parent().unwrap().to_path_buf();
+        let _failure = SyncFailureGuard;
         crate::session::anchored_fs::FAIL_SYNC_ONCE.set(Some(transaction));
         let result = publish_receipt(&mut receipt, &path);
         crate::session::anchored_fs::FAIL_SYNC_ONCE.set(None);
