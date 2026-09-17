@@ -284,12 +284,9 @@ pub trait BroadcastSink: Send + Sync + 'static {
     }
     /// Agent ids of `BackgroundAgentLaunched` events on disk with no
     /// matching `BackgroundAgentCompleted`: sub-agents a dead worker's
-    /// tailer will never report on again, whether the worker went down
-    /// gracefully (`Supervisor::shutdown_with_reason`) or the daemon
-    /// itself restarted without one (`Supervisor::spawn`/`attach`, which
-    /// see a fresh launch is never replayed to resume tracking). Default
-    /// returns empty so test sinks without an event store opt out
-    /// cleanly, mirroring `unresolved_approval_nonces`.
+    /// tailer will never report on again. Default returns empty so test
+    /// sinks without an event store opt out cleanly, mirroring
+    /// `unresolved_approval_nonces`.
     fn unresolved_background_agent_ids(&self, _session_id: &str) -> Vec<String> {
         Vec::new()
     }
@@ -2796,12 +2793,14 @@ impl<S: BroadcastSink> Supervisor<S> {
                     drop(reservation);
 
                     // The respawned client starts with an empty
-                    // `pending_responders`, so requests still unresolved in
-                    // the log are orphaned by the crashed worker it replaced.
-                    // Same sweep the spawn/attach paths run, now that the new
-                    // client owns the session.
+                    // `pending_responders`, and no tailer is respawned on
+                    // replay, so requests and background sub-agents still
+                    // unresolved in the log are orphaned by the crashed
+                    // worker it replaced. Same sweep the spawn/attach paths
+                    // run, now that the new client owns the session.
                     cancel_orphaned_approvals_on(&*sink, &next_seqs, &session_id);
                     cancel_orphaned_elicitations_on(&*sink, &next_seqs, &session_id);
+                    detach_orphaned_background_agents_on(&*sink, &next_seqs, &session_id);
 
                     info!(
                         target: "acp.supervisor",
@@ -8446,43 +8445,6 @@ cursor-acp-bridge = "agent acp"
         );
     }
 
-    /// Orphaned-background-agent sweep publishes a `BackgroundAgentCompleted
-    /// { status: Detached }` per stale agent id, so a sub-agent whose
-    /// tailer died with the previous daemon does not show as running
-    /// forever (`Detached` was defined but never constructed before this).
-    #[tokio::test]
-    async fn detach_orphaned_background_agents_publishes_completed_detached() {
-        let sink = VecSink::with_stale_background_agent_ids(vec!["a-1".into(), "a-2".into()]);
-        let sup = Supervisor::new(sink.clone());
-        sup.detach_orphaned_background_agents("s-attach");
-        let frames = sink.frames.lock().unwrap().clone();
-        assert_eq!(
-            frames.len(),
-            2,
-            "expected 2 BackgroundAgentCompleted, got {frames:?}"
-        );
-        for (frame, expected) in frames.iter().zip(["a-1", "a-2"]) {
-            match &frame.2 {
-                Event::BackgroundAgentCompleted {
-                    agent_id, status, ..
-                } => {
-                    assert_eq!(agent_id, expected);
-                    assert_eq!(*status, crate::acp::state::BackgroundAgentStatus::Detached);
-                }
-                other => panic!("expected BackgroundAgentCompleted, got {other:?}"),
-            }
-        }
-        assert!(frames[0].1 < frames[1].1, "seqs must be monotonic");
-    }
-
-    #[tokio::test]
-    async fn detach_orphaned_background_agents_noop_when_empty() {
-        let sink = VecSink::new();
-        let sup = Supervisor::new(sink.clone());
-        sup.detach_orphaned_background_agents("s-attach");
-        assert!(sink.frames.lock().unwrap().is_empty());
-    }
-
     /// End-to-end through `spawn`: a session whose event log already has
     /// a `BackgroundAgentLaunched` + `BackgroundAgentProgress(Running)`
     /// with no matching `BackgroundAgentCompleted` (as a tailer that died
@@ -8490,6 +8452,7 @@ cursor-acp-bridge = "agent acp"
     /// `Detached` completion the moment the fresh worker spawns, so the
     /// panel does not show it running forever.
     #[tokio::test]
+    #[serial_test::serial]
     async fn spawn_detaches_background_agent_orphaned_by_previous_daemon() {
         use crate::acp::event_store::EventStore;
         use crate::acp::state::BackgroundAgentStatus;
@@ -8570,5 +8533,164 @@ cursor-acp-bridge = "agent acp"
             BackgroundAgentStatus::Detached
         );
         sup.shutdown("s-startup").await.unwrap();
+    }
+
+    /// End-to-end through `attach`, the primary daemon-restart path: a
+    /// live runner from the previous daemon with the same orphaned
+    /// `BackgroundAgentLaunched` also gets detached, not just a fresh
+    /// `spawn`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn attach_detaches_background_agent_orphaned_by_previous_daemon() {
+        use crate::acp::control_protocol::{self, ControlBody};
+        use crate::acp::event_store::EventStore;
+        use crate::acp::state::BackgroundAgentStatus;
+        use std::os::unix::process::CommandExt as _;
+
+        let tmp = tempfile::TempDir::with_prefix_in("aoe-attach-detach-", "/tmp").unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        let store = Arc::new(EventStore::open(&tmp.path().join("acp.db"), 1000).unwrap());
+        let (tx, mut rx) = broadcast::channel(16);
+        let sink = Arc::new(ChannelSink {
+            tx,
+            event_store: store.clone(),
+            control_cache: Arc::new(crate::acp::control_cache::ControlStateCache::new()),
+        });
+        sink.publish(
+            "s-attach-startup",
+            1,
+            &Event::BackgroundAgentLaunched {
+                agent_id: "sub-1".into(),
+                tool_call_id: "tc-1".into(),
+                description: "do a thing".into(),
+                prompt: "do a thing".into(),
+                model: "claude".into(),
+                output_file: "/tmp/nonexistent.jsonl".into(),
+                started_at: chrono::Utc::now(),
+            },
+        );
+        sink.publish(
+            "s-attach-startup",
+            2,
+            &Event::BackgroundAgentProgress {
+                agent_id: "sub-1".into(),
+                status: BackgroundAgentStatus::Running,
+                tool_count: 1,
+                tools: Vec::new(),
+                last_tool: None,
+                last_text: None,
+                at: chrono::Utc::now(),
+            },
+        );
+
+        // A stand-in runner: `is_record_live` requires a live pid; `sleep 60`
+        // as its own process group leader keeps the cleanup kill below from
+        // landing on the test process (see `attach_terminates_a_worker_whose_agent_is_no_longer_allowed`).
+        let mut fake_runner = std::process::Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .expect("spawn stand-in runner");
+
+        let socket = tmp.path().join("s-attach-startup.sock");
+        let control_socket = crate::process::worker::control_socket_sibling(&socket);
+        let listener = tokio::net::UnixListener::bind(&control_socket).unwrap();
+        let runner_handshake = tokio::spawn(async move {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            control_protocol::write_frame(
+                &mut peer,
+                &ControlBody::Hello {
+                    control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
+                    session_id: "s-attach-startup".into(),
+                },
+            )
+            .await
+            .unwrap();
+            while let Some(frame) = control_protocol::read_frame(&mut peer).await.unwrap() {
+                let reply = match frame {
+                    ControlBody::Attach { .. } => continue,
+                    ControlBody::Initialize { .. } => ControlBody::Initialized {
+                        result: serde_json::json!({
+                            "protocolVersion": 1, "agentCapabilities": {}
+                        }),
+                    },
+                    ControlBody::ResumeSession => ControlBody::SessionReady {
+                        acp_session_id: "acp-sid".into(),
+                        result: serde_json::json!({}),
+                    },
+                    frame => panic!("unexpected attach handshake frame: {frame:?}"),
+                };
+                control_protocol::write_frame(&mut peer, &reply)
+                    .await
+                    .unwrap();
+            }
+        });
+
+        // An agent key absent from the registry resolves to
+        // `ExpectedAgent::Other`, which skips the per-adapter compat gate
+        // (name/version checks); this fixture is testing attach wiring,
+        // not agent compatibility.
+        let record = crate::process::worker_registry::WorkerRecord::new(
+            "s-attach-startup".into(),
+            fake_runner.id(),
+            socket,
+            "test-agent-acp".into(),
+            "test-agent".into(),
+            tmp.path().to_path_buf(),
+            None,
+            vec![],
+            vec![],
+            Some("acp-sid".into()),
+            None,
+        );
+        crate::process::worker_registry::save(&record).unwrap();
+
+        let sup = Supervisor::new(sink);
+        sup.hydrate_seqs(store.all_session_seqs());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            sup.attach(
+                "s-attach-startup".into(),
+                tmp.path().to_path_buf(),
+                vec![],
+                false,
+                None,
+            ),
+        )
+        .await
+        .expect("attach must not hang")
+        .expect("attach must succeed against the fake runner");
+        runner_handshake.abort();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while store
+                .unresolved_background_agent_ids("s-attach-startup")
+                .contains(&"sub-1".to_string())
+            {
+                rx.recv().await.unwrap();
+            }
+        })
+        .await
+        .expect("stale background agent must be detached on attach");
+        assert!(store
+            .unresolved_background_agent_ids("s-attach-startup")
+            .is_empty());
+
+        let mut state = crate::acp::state::AcpState::new(
+            crate::acp::state::AcpSessionId("s-attach-startup".into()),
+            crate::acp::state::AgentName("claude".into()),
+            None,
+        );
+        for (_, event) in store.replay_from("s-attach-startup", 0) {
+            state.apply_event(event).unwrap();
+        }
+        assert_eq!(state.background_agents.len(), 1);
+        assert_eq!(
+            state.background_agents[0].status,
+            BackgroundAgentStatus::Detached
+        );
+
+        let _ = fake_runner.kill();
+        let _ = fake_runner.wait();
     }
 }
