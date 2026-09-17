@@ -218,6 +218,9 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
     // otherwise fall back to default permissions, ignoring the profile.
     // See #1142.
     fetchProfiles()
+      // A failed profiles fetch must not skip settings: an explicit prefill
+      // profile, or the unresolved global config, still applies.
+      .catch(() => [] as Awaited<ReturnType<typeof fetchProfiles>>)
       .then((p) => {
         dispatch({ type: "SET_PROFILES", profiles: p });
         // Prefer an explicit prefill profile; otherwise use the server's active

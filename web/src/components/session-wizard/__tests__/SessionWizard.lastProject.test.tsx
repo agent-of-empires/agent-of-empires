@@ -18,6 +18,7 @@ async function clickLaunch(getByText: (m: RegExp) => HTMLElement) {
 
 const createSession = vi.fn();
 const fetchSettings = vi.fn();
+const fetchProfiles = vi.fn();
 const fetchIsGitRepo = vi.fn().mockResolvedValue(true);
 const fetchRecentProjects = vi.fn();
 
@@ -27,7 +28,7 @@ vi.mock("../../../lib/api", () => ({
   fetchIsGitRepo: (...args: unknown[]) => fetchIsGitRepo(...args),
   fetchGroups: vi.fn().mockResolvedValue([]),
   fetchDockerStatus: vi.fn().mockResolvedValue({ available: false }),
-  fetchProfiles: vi.fn().mockResolvedValue([]),
+  fetchProfiles: (...args: unknown[]) => fetchProfiles(...args),
   fetchVolumeIgnoresPreview: vi.fn().mockResolvedValue({ acknowledged: true, globs: [] }),
   markVolumeIgnoresGlobsAcknowledged: vi.fn().mockResolvedValue(undefined),
   fetchSessions: vi.fn().mockResolvedValue({ sessions: [] }),
@@ -61,6 +62,7 @@ describe("SessionWizard last-project memory", () => {
     localStorage.clear();
     createSession.mockResolvedValue({ ok: true, session: { id: "s1" } });
     fetchSettings.mockResolvedValue({});
+    fetchProfiles.mockResolvedValue([]);
     fetchIsGitRepo.mockResolvedValue(true);
     fetchRecentProjects.mockResolvedValue(RECENTS);
   });
@@ -164,6 +166,22 @@ describe("SessionWizard last-project memory", () => {
       sandbox: true,
       worktree_enabled: true,
     });
+  });
+
+  it("still fetches and applies settings when the profiles fetch fails", async () => {
+    // The chain is profiles then settings; a rejected profiles request must
+    // fall back to the unresolved global settings, not skip them and launch
+    // on initialData. Prove the profile's sandbox default still lands.
+    localStorage.setItem(PROJECT_KEY, "/tmp/remembered");
+    fetchProfiles.mockRejectedValue(new Error("profiles down"));
+    fetchSettings.mockResolvedValue({ sandbox: { enabled_by_default: true } });
+    const { getByText } = renderWizard();
+
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith(undefined));
+    await clickLaunch(getByText);
+
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(createSession.mock.calls[0][0]).toMatchObject({ path: "/tmp/remembered", sandbox: true });
   });
 
   it("does not stay disabled when the settings fetch fails", async () => {
