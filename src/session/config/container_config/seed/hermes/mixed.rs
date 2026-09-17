@@ -208,7 +208,9 @@ pub(in super::super) fn seed_projects(
     };
     let mut wal = canonical.as_os_str().to_os_string();
     wal.push("-wal");
-    let leaves = [canonical, PathBuf::from(wal)];
+    let mut journal = canonical.as_os_str().to_os_string();
+    journal.push("-journal");
+    let leaves = [canonical, PathBuf::from(wal), PathBuf::from(journal)];
     let access = ReadAccess {
         root: Some(source),
         exception: Exception::Mixed {
@@ -508,6 +510,165 @@ mod tests {
             fs::read(destination.join("auth.json")).unwrap(),
             b"PORTABLE_AUTH"
         );
+    }
+
+    fn project_journal_fixture(source: &Path, mode: &str) -> rusqlite::Connection {
+        fs::create_dir_all(source).unwrap();
+        let database = rusqlite::Connection::open(source.join("projects.db")).unwrap();
+        database.execute_batch(&format!("PRAGMA journal_mode={mode}; PRAGMA page_size=1024; PRAGMA cache_size=2; PRAGMA cache_spill=ON;")).unwrap();
+        for &(_, schema) in PROJECT_TABLES {
+            database.execute_batch(schema).unwrap();
+        }
+        database.execute_batch("INSERT INTO projects(id,slug,name,created_at) VALUES('project','workspace','Workspace',1); INSERT INTO discovered_repos VALUES('/PRIVATE_REPO','CACHE_PRIVATE',1); CREATE TABLE history(id INTEGER PRIMARY KEY, secret TEXT, padding BLOB); WITH RECURSIVE rows(id) AS (VALUES(1) UNION ALL SELECT id+1 FROM rows WHERE id<128) INSERT INTO history SELECT id, 'UNRELATED_PRIVATE', zeroblob(900) FROM rows;").unwrap();
+        database
+    }
+
+    fn assert_project_projection(destination: &Path) {
+        let projected = rusqlite::Connection::open(destination.join("projects.db")).unwrap();
+        assert_eq!(
+            projected
+                .query_row("SELECT name FROM projects WHERE id='project'", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "Workspace"
+        );
+        assert_eq!(
+            projected
+                .query_row("SELECT COUNT(*) FROM discovered_repos", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            projected
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE name='history'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn project_configuration_accepts_inactive_rollback_journals_without_changing_source() {
+        for mode in ["PERSIST", "TRUNCATE"] {
+            let temporary = tempfile::tempdir().unwrap();
+            let source = temporary.path().join("source");
+            let _database = project_journal_fixture(&source, mode);
+            let database_before = fs::read(source.join("projects.db")).unwrap();
+            let journal_before = fs::read(source.join("projects.db-journal")).unwrap();
+            if mode == "PERSIST" {
+                assert!(journal_before.len() >= 28);
+                assert_eq!(&journal_before[..28], &[0; 28]);
+            } else {
+                assert!(journal_before.is_empty());
+            }
+            let destination = temporary.path().join("active");
+            let boundary = boundary(&source, &destination);
+            seed_projects(
+                &boundary,
+                boundary.hermes.source.unwrap(),
+                &boundary.source_root,
+                &AnchoredDir::open(&destination).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                fs::read(source.join("projects.db")).unwrap(),
+                database_before,
+                "{mode}"
+            );
+            assert_eq!(
+                fs::read(source.join("projects.db-journal")).unwrap(),
+                journal_before,
+                "{mode}"
+            );
+            assert_project_projection(&destination);
+        }
+    }
+
+    #[test]
+    fn project_configuration_refuses_spilled_pages_and_retries_after_rollback() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let database = project_journal_fixture(&source, "DELETE");
+        let committed = fs::read(source.join("projects.db")).unwrap();
+        database
+            .execute_batch("BEGIN IMMEDIATE; UPDATE history SET secret='UNCOMMITTED_PRIVATE';")
+            .unwrap();
+        let database_before = fs::read(source.join("projects.db")).unwrap();
+        let journal_before = fs::read(source.join("projects.db-journal")).unwrap();
+        assert_ne!(
+            database_before, committed,
+            "the transaction must spill to the main file"
+        );
+        assert!(journal_before.len() >= 28 && journal_before[..28].iter().any(|byte| *byte != 0));
+        let destination = temporary.path().join("active");
+        let source_boundary = boundary(&source, &destination);
+        let output = AnchoredDir::open(&destination).unwrap();
+        let result = seed_projects(
+            &source_boundary,
+            source_boundary.hermes.source.unwrap(),
+            &source_boundary.source_root,
+            &output,
+        );
+        assert!(
+            result.is_err(),
+            "an active journal must prevent publication: {result:?}"
+        );
+        assert!(!destination.join("projects.db").exists());
+        assert_eq!(
+            fs::read(source.join("projects.db")).unwrap(),
+            database_before
+        );
+        assert_eq!(
+            fs::read(source.join("projects.db-journal")).unwrap(),
+            journal_before
+        );
+        database.execute_batch("ROLLBACK;").unwrap();
+        let source_boundary = boundary(&source, &destination);
+        seed_projects(
+            &source_boundary,
+            source_boundary.hermes.source.unwrap(),
+            &source_boundary.source_root,
+            &output,
+        )
+        .unwrap();
+        assert_project_projection(&destination);
+    }
+
+    #[test]
+    fn project_journal_cannot_borrow_another_native_states_exception() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let _database = project_journal_fixture(&source, "PERSIST");
+        fs::create_dir(source.join("sessions")).unwrap();
+        let journal = source.join("projects.db-journal");
+        let alias = source.join("sessions/native-journal");
+        fs::hard_link(&journal, &alias).unwrap();
+        let database_before = fs::read(source.join("projects.db")).unwrap();
+        let journal_before = fs::read(&journal).unwrap();
+        let destination = temporary.path().join("active");
+        let boundary = boundary(&source, &destination);
+        let result = seed_projects(
+            &boundary,
+            boundary.hermes.source.unwrap(),
+            &boundary.source_root,
+            &AnchoredDir::open(&destination).unwrap(),
+        );
+        assert!(
+            result.is_err(),
+            "a journal aliased to native state must fail: {result:?}"
+        );
+        assert!(!destination.join("projects.db").exists());
+        assert_eq!(
+            fs::read(source.join("projects.db")).unwrap(),
+            database_before
+        );
+        assert_eq!(fs::read(&journal).unwrap(), journal_before);
+        assert_eq!(fs::read(&alias).unwrap(), journal_before);
     }
 
     #[test]

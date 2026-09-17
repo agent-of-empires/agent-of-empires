@@ -1266,8 +1266,11 @@ fn discard_stage(app: &Path, receipt: &mut Receipt, path: &Path) -> Result<()> {
         let renamed = match &part.original {
             Some(original) => identity(&part.root.path)?.as_ref() != Some(original),
             None => {
-                part.published.is_some()
-                    && owned_root(app, &receipt.instance, &part.root.path)?.is_none()
+                (part.published.is_some()
+                    && owned_root(app, &receipt.instance, &part.root.path)?.is_none())
+                    || (part.published.is_none()
+                        && part.staged.is_some()
+                        && identity(&part.root.path)? == part.staged)
             }
         };
         if renamed {
@@ -1918,19 +1921,42 @@ fn reconcile_in(
 }
 
 pub fn run() -> Result<()> {
-    // Content isolation is keyed by home and this pass only reports pending
-    // rows, so a host that cannot name one still advances the schema; the
-    // reconcile below makes the same call on the schema-current path. Nothing
-    // is lost: the startup pass retries once a host home exists.
+    // Content isolation is keyed by home. A host without one still advances
+    // the schema and retries reconciliation once a home is available.
     if dirs::home_dir().is_none() {
         return Ok(());
     }
-    reconcile_pending(false)
+    reconcile_pending(progress::announced())
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct TestReconcileProbes {
+    running: fn(&str) -> Result<bool>,
+    reap: fn(&str) -> Result<bool>,
+    exposure: fn(&str) -> Result<Vec<PathBuf>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_RECONCILE_PROBES: std::cell::Cell<Option<TestReconcileProbes>> = const { std::cell::Cell::new(None) };
 }
 
 pub(crate) fn reconcile_pending(move_stores: bool) -> Result<()> {
     let app = crate::session::get_app_dir()?;
     let home = dirs::home_dir().context("home directory unavailable for content isolation")?;
+    #[cfg(test)]
+    if let Some(probes) = TEST_RECONCILE_PROBES.get() {
+        return reconcile_in(
+            &app,
+            &home,
+            None,
+            move_stores,
+            &probes.running,
+            &probes.reap,
+            &probes.exposure,
+        );
+    }
     reconcile_in(
         &app,
         &home,
@@ -2103,6 +2129,26 @@ pub(crate) fn guard_preparation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestReconcileGuard(Option<TestReconcileProbes>);
+
+    impl Drop for TestReconcileGuard {
+        fn drop(&mut self) {
+            TEST_RECONCILE_PROBES.set(self.0);
+        }
+    }
+
+    fn install_test_reconcile_probes(
+        running: fn(&str) -> Result<bool>,
+        reap: fn(&str) -> Result<bool>,
+        exposure: fn(&str) -> Result<Vec<PathBuf>>,
+    ) -> TestReconcileGuard {
+        TestReconcileGuard(TEST_RECONCILE_PROBES.replace(Some(TestReconcileProbes {
+            running,
+            reap,
+            exposure,
+        })))
+    }
 
     /// The same-kernel mount proof runs only for a running container on a
     /// kernel-sharing host with no VM runtime handler. A VM-backed runtime
@@ -2856,6 +2902,76 @@ mod tests {
         assert!(!stage.exists());
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn a_fresh_stage_renamed_into_place_survives_deferral_and_retry() {
+        let temporary = tempfile::tempdir().unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let home = dirs::home_dir().unwrap();
+        let app = crate::session::get_app_dir().unwrap();
+        let project = temporary.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let mut instance = crate::session::Instance::new("codex", project.to_str().unwrap());
+        instance.tool = "codex".to_owned();
+        let config = crate::session::Config::default();
+        let roots = container_config::sandbox_content_roots(
+            "codex",
+            None,
+            &config.session,
+            &home,
+            &instance.id,
+        )
+        .unwrap();
+        let root = &roots[0].path;
+        fs::create_dir_all(&roots[0].host).unwrap();
+        fs::write(roots[0].host.join("auth.json"), b"PORTABLE_AUTH").unwrap();
+        let mut row = serde_json::to_value(&instance).unwrap();
+        row["sandbox_info"] = serde_json::json!({"enabled": true, "image": "img", "container_name": "aoe-sandbox-fixture"});
+        let registry = app.join("sessions.json");
+        fs::write(&registry, serde_json::to_vec(&vec![row.clone()]).unwrap()).unwrap();
+        let (path, mut receipt) = checked_receipt(&app, &row, "codex", &roots).unwrap();
+        stage_receipt(&app, &mut receipt, &path, &home, &config, &project).unwrap();
+        assert!(receipt.roots[0].original.is_none());
+        assert!(receipt.roots[0].published.is_none());
+        let staged = receipt.roots[0].staged.clone();
+        assert!(staged.is_some());
+        fs::create_dir_all(root.parent().unwrap()).unwrap();
+        fs::rename(&receipt.roots[0].stage, root).unwrap();
+        let target = (registry.as_path(), instance.id.as_str(), "codex");
+        assert!(!migrate_target(
+            &app,
+            &home,
+            target,
+            &|_| Ok(false),
+            &|_| Ok(false),
+            &|_| Ok(Vec::new())
+        )
+        .unwrap());
+        let deferred = read_receipt(&path).unwrap().unwrap();
+        assert_eq!(deferred.phase, Phase::Staged);
+        assert_eq!(deferred.roots[0].staged, staged);
+        assert_eq!(identity(root).unwrap(), staged);
+        assert!(!roots_ready(&app, &instance.id, "codex", &roots).unwrap());
+        assert!(
+            migrate_target(&app, &home, target, &|_| Ok(false), &|_| Ok(true), &|_| Ok(
+                Vec::new()
+            ))
+            .unwrap()
+        );
+        assert!(roots_ready(&app, &instance.id, "codex", &roots).unwrap());
+        assert_eq!(identity(root).unwrap(), staged);
+        assert_eq!(fs::read(root.join("auth.json")).unwrap(), b"PORTABLE_AUTH");
+        assert!(read_receipt(&path).unwrap().is_none());
+        assert!(!receipt.roots[0].recovery.exists());
+        assert!(
+            migrate_target(&app, &home, target, &|_| Ok(false), &|_| Ok(true), &|_| Ok(
+                Vec::new()
+            ))
+            .unwrap()
+        );
+        assert_eq!(identity(root).unwrap(), staged);
+    }
+
     /// A part renamed into place without a certificate is mid-publication: its
     /// stage is what the resume path needs, and discarding it would make every
     /// later pass refuse the store.
@@ -2952,6 +3068,160 @@ mod tests {
             read_receipt(&path).unwrap().unwrap().phase,
             Phase::Staged,
             "a rename the journal has not recorded is still mid-publication"
+        );
+    }
+
+    /// The announced runner dispatches through the production wiring from
+    /// schema 28, so an announced first call must certify a fresh store and
+    /// retire its private context, not merely report the row as pending.
+    #[test]
+    #[serial_test::serial]
+    fn first_announced_run_from_schema_28_completes_content_isolation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let home = dirs::home_dir().unwrap();
+        let app = crate::session::get_app_dir().unwrap();
+        let project = temporary.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let mut instance = crate::session::Instance::new("codex", project.to_str().unwrap());
+        instance.tool = "codex".to_owned();
+        instance.agent_session_id = Some("old-native-context".to_owned());
+        let config = crate::session::Config::default();
+        let roots = container_config::sandbox_content_roots(
+            "codex",
+            None,
+            &config.session,
+            &home,
+            &instance.id,
+        )
+        .unwrap();
+        let root = &roots[0].path;
+        fs::create_dir_all(root.join("sessions")).unwrap();
+        fs::write(
+            root.join("sessions/original.jsonl"),
+            b"PRIVATE_ORIGINAL_CONTEXT",
+        )
+        .unwrap();
+        let mut row = serde_json::to_value(&instance).unwrap();
+        row["sandbox_info"] = serde_json::json!({"enabled": true, "image": "img", "container_name": "aoe-sandbox-fixture"});
+        fs::write(
+            app.join("sessions.json"),
+            serde_json::to_vec(&vec![row]).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(app.join(".schema_version"), "28").unwrap();
+
+        let _probes =
+            install_test_reconcile_probes(|_| Ok(false), |_| Ok(true), |_| Ok(Vec::new()));
+        super::super::run_migrations_announced(None).unwrap();
+        assert!(roots_ready(&app, &instance.id, "codex", &roots).unwrap());
+        assert!(!root.join("sessions").exists());
+        let receipt = receipt_path(&app, &instance.id, "codex").unwrap();
+        let archives: Vec<_> = fs::read_dir(receipt.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "complete")
+            })
+            .collect();
+        assert_eq!(archives.len(), 1);
+        let archive: Receipt = serde_json::from_slice(&fs::read(&archives[0]).unwrap()).unwrap();
+        assert_eq!(archive.phase, Phase::Committed);
+        assert_eq!(
+            fs::read(archive.roots[0].recovery.join("sessions/original.jsonl")).unwrap(),
+            b"PRIVATE_ORIGINAL_CONTEXT"
+        );
+        assert_eq!(fs::read(app.join(".schema_version")).unwrap(), b"31");
+        assert!(
+            read_receipt(&receipt_path(&app, &instance.id, "codex").unwrap())
+                .unwrap()
+                .is_none()
+        );
+        let rows: Vec<Value> =
+            serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
+        assert!(rows[0]
+            .get("agent_session_id")
+            .and_then(Value::as_str)
+            .is_none());
+    }
+
+    /// Startup never migrates content on its own: it must advance the schema,
+    /// report the pending row, and leave the original store byte-identical.
+    #[test]
+    #[serial_test::serial]
+    fn startup_from_schema_28_with_reporter_only_reports_content_isolation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let home = dirs::home_dir().unwrap();
+        let app = crate::session::get_app_dir().unwrap();
+        let project = temporary.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let mut instance = crate::session::Instance::new("codex", project.to_str().unwrap());
+        instance.tool = "codex".to_owned();
+        instance.agent_session_id = Some("old-native-context".to_owned());
+        let config = crate::session::Config::default();
+        let roots = container_config::sandbox_content_roots(
+            "codex",
+            None,
+            &config.session,
+            &home,
+            &instance.id,
+        )
+        .unwrap();
+        let root = &roots[0].path;
+        fs::create_dir_all(root.join("sessions")).unwrap();
+        fs::write(
+            root.join("sessions/original.jsonl"),
+            b"PRIVATE_ORIGINAL_CONTEXT",
+        )
+        .unwrap();
+        let mut row = serde_json::to_value(&instance).unwrap();
+        row["sandbox_info"] = serde_json::json!({"enabled": true, "image": "img", "container_name": "aoe-sandbox-fixture"});
+        fs::write(
+            app.join("sessions.json"),
+            serde_json::to_vec(&vec![row]).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(app.join(".schema_version"), "28").unwrap();
+        let original: Vec<Value> =
+            serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
+
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let reporter: progress::Reporter =
+            std::sync::Arc::new(move |event| captured.lock().unwrap().push(event));
+        let _probes =
+            install_test_reconcile_probes(|_| Ok(false), |_| Ok(true), |_| Ok(Vec::new()));
+        super::super::run_migrations_with(Some(reporter)).unwrap();
+        assert_eq!(fs::read(app.join(".schema_version")).unwrap(), b"31");
+        assert!(
+            read_receipt(&receipt_path(&app, &instance.id, "codex").unwrap())
+                .unwrap()
+                .is_none()
+        );
+        let rows: Vec<Value> =
+            serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
+        assert_eq!(rows, original);
+        assert!(!roots_ready(&app, &instance.id, "codex", &roots).unwrap());
+        assert_eq!(
+            fs::read(root.join("sessions/original.jsonl")).unwrap(),
+            b"PRIVATE_ORIGINAL_CONTEXT"
+        );
+        let notices: Vec<String> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                crate::migrations::progress::Event::Notice(message) => Some(message.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            notices
+                .iter()
+                .any(|message| message.contains(&format!("sandbox {}", instance.id))),
+            "startup reports the pending row: {notices:?}"
         );
     }
 

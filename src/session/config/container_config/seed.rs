@@ -533,11 +533,19 @@ pub(super) fn carry_sandbox_state(
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error).context("resolving carried native state"),
             };
+            let declared = boundary.source_root.path().join(relative);
+            if !canonical.starts_with(&declared) {
+                anyhow::bail!(
+                    "carried native state {} leaves its declared root {}",
+                    entry.display(),
+                    declared.display()
+                );
+            }
             let leaf = Path::new(relative.file_name().context("carried state has no leaf")?);
             let parent = destination.create_child(relative.parent().unwrap_or(Path::new("")))?;
             let access = ReadAccess {
                 root: Some(&boundary.source_root),
-                exception: Exception::Carried { root: &canonical },
+                exception: Exception::Carried { root: &declared },
             };
             if entry.is_dir() {
                 seed_directory(&entry, &parent, leaf, boundary, false, access)?;
@@ -1544,6 +1552,81 @@ mod tests {
                 .unwrap();
             assert_eq!(value, "committed", "{mode}");
         }
+    }
+
+    #[test]
+    fn carried_directory_cannot_redirect_its_declared_root_to_internal_history() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let active = temporary.path().join("active");
+        fs::create_dir_all(source.join("history-tree/proj")).unwrap();
+        fs::create_dir(&active).unwrap();
+        let history = source.join("history-tree/proj/session.jsonl");
+        fs::write(&history, b"OTHER_NATIVE_HISTORY").unwrap();
+        std::os::unix::fs::symlink("history-tree", source.join("projects")).unwrap();
+        let mut boundary = NativeStateBoundary::for_source(&source, &active).unwrap();
+        boundary.stopped_original = Some(boundary.source_root.path().to_path_buf());
+        boundary.add_path(source.join("history-tree"));
+        let result = carry_sandbox_state(&source, &active, &["projects"], &boundary);
+        assert!(
+            result.is_err(),
+            "a redirected carried directory must fail: {result:?}"
+        );
+        assert!(!active.join("projects").exists());
+        assert_eq!(fs::read(&history).unwrap(), b"OTHER_NATIVE_HISTORY");
+        assert_eq!(
+            fs::read_link(source.join("projects")).unwrap(),
+            Path::new("history-tree")
+        );
+    }
+
+    #[test]
+    fn carried_file_cannot_redirect_its_declared_root_to_internal_history() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let active = temporary.path().join("active");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&active).unwrap();
+        let history = source.join("history.db");
+        fs::write(&history, b"OTHER_NATIVE_DATABASE").unwrap();
+        std::os::unix::fs::symlink("history.db", source.join("opencode.db")).unwrap();
+        let mut boundary = NativeStateBoundary::for_source(&source, &active).unwrap();
+        boundary.stopped_original = Some(boundary.source_root.path().to_path_buf());
+        boundary.add_path(history.clone());
+        let result = carry_sandbox_state(&source, &active, &["opencode.db*"], &boundary);
+        assert!(
+            result.is_err(),
+            "a redirected carried file must fail: {result:?}"
+        );
+        assert!(!active.join("opencode.db").exists());
+        assert_eq!(fs::read(&history).unwrap(), b"OTHER_NATIVE_DATABASE");
+        assert_eq!(
+            fs::read_link(source.join("opencode.db")).unwrap(),
+            Path::new("history.db")
+        );
+    }
+
+    #[test]
+    fn carried_state_accepts_a_source_beneath_a_symlinked_parent() {
+        let temporary = tempfile::tempdir().unwrap();
+        let parent = temporary.path().join("parent");
+        let alias = temporary.path().join("alias");
+        fs::create_dir_all(parent.join("source/projects/proj")).unwrap();
+        std::os::unix::fs::symlink(&parent, &alias).unwrap();
+        let source = alias.join("source");
+        let active = temporary.path().join("active");
+        fs::create_dir(&active).unwrap();
+        let history = source.join("projects/proj/session.jsonl");
+        fs::write(&history, b"OWN_NATIVE_HISTORY").unwrap();
+        let mut boundary = NativeStateBoundary::for_source(&source, &active).unwrap();
+        boundary.stopped_original = Some(boundary.source_root.path().to_path_buf());
+        boundary.add_path(source.join("projects"));
+        carry_sandbox_state(&source, &active, &["projects"], &boundary).unwrap();
+        assert_eq!(
+            fs::read(active.join("projects/proj/session.jsonl")).unwrap(),
+            b"OWN_NATIVE_HISTORY"
+        );
+        assert_eq!(fs::read(&history).unwrap(), b"OWN_NATIVE_HISTORY");
     }
 
     #[test]
