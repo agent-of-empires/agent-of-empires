@@ -325,9 +325,6 @@ pub(super) fn native_store_snapshot(
     command: &std::process::Command,
     overrides: &[(String, String)],
 ) -> Option<crate::session::ExecutionBinding> {
-    // `claude-code` is the legacy alias for the same adapter and the same
-    // CLI-resumable store (see `acp_transcript_cli_resumable`), so its
-    // worker proves the same handoff store a `claude` worker does.
     if config.sandbox_info.is_some()
         || !matches!(config.agent_key.as_str(), "claude" | "claude-code")
     {
@@ -373,12 +370,10 @@ mod snapshot_tests {
     use super::*;
     use crate::acp::acp_client::test_helpers::env_test_spawn_config;
 
-    /// The legacy `claude-code` alias names the same adapter and CLI store
-    /// as `claude` (see `acp_transcript_cli_resumable`), so its worker must
-    /// prove the same handoff store instead of being refused outright.
     #[test]
     fn snapshot_accepts_the_claude_code_alias_like_the_primary_name() {
-        let cwd = std::env::temp_dir().join("aoe-snapshot-alias");
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().to_path_buf();
         let store = cwd.join("store");
         std::fs::create_dir_all(&store).unwrap();
         let mut primary = env_test_spawn_config(cwd.clone());

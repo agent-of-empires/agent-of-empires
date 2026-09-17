@@ -335,7 +335,10 @@ impl RuntimeExecutionSnapshot {
             ),
             self.global_arguments
                 .iter()
-                .map(|arg| format!(" {}", crate::session::environment::shell_escape(arg)))
+                .map(|arg| format!(
+                    " {}",
+                    crate::session::environment::shell_escape_script_word(arg)
+                ))
                 .collect::<String>(),
             command
                 .strip_prefix(runtime.base.binary)
@@ -586,11 +589,12 @@ mod tests {
         let docker = bin.join("docker");
         std::fs::write(
             &docker,
-            "#!/bin/sh\nif [ \"$1\" = context ]; then printf '%s' \"$FIXTURE_CONTEXT\"; else echo '{}'; fi\n",
+            "#!/bin/sh\nif [ \"$1\" = context ]; then printf '%s' \"$FIXTURE_CONTEXT\"; else printf '%s\\0' \"$@\"; fi\n",
         )
         .unwrap();
         std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let tls_dir = temp.path().join("metadata/docker");
+        let metadata = temp.path().join("metadata\r\n'quoted");
+        let tls_dir = metadata.join("docker");
         std::fs::create_dir_all(&tls_dir).unwrap();
         for file in ["ca.pem", "cert.pem", "key.pem"] {
             std::fs::write(tls_dir.join(file), b"fixture").unwrap();
@@ -599,7 +603,7 @@ mod tests {
             "Name": "tlsctx",
             "Endpoints": {"docker": {"Host": "tcp://127.0.0.1:2375", "SkipTLSVerify": false}},
             "TLSMaterial": {"docker": ["ca.pem", "cert.pem", "key.pem"]},
-            "Storage": {"TLSPath": temp.path().join("metadata")},
+            "Storage": {"TLSPath": metadata},
         })
         .to_string();
         let path = format!(
@@ -635,6 +639,25 @@ mod tests {
         );
         let command = snapshot.command(&["ps".to_owned()]);
         assert_eq!(command.get_args().next().unwrap(), "--tls");
+        let direct = snapshot
+            .exec("fixture", "/", &["true".into()])
+            .output()
+            .unwrap();
+        assert!(direct.status.success());
+        let shell = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(snapshot.exec_shell_command("fixture", None, "true"))
+            .output()
+            .unwrap();
+        assert!(shell.status.success());
+        let tls_arguments = |output: &[u8]| {
+            output
+                .split(|byte| *byte == 0)
+                .filter(|arg| arg.starts_with(b"--tls"))
+                .map(<[u8]>::to_vec)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(tls_arguments(&shell.stdout), tls_arguments(&direct.stdout));
     }
 
     fn expect_path(tls_dir: &std::path::Path, file: &str) -> String {
