@@ -1290,6 +1290,10 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
                 fresh_after_failed_resume.push((title.clone(), sid));
                 succeeded.push((id, title));
             }
+            Ok(StartOutcome::FreshAfterUnavailableResume { notice, .. }) => {
+                eprintln!("{title}: {}", notice.warning_message());
+                succeeded.push((id, title));
+            }
             Ok(StartOutcome::Resumed | StartOutcome::Fresh) => succeeded.push((id, title)),
             Err(e) => failed.push((title, e.to_string())),
         }
@@ -1475,6 +1479,10 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
                 "✓ Restarted session: {} (started fresh; a prior resume attempt failed for sid {sid}, the old conversation is still reachable via the agent's own resume/history picker)",
                 title
             );
+        }
+        StartOutcome::FreshAfterUnavailableResume { notice, .. } => {
+            eprintln!("{}", notice.warning_message());
+            println!("Restarted session: {}", title);
         }
         StartOutcome::Resumed | StartOutcome::Fresh => {
             println!("✓ Restarted session: {}", title);

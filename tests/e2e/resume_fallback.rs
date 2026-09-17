@@ -113,7 +113,7 @@ fn read_log_lines(path: &Path) -> Vec<String> {
 /// <encoded-canonical-project-path>/<sid>.jsonl`, where the encoding maps every
 /// char that is not ASCII-alphanumeric or `-` to `-`. Models a real prior
 /// Claude session whose sid later fails to resume.
-fn seed_claude_transcript(h: &TuiTestHarness, project_path: &Path, sid: &str) {
+fn seed_claude_transcript(h: &TuiTestHarness, project_path: &Path, sid: &str) -> PathBuf {
     let canonical = fs::canonicalize(project_path).unwrap_or_else(|_| project_path.to_path_buf());
     let encoded: String = canonical
         .to_string_lossy()
@@ -128,7 +128,9 @@ fn seed_claude_transcript(h: &TuiTestHarness, project_path: &Path, sid: &str) {
         .collect();
     let dir = h.home_path().join(".claude").join("projects").join(encoded);
     fs::create_dir_all(&dir).expect("create claude projects dir");
-    fs::write(dir.join(format!("{sid}.jsonl")), "{}\n").expect("write claude transcript");
+    let path = dir.join(format!("{sid}.jsonl"));
+    fs::write(&path, "{}\n").expect("write claude transcript");
+    path
 }
 
 struct StopSessionOnDrop<'a> {
@@ -139,6 +141,71 @@ impl Drop for StopSessionOnDrop<'_> {
     fn drop(&mut self) {
         let _ = self.h.run_cli(&["session", "stop", TITLE]);
     }
+}
+
+#[test]
+#[parallel]
+fn migrated_unknown_restart_warns_and_leaves_the_old_conversation_intact() {
+    require_tmux!();
+    let mut h = new_harness("resume_unknown_warning");
+    disable_restart_wake_message(&h);
+    let log = install_fake_agent(&mut h);
+    let project = h.project_path();
+    let add = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "--cmd",
+        FAKE_AGENT,
+        "-t",
+        TITLE,
+    ]);
+    assert!(add.status.success(), "{add:?}");
+    let _cleanup = StopSessionOnDrop { h: &h };
+    let transcript = seed_claude_transcript(&h, &project, STALE_SID);
+    let original = fs::read(&transcript).unwrap();
+    patch_session(&h, TITLE, |row| {
+        row.insert("agent_session_id".into(), Value::String(STALE_SID.into()));
+        row.insert(
+            "agent_session_binding".into(),
+            serde_json::json!({
+                "session_id": STALE_SID,
+                "execution": null,
+                "provenance": "unknown",
+                "transcript_path": null
+            }),
+        );
+        row.remove("resume_intent");
+        row.remove("resume_binding");
+        row.remove("active_execution");
+    });
+    let restarted = h.run_cli(&["session", "restart", TITLE]);
+    assert!(restarted.status.success(), "{restarted:?}");
+    let diagnostic = String::from_utf8_lossy(&restarted.stderr);
+    assert!(
+        diagnostic.contains("starting fresh") && diagnostic.contains("unknown provenance"),
+        "restart must explain why the previous conversation was not resumed: {restarted:?}"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let lines = loop {
+        let lines = read_log_lines(&log);
+        if !lines.is_empty() {
+            break lines;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the agent was not invoked"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert!(
+        lines.iter().all(|line| !line.contains(STALE_SID)),
+        "{lines:?}"
+    );
+    let sessions = read_sessions(&h);
+    let row = session_by_title(&sessions, TITLE);
+    assert_ne!(row["agent_session_id"].as_str(), Some(STALE_SID));
+    assert_default_resume_intent(row);
+    assert_eq!(fs::read(&transcript).unwrap(), original);
 }
 
 #[test]

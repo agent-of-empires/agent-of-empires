@@ -46,6 +46,9 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
                 Ok(EnsureReadyOutcome::Started) => {
                     eprintln!("  (started stopped session before send)");
                 }
+                Ok(EnsureReadyOutcome::FreshAfterUnavailableResume { notice }) => {
+                    eprintln!("{}", notice.warning_message());
+                }
                 Ok(EnsureReadyOutcome::ResumeFailed { sid }) => {
                     bail!("Resume failed for sid {sid}; preserved for explicit retry")
                 }

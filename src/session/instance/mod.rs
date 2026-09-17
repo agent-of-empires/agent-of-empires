@@ -68,6 +68,7 @@ mod tmux_session;
 mod types;
 
 pub use flags::{is_valid_session_color, SessionBucket, SESSION_COLORS};
+pub use launch_command::FreshLaunchNotice;
 pub(crate) use lifecycle::NEWER_GENERATION_BUSY_REASON;
 pub use lifecycle::{LifecycleOperation, LifecycleReservation, LifecycleReservationError};
 

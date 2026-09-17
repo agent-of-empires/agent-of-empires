@@ -73,6 +73,8 @@ aoe session set-session-id <session-name-or-id> <native-session-id>
 
 This records an assertion about the intended native target, separately from any observed conversation. The pin is sticky. If the execution context changes, restore it or explicitly rebind the intended conversation before retrying. Legacy IDs and IDs from old unqualified publishers remain unknown after migration; they are not relabeled from current configuration.
 
+On automatic start or restart, an unknown stored conversation starts fresh with a warning. The previous transcript is left intact. Explicit resume pins and forks still require a qualified binding; use `set-session-id` with the original store to select that conversation again.
+
 For an explicit store assertion:
 
 ```sh

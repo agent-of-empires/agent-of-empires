@@ -86,6 +86,12 @@ pub enum StartOutcome {
     /// conversation is still reachable through the agent's own resume/
     /// history picker. See #2609.
     FreshAfterFailedResume { sid: String },
+    /// Automatic resume skipped an unqualified stored conversation.
+    /// The old transcript remains intact; callers must surface the notice.
+    FreshAfterUnavailableResume {
+        sid: String,
+        notice: super::launch_command::FreshLaunchNotice,
+    },
 }
 
 /// What `start_with_size_opts` did with the agent's session id this call.
@@ -101,8 +107,6 @@ pub enum LaunchSidOutcome {
     /// observed `agent_session_id`, or retroactive-capture hit. The launch
     /// command embedded the agent's resume flag.
     Existing { sid: String },
-    /// `acquire_session_id` returned a fresh sid (Claude UUID generation)
-    /// or `None`. No prior conversation continued.
     Fresh {
         /// Set when the fresh launch pinned an id the session already had
         /// stored, rather than a UUID minted for a brand-new conversation:
@@ -112,6 +116,9 @@ pub enum LaunchSidOutcome {
         /// probing; a genuinely new session cannot and skips the probe.
         /// See #3399.
         pinned_prior_sid: Option<String>,
+        /// Why the launch deliberately did not resume the stored
+        /// conversation, produced only by the plan actually spawned.
+        fresh_notice: Option<super::launch_command::FreshLaunchNotice>,
     },
     /// `start_with_size_opts` short-circuited before `apply_session_flags`
     /// ran: structured view-mode session, or a pre-existing tmux pane that is
@@ -429,10 +436,12 @@ impl Instance {
 
         #[cfg(test)]
         test_support::observe(self, test_support::FinalizePhase::After);
-
         Ok(match launch_sid {
             Some(sid) => LaunchSidOutcome::Existing { sid },
-            None => LaunchSidOutcome::Fresh { pinned_prior_sid },
+            None => LaunchSidOutcome::Fresh {
+                pinned_prior_sid,
+                fresh_notice: prepared.fresh_notice,
+            },
         })
     }
 

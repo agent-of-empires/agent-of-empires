@@ -14,6 +14,28 @@ pub(super) struct LaunchEnvironment {
     pub(super) container: Vec<(String, String)>,
 }
 
+/// Why a fresh launch deliberately did not resume the stored conversation.
+/// Describes the launch actually dispatched; never persisted on the row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FreshLaunchNotice {
+    /// The stored conversation id could not be qualified for automatic
+    /// resume after an upgrade; the conversation was not deleted.
+    UnqualifiedStoredConversation { sid: String },
+}
+
+impl FreshLaunchNotice {
+    /// One-line user-facing explanation; never echoes argv, auth or config.
+    pub fn warning_message(&self) -> String {
+        match self {
+            FreshLaunchNotice::UnqualifiedStoredConversation { sid } => format!(
+                "starting fresh; the stored conversation id {sid} has unknown provenance \
+                 after upgrade and was not resumed. The previous conversation was not \
+                 deleted; point `aoe session set-session-id` at its store to resume it."
+            ),
+        }
+    }
+}
+
 pub(super) struct PreparedLaunch {
     pub(super) command: Option<String>,
     pub(super) is_existing: bool,
@@ -23,6 +45,7 @@ pub(super) struct PreparedLaunch {
     pub(super) canonical_conversation: Option<ConversationState>,
     pub(super) expected_prior_omp_generation: Option<String>,
     pub(super) execution: Option<super::execution::NativeExecution>,
+    pub(super) fresh_notice: Option<FreshLaunchNotice>,
 }
 
 /// Append yolo-mode flags or environment variables to a launch command.
@@ -461,7 +484,24 @@ impl Instance {
         let expected_prior_omp_generation = self.omp_capture_generation.clone();
         let prior_probe_failed_sid = self.resume_probe_failed_sid.clone();
         let preparation = (|| -> Result<_> {
+            let mut fresh_notice = None;
             if matches!(self.resume_intent, ResumeIntent::Default) {
+                // Migrated IDs cannot authorize resume until their store is qualified.
+                if let Some((sid, binding, _)) = self.conversation_target() {
+                    if binding.is_some_and(|binding| {
+                        !binding.is_known() && binding.provenance == ConversationProvenance::Unknown
+                    }) {
+                        fresh_notice = Some(FreshLaunchNotice::UnqualifiedStoredConversation {
+                            sid: sid.to_owned(),
+                        });
+                        tracing::warn!(
+                            target: "session.store",
+                            sid = %sid,
+                            "stored conversation id has unknown provenance; starting fresh"
+                        );
+                        self.set_agent_conversation(None, None, self.pi_session_path.clone());
+                    }
+                }
                 if let Some(observation) = self.capture_freshest_conversation() {
                     self.apply_conversation_observation(&observation);
                 }
@@ -482,29 +522,7 @@ impl Instance {
                 }
                 Err(error) if managed => return Err(error),
                 Err(_) => {
-                    // Fail fast on argv alone: an unsupported user argument is
-                    // known before any native I/O or namespace attestation, so
-                    // surface it at creation instead of discovering it only at
-                    // the first managed restart. Only a resolvable agent gets
-                    // this check: an undeclared wrapper has nothing managed to
-                    // validate against, and stays swallowed for its host
-                    // single-shot launch. Namespace and auth errors stay
-                    // swallowed as well: they govern managed resume and fork.
-                    // The check returns `()` on purpose: it must not feed the
-                    // `execution` used below, or a namespace refusal would
-                    // poison a launch the namespace gates deliberately leave
-                    // unmanaged.
-                    if let Ok(agent) = Self::execution_agent_for(
-                        &self.tool,
-                        self.get_tool_command(),
-                        &crate::session::config::repo_config::resolve_config_with_repo(
-                            &self.effective_profile(),
-                            std::path::Path::new(&self.project_path),
-                        )?
-                        .session,
-                    ) {
-                        self.managed_user_argv(agent)?;
-                    }
+                    // Unattested arguments must not prevent an unmanaged launch.
                     None
                 }
             };
@@ -550,12 +568,13 @@ impl Instance {
                 self.adopt_conversation_state(prior);
                 canonical
             });
-            Ok((parts, execution, canonical_conversation))
+            Ok((parts, execution, canonical_conversation, fresh_notice))
         })();
         let (
             (command, is_existing, omp_capture_plan, mut launch_env),
             mut execution,
             canonical_conversation,
+            fresh_notice,
         ) = match preparation {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -583,6 +602,7 @@ impl Instance {
             canonical_conversation,
             expected_prior_omp_generation,
             execution,
+            fresh_notice,
         })
     }
 
@@ -1068,6 +1088,53 @@ mod tests {
                 published
             );
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn migrated_unknown_default_starts_fresh_but_explicit_resume_refuses() {
+        let home = tempfile::tempdir().unwrap();
+        let _isolation = crate::session::test_support::isolate_app_dir_at(home.path());
+        let (_hooks, _, _hook_dir) = crate::hooks::test_support::BaseGuard::ready();
+        let _program = crate::session::test_support::install_login_shell_path_command(
+            home.path(),
+            "claude",
+            "#!/bin/sh\nexit 0\n",
+        );
+        let sid = "11111111-1111-4111-8111-111111111111";
+        let mut instance = Instance::new("migrated", home.path().to_str().unwrap());
+        instance.tool = "claude".into();
+        instance.command = "claude".into();
+        instance.set_agent_conversation(
+            Some(sid.into()),
+            Some(ConversationBinding {
+                session_id: sid.into(),
+                execution: None,
+                provenance: ConversationProvenance::Unknown,
+                transcript_path: None,
+            }),
+            None,
+        );
+        for intent in [
+            ResumeIntent::Use(sid.into()),
+            ResumeIntent::Fork { from: sid.into() },
+        ] {
+            let mut explicit = instance.clone();
+            explicit.resume_intent = intent;
+            explicit.resume_binding = explicit.agent_session_binding.clone();
+            let before = explicit.conversation_state();
+            assert!(explicit.prepare_launch_command(before.clone()).is_err());
+            assert!(before.matches(&explicit));
+        }
+        let prepared = instance
+            .prepare_launch_command(instance.conversation_state())
+            .expect("an upgraded default session must start fresh");
+        assert!(!prepared.is_existing);
+        let command = prepared.command.expect("native launch command");
+        assert!(
+            !command.contains(sid),
+            "the unqualified id must not be resumed"
+        );
     }
 
     #[test]
@@ -2471,17 +2538,16 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn unsupported_managed_argument_fails_before_first_managed_restart() {
+    fn unmanaged_creation_launches_with_unattested_flags_but_managed_restart_refuses() {
         use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir().unwrap();
         let _isolation = crate::session::test_support::isolate_app_dir_at(home.path());
         let program = home.path().join("claude");
         std::fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let mut instance = Instance::new("argv-fail-fast", home.path().to_str().unwrap());
+        let mut instance = Instance::new("argv-unmanaged", home.path().to_str().unwrap());
         instance.tool = "claude".into();
         instance.command = "claude".into();
-        instance.extra_args = "--add-dir /tmp/elsewhere".into();
         instance.pending_host_env = vec![
             (
                 "PATH".into(),
@@ -2489,13 +2555,36 @@ mod tests {
             ),
             ("HOME".into(), home.path().display().to_string()),
         ];
-        let error = match instance.prepare_launch_command(instance.conversation_state()) {
-            Ok(_) => panic!("unsupported argv must fail at creation"),
+        let binding = instance.resolve_native_execution(None).unwrap().binding;
+        instance.extra_args = "--mcp-config /tmp/elsewhere.json".into();
+        let prepared = instance
+            .prepare_launch_command(instance.conversation_state())
+            .expect("an unmanaged first launch must not refuse user flags");
+        assert!(prepared
+            .command
+            .as_deref()
+            .unwrap()
+            .contains("--mcp-config"));
+        assert!(!prepared.is_existing);
+        instance.set_agent_conversation(
+            Some("11111111-1111-4111-8111-111111111111".into()),
+            Some(ConversationBinding {
+                session_id: "11111111-1111-4111-8111-111111111111".into(),
+                execution: Some(binding),
+                provenance: ConversationProvenance::Observed,
+                transcript_path: None,
+            }),
+            None,
+        );
+        let before = instance.conversation_state();
+        let error = match instance.prepare_launch_command(before.clone()) {
+            Ok(_) => panic!("a managed restart must still refuse unattested argv"),
             Err(error) => error.to_string(),
         };
         assert!(
-            error.contains("argument --add-dir is not supported for a managed"),
-            "unsupported argv must fail at creation, got: {error}"
+            error.contains("argument --mcp-config is not supported for a managed"),
+            "managed restart must refuse unattested argv, got: {error}"
         );
+        assert!(before.matches(&instance));
     }
 }
