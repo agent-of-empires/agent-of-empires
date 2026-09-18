@@ -404,3 +404,185 @@ fn selected_claude_store_survives_terminal_handoff() {
         Some(selected.to_str().unwrap())
     );
 }
+
+/// Stop → fresh-spawn continuity: after the terminal handoff onto the
+/// asserted store B, `POST /stop` shuts the worker down while keeping the
+/// transcript, and `POST /acp/spawn` must bring the worker back on the SAME
+/// store with `session/load` for the same SID. Before the persistence fix
+/// (`2b5888d4`) the spawn rebuilt its pin from the profile default A, so the
+/// second launch read the wrong store.
+#[test]
+#[parallel]
+fn selected_claude_store_survives_stop_and_respawn() {
+    require_tmux!();
+    require_node!();
+    let mut h = TuiTestHarness::new_in_tmp("handoff_respawn");
+    h.stop_daemon_on_drop();
+    let selected = h.home_path().join("selected-claude");
+    let configured = h.home_path().join("configured-claude");
+    let project = h.project_path().canonicalize().unwrap();
+    let script = h.home_path().join("agent.json");
+    std::fs::write(&script, EMPTY_SCRIPT).unwrap();
+    let capture_dir = h.home_path().join("adapter-env");
+    h.install_acp_shim_capturing_env(&script, &capture_dir);
+    let config_path = app_dir_in(h.home_path()).join("config.toml");
+    let config = std::fs::read_to_string(&config_path).unwrap();
+    std::fs::write(
+        &config_path,
+        format!(
+            "environment = [\"CLAUDE_CONFIG_DIR={}\"]\n{config}",
+            configured.display()
+        ),
+    )
+    .unwrap();
+    let add = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "-t",
+        "handoff",
+        "-c",
+        "claude",
+    ]);
+    assert!(
+        add.status.success(),
+        "{}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let sid = "11111111-1111-4111-8111-111111111111";
+    let encoded: String = project
+        .to_string_lossy()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let transcripts = selected.join("projects").join(encoded);
+    std::fs::create_dir_all(&transcripts).unwrap();
+    std::fs::write(transcripts.join(format!("{sid}.jsonl")), "{}\n").unwrap();
+    let pin = h.run_cli(&[
+        "session",
+        "set-session-id",
+        "handoff",
+        sid,
+        "--store",
+        selected.to_str().unwrap(),
+    ]);
+    assert!(
+        pin.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pin.stderr)
+    );
+    let sessions_path = app_dir_in(h.home_path()).join("profiles/default/sessions.json");
+    let rows: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&sessions_path).unwrap()).unwrap();
+    let id = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["title"] == "handoff")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let port = pick_free_port();
+    let start = h.run_cli(&[
+        "serve",
+        "--daemon",
+        "--port",
+        &port.to_string(),
+        "--no-auth",
+    ]);
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    assert!(wait_for_port(port, Duration::from_secs(10)));
+
+    let base = format!("http://127.0.0.1:{port}/api/sessions/{id}");
+    let log = app_dir_in(h.home_path()).join("fake-acp.log");
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("{base}/acp/enable"))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_success(),
+            "{}",
+            response.text().await.unwrap()
+        );
+    });
+    let first_loads = wait_for_session_loads(&log, 1, 75);
+    assert_eq!(first_loads, 1, "exactly one load before stop");
+    // The shim writes its env capture before exec'ing the agent, so every
+    // shim invocation that has logged a load already has its capture on
+    // disk. Snapshot the capture FILE NAMES now: the respawned worker must
+    // add one whose CLAUDE_CONFIG_DIR is the asserted store.
+    let captures_before: Vec<String> = captures(&capture_dir)
+        .into_iter()
+        .map(|(path, _)| path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+
+    runtime.block_on(async {
+        let client = reqwest::Client::new();
+        let response = client.post(format!("{base}/stop")).send().await.unwrap();
+        assert!(
+            response.status().is_success(),
+            "stop failed: {}",
+            response.text().await.unwrap()
+        );
+        let response = client
+            .post(format!("{base}/acp/spawn"))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_success(),
+            "respawn failed: {}",
+            response.text().await.unwrap()
+        );
+    });
+    // The respawn must issue a SECOND session/load (a session/new instead
+    // would leave the count at one and the wait below would time out) and
+    // must start on the asserted store, not the profile default.
+    let second_loads = wait_for_session_loads(&log, 2, 75);
+    assert_eq!(second_loads, 2, "respawn must session/load again");
+    let respawned = captures(&capture_dir).into_iter().find(|(path, capture)| {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        !captures_before.contains(&name)
+            && env_value(capture, "CLAUDE_CONFIG_DIR").as_deref()
+                == Some(selected.to_str().unwrap())
+    });
+    assert!(
+        respawned.is_some(),
+        "respawned adapter must capture CLAUDE_CONFIG_DIR={}; prior captures={captures_before:?}",
+        selected.display()
+    );
+}
+
+/// Count `session/load` request lines in the fake agent log, waiting until
+/// at least `min` appear. Panics with the log on timeout.
+fn wait_for_session_loads(log: &Path, min: usize, seconds: u64) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    loop {
+        let contents = std::fs::read_to_string(log).unwrap_or_default();
+        let loads = contents
+            .matches("handleRequest method=session/load")
+            .count();
+        if loads >= min {
+            return loads;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "worker did not complete handshake: {contents}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}

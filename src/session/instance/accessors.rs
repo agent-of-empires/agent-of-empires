@@ -654,6 +654,58 @@ mod tests {
         );
     }
 
+    /// A pending terminal fork's parent must not present itself as the
+    /// resumable conversation: acp_enable would clear the fork intent and
+    /// session/load the parent, attaching the preallocated child directly to
+    /// it. See the `selected_claude_conversation` contract.
+    #[test]
+    fn selected_claude_conversation_excludes_a_pending_fork() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let mut inst = Instance::new("claude", "/tmp");
+        inst.resume_intent = ResumeIntent::Fork {
+            from: "parent-sid".into(),
+        };
+        inst.resume_binding = Some(ConversationBinding {
+            session_id: "parent-sid".into(),
+            provenance: ConversationProvenance::Asserted,
+            transcript_path: None,
+            execution: Some(ExecutionBinding {
+                agent: "claude".into(),
+                stores: vec!["/tmp/claude".into()],
+                configuration: Vec::new(),
+                cwd: "/tmp".into(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+            }),
+        });
+
+        assert_eq!(
+            inst.selected_claude_conversation(),
+            None,
+            "a pending fork's parent is not a resumable conversation"
+        );
+    }
+
+    /// A sandboxed session's conversation store lives in the container; the
+    /// host-side selector must not return it as a handoff target.
+    #[test]
+    fn selected_claude_conversation_excludes_a_sandboxed_session() {
+        let mut inst = Instance::new("claude", "/tmp");
+        inst.sandbox_info = Some(SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "alpine:latest".into(),
+            container_name: "aoe-sandbox-x".into(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        });
+
+        assert_eq!(inst.selected_claude_conversation(), None);
+    }
+
     #[test]
     #[serial_test::serial]
     fn switch_to_terminal_keep_context_accepts_a_session_home_store() {
