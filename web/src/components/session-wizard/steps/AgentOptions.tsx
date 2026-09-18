@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import type { AgentInfo, ProfileInfo } from "../../../lib/types";
 import { fetchSettings } from "../../../lib/api";
 import { isAcpEligible } from "../../../lib/acpCapableTools";
@@ -20,6 +20,13 @@ interface WizardData {
   extraArgs: string;
   commandOverride: string;
   useStructuredView: boolean;
+  structuredOffered: boolean;
+  /** Non-empty while importing an existing agent session, which resumes a
+   *  session that is already structured on disk. */
+  importAcpSessionId?: string;
+  /** Whether the user set the structured-view toggle by hand. Tracked apart
+   *  from `profileDirty`, so the confirmation guard has to name it. */
+  structuredViewDirty?: boolean;
   [key: string]: unknown;
 }
 
@@ -37,6 +44,9 @@ interface Props {
     extraEnv: string[];
     agentModel?: string;
     agentEffort?: string;
+    structuredOffered?: boolean;
+    useStructuredView?: boolean;
+    resetStructuredViewDirty?: boolean;
     commandMaps?: CommandMaps;
   }) => void;
   /** Profile-resolved override / custom-agent maps, used to preview the
@@ -59,33 +69,41 @@ function ViewNotice({
   tool,
   customAgent,
   policyDenied,
+  notOffered,
+  imported,
 }: {
   tool: string;
   customAgent: boolean;
   policyDenied: boolean;
+  notOffered: boolean;
+  imported: boolean;
 }) {
   return (
     <div className="mb-5 rounded-lg border border-surface-700 bg-surface-950 px-3 py-2.5">
       <div className="flex items-center gap-2">
-        <span className="text-sm font-semibold text-text-primary">Terminal</span>
+        <span className="text-sm font-semibold text-text-primary">{imported ? "Structured view" : "Terminal"}</span>
         <span className="rounded px-1.5 py-px text-[10px] font-mono uppercase tracking-wide bg-surface-700 text-text-dim">
-          Fallback
+          {imported ? "Resumed" : "Fallback"}
         </span>
       </div>
       <p className="mt-1 text-xs text-text-dim leading-snug">
-        {policyDenied
-          ? `${tool} is not on the operator's allowed agents list, so this session runs in the terminal view. Pick a permitted agent to use the structured view.`
-          : customAgent
-            ? "Custom agents run in the terminal unless they define agent_acp_cmd in config or TUI settings."
-            : `${tool} has no ACP adapter yet, so this session runs in the terminal view. Pick a tool with an ACP adapter (e.g. claude, opencode, gemini) to use the structured view.`}
+        {imported
+          ? "This session is already structured on disk, so it resumes in the structured view. Turning the structured view off in settings does not affect resuming an existing session."
+          : notOffered
+            ? "The structured view is turned off in settings, so this session runs in the terminal view. Turn on \u201cOffer structured view when creating a session\u201d to choose per session."
+            : policyDenied
+              ? `${tool} is not on the operator's allowed agents list, so this session runs in the terminal view. Pick a permitted agent to use the structured view.`
+              : customAgent
+                ? "Custom agents run in the terminal unless they define agent_acp_cmd in config or TUI settings."
+                : `${tool} has no ACP adapter yet, so this session runs in the terminal view. Pick a tool with an ACP adapter (e.g. claude, opencode, gemini) to use the structured view.`}
       </p>
     </div>
   );
 }
 
-/** Interactive view picker shown when the selected tool is ACP-capable.
- *  Defaults on (the structured view is the default); turning it off launches a
- *  terminal-view session instead (see #1580). */
+/** Interactive view picker shown when the selected tool is ACP-capable and
+ *  the structured view is offered. Opens on `acp.default_new_session_view`;
+ *  turning it off launches a terminal-view session instead (see #1580). */
 function ViewPickerCard({
   checked,
   onChange,
@@ -146,7 +164,8 @@ export function AgentOptions({
 
   // Mirror SessionWizard.handleSubmit so the preview shows the view the
   // session will actually launch with (#1580).
-  const willUseStructuredView = acpCapable && data.useStructuredView;
+  const structuredOffered = data.structuredOffered !== false;
+  const willUseStructuredView = acpCapable && structuredOffered && data.useStructuredView;
   const resolvedCommand = resolveLaunchCommand({
     tool: data.tool,
     useStructuredView: willUseStructuredView,
@@ -160,22 +179,51 @@ export function AgentOptions({
   }).full;
   const extraArgsIgnored = willUseStructuredView && data.extraArgs.trim().length > 0;
 
+  // Each selection claims a ticket; only the newest one may apply its
+  // settings, so a slow response for an abandoned profile cannot land last
+  // and overwrite the selection the user actually made.
+  const profileRequestRef = useRef(0);
+  /** Reset just the view state to the opt-in's own default. Used when a
+   *  profile change lands but its settings do not, so a create cannot inherit
+   *  the previous profile's view. */
+  const onApplyProfileDefaultsViewOnly = useCallback(() => {
+    onChange("structuredOffered", false);
+    onChange("useStructuredView", false);
+  }, [onChange]);
   const handleProfileChange = useCallback(
     async (profileName: string) => {
-      // If user had manual edits, confirm before overwriting
-      if (data.profileDirty && profileName) {
+      // If user had manual edits, confirm before overwriting. "Server default"
+      // (an empty name) now resolves and applies its own settings, so it needs
+      // the same confirmation as a named profile rather than silently winning.
+      // A hand-set view counts as an edit even though it is tracked apart from
+      // `profileDirty`, since the profile defaults would otherwise replace it
+      // without asking.
+      if (data.profileDirty || data.structuredViewDirty) {
         const ok = window.confirm("Selecting a profile will reset your settings to that profile's defaults. Continue?");
         if (!ok) return;
       }
+      // Claimed only once the change is going ahead: a cancelled confirmation
+      // must leave an in-flight request for the still-selected profile valid.
+      const requestId = ++profileRequestRef.current;
 
+      // The selection lands immediately so the picker responds to the click,
+      // rather than waiting on the network to light up.
       onChange("profile", profileName);
 
-      if (!profileName) return;
-
-      // Load profile-resolved settings (global + profile overrides merged)
+      // An empty name is "Server default", which still needs its own resolved
+      // settings: returning here would leave the previously selected profile's
+      // values, including the view choice, in state.
       try {
-        const settings = await fetchSettings(profileName);
-        if (settings) {
+        const settings = await fetchSettings(profileName || undefined);
+        if (requestId !== profileRequestRef.current) return;
+        if (!settings) {
+          // The profile changed but its settings are unknown, so the old
+          // profile's view state no longer describes anything. Fall back to
+          // the opt-in's own default rather than letting a create inherit it.
+          onApplyProfileDefaultsViewOnly();
+          return;
+        }
+        {
           const session = settings.session as Record<string, unknown> | undefined;
           const sandbox = settings.sandbox as Record<string, unknown> | undefined;
           const worktree = settings.worktree as Record<string, unknown> | undefined;
@@ -188,6 +236,11 @@ export function AgentOptions({
           const defaultTool = (session?.default_tool as string) || data.tool;
           const acpDefaults = session?.acp_defaults as Record<string, unknown> | undefined;
           const acpDefault = acpDefaults?.[defaultTool] as Record<string, unknown> | undefined;
+          // The view defaults travel with every other profile default (#3517);
+          // without them a profile switch would leave the previous profile's
+          // opening view in place.
+          const acp = settings.acp as Record<string, unknown> | undefined;
+          const structuredOffered = (acp?.offer_structured_in_new_session as boolean) ?? false;
           onApplyProfileDefaults({
             yoloMode: (session?.yolo_mode_default as boolean) ?? false,
             sandboxEnabled: (sandbox?.enabled_by_default as boolean) ?? false,
@@ -196,14 +249,29 @@ export function AgentOptions({
             extraEnv: env,
             agentModel: typeof acpDefault?.model === "string" ? acpDefault.model : "",
             agentEffort: typeof acpDefault?.effort === "string" ? acpDefault.effort : "",
+            structuredOffered,
+            useStructuredView: structuredOffered && (acp?.default_new_session_view as string) !== "terminal",
+            // The user confirmed this overwrite in the prompt above, so a view
+            // they had set by hand is reset along with everything else.
+            resetStructuredViewDirty: true,
             commandMaps: commandMapsFromSettings(settings),
           });
         }
       } catch {
-        // If we can't load profile settings, just set the profile name
+        // Same reasoning as the empty-settings case above: the profile moved,
+        // its settings did not arrive, so the view state must not stay on the
+        // previous profile's answer.
+        if (requestId === profileRequestRef.current) onApplyProfileDefaultsViewOnly();
       }
     },
-    [data.profileDirty, data.tool, onChange, onApplyProfileDefaults],
+    [
+      data.profileDirty,
+      data.structuredViewDirty,
+      data.tool,
+      onChange,
+      onApplyProfileDefaults,
+      onApplyProfileDefaultsViewOnly,
+    ],
   );
 
   const advancedBlock = (
@@ -312,7 +380,7 @@ export function AgentOptions({
       {/* View picker. ACP-capable tools get a per-session structured-view
           toggle (default on, see #1580); other tools show a read-only
           terminal fallback notice. Lives under More options (#2210). */}
-      {acpCapable ? (
+      {acpCapable && structuredOffered && !data.importAcpSessionId ? (
         <ViewPickerCard
           checked={data.useStructuredView}
           onChange={(v) => onChange("useStructuredView", v)}
@@ -323,6 +391,8 @@ export function AgentOptions({
           tool={data.tool}
           customAgent={selectedCustomAgent}
           policyDenied={selectedAgent?.acp_allowed === false}
+          notOffered={acpCapable && !structuredOffered}
+          imported={Boolean(data.importAcpSessionId)}
         />
       )}
 

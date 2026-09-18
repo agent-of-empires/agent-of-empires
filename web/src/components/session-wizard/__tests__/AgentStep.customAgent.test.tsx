@@ -73,7 +73,9 @@ function renderAgentStep(overrides: { tool?: string; agents?: AgentInfo[] }) {
   const onChange = vi.fn();
   const utils = render(
     <AgentStep
-      data={{ ...initialData, tool: overrides.tool ?? "claude" }}
+      // The structured view is opt-in (#3517); these cases are about what the
+      // picker renders once you have opted in.
+      data={{ ...initialData, structuredOffered: true, tool: overrides.tool ?? "claude" }}
       onChange={onChange}
       agents={overrides.agents ?? [builtin, custom]}
       profiles={[] as ProfileInfo[]}
@@ -156,7 +158,7 @@ describe("AgentStep profile description (#949)", () => {
     const onApplyProfileDefaults = vi.fn();
     const utils = render(
       <AgentStep
-        data={{ ...initialData, tool: "claude", ...dataOverrides }}
+        data={{ ...initialData, structuredOffered: true, tool: "claude", ...dataOverrides }}
         onChange={onChange}
         agents={[builtin]}
         profiles={profiles}
@@ -193,6 +195,27 @@ describe("AgentStep profile description (#949)", () => {
     expect(getByRole("radio", { name: /other/ })).toBeTruthy();
     // ... but no description text leaks through with a stray "undefined".
     expect(queryByText(/undefined/)).toBeNull();
+  });
+
+  it("confirms before a profile change discards a hand-set structured view (#3517)", () => {
+    // The view toggle is tracked apart from the other profile fields, so the
+    // confirmation guard has to name it or the change lands silently.
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+    try {
+      const { onChange, getByRole } = renderWithProfiles(
+        [
+          { name: "default", is_default: true },
+          { name: "other", is_default: false },
+        ],
+        { profileDirty: false, structuredViewDirty: true },
+      );
+      fireEvent.click(getByRole("radio", { name: /other/ }));
+      expect(confirmSpy).toHaveBeenCalled();
+      // Declined, so the selection never happens.
+      expect(onChange).not.toHaveBeenCalledWith("profile", "other");
+    } finally {
+      confirmSpy.mockRestore();
+    }
   });
 
   it("clicking a profile card calls onChange with the profile name", () => {

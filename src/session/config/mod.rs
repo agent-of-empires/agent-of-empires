@@ -428,6 +428,17 @@ pub struct AcpConfig {
         widget = "toggle"
     )]
     pub offer_structured_in_new_session: bool,
+    /// Which view the new-session dialog starts on, once the toggle above has
+    /// opted in and the chosen agent can back a structured session. The
+    /// dialog's own toggle still wins for that one session either way.
+    /// Ignored while the toggle above is off: every new session is a terminal.
+    #[serde(default)]
+    #[setting(
+        label = "Default view for new sessions",
+        widget = "select",
+        options = "structured:Structured view,terminal:Terminal view"
+    )]
+    pub default_new_session_view: NewSessionView,
     /// Acp agent used when --agent is not specified (e.g. claude-code,
     /// codex). Must name an agent that can start: `aoe-agent` is not
     /// packaged yet (#3553).
@@ -634,6 +645,7 @@ impl Default for AcpConfig {
     fn default() -> Self {
         Self {
             offer_structured_in_new_session: false,
+            default_new_session_view: NewSessionView::default(),
             default_agent: default_agent(),
             restrict_agents: false,
             allowed_agents: Vec::new(),
@@ -1684,6 +1696,18 @@ pub enum NewSessionMode {
     MatchDefault,
     Tmux,
     LiveSend,
+}
+
+/// Which view the new-session dialog starts on. See
+/// `AcpConfig::default_new_session_view`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NewSessionView {
+    /// Start on the structured view when the chosen agent can back one.
+    #[default]
+    Structured,
+    /// Start on a terminal, leaving the structured view one toggle away.
+    Terminal,
 }
 
 /// How the TUI activates an existing terminal-mode session. See

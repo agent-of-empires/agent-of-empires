@@ -203,6 +203,10 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
         const sandbox = s.sandbox as Record<string, unknown> | undefined;
         const session = s.session as Record<string, unknown> | undefined;
         const worktree = s.worktree as Record<string, unknown> | undefined;
+        const acp = s.acp as Record<string, unknown> | undefined;
+        // `offer_structured_in_new_session` off hides the toggle and forces
+        // every create to a terminal, the same gate the TUI dialog applies.
+        const structuredOffered = (acp?.offer_structured_in_new_session as boolean) ?? false;
         const img = (sandbox?.default_image as string) || "";
         if (img) dispatch({ type: "SET_FIELD", field: "sandboxImage", value: img });
         const env = Array.isArray(sandbox?.environment)
@@ -223,6 +227,8 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
           extraEnv: env,
           agentModel: acpDefaults.model,
           agentEffort: acpDefaults.effort,
+          structuredOffered,
+          useStructuredView: structuredOffered && (acp?.default_new_session_view as string) !== "terminal",
           skipIfDirty: true,
         });
       });
@@ -267,6 +273,9 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
       extraEnv: string[];
       agentModel?: string;
       agentEffort?: string;
+      structuredOffered?: boolean;
+      useStructuredView?: boolean;
+      resetStructuredViewDirty?: boolean;
       commandMaps?: CommandMaps;
     }) => {
       const { commandMaps: maps, ...rest } = defaults;
@@ -283,6 +292,14 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
       d.tool,
       state.agents.find((a) => a.name === d.tool),
     );
+    // An import resumes a session that is already structured on disk, which
+    // `offer_structured_in_new_session` explicitly does not govern; every
+    // other create needs that opt-in. Gating here as well as in the picker
+    // keeps a submit that races the settings fetch on the terminal side.
+    const wantsStructured =
+      selectedAgentAcpCapable &&
+      d.useStructuredView &&
+      (d.structuredOffered !== false || Boolean(d.importAcpSessionId));
     // Scratch sessions: server provisions the working directory and
     // ignores `path`. Force-omit every worktree-related field so a
     // stale reducer state cannot make the server return 400 on the
@@ -317,17 +334,14 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
       command_override: d.commandOverride || undefined,
       custom_instruction: d.customInstruction || undefined,
       profile: d.profile || undefined,
-      // Structured view runs when the agent is ACP-capable and the user
-      // kept the per-session toggle on (default). Capability comes from
-      // the server's per-agent
-      // `acp_capable` flag (including custom agents with an
-      // `agent_acp_cmd`) with hardcoded fallback while loading. The
-      // server re-resolves capability (see src/server/api/sessions/create.rs),
-      // so a tampered request can't escalate structured view on for a
-      // non-capable agent.
-      view: selectedAgentAcpCapable && d.useStructuredView ? "structured" : "terminal",
-      agent_model: selectedAgentAcpCapable && d.useStructuredView && d.agentModel ? d.agentModel : undefined,
-      agent_effort: selectedAgentAcpCapable && d.useStructuredView && d.agentEffort ? d.agentEffort : undefined,
+      // Capability comes from the server's per-agent `acp_capable` flag
+      // (including custom agents with an `agent_acp_cmd`) with a hardcoded
+      // fallback while loading. The server re-resolves capability (see
+      // src/server/api/sessions/create.rs), so a tampered request can't
+      // escalate structured view on for a non-capable agent.
+      view: wantsStructured ? "structured" : "terminal",
+      agent_model: wantsStructured && d.agentModel ? d.agentModel : undefined,
+      agent_effort: wantsStructured && d.agentEffort ? d.agentEffort : undefined,
       scratch: d.scratch || undefined,
       // #2276: importing an existing Claude session. The server adopts this
       // id as the session's acp_session_id and resumes it via session/load.

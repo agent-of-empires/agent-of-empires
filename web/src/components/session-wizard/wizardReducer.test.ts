@@ -219,8 +219,113 @@ describe("SessionWizard reducer / APPLY_PROFILE_DEFAULTS (#1142)", () => {
 });
 
 describe("SessionWizard reducer / useStructuredView (#1580)", () => {
-  it("defaults useStructuredView to true so ACP-capable tools use the structured view by default", () => {
-    expect(initialData.useStructuredView).toBe(true);
+  it("holds the structured view behind the opt-in until settings load", () => {
+    expect(initialData.structuredOffered).toBe(false);
+  });
+
+  it("seeds the opening view and the offer gate from settings (#3517)", () => {
+    const cases = [
+      { structuredOffered: true, useStructuredView: false },
+      { structuredOffered: false, useStructuredView: false },
+      { structuredOffered: true, useStructuredView: true },
+    ];
+    for (const seed of cases) {
+      const next = reducer(makeState(), {
+        type: "APPLY_PROFILE_DEFAULTS",
+        yoloMode: false,
+        sandboxEnabled: false,
+        worktreeEnabled: false,
+        tool: "claude",
+        extraEnv: [],
+        ...seed,
+      });
+      expect(next.data.structuredOffered).toBe(seed.structuredOffered);
+      expect(next.data.useStructuredView).toBe(seed.useStructuredView);
+    }
+  });
+
+  it("still seeds the view fields when a profile-tracked edit made the state dirty", () => {
+    // Editing yoloMode marks the state dirty, which makes the mount-time
+    // seeder skip. The view fields have to land anyway, or an opted-in user
+    // never gets the control in that wizard instance.
+    const dirty = reducer(makeState(), { type: "SET_FIELD", field: "yoloMode", value: true });
+    expect(dirty.data.profileDirty).toBe(true);
+    const seeded = reducer(dirty, {
+      type: "APPLY_PROFILE_DEFAULTS",
+      yoloMode: false,
+      sandboxEnabled: false,
+      worktreeEnabled: false,
+      tool: "claude",
+      extraEnv: [],
+      structuredOffered: true,
+      useStructuredView: true,
+      skipIfDirty: true,
+    });
+    expect(seeded.data.structuredOffered).toBe(true);
+    expect(seeded.data.useStructuredView).toBe(true);
+    // The edit itself, and the dirty flag protecting it, are untouched.
+    expect(seeded.data.yoloMode).toBe(true);
+    expect(seeded.data.profileDirty).toBe(true);
+  });
+
+  it("keeps a view the user set before settings landed (#3517)", () => {
+    // SET_FIELD deliberately leaves this field out of profileDirty, so the
+    // seeder's skipIfDirty guard does not cover it.
+    const edited = reducer(makeState(), {
+      type: "SET_FIELD",
+      field: "useStructuredView",
+      value: false,
+    });
+    expect(edited.data.structuredViewDirty).toBe(true);
+    const seeded = reducer(edited, {
+      type: "APPLY_PROFILE_DEFAULTS",
+      yoloMode: false,
+      sandboxEnabled: false,
+      worktreeEnabled: false,
+      tool: "claude",
+      extraEnv: [],
+      structuredOffered: true,
+      useStructuredView: true,
+      skipIfDirty: true,
+    });
+    expect(seeded.data.useStructuredView).toBe(false);
+  });
+
+  it("lets a confirmed profile change reset a view the user set (#3517)", () => {
+    const edited = reducer(makeState(), {
+      type: "SET_FIELD",
+      field: "useStructuredView",
+      value: false,
+    });
+    const switched = reducer(edited, {
+      type: "APPLY_PROFILE_DEFAULTS",
+      yoloMode: false,
+      sandboxEnabled: false,
+      worktreeEnabled: false,
+      tool: "claude",
+      extraEnv: [],
+      structuredOffered: true,
+      useStructuredView: true,
+      resetStructuredViewDirty: true,
+    });
+    expect(switched.data.useStructuredView).toBe(true);
+    expect(switched.data.structuredViewDirty).toBe(false);
+  });
+
+  it("leaves an imported session on the structured view the seeder would clear", () => {
+    const state = makeState();
+    state.data.importAcpSessionId = "abc";
+    state.data.useStructuredView = true;
+    const next = reducer(state, {
+      type: "APPLY_PROFILE_DEFAULTS",
+      yoloMode: false,
+      sandboxEnabled: false,
+      worktreeEnabled: false,
+      tool: "claude",
+      extraEnv: [],
+      useStructuredView: false,
+    });
+    expect(next.data.useStructuredView).toBe(true);
   });
 
   it("SET_FIELD useStructuredView updates the flag", () => {
