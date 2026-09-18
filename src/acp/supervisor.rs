@@ -285,7 +285,7 @@ pub trait BroadcastSink: Send + Sync + 'static {
     /// Agent ids of `BackgroundAgentLaunched` events on disk with no
     /// matching `BackgroundAgentCompleted`: sub-agents a dead worker's
     /// tailer will never report on again. See
-    /// [`detach_orphaned_background_agents_on`] for its callers. Default
+    /// `detach_orphaned_background_agents_on` for its callers. Default
     /// returns empty so test sinks without an event store opt out cleanly,
     /// mirroring `unresolved_approval_nonces`.
     fn unresolved_background_agent_ids(&self, _session_id: &str) -> Vec<String> {
