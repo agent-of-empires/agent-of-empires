@@ -222,6 +222,11 @@ export interface SessionResponse {
   /** The `description` the agent gave the `Monitor` tool, shown as the
    *  badge tooltip. Only set when `monitor_active` is true. */
   monitor_description?: string;
+  /** One-line explanation when a lifecycle action took a non-default path,
+   *  e.g. a start that fell back to a fresh conversation because the stored
+   *  one could not be resumed. Present only on the start/ensure responses
+   *  that carry it; absent on regular session fetches. */
+  message?: string;
 }
 
 export interface PlanSummary {

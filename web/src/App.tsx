@@ -1251,7 +1251,7 @@ function AppContent({
         toastBus.handler?.error("Failed to start session");
         return;
       }
-      toastBus.handler?.info("Session started");
+      toastBus.handler?.info(result.message ?? "Session started");
     },
     [workspaces, setSessionStatus],
   );

@@ -2636,7 +2636,12 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/ensure-session-restart.spec.ts"],
-      "components": []
+      "components": [
+        "web/src/lib/api.ts",
+        "web/src/components/LiveTerminalView.tsx",
+        "web/src/App.tsx",
+        "web/src/lib/types.ts"
+      ]
     },
     {
       "id": "modals",

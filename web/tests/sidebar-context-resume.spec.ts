@@ -1,6 +1,7 @@
 import type { Page } from "@playwright/test";
 import type { ContextResumeAvailability, SessionStatus } from "../src/lib/types";
 import { expect, test } from "./helpers/mockedTest";
+import { mockTerminalApis } from "./helpers/terminal-mocks";
 
 interface MockSession {
   id: string;
@@ -141,3 +142,38 @@ for (const axis of ["group", "repo+group"]) {
     await expect(page).toHaveURL(new RegExp("/session/idle$"));
   });
 }
+
+for (const retry of [false, true]) {
+  test(`shows the fresh conversation warning on ${retry ? "retry" : "initial attach"}`, async ({ page }) => {
+    const terminal = await mockTerminalApis(page);
+    const warning = "Stored conversation legacy-sid was not resumed. Its transcript is preserved.";
+    let refuse = retry;
+    await page.route("**/api/sessions/pinch-test/ensure", (route) => {
+      if (refuse) return route.fulfill({ status: 503, json: { message: "Try again" } });
+      return route.fulfill({
+        json: { status: "restarted", resume_outcome: "fresh_after_unavailable_resume", message: warning },
+      });
+    });
+    await page.goto("/");
+    await page.getByRole("link", { name: /pinch-test/ }).click();
+    if (retry) {
+      await expect(page.getByText("Try again", { exact: true })).toBeVisible();
+      refuse = false;
+      await page.getByRole("button", { name: "Retry", exact: true }).click();
+    }
+    await terminal.waitForLiveReady();
+    await expect(page.locator('[data-term="agent"]').getByText(warning, { exact: true })).toBeVisible();
+  });
+}
+
+test("shows the fresh conversation warning after Start", async ({ page }) => {
+  await mockApis(page, [{ id: "stopped", title: "Stopped session", status: "Stopped" }]);
+  const warning = "Stored conversation legacy-sid was not resumed. Its transcript is preserved.";
+  await page.route("**/api/sessions/stopped/start", (route) =>
+    route.fulfill({ json: { id: "stopped", message: warning, resume_outcome: "fresh_after_unavailable_resume" } }),
+  );
+  await page.goto("/");
+  await page.getByRole("link", { name: /Stopped session/ }).click({ button: "right" });
+  await page.getByTestId("sidebar-context-menu-start").click();
+  await expect(page.getByText(warning, { exact: true })).toBeVisible();
+});

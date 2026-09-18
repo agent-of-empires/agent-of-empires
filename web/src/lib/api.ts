@@ -119,6 +119,7 @@ export async function ensureSession(id: string, signal?: AbortSignal): Promise<E
     return {
       ok: true,
       status: body.status as "alive" | "restarted" | undefined,
+      message: typeof body.message === "string" ? body.message : undefined,
     };
   } catch (e) {
     if ((e as { name?: string }).name === "AbortError") {
