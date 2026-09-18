@@ -137,6 +137,11 @@ use super::{Instance, ResumeIntent};
 use crate::agents::{AgentDef, AGENTS};
 use anyhow::{bail, Context, Result};
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static FAIL_NEXT_NATIVE_RESOLUTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 const VIBE_NAMESPACE_ENVIRONMENT: &[&str] = &[
     "SAVE_DIR",
     "SESSION_PREFIX",
@@ -1127,6 +1132,10 @@ impl Instance {
         &self,
         target: Option<(&str, Option<&ConversationBinding>, bool)>,
     ) -> Result<NativeExecution> {
+        #[cfg(test)]
+        if FAIL_NEXT_NATIVE_RESOLUTION.with(|fail| fail.replace(false)) {
+            anyhow::bail!("injected transient native resolution failure");
+        }
         let config = crate::session::config::repo_config::resolve_config_with_repo(
             &self.effective_profile(),
             std::path::Path::new(&self.project_path),

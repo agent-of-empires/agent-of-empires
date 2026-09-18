@@ -528,17 +528,16 @@ impl Instance {
             // conversation, but an ordinary start must not fail. Start fresh
             // and say why; explicit Use/Fork still fail closed in
             // validate_conversation_target.
-            let degraded = matches!(self.resume_intent, ResumeIntent::Default)
+            let resolution_error = if matches!(self.resume_intent, ResumeIntent::Default)
                 && self.agent_session_id.is_some()
-                && self
-                    .resolve_native_execution(self.conversation_target())
-                    .is_err();
-            if degraded {
+            {
+                self.resolve_native_execution(self.conversation_target())
+                    .err()
+            } else {
+                None
+            };
+            if let Some(error) = resolution_error {
                 let sid = self.agent_session_id.clone().unwrap_or_default();
-                let error = match self.resolve_native_execution(self.conversation_target()) {
-                    Err(error) => error,
-                    Ok(_) => unreachable!(),
-                };
                 abandoned_conversation = Some(
                     self.agent_session_binding
                         .clone()
@@ -2718,6 +2717,49 @@ mod tests {
             .unwrap()
             .contains("--mcp-config"));
         assert!(!prepared.is_existing);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn transient_resolution_failure_starts_fresh_with_notice() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let _isolation = crate::session::test_support::isolate_app_dir_at(home.path());
+        let (_hooks, _, _hook_dir) = crate::hooks::test_support::BaseGuard::ready();
+        let program = home.path().join("claude");
+        std::fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut instance = Instance::new("transient-resolution", home.path().to_str().unwrap());
+        instance.tool = "claude".into();
+        instance.command = "claude".into();
+        instance.pending_host_env = vec![
+            (
+                "PATH".into(),
+                format!("{}:/usr/bin:/bin", home.path().display()),
+            ),
+            ("HOME".into(), home.path().display().to_string()),
+        ];
+        let binding = instance.resolve_native_execution(None).unwrap().binding;
+        let sid = "11111111-1111-4111-8111-111111111111";
+        instance.set_agent_conversation(
+            Some(sid.into()),
+            Some(ConversationBinding {
+                session_id: sid.into(),
+                execution: Some(binding),
+                provenance: ConversationProvenance::Observed,
+                transcript_path: None,
+            }),
+            None,
+        );
+        super::super::execution::FAIL_NEXT_NATIVE_RESOLUTION.with(|fail| fail.set(true));
+        let prepared = instance
+            .prepare_launch_command(instance.conversation_state())
+            .expect("a transient resolution failure must start fresh rather than panic");
+        assert!(!prepared.is_existing);
+        assert!(matches!(prepared.fresh_notice,
+            Some(FreshLaunchNotice::UnattestedContext { sid: abandoned }) if abandoned == sid));
+        assert!(!prepared.command.as_deref().unwrap().contains("--resume"));
+        assert_ne!(instance.agent_session_id.as_deref(), Some(sid));
     }
 
     #[test]
