@@ -179,11 +179,11 @@ export function AgentOptions({
 
       onChange("profile", profileName);
 
-      if (!profileName) return;
-
-      // Load profile-resolved settings (global + profile overrides merged)
+      // An empty name is "Server default", which still needs its own resolved
+      // settings: returning here would leave the previously selected profile's
+      // values, including the view choice, in state.
       try {
-        const settings = await fetchSettings(profileName);
+        const settings = await fetchSettings(profileName || undefined);
         if (settings) {
           const session = settings.session as Record<string, unknown> | undefined;
           const sandbox = settings.sandbox as Record<string, unknown> | undefined;

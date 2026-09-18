@@ -167,6 +167,20 @@ export const initialData: WizardData = {
   importAcpSessionId: "",
 };
 
+/** Resolve the structured-view value a settings seed should land on. Two
+ *  choices outrank the seeded default: an import, which picked the structured
+ *  view for a session that is structured on disk, and a view the user set
+ *  themselves. A profile change clears the latter (`resetStructuredViewDirty`)
+ *  because the user confirmed that overwrite. */
+function seededStructuredView(
+  data: WizardData,
+  action: { useStructuredView?: boolean; resetStructuredViewDirty?: boolean },
+): boolean {
+  if (data.importAcpSessionId) return data.useStructuredView;
+  if (data.structuredViewDirty && !action.resetStructuredViewDirty) return data.useStructuredView;
+  return action.useStructuredView ?? data.useStructuredView;
+}
+
 export function reducer(state: WizardState, action: Action): WizardState {
   switch (action.type) {
     case "SET_FIELD": {
@@ -262,7 +276,21 @@ export function reducer(state: WizardState, action: Action): WizardState {
       // /api/settings response doesn't clobber edits the user already
       // made. The picker-driven path leaves it false; it has already
       // shown a window.confirm() to the user before dispatching.
-      if (action.skipIfDirty && state.data.profileDirty) return state;
+      // The view fields are exempt from that guard: they describe whether the
+      // structured view is available at all, not a profile default the user
+      // might have edited, so an edit to yoloMode or tool must not leave an
+      // opted-in user without the control. Everything else, `profileDirty`
+      // included, is left untouched on this path.
+      if (action.skipIfDirty && state.data.profileDirty) {
+        const structuredOffered = action.structuredOffered ?? state.data.structuredOffered;
+        const useStructuredView = seededStructuredView(state.data, action);
+        // Identity is the contract when there is nothing to seed: callers that
+        // send no view fields must get the same object back, unchanged.
+        if (structuredOffered === state.data.structuredOffered && useStructuredView === state.data.useStructuredView) {
+          return state;
+        }
+        return { ...state, data: { ...state.data, structuredOffered, useStructuredView } };
+      }
       return {
         ...state,
         data: {
@@ -281,10 +309,7 @@ export function reducer(state: WizardState, action: Action): WizardState {
           // the structured view for a session that is structured on disk, and
           // a view the user set themselves. A profile change clears the latter
           // (`resetStructuredViewDirty`) because the user confirmed it.
-          useStructuredView:
-            state.data.importAcpSessionId || (state.data.structuredViewDirty && !action.resetStructuredViewDirty)
-              ? state.data.useStructuredView
-              : (action.useStructuredView ?? state.data.useStructuredView),
+          useStructuredView: seededStructuredView(state.data, action),
           structuredViewDirty: action.resetStructuredViewDirty ? false : state.data.structuredViewDirty,
           profileDirty: false,
         },

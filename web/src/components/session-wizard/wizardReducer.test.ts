@@ -244,6 +244,30 @@ describe("SessionWizard reducer / useStructuredView (#1580)", () => {
     }
   });
 
+  it("still seeds the view fields when a profile-tracked edit made the state dirty", () => {
+    // Editing yoloMode marks the state dirty, which makes the mount-time
+    // seeder skip. The view fields have to land anyway, or an opted-in user
+    // never gets the control in that wizard instance.
+    const dirty = reducer(makeState(), { type: "SET_FIELD", field: "yoloMode", value: true });
+    expect(dirty.data.profileDirty).toBe(true);
+    const seeded = reducer(dirty, {
+      type: "APPLY_PROFILE_DEFAULTS",
+      yoloMode: false,
+      sandboxEnabled: false,
+      worktreeEnabled: false,
+      tool: "claude",
+      extraEnv: [],
+      structuredOffered: true,
+      useStructuredView: true,
+      skipIfDirty: true,
+    });
+    expect(seeded.data.structuredOffered).toBe(true);
+    expect(seeded.data.useStructuredView).toBe(true);
+    // The edit itself, and the dirty flag protecting it, are untouched.
+    expect(seeded.data.yoloMode).toBe(true);
+    expect(seeded.data.profileDirty).toBe(true);
+  });
+
   it("keeps a view the user set before settings landed (#3517)", () => {
     // SET_FIELD deliberately leaves this field out of profileDirty, so the
     // seeder's skipIfDirty guard does not cover it.
