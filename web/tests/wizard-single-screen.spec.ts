@@ -26,7 +26,12 @@ const SEED_SESSION = {
   workspace_repos: [],
 };
 
-async function mockApis(page: Page, captured?: { body: Record<string, unknown> | null }) {
+async function mockApis(
+  page: Page,
+  captured?: { body: Record<string, unknown> | null },
+  opts: { optInStructured?: boolean } = {},
+) {
+  const optInStructured = opts.optInStructured ?? true;
   await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   for (const path of ["settings", "themes", "profiles", "groups", "devices", "about", "system/update-status"]) {
     await page.route(`**/api/${path}`, (r) =>
@@ -35,7 +40,13 @@ async function mockApis(page: Page, captured?: { body: Record<string, unknown> |
         // these worktree-flow specs assume it is on.
         json:
           path === "settings"
-            ? { worktree: { enabled: true } }
+            ? {
+                worktree: { enabled: true },
+                // The structured view is opt-in (#3517). Most specs here assert
+                // the toggle exists, so they turn it on; before #3517 the
+                // dashboard ignored this setting and offered the view anyway.
+                acp: { offer_structured_in_new_session: optInStructured },
+              }
             : path === "about" || path === "system/update-status"
               ? {}
               : [],
@@ -71,6 +82,28 @@ test.describe("Single-screen wizard (#2210)", () => {
 
     await expect.poll(() => captured.body?.path).toBe("/tmp/example");
     expect(captured.body?.tool).toBe("claude");
+  });
+
+  test("no structured-view toggle, and a terminal create, when nobody opted in (#3517)", async ({ page }) => {
+    // Story: the structured view is opt-in and ships off. Before #3517 the
+    // dashboard ignored that setting and offered the view to everyone, so
+    // without this case the suite cannot tell the fix from the bug: every
+    // other spec here opts in, and would keep passing if the opt-in were
+    // ignored again.
+    const captured: { body: Record<string, unknown> | null } = { body: null };
+    await mockApis(page, captured, { optInStructured: false });
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.goto("/");
+
+    await openWizard(page);
+    await selectProject(page, "/tmp/example");
+    await expandMoreOptions(page);
+
+    const w = wizard(page);
+    await expect(w.getByRole("switch", { name: "Use structured view" })).toHaveCount(0);
+
+    await launch(page);
+    await expect.poll(() => captured.body?.view).toBe("terminal");
   });
 
   test("only essentials show on open; advanced controls hide behind collapsed More options", async ({ page }) => {

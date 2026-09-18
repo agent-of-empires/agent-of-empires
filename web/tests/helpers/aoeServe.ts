@@ -68,9 +68,14 @@ export interface SpawnOptions {
   tokenGraceSecs?: number;
   /**
    * When true, install `fakeAcpAgent.mjs` as the `claude` / `aoe-agent`
-   * shim instead of the tail-f-dev-null stub, and flip the structured view
-   * master enable flag via `PATCH /api/acp/master` after the server
-   * boots.
+   * shim instead of the tail-f-dev-null stub, and opt the seeded config in
+   * to the structured view (`acp.offer_structured_in_new_session`), which
+   * the new-session wizard honors as of #3517.
+   *
+   * This used to claim it flipped a "master enable flag" through
+   * `PATCH /api/acp/master`. That endpoint went away with the master switch
+   * itself, so the call had been doing nothing; nothing noticed, because the
+   * wizard ignored the opt-in too.
    */
   acp?: boolean;
   /** Optional path to a FAKE_ACP_SCRIPT for structured view tests. */
@@ -729,7 +734,12 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
   const appDir = appDirFor(home, xdg, aoeBinary);
   mkdirSync(appDir, { recursive: true, mode: 0o700 });
   // General live tests exercise launches, not the one-time TUI approval flow.
-  writeFileSync(join(appDir, "config.toml"), "[app_state]\nhas_acknowledged_agent_hooks = true\n");
+  // A structured-view test also has to opt in, since the wizard now honors
+  // `acp.offer_structured_in_new_session` and it ships off (#3517).
+  const seededConfig = opts.acp
+    ? "[app_state]\nhas_acknowledged_agent_hooks = true\n\n[acp]\noffer_structured_in_new_session = true\n"
+    : "[app_state]\nhas_acknowledged_agent_hooks = true\n";
+  writeFileSync(join(appDir, "config.toml"), seededConfig);
   const fakeAcpDebugLog = join(home, "fake-acp.log");
   if (opts.acp) {
     writeFakeAcpShim(shimBin, opts.fakeAcpScript, fakeAcpDebugLog, opts.extraEnv);

@@ -25,10 +25,10 @@ test("wizard with Use structured view on creates a structured_view session", asy
     // Single screen: a scratch dir keeps the test self-contained.
     await wizard.getByRole("switch", { name: "Skip project folder" }).click();
 
-    // claude is the default ACP-capable agent and the structured view master
-    // switch is on, so the "Use structured view" toggle (under More options)
-    // defaults on. The docs tell the user to leave it on; assert that, then
-    // launch.
+    // claude is the default ACP-capable agent and the harness opts this
+    // server in to the structured view, so the "Use structured view" toggle
+    // (under More options) defaults on. The docs tell the user to leave it
+    // on; assert that, then launch.
     await wizard.getByRole("button", { name: "More options" }).click();
     const acpToggle = wizard.getByRole("switch", {
       name: "Use structured view",
