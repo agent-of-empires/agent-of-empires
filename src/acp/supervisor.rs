@@ -2254,7 +2254,9 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// Drain events from a worker into the broadcast sink. When the
     /// inbound channel closes (subprocess exit / transport break) the
     /// drain task respawns the worker under a fresh epoch of the same
-    /// lease line, or parks the session if the restart budget is burned.
+    /// lease line, parks the session if the restart budget is burned,
+    /// and hands an `Attached` worker's crash back to the reconciler:
+    /// it has no spawn config of its own to respawn from.
     fn start_drain_task(
         &self,
         session_id: String,
@@ -2430,6 +2432,17 @@ impl<S: BroadcastSink> Supervisor<S> {
                                         ),
                                     },
                                 );
+                                drop_handle(&lease).await;
+                                return;
+                            }
+                            RestartDecision::LeaveToReconciler => {
+                                info!(
+                                    target: "acp.supervisor",
+                                    session = %session_id,
+                                    "attached worker connection died; leaving the \
+                                     fresh spawn to the reconciler"
+                                );
+                                lock_recover(&startup_failures).insert(session_id.clone());
                                 drop_handle(&lease).await;
                                 return;
                             }
@@ -4053,6 +4066,12 @@ enum RestartDecision {
     // respawn flow.
     Respawn(Box<SpawnConfig>),
     BudgetBurned,
+    /// An `Attached` worker's connection died. There is no spawn config
+    /// to respawn from, and parking would strand an adopted session
+    /// behind a banner nobody may be watching. The drain task drops the
+    /// handle and records a startup failure so the reconciler
+    /// fresh-spawns the session under its own budget.
+    LeaveToReconciler,
     /// The worker entry was removed (e.g. shutdown).
     Gone,
     /// The on-disk worker registry entry for this session was deleted
@@ -4128,10 +4147,11 @@ async fn restart_decision(
     match &handle.kind {
         WorkerKind::Runner { spawn_config } => RestartDecision::Respawn(spawn_config.clone()),
         // Attached: the previous daemon owned the runner and we have
-        // no spawn config to respawn from. The reconciler will pick
-        // this session back up on the next tick if it's still
-        // `structured_view = true`.
-        WorkerKind::Attached => RestartDecision::BudgetBurned,
+        // no spawn config to respawn from. Hand the session back to
+        // the reconciler, which fresh-spawns it on its next tick;
+        // parking here would strand an adopted worker behind a
+        // banner nobody may be watching.
+        WorkerKind::Attached => RestartDecision::LeaveToReconciler,
         // Stdio: in-proc test fixture with no subprocess to respawn.
         #[cfg(test)]
         WorkerKind::Stdio => RestartDecision::BudgetBurned,
@@ -6435,6 +6455,99 @@ cursor-acp-bridge = "agent acp"
                 crash_messages,
                 usize::from(expect_crash_message),
                 "{id}: restart budget message"
+            );
+        }
+    }
+
+    /// An `Attached` worker (reattached to a runner a previous daemon
+    /// owned) has no spawn config to respawn from. A crash after the
+    /// session was established must not park the session behind the
+    /// crash-loop banner: the drain task drops the handle and records a
+    /// startup failure so the reconciler fresh-spawns it on its next
+    /// tick. With the on-disk registry entry gone the same crash is a
+    /// user-initiated stop (`aoe acp stop|kill`) and must not re-arm.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn drain_rearms_an_attached_crash_for_the_reconciler() {
+        for (id, registry_saved, expect_rearm) in [
+            ("s-attach-rearm", true, true),
+            ("s-attach-user-stop", false, false),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let _home = crate::session::test_support::isolate_home(tmp.path());
+            let sink = VecSink::new();
+            let sup = Supervisor::new(sink.clone());
+            if registry_saved {
+                // A live registry record keeps `restart_decision` past the
+                // user-stop gate so the attached handoff is exercised.
+                let record = crate::process::worker_registry::WorkerRecord::new(
+                    id.into(),
+                    std::process::id(),
+                    tmp.path().join("attach.sock"),
+                    "claude-agent-acp".into(),
+                    "claude-code".into(),
+                    std::env::temp_dir(),
+                    None,
+                    vec![],
+                    vec![],
+                    None,
+                    None,
+                );
+                crate::process::worker_registry::save(&record).unwrap();
+            }
+            let (client, _client_tx) = AcpClient::fake_for_test(AcpSessionId(id.into()));
+            let lease = sup
+                .test_install_handle(id, client, WorkerKind::Attached, None)
+                .await;
+            let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<Event>(16);
+            let drain = sup.start_drain_task(id.into(), lease, inbound_rx);
+
+            inbound_tx
+                .send(Event::AcpSessionAssigned {
+                    acp_session_id: "acp-1".into(),
+                })
+                .await
+                .unwrap();
+            inbound_tx
+                .send(Event::AgentStartupError {
+                    message: "ACP connection failed: native binary failed to launch".into(),
+                })
+                .await
+                .unwrap();
+            drop(inbound_tx);
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), drain)
+                .await
+                .expect("drain task should exit within 2s of inbound close");
+
+            assert!(
+                !sup.workers.lock().await.contains_key(id),
+                "{id}: the handle must be dropped"
+            );
+            assert_eq!(
+                sup.take_startup_failures(),
+                if expect_rearm {
+                    vec![id.to_string()]
+                } else {
+                    Vec::<String>::new()
+                },
+                "{id}: only a registry-backed attached crash re-arms"
+            );
+            let frames = sink.frames.lock().unwrap();
+            assert!(
+                !frames.iter().any(|(_, _, ev)| {
+                    matches!(ev, Event::AgentStartupError { message } if message.contains("crashed more than"))
+                }),
+                "{id}: the crash-loop banner must not be published for an attached worker"
+            );
+            assert_eq!(
+                frames
+                    .iter()
+                    .filter(|(_, _, ev)| {
+                        matches!(ev, Event::Stopped { reason } if reason == "user_stopped")
+                    })
+                    .count(),
+                usize::from(!expect_rearm),
+                "{id}: a registry-gone attached crash is a user stop"
             );
         }
     }
