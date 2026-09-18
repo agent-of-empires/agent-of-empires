@@ -28,8 +28,8 @@ pub struct RestartRequest {
     /// labelled for another tool, but not one created before that label (#3959).
     pub discard_sandbox_container: bool,
     /// Copy the conversation into the incoming account's agent config root
-    /// before relaunching. Set when the user accepts the carry on a swap that
-    /// changes only the account (#4030); planned against the pre-swap row.
+    /// before relaunching. Set on a swap that changes only the account
+    /// (#4030); planned against the pre-swap row.
     pub conversation_carry: Option<crate::session::conversation_carry::ConversationCarry>,
 }
 

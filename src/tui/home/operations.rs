@@ -491,7 +491,7 @@ impl HomeView {
             ),
             None => conversation_carry::ToolSwap::Park,
         };
-        let (account_swap, carry_plan) = match swap_kind {
+        let (account_swap, mut carry_plan) = match swap_kind {
             conversation_carry::ToolSwap::Park => (false, None),
             conversation_carry::ToolSwap::KeepConversation(carry) => (true, carry),
         };
@@ -551,7 +551,10 @@ impl HomeView {
                     } else {
                         self.mutate_instance(&id, |inst| inst.swap_tool(target_tool));
                     }
-                    self.persist_tool_swap(&id, target_tool, account_swap);
+                    let disk_ids = self.persist_tool_swap(&id, target_tool, account_swap);
+                    if let Some(carry) = carry_plan.as_mut() {
+                        carry.retarget(disk_ids);
+                    }
                 }
             }
             if let Some(command) = new_command_override {
@@ -625,6 +628,9 @@ impl HomeView {
     ///
     /// `account_swap` picks which swap the disk row takes: the parking one, or
     /// the one that keeps the conversation because only the account changed.
+    /// Returns the conversation ids the disk row held before the swap, which a
+    /// carry uses in place of the ones its plan froze; see
+    /// [`crate::session::conversation_carry::ConversationCarry::retarget`].
     ///
     /// `save()` syncs `tool`/`command`/`extra_args` through `merge_from_tui`
     /// but deliberately leaves `agent_session_id` and friends to their CAS
@@ -640,9 +646,9 @@ impl HomeView {
     /// Best-effort. A failed write leaves the stale sid on disk (the restart
     /// still runs, and its resume-probe fallback recovers by starting fresh),
     /// so it is logged rather than surfaced as a restart failure.
-    fn persist_tool_swap(&self, id: &str, new_tool: &str, account_swap: bool) {
+    fn persist_tool_swap(&self, id: &str, new_tool: &str, account_swap: bool) -> Vec<String> {
         let Some(profile) = self.instances.get(id).map(|i| i.source_profile.clone()) else {
-            return;
+            return Vec::new();
         };
         let Some(storage) = self.storages.get(&profile) else {
             tracing::warn!(
@@ -652,13 +658,15 @@ impl HomeView {
                 "persist_tool_swap: no storage registered for profile; \
                  the old engine's session id stays on disk"
             );
-            return;
+            return Vec::new();
         };
         let id_owned = id.to_string();
         let new_tool = new_tool.to_string();
         let row_profile = profile.clone();
-        if let Err(e) = storage.update(|instances, _groups| {
+        let observed = storage.update(|instances, _groups| {
+            let mut observed = Vec::new();
             if let Some(disk) = instances.iter_mut().find(|i| i.id == id_owned) {
+                observed = crate::session::conversation_carry::conversation_ids(disk);
                 // `source_profile` is `skip_serializing`, so a storage-loaded
                 // row always comes back blank and would resolve the incoming
                 // tool's `agent_detect_as` alias against the default profile.
@@ -674,13 +682,18 @@ impl HomeView {
                     disk.swap_tool(&new_tool);
                 }
             }
-            Ok(())
-        }) {
-            tracing::error!(
-                target: "tui.home",
-                id = %id,
-                "persist_tool_swap: failed to move the old engine's session state aside: {e}"
-            );
+            Ok(observed)
+        });
+        match observed {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::error!(
+                    target: "tui.home",
+                    id = %id,
+                    "persist_tool_swap: failed to move the old engine's session state aside: {e}"
+                );
+                Vec::new()
+            }
         }
     }
 

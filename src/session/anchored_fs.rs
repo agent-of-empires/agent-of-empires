@@ -219,6 +219,21 @@ impl AnchoredDir {
         matches!(self.regular_lookup(relative), Ok(Some(true)))
     }
 
+    /// Rename `from` onto `to`, both anchored. Used to publish a file only
+    /// once it is complete, so a process killed mid-write leaves a temporary
+    /// name rather than a half file under the real one.
+    pub(crate) fn rename_within(&self, from: &Path, to: &Path) -> Result<()> {
+        let (from_parent, from_leaf) = self.open_parent(from)?;
+        let (to_parent, to_leaf) = self.open_parent(to)?;
+        nix::fcntl::renameat(
+            &from_parent,
+            from_leaf.as_os_str(),
+            &to_parent,
+            to_leaf.as_os_str(),
+        )
+        .context("renaming anchored file")
+    }
+
     pub(crate) fn remove_file(&self, relative: &Path) -> Result<()> {
         let (parent, leaf) = self.open_parent(relative)?;
         match unlinkat(&parent, leaf.as_os_str(), UnlinkatFlags::NoRemoveDir) {

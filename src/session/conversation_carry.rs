@@ -10,7 +10,7 @@
 //!
 //! The copy is bounded to swaps that keep the same built-in agent. A swap to a
 //! genuinely different agent lands a transcript that agent cannot read, and
-//! [`Instance::swap_tool`] already parks the outgoing ids for it.
+//! `Instance::swap_tool` already parks the outgoing ids for it.
 
 use std::path::{Path, PathBuf};
 
@@ -96,7 +96,7 @@ pub(crate) enum ToolSwap {
 /// [`ToolSwap::KeepConversation`] needs every part of the carry to hold, not
 /// just the classification: keeping a session id the incoming account has no
 /// transcript for would resume into nothing and lose the id the parking swap
-/// would have kept.
+/// would have kept. Anything unresolvable therefore parks.
 pub(crate) fn classify(instance: &Instance, new_profile: &str, new_tool: &str) -> ToolSwap {
     if !is_account_swap(
         &instance.source_profile,
@@ -108,63 +108,49 @@ pub(crate) fn classify(instance: &Instance, new_profile: &str, new_tool: &str) -
     {
         return ToolSwap::Park;
     }
-    match plan(instance, new_profile, new_tool) {
-        Some(carry) => ToolSwap::KeepConversation(Some(carry)),
-        // Both tools resolve to one config root, so the transcript is already
-        // where the incoming account reads it.
-        None if shares_config_root(instance, new_profile, new_tool) => {
-            ToolSwap::KeepConversation(None)
-        }
-        None => ToolSwap::Park,
-    }
-}
-
-fn shares_config_root(instance: &Instance, new_profile: &str, new_tool: &str) -> bool {
     let (Some(agent), Some(home)) = (instance.resolved_agent(), dirs::home_dir()) else {
-        return false;
+        return ToolSwap::Park;
     };
-    let source = config_root(
-        instance,
-        &instance.effective_profile(),
-        &instance.tool,
-        agent,
-        &home,
-    );
-    source.is_some() && source == config_root(instance, new_profile, new_tool, agent, &home)
-}
-
-/// Plan the copy for a swap already classified by [`is_account_swap`], reading
-/// `instance` in its pre-swap state. `None` when there is nothing to carry or
-/// either config root is unresolvable.
-fn plan(instance: &Instance, new_profile: &str, new_tool: &str) -> Option<ConversationCarry> {
-    let agent = instance.resolved_agent()?;
-    if !carries_transcript(agent) || instance.sandbox_store_move_pending() {
-        return None;
-    }
-    let session_ids = conversation_ids(instance);
-    if session_ids.is_empty() {
-        return None;
-    }
-    let home = dirs::home_dir()?;
-    let source_root = config_root(
-        instance,
-        &instance.effective_profile(),
-        &instance.tool,
-        agent,
-        &home,
-    )?;
-    let target_root = config_root(instance, new_profile, new_tool, agent, &home)?;
+    let (Some(source_root), Some(target_root)) = (
+        config_root(
+            instance,
+            &instance.effective_profile(),
+            &instance.tool,
+            agent,
+            &home,
+        ),
+        config_root(instance, new_profile, new_tool, agent, &home),
+    ) else {
+        return ToolSwap::Park;
+    };
     if source_root == target_root {
-        return None;
+        // Both names read one config root, so the transcript is already where
+        // the incoming account looks for it.
+        return ToolSwap::KeepConversation(None);
     }
-    Some(ConversationCarry {
+    ToolSwap::KeepConversation(Some(ConversationCarry {
         source_root,
         target_root,
-        session_ids,
-    })
+        session_ids: conversation_ids(instance),
+    }))
 }
 
 impl ConversationCarry {
+    /// Point the carry at the conversation the disk row actually holds.
+    ///
+    /// The plan is built from the TUI's in-memory mirror, but the capture
+    /// pollers own `agent_session_id` through CAS writes to disk, so the disk
+    /// row can carry a conversation the snapshot had not seen yet. That row is
+    /// what the next launch resumes from, which makes it the one whose
+    /// transcript has to travel. `persist_tool_swap` reads it under the storage
+    /// lock it already takes, so this costs no extra read and opens no race the
+    /// swap did not already have. Empty leaves the planned ids alone.
+    pub(crate) fn retarget(&mut self, session_ids: Vec<String>) {
+        if !session_ids.is_empty() {
+            self.session_ids = session_ids;
+        }
+    }
+
     /// Copy each planned transcript. Best-effort: the launch that follows
     /// falls back to a fresh conversation the same way it does for any sid
     /// whose transcript is missing, so a failure is logged rather than
@@ -211,7 +197,7 @@ fn carries_transcript(agent: &'static AgentDef) -> bool {
 
 /// The ids whose transcripts a carry copies: the terminal conversation, the
 /// structured one, or both when the row holds each.
-fn conversation_ids(instance: &Instance) -> Vec<String> {
+pub(crate) fn conversation_ids(instance: &Instance) -> Vec<String> {
     let mut ids: Vec<String> = [
         instance.agent_session_id.as_deref(),
         instance.acp_session_id.as_deref(),
@@ -226,8 +212,13 @@ fn conversation_ids(instance: &Instance) -> Vec<String> {
 }
 
 /// The agent config root one tool reads on this session: the per-instance
-/// sandbox store when the session is sandboxed, else the profile's declared
-/// directory for that tool, else the account the host environment points at.
+/// sandbox store when the session is sandboxed, else whatever
+/// [`crate::session::capture::claude_home_for_host_environment`] resolves, so
+/// the carry writes to the directory the launch-time transcript probe reads.
+///
+/// `profile` is explicit rather than the instance's own because a restart that
+/// also moves profiles resolves the incoming tool under the target profile's
+/// config.
 fn config_root(
     instance: &Instance,
     profile: &str,
@@ -248,12 +239,11 @@ fn config_root(
         .ok()
         .flatten();
     }
-    declared.or_else(|| {
-        crate::session::capture::claude_home_for_host_environment(
-            &instance.resolved_host_environment(),
-        )
-        .ok()
-    })
+    crate::session::capture::claude_home_for_host_environment(
+        declared.as_deref(),
+        &instance.resolved_host_environment(),
+    )
+    .ok()
 }
 
 /// Every `projects/<encoded-cwd>/<sid>.jsonl` under `root`.
@@ -268,8 +258,18 @@ fn claude_transcripts_for(root: &AnchoredDir, session_id: &str) -> Result<Vec<Pa
         return Ok(Vec::new());
     }
     let leaf = format!("{session_id}.jsonl");
+    let encoded_dirs = root.read_dir(projects, PROJECT_DIR_SCAN_MAX)?;
+    if encoded_dirs.len() == PROJECT_DIR_SCAN_MAX {
+        tracing::warn!(
+            target: "session.store",
+            root = %root.path().display(),
+            scanned = PROJECT_DIR_SCAN_MAX,
+            "stopped scanning the account's projects at the cap; a transcript \
+             beyond it will not be carried"
+        );
+    }
     let mut found = Vec::new();
-    for encoded in root.read_dir(projects, PROJECT_DIR_SCAN_MAX)? {
+    for encoded in encoded_dirs {
         let relative = projects.join(encoded).join(&leaf);
         if root.regular_exists(&relative) {
             found.push(relative);
@@ -279,24 +279,55 @@ fn claude_transcripts_for(root: &AnchoredDir, session_id: &str) -> Result<Vec<Pa
 }
 
 /// Copy `relative` from `source` to `target`, leaving an existing target file
-/// alone. A failed write is removed rather than left truncated: a half
-/// transcript resumes into a conversation that silently loses its tail.
+/// alone.
+///
+/// The content lands under a temporary name and is renamed into place, so a
+/// half transcript is never reachable under the real one: it would resume into
+/// a conversation that silently loses its tail, and being already-present the
+/// next carry would skip rather than repair it. A crash leaves the temporary
+/// name behind instead, which nothing reads.
 fn copy_file(source: &AnchoredDir, target: &AnchoredDir, relative: &Path) -> Result<()> {
     let Some(mut reader) = source.open_regular(relative, TRANSCRIPT_MAX_BYTES)? else {
+        if source.regular_exists(relative) {
+            tracing::warn!(
+                target: "session.store",
+                transcript = %relative.display(),
+                max_bytes = TRANSCRIPT_MAX_BYTES,
+                "transcript is larger than the carry cap and was not copied"
+            );
+        }
         return Ok(());
     };
     if let Some(parent) = relative.parent() {
         target.ensure_dir(parent)?;
     }
-    let Some(mut writer) = target.create_new_regular(relative)? else {
+    if target.regular_lookup(relative)?.is_some() {
+        return Ok(());
+    }
+    let staging = staging_path(relative);
+    // A leftover from a crashed carry: the rename below would publish whatever
+    // it holds, so start from a fresh file.
+    target.remove_file(&staging)?;
+    let Some(mut writer) = target.create_new_regular(&staging)? else {
         return Ok(());
     };
-    if let Err(error) = std::io::copy(&mut reader, &mut writer) {
-        drop(writer);
-        let _ = target.remove_file(relative);
-        return Err(error.into());
+    let copied = std::io::copy(&mut reader, &mut writer)
+        .and_then(|_| writer.sync_all())
+        .map_err(anyhow::Error::from)
+        .and_then(|()| target.rename_within(&staging, relative));
+    if let Err(error) = copied {
+        let _ = target.remove_file(&staging);
+        return Err(error);
     }
     Ok(())
+}
+
+/// The temporary name `relative` is written under before it is published.
+/// Same directory, so the rename is atomic.
+fn staging_path(relative: &Path) -> PathBuf {
+    let mut staged = relative.as_os_str().to_os_string();
+    staged.push(".aoe-carry");
+    PathBuf::from(staged)
 }
 
 #[cfg(test)]
@@ -384,6 +415,79 @@ mod tests {
         inst.tool = "claude-1".to_string();
         inst.detect_as = "claude".to_string();
         assert_eq!(classify(&inst, PROFILE, "claude-2"), ToolSwap::Park);
+    }
+
+    /// The decisive end-to-end fact: a host session pinned to two accounts
+    /// through `agent_config_dir` must have its transcript copied into the
+    /// directory the launch-time resume probe reads. If those two disagree the
+    /// launch downgrades `--resume <sid>` to `--session-id <sid>`, which the
+    /// agent rejects as already in use now that the transcript exists there.
+    #[test]
+    #[serial_test::serial]
+    fn carry_lands_where_the_launch_probe_looks_for_it() {
+        const SID: &str = "11111111-2222-3333-4444-555555555555";
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let home = dirs::home_dir().expect("home");
+        let app_dir = crate::session::get_app_dir().expect("app dir");
+        std::fs::create_dir_all(&app_dir).expect("app dir");
+        std::fs::write(
+            app_dir.join("config.toml"),
+            "[session.agent_detect_as]\n\
+             claude-1 = \"claude\"\n\
+             claude-2 = \"claude\"\n\
+             \n\
+             [session.agent_config_dir]\n\
+             claude-1 = \"~/dot-claude-1\"\n\
+             claude-2 = \"~/dot-claude-2\"\n",
+        )
+        .expect("config");
+        let profile = crate::session::config::effective_profile("");
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(&profile);
+        crate::session::config::profile_config::resolve_config_or_warn(&profile);
+
+        let project = home.join("project");
+        std::fs::create_dir_all(&project).expect("project");
+        let mut inst = Instance::new("t", project.to_str().unwrap());
+        inst.tool = "claude-1".to_string();
+        inst.detect_as = "claude".to_string();
+        inst.agent_session_id = Some(SID.to_string());
+
+        let ToolSwap::KeepConversation(Some(carry)) = classify(&inst, &profile, "claude-2") else {
+            panic!("an account swap with a conversation must plan a carry");
+        };
+        assert_eq!(carry.source_root, home.join("dot-claude-1"));
+        assert_eq!(carry.target_root, home.join("dot-claude-2"));
+
+        // Seed the outgoing account exactly where Claude writes it, then carry.
+        let encoded = crate::session::capture::encode_claude_project_path(
+            &crate::session::capture::canonicalize_or_raw(project.to_str().unwrap())
+                .to_string_lossy(),
+        );
+        let seeded = carry.source_root.join("projects").join(&encoded);
+        std::fs::create_dir_all(&seeded).expect("seed dir");
+        std::fs::write(seeded.join(format!("{SID}.jsonl")), "conversation\n").expect("seed");
+
+        assert!(
+            crate::session::capture::claude_host_transcript_confirmed_absent(
+                project.to_str().unwrap(),
+                SID,
+                &[],
+                inst.declared_agent_config_dir_for("claude-2").as_deref(),
+            ),
+            "pre-condition: the incoming account cannot see it yet"
+        );
+
+        carry.run();
+
+        assert!(
+            !crate::session::capture::claude_host_transcript_confirmed_absent(
+                project.to_str().unwrap(),
+                SID,
+                &[],
+                inst.declared_agent_config_dir_for("claude-2").as_deref(),
+            ),
+            "after the carry the launch must resume rather than re-pin the id"
+        );
     }
 
     #[test]

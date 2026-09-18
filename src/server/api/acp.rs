@@ -2139,6 +2139,9 @@ pub async fn acp_enable(
                     &instance.project_path,
                     sid,
                     &instance.resolved_host_environment(),
+                    instance
+                        .declared_agent_config_dir_for(&instance.tool)
+                        .as_deref(),
                 )
             })
             .unwrap_or(false);

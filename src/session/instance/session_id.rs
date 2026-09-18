@@ -488,6 +488,7 @@ impl Instance {
                     &self.project_path,
                     &stored,
                     &self.resolved_host_environment(),
+                    self.declared_agent_config_dir_for(&self.tool).as_deref(),
                 )
             {
                 tracing::info!(
