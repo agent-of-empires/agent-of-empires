@@ -268,3 +268,139 @@ fn configured_host_environment_reaches_structured_worker() {
         );
     }
 }
+
+#[test]
+#[parallel]
+fn selected_claude_store_survives_terminal_handoff() {
+    require_tmux!();
+    require_node!();
+    let mut h = TuiTestHarness::new_in_tmp("handoff_store");
+    h.stop_daemon_on_drop();
+    let selected = h.home_path().join("selected-claude");
+    let configured = h.home_path().join("configured-claude");
+    let project = h.project_path().canonicalize().unwrap();
+    let script = h.home_path().join("agent.json");
+    std::fs::write(&script, EMPTY_SCRIPT).unwrap();
+    let capture_dir = h.home_path().join("adapter-env");
+    h.install_acp_shim_capturing_env(&script, &capture_dir);
+    let config_path = app_dir_in(h.home_path()).join("config.toml");
+    let config = std::fs::read_to_string(&config_path).unwrap();
+    std::fs::write(
+        &config_path,
+        format!(
+            "environment = [\"CLAUDE_CONFIG_DIR={}\"]\n{config}",
+            configured.display()
+        ),
+    )
+    .unwrap();
+    let add = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "-t",
+        "handoff",
+        "-c",
+        "claude",
+    ]);
+    assert!(
+        add.status.success(),
+        "{}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let sid = "11111111-1111-4111-8111-111111111111";
+    let encoded: String = project
+        .to_string_lossy()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let transcripts = selected.join("projects").join(encoded);
+    std::fs::create_dir_all(&transcripts).unwrap();
+    std::fs::write(transcripts.join(format!("{sid}.jsonl")), "{}\n").unwrap();
+    let pin = h.run_cli(&[
+        "session",
+        "set-session-id",
+        "handoff",
+        sid,
+        "--store",
+        selected.to_str().unwrap(),
+    ]);
+    assert!(
+        pin.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pin.stderr)
+    );
+    let sessions_path = app_dir_in(h.home_path()).join("profiles/default/sessions.json");
+    let rows: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&sessions_path).unwrap()).unwrap();
+    let id = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["title"] == "handoff")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let port = pick_free_port();
+    let start = h.run_cli(&[
+        "serve",
+        "--daemon",
+        "--port",
+        &port.to_string(),
+        "--no-auth",
+    ]);
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    assert!(wait_for_port(port, Duration::from_secs(10)));
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let response = reqwest::Client::new()
+            .post(format!(
+                "http://127.0.0.1:{port}/api/sessions/{id}/acp/enable"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_success(),
+            "{}",
+            response.text().await.unwrap()
+        );
+    });
+    let log = app_dir_in(h.home_path()).join("fake-acp.log");
+    let deadline = Instant::now() + Duration::from_secs(75);
+    loop {
+        let contents = std::fs::read_to_string(&log).unwrap_or_default();
+        if contents.contains("handleRequest method=session/load")
+            || contents.contains("handleRequest method=session/new")
+        {
+            assert!(
+                contents.contains("handleRequest method=session/load"),
+                "handoff started fresh: {contents}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "worker did not complete handshake: {contents}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let capture = wait_for_capture_with(
+        &capture_dir,
+        "CLAUDE_CONFIG_DIR",
+        selected.to_str().unwrap(),
+        Duration::from_secs(5),
+    );
+    assert_eq!(
+        env_value(&capture, "CLAUDE_CONFIG_DIR").as_deref(),
+        Some(selected.to_str().unwrap())
+    );
+}

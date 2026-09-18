@@ -531,6 +531,24 @@ impl Instance {
         Ok(())
     }
 
+    /// The host Claude conversation this session selected, either through an
+    /// explicit pin (`ResumeIntent::Use`) or the observed agent session. A
+    /// structured handoff must keep reading this conversation's own store
+    /// rather than the profile default, or the transcript the pin points at
+    /// becomes unreadable to the new worker.
+    pub(crate) fn selected_claude_conversation(&self) -> Option<(&str, &ExecutionBinding)> {
+        if self.is_sandboxed() || matches!(self.resume_intent, ResumeIntent::Fork { .. }) {
+            return None;
+        }
+        let (sid, binding, _) = self.conversation_target()?;
+        let binding = binding?;
+        if !binding.is_known() {
+            return None;
+        }
+        let execution = binding.execution.as_ref()?;
+        (execution.agent == "claude" && execution.filesystem == "host").then_some((sid, execution))
+    }
+
     fn resolved_handoff_binding(
         &self,
         sid: &str,

@@ -373,7 +373,7 @@ fn stale_resume_failure_persists_loop_breaker_and_next_restart_starts_fresh() {
     // be a few milliseconds from the fake agent's printf, so read until the
     // invocation appears instead of sampling the log once (races under load).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let second_lines = loop {
+    loop {
         let all_lines = read_log_lines(&log_path);
         let second_lines = &all_lines[before_second..];
         assert!(
@@ -381,12 +381,12 @@ fn stale_resume_failure_persists_loop_breaker_and_next_restart_starts_fresh() {
             "second restart must not retry stale sid; new log lines={second_lines:?}"
         );
         if !second_lines.is_empty() {
-            break second_lines.to_vec();
+            break;
         }
         assert!(
             std::time::Instant::now() < deadline,
             "second restart should invoke fake agent; log={all_lines:?}"
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
-    };
+    }
 }

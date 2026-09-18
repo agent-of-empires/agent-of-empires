@@ -115,6 +115,11 @@ pub struct SpawnConfig {
     /// Lifecycle epoch stamped on the runner's registry record; the
     /// supervisor sets it from the lease that admitted the spawn.
     pub generation: u64,
+    /// Claude store pin threaded from `SpawnRequest::claude_store_pin` for a
+    /// host claude spawn. Applied after hooks on the initial launch and on
+    /// watchdog respawns (which clone this config), so `CLAUDE_CONFIG_DIR`
+    /// keeps pointing at the conversation's transcript store.
+    pub claude_store_pin: Option<PathBuf>,
 }
 
 /// Reject `provider_env` request entries whose key would either escape
@@ -621,6 +626,7 @@ mod tests {
     #[serial_test::serial]
     async fn spawn_with_nonexistent_command_errors_cleanly() {
         let config = SpawnConfig {
+            claude_store_pin: None,
             wrapper_substitution: None,
             agent_key: "claude".into(),
             tool: "claude".into(),
@@ -662,6 +668,7 @@ mod tests {
         // Ensure the path truly does not exist.
         let _ = std::fs::remove_dir_all(&missing);
         let config = SpawnConfig {
+            claude_store_pin: None,
             wrapper_substitution: None,
             agent_key: "claude".into(),
             tool: "claude".into(),

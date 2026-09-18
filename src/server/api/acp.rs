@@ -498,6 +498,9 @@ pub async fn spawn_acp(
                 &instance.command,
             ),
             seed_history_replay,
+            claude_store_pin: instance
+                .selected_claude_conversation()
+                .and_then(|(_, execution)| execution.stores.first().cloned()),
         })
         .await;
 
@@ -1134,6 +1137,9 @@ pub async fn switch_acp_agent(
             ),
             // Switching ACP backend starts a fresh session, never an import.
             seed_history_replay: false,
+            // A different backend cannot read the pinned Claude store; the
+            // pin must not leak into a codex/opencode spawn.
+            claude_store_pin: None,
         })
         .await;
     if let Err(e) = spawn_result {
@@ -1969,6 +1975,17 @@ pub async fn acp_enable(
         let profile = inst.source_profile.clone();
         (inst, profile)
     };
+    // Capture the conversation the terminal session selected before the
+    // transition below resets the resume intent: the pin and its sid must
+    // survive the wipe to seed the structured spawn.
+    let selected_conversation = instance
+        .selected_claude_conversation()
+        .map(|(sid, execution)| (sid.to_owned(), execution.clone()));
+    let selected_binding = selected_conversation.as_ref().and_then(|_| {
+        instance
+            .conversation_target()
+            .and_then(|(_, binding, _)| binding.cloned())
+    });
 
     if instance.is_structured() {
         return Json(ViewSwitchResponse {
@@ -2036,6 +2053,7 @@ pub async fn acp_enable(
     let id_for_log = id.clone();
     let profile_for_transition = profile.clone();
     let file_watch_for_transition = state.file_watch.clone();
+    let binding_for_transition = selected_binding.clone();
     let transition = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
         let storage =
             crate::session::Storage::new(&profile_for_transition, file_watch_for_transition)?;
@@ -2057,6 +2075,10 @@ pub async fn acp_enable(
             };
             slot.view = crate::session::View::Structured;
             slot.resume_intent = crate::session::ResumeIntent::Default;
+            if let Some(binding) = &binding_for_transition {
+                slot.agent_session_id = Some(binding.session_id.clone());
+                slot.agent_session_binding = Some(binding.clone());
+            }
             // Reset to Idle: killing tmux above removes the poller that would
             // settle a terminal session's status, and structured rows are
             // skipped by the tmux poller. Structured status is event-driven
@@ -2093,6 +2115,10 @@ pub async fn acp_enable(
     };
     instance.view = crate::session::View::Structured;
     instance.resume_intent = crate::session::ResumeIntent::Default;
+    if let Some(binding) = &selected_binding {
+        instance.agent_session_id = Some(binding.session_id.clone());
+        instance.agent_session_binding = Some(binding.clone());
+    }
     instance.status = crate::session::Status::Idle;
     instance.lifecycle_generation = lifecycle_generation;
     instance.acp_load_session_capable = None;
@@ -2102,6 +2128,10 @@ pub async fn acp_enable(
             if lifecycle_generation >= slot.lifecycle_generation {
                 slot.view = crate::session::View::Structured;
                 slot.resume_intent = crate::session::ResumeIntent::Default;
+                if let Some(binding) = &selected_binding {
+                    slot.agent_session_id = Some(binding.session_id.clone());
+                    slot.agent_session_binding = Some(binding.clone());
+                }
                 slot.status = crate::session::Status::Idle;
                 slot.lifecycle_generation = lifecycle_generation;
                 slot.acp_load_session_capable = None;
@@ -2124,21 +2154,30 @@ pub async fn acp_enable(
     let effort = instance.acp_effort.clone();
     let yolo_mode = instance.yolo_mode;
     let acp_mode_id = instance.acp_mode_id.clone();
+    let claude_store_pin = selected_conversation
+        .as_ref()
+        .and_then(|(_, execution)| execution.stores.first().cloned());
     // #2252 direction B: a claude terminal session's resumable transcript lives
     // in `agent_session_id`, not `acp_session_id`. When present on the host (the
     // seeded `session/load` hard-fails on a missing id), carry it into the
     // structured spawn so the conversation continues in structured view. The
     // in-container transcript can't be probed from the host, so sandboxed
-    // sessions attempt the load unconditionally.
+    // sessions attempt the load unconditionally. The probe resolves through the
+    let resume_sid = selected_conversation
+        .as_ref()
+        .map(|(sid, _)| sid.as_str())
+        .or(instance.agent_session_id.as_deref());
     let transcript_present = instance.is_sandboxed()
-        || instance
-            .agent_session_id
-            .as_deref()
+        || resume_sid
             .map(|sid| {
-                crate::session::capture::claude_home_for_host_environment(
-                    &instance.resolved_host_environment(),
-                )
-                .map(|home| {
+                let home = match &claude_store_pin {
+                    Some(store) => Some(store.clone()),
+                    None => crate::session::capture::claude_home_for_host_environment(
+                        &instance.resolved_host_environment(),
+                    )
+                    .ok(),
+                };
+                home.map(|home| {
                     !crate::session::capture::claude_host_transcript_confirmed_absent(
                         &instance.project_path,
                         sid,
@@ -2152,7 +2191,7 @@ pub async fn acp_enable(
         &instance.tool,
         &agent_name,
         instance.acp_session_id.as_deref(),
-        instance.agent_session_id.as_deref(),
+        resume_sid,
         instance.import_pending == Some(true),
         transcript_present,
     );
@@ -2224,6 +2263,7 @@ pub async fn acp_enable(
                 acp_mode_id,
                 agent_command_override: command_override,
                 seed_history_replay,
+                claude_store_pin,
             })
             .await
         {

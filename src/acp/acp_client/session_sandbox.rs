@@ -335,6 +335,7 @@ mod tests {
             container_workdir: None,
         };
         let config = SpawnConfig {
+            claude_store_pin: None,
             wrapper_substitution: None,
             agent_key: "claude".into(),
             tool: "claude".into(),
@@ -412,6 +413,7 @@ mod tests {
             container_workdir: None,
         };
         let config = SpawnConfig {
+            claude_store_pin: None,
             wrapper_substitution: None,
             agent_key: "claude".into(),
             tool: "claude".into(),
@@ -515,6 +517,7 @@ mod tests {
             container_workdir: None,
         };
         let config = SpawnConfig {
+            claude_store_pin: None,
             wrapper_substitution: None,
             agent_key: "codex".into(),
             tool: "codex".into(),
