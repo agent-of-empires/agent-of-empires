@@ -3,7 +3,7 @@
 use anyhow::{bail, Context, Result};
 use nix::dir::Dir;
 use nix::errno::Errno;
-use nix::fcntl::{open, openat, AtFlags, OFlag};
+use nix::fcntl::{open, openat, renameat, AtFlags, OFlag};
 use nix::sys::stat::{fstat, fstatat, mkdirat, Mode};
 use nix::unistd::{linkat, unlinkat, UnlinkatFlags};
 use std::ffi::OsString;
@@ -219,18 +219,30 @@ impl AnchoredDir {
         matches!(self.regular_lookup(relative), Ok(Some(true)))
     }
 
-    /// Publish the staging file `from` at `to`, then drop the staging name.
-    /// `false` means something was already at `to` and was left untouched.
+    /// Publish the staging file `from` at `to` and drop the staging name.
+    /// `false` means something was already at `to` and was left untouched,
+    /// which only happens when `replace` is unset.
     ///
     /// Makes a file visible only once it is complete, so a process killed
     /// mid-write leaves a staging name rather than a half file under the real
-    /// one. `linkat` rather than `renameat` because rename replaces the
-    /// destination: a writer that created `to` between a caller's existence
-    /// check and this call would lose its file. `renameat2(RENAME_NOREPLACE)`
-    /// would also answer, but it is Linux-only and this has to hold on macOS.
-    pub(crate) fn publish_staged(&self, from: &Path, to: &Path) -> Result<bool> {
+    /// one. Without `replace` this is `linkat`, not `renameat`, because rename
+    /// replaces the destination: a writer that created `to` between a caller's
+    /// existence check and this call would lose its file.
+    /// `renameat2(RENAME_NOREPLACE)` would also answer, but it is Linux-only
+    /// and this has to hold on macOS.
+    pub(crate) fn publish_staged(&self, from: &Path, to: &Path, replace: bool) -> Result<bool> {
         let (from_parent, from_leaf) = self.open_parent(from)?;
         let (to_parent, to_leaf) = self.open_parent(to)?;
+        if replace {
+            renameat(
+                &from_parent,
+                from_leaf.as_os_str(),
+                &to_parent,
+                to_leaf.as_os_str(),
+            )
+            .context("replacing anchored file")?;
+            return Ok(true);
+        }
         let published = match linkat(
             &from_parent,
             from_leaf.as_os_str(),

@@ -278,14 +278,20 @@ fn claude_transcripts_for(root: &AnchoredDir, session_id: &str) -> Result<Vec<Pa
     Ok(found)
 }
 
-/// Copy `relative` from `source` to `target`, leaving an existing target file
-/// alone.
+/// Copy `relative` from `source` to `target`.
 ///
-/// The content lands under a staging name and is published with a no-replace
-/// link, so a half transcript is never reachable under the real one: it would
-/// resume into a conversation that silently loses its tail, and being
-/// already-present the next carry would skip rather than repair it. A crash
-/// leaves the staging name behind instead, which nothing reads.
+/// A destination copy at least as new as the source is left alone; a strictly
+/// older one is replaced. The source account is the one the session was just
+/// running on, so its transcript is the live continuation, and an older
+/// destination is a stale earlier carry. Skipping it unconditionally forked the
+/// conversation on a swap back: `A -> B -> A` found `A`'s pre-swap copy still
+/// in place and resumed that, silently stranding everything that happened on
+/// `B` under `B`'s root.
+///
+/// The content lands under a staging name before it is published, so a half
+/// transcript is never reachable under the real one: it would resume into a
+/// conversation that silently loses its tail. A crash leaves the staging name
+/// behind instead, which nothing reads.
 fn copy_file(source: &AnchoredDir, target: &AnchoredDir, relative: &Path) -> Result<()> {
     let Some(mut reader) = source.open_regular(relative, TRANSCRIPT_MAX_BYTES)? else {
         if source.regular_exists(relative) {
@@ -298,15 +304,22 @@ fn copy_file(source: &AnchoredDir, target: &AnchoredDir, relative: &Path) -> Res
         }
         return Ok(());
     };
+    let incoming = source.regular_modified(relative)?;
     if let Some(parent) = relative.parent() {
         target.ensure_dir(parent)?;
     }
-    if target.regular_lookup(relative)?.is_some() {
-        return Ok(());
-    }
+    let replace = match (target.regular_modified(relative)?, incoming) {
+        // Nothing there, or nothing readable there: publish without replacing,
+        // so a writer that lands one first keeps it.
+        (None, _) => false,
+        (Some(existing), Some(incoming)) if incoming > existing => true,
+        // Current, or two timestamps that cannot be ordered. Either way the
+        // destination is not provably stale, so leave it.
+        (Some(_), _) => return Ok(()),
+    };
     let staging = staging_path(relative);
-    // A leftover from a crashed carry: the rename below would publish whatever
-    // it holds, so start from a fresh file.
+    // A leftover from a crashed carry: the publish below would hand over
+    // whatever it holds, so start from a fresh file.
     target.remove_file(&staging)?;
     let Some(mut writer) = target.create_new_regular(&staging)? else {
         return Ok(());
@@ -314,7 +327,7 @@ fn copy_file(source: &AnchoredDir, target: &AnchoredDir, relative: &Path) -> Res
     let copied = std::io::copy(&mut reader, &mut writer)
         .and_then(|_| writer.sync_all())
         .map_err(anyhow::Error::from)
-        .and_then(|()| target.publish_staged(&staging, relative));
+        .and_then(|()| target.publish_staged(&staging, relative, replace));
     match copied {
         Ok(_) => Ok(()),
         Err(error) => {
@@ -514,19 +527,61 @@ mod tests {
         assert!(!target.join("projects/-work-repo/sid-b.jsonl").exists());
     }
 
+    /// Set `path`'s mtime so the newer-wins comparison is deterministic rather
+    /// than at the mercy of filesystem timestamp granularity.
+    fn set_age(path: &Path, seconds_ago: u64) {
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(seconds_ago);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(when))
+            .unwrap();
+    }
+
     #[test]
-    fn run_leaves_a_transcript_the_target_account_already_has() {
+    fn run_leaves_a_transcript_the_target_account_has_more_recently() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("claude-1");
         let target = temp.path().join("claude-2");
-        seed_transcript(&source, "-work-repo", "sid-a", "incoming\n");
-        seed_transcript(&target, "-work-repo", "sid-a", "already here\n");
+        let from = seed_transcript(&source, "-work-repo", "sid-a", "incoming\n");
+        let to = seed_transcript(&target, "-work-repo", "sid-a", "already here\n");
+        set_age(&from, 3600);
+        set_age(&to, 60);
 
         carry(&source, &target, &["sid-a"]).run();
 
         assert_eq!(
-            std::fs::read_to_string(target.join("projects/-work-repo/sid-a.jsonl")).unwrap(),
-            "already here\n"
+            std::fs::read_to_string(&to).unwrap(),
+            "already here\n",
+            "the destination was written after the source, so it is not stale"
+        );
+    }
+
+    /// A swap back to an account that already holds an earlier copy of the
+    /// conversation must resume everything that happened in between, not the
+    /// snapshot it kept from before the first swap.
+    #[test]
+    fn run_replaces_a_stale_copy_left_by_an_earlier_swap() {
+        let temp = tempfile::tempdir().unwrap();
+        let account_a = temp.path().join("claude-1");
+        let account_b = temp.path().join("claude-2");
+        let on_a = seed_transcript(&account_a, "-work-repo", "sid-a", "first\n");
+        set_age(&on_a, 3600);
+
+        // A -> B, then the agent keeps working on B.
+        carry(&account_a, &account_b, &["sid-a"]).run();
+        let on_b = account_b.join("projects/-work-repo/sid-a.jsonl");
+        std::fs::write(&on_b, "first\nsecond\n").unwrap();
+        set_age(&on_b, 60);
+
+        // B -> A: A still holds its pre-swap copy.
+        carry(&account_b, &account_a, &["sid-a"]).run();
+
+        assert_eq!(
+            std::fs::read_to_string(&on_a).unwrap(),
+            "first\nsecond\n",
+            "swapping back must resume the work done on the other account"
         );
     }
 

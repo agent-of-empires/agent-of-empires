@@ -80,9 +80,13 @@ ID, its model, and its effort setting, since none of those changed agent.
 
 The carry applies only when the new tool resolves to the same built-in agent,
 the session has a conversation to carry, and AoE knows the agent's transcript
-layout (Claude Code today). Anything else takes the parking swap above. The copy
-never overwrites a transcript the incoming account already has, and leaves the
-outgoing account's copy in place, so swapping back still reaches the original.
+layout (Claude Code today). Anything else takes the parking swap above.
+
+The outgoing account keeps its own copy, so swapping accounts back and forth
+stays continuous: the account you swap away from is the one that was just
+running, so on the way back its transcript replaces the older copy the earlier
+swap left behind. A copy the incoming account wrote more recently than the
+outgoing one is left alone.
 
 ## Importing existing Claude Code sessions (web dashboard)
 
