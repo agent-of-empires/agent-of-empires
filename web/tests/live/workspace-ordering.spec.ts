@@ -80,7 +80,11 @@ base.describe("workspace ordering live round-trip (#1220)", () => {
       const sourceClass = await wrappers.nth(2).getAttribute("class");
       expect(sourceClass ?? "").toContain("ring-2");
 
+      const putWait = page.waitForResponse(
+        (response) => response.url().endsWith("/api/workspace-ordering") && response.request().method() === "PUT",
+      );
       await page.mouse.up();
+      expect((await putWait).ok()).toBe(true);
 
       // After release, the bottom row is now at the top and the PUT
       // body reflects the new full flat order.
@@ -103,9 +107,7 @@ base.describe("workspace ordering live round-trip (#1220)", () => {
         .poll(() => puts.at(-1), { timeout: 4_000 })
         .toEqual([byTitle.get(initial[2]!), byTitle.get(initial[0]!), byTitle.get(initial[1]!)]);
 
-      // After the drag completes, the server's persisted ordering
-      // mirrors the PUT body. Probe via `GET /api/sessions` which
-      // returns the merged ordering envelope.
+      // A successful PUT acknowledges persistence and snapshot publication.
       const after = await fetch(`${serve.baseUrl}/api/sessions`);
       const body = (await after.json()) as { workspace_ordering: string[] };
       expect(body.workspace_ordering.slice(0, 3)).toEqual(puts.at(-1));

@@ -362,6 +362,8 @@ function processSnapshot(env: NodeJS.ProcessEnv): ProcessSnapshot[] {
   const result = spawnSync("ps", ["-ww", "-axo", "pid=,ppid=,pgid=,stat=,args="], {
     env: { ...env, LC_ALL: "C" },
     encoding: "utf8",
+    // Full command lines can exceed Node's default 1 MiB on busy hosts.
+    maxBuffer: Infinity,
     timeout: 2000,
   });
   if (result.status !== 0) throw new Error(`cannot inspect fixture processes: ${result.error ?? result.stderr}`);
