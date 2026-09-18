@@ -1177,7 +1177,7 @@ mod tests {
         let execution = instance
             .resolve_native_execution(instance.conversation_target())
             .unwrap();
-        assert_eq!(execution.binding.stores[0], store);
+        assert_eq!(execution.binding.stores[0], store.canonicalize().unwrap());
         let directory = crate::hooks::ensure_instance_dir_path(&instance.id).unwrap();
         let publication = directory.join(format!("session_id.{}", execution.inputs.launch_id));
         instance.active_execution = Some(ActiveExecution {
