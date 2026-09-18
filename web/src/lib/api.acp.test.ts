@@ -196,17 +196,32 @@ describe("acpEnable / acpDisable", () => {
   it("acpDisable POSTs to /acp/disable and returns the view", async () => {
     (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(ok({ session_id: "s-1", view: "terminal" }));
     const result = await acpDisable("s-1");
-    expect(result).toEqual({ session_id: "s-1", view: "terminal" });
+    expect(result).toEqual({ ok: true, data: { session_id: "s-1", view: "terminal" } });
     const [url, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(String(url)).toContain("/api/sessions/s-1/acp/disable");
     expect((init as RequestInit).method).toBe("POST");
   });
 
-  it("encodes the session id and returns null on non-2xx", async () => {
+  it("encodes the session id and returns the server text on failure", async () => {
     (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(ok({ session_id: "a/b", view: "terminal" }));
     await acpDisable("a/b");
     const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0]?.[0];
     expect(String(url)).toContain("/api/sessions/a%2Fb/acp/disable");
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      new Response("Run set-session-id --store /path to pin the native store", { status: 409 }),
+    );
+    expect(await acpDisable("s-1")).toEqual({
+      ok: false,
+      message: "Run set-session-id --store /path to pin the native store",
+    });
+  });
+
+  it("returns ok:false without message when the failure body is empty", async () => {
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(new Response("", { status: 500 }));
+    expect(await acpDisable("s-1")).toEqual({ ok: false });
+  });
+
+  it("acpEnable still returns null on non-2xx", async () => {
     // default mocked fetch is 404 -> fetchJson returns null.
     expect(await acpEnable("missing")).toBeNull();
   });
