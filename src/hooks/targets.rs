@@ -1,7 +1,4 @@
-//! Hook target enumeration and marker-presence walker shared by the live
-//! install/uninstall lifecycle and the hook-rewrite migrations (v015, v017,
-//! v018). Extracted from `src/hooks/mod.rs` as a pure file-split refactor
-//! (#2188); no behavior change.
+//! Hook target enumeration shared by installation, removal and migrations.
 
 use std::path::{Path, PathBuf};
 
@@ -47,10 +44,8 @@ pub(crate) struct HookTarget {
     pub events: Vec<crate::agents::ResolvedHookEvent>,
 }
 
-/// Enumerate every hook target reachable from the running AoE process: the
-/// home-relative default for each agent, plus every profile-overridden path
-/// (CLAUDE_CONFIG_DIR / CODEX_HOME / etc.) from the global config and each
-/// profile's `environment` list. Deduplicated by `(kind discriminant, path)`.
+/// Enumerate default, configured and persisted conversation hook paths.
+/// Deduplicated by `(kind discriminant, path)`.
 ///
 /// Shared by [`super::uninstall_all_hooks`] and the v015 migration so new
 /// agents in [`crate::agents::AGENTS`] appear in both flows.
@@ -59,7 +54,77 @@ pub(crate) fn iter_hook_targets() -> Vec<HookTarget> {
         Some(h) => h,
         None => return Vec::new(),
     };
-    iter_hook_targets_in(&home, &collect_env_lists_from_session())
+    let mut targets = iter_hook_targets_in(&home, &collect_env_lists_from_session());
+    match crate::session::list_profiles() {
+        Ok(profiles) => {
+            for profile in profiles {
+                let instances = match crate::session::Storage::new_unwatched(&profile)
+                    .and_then(|storage| storage.load())
+                {
+                    Ok(instances) => instances,
+                    Err(error) => {
+                        tracing::warn!(target: "hooks", %profile, %error, "Failed to read conversation hook targets");
+                        continue;
+                    }
+                };
+                for instance in instances {
+                    let bindings = [
+                        instance
+                            .agent_session_binding
+                            .as_ref()
+                            .and_then(|binding| binding.execution.as_ref()),
+                        instance
+                            .resume_binding
+                            .as_ref()
+                            .and_then(|binding| binding.execution.as_ref()),
+                        instance
+                            .active_execution
+                            .as_ref()
+                            .map(|active| &active.binding),
+                    ];
+                    let prior_bindings =
+                        instance
+                            .prior_tool_session_ids
+                            .values()
+                            .filter_map(|prior| {
+                                prior
+                                    .agent_session_binding
+                                    .as_ref()
+                                    .and_then(|binding| binding.execution.as_ref())
+                            });
+                    for binding in bindings.into_iter().flatten().chain(prior_bindings) {
+                        if binding.agent != "claude" || binding.filesystem != "host" {
+                            continue;
+                        }
+                        for root in &binding.stores {
+                            let path = root.join("settings.json");
+                            if targets.iter().any(|target| {
+                                matches!(target.kind, HookTargetKind::JsonSettings)
+                                    && target.path == path
+                            }) {
+                                continue;
+                            }
+                            targets.push(HookTarget {
+                                agent_name: "claude",
+                                kind: HookTargetKind::JsonSettings,
+                                path,
+                                events: crate::agents::resolved_hook_events(
+                                    crate::agents::get_agent("claude")
+                                        .expect("built-in Claude agent"),
+                                    &crate::session::config::Config::default(),
+                                )
+                                .unwrap_or_default(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(target: "hooks", %error, "Failed to list conversation hook profiles")
+        }
+    }
+    targets
 }
 
 /// Home-injectable variant of [`iter_hook_targets`]. Tests construct a

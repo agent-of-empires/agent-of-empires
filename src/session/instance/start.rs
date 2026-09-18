@@ -272,6 +272,9 @@ impl Instance {
                 self.id
             );
         }
+        if !self.is_sandboxed() {
+            self.install_agent_status_hooks(self.status_agent(), prepared.execution.as_ref());
+        }
         let canonicalized = prepared.canonical_conversation.is_some();
         let launch_sid = if prepared.is_existing {
             Some(
