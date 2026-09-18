@@ -88,6 +88,16 @@ impl Instance {
             )
         } else if self.uses_pi_session_sidecar() {
             self.pi_published_conversation(true)
+        } else if matches!(
+            self.active_execution
+                .as_ref()
+                .and_then(|active| active.capture.as_ref()),
+            Some(CaptureContext::Prime {
+                sidecar: Some(_),
+                ..
+            })
+        ) {
+            self.prime_published_conversation()
         } else {
             None
         }

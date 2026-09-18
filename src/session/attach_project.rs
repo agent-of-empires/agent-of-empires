@@ -1729,6 +1729,60 @@ mod tests {
         assert!(observed.agent_session_binding.as_ref().unwrap().is_known());
         assert!(session_wt.join("README.md").exists());
 
+        let mut prime = observed;
+        prime.tool = "prime-agent".into();
+        prime.agent_session_id = None;
+        prime.agent_session_binding = None;
+        let prime_store = temp.path().join("prime-store");
+        let sessions = prime_store.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let sidecars = prime_store.join("aoe-session").join(&prime.id);
+        std::fs::create_dir_all(&sidecars).unwrap();
+        let header = serde_json::json!({
+            "type": "session", "id": rotated, "cwd": "/workspace", "rlmDepth": 0
+        });
+        std::fs::write(sessions.join("root.jsonl"), format!("{header}\n")).unwrap();
+        std::fs::write(
+            sidecars.join("root_session"),
+            serde_json::to_vec(&serde_json::json!({
+                "id": rotated, "path": "/root/.prime/agent/sessions/root.jsonl",
+                "cwd": "/workspace", "rlmDepth": 0
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let active = prime.active_execution.as_mut().unwrap();
+        active.binding.agent = "prime-agent".into();
+        active.binding.stores = vec![prime_store.clone()];
+        active.capture = Some(crate::session::instance::CaptureContext::Prime {
+            plan: crate::session::instance::PrimeAgentCapturePlan {
+                store: prime_store,
+                session_dir: "sessions".into(),
+                container_session_dir: "/root/.prime/agent/sessions".into(),
+                container_cwd: "/workspace".into(),
+            },
+            sidecar: Some(crate::session::instance::SessionSidecarSource::SandboxDir(
+                sidecars,
+            )),
+        });
+        storage
+            .update(|rows, _| {
+                rows[0] = prime.clone();
+                Ok(())
+            })
+            .unwrap();
+        let prime_plan = plan(&prime, "attach-conv", &frontend, ExistingBranch::Refuse).unwrap();
+        assert!(
+            attach_planned(&storage, &prime.id, &prime, prime_plan).is_err(),
+            "a materialized Prime root must be drained before conversion commits"
+        );
+        let disk = storage.load().unwrap().remove(0);
+        assert_eq!(disk.project_path, inst.project_path);
+        assert!(disk.workspace_info.is_none());
+        assert_eq!(disk.agent_session_id.as_deref(), Some(rotated));
+        assert!(disk.agent_session_binding.as_ref().unwrap().is_known());
+        assert!(session_wt.join("README.md").exists());
+
         storage
             .update(|rows, _| {
                 rows[0].resume_intent = crate::session::ResumeIntent::Cleared;

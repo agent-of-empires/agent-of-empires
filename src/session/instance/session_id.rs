@@ -1149,6 +1149,15 @@ impl Instance {
         observation
     }
 
+    pub(super) fn prime_published_conversation(
+        &self,
+    ) -> Option<crate::session::poller::SessionIdObservation> {
+        let PrimeRootPublication::Ready(sid) = self.prime_root_publication()? else {
+            return None;
+        };
+        Some(self.prime_root_observation(sid))
+    }
+
     pub(super) fn absorb_published_prime_session(&mut self) -> bool {
         if !matches!(self.resume_intent, ResumeIntent::Default) {
             return false;
@@ -2304,6 +2313,106 @@ mod tests {
             assert!(command.contains(&format!("--resume {sid}")), "{command}");
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn fresh_prime_launch_does_not_recapture_abandoned_root() {
+        use crate::session::instance::start::test_support::{FinalizeObserver, FinalizePhase};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut inst = Instance::new("prime-abandoned", project.to_str().unwrap());
+        inst.tool = "prime-agent".into();
+        inst.sandbox_info = Some(SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test-image".into(),
+            container_name: "prime-abandoned".into(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: Some("/workspace/project".into()),
+        });
+        let _transport = install_container_transport(
+            tmp.path(),
+            "prime-abandoned",
+            &inst.build_container_config().unwrap().volumes,
+        );
+        inst.build_launch_command(None).unwrap();
+        let plan = inst
+            .prime_agent_capture_plan(inst.prime_agent_capture_options().unwrap())
+            .unwrap();
+        let old = "018f47a6-7b80-7cc3-98a2-37b5f486b2a1";
+        let abandoned = "018f47a6-7b80-7cc3-98a2-37b5f486b2a2";
+        let sessions = plan.store.join(&plan.session_dir);
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("abandoned.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "type": "session", "id": abandoned, "cwd": plan.container_cwd, "rlmDepth": 0
+                })
+            ),
+        )
+        .unwrap();
+        let sidecars = plan.store.join("aoe-session").join(&inst.id);
+        std::fs::create_dir_all(&sidecars).unwrap();
+        std::fs::write(
+            sidecars.join("root_session"),
+            serde_json::to_vec(&serde_json::json!({
+                "id": abandoned,
+                "path": plan.container_session_dir.join("abandoned.jsonl"),
+                "cwd": plan.container_cwd, "rlmDepth": 0
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        inst.set_agent_conversation(Some(old.into()), None, None);
+        let prepared = inst
+            .prepare_launch_command(inst.conversation_state())
+            .unwrap();
+        assert!(!prepared.is_existing);
+        assert!(matches!(prepared.fresh_notice,
+            Some(crate::session::instance::FreshLaunchNotice::UnqualifiedStoredConversation { ref sid })
+                if sid == abandoned));
+        let name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(name);
+        let observed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let observed_in_callback = observed.clone();
+        let _observer = FinalizeObserver::install(inst.id.clone(), move |instance, phase| {
+            if let FinalizePhase::Before = phase {
+                observed_in_callback.set(true);
+                let poll = crate::session::capture::prime_agent_poll_fn_sandboxed(
+                    instance.prime_root_sidecar_poll_fn(plan.clone()),
+                    plan.clone(),
+                    instance.id.clone(),
+                    f64::MAX,
+                    instance.retroactive_capture_excludes.clone(),
+                    instance
+                        .active_execution
+                        .as_ref()
+                        .map(|active| active.binding.clone()),
+                );
+                assert_eq!(
+                    poll(),
+                    None,
+                    "fresh launch must not recapture the abandoned root before republication"
+                );
+            }
+        });
+        let outcome = inst
+            .spawn_prepared_launch(None, "default", prepared)
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            crate::session::LaunchSidOutcome::Fresh { .. }
+        ));
+        inst.stop_poller();
+        assert!(observed.get());
     }
 
     #[test]
