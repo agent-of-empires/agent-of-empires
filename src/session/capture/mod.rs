@@ -1683,7 +1683,12 @@ mod tests {
     #[test]
     fn test_claude_host_transcript_confirmed_absent() {
         let tmp = tempfile::tempdir().unwrap();
-        let project_dir = tmp.path().join("projects").join("-tmp-myproject");
+        // The lookup resolves existing ancestors even for a missing project:
+        // on macOS, /tmp/myproject is rooted under /private/tmp.
+        let project_path = "/tmp/myproject";
+        let project_dir = tmp.path().join("projects").join(encode_claude_project_path(
+            &canonicalize_or_raw(project_path).to_string_lossy(),
+        ));
         std::fs::create_dir_all(&project_dir).unwrap();
 
         let present = "11111111-2222-3333-4444-555555555555";
@@ -1704,11 +1709,11 @@ mod tests {
             crate::session::test_support::EnvGuard::set(&[("CLAUDE_CONFIG_DIR", tmp.path())]);
 
         assert!(
-            !claude_host_transcript_confirmed_absent("/tmp/myproject", present, &[]),
+            !claude_host_transcript_confirmed_absent(project_path, present, &[]),
             "a transcript on disk (even stale) must not be reported absent"
         );
         assert!(
-            claude_host_transcript_confirmed_absent("/tmp/myproject", missing, &[]),
+            claude_host_transcript_confirmed_absent(project_path, missing, &[]),
             "an unwritten sid must be reported confirmed-absent"
         );
         // A project dir that was never created is also confirmed-absent.

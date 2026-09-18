@@ -12,6 +12,7 @@ use std::io::Read;
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 #[derive(Debug)]
 pub(crate) struct AnchoredDir {
@@ -190,16 +191,35 @@ impl AnchoredDir {
         if Path::new(name).file_name() != Some(name) {
             bail!("lock file needs a single leaf");
         }
-        let fd = openat(
-            &self.fd,
-            name,
-            OFlag::O_RDWR
-                | OFlag::O_CREAT
-                | OFlag::O_CLOEXEC
-                | OFlag::O_NOFOLLOW
-                | OFlag::O_NONBLOCK,
-            Mode::from_bits_truncate(0o600),
-        )?;
+        let mut retries = 0u8;
+        let fd = loop {
+            match openat(
+                &self.fd,
+                name,
+                OFlag::O_RDWR
+                    | OFlag::O_CREAT
+                    | OFlag::O_CLOEXEC
+                    | OFlag::O_NOFOLLOW
+                    | OFlag::O_NONBLOCK,
+                Mode::from_bits_truncate(0o600),
+            ) {
+                Ok(fd) => break fd,
+                // POSIX gives O_CREAT on an open directory descriptor no way
+                // to report ENOENT for a non-empty leaf. macOS APFS does so
+                // transiently while sibling threads churn creates and renames
+                // in the same directory. A deleted anchor keeps failing and
+                // the context below still names the sidecar.
+                Err(Errno::ENOENT) if retries < 3 => {
+                    retries += 1;
+                    std::thread::sleep(Duration::from_millis(u64::from(retries)));
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("opening lock sidecar {}", self.root.join(name).display())
+                    });
+                }
+            }
+        };
         if fstat(&fd)?.st_mode & nix::libc::S_IFMT != nix::libc::S_IFREG {
             bail!("data-file sidecar is not a regular file");
         }

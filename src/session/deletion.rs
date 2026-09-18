@@ -2891,11 +2891,10 @@ mod tests {
         #[test]
         fn sandboxed_with_worktree_kills_tmux_and_container_before_worktree() {
             let _app_guard = crate::session::test_support::isolate_app_dir();
-            // Synthesize an instance with both worktree_info and an
-            // (enabled) sandbox_info pointing at a non-existent
-            // container. The container ops will no-op (container does
-            // not exist), but the *order* of stage events is still
-            // emitted, and that's what we're testing.
+            // Exercise sandbox + worktree stage ordering with an explicitly
+            // absent container. A nonexistent name alone is insufficient:
+            // an unavailable runtime fails teardown and correctly prevents
+            // worktree cleanup.
             let mut instance = Instance::new("Test", "/tmp/aoe-deletion-test-nonexistent");
             instance.sandbox_info = Some(SandboxInfo {
                 enabled: true,
@@ -2920,7 +2919,9 @@ mod tests {
             };
 
             let stages = run_with_capture(|| {
-                let _ = perform_deletion(&request);
+                let result =
+                    perform_deletion_with(&request, |_id| crate::containers::Teardown::AlreadyGone);
+                assert!(result.success, "{:?}", result.errors);
             });
 
             // tmux_kill must precede container_remove must precede
