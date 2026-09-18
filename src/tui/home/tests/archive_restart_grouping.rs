@@ -2572,7 +2572,7 @@ fn profile_move_group_metadata_survives_reload() {
             .entry("beta".to_string())
             .or_insert_with(|| GroupTree::new_with_groups(&[], &[]));
         let requested = view.instances["moved"].clone();
-        view.move_to_profile("moved", "beta", requested, None)
+        view.move_to_profile("moved", "beta", requested, None, false)
             .unwrap();
     }
 

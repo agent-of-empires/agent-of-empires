@@ -531,7 +531,16 @@ impl HomeView {
                 target_profile,
                 requested,
                 Some(&restart_edit_authoritative),
+                account_swap,
             )?;
+            // The committed row is the authority the launch resumes from, and
+            // the capture pollers can have refreshed its conversation since the
+            // snapshot the plan froze; see `ConversationCarry::retarget`.
+            if let Some(carry) = carry_plan.as_mut() {
+                if let Some(moved) = self.get_instance(&id) {
+                    carry.retarget(conversation_carry::conversation_ids(moved));
+                }
+            }
             self.reload_preserving_profile_move_runtime(std::slice::from_ref(&id))?;
         } else {
             // Outside Attention sort, restart on a snoozed row clears the
@@ -1669,6 +1678,7 @@ impl HomeView {
                     target_profile,
                     projected_move,
                     Some(&current_instance),
+                    false,
                     move |candidate| {
                         if tied_edit {
                             if let Some(worktree_info) = effect_instance.worktree_info.as_ref() {

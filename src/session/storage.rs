@@ -968,6 +968,10 @@ impl GroupMovePlan {
 struct MoveTransactionPlan<'a> {
     group_move: &'a GroupMovePlan,
     merge_complete_post: bool,
+    /// A tool change on this move swaps accounts of one agent rather than
+    /// agents, so the moved row keeps its conversation; see
+    /// [`Instance::merge_profile_move_diff`].
+    account_swap: bool,
 }
 
 fn apply_group_move(
@@ -1391,6 +1395,7 @@ impl Storage {
         target: &Storage,
         before: &Instance,
         after: &Instance,
+        account_swap: bool,
         validate_target: F,
         before_commit: B,
     ) -> Result<Instance>
@@ -1406,6 +1411,7 @@ impl Storage {
             MoveTransactionPlan {
                 group_move: &group_move,
                 merge_complete_post: true,
+                account_swap,
             },
             |instances, candidates| validate_target(instances, &candidates[0]),
             |candidates| before_commit(&candidates[0]),
@@ -1437,6 +1443,7 @@ impl Storage {
             MoveTransactionPlan {
                 group_move,
                 merge_complete_post: false,
+                account_swap: false,
             },
             validate_target,
             |_| Ok(()),
@@ -1545,7 +1552,7 @@ impl Storage {
             }
             let mut candidate = source.clone();
             if plan.merge_complete_post {
-                candidate.merge_profile_move_diff(before, after);
+                candidate.merge_profile_move_diff(before, after, plan.account_swap);
             } else {
                 candidate.merge_user_action_diff(before, after);
             }
@@ -4501,6 +4508,7 @@ mod tests {
             &target,
             &before,
             &before,
+            false,
             |instances, candidate| {
                 if instances.iter().any(|row| {
                     row.title == candidate.title
@@ -4651,6 +4659,7 @@ mod tests {
             MoveTransactionPlan {
                 group_move: &GroupMovePlan::single("work", "work"),
                 merge_complete_post: true,
+                account_swap: false,
             },
             |_existing, _candidates| Ok(()),
             |_| Ok(()),
@@ -4705,6 +4714,7 @@ mod tests {
             MoveTransactionPlan {
                 group_move: &plan,
                 merge_complete_post: true,
+                account_swap: false,
             },
             |_existing, _candidates| Ok(()),
             |_| Ok(()),
@@ -4757,6 +4767,7 @@ mod tests {
             MoveTransactionPlan {
                 group_move: &plan,
                 merge_complete_post: true,
+                account_swap: false,
             },
             |_existing, _candidates| Ok(()),
             |_moved| {
@@ -4859,6 +4870,7 @@ mod tests {
                 &target,
                 &before,
                 &before,
+                false,
                 |_instances, _candidate| Ok(()),
                 |_| Ok(()),
             )
@@ -4880,6 +4892,7 @@ mod tests {
                 &target,
                 &before,
                 &before,
+                false,
                 |_instances, _candidate| Ok(()),
                 |_| {
                     effect_ran.set(true);
@@ -4993,6 +5006,7 @@ mod tests {
                 MoveTransactionPlan {
                     group_move: &GroupMovePlan::single("work", "moved"),
                     merge_complete_post: true,
+                    account_swap: false,
                 },
                 |_existing, _candidates| Ok(()),
                 |_| Ok(()),
@@ -5061,6 +5075,7 @@ mod tests {
                 MoveTransactionPlan {
                     group_move: &GroupMovePlan::single("work", "moved"),
                     merge_complete_post: true,
+                    account_swap: false,
                 },
                 |_existing, _candidates| Ok(()),
                 |_| Ok(()),
@@ -5902,6 +5917,7 @@ mod tests {
                 MoveTransactionPlan {
                     group_move: &GroupMovePlan::single("work", "moved"),
                     merge_complete_post: true,
+                    account_swap: false,
                 },
                 |_existing, _candidates| Ok(()),
                 |_| {

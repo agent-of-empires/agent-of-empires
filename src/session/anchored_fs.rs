@@ -5,7 +5,7 @@ use nix::dir::Dir;
 use nix::errno::Errno;
 use nix::fcntl::{open, openat, AtFlags, OFlag};
 use nix::sys::stat::{fstat, fstatat, mkdirat, Mode};
-use nix::unistd::{unlinkat, UnlinkatFlags};
+use nix::unistd::{linkat, unlinkat, UnlinkatFlags};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::Read;
@@ -219,19 +219,31 @@ impl AnchoredDir {
         matches!(self.regular_lookup(relative), Ok(Some(true)))
     }
 
-    /// Rename `from` onto `to`, both anchored. Used to publish a file only
-    /// once it is complete, so a process killed mid-write leaves a temporary
-    /// name rather than a half file under the real one.
-    pub(crate) fn rename_within(&self, from: &Path, to: &Path) -> Result<()> {
+    /// Publish the staging file `from` at `to`, then drop the staging name.
+    /// `false` means something was already at `to` and was left untouched.
+    ///
+    /// Makes a file visible only once it is complete, so a process killed
+    /// mid-write leaves a staging name rather than a half file under the real
+    /// one. `linkat` rather than `renameat` because rename replaces the
+    /// destination: a writer that created `to` between a caller's existence
+    /// check and this call would lose its file. `renameat2(RENAME_NOREPLACE)`
+    /// would also answer, but it is Linux-only and this has to hold on macOS.
+    pub(crate) fn publish_staged(&self, from: &Path, to: &Path) -> Result<bool> {
         let (from_parent, from_leaf) = self.open_parent(from)?;
         let (to_parent, to_leaf) = self.open_parent(to)?;
-        nix::fcntl::renameat(
+        let published = match linkat(
             &from_parent,
             from_leaf.as_os_str(),
             &to_parent,
             to_leaf.as_os_str(),
-        )
-        .context("renaming anchored file")
+            AtFlags::empty(),
+        ) {
+            Ok(()) => true,
+            Err(Errno::EEXIST) => false,
+            Err(error) => return Err(error).context("publishing anchored file"),
+        };
+        self.remove_file(from)?;
+        Ok(published)
     }
 
     pub(crate) fn remove_file(&self, relative: &Path) -> Result<()> {

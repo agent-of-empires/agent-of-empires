@@ -281,11 +281,11 @@ fn claude_transcripts_for(root: &AnchoredDir, session_id: &str) -> Result<Vec<Pa
 /// Copy `relative` from `source` to `target`, leaving an existing target file
 /// alone.
 ///
-/// The content lands under a temporary name and is renamed into place, so a
-/// half transcript is never reachable under the real one: it would resume into
-/// a conversation that silently loses its tail, and being already-present the
-/// next carry would skip rather than repair it. A crash leaves the temporary
-/// name behind instead, which nothing reads.
+/// The content lands under a staging name and is published with a no-replace
+/// link, so a half transcript is never reachable under the real one: it would
+/// resume into a conversation that silently loses its tail, and being
+/// already-present the next carry would skip rather than repair it. A crash
+/// leaves the staging name behind instead, which nothing reads.
 fn copy_file(source: &AnchoredDir, target: &AnchoredDir, relative: &Path) -> Result<()> {
     let Some(mut reader) = source.open_regular(relative, TRANSCRIPT_MAX_BYTES)? else {
         if source.regular_exists(relative) {
@@ -314,12 +314,14 @@ fn copy_file(source: &AnchoredDir, target: &AnchoredDir, relative: &Path) -> Res
     let copied = std::io::copy(&mut reader, &mut writer)
         .and_then(|_| writer.sync_all())
         .map_err(anyhow::Error::from)
-        .and_then(|()| target.rename_within(&staging, relative));
-    if let Err(error) = copied {
-        let _ = target.remove_file(&staging);
-        return Err(error);
+        .and_then(|()| target.publish_staged(&staging, relative));
+    match copied {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let _ = target.remove_file(&staging);
+            Err(error)
+        }
     }
-    Ok(())
 }
 
 /// The temporary name `relative` is written under before it is published.

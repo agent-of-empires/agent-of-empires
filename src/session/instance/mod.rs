@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use crate::containers::{self, DockerContainer};
 use crate::session::config::container_config;
+use crate::session::conversation_carry::ConversationCarry;
 use crate::session::environment::{
     build_docker_env_args_with_managed_codex_home, resolved_sandbox_environment, shell_escape,
     shell_escape_script_word,

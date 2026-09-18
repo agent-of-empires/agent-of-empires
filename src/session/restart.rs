@@ -27,9 +27,10 @@ pub struct RestartRequest {
     /// creates a fresh one. Set on a tool swap: launch recreates a container
     /// labelled for another tool, but not one created before that label (#3959).
     pub discard_sandbox_container: bool,
-    /// Copy the conversation into the incoming account's agent config root
-    /// before relaunching. Set on a swap that changes only the account
-    /// (#4030); planned against the pre-swap row.
+    /// Copy the conversation into the incoming account's agent config root.
+    /// Set on a swap that changes only the account (#4030); planned against the
+    /// pre-swap row and run inside the cascade, once the outgoing agent is dead
+    /// and before the incoming one starts.
     pub conversation_carry: Option<crate::session::conversation_carry::ConversationCarry>,
 }
 
@@ -58,12 +59,6 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
         conversation_carry,
     } = request;
 
-    // Before the cascade: the launch resumes from the incoming account's
-    // config root, so the transcript has to be there by then.
-    if let Some(carry) = conversation_carry {
-        carry.run();
-    }
-
     let title = instance.title.clone();
     let tool = instance.tool.clone();
     let before = instance.clone();
@@ -80,7 +75,12 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
             )
         });
         instance
-            .restart_discarding_sandbox_container(size, skip_on_launch, discard_sandbox_container)
+            .restart_discarding_sandbox_container(
+                size,
+                skip_on_launch,
+                discard_sandbox_container,
+                conversation_carry,
+            )
             .map_err(|e| e.to_string())
     };
 

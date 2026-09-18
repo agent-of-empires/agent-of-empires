@@ -362,13 +362,22 @@ impl Instance {
     /// preserving unrelated fields refreshed by a peer after `pre` was read.
     /// A tool change is one atomic state transition: the tool name and every
     /// conversation field staged by `swap_tool` must travel together.
-    pub(crate) fn merge_profile_move_diff(&mut self, pre: &Self, post: &Self) {
+    /// `account_swap` says the tool change keeps the same agent and changes
+    /// only which account it runs as, so the conversation travels with the row
+    /// instead of being parked (#4030). The caller classifies it, rather than
+    /// this deciding for itself, so the row that lands matches the swap the
+    /// restart already planned its transcript copy for.
+    pub(crate) fn merge_profile_move_diff(&mut self, pre: &Self, post: &Self, account_swap: bool) {
         self.merge_user_action_diff(pre, post);
         if pre.tool != post.tool {
             // Apply the requested transition to the freshly locked disk row.
             // The TUI post snapshot can carry parked session ids captured
             // before a poller or peer refreshed the durable conversation state.
-            self.swap_tool(&post.tool);
+            if account_swap {
+                self.swap_account(&post.tool);
+            } else {
+                self.swap_tool(&post.tool);
+            }
         }
         if pre.command != post.command {
             self.command = post.command.clone();
@@ -1824,6 +1833,51 @@ mod tests {
     /// `swap_tool` re-resolves the alias for the incoming tool. The alias is
     /// per-tool, so carrying the outgoing tool's value forward aims every
     /// launch-time reader at the wrong built-in.
+    /// The cross-profile move re-applies the swap to the freshly locked disk
+    /// row, so it has to be told which swap the restart classified. Left to
+    /// park, an account swap lands the moved row with no session id and the
+    /// transcript the carry copied is orphaned (#4030).
+    #[test]
+    fn merge_profile_move_diff_carries_the_conversation_on_an_account_swap() {
+        const PROFILE: &str = "profile-move-account-swap-test";
+        let _registry = install_aliases(PROFILE, &[("claude-1", "claude"), ("claude-2", "claude")]);
+
+        // (account swap, sid on the moved row, sid parked under the old tool)
+        let cases = [
+            (true, Some("durable-sid"), None),
+            (false, None, Some("durable-sid")),
+        ];
+        for (account_swap, expected_live, expected_parked) in cases {
+            let mut locked = Instance::new("t", "/tmp/x");
+            locked.source_profile = PROFILE.to_string();
+            locked.tool = "claude-1".to_string();
+            locked.detect_as = "claude".to_string();
+            locked.agent_session_id = Some("durable-sid".to_string());
+
+            let mut pre = locked.clone();
+            pre.agent_session_id = Some("stale-snapshot-sid".to_string());
+            let mut post = pre.clone();
+            post.tool = "claude-2".to_string();
+
+            locked.merge_profile_move_diff(&pre, &post, account_swap);
+
+            assert_eq!(locked.tool, "claude-2", "account_swap={account_swap}");
+            assert_eq!(
+                locked.agent_session_id.as_deref(),
+                expected_live,
+                "account_swap={account_swap}: the locked row's own id is the durable one"
+            );
+            assert_eq!(
+                locked
+                    .prior_tool_session_ids
+                    .get("claude-1")
+                    .and_then(|parked| parked.agent_session_id.as_deref()),
+                expected_parked,
+                "account_swap={account_swap}"
+            );
+        }
+    }
+
     #[test]
     fn swap_account_keeps_the_conversation_and_drops_the_parked_one() {
         const PROFILE: &str = "account-swap-test";

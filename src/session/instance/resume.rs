@@ -62,17 +62,20 @@ impl Instance {
         skip_on_launch: bool,
         resume_policy: ResumeAttemptPolicy,
     ) -> Result<StartOutcome> {
-        self.orchestrate_resume_launch(size, skip_on_launch, resume_policy, true, false)
+        self.orchestrate_resume_launch(size, skip_on_launch, resume_policy, true, false, None)
     }
 
     /// Restart, first removing the sandbox container when `discard_sandbox_container`
-    /// is set so the launch recreates it with the current tool's mounts (#3959).
+    /// is set so the launch recreates it with the current tool's mounts (#3959),
+    /// and carrying the conversation into the incoming account's config root
+    /// when the swap changed only the account (#4030).
     /// Removal happens only once this restart owns the Launch reservation.
     pub fn restart_discarding_sandbox_container(
         &mut self,
         size: Option<(u16, u16)>,
         skip_on_launch: bool,
         discard_sandbox_container: bool,
+        conversation_carry: Option<ConversationCarry>,
     ) -> Result<StartOutcome> {
         self.orchestrate_resume_launch(
             size,
@@ -80,6 +83,7 @@ impl Instance {
             ResumeAttemptPolicy::HonorAutoResumeSetting,
             true,
             discard_sandbox_container,
+            conversation_carry,
         )
     }
 
@@ -185,7 +189,7 @@ impl Instance {
         skip_on_launch: bool,
         resume_policy: ResumeAttemptPolicy,
     ) -> Result<StartOutcome> {
-        self.orchestrate_resume_launch(size, skip_on_launch, resume_policy, false, false)
+        self.orchestrate_resume_launch(size, skip_on_launch, resume_policy, false, false, None)
     }
 
     fn orchestrate_resume_launch(
@@ -195,6 +199,7 @@ impl Instance {
         resume_policy: ResumeAttemptPolicy,
         restart: bool,
         discard_sandbox_container: bool,
+        conversation_carry: Option<ConversationCarry>,
     ) -> Result<StartOutcome> {
         crate::session::validate_instance_id(&self.id)
             .context("refusing to start: AOE_INSTANCE_ID failed validation")?;
@@ -263,6 +268,14 @@ impl Instance {
             if restart {
                 self.kill_clean_locked()?;
                 prepared = self.refresh_prepared_prime_launch_after_pane_stop(prepared)?;
+            }
+            // After the outgoing pane is dead and before the incoming one
+            // starts. The outgoing agent appends to its transcript for as long
+            // as it runs, so a copy taken earlier would silently drop whatever
+            // it wrote after that read, and the incoming account's copy is
+            // never repaired once it exists.
+            if let Some(carry) = conversation_carry {
+                carry.run();
             }
             let launch_outcome = self.spawn_prepared_launch(size, &profile, prepared)?;
             let outcome =
