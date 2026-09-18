@@ -3583,6 +3583,18 @@ impl<S: BroadcastSink> Supervisor<S> {
                 resumed = resumable.len(),
                 "resuming background sub-agent tailing after daemon restart"
             );
+            // A send failure here means the connection died between install
+            // and this await; `cmd_tx` and the drain task's `inbound` come
+            // from the same connection task, so the drain task already saw
+            // (or is about to see) the closed channel and will run its own
+            // closed-inbound handling, which drops this `WorkerHandle` and
+            // releases its lease. Propagating the error instead would route
+            // through the caller's fresh-spawn fallback, which calls
+            // `terminate_and_wait` on the runner, killing a runner that may
+            // still be alive (this is a client-connection failure, not proof
+            // the runner process died). Swallowing it here and letting
+            // `readopt_orphan_runners` reattach on the next tick keeps that
+            // runner alive for the self-heal instead.
             let _ = client.resume_background_tailing(resumable).await;
         }
         info!(
@@ -4221,7 +4233,13 @@ fn detach_orphaned_background_agents_on<S: BroadcastSink>(
         "detaching background sub-agents orphaned by daemon restart"
     );
     for agent_id in stale_ids {
-        publish_background_agent_detached(sink, next_seqs, session_id, agent_id);
+        publish_background_agent_detached(
+            sink,
+            next_seqs,
+            session_id,
+            agent_id,
+            "the worker that was tracking this sub-agent was replaced; tracking stopped",
+        );
     }
 }
 
@@ -4229,12 +4247,14 @@ fn detach_orphaned_background_agents_on<S: BroadcastSink>(
 /// for one orphaned agent id. Shared by
 /// [`detach_orphaned_background_agents_on`] (every id) and
 /// [`collect_resumable_background_agent_launches`] (only ids with no
-/// transcript path to resume from).
+/// transcript path to resume from); `warning` is caller-supplied since the
+/// two sites replace the tracking worker for different reasons.
 fn publish_background_agent_detached<S: BroadcastSink>(
     sink: &S,
     next_seqs: &SeqMap,
     session_id: &str,
     agent_id: String,
+    warning: &str,
 ) {
     let seq = next_seq(next_seqs, session_id);
     sink.publish(
@@ -4245,9 +4265,7 @@ fn publish_background_agent_detached<S: BroadcastSink>(
             status: crate::acp::state::BackgroundAgentStatus::Detached,
             tools: Vec::new(),
             result: None,
-            warning: Some(
-                "session reattached before this sub-agent finished; tracking stopped".to_string(),
-            ),
+            warning: Some(warning.to_string()),
             ended_at: chrono::Utc::now(),
         },
     );
@@ -4272,7 +4290,13 @@ fn collect_resumable_background_agent_launches<S: BroadcastSink>(
         .into_iter()
         .partition(|l| !l.output_file.is_empty());
     for launch in untrackable {
-        publish_background_agent_detached(sink, next_seqs, session_id, launch.agent_id);
+        publish_background_agent_detached(
+            sink,
+            next_seqs,
+            session_id,
+            launch.agent_id,
+            "session reattached before this sub-agent finished; tracking stopped",
+        );
     }
     resumable
 }
