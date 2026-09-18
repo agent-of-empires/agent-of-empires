@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use crate::session::{
     acquire_session_identity_lock, duplicate_session_error, is_duplicate_session, GroupTree,
-    Instance, LifecycleOperation, ResumeIntent, StartOutcome, Storage,
+    Instance, LaunchSidOutcome, LifecycleOperation, ResumeIntent, StartOutcome, Storage,
 };
 
 #[derive(Subcommand)]
@@ -822,10 +822,9 @@ async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
 
     // Launch orchestration owns its lifecycle locks and deliberately releases
     // them while user hooks run.
-    let _ = working.start_with_size_opts(crate::terminal::get_size(), false)?;
+    let launch_sid = working.start_with_size_opts(crate::terminal::get_size(), false)?;
 
     // The CLI has no long-lived loop to drain the just-started session-id
-    // poller, so a capture-deferred agent would exit with agent_session_id unset
     // and silently lose resume. Wait briefly for the poller and persist via the
     // same drain the TUI/daemon use.
     let file_watch = crate::file_watch::FileWatchService::noop();
@@ -864,6 +863,13 @@ async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         );
     }
 
+    if let LaunchSidOutcome::Fresh {
+        fresh_notice: Some(notice),
+        ..
+    } = launch_sid
+    {
+        eprintln!("{}", notice.warning_message());
+    }
     println!("✓ Started session: {}", title);
     Ok(())
 }

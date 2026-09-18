@@ -210,6 +210,55 @@ fn migrated_unknown_restart_warns_and_leaves_the_old_conversation_intact() {
 
 #[test]
 #[parallel]
+fn migrated_unknown_start_warns_like_restart() {
+    require_tmux!();
+    let mut h = new_harness("resume_unknown_start_warning");
+    let log = install_fake_agent(&mut h);
+    let project = h.project_path();
+    let add = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "--cmd",
+        FAKE_AGENT,
+        "-t",
+        TITLE,
+    ]);
+    assert!(add.status.success(), "{add:?}");
+    let _cleanup = StopSessionOnDrop { h: &h };
+    let transcript = seed_claude_transcript(&h, &project, STALE_SID);
+    let original = fs::read(&transcript).unwrap();
+    patch_session(&h, TITLE, |row| {
+        row.insert("agent_session_id".into(), Value::String(STALE_SID.into()));
+        row.insert(
+            "agent_session_binding".into(),
+            serde_json::json!({
+                "session_id": STALE_SID,
+                "execution": null,
+                "provenance": "unknown",
+                "transcript_path": null
+            }),
+        );
+        row.remove("resume_intent");
+        row.remove("resume_binding");
+        row.remove("active_execution");
+    });
+    let started = h.run_cli(&["session", "stop", TITLE]);
+    assert!(started.status.success(), "{started:?}");
+    let started = h.run_cli(&["session", "start", TITLE]);
+    assert!(started.status.success(), "{started:?}");
+    let diagnostic = String::from_utf8_lossy(&started.stderr);
+    assert!(
+        diagnostic.contains("starting fresh") && diagnostic.contains("unknown provenance"),
+        "start must explain why the previous conversation was not resumed: {started:?}"
+    );
+    let sessions = read_sessions(&h);
+    let row = session_by_title(&sessions, TITLE);
+    assert_ne!(row["agent_session_id"].as_str(), Some(STALE_SID));
+    assert_eq!(fs::read(&transcript).unwrap(), original);
+}
+
+#[test]
+#[parallel]
 fn stale_resume_failure_persists_loop_breaker_and_next_restart_starts_fresh() {
     require_tmux!();
 
