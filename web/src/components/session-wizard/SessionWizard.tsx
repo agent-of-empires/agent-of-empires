@@ -47,6 +47,11 @@ const MORE_OPTIONS_OPEN_KEY = "aoe-new-session-more-options-open";
  *  #2614. */
 const LAST_USED_INSTRUCTION_KEY = "aoe-new-session-last-instruction";
 
+/** localStorage key remembering the project path of the last launched
+ *  session, read only by a plain open (a prefill brings its own path or
+ *  none). Absolute paths only; anything else is ignored. */
+const LAST_USED_PROJECT_KEY = "aoe-new-session-last-project";
+
 function loadLastUsedTool(): string {
   const stored = safeGetItem(LAST_USED_TOOL_KEY);
   if (stored && ACP_CAPABLE_TOOLS.has(stored)) {
@@ -68,6 +73,16 @@ function saveLastUsedInstruction(instruction: string): void {
   safeSetItem(LAST_USED_INSTRUCTION_KEY, instruction);
 }
 
+function loadLastUsedProject(): string {
+  const stored = safeGetItem(LAST_USED_PROJECT_KEY) ?? "";
+  return stored.startsWith("/") ? stored : "";
+}
+
+function saveLastUsedProject(path: string): void {
+  if (!path.startsWith("/")) return;
+  safeSetItem(LAST_USED_PROJECT_KEY, path);
+}
+
 function loadMoreOptionsOpen(): boolean {
   return safeGetItem(MORE_OPTIONS_OPEN_KEY) === "true";
 }
@@ -79,8 +94,13 @@ function saveMoreOptionsOpen(open: boolean): void {
 /** Layer the last-used tool over the shared `initialData` template so
  *  fresh wizard opens default to whatever the user picked last. The
  *  prefill path overrides this when `prefill.tool` is set. */
-function buildInitialData(): WizardData {
-  return { ...initialData, tool: loadLastUsedTool(), customInstruction: loadLastUsedInstruction() };
+function buildInitialData(nameOnly: boolean): WizardData {
+  return {
+    ...initialData,
+    path: nameOnly ? "" : loadLastUsedProject(),
+    tool: loadLastUsedTool(),
+    customInstruction: loadLastUsedInstruction(),
+  };
 }
 
 function acpDefaultsFor(session: Record<string, unknown> | undefined, tool: string): { model: string; effort: string } {
@@ -119,7 +139,7 @@ interface Props {
 }
 
 export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }: Props) {
-  const baseInitial = buildInitialData();
+  const baseInitial = buildInitialData(nameOnly);
   const prefillData: WizardData = prefill
     ? {
         ...baseInitial,
@@ -178,6 +198,12 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
     body: CreateSessionRequest;
     tool: string;
   } | null>(null);
+  // Launch waits for the profile defaults below to settle. A remembered path
+  // satisfies the submit gate at mount, so without this a one-action launch
+  // could send initialData's sandbox/worktree/yolo values instead of the
+  // profile's. Set on every outcome of the chain, so a failed fetch leaves the
+  // form usable with the defaults it has.
+  const [defaultsReady, setDefaultsReady] = useState(false);
 
   useEffect(() => {
     fetchAgents().then((a) => dispatch({ type: "SET_AGENTS", agents: a }));
@@ -191,13 +217,19 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
     // `APPLY_PROFILE_DEFAULTS` path never fires and the wizard would
     // otherwise fall back to default permissions, ignoring the profile.
     // See #1142.
-    fetchProfiles().then((p) => {
-      dispatch({ type: "SET_PROFILES", profiles: p });
-      // Prefer an explicit prefill profile; otherwise use the server's active
-      // profile (`is_default: true`). If neither resolves, pass undefined so
-      // `fetchSettings` loads the unresolved global config.
-      const effectiveProfile = prefill?.profile || p.find((x) => x.is_default)?.name || "";
-      fetchSettings(effectiveProfile || undefined).then((s) => {
+    fetchProfiles()
+      // A failed profiles fetch must not skip settings: an explicit prefill
+      // profile, or the unresolved global config, still applies.
+      .catch(() => [] as Awaited<ReturnType<typeof fetchProfiles>>)
+      .then((p) => {
+        dispatch({ type: "SET_PROFILES", profiles: p });
+        // Prefer an explicit prefill profile; otherwise use the server's active
+        // profile (`is_default: true`). If neither resolves, pass undefined so
+        // `fetchSettings` loads the unresolved global config.
+        const effectiveProfile = prefill?.profile || p.find((x) => x.is_default)?.name || "";
+        return fetchSettings(effectiveProfile || undefined);
+      })
+      .then((s) => {
         if (!s) return;
         setCommandMaps(commandMapsFromSettings(s));
         const sandbox = s.sandbox as Record<string, unknown> | undefined;
@@ -225,8 +257,9 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
           agentEffort: acpDefaults.effort,
           skipIfDirty: true,
         });
-      });
-    });
+      })
+      .catch(() => {})
+      .finally(() => setDefaultsReady(true));
     // prefill is captured at first render; we don't want to re-seed defaults
     // (and stomp on user edits) if the parent re-renders with a new object
     // identity.
@@ -355,6 +388,7 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
       dispatch({ type: "SUBMIT_SUCCESS" });
       saveLastUsedTool(tool);
       saveLastUsedInstruction(body.custom_instruction ?? "");
+      saveLastUsedProject(body.path);
       const warnings = result.session?.warnings;
       if (warnings && warnings.length > 0) {
         for (const w of warnings) toastBus.handler?.error(w);
@@ -495,6 +529,7 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
             error={state.error}
             onSubmit={handleSubmit}
             nameOnly={nameOnly}
+            defaultsReady={defaultsReady}
           />
         </div>
       </div>

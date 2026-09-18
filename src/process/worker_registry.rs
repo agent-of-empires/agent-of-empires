@@ -33,14 +33,15 @@ use crate::util::now_secs;
 pub use crate::process::worker::{is_pid_alive, validate_id as validate_session_id};
 
 /// Generation of the runner protocol and ownership semantics this daemon speaks.
-/// Generation 3 terminates ACP in the runner over the control-only transport.
-/// Earlier generations cannot be attached safely.
+/// Generation 4 announces authoritative native session identity before callbacks.
+/// Generation 3 introduced control-only ACP, but lacks this admission prerequisite.
+/// The control wire version remains 3; earlier runner generations cannot attach safely.
 ///
 /// This is deliberately separate from `is_record_live`: a wrong-generation
 /// process is still live and must be reaped before its replacement starts.
 /// Build-stale workers of the current generation remain attachable and may
 /// drain an in-flight turn before replacement.
-pub const RUNNER_VERSION: u32 = 3;
+pub const RUNNER_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerRecord {
@@ -1098,9 +1099,9 @@ mod tests {
     }
 
     /// The upgrade path #2977 introduced, over a genuinely live process: a
-    /// `runner_version: 1` record left by a previous daemon.
+    /// `runner_version: 1` or `3` record left by a previous daemon.
     ///
-    /// The chain that matters is classification then reaping. A live v1 runner
+    /// The chain that matters is classification then reaping. A live legacy runner
     /// must read as LIVE (so nothing deletes its record while its PID is the
     /// only copy of where the process is), as NOT runner-current (so the
     /// reconciler replaces it), and `terminate` must actually signal it. Get
@@ -1110,63 +1111,66 @@ mod tests {
     #[test]
     #[serial]
     #[cfg(unix)]
-    fn live_v1_record_is_live_but_stale_and_terminate_reaps_it() {
+    fn live_legacy_records_are_live_but_stale_and_terminate_reaps_them() {
         use std::os::unix::process::CommandExt as _;
 
         with_temp_home(|| {
-            // Its own process group, so the killpg lands on it alone rather
-            // than on the test runner.
-            let mut victim = KillOnDrop(
-                std::process::Command::new("sleep")
-                    .arg("60")
-                    .process_group(0)
-                    .spawn()
-                    .expect("spawn stand-in runner"),
-            );
-            let dir = workers_dir().unwrap();
-            let sock = dir.join("v1sess.sock");
-            // A v1 runner bound the relay path itself, not the sibling.
-            std::fs::write(&sock, b"").unwrap();
-            let mut rec = WorkerRecord::new(
-                "v1sess".into(),
-                victim.0.id(),
-                sock.clone(),
-                "aoe-agent".into(),
-                "aoe-agent".into(),
-                PathBuf::from("/repo"),
-                None,
-                vec![],
-                vec![],
-                None,
-                None,
-            );
-            rec.runner_version = 1;
-            save(&rec).unwrap();
+            for version in [1, 3] {
+                // Its own process group, so the killpg lands on it alone rather
+                // than on the test runner.
+                let mut victim = KillOnDrop(
+                    std::process::Command::new("sleep")
+                        .arg("60")
+                        .process_group(0)
+                        .spawn()
+                        .expect("spawn stand-in runner"),
+                );
+                let dir = workers_dir().unwrap();
+                let session_id = format!("v{version}sess");
+                let sock = dir.join(format!("{session_id}.sock"));
+                let mut rec = WorkerRecord::new(
+                    session_id.clone(),
+                    victim.0.id(),
+                    sock.clone(),
+                    "aoe-agent".into(),
+                    "aoe-agent".into(),
+                    PathBuf::from("/repo"),
+                    None,
+                    vec![],
+                    vec![],
+                    None,
+                    None,
+                );
+                rec.runner_version = version;
+                // Legacy relay and control-only runners use different socket paths.
+                std::fs::write(expected_socket(&rec), b"").unwrap();
+                save(&rec).unwrap();
 
-            assert!(
+                assert!(
                 is_record_live(&rec),
-                "a live v1 runner must not read as dead: its record holds the only copy of the pid"
+                "a live legacy runner must not read as dead: its record holds the only copy of the pid"
             );
-            assert!(
-                !is_runner_current(&rec),
-                "v1 is a generation behind, so the reconciler must replace it"
-            );
+                assert!(
+                    !is_runner_current(&rec),
+                    "a legacy runner is a generation behind, so the reconciler must replace it"
+                );
 
-            terminate("v1sess");
+                terminate(&session_id);
 
-            // Signalled, not merely forgotten.
-            let reaped = (0..40).any(|_| {
-                if matches!(victim.0.try_wait(), Ok(Some(_))) {
-                    return true;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                false
-            });
-            assert!(
-                reaped,
-                "terminate must signal the live v1 runner, not orphan it"
-            );
-            assert!(!record_path("v1sess").unwrap().exists());
+                // Signalled, not merely forgotten.
+                let reaped = (0..40).any(|_| {
+                    if matches!(victim.0.try_wait(), Ok(Some(_))) {
+                        return true;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    false
+                });
+                assert!(
+                    reaped,
+                    "terminate must signal the live legacy runner, not orphan it"
+                );
+                assert!(!record_path(&session_id).unwrap().exists());
+            }
         });
     }
 

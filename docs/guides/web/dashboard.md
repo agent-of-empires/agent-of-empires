@@ -17,7 +17,7 @@ Each sidebar row carries an animated braille glyph encoding the session's state:
 
 ## Creating a session
 
-The **New session** wizard walks four steps:
+The **New session** wizard is one screen with these sections:
 
 - **Project**: pick the working directory from the Recent tab, browse for one, clone a URL, or start a scratch session with no path. The Recent tab lists your saved projects under a "Saved projects" section above the directories of your recent sessions. The recent list keeps a project around after its last session is deleted, so you can quickly start there again; entries whose directory no longer exists are dropped.
 - **Session**: set the title (auto-slugifies into a worktree branch name unless you edit the branch), or attach an existing branch instead.
@@ -25,6 +25,8 @@ The **New session** wizard walks four steps:
 - **Review**: confirm before the session spawns.
 
 Choosing a profile seeds the agent-step defaults. If you have already edited a field, switching profiles asks before overwriting it.
+
+A plain New session opens on the project you launched last; pick another from Recent or Browse to change it.
 
 ## Command palette
 

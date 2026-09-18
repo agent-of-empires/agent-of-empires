@@ -42,6 +42,18 @@ const SESSION_SCHEMA = [
   },
   {
     section: "session",
+    field: "show_diagnostics_pane",
+    category: "Interaction",
+    label: "Show system health strip",
+    description: "",
+    widget: { kind: "toggle" },
+    web_write: { policy: "allow" },
+    profile_overridable: true,
+    validation: { rule: "none" },
+    advanced: false,
+  },
+  {
+    section: "session",
     field: "smart_rename",
     category: "Agents",
     label: "Smart Session Rename",
@@ -97,6 +109,22 @@ function numberInputByLabel(container: HTMLElement, label: string): HTMLInputEle
   const input = match?.parentElement?.querySelector('input[type="number"]');
   expect(input).toBeTruthy();
   return input as HTMLInputElement;
+}
+
+/** The switch on the toggle row whose caption is `label`. A toggle row renders
+ *  its caption as plain text beside the control, not as a `<label>`, so this
+ *  walks up from the caption to the row rather than querying by position: the
+ *  section holds several switches and their order is schema order. */
+function toggleByLabel(container: HTMLElement, label: string): HTMLButtonElement {
+  // The caption is plain text beside the control, not a `<label>`, and several
+  // ancestors share its text, so match the leaf and walk up to the row. Not by
+  // position: the section holds several switches in schema order.
+  const caption = Array.from(container.querySelectorAll("div")).find(
+    (el) => el.children.length === 0 && el.textContent === label,
+  );
+  const button = caption?.closest("div.justify-between")?.querySelector("button[role=switch]");
+  expect(button).toBeTruthy();
+  return button as HTMLButtonElement;
 }
 
 function commit(input: HTMLInputElement, value: string) {
@@ -175,8 +203,7 @@ describe("Session tab auto-stop idle field", () => {
     );
     await screen.findByText("Smart Session Rename");
 
-    // Only one toggle field is in SESSION_SCHEMA, so the lone switch is it.
-    const toggle = container.querySelector("button[role=switch]") as HTMLButtonElement;
+    const toggle = toggleByLabel(container, "Smart Session Rename");
     expect(toggle).toBeTruthy();
     fireEvent.click(toggle);
 
@@ -218,6 +245,38 @@ describe("Session tab auto-stop idle field", () => {
     await waitFor(() =>
       expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
         session: { row_tag: "none" },
+      }),
+    );
+    expect(onSettingsRefresh).toHaveBeenCalledTimes(1);
+  });
+
+  it("refreshes app-level settings after saving session.show_diagnostics_pane", async () => {
+    // The strip is handed down by context from the app shell, so a save that
+    // does not re-read settings leaves it on screen after being switched off.
+    const onSettingsRefresh = vi.fn();
+    vi.mocked(api.fetchSettings).mockResolvedValue({
+      session: { show_diagnostics_pane: true },
+      acp: {},
+      sandbox: {},
+      worktree: {},
+    } as never);
+
+    const { container } = render(
+      <SettingsView
+        onClose={() => {}}
+        tab="session"
+        onSelectTab={() => {}}
+        onServerAboutRefresh={() => {}}
+        onSettingsRefresh={onSettingsRefresh}
+      />,
+    );
+    await screen.findByText("Show system health strip");
+
+    fireEvent.click(toggleByLabel(container, "Show system health strip"));
+
+    await waitFor(() =>
+      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
+        session: { show_diagnostics_pane: false },
       }),
     );
     expect(onSettingsRefresh).toHaveBeenCalledTimes(1);

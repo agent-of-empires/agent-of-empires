@@ -7,9 +7,17 @@
 // the real fetch layer; this exercises the SessionWizard handlers directly.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, fireEvent, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
 import { SessionWizard } from "../SessionWizard";
+
+/** Launch is gated until the wizard's profile defaults have settled, the
+ *  way a real click is; wait for it the same way. */
+async function clickLaunch(getByText: (m: RegExp) => HTMLElement) {
+  const button = getByText(/Launch session/).closest("button") as HTMLButtonElement;
+  await waitFor(() => expect(button.disabled).toBe(false));
+  fireEvent.click(button);
+}
 
 const createSession = vi.fn();
 
@@ -63,7 +71,7 @@ describe("SessionWizard hooks-trust flow (#2066)", () => {
     createSession.mockResolvedValueOnce(HOOKS_REFUSAL).mockResolvedValueOnce({ ok: true, session: { id: "s1" } });
     const { getByText, getByTestId } = renderWizard(onCreated);
 
-    fireEvent.click(getByText(/Launch session/));
+    await clickLaunch(getByText);
     await waitFor(() => expect(getByTestId("hooks-trust-dialog")).toBeTruthy());
     expect(getByTestId("hooks-trust-list").textContent).toContain("bash scripts/setup-worktree.sh");
     expect(getByTestId("hooks-trust-list").textContent).toContain("npm start");
@@ -80,7 +88,7 @@ describe("SessionWizard hooks-trust flow (#2066)", () => {
     createSession.mockResolvedValue(HOOKS_REFUSAL);
     const { getByText, getByTestId, queryByTestId } = renderWizard();
 
-    fireEvent.click(getByText(/Launch session/));
+    await clickLaunch(getByText);
     await waitFor(() => expect(getByTestId("hooks-trust-dialog")).toBeTruthy());
 
     fireEvent.click(getByText("Cancel"));
@@ -94,7 +102,7 @@ describe("SessionWizard hooks-trust flow (#2066)", () => {
     createSession.mockResolvedValue(HOOKS_REFUSAL);
     const { getByText, getByTestId } = renderWizard();
 
-    fireEvent.click(getByText(/Launch session/));
+    await clickLaunch(getByText);
     await waitFor(() => expect(getByTestId("hooks-trust-dialog")).toBeTruthy());
     fireEvent.click(getByTestId("hooks-trust-proceed"));
 

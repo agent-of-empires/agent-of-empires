@@ -167,6 +167,35 @@ impl Drop for ActiveGuard {
     }
 }
 
+/// Why a tailer was started. Decides how a transcript that never appears is
+/// reported: for a live launch the SDK has just promised the file, so its
+/// absence is a real failure, while a launch resumed after a daemon restart
+/// may simply have outlived its transcript, which is lost tracking rather
+/// than a failed sub-agent. See `BackgroundAgentStatus::Detached`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TailerStart {
+    /// A `BackgroundAgentLaunched` notification on the live connection.
+    Live,
+    /// `Supervisor::attach` re-tailing a launch the previous daemon left
+    /// unresolved.
+    Resumed,
+}
+
+/// Status and warning for a transcript that never appeared, per
+/// [`TailerStart`].
+fn missing_transcript_outcome(start: TailerStart) -> (BackgroundAgentStatus, &'static str) {
+    match start {
+        TailerStart::Live => (
+            BackgroundAgentStatus::Error,
+            "sub-agent transcript never appeared",
+        ),
+        TailerStart::Resumed => (
+            BackgroundAgentStatus::Detached,
+            "sub-agent transcript is no longer on disk; tracking stopped",
+        ),
+    }
+}
+
 /// Spawn the tailer for one async sub-agent. Returns immediately; the
 /// task runs until the agent reaches a terminal state or `event_tx`
 /// closes. `output_file` is the launch payload's transcript path.
@@ -178,11 +207,18 @@ pub fn spawn_tailer(
     source: TranscriptSource,
     event_tx: Sender<Event>,
     active: Arc<Mutex<HashSet<String>>>,
+    start: TailerStart,
 ) {
-    active
+    // `insert` returns false when the id is already active: a second spawn
+    // for the same agent is a no-op instead of racing two tailers against
+    // one transcript.
+    if !active
         .lock()
         .expect("bg-agent active set mutex poisoned")
-        .insert(agent_id.clone());
+        .insert(agent_id.clone())
+    {
+        return;
+    }
     if output_file.is_empty() {
         // No transcript path: we can never tail it. Mark it so the panel
         // doesn't show a forever-running agent.
@@ -208,7 +244,7 @@ pub fn spawn_tailer(
             active,
             agent_id: agent_id.clone(),
         };
-        run_tailer(agent_id, output_file, source, event_tx).await;
+        run_tailer(agent_id, output_file, source, event_tx, start).await;
     });
 }
 
@@ -260,20 +296,22 @@ async fn run_tailer(
     output_file: String,
     source: TranscriptSource,
     event_tx: Sender<Event>,
+    start: TailerStart,
 ) {
     // Wait for the transcript to appear (the SDK writes it shortly after
-    // the launch event). Bail to Error if it never shows. For a sandboxed
-    // session this checks inside the container, not the host.
+    // the launch event). For a sandboxed session this checks inside the
+    // container, not the host.
     let mut waited = Duration::ZERO;
     while !source.exists(&output_file).await {
         if waited >= WAIT_FILE_FOR {
+            let (status, warning) = missing_transcript_outcome(start);
             let _ = event_tx
                 .send(completed(
                     agent_id,
-                    BackgroundAgentStatus::Error,
+                    status,
                     Vec::new(),
                     None,
-                    Some("sub-agent transcript never appeared".into()),
+                    Some(warning.into()),
                 ))
                 .await;
             return;
@@ -609,6 +647,47 @@ fn completed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A transcript that never appears means different things per
+    /// [`TailerStart`]: the SDK failing to write one for a live launch is a
+    /// real error, while a launch resumed after a daemon restart whose
+    /// transcript has since been cleaned up is lost tracking, and reporting
+    /// that as `Error` would show a sub-agent that very likely finished fine
+    /// as failed.
+    #[test]
+    fn a_missing_transcript_is_an_error_only_for_a_live_launch() {
+        assert_eq!(
+            missing_transcript_outcome(TailerStart::Live).0,
+            BackgroundAgentStatus::Error
+        );
+        assert_eq!(
+            missing_transcript_outcome(TailerStart::Resumed).0,
+            BackgroundAgentStatus::Detached
+        );
+    }
+
+    /// A second `spawn_tailer` for an id already in the active set must not
+    /// spawn a competing tailer against the same transcript.
+    #[tokio::test]
+    async fn spawn_tailer_is_a_noop_when_the_agent_id_is_already_active() {
+        let active = Arc::new(Mutex::new(HashSet::from(["dup".to_string()])));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        spawn_tailer(
+            "dup".into(),
+            String::new(),
+            TranscriptSource::Host,
+            tx,
+            active.clone(),
+            TailerStart::Live,
+        );
+        tokio::task::yield_now().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "an id already active must not get a second tailer, even the \
+             untrackable-path completion the empty output_file would otherwise emit"
+        );
+        assert!(active.lock().unwrap().contains("dup"));
+    }
 
     /// The host read path returns only bytes appended since `offset`, and
     /// `read_new_lines` folds each complete line while a partial trailing

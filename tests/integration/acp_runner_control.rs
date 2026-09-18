@@ -277,12 +277,8 @@ fn runner_proxies_agent_requests_over_the_control_channel() {
 
 /// Read control frames until one is not a `notify`.
 ///
-/// Since #2977 the control channel carries the agent's whole event stream
-/// alongside the typed frames, in agent-stdout order. An adapter that emits
-/// `session/update` while answering a handshake step (history replay on
-/// `session/load`, for instance) therefore puts those notifications ahead of
-/// the reply, which is the ordering guarantee working as intended. Tests that
-/// want the typed frame skip past them.
+/// The control channel interleaves the agent's `session/update` stream with
+/// typed frames. Tests that want the typed frame skip past them.
 fn read_typed_frame(stream: &mut UnixStream) -> serde_json::Value {
     loop {
         let frame = read_frame(stream);
@@ -305,9 +301,11 @@ fn write_frame(stream: &mut UnixStream, body: &serde_json::Value) {
     stream.flush().expect("flush frame");
 }
 
-/// Invalid peers cannot consume a confirmed backlog. A valid peer that stops
-/// reading a 17 MiB agent frame must time out without losing it or monopolizing
-/// the accept slot; the next daemon receives the same frame.
+/// A valid peer that stops reading a 17 MiB agent frame must time out without
+/// losing it or monopolizing the accept slot; the next daemon receives the same
+/// frame. Since the identity guard holds the detached backlog until the session
+/// is announced, both peers establish the session before the large
+/// `session/update` is delivered.
 #[test]
 #[serial_test::parallel]
 fn runner_requeues_large_frame_after_stalled_writer() {
@@ -324,20 +322,29 @@ fn runner_requeues_large_frame_after_stalled_writer() {
     let xdg = scratch.0.join("xdg");
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&xdg).unwrap();
+    let trigger = scratch.0.join("emit-large");
+    let emitted = scratch.0.join("large-emitted");
     let agent = scratch.0.join("large_agent.py");
+    // Establishes a session, then on trigger emits one 17 MiB session/update
+    // (the detached backlog) and records that it left the agent.
     std::fs::write(
         &agent,
-        r#"import json, sys
-message = {"jsonrpc":"2.0","method":"session/update","params":{"blob":"x" * (17 * 1024 * 1024)}}
-ack = {"jsonrpc":"2.0","id":"queue-ack","method":"fs/read_text_file","params":{"path":"unused"}}
-sys.stdout.write(json.dumps(message) + "\n" + json.dumps(ack) + "\n")
-sys.stdout.flush()
-response = sys.stdin.readline()
-with open(sys.argv[1], "w") as marker:
-    marker.write(response)
+        r#"import json, sys, pathlib, time
+trigger, emitted = map(pathlib.Path, sys.argv[1:])
+def send(m):
+    print(json.dumps(m), flush=True)
 for line in sys.stdin:
-    sys.stdout.write(line)
-    sys.stdout.flush()
+    msg = json.loads(line)
+    method = msg.get("method")
+    if method == "initialize":
+        send({"jsonrpc":"2.0","id":msg["id"],"result":{"protocolVersion":1,"agentCapabilities":{}}})
+    elif method == "session/new":
+        send({"jsonrpc":"2.0","id":msg["id"],"result":{"sessionId":"large-sess"}})
+        while not trigger.exists(): time.sleep(0.01)
+        send({"jsonrpc":"2.0","method":"session/update","params":{"blob":"x" * (17 * 1024 * 1024)}})
+        emitted.write_text("emitted")
+    else:
+        send({"jsonrpc":"2.0","id":msg["id"],"result":{}})
 "#,
     )
     .unwrap();
@@ -347,7 +354,6 @@ for line in sys.stdin:
     let socket = workers.join(format!("{session_id}.sock"));
     let control = workers.join(format!("{session_id}.control.sock"));
     let record = workers.join(format!("{session_id}.json"));
-    let queued = scratch.0.join("notification-queued");
     let _child = KillOnDrop(
         Command::new(env!("CARGO_BIN_EXE_aoe"))
             .args([
@@ -363,7 +369,8 @@ for line in sys.stdin:
                 "--",
                 python3.to_str().unwrap(),
                 agent.to_str().unwrap(),
-                queued.to_str().unwrap(),
+                trigger.to_str().unwrap(),
+                emitted.to_str().unwrap(),
             ])
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", &xdg)
@@ -374,44 +381,54 @@ for line in sys.stdin:
 
     wait_for(&record, "registry record");
     wait_for(&control, "control socket");
-    wait_for(&queued, "notification queue acknowledgment");
-    let acknowledgment: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&queued).unwrap()).unwrap();
-    assert_eq!(acknowledgment["id"], "queue-ack");
-    assert!(acknowledgment["error"].is_object());
-    let mut rejected = UnixStream::connect(&control).expect("connect rejected peer");
-    rejected
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    assert_eq!(read_frame(&mut rejected)["kind"], "hello");
-    write_frame(
-        &mut rejected,
-        &serde_json::json!({"kind": "initialize", "request": {"protocolVersion": 1}}),
-    );
-    let mut prefix = [0u8; 4];
-    assert!(rejected.read_exact(&mut prefix).is_err());
-    drop(rejected);
 
+    // Helpers driving the framed handshake over a raw peer.
+    let attach = |stream: &mut UnixStream| {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        assert_eq!(read_frame(stream)["kind"], "hello");
+        write_frame(
+            stream,
+            &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
+        );
+    };
+    let initialize = |stream: &mut UnixStream| {
+        write_frame(
+            stream,
+            &serde_json::json!({"kind": "initialize", "request": {"protocolVersion": 1}}),
+        );
+        assert_eq!(read_typed_frame(stream)["kind"], "initialized");
+    };
+
+    // The stalled peer establishes the session, then stops reading so the
+    // large notify's write times out and the frame is requeued.
     let mut stalled = UnixStream::connect(&control).expect("connect stalled peer");
-    stalled
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    assert_eq!(read_frame(&mut stalled)["kind"], "hello");
+    attach(&mut stalled);
+    initialize(&mut stalled);
     write_frame(
         &mut stalled,
-        &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
+        &serde_json::json!({
+            "kind": "establish_session",
+            "method": "session/new",
+            "request": {"cwd": home.to_str().unwrap(), "mcpServers": []},
+        }),
     );
-    // Replacement receipt below waits for eviction of the stalled writer.
+    assert_eq!(read_typed_frame(&mut stalled)["kind"], "session_ready");
+    // Release the backlog now that identity is announced, then stall.
+    std::fs::write(&trigger, "go").unwrap();
+    wait_for(&emitted, "detached backlog");
 
+    // The replacement peer is admitted only after the stalled writer times out;
+    // it resumes and receives the requeued large frame.
     let mut accepted = UnixStream::connect(&control).expect("connect replacement peer");
-    accepted
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    assert_eq!(read_frame(&mut accepted)["kind"], "hello");
+    attach(&mut accepted);
+    initialize(&mut accepted);
     write_frame(
         &mut accepted,
-        &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
+        &serde_json::json!({"kind": "resume_session"}),
     );
+    assert_eq!(read_frame(&mut accepted)["kind"], "session_ready");
     let buffered = read_frame(&mut accepted);
     assert_eq!(buffered["kind"], "notify", "got {buffered}");
     assert_eq!(buffered["method"], "session/update");
@@ -419,6 +436,7 @@ for line in sys.stdin:
         buffered["params"]["blob"].as_str().unwrap().len(),
         17 * 1024 * 1024
     );
+    drop(stalled);
 }
 
 /// Regression for a control-lane deadlock: an agent
@@ -1441,6 +1459,173 @@ for line in sys.stdin:
     assert_eq!(addressed.as_deref(), Some("session-2:new-count=2"));
 }
 
+/// A daemon reattaching while a turn is still streaming must not be killed.
+/// The runner announces the cached identity ahead of the detached backlog, so
+/// the daemon commits identity and routes the flushed backlog plus continuing
+/// live traffic directly instead of buffering unbounded pre-identity traffic.
+/// Before the fix a full backlog plus live streaming overflowed the pending
+/// replay bound ("pending native session updates exceed replay capacity") and
+/// the reconciler terminated the worker. See #3937.
+#[tokio::test]
+#[serial_test::parallel]
+async fn streaming_during_reattach_does_not_overflow_pending_replay() {
+    use agent_of_empires::acp::control_protocol::{self, ControlBody};
+    use agent_of_empires::acp::state::Event;
+
+    let Some(python3) = find_python3() else {
+        return;
+    };
+    let scratch = Scratch::new("stream-reattach");
+    let home = scratch.0.join("home");
+    let xdg = scratch.0.join("xdg");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&xdg).unwrap();
+    let trigger = scratch.0.join("flood-trigger");
+    let flooded = scratch.0.join("flooded");
+    let agent = scratch.0.join("agent.py");
+    // On session/new the agent mints its id and blocks until the test has
+    // detached, then floods a full detached backlog and keeps streaming one
+    // update every ~2ms across the reattach handshake. The detached reverse
+    // call is answered only after the runner has read the whole backlog.
+    std::fs::write(
+        &agent,
+        r#"import json, sys, pathlib, time
+trigger, flooded = map(pathlib.Path, sys.argv[1:])
+sid = None
+def send(msg):
+    print(json.dumps(msg), flush=True)
+def chunk(text):
+    send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":sid,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":text}}}})
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    if method == "initialize":
+        send({"jsonrpc":"2.0","id":msg["id"],"result":{"protocolVersion":1,"agentCapabilities":{}}})
+    elif method == "session/new":
+        sid = "stream-session"
+        send({"jsonrpc":"2.0","id":msg["id"],"result":{"sessionId":sid}})
+        while not trigger.exists(): time.sleep(0.01)
+        for _ in range(5000): chunk("backlog")
+        send({"jsonrpc":"2.0","id":"barrier","method":"x/barrier","params":{}})
+        sys.stdin.readline()
+        flooded.write_text("flooded")
+        while True:
+            chunk("live")
+            time.sleep(0.002)
+    else:
+        send({"jsonrpc":"2.0","id":msg["id"],"result":{}})
+"#,
+    )
+    .unwrap();
+    let session = "stream-reattach";
+    let socket = scratch.0.join(format!("{session}.sock"));
+    let control = agent_of_empires::process::worker::control_socket_sibling(&socket);
+    let _runner = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_aoe"))
+            .args([
+                "__acp-runner",
+                "--socket",
+                socket.to_str().unwrap(),
+                "--session-id",
+                session,
+                "--agent-name",
+                "stream-agent",
+                "--cwd",
+                home.to_str().unwrap(),
+                "--",
+                python3.to_str().unwrap(),
+                agent.to_str().unwrap(),
+                trigger.to_str().unwrap(),
+                flooded.to_str().unwrap(),
+            ])
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .spawn()
+            .unwrap(),
+    );
+    wait_for(&control, "control socket");
+
+    // First daemon: establish the native session, then detach.
+    let mut first = tokio::net::UnixStream::connect(&control).await.unwrap();
+    assert!(matches!(
+        control_protocol::read_frame(&mut first).await.unwrap(),
+        Some(ControlBody::Hello { .. })
+    ));
+    control_protocol::write_frame(
+        &mut first,
+        &ControlBody::Attach {
+            control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
+        },
+    )
+    .await
+    .unwrap();
+    control_protocol::write_frame(
+        &mut first,
+        &ControlBody::Initialize {
+            request: serde_json::json!({"protocolVersion":1}),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        control_protocol::read_frame(&mut first).await.unwrap(),
+        Some(ControlBody::Initialized { .. })
+    ));
+    control_protocol::write_frame(
+        &mut first,
+        &ControlBody::EstablishSession {
+            method: "session/new".into(),
+            request: serde_json::json!({"cwd":home,"mcpServers":[]}),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        control_protocol::read_frame(&mut first).await.unwrap(),
+        Some(ControlBody::SessionReady { .. })
+    ));
+    drop(first);
+
+    // With no daemon attached, flood a full detached backlog and keep
+    // streaming, so the reattach faces backlog plus live traffic.
+    std::fs::write(&trigger, "go").unwrap();
+    wait_for(&flooded, "runner consumed detached backlog");
+
+    let mut resumed = AcpClient::attach(
+        socket,
+        home,
+        vec![],
+        "stream-session".into(),
+        false,
+        AcpSessionId(session.into()),
+        None,
+        "stream-agent".into(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut assigned = None;
+    let mut chunks = 0usize;
+    while assigned.is_none() || chunks == 0 {
+        match tokio::time::timeout_at(deadline, resumed.next_event())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Event::AcpSessionAssigned { acp_session_id } => assigned = Some(acp_session_id),
+            Event::AgentMessageChunk { .. } => chunks += 1,
+            Event::AgentStartupError { .. } => {
+                panic!("reattach overflowed pending replay and the worker was killed")
+            }
+            _ => {}
+        }
+    }
+    resumed.shutdown().await.unwrap();
+    assert_eq!(assigned.as_deref(), Some("stream-session"));
+}
+
 #[tokio::test]
 #[serial_test::parallel]
 async fn resumed_prompt_completes_only_for_its_own_runner_request() {
@@ -1580,5 +1765,215 @@ for line in sys.stdin:
             }
         }
         resumed.shutdown().await.unwrap();
+    }
+}
+
+#[test]
+fn runner_native_identity_is_announced_before_callbacks_and_never_reassigned() {
+    let Some(python3) = find_python3() else {
+        eprintln!("skipping: python3 not found for native identity protocol agent");
+        return;
+    };
+    let scratch = Scratch::new("nativeidentity");
+    let home = scratch.0.join("home");
+    let xdg = scratch.0.join("xdg");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&xdg).unwrap();
+    let agent = scratch.0.join("agent.py");
+    let answers = scratch.0.join("answers.jsonl");
+    std::fs::write(&agent, r#"import json, sys
+count = 0
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method is None:
+        with open(sys.argv[1], "a") as output:
+            output.write(json.dumps(message) + "\n")
+        continue
+    if method == "initialize":
+        result = {"protocolVersion":1,"agentCapabilities":{}}
+    elif method == "session/new":
+        result = {"sessionId":"native-owner"}
+    else:
+        result = {}
+    frames = [json.dumps({"jsonrpc":"2.0","id":message["id"],"result":result})]
+    if method in ("session/new", "test/callback"):
+        count += 1
+        positional = method == "test/callback" and message["params"].get("positional")
+        if positional:
+            frames.append(json.dumps({"jsonrpc":"2.0","id":"connection-elicitation","method":"elicitation/create","params":{"mode":"form","message":"Connection authentication","requestId":message["id"],"requestedSchema":{"type":"object","properties":{}}}}))
+        params = ["native-owner", "unused"] if positional else {"sessionId":"native-owner","path":"unused"}
+        frames.append(json.dumps({"jsonrpc":"2.0","id":f"callback-{count}","method":"fs/read_text_file","params":params}))
+    sys.stdout.write("\n".join(frames) + "\n")
+    sys.stdout.flush()
+"#).unwrap();
+    let session = "nativeguard";
+    let workers = app_dir(&home, &xdg).join("acp-workers");
+    let socket = workers.join(format!("{session}.sock"));
+    let control = workers.join(format!("{session}.control.sock"));
+    let _child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_aoe"))
+            .args([
+                "__acp-runner",
+                "--socket",
+                socket.to_str().unwrap(),
+                "--session-id",
+                session,
+                "--agent-name",
+                "fake-agent",
+                "--cwd",
+                home.to_str().unwrap(),
+                "--",
+                python3.to_str().unwrap(),
+                agent.to_str().unwrap(),
+                answers.to_str().unwrap(),
+            ])
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("AOE_ACP_WATCHDOG_POLL_MS", "150")
+            .spawn()
+            .expect("spawn native-identity runner"),
+    );
+    wait_for(&control, "native-identity control socket");
+    let attach = || {
+        let mut stream = UnixStream::connect(&control).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        assert_eq!(read_frame(&mut stream)["kind"], "hello");
+        write_frame(
+            &mut stream,
+            &serde_json::json!({"kind":"attach","control_protocol_version":3}),
+        );
+        stream
+    };
+    let initialize = |stream: &mut UnixStream| {
+        write_frame(
+            stream,
+            &serde_json::json!({"kind":"initialize","request":{"protocolVersion":1}}),
+        );
+        assert_eq!(read_frame(stream)["kind"], "initialized");
+    };
+    let resume = |stream: &mut UnixStream| {
+        write_frame(stream, &serde_json::json!({"kind":"resume_session"}));
+        let ready = read_frame(stream);
+        assert_eq!(ready["kind"], "session_ready");
+        assert_eq!(ready["acp_session_id"], "native-owner");
+    };
+    let answer = |stream: &mut UnixStream, positional: bool| {
+        let call = read_frame(stream);
+        assert_eq!(call["kind"], "server_call");
+        assert_eq!(call["method"], "fs/read_text_file");
+        let expected = if positional {
+            serde_json::json!(["native-owner", "unused"])
+        } else {
+            serde_json::json!({"sessionId":"native-owner","path":"unused"})
+        };
+        assert_eq!(call["params"], expected);
+        write_frame(
+            stream,
+            &serde_json::json!({"kind":"server_result","call_id":call["call_id"],"result":{"content":"owned"}}),
+        );
+    };
+    let trigger = |stream: &mut UnixStream, id| {
+        write_frame(
+            stream,
+            &serde_json::json!({"kind":"agent_call","call_id":id,"method":"test/callback","params":{"positional":id == 2}}),
+        );
+        let reply = read_frame(stream);
+        assert_eq!(reply["kind"], "agent_result");
+        assert_eq!(reply["call_id"], id);
+    };
+    let assert_quiet = |stream: &mut UnixStream| {
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let error = stream
+            .read(&mut [0])
+            .expect_err("callback overtook native identity or changed attachment");
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ));
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+    };
+
+    let mut first = attach();
+    initialize(&mut first);
+    write_frame(
+        &mut first,
+        &serde_json::json!({"kind":"establish_session","method":"session/new","request":{"cwd":home,"mcpServers":[]}}),
+    );
+    assert_eq!(read_frame(&mut first)["kind"], "session_ready");
+    assert_eq!(read_frame(&mut first)["method"], "_aoe/session_replayed");
+    answer(&mut first, false);
+    drop(first);
+
+    // A stable runner can emit callbacks before the replacement daemon asks
+    // ResumeSession. Keep them on that attachment, behind its authority frame.
+    let mut second = attach();
+    trigger(&mut second, 2);
+    // Request-scoped elicitation is independent of native session authority.
+    let mut elicitation = read_frame(&mut second);
+    assert_eq!(elicitation["kind"], "server_call");
+    assert_eq!(elicitation["method"], "elicitation/create");
+    let request: agent_client_protocol::schema::v1::CreateElicitationRequest =
+        serde_json::from_value(elicitation["params"].take()).unwrap();
+    assert!(matches!(
+        request.scope(),
+        agent_client_protocol::schema::v1::ElicitationScope::Request(_)
+    ));
+    write_frame(
+        &mut second,
+        &serde_json::json!({"kind":"server_result","call_id":elicitation["call_id"],"result":{"action":"cancel"}}),
+    );
+    assert_quiet(&mut second);
+    initialize(&mut second);
+    resume(&mut second);
+    answer(&mut second, true);
+    drop(second);
+
+    // A callback waiting for a dead attachment must be answered as disconnected,
+    // not retargeted to the next daemon simply because its native ID is equal.
+    let mut third = attach();
+    trigger(&mut third, 3);
+    assert_quiet(&mut third);
+    // A newly registered native reset must release the cached callback gate:
+    // otherwise stdout cannot reach the reset response behind that callback.
+    write_frame(
+        &mut third,
+        &serde_json::json!({"kind":"agent_call","call_id":99,"method":"session/new","params":{"cwd":home,"mcpServers":[]}}),
+    );
+    answer(&mut third, false);
+    let reset_reply = read_frame(&mut third);
+    assert_eq!(reset_reply["kind"], "agent_result");
+    assert_eq!(reset_reply["call_id"], 99);
+    assert_quiet(&mut third);
+    drop(third);
+    let mut fourth = attach();
+    initialize(&mut fourth);
+    resume(&mut fourth);
+    assert_quiet(&mut fourth);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let responses = std::fs::read_to_string(&answers).unwrap_or_default();
+        if let Some(answer) = responses
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|answer| answer["id"] == "callback-4")
+        {
+            assert!(
+                answer["error"].is_object(),
+                "detached callback was not rejected: {answer}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "agent never received detached callback rejection"
+        );
+        std::thread::sleep(Duration::from_millis(10));
     }
 }

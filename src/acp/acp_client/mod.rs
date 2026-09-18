@@ -33,6 +33,7 @@ mod raw_input;
 mod reset;
 mod resolve_command;
 mod runner;
+mod session_identity;
 mod session_sandbox;
 mod spawn;
 mod steer;
@@ -251,6 +252,7 @@ impl AcpClient {
                     ClientCmd::ForceStop => "force_stop",
                     ClientCmd::SetMode(_) => "set_mode",
                     ClientCmd::SetConfigOption { .. } => "set_config_option",
+                    ClientCmd::ResumeBackgroundTailing(_) => "resume_background_tailing",
                     ClientCmd::DeleteSession { respond_to, .. } => {
                         let _ = respond_to.send(DeleteSessionOutcome::UnsupportedMethod);
                         "delete_session"
@@ -879,6 +881,27 @@ impl AcpClient {
                 config_id: config_id.to_string(),
                 value: value.to_string(),
             })
+            .await
+            .map_err(|_| AcpError::AgentExited)
+    }
+
+    /// Spawn tailers for sub-agents that survived a daemon restart:
+    /// `Supervisor::attach` calls this once, right after the connection is
+    /// up, with every unresolved `BackgroundAgentLaunched` for the
+    /// session. A no-op send failure just means the connection already
+    /// died; the caller's next sweep will detach what's left.
+    pub async fn resume_background_tailing(
+        &self,
+        launches: Vec<crate::acp::event_store::UnresolvedBackgroundAgentLaunch>,
+    ) -> Result<(), AcpError> {
+        let cmd_tx = self.cmd_tx.as_ref().ok_or(AcpError::NotRunning)?;
+        cmd_tx
+            .send(ClientCmd::ResumeBackgroundTailing(
+                launches
+                    .into_iter()
+                    .map(|l| (l.agent_id, l.output_file))
+                    .collect(),
+            ))
             .await
             .map_err(|_| AcpError::AgentExited)
     }
