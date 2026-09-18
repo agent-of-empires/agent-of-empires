@@ -1,5 +1,5 @@
 //! Misc system endpoints: agents, settings, themes, profiles, filesystem,
-//! groups, docker status, devices, about.
+//! groups, docker status, system health, devices, about.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1370,8 +1370,16 @@ pub struct SystemHealth {
     pub agents: Vec<SystemHealthAgent>,
 }
 
-pub async fn system_health(State(state): State<Arc<AppState>>) -> Json<SystemHealth> {
+pub async fn system_health(State(state): State<Arc<AppState>>) -> axum::response::Response {
     use crate::process::metrics::pressure_band;
+
+    // The per-agent rows are the population CityHall hides: the sampler's
+    // `eligible_instance` selects the non-structured sessions that
+    // `list_sessions` filters out and `sessions/search` refuses, so serving
+    // this would hand a locked-down client their ids and titles. See #7.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
 
     let instances = state.instances.read().await.clone();
     // Sampling walks the host process table, shells out to tmux, and may read
@@ -1410,6 +1418,7 @@ pub async fn system_health(State(state): State<Arc<AppState>>) -> Json<SystemHea
             })
             .collect(),
     })
+    .into_response()
 }
 
 #[derive(Serialize)]
