@@ -213,7 +213,7 @@ fn migrated_unknown_restart_warns_and_leaves_the_old_conversation_intact() {
 fn migrated_unknown_start_warns_like_restart() {
     require_tmux!();
     let mut h = new_harness("resume_unknown_start_warning");
-    let log = install_fake_agent(&mut h);
+    install_fake_agent(&mut h);
     let project = h.project_path();
     let add = h.run_cli(&[
         "add",
@@ -369,14 +369,24 @@ fn stale_resume_failure_persists_loop_breaker_and_next_restart_starts_fresh() {
     );
     assert_default_resume_intent(row);
 
-    let all_lines = read_log_lines(&log_path);
-    let second_lines = &all_lines[before_second..];
-    assert!(
-        !second_lines.is_empty(),
-        "second restart should invoke fake agent; log={all_lines:?}"
-    );
-    assert!(
-        second_lines.iter().all(|line| !line.contains(STALE_SID)),
-        "second restart must not retry stale sid; new log lines={second_lines:?}"
-    );
+    // The CLI returns once the poller drain lands; the pane shell may still
+    // be a few milliseconds from the fake agent's printf, so read until the
+    // invocation appears instead of sampling the log once (races under load).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let second_lines = loop {
+        let all_lines = read_log_lines(&log_path);
+        let second_lines = &all_lines[before_second..];
+        assert!(
+            second_lines.iter().all(|line| !line.contains(STALE_SID)),
+            "second restart must not retry stale sid; new log lines={second_lines:?}"
+        );
+        if !second_lines.is_empty() {
+            break second_lines.to_vec();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "second restart should invoke fake agent; log={all_lines:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
 }

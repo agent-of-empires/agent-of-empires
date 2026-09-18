@@ -1149,6 +1149,92 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
+    fn asserted_store_survives_qualified_publication() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let _isolation = crate::session::test_support::isolate_app_dir_at(home.path());
+        let (_hooks, _, _hook_dir) = crate::hooks::test_support::BaseGuard::ready();
+        let program = home.path().join("claude");
+        std::fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = home.path().join("alternate-claude");
+        std::fs::create_dir(&store).unwrap();
+        let sid = "11111111-1111-4111-8111-111111111111";
+        let mut instance = Instance::new("asserted-store", home.path().to_str().unwrap());
+        instance.tool = "claude".into();
+        instance.command = "claude".into();
+        instance.pending_host_env = vec![
+            (
+                "PATH".into(),
+                format!("{}:/usr/bin:/bin", home.path().display()),
+            ),
+            ("HOME".into(), home.path().display().to_string()),
+        ];
+        let binding = instance.asserted_resume_binding(sid, Some(&store)).unwrap();
+        instance.resume_intent = ResumeIntent::Use(sid.into());
+        instance.resume_binding = Some(binding.clone());
+        instance.set_agent_conversation(Some(sid.into()), Some(binding), None);
+        let execution = instance
+            .resolve_native_execution(instance.conversation_target())
+            .unwrap();
+        assert_eq!(execution.binding.stores[0], store);
+        let directory = crate::hooks::ensure_instance_dir_path(&instance.id).unwrap();
+        let publication = directory.join(format!("session_id.{}", execution.inputs.launch_id));
+        instance.active_execution = Some(ActiveExecution {
+            launch_id: execution.inputs.launch_id,
+            binding: execution.binding,
+            capture: execution.capture,
+            container: None,
+        });
+        instance.resume_intent = ResumeIntent::Default;
+        instance.resume_binding = None;
+        instance
+            .prepare_launch_command(instance.conversation_state())
+            .unwrap();
+        std::fs::write(publication, sid).unwrap();
+        let result = instance.prepare_launch_command(instance.conversation_state());
+        if let Err(error) = result {
+            panic!("qualified publication must retain asserted store: {error:#}");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn asserted_store_refuses_agents_without_store_routing() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let _isolation = crate::session::test_support::isolate_app_dir_at(home.path());
+        let program = home.path().join("gemini");
+        std::fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let configured = home.path().join("configured/.gemini");
+        std::fs::create_dir_all(&configured).unwrap();
+        let sid = "11111111-1111-4111-8111-111111111111";
+        let mut instance = Instance::new("gemini-store", home.path().to_str().unwrap());
+        instance.tool = "gemini".into();
+        instance.command = "gemini".into();
+        instance.pending_host_env = vec![
+            (
+                "PATH".into(),
+                format!("{}:/usr/bin:/bin", home.path().display()),
+            ),
+            ("HOME".into(), home.path().display().to_string()),
+            (
+                "GEMINI_CLI_HOME".into(),
+                configured.parent().unwrap().display().to_string(),
+            ),
+        ];
+        let error = instance
+            .asserted_resume_binding(sid, Some(&home.path().join("alternate/.gemini")))
+            .expect_err("Gemini has no --store routing; the assertion must refuse");
+        assert!(error
+            .to_string()
+            .contains("--store routing is only supported for Claude"));
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn migrated_unknown_default_starts_fresh_but_explicit_resume_refuses() {
         let home = tempfile::tempdir().unwrap();
         let _isolation = crate::session::test_support::isolate_app_dir_at(home.path());

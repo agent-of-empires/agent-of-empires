@@ -287,7 +287,7 @@ pub struct SetSessionIdArgs {
     /// keeps its ACP conversation and needs the native ID plus an explicit
     /// `--store` and a bound Claude conversation.
     session_id: String,
-    /// Assert the primary native store root, for example CLAUDE_CONFIG_DIR or CODEX_HOME.
+    /// Assert the native store: a Claude store directory, or a Pi/OMP transcript file.
     #[arg(long)]
     store: Option<std::path::PathBuf>,
 }

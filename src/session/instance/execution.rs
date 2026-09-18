@@ -1189,20 +1189,21 @@ impl Instance {
         let mut namespace_arguments = Vec::new();
         let mut roots = match agent.name {
             "claude" => {
-                // Assertions carry physical identities, not container-native paths.
-                let asserted = (inputs.container.is_none())
+                // The recorded binding names the store this conversation
+                // actually lives in, whether it was asserted with `--store`
+                // or captured by a validated launch; assertions must survive
+                // the qualified publication that relabels them Observed.
+                let recorded = (inputs.container.is_none())
                     .then(|| {
                         target
                             .and_then(|(_, binding, _)| binding)
-                            .filter(|binding| {
-                                binding.provenance == ConversationProvenance::Asserted
-                            })
+                            .filter(|binding| binding.is_known())
                             .and_then(|binding| binding.execution.as_ref())
                             .and_then(|execution| execution.stores.first())
                             .cloned()
                     })
                     .flatten();
-                let root = absolute(asserted
+                let root = absolute(recorded
                     .or_else(|| declared.clone())
                     .or_else(|| value("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty()).map(PathBuf::from))
                     .unwrap_or_else(|| home.join(".claude")));
@@ -2141,6 +2142,10 @@ impl Instance {
                 .to_path_buf();
             transcript_path = Some(file);
         } else if let Some(store) = store {
+            anyhow::ensure!(
+                execution.agent.as_str() == "claude",
+                "--store routing is only supported for Claude; other agents resolve their store from configuration"
+            );
             anyhow::ensure!(
                 !self.is_sandboxed(),
                 "sandbox recovery must use its managed mounted store"
