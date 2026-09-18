@@ -1,6 +1,7 @@
 //! Session operations for HomeView (create, delete, rename)
 
 use crate::session::builder::{self, InstanceParams};
+use crate::session::conversation_carry;
 use crate::session::{
     acquire_session_identity_lock, duplicate_session_error, is_duplicate_session, list_profiles,
     GroupMovePlan, Instance, Item, LifecycleOperation, Status, Storage,
@@ -346,6 +347,10 @@ impl HomeView {
     /// the field is updated before respawn so the new agent binary starts
     /// on the next launch.
     ///
+    /// A swap between two tool names running the same agent on different
+    /// accounts carries the conversation across instead of parking it; see
+    /// [`crate::session::conversation_carry::classify`].
+    ///
     /// The start cascade itself runs on the `RestartPoller` worker thread (it
     /// shells out to docker and runs the before_start host hook, which can
     /// block for seconds), so the TUI event loop never blocks. The post-cascade
@@ -476,6 +481,20 @@ impl HomeView {
         }
 
         let tool_swapped = new_tool.is_some_and(|tool| tool != restart_edit_authoritative.tool);
+        // Decided against the pre-swap row: once the swap has run, the outgoing
+        // account's config root is no longer reachable from the instance.
+        let swap_kind = match new_tool.filter(|_| tool_swapped) {
+            Some(tool) => conversation_carry::classify(
+                &restart_edit_authoritative,
+                profile_move_target.as_deref().unwrap_or(&current_profile),
+                tool,
+            ),
+            None => conversation_carry::ToolSwap::Park,
+        };
+        let (account_swap, carry_plan) = match swap_kind {
+            conversation_carry::ToolSwap::Park => (false, None),
+            conversation_carry::ToolSwap::KeepConversation(carry) => (true, carry),
+        };
 
         // A cross-profile restart is staged entirely on a detached candidate.
         // In particular, do not persist a tool swap into the source row before
@@ -494,7 +513,11 @@ impl HomeView {
             }
             if let Some(target_tool) = new_tool {
                 if target_tool != restart_edit_authoritative.tool.as_str() {
-                    requested.swap_tool(target_tool);
+                    if account_swap {
+                        requested.swap_account(target_tool);
+                    } else {
+                        requested.swap_tool(target_tool);
+                    }
                 }
             }
             if let Some(command) = new_command_override {
@@ -523,8 +546,12 @@ impl HomeView {
                     .map(|i| i.tool.clone())
                     .unwrap_or_default();
                 if target_tool != current_tool {
-                    self.mutate_instance(&id, |inst| inst.swap_tool(target_tool));
-                    self.persist_tool_swap(&id, target_tool);
+                    if account_swap {
+                        self.mutate_instance(&id, |inst| inst.swap_account(target_tool));
+                    } else {
+                        self.mutate_instance(&id, |inst| inst.swap_tool(target_tool));
+                    }
+                    self.persist_tool_swap(&id, target_tool, account_swap);
                 }
             }
             if let Some(command) = new_command_override {
@@ -589,11 +616,15 @@ impl HomeView {
             skip_on_launch: false,
             bound_hooks: true,
             discard_sandbox_container: tool_swapped,
+            conversation_carry: carry_plan,
         });
         Ok(())
     }
 
     /// Land an engine swap's session bookkeeping on the disk row.
+    ///
+    /// `account_swap` picks which swap the disk row takes: the parking one, or
+    /// the one that keeps the conversation because only the account changed.
     ///
     /// `save()` syncs `tool`/`command`/`extra_args` through `merge_from_tui`
     /// but deliberately leaves `agent_session_id` and friends to their CAS
@@ -609,7 +640,7 @@ impl HomeView {
     /// Best-effort. A failed write leaves the stale sid on disk (the restart
     /// still runs, and its resume-probe fallback recovers by starting fresh),
     /// so it is logged rather than surfaced as a restart failure.
-    fn persist_tool_swap(&self, id: &str, new_tool: &str) {
+    fn persist_tool_swap(&self, id: &str, new_tool: &str, account_swap: bool) {
         let Some(profile) = self.instances.get(id).map(|i| i.source_profile.clone()) else {
             return;
         };
@@ -637,7 +668,11 @@ impl HomeView {
                 // reads that value rather than the in-memory one. Restore it
                 // the same way `reconcile_from_disk` does before the swap.
                 disk.source_profile = row_profile.clone();
-                disk.swap_tool(&new_tool);
+                if account_swap {
+                    disk.swap_account(&new_tool);
+                } else {
+                    disk.swap_tool(&new_tool);
+                }
             }
             Ok(())
         }) {

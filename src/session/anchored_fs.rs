@@ -144,6 +144,23 @@ impl AnchoredDir {
         Ok(Some(bytes))
     }
 
+    /// Create `relative` for writing, or `None` when an entry is already
+    /// there. `O_EXCL | O_NOFOLLOW` so a planted symlink is never followed
+    /// and an existing file is never truncated.
+    pub(crate) fn create_new_regular(&self, relative: &Path) -> Result<Option<File>> {
+        let (parent, leaf) = self.open_parent(relative)?;
+        match openat(
+            &parent,
+            leaf.as_os_str(),
+            OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_WRONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::S_IRUSR | Mode::S_IWUSR,
+        ) {
+            Ok(fd) => Ok(Some(File::from(fd))),
+            Err(Errno::EEXIST) => Ok(None),
+            Err(error) => Err(error).context("creating anchored file"),
+        }
+    }
+
     pub(crate) fn read_dir(&self, relative: &Path, max_entries: usize) -> Result<Vec<OsString>> {
         let fd = self.open_dir(relative)?;
         let mut dir = Dir::from_fd(fd)?;

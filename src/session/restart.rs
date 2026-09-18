@@ -27,6 +27,10 @@ pub struct RestartRequest {
     /// creates a fresh one. Set on a tool swap: launch recreates a container
     /// labelled for another tool, but not one created before that label (#3959).
     pub discard_sandbox_container: bool,
+    /// Copy the conversation into the incoming account's agent config root
+    /// before relaunching. Set when the user accepts the carry on a swap that
+    /// changes only the account (#4030); planned against the pre-swap row.
+    pub conversation_carry: Option<crate::session::conversation_carry::ConversationCarry>,
 }
 
 pub struct RestartResult {
@@ -51,7 +55,14 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
         skip_on_launch,
         bound_hooks,
         discard_sandbox_container,
+        conversation_carry,
     } = request;
+
+    // Before the cascade: the launch resumes from the incoming account's
+    // config root, so the transcript has to be there by then.
+    if let Some(carry) = conversation_carry {
+        carry.run();
+    }
 
     let title = instance.title.clone();
     let tool = instance.tool.clone();
@@ -162,6 +173,7 @@ mod tests {
             skip_on_launch: false,
             bound_hooks: true,
             discard_sandbox_container: false,
+            conversation_carry: None,
         });
         // The cascade may create a real tmux session; tear it down so the test
         // cleans up after itself.
@@ -244,6 +256,7 @@ mod tests {
                 skip_on_launch: false,
                 bound_hooks: true,
                 discard_sandbox_container: true,
+                conversation_carry: None,
             });
 
             let error = result

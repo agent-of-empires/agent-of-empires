@@ -64,6 +64,26 @@ This is one-shot. The next launch starts fresh, then automatic capture takes ove
 
 Structured-view sessions manage their own conversation through ACP and reject `set-session-id`. Toggle the session out of structured view first, or set the resume target through the structured view UI.
 
+## Swapping the engine on a restart
+
+The restart dialog can change the tool a session runs. Session IDs live in
+per-agent namespaces, so swapping to a different agent parks the outgoing
+agent's conversation under its own tool name and starts a new one; swapping
+back restores what was parked.
+
+Two tool names can also point at the same agent on different accounts, through
+`[session.agent_config_dir]`. That swap changes the agent's config root, so the
+conversation is still on disk but under the account you swapped away from. AoE
+carries it across: it copies the transcript into the incoming account's config
+root so the agent resumes where it left off, and the row keeps its conversation
+ID, its model, and its effort setting, since none of those changed agent.
+
+The carry applies only when the new tool resolves to the same built-in agent,
+the session has a conversation to carry, and AoE knows the agent's transcript
+layout (Claude Code today). Anything else takes the parking swap above. The copy
+never overwrites a transcript the incoming account already has, and leaves the
+outgoing account's copy in place, so swapping back still reaches the original.
+
 ## Importing existing Claude Code sessions (web dashboard)
 
 If you already have Claude Code conversations started outside AoE (plain `claude` in a terminal), you can pull one into a structured-view session from the web dashboard.

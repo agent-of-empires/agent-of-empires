@@ -37,7 +37,7 @@ fn resolve_agent_home(env_var: Option<&str>, default_subdir: &str) -> Result<Pat
 /// Precedence mirrors [`crate::hooks::agent_settings_path_in`]: the session's
 /// host environment first, then AoE's own env (a var exported in the shell that
 /// launched `aoe` is inherited by the agent too), then `~/.claude`.
-fn claude_home_for_host_environment(host_env: &[String]) -> Result<PathBuf> {
+pub(crate) fn claude_home_for_host_environment(host_env: &[String]) -> Result<PathBuf> {
     match claude_config_dir_override(host_env) {
         Some(dir) => Ok(PathBuf::from(dir)),
         None => resolve_agent_home(None, ".claude"),

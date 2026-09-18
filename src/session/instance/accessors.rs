@@ -521,7 +521,7 @@ impl Instance {
 
 /// Resolve a built-in from the instance's stored alias or its profile registry.
 /// The stored value wins; legacy rows with no value consult the live registry.
-fn resolved_agent_for(
+pub(crate) fn resolved_agent_for(
     profile: &str,
     tool: &str,
     detect_as: &str,
