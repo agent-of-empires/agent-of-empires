@@ -197,6 +197,27 @@ describe("AgentStep profile description (#949)", () => {
     expect(queryByText(/undefined/)).toBeNull();
   });
 
+  it("confirms before a profile change discards a hand-set structured view (#3517)", () => {
+    // The view toggle is tracked apart from the other profile fields, so the
+    // confirmation guard has to name it or the change lands silently.
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+    try {
+      const { onChange, getByRole } = renderWithProfiles(
+        [
+          { name: "default", is_default: true },
+          { name: "other", is_default: false },
+        ],
+        { profileDirty: false, structuredViewDirty: true },
+      );
+      fireEvent.click(getByRole("radio", { name: /other/ }));
+      expect(confirmSpy).toHaveBeenCalled();
+      // Declined, so the selection never happens.
+      expect(onChange).not.toHaveBeenCalledWith("profile", "other");
+    } finally {
+      confirmSpy.mockRestore();
+    }
+  });
+
   it("clicking a profile card calls onChange with the profile name", () => {
     const { onChange, getByRole } = renderWithProfiles([
       { name: "default", is_default: true },

@@ -24,6 +24,9 @@ interface WizardData {
   /** Non-empty while importing an existing agent session, which resumes a
    *  session that is already structured on disk. */
   importAcpSessionId?: string;
+  /** Whether the user set the structured-view toggle by hand. Tracked apart
+   *  from `profileDirty`, so the confirmation guard has to name it. */
+  structuredViewDirty?: boolean;
   [key: string]: unknown;
 }
 
@@ -182,14 +185,19 @@ export function AgentOptions({
   const profileRequestRef = useRef(0);
   const handleProfileChange = useCallback(
     async (profileName: string) => {
-      const requestId = ++profileRequestRef.current;
       // If user had manual edits, confirm before overwriting. "Server default"
       // (an empty name) now resolves and applies its own settings, so it needs
       // the same confirmation as a named profile rather than silently winning.
-      if (data.profileDirty) {
+      // A hand-set view counts as an edit even though it is tracked apart from
+      // `profileDirty`, since the profile defaults would otherwise replace it
+      // without asking.
+      if (data.profileDirty || data.structuredViewDirty) {
         const ok = window.confirm("Selecting a profile will reset your settings to that profile's defaults. Continue?");
         if (!ok) return;
       }
+      // Claimed only once the change is going ahead: a cancelled confirmation
+      // must leave an in-flight request for the still-selected profile valid.
+      const requestId = ++profileRequestRef.current;
 
       onChange("profile", profileName);
 
@@ -236,7 +244,7 @@ export function AgentOptions({
         // If we can't load profile settings, just set the profile name
       }
     },
-    [data.profileDirty, data.tool, onChange, onApplyProfileDefaults],
+    [data.profileDirty, data.structuredViewDirty, data.tool, onChange, onApplyProfileDefaults],
   );
 
   const advancedBlock = (
