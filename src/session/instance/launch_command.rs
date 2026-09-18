@@ -56,6 +56,7 @@ pub(super) struct PreparedLaunch {
     pub(super) expected_prior_omp_generation: Option<String>,
     pub(super) execution: Option<super::execution::NativeExecution>,
     pub(super) fresh_notice: Option<FreshLaunchNotice>,
+    pub(super) abandoned_conversation: Option<ConversationBinding>,
 }
 
 /// Append yolo-mode flags or environment variables to a launch command.
@@ -495,6 +496,7 @@ impl Instance {
         let prior_probe_failed_sid = self.resume_probe_failed_sid.clone();
         let preparation = (|| -> Result<_> {
             let mut fresh_notice = None;
+            let mut abandoned_conversation = None;
             if matches!(self.resume_intent, ResumeIntent::Default) {
                 if let Some(observation) = self.capture_freshest_conversation() {
                     self.apply_conversation_observation(&observation);
@@ -504,6 +506,11 @@ impl Instance {
                     if binding.is_none_or(|binding| {
                         !binding.is_known() && binding.provenance == ConversationProvenance::Unknown
                     }) {
+                        abandoned_conversation = Some(
+                            binding
+                                .cloned()
+                                .unwrap_or_else(|| ConversationBinding::unknown(sid)),
+                        );
                         fresh_notice = Some(FreshLaunchNotice::UnqualifiedStoredConversation {
                             sid: sid.to_owned(),
                         });
@@ -532,6 +539,11 @@ impl Instance {
                     Err(error) => error,
                     Ok(_) => unreachable!(),
                 };
+                abandoned_conversation = Some(
+                    self.agent_session_binding
+                        .clone()
+                        .unwrap_or_else(|| ConversationBinding::unknown(&sid)),
+                );
                 fresh_notice = Some(FreshLaunchNotice::UnattestedContext { sid });
                 tracing::warn!(target: "session.store", error = %error, "stored conversation cannot be resumed from an unattested context; starting fresh");
                 self.set_agent_conversation(None, None, self.pi_session_path.clone());
@@ -605,13 +617,20 @@ impl Instance {
                 self.adopt_conversation_state(prior);
                 canonical
             });
-            Ok((parts, execution, canonical_conversation, fresh_notice))
+            Ok((
+                parts,
+                execution,
+                canonical_conversation,
+                fresh_notice,
+                abandoned_conversation,
+            ))
         })();
         let (
             (command, is_existing, omp_capture_plan, mut launch_env),
             mut execution,
             canonical_conversation,
             fresh_notice,
+            abandoned_conversation,
         ) = match preparation {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -640,6 +659,7 @@ impl Instance {
             expected_prior_omp_generation,
             execution,
             fresh_notice,
+            abandoned_conversation,
         })
     }
 

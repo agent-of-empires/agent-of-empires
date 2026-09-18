@@ -422,6 +422,9 @@ impl Instance {
                     }
                 }
             }
+            if let Some(abandoned) = prepared.abandoned_conversation.take() {
+                self.retroactive_capture_excludes.insert(abandoned);
+            }
         }
         #[cfg(test)]
         test_support::observe(self, test_support::FinalizePhase::Before);
