@@ -200,9 +200,11 @@ pub struct NewSessionDialog {
     /// Configured opening state (`acp.default_new_session_view`), re-applied
     /// when a tool change makes the structured view available again.
     pub(super) structured_default: bool,
-    /// Set once the user works the Structured toggle, so a later tool change
-    /// stops re-applying `structured_default` over their choice.
-    pub(super) structured_overridden: bool,
+    /// What the user chose when they worked the Structured toggle, if they
+    /// did. A tool change forces the field off while the tool cannot back a
+    /// structured session, then restores this rather than the configured
+    /// default, so passing through an incapable tool does not discard it.
+    pub(super) structured_choice: Option<bool>,
     /// Whether the currently selected tool can back a structured-view
     /// session (registry entry or `agent_acp_cmd`). Recomputed whenever
     /// the tool or profile changes.
@@ -556,7 +558,7 @@ impl NewSessionDialog {
             yolo_mode_default: yolo_mode,
             structured_enabled: structured_capable && structured_default,
             structured_default,
-            structured_overridden: false,
+            structured_choice: None,
             structured_capable,
             extra_env,
             extra_env_overridden: false,
@@ -663,11 +665,11 @@ impl NewSessionDialog {
     /// incapable tool forces it off, and a capable one restores the
     /// configured default unless the user has already set it themselves.
     fn apply_structured_default(&mut self) {
-        if !self.structured_capable {
-            self.structured_enabled = false;
-        } else if !self.structured_overridden {
-            self.structured_enabled = self.structured_default;
-        }
+        self.structured_enabled = if !self.structured_capable {
+            false
+        } else {
+            self.structured_choice.unwrap_or(self.structured_default)
+        };
     }
 
     /// resolution, so structured capability is opted into per-test.
@@ -928,7 +930,7 @@ impl NewSessionDialog {
             // opted into per-test via `set_structured_capable`.
             structured_enabled: false,
             structured_default: false,
-            structured_overridden: false,
+            structured_choice: None,
             structured_capable: false,
             extra_env: Vec::new(),
             extra_env_overridden: false,
@@ -1003,7 +1005,7 @@ impl NewSessionDialog {
             yolo_mode_default: false,
             structured_enabled: false,
             structured_default: false,
-            structured_overridden: false,
+            structured_choice: None,
             structured_capable: false,
             extra_env: Vec::new(),
             extra_env_overridden: false,
@@ -1269,7 +1271,7 @@ impl NewSessionDialog {
             }
         } else if self.focused_field == structured_field {
             self.structured_enabled = !self.structured_enabled;
-            self.structured_overridden = true;
+            self.structured_choice = Some(self.structured_enabled);
         } else if self.focused_field == yolo_mode_field {
             self.yolo_mode = !self.yolo_mode;
         } else if self.focused_field == worktree_field {
@@ -1649,7 +1651,7 @@ impl NewSessionDialog {
                 if self.focused_field == structured_field =>
             {
                 self.structured_enabled = !self.structured_enabled;
-                self.structured_overridden = true;
+                self.structured_choice = Some(self.structured_enabled);
                 DialogResult::Continue
             }
             _ => {

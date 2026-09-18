@@ -183,6 +183,13 @@ export function AgentOptions({
   // settings, so a slow response for an abandoned profile cannot land last
   // and overwrite the selection the user actually made.
   const profileRequestRef = useRef(0);
+  /** Reset just the view state to the opt-in's own default. Used when a
+   *  profile change lands but its settings do not, so a create cannot inherit
+   *  the previous profile's view. */
+  const onApplyProfileDefaultsViewOnly = useCallback(() => {
+    onChange("structuredOffered", false);
+    onChange("useStructuredView", false);
+  }, [onChange]);
   const handleProfileChange = useCallback(
     async (profileName: string) => {
       // If user had manual edits, confirm before overwriting. "Server default"
@@ -199,6 +206,8 @@ export function AgentOptions({
       // must leave an in-flight request for the still-selected profile valid.
       const requestId = ++profileRequestRef.current;
 
+      // The selection lands immediately so the picker responds to the click,
+      // rather than waiting on the network to light up.
       onChange("profile", profileName);
 
       // An empty name is "Server default", which still needs its own resolved
@@ -206,7 +215,15 @@ export function AgentOptions({
       // values, including the view choice, in state.
       try {
         const settings = await fetchSettings(profileName || undefined);
-        if (settings && requestId === profileRequestRef.current) {
+        if (requestId !== profileRequestRef.current) return;
+        if (!settings) {
+          // The profile changed but its settings are unknown, so the old
+          // profile's view state no longer describes anything. Fall back to
+          // the opt-in's own default rather than letting a create inherit it.
+          onApplyProfileDefaultsViewOnly();
+          return;
+        }
+        {
           const session = settings.session as Record<string, unknown> | undefined;
           const sandbox = settings.sandbox as Record<string, unknown> | undefined;
           const worktree = settings.worktree as Record<string, unknown> | undefined;
@@ -241,10 +258,20 @@ export function AgentOptions({
           });
         }
       } catch {
-        // If we can't load profile settings, just set the profile name
+        // Same reasoning as the empty-settings case above: the profile moved,
+        // its settings did not arrive, so the view state must not stay on the
+        // previous profile's answer.
+        if (requestId === profileRequestRef.current) onApplyProfileDefaultsViewOnly();
       }
     },
-    [data.profileDirty, data.structuredViewDirty, data.tool, onChange, onApplyProfileDefaults],
+    [
+      data.profileDirty,
+      data.structuredViewDirty,
+      data.tool,
+      onChange,
+      onApplyProfileDefaults,
+      onApplyProfileDefaultsViewOnly,
+    ],
   );
 
   const advancedBlock = (

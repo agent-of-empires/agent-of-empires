@@ -1738,7 +1738,10 @@ fn structured_default_reseeds_only_until_the_user_decides() {
         // (configured default, user toggled first, expected after regain)
         (true, false, true),
         (false, false, false),
+        // A chosen value survives a trip through an incapable tool, in both
+        // directions: the choice is restored, not the configured default.
         (true, true, false),
+        (false, true, true),
     ];
     for (structured_default, user_toggled, expected) in cases {
         let mut dialog = single_tool_dialog();
