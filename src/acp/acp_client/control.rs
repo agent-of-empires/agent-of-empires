@@ -1,15 +1,15 @@
 //! The v3 runner control socket: connecting, establishing a session, and
 //! routing ACP frames over it.
 
-use crate::acp::control_protocol::{self, ControlBody};
+use crate::acp::control_protocol::{self, ControlBody, SessionReplayed};
 use crate::acp::state::Event;
 use agent_client_protocol::schema::v1::PromptResponse;
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, RawFd};
-use std::sync::atomic::Ordering as AtomicOrdering;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt as _;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tracing::{debug, info, warn};
 
 use super::errors::{acp_error_from_value, acp_internal_error, AcpError};
@@ -41,6 +41,8 @@ pub(super) struct DaemonControlClient {
     pub(super) ingress: Arc<SessionIngress>,
     write: Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
     handshake_rx: Mutex<mpsc::Receiver<ControlBody>>,
+    sessions_established: AtomicU64,
+    sessions_replayed: watch::Sender<u64>,
     completion: Arc<std::sync::Mutex<PromptCompletion>>,
     raw_fd: RawFd,
 }
@@ -173,7 +175,11 @@ impl DaemonControlClient {
             Some(ControlBody::SessionReady {
                 acp_session_id,
                 result,
-            }) => Ok((acp_session_id, result)),
+            }) => {
+                self.sessions_established
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                Ok((acp_session_id, result))
+            }
             Some(ControlBody::HandshakeFailed { error }) => Err(acp_error_from_value(error)),
             _ => Err(acp_internal_error(
                 "control channel closed during session establishment".into(),
@@ -193,6 +199,22 @@ impl DaemonControlClient {
                 "control channel closed during resume".into(),
             )),
         }
+    }
+
+    /// Wait until the crate has applied the updates the runner queued ahead of
+    /// every established session's replay barrier.
+    pub(super) async fn session_replayed(&self) {
+        let established = self.sessions_established.load(AtomicOrdering::Relaxed);
+        let _ = self
+            .sessions_replayed
+            .subscribe()
+            .wait_for(|replayed| *replayed >= established)
+            .await;
+    }
+
+    pub(super) fn mark_session_replayed(&self, _: SessionReplayed) {
+        self.sessions_replayed
+            .send_modify(|replayed| *replayed += 1);
     }
 
     /// Transfer terminal ownership before the command loop arms a local turn.
@@ -657,6 +679,8 @@ pub(super) async fn connect_runner_control_v3(
             ingress,
             write: write_half,
             handshake_rx: Mutex::new(hs_rx),
+            sessions_established: AtomicU64::new(0),
+            sessions_replayed: watch::Sender::new(0),
             completion,
             raw_fd,
         }),
@@ -1798,5 +1822,133 @@ mod tests {
             "{message}"
         );
         assert!(!message.contains("timed out attaching"), "{message}");
+    }
+
+    /// The runner's session reply precedes the replay it follows; a load must
+    /// not count as replayed until the crate has applied that replay (#4016).
+    #[tokio::test]
+    async fn session_replayed_waits_for_replay_sent_after_the_reply() {
+        use super::super::session_identity::SessionIngressNotification;
+        use agent_client_protocol::{ByteStreams, Client};
+        use futures_util::FutureExt as _;
+        use std::sync::atomic::AtomicBool;
+        use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let control =
+            crate::process::worker::control_socket_sibling(&tmp.path().join("replayed.sock"));
+        let listener = tokio::net::UnixListener::bind(&control).unwrap();
+        let runner = async {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            control_protocol::write_frame(
+                &mut peer,
+                &ControlBody::Hello {
+                    control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
+                    session_id: "replayed".into(),
+                },
+            )
+            .await
+            .unwrap();
+            while let Some(frame) = control_protocol::read_frame(&mut peer).await.unwrap() {
+                match frame {
+                    ControlBody::Attach { .. } => {}
+                    ControlBody::EstablishSession { .. } => {
+                        for body in [
+                            ControlBody::SessionReady {
+                                acp_session_id: "s".into(),
+                                result: serde_json::json!({}),
+                            },
+                            ControlBody::Notify {
+                                method: "session/update".into(),
+                                params: serde_json::json!({"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"replayed"}}}),
+                            },
+                            ControlBody::Notify {
+                                method: "_aoe/session_replayed".into(),
+                                params: serde_json::json!({}),
+                            },
+                        ] {
+                            control_protocol::write_frame(&mut peer, &body)
+                                .await
+                                .unwrap();
+                        }
+                    }
+                    other => panic!("unexpected frame {other:?}"),
+                }
+            }
+        };
+        let daemon = async {
+            let (client, crate_side) = connect_runner_control_v3(
+                &control,
+                mpsc::channel::<Event>(1).0,
+                "replayed".into(),
+                Arc::new(TerminalClaim::new()),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap();
+            let (entered_tx, entered_rx) = oneshot::channel::<()>();
+            let (release_tx, release_rx) = oneshot::channel::<()>();
+            let gate = Arc::new(Mutex::new(Some((entered_tx, release_rx))));
+            let applied = Arc::new(AtomicBool::new(false));
+            let marker_client = client.clone();
+            let (read, write) = tokio::io::split(crate_side);
+            Client
+                .builder()
+                // One handler for both, as the connection registers them.
+                .on_receive_notification(
+                    {
+                        let applied = applied.clone();
+                        move |notification: SessionIngressNotification, _cx| {
+                            let gate = gate.clone();
+                            let applied = applied.clone();
+                            let control = marker_client.clone();
+                            async move {
+                                match notification {
+                                    SessionIngressNotification::Replayed(marker) => {
+                                        control.mark_session_replayed(marker);
+                                    }
+                                    SessionIngressNotification::Update(_) => {
+                                        if let Some((entered, release)) = gate.lock().await.take() {
+                                            entered.send(()).unwrap();
+                                            release.await.unwrap();
+                                        }
+                                        applied.store(true, AtomicOrdering::Relaxed);
+                                    }
+                                }
+                                Ok(())
+                            }
+                        }
+                    },
+                    agent_client_protocol::on_receive_notification!(),
+                )
+                .connect_with(
+                    ByteStreams::new(write.compat_write(), read.compat()),
+                    |_connection| async move {
+                        client
+                            .establish_session("session/load", serde_json::json!({}))
+                            .await
+                            .unwrap();
+                        entered_rx.await.unwrap();
+                        let replayed = client.session_replayed();
+                        tokio::pin!(replayed);
+                        assert!(
+                            replayed.as_mut().now_or_never().is_none(),
+                            "a load must not count as replayed mid-replay"
+                        );
+                        release_tx.send(()).unwrap();
+                        replayed.await;
+                        assert!(applied.load(AtomicOrdering::Relaxed));
+                        client.shutdown();
+                        Ok(())
+                    },
+                )
+                .await
+                .unwrap();
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(runner, daemon);
+        })
+        .await
+        .unwrap();
     }
 }

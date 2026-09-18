@@ -32,9 +32,10 @@ use tokio::sync::{mpsc, watch, Mutex};
 use tracing::{debug, info, warn};
 
 use super::worker_registry::{self, WorkerRecord};
-use crate::acp::control_protocol::{self, ControlBody, PromptOutcome};
+use crate::acp::control_protocol::{self, ControlBody, PromptOutcome, SessionReplayed};
 use crate::process::worker::RunnerRecordState;
 use crate::util::now_secs;
+use agent_client_protocol::JsonRpcMessage;
 
 /// How often the abandonment watchdog inspects its own registry record.
 const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_secs(10);
@@ -681,6 +682,8 @@ enum QueuedKind {
     Handshake,
     ServerCall,
     AgentReply,
+    // Not `Notify`: shedding it would leave the daemon's session/load waiting.
+    SessionReplayed,
 }
 
 struct QueuedControl {
@@ -972,6 +975,9 @@ impl RunnerShared {
         }
 
         if let Some((method, params)) = parse_notification(line) {
+            if SessionReplayed::matches_method(&method) {
+                return;
+            }
             self.enqueue(
                 DeliveryScope::Persistent,
                 QueuedKind::Notify,
@@ -1300,6 +1306,24 @@ impl RunnerShared {
                 }
             }
             space.await;
+        }
+    }
+
+    /// Queue a handshake reply; an established session is followed by its
+    /// replay barrier.
+    async fn enqueue_handshake(&self, attachment_id: u64, frame: ControlBody, established: bool) {
+        let scope = DeliveryScope::Attachment(attachment_id);
+        if self.enqueue(scope, QueuedKind::Handshake, frame).await && established {
+            let marker = SessionReplayed::default();
+            self.enqueue(
+                scope,
+                QueuedKind::SessionReplayed,
+                ControlBody::Notify {
+                    method: marker.method().into(),
+                    params: serde_json::json!({}),
+                },
+            )
+            .await;
         }
     }
 
@@ -2090,6 +2114,7 @@ async fn handle_control_connection(
         let mut control_closed = control_closed_rx;
         while let Some(command) = handshake_rx.recv().await {
             let mut dispatch_release = None;
+            let mut established = false;
             let frame = match command {
                 HandshakeCommand::Initialize(request) => {
                     let Some(result) = await_handshake_or_control_loss(
@@ -2146,6 +2171,7 @@ async fn handle_control_connection(
                     match result {
                         Ok((acp_session_id, result)) => {
                             handshake_done.store(true, Ordering::Release);
+                            established = true;
                             ControlBody::SessionReady {
                                 acp_session_id,
                                 result,
@@ -2159,11 +2185,7 @@ async fn handle_control_connection(
                 }
             };
             handshake_shared
-                .enqueue(
-                    DeliveryScope::Attachment(attachment_id),
-                    QueuedKind::Handshake,
-                    frame,
-                )
+                .enqueue_handshake(attachment_id, frame, established)
                 .await;
             drop(dispatch_release);
         }
@@ -3088,6 +3110,45 @@ mod tests {
         assert!(
             !channel.make_room(control_protocol::MAX_CONTROL_QUEUE_BYTES - 31),
             "correlation frames must apply backpressure rather than be evicted"
+        );
+    }
+
+    /// The replay barrier follows the updates an agent sent before its session
+    /// reply, which itself goes out first; an agent cannot forge it (#4016).
+    #[tokio::test]
+    async fn established_session_barrier_follows_its_replay() {
+        let (shared, stdin, _child) = shared_with_stdin().await;
+        let attachment = shared.begin_attachment().await;
+        for line in [
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"text":"replayed"}}"#,
+            r#"{"jsonrpc":"2.0","method":"_aoe/session_replayed","params":{}}"#,
+        ] {
+            shared.deliver_line(line.as_bytes(), &stdin).await;
+        }
+        let ready = ControlBody::SessionReady {
+            acp_session_id: "s".into(),
+            result: serde_json::json!({}),
+        };
+        shared
+            .enqueue_handshake(attachment, ready.clone(), true)
+            .await;
+
+        let mut sent = Vec::new();
+        while let Some((id, wire)) = shared.next_outbound(attachment).await {
+            sent.push(serde_json::from_slice::<ControlBody>(&wire[4..]).unwrap());
+            shared.commit_outbound(attachment, id).await;
+        }
+        let notify = |method: &str, params| ControlBody::Notify {
+            method: method.into(),
+            params,
+        };
+        assert_eq!(
+            sent,
+            [
+                ready,
+                notify("session/update", serde_json::json!({"text":"replayed"})),
+                notify("_aoe/session_replayed", serde_json::json!({})),
+            ]
         );
     }
 

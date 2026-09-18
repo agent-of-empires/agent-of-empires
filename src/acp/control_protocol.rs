@@ -46,6 +46,16 @@ pub const MAX_CONTROL_FRAME_BYTES: u32 = MAX_AGENT_FRAME_BYTES as u32 + 64 * 102
 pub const MAX_CONTROL_QUEUE_FRAMES: usize = 4096;
 pub const MAX_CONTROL_QUEUE_BYTES: usize = 128 * 1024 * 1024;
 
+/// Runner-minted [`ControlBody::Notify`] queued right after an established
+/// session's [`ControlBody::SessionReady`]. Frames go out handshake first, so
+/// it follows the updates the agent sent before its reply; the daemon handles
+/// it only once that replay has been applied.
+#[derive(
+    Debug, Clone, Default, Serialize, Deserialize, agent_client_protocol::JsonRpcNotification,
+)]
+#[notification(method = "_aoe/session_replayed")]
+pub struct SessionReplayed {}
+
 /// A single control frame. `kind` tags the variant so the wire form is
 /// self-describing and forward-compatible: an unknown variant fails to
 /// deserialize rather than being silently misread.
