@@ -2366,16 +2366,40 @@ impl<S: BroadcastSink> Supervisor<S> {
                         kill_wedged_runner(&*process_control, &session_id).await;
                     }
                     // Removes this epoch's handle; a no-op if a newer epoch
-                    // already replaced it.
+                    // already replaced it. Every caller is a terminal arm
+                    // with no respawn behind it, so this worker's background
+                    // sub-agent tailers die here and nothing will ever report
+                    // their outcomes. Detach them, or a rate-limit or
+                    // crash-loop park leaves the panel showing them running
+                    // and `has_active_background_agent` holds the sidebar dot
+                    // lit for the length of the park (#4001). Gated on
+                    // `release_running` so a newer epoch's sub-agents, which
+                    // that epoch's own spawn sweep owns, are left alone; run
+                    // off the `workers` guard because it reads the store.
                     let drop_handle = |lease: &Lease| {
                         let workers = Arc::clone(&workers);
                         let lifecycle = Arc::clone(&lifecycle);
                         let lease = lease.clone();
                         let session_id = session_id.clone();
+                        let sink = Arc::clone(&sink);
+                        let next_seqs = Arc::clone(&next_seqs);
                         async move {
-                            let mut guard = workers.lock().await;
-                            if lock_recover(&lifecycle).release_running(&lease) {
-                                guard.remove(&session_id);
+                            let dropped = {
+                                let mut guard = workers.lock().await;
+                                let dropped = lock_recover(&lifecycle).release_running(&lease);
+                                if dropped {
+                                    guard.remove(&session_id);
+                                }
+                                dropped
+                            };
+                            if dropped {
+                                detach_orphaned_background_agents_on(
+                                    &*sink,
+                                    &next_seqs,
+                                    &session_id,
+                                    "the worker that was tracking this sub-agent stopped; \
+                                     tracking stopped",
+                                );
                             }
                         }
                     };
@@ -2825,7 +2849,12 @@ impl<S: BroadcastSink> Supervisor<S> {
                     // run, now that the new client owns the session.
                     cancel_orphaned_approvals_on(&*sink, &next_seqs, &session_id);
                     cancel_orphaned_elicitations_on(&*sink, &next_seqs, &session_id);
-                    detach_orphaned_background_agents_on(&*sink, &next_seqs, &session_id);
+                    detach_orphaned_background_agents_on(
+                        &*sink,
+                        &next_seqs,
+                        &session_id,
+                        WORKER_REPLACED_DETACH_WARNING,
+                    );
 
                     info!(
                         target: "acp.supervisor",
@@ -3550,16 +3579,10 @@ impl<S: BroadcastSink> Supervisor<S> {
                 .retire_refused_install(&lease, Some(identity), refusal)
                 .await);
         }
-        // Hold `workers` across install AND the insert below, as `spawn_inner`
-        // does. `shutdown_with_reason` takes this same lock before its
-        // `begin_stop` decision and removes whatever `workers.remove` finds
-        // there; if this guard were dropped between install and insert, a
-        // stop landing in that window would see no handle, settle the lease
-        // as `Proven`, and return `Ok` while the runner it never touched kept
-        // running, and then this insert would leave a live handle under a
-        // lease shutdown already considers resolved. `install` alone does not
-        // close that gap: it claims the lifecycle slot, but `begin_stop` acts
-        // on the `workers` map, not the lifecycle table.
+        // `workers` stays held across install and the insert below, as in
+        // `spawn_inner`: a `shutdown_with_reason` landing in that window
+        // would otherwise find no handle, settle the lease as `Proven`, and
+        // leave this insert publishing a live handle under a resolved lease.
         // Same pre-drain sweep as `spawn`, for entries the previous daemon
         // orphaned: after the drain starts, this worker's own approvals are
         // in the log and the sweep can no longer tell them apart. Background
@@ -3596,18 +3619,13 @@ impl<S: BroadcastSink> Supervisor<S> {
                 resumed = resumable.len(),
                 "resuming background sub-agent tailing after daemon restart"
             );
-            // A send failure here means the connection died between install
-            // and this await; `cmd_tx` and the drain task's `inbound` come
-            // from the same connection task, so the drain task already saw
-            // (or is about to see) the closed channel and will run its own
-            // closed-inbound handling, which drops this `WorkerHandle` and
-            // releases its lease. Propagating the error instead would route
-            // through the caller's fresh-spawn fallback, which calls
-            // `terminate_and_wait` on the runner, killing a runner that may
-            // still be alive (this is a client-connection failure, not proof
-            // the runner process died). Swallowing it here and letting
-            // `readopt_orphan_runners` reattach on the next tick keeps that
-            // runner alive for the self-heal instead.
+            // Swallowed deliberately: a send failure proves only that the
+            // client connection task died, not the runner. Propagating it
+            // routes into the caller's fresh-spawn fallback, which
+            // `terminate_and_wait`s a runner that may still be serving. The
+            // drain task shares this connection's channel, so it runs its own
+            // closed-inbound handling and `readopt_orphan_runners` reattaches
+            // on the next tick.
             let _ = client.resume_background_tailing(resumable).await;
         }
         info!(
@@ -3664,7 +3682,12 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// Detach background sub-agents that were left `Running`/`Stalled` by
     /// the previous daemon. See [`detach_orphaned_background_agents_on`].
     fn detach_orphaned_background_agents(&self, session_id: &str) {
-        detach_orphaned_background_agents_on(&*self.sink, &self.next_seqs, session_id);
+        detach_orphaned_background_agents_on(
+            &*self.sink,
+            &self.next_seqs,
+            session_id,
+            WORKER_REPLACED_DETACH_WARNING,
+        );
     }
 
     /// Whether this session has a structured view worker up or coming up.
@@ -4227,20 +4250,28 @@ fn cancel_orphaned_elicitations_on<S: BroadcastSink>(
     }
 }
 
+/// The reason `spawn` and the drain respawn path detach: both install a
+/// fresh worker over the one whose tailer died.
+const WORKER_REPLACED_DETACH_WARNING: &str =
+    "the worker that was tracking this sub-agent was replaced; tracking stopped";
+
 /// Detach background sub-agents left `Running`/`Stalled` by a dead worker:
-/// its tailer died with the previous daemon and no fresh launch will be
-/// replayed for it. Publish a synthetic `BackgroundAgentCompleted { status:
-/// Detached }` per orphaned agent id so the panel stops showing it as
-/// running forever. Called by `spawn` and the drain respawn path, which
-/// only ever see a dead or fresh worker, so detaching is the only option;
-/// `shutdown_with_reason` inlines its own version with `warning: None`
-/// rather than sharing this one. `attach` instead resumes tailing whatever
-/// it can; see [`collect_resumable_background_agent_launches`]. Mirrors
+/// its tailer died with that worker and no fresh launch will be replayed
+/// for it. Publish a synthetic `BackgroundAgentCompleted { status: Detached
+/// }` per orphaned agent id so the panel stops showing it as running
+/// forever. Called wherever a worker goes away with no tailer inheriting
+/// its sub-agents: `spawn`, the drain respawn path, and the drain's
+/// terminal arms via `drop_handle`. `warning` is caller-supplied because
+/// those sites differ in why tracking stopped. `shutdown_with_reason`
+/// inlines its own version with `warning: None` rather than sharing this
+/// one. `attach` instead resumes tailing whatever it can; see
+/// [`collect_resumable_background_agent_launches`]. Mirrors
 /// `cancel_orphaned_approvals_on`.
 fn detach_orphaned_background_agents_on<S: BroadcastSink>(
     sink: &S,
     next_seqs: &SeqMap,
     session_id: &str,
+    warning: &str,
 ) {
     let stale_ids = sink.unresolved_background_agent_ids(session_id);
     if stale_ids.is_empty() {
@@ -4253,13 +4284,7 @@ fn detach_orphaned_background_agents_on<S: BroadcastSink>(
         "detaching background sub-agents orphaned by daemon restart"
     );
     for agent_id in stale_ids {
-        publish_background_agent_detached(
-            sink,
-            next_seqs,
-            session_id,
-            agent_id,
-            "the worker that was tracking this sub-agent was replaced; tracking stopped",
-        );
+        publish_background_agent_detached(sink, next_seqs, session_id, agent_id, warning);
     }
 }
 
@@ -8666,6 +8691,83 @@ cursor-acp-bridge = "agent acp"
         assert!(
             sink.frames.lock().unwrap().is_empty(),
             "no nonces means no published frames"
+        );
+    }
+
+    /// A worker that goes away with no respawn behind it takes its
+    /// background-agent tailers with it, so the drain task's terminal arms
+    /// must detach whatever the log still shows running. Covers the user-stop
+    /// arm (`aoe acp stop|kill` deletes the registry record out from under a
+    /// live daemon): without the sweep the sub-agent stays `Running` in the
+    /// panel and `has_active_background_agent` holds the sidebar dot lit past
+    /// the `Stopped` this same arm publishes (#4001).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_terminal_drain_arm_detaches_the_workers_background_agents() {
+        use crate::acp::event_store::EventStore;
+        use crate::acp::state::BackgroundAgentStatus;
+
+        let id = "s-drain-detach";
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        let store = Arc::new(EventStore::open(&tmp.path().join("acp.db"), 1000).unwrap());
+        let (tx, _rx) = broadcast::channel(16);
+        let sink = Arc::new(ChannelSink {
+            tx,
+            event_store: store.clone(),
+            control_cache: Arc::new(crate::acp::control_cache::ControlStateCache::new()),
+        });
+        sink.publish(
+            id,
+            1,
+            &Event::BackgroundAgentLaunched {
+                agent_id: "sub-1".into(),
+                tool_call_id: "tc-1".into(),
+                description: "do a thing".into(),
+                prompt: "do a thing".into(),
+                model: "claude".into(),
+                output_file: "/tmp/nonexistent-4029.jsonl".into(),
+                started_at: chrono::Utc::now(),
+            },
+        );
+
+        let sup = Supervisor::new(sink);
+        sup.hydrate_seqs(store.all_session_seqs());
+        let (client, _client_tx) = AcpClient::fake_for_test(AcpSessionId(id.into()));
+        // No registry record: `restart_decision` reads that as the user
+        // stopping the runner externally and drops the handle without a
+        // respawn, which is the arm under test.
+        let lease = sup
+            .test_install_handle(id, client, WorkerKind::Attached, None)
+            .await;
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<Event>(16);
+        let drain = sup.start_drain_task(id.into(), lease, inbound_rx);
+        drop(inbound_tx);
+        tokio::time::timeout(std::time::Duration::from_secs(5), drain)
+            .await
+            .expect("drain task should exit within 5s of inbound close")
+            .unwrap();
+
+        assert!(
+            store.unresolved_background_agent_ids(id).is_empty(),
+            "the dropped worker's sub-agent must be detached in the durable log"
+        );
+        let mut state = crate::acp::state::AcpState::new(
+            crate::acp::state::AcpSessionId(id.into()),
+            crate::acp::state::AgentName("claude".into()),
+            None,
+        );
+        for (_, event) in store.replay_from(id, 0) {
+            state.apply_event(event).unwrap();
+        }
+        assert_eq!(state.background_agents.len(), 1);
+        assert_eq!(
+            state.background_agents[0].status,
+            BackgroundAgentStatus::Detached
+        );
+        assert!(
+            !state.has_active_background_agent(),
+            "the sidebar dot must not stay lit behind a stopped worker"
         );
     }
 

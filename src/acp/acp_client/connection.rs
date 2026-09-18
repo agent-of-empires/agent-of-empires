@@ -150,6 +150,7 @@ fn handle_resume_background_tailing_cmd(
             bg_transcript_source.clone(),
             event_tx.clone(),
             between_prompt_bg_agents.clone(),
+            crate::acp::background_agent::TailerStart::Resumed,
         );
     }
 }
@@ -696,6 +697,7 @@ pub(super) async fn run_connection_task<W, R>(
                                 bg_transcript_source.clone(),
                                 event_tx.clone(),
                                 between_prompt_bg_agents.clone(),
+                                crate::acp::background_agent::TailerStart::Live,
                             );
                         }
                     }
