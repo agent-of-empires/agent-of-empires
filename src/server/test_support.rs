@@ -15,7 +15,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, RwLock};
-use tokio_util::sync::CancellationToken;
 
 /// Build a minimal `Arc<AppState>` for helper-equivalence tests. Most
 /// fields are seeded with empty / default values; only `instances`,
@@ -28,7 +27,7 @@ pub fn build_test_app_state(prior: Vec<Instance>) -> Arc<AppState> {
 /// Like [`build_test_app_state`] but with CityHall client mode on, so route
 /// tests can assert the mode's 403/400 guards fire (#7).
 pub fn build_test_app_state_cityhall(prior: Vec<Instance>) -> Arc<AppState> {
-    build_test_app_state_impl(prior, Vec::new(), Vec::new(), None, true)
+    build_test_app_state_impl(prior, Vec::new(), Vec::new(), None, true, |_| {})
 }
 
 /// Like [`build_test_app_state`] but seeds the DNS-rebinding allowlist and,
@@ -40,7 +39,31 @@ pub fn build_test_app_state_with_policy(
     allowed_origins: Vec<String>,
     token: Option<String>,
 ) -> Arc<AppState> {
-    build_test_app_state_impl(prior, allowed_hosts, allowed_origins, token, false)
+    build_test_app_state_impl(prior, allowed_hosts, allowed_origins, token, false, |_| {})
+}
+
+pub fn build_test_app_state_with_policy_configured(
+    prior: Vec<Instance>,
+    allowed_hosts: Vec<String>,
+    allowed_origins: Vec<String>,
+    token: Option<String>,
+    configure: impl FnOnce(&mut AppState),
+) -> Arc<AppState> {
+    build_test_app_state_impl(
+        prior,
+        allowed_hosts,
+        allowed_origins,
+        token,
+        false,
+        configure,
+    )
+}
+
+pub fn build_test_app_state_configured(
+    prior: Vec<Instance>,
+    configure: impl FnOnce(&mut AppState),
+) -> Arc<AppState> {
+    build_test_app_state_impl(prior, Vec::new(), Vec::new(), None, false, configure)
 }
 
 fn build_test_app_state_impl(
@@ -49,6 +72,7 @@ fn build_test_app_state_impl(
     allowed_origins: Vec<String>,
     token: Option<String>,
     cityhall_mode: bool,
+    configure: impl FnOnce(&mut AppState),
 ) -> Arc<AppState> {
     let app_dir = tempfile::tempdir().expect("tempdir");
     let acp_db = app_dir.path().join("acp_events.db");
@@ -81,15 +105,31 @@ fn build_test_app_state_impl(
             control_cache: acp_control_cache.clone(),
         },
     ));
-    Arc::new(AppState {
-        profile: "test".to_string(),
+    let shutdown = session_service.work.shutdown.clone();
+    let mut state = AppState {
+        core_only: false,
         read_only: false,
         cityhall_mode,
         instances,
+        profile_namespace: Arc::new(RwLock::new(())),
+        publication: Arc::new(RwLock::new(())),
+        reload_lane: tokio::sync::Mutex::new(()),
+        canonical_metadata: RwLock::new(super::reload::CanonicalMetadata {
+            default_profile: "test".into(),
+            ..Default::default()
+        }),
+        canonical_health: RwLock::new(crate::daemon::RuntimeHealth::Healthy),
+        runtime: super::runtime::NativeRuntime::new(
+            "test".into(),
+            None,
+            session_service.work.clone(),
+        ),
         session_service,
         token_manager: Arc::new(TokenManager::new(token, Duration::from_secs(3600))),
         login_manager: Arc::new(login::LoginManager::new(None)),
         rate_limiter: Arc::new(RateLimiter::new()),
+        pairing_limiter: Arc::new(RateLimiter::new()),
+        pairing: Default::default(),
         behind_tunnel: false,
         auth_mode: "none",
         serve_mode: "local",
@@ -134,11 +174,15 @@ fn build_test_app_state_impl(
         telemetry_session_creates,
         telemetry_structured: StructuredTelemetryCounters::default(),
         telemetry_last_reported: std::sync::Mutex::new(None),
-        shutdown: CancellationToken::new(),
+        shutdown,
         file_watch,
         disk_changed: Arc::new(tokio::sync::Notify::new()),
         disk_watch_handles: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-    })
+    };
+    configure(&mut state);
+    let state = Arc::new(state);
+    state.session_service.bind_native_state(&state);
+    state
 }
 
 pub async fn drain_session_id_updates_for_test(state: &Arc<AppState>) {
@@ -180,9 +224,7 @@ pub async fn disk_watch_handle_count(state: &Arc<AppState>) -> usize {
     state.disk_watch_handles.lock().await.len()
 }
 
-pub use super::api::system::{
-    create_profile, delete_profile, rename_profile, CreateProfileBody, RenameProfileBody,
-};
+pub use super::api::system::{create_profile, delete_profile, rename_profile};
 
 pub async fn add_profile_disk_watch(state: &Arc<AppState>, profile: &str) {
     super::add_profile_disk_watch(state, profile).await
@@ -196,11 +238,11 @@ pub async fn rename_profile_disk_watch(state: &Arc<AppState>, old: &str, new: &s
     super::rename_profile_disk_watch(state, old, new).await
 }
 
-/// Replace the `Arc<FileWatchService>` on a unique-Arc'd `AppState`.
-/// Tests build state with a `noop` service, then swap to live before
-/// exercising propagation paths. Crate-internal field access is
-/// hidden behind this helper so the field can stay `pub(crate)`.
+/// Configure both collaborators before binding the native runtime.
 pub fn replace_file_watch(state: &mut AppState, fw: Arc<crate::file_watch::FileWatchService>) {
+    Arc::get_mut(&mut state.session_service)
+        .expect("configure session service before sharing it")
+        .file_watch = fw.clone();
     state.file_watch = fw;
 }
 
@@ -224,8 +266,13 @@ pub async fn reload_disk_only_for_test(
         live_worker_records,
         super::state::StatusSource::DiskOnly,
         read_epoch,
+        {
+            let metadata = (state).canonical_metadata.read().await.clone();
+            metadata
+        },
+        Default::default(),
     )
-    .await
+    .await;
 }
 
 pub async fn reload_tmux_applied_for_test(
@@ -242,6 +289,11 @@ pub async fn reload_tmux_applied_for_test(
         live_worker_records,
         super::state::StatusSource::TmuxApplied,
         read_epoch,
+        {
+            let metadata = (state).canonical_metadata.read().await.clone();
+            metadata
+        },
+        Default::default(),
     )
-    .await
+    .await;
 }

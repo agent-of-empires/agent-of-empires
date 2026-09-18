@@ -32,16 +32,20 @@ pub fn runtime_binary() -> &'static str {
 /// listing passes to the runtime, so the two cannot drift.
 pub const SANDBOX_NAME_PREFIX: &str = "aoe-sandbox-";
 
-pub fn get_container_runtime() -> ContainerRuntime {
-    if let Ok(cfg) = Config::load() {
-        match cfg.sandbox.container_runtime {
-            ContainerRuntimeName::AppleContainer => ContainerRuntime::apple_container(),
-            ContainerRuntimeName::Docker => ContainerRuntime::docker(),
-            ContainerRuntimeName::Podman => ContainerRuntime::podman(),
+impl From<ContainerRuntimeName> for ContainerRuntime {
+    fn from(name: ContainerRuntimeName) -> Self {
+        match name {
+            ContainerRuntimeName::AppleContainer => Self::apple_container(),
+            ContainerRuntimeName::Docker => Self::docker(),
+            ContainerRuntimeName::Podman => Self::podman(),
         }
-    } else {
-        ContainerRuntime::default()
     }
+}
+
+pub fn get_container_runtime() -> ContainerRuntime {
+    Config::load()
+        .map(|config| config.sandbox.container_runtime.into())
+        .unwrap_or_default()
 }
 
 /// Check running state of all aoe sandbox containers in a single subprocess call.
@@ -152,11 +156,11 @@ pub struct DockerContainer {
 }
 
 impl DockerContainer {
-    pub fn new(session_id: &str, image: &str) -> Self {
+    pub fn new(session_id: &str, image: &str, runtime: ContainerRuntime) -> Self {
         Self {
             name: Self::generate_name(session_id),
             image: image.to_string(),
-            runtime: get_container_runtime(),
+            runtime,
         }
     }
 
@@ -165,11 +169,15 @@ impl DockerContainer {
     }
 
     pub fn from_session_id(session_id: &str) -> Self {
-        Self {
-            name: Self::generate_name(session_id),
-            image: String::new(),
-            runtime: get_container_runtime(),
-        }
+        Self::new(session_id, "", get_container_runtime())
+    }
+
+    pub fn ensure_image(&self) -> Result<()> {
+        self.runtime.ensure_image(&self.image)
+    }
+
+    pub(crate) fn runtime(&self) -> &ContainerRuntime {
+        &self.runtime
     }
 
     pub fn exists(&self) -> Result<bool> {
@@ -313,19 +321,14 @@ impl DockerContainer {
         }
     }
 
-    /// Force-remove this container, then sweep its named ignore volumes.
-    ///
-    /// Idempotent: a container that is already gone yields
-    /// [`Teardown::AlreadyGone`], not a failure. Named ignore volumes outlive
-    /// the container, so they are swept regardless of the removal outcome.
-    ///
-    /// This method must be invoked unconditionally by callers, which then
-    /// act on the returned outcome; it must never be gated behind a separate
-    /// existence probe, whose transient failure would skip removal and orphan
-    /// a live container.
+    /// Remove the container before reclaiming its named ignore volumes.
+    /// Already-absent containers permit reclamation; failed removals retain volumes.
+    /// Call unconditionally: a failed presence probe must not skip teardown.
     pub fn teardown(&self, session_id: &str) -> Teardown {
         let outcome = classify_removal(self.remove(true));
-        self.remove_named_ignore_volumes(session_id);
+        if !matches!(outcome, Teardown::Failed(_)) {
+            self.remove_named_ignore_volumes(session_id);
+        }
         outcome
     }
 
@@ -463,15 +466,22 @@ mod tests {
 
     #[test]
     fn test_container_exec_command() {
-        let mut container = DockerContainer::new("test1234567890ab", "ubuntu:latest");
-        container.runtime = ContainerRuntime::docker();
+        let container = DockerContainer::new(
+            "test1234567890ab",
+            "ubuntu:latest",
+            ContainerRuntime::docker(),
+        );
 
         let cmd = container.exec_command(None, "my-agent");
         assert_eq!(cmd, "docker exec -it aoe-sandbox-test1234 my-agent");
     }
     #[test]
     fn test_anonymous_volumes_in_create_args() {
-        let container = DockerContainer::new("test1234567890ab", "alpine:latest");
+        let container = DockerContainer::new(
+            "test1234567890ab",
+            "alpine:latest",
+            ContainerRuntime::docker(),
+        );
         let config = ContainerConfig {
             working_dir: "/workspace/myproject".to_string(),
             volumes: vec![],
@@ -505,7 +515,11 @@ mod tests {
 
     #[test]
     fn test_no_anonymous_volumes_when_empty() {
-        let container = DockerContainer::new("test1234567890ab", "alpine:latest");
+        let container = DockerContainer::new(
+            "test1234567890ab",
+            "alpine:latest",
+            ContainerRuntime::docker(),
+        );
         let config = ContainerConfig {
             working_dir: "/workspace".to_string(),
             volumes: vec![],

@@ -147,6 +147,38 @@ impl RateLimiter {
         false
     }
 
+    /// Every IP locked out right now, with the seconds left.
+    pub async fn lockouts(&self) -> Vec<(IpAddr, u64)> {
+        let now = Instant::now();
+        let failures = self.failures.read().await;
+        failures
+            .iter()
+            .filter_map(|(ip, record)| {
+                let until = record.locked_until.filter(|until| now < *until)?;
+                Some((*ip, until.duration_since(now).as_secs().max(1)))
+            })
+            .collect()
+    }
+
+    /// Forget every failure and lockout.
+    pub async fn clear(&self) {
+        self.failures.write().await.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn lock_out(&self, ip: IpAddr) {
+        let now = Instant::now();
+        self.failures.write().await.insert(
+            ip,
+            FailureRecord {
+                count: MAX_FAILURES,
+                first_failure: now,
+                last_failure: now,
+                locked_until: Some(now + LOCKOUT_DURATION),
+            },
+        );
+    }
+
     /// Clear failure count for an IP after successful auth.
     pub async fn record_success(&self, ip: IpAddr) {
         let mut failures = self.failures.write().await;

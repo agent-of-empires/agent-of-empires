@@ -16,6 +16,40 @@ pub struct TerminalInfo {
     pub created: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AuxiliaryTarget {
+    Host { index: u32 },
+    Container { index: u32 },
+    Tool { tool_name: String },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PanePresence {
+    Absent,
+    Alive,
+    Dead,
+    #[default]
+    Unknown,
+}
+
+/// Native handoff requires Alive and the same name as the preparation receipt.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneObservation {
+    #[serde(default)]
+    pub state: PanePresence,
+    #[serde(default)]
+    pub tmux_session: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuxiliaryObservation {
+    pub target: AuxiliaryTarget,
+    #[serde(flatten)]
+    pub pane: PaneObservation,
+}
+
 /// How a session is rendered. `Structured` uses the ACP-based native
 /// rendering (plan panels, tool-call cards, approvals); `Terminal` streams
 /// the raw tmux/PTY through xterm.js. `Terminal` is the conservative

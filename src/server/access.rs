@@ -267,6 +267,7 @@ pub(super) fn access_denied() -> axum::response::Response {
     use axum::response::IntoResponse;
     (
         axum::http::StatusCode::FORBIDDEN,
+        crate::daemon::ApiErrorCode::AccessPolicyDenied.header(),
         "forbidden: host or origin not allowed",
     )
         .into_response()
@@ -325,18 +326,25 @@ pub(super) const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
     // Session creation (server-derived) + lifecycle / metadata on the structured
     // sessions this mode owns; each handler re-checks the target is structured.
     ("POST", "/api/sessions"),
+    ("POST", "/api/sessions/{id}/creation/cancel"),
     ("DELETE", "/api/sessions/{id}"),
     ("DELETE", "/api/workspaces"),
     ("PATCH", "/api/sessions/{id}"),
     ("PATCH", "/api/sessions/{id}/archive"),
     ("PATCH", "/api/sessions/{id}/color"),
     ("PATCH", "/api/sessions/{id}/diff-base"),
+    ("PATCH", "/api/sessions/{id}/favorite"),
     ("PATCH", "/api/sessions/{id}/group"),
+    ("PATCH", "/api/groups"),
+    ("POST", "/api/groups"),
+    ("DELETE", "/api/groups"),
+    ("PATCH", "/api/groups/collapse"),
     ("PATCH", "/api/sessions/{id}/notifications"),
     ("PATCH", "/api/sessions/{id}/pin"),
     ("PATCH", "/api/sessions/{id}/snooze"),
     ("PATCH", "/api/sessions/{id}/unread"),
     ("PATCH", "/api/sessions/{id}/worktree-name"),
+    ("POST", "/api/sessions/{id}/purge/abandon"),
     ("POST", "/api/sessions/{id}/restore"),
     ("POST", "/api/sessions/{id}/start"),
     ("POST", "/api/sessions/{id}/stop"),
@@ -398,11 +406,14 @@ pub(super) const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
 pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     // Terminal surface.
     ("POST", "/api/sessions/{id}/ensure"),
+    ("POST", "/api/sessions/{id}/restart"),
     ("POST", "/api/sessions/{id}/send"),
     ("POST", "/api/sessions/{id}/terminal"),
     ("DELETE", "/api/sessions/{id}/terminal"),
     ("POST", "/api/sessions/{id}/container-terminal"),
-    // Git / project / profile management.
+    ("POST", "/api/sessions/{id}/auxiliary/stop"),
+    ("POST", "/api/sessions/{id}/tools/ensure"),
+    ("POST", "/api/sessions/creation-trust"),
     ("POST", "/api/git/clone"),
     ("POST", "/api/projects"),
     // Attaching a repo to a session (#3103) takes an arbitrary host path, so it
@@ -447,10 +458,17 @@ pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     ("POST", "/api/sessions/{id}/acp/mode"),
     ("POST", "/api/sessions/{id}/acp/spawn"),
     ("POST", "/api/sessions/{id}/acp/switch-agent"),
+    // Consenting to agent hook installation writes into the daemon user's own
+    // agent settings, so it stays with the operator, not a CityHall client.
+    ("POST", "/api/app-state/agent-hooks-acknowledgement"),
     // Global settings / ops / shared workspace ordering.
     ("PATCH", "/api/settings"),
     ("PATCH", "/api/log-level"),
     ("PUT", "/api/workspace-ordering"),
+    // Device pairing grants a new long-lived credential.
+    ("POST", "/api/pair"),
+    ("POST", "/api/pair/codes"),
+    ("DELETE", "/api/pair/lockouts"),
 ];
 
 /// Default-deny CityHall reachability boundary. A no-op outside CityHall mode
@@ -549,6 +567,9 @@ pub(super) async fn security_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::server::test_helpers::vecs;
+    use crate::server::test_support;
     /// Extract every mutating `(METHOD, path-template)` pair registered in
     /// `build_router` by scanning `.route("<path>", <handlers>)` and reading the
     /// method combinators inside each handler expression (balanced parens so a
@@ -568,7 +589,6 @@ mod tests {
         let mut i = 0;
         while let Some(rel) = body[i..].find(marker) {
             let mut j = i + rel + marker.len();
-            // Skip to the opening quote of the path literal.
             while j < body.len() && bytes[j] != b'"' {
                 j += 1;
             }
@@ -578,8 +598,6 @@ mod tests {
                 j += 1;
             }
             let path = &body[path_start..j];
-            // Handler expression: from here to the matching close paren of
-            // `.route(` at depth 0.
             let mut depth = 1i32;
             let mut k = j;
             while k < body.len() && depth > 0 {
@@ -601,15 +619,11 @@ mod tests {
         out
     }
 
-    use crate::server::test_helpers::vecs;
-    use crate::server::test_support;
-
     /// CityHall audit (route-table exhaustiveness, replaces the old
-    /// handler-body text scan). Both sides are route enumerations, so it is
-    /// sound where a text scan was not: every mutating route the router
-    /// registers (ANY module prefix, ANY method) must appear in exactly the
-    /// `CITYHALL_MUTATION_ALLOW` / `CITYHALL_MUTATION_DENY` tables that drive the
-    /// default-deny `cityhall_gate`. A new mutating route absent from both fails
+    /// handler-body text scan). Every mutating route the router registers
+    /// must appear in exactly the `CITYHALL_MUTATION_ALLOW` /
+    /// `CITYHALL_MUTATION_DENY` tables that drive the default-deny
+    /// `cityhall_gate`. A new mutating route absent from both fails
     /// the build (forcing a reachable/closed decision), and a stale table entry
     /// with no matching route also fails. See #7.
     #[test]
@@ -625,14 +639,11 @@ mod tests {
             .chain(CITYHALL_MUTATION_DENY.iter())
             .map(|(m, p)| ((*m).to_string(), (*p).to_string()))
             .collect();
-
         let mut failures = Vec::new();
         for route in &routed {
             if !classified.contains(route) {
                 failures.push(format!(
-                    "{} {} is a mutating route but is in neither CITYHALL_MUTATION_ALLOW nor \
-                     CITYHALL_MUTATION_DENY. Add it to the allow table if the CityHall client \
-                     must reach it, else to the deny table.",
+                    "{} {} is a mutating route but is in neither CITYHALL_MUTATION_ALLOW nor CITYHALL_MUTATION_DENY.",
                     route.0, route.1
                 ));
             }
@@ -640,13 +651,11 @@ mod tests {
         for entry in &classified {
             if !routed.contains(entry) {
                 failures.push(format!(
-                    "{} {} is listed in a CityHall table but no router route matches it; remove \
-                     the stale entry (path template or method changed?).",
+                    "{} {} is listed in a CityHall table but no router route matches it.",
                     entry.0, entry.1
                 ));
             }
         }
-        // Allow and deny must be disjoint.
         for a in CITYHALL_MUTATION_ALLOW {
             assert!(
                 !CITYHALL_MUTATION_DENY.contains(a),
@@ -661,7 +670,6 @@ mod tests {
             failures.join("\n")
         );
     }
-
     #[test]
     fn strip_host_port_variants() {
         assert_eq!(strip_host_port("localhost:8080"), "localhost");
@@ -1125,6 +1133,9 @@ mod tests {
         let req = axum::http::Request::builder()
             .uri("/api/sessions")
             .header("host", "evil.com")
+            .extension(axum::extract::ConnectInfo(
+                "203.0.113.7:5555".parse::<std::net::SocketAddr>().unwrap(),
+            ))
             .body(axum::body::Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -1163,6 +1174,7 @@ mod tests {
         let mut good = axum::http::Request::builder()
             .uri("/api/sessions")
             .header("host", "localhost")
+            .header("authorization", "Bearer secret-token")
             .body(axum::body::Body::empty())
             .unwrap();
         good.extensions_mut()
@@ -1170,9 +1182,49 @@ mod tests {
         let resp = app.oneshot(good).await.unwrap();
         assert_eq!(
             resp.status(),
-            axum::http::StatusCode::UNAUTHORIZED,
-            "a listed Host passes the gate and reaches auth"
+            axum::http::StatusCode::OK,
+            "a listed Host over plain HTTP reaches auth and the handler"
         );
+    }
+
+    #[tokio::test]
+    async fn plain_http_off_host_reaches_auth_without_tls_gate() {
+        use axum::http::StatusCode;
+        use tower::ServiceExt;
+        for (peer, proto) in [
+            ("127.0.0.1:5555", None),
+            ("127.0.0.1:5555", Some("http")),
+            ("203.0.113.7:5555", None),
+            ("203.0.113.7:5555", Some("http")),
+            ("203.0.113.7:5555", Some("https")),
+        ] {
+            let state = test_support::build_test_app_state_with_policy_configured(
+                Vec::new(),
+                vecs(&["localhost"]),
+                Vec::new(),
+                None,
+                |state| state.behind_tunnel = true,
+            );
+            let mut request = axum::http::Request::builder()
+                .uri("/api/login/status")
+                .header("host", "localhost");
+            if let Some(proto) = proto {
+                request = request.header("x-forwarded-proto", proto);
+            }
+            let mut request = request.body(axum::body::Body::empty()).unwrap();
+            request.extensions_mut().insert(axum::extract::ConnectInfo(
+                peer.parse::<std::net::SocketAddr>().unwrap(),
+            ));
+            let response = test_support::build_router_for_test(state)
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "{peer} with {proto:?} must not be gated by transport"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1197,6 +1249,9 @@ mod tests {
         let host_deny = axum::http::Request::builder()
             .uri("/api/sessions")
             .header("host", "evil.com")
+            .extension(axum::extract::ConnectInfo(
+                "203.0.113.7:5555".parse::<std::net::SocketAddr>().unwrap(),
+            ))
             .body(axum::body::Body::empty())
             .unwrap();
         let host_body = body_of(app.oneshot(host_deny).await.unwrap()).await;
@@ -1206,11 +1261,14 @@ mod tests {
             .uri("/api/sessions")
             .header("host", "localhost")
             .header("origin", "https://evil.com")
+            .extension(axum::extract::ConnectInfo(
+                "203.0.113.7:5555".parse::<std::net::SocketAddr>().unwrap(),
+            ))
             .body(axum::body::Body::empty())
             .unwrap();
         let origin_body = body_of(app.oneshot(origin_deny).await.unwrap()).await;
 
-        assert_eq!(host_body, "forbidden: host or origin not allowed");
+        assert!(!host_body.contains("evil.com"));
         assert_eq!(
             host_body, origin_body,
             "both deny reasons must return an identical, non-leaking body"
@@ -1220,18 +1278,20 @@ mod tests {
     #[tokio::test]
     async fn listed_origin_passes_gate_to_auth() {
         use tower::ServiceExt;
-        let remote: std::net::SocketAddr = "203.0.113.7:5555".parse().unwrap();
-        let state = test_support::build_test_app_state_with_policy(
+        let remote: std::net::SocketAddr = "127.0.0.1:5555".parse().unwrap();
+        let state = test_support::build_test_app_state_with_policy_configured(
             Vec::new(),
             vecs(&["localhost"]),
             vecs(&["http://localhost:8080"]),
             Some("secret-token".to_string()),
+            |state| state.behind_tunnel = true,
         );
         let app = test_support::build_router_for_test(state);
         let mut req = axum::http::Request::builder()
             .uri("/api/sessions")
             .header("host", "localhost")
             .header("origin", "http://localhost:8080")
+            .header("x-forwarded-proto", "https")
             .body(axum::body::Body::empty())
             .unwrap();
         req.extensions_mut()
@@ -1247,18 +1307,20 @@ mod tests {
     #[tokio::test]
     async fn access_policy_authority_fallback_allows_listed() {
         use tower::ServiceExt;
-        let remote: std::net::SocketAddr = "203.0.113.7:5555".parse().unwrap();
-        let state = test_support::build_test_app_state_with_policy(
+        let remote: std::net::SocketAddr = "127.0.0.1:5555".parse().unwrap();
+        let state = test_support::build_test_app_state_with_policy_configured(
             Vec::new(),
             vecs(&["x.trycloudflare.com"]),
             Vec::new(),
             Some("secret-token".to_string()),
+            |state| state.behind_tunnel = true,
         );
         let app = test_support::build_router_for_test(state);
         // Absolute-form URI + no Host header: access_policy falls back to
         // request.uri().authority() (the HTTP/2 :authority path).
         let mut req = axum::http::Request::builder()
             .uri("http://x.trycloudflare.com/api/sessions")
+            .header("x-forwarded-proto", "https")
             .body(axum::body::Body::empty())
             .unwrap();
         assert!(req.headers().get(axum::http::header::HOST).is_none());
@@ -1284,6 +1346,9 @@ mod tests {
         let app = test_support::build_router_for_test(state);
         let req = axum::http::Request::builder()
             .uri("http://evil.trycloudflare.com/api/sessions")
+            .extension(axum::extract::ConnectInfo(
+                "203.0.113.7:5555".parse::<std::net::SocketAddr>().unwrap(),
+            ))
             .body(axum::body::Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();

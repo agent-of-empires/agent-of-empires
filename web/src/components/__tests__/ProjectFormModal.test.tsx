@@ -1,105 +1,72 @@
 // @vitest-environment jsdom
-//
-// Vitest coverage for the extracted project add/edit form (#2212), migrated
-// from the former ProjectsView test: the add form sends `default_base_branch`
-// only when filled, and edit mode PATCHes the registration (including clearing
-// the base branch to null).
 
+import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-
 import { ProjectFormModal } from "../ProjectFormModal";
+import { updateProject } from "../../lib/api";
+import type * as Api from "../../lib/api";
 
-vi.mock("../../lib/api", () => ({
-  createProject: vi.fn(),
+vi.mock("../../lib/api", async (importOriginal) => ({
+  ...(await importOriginal<typeof Api>()),
   updateProject: vi.fn(),
 }));
 
-import { createProject, updateProject } from "../../lib/api";
+function Form({ saved = async () => {} }: { saved?: () => Promise<void> }) {
+  const [open, setOpen] = useState(true);
+  return open ? (
+    <ProjectFormModal
+      profile="alpha"
+      initial={{ name: "extra", path: "/repo/extra", scope: "profile", default_base_branch: "develop", pinned: true }}
+      onClose={() => setOpen(false)}
+      onSaved={saved}
+    />
+  ) : (
+    <p>Closed</p>
+  );
+}
 
-const mockCreate = createProject as ReturnType<typeof vi.fn>;
-const mockUpdate = updateProject as ReturnType<typeof vi.fn>;
+const baseField = () =>
+  screen.getByPlaceholderText("blank = inherit global default, then auto-detect") as HTMLInputElement;
 
 afterEach(() => {
   cleanup();
-  vi.clearAllMocks();
+  vi.resetAllMocks();
 });
 
 describe("ProjectFormModal", () => {
-  it("sends default_base_branch in the create payload when set", async () => {
-    mockCreate.mockResolvedValue({ ok: true });
-    render(<ProjectFormModal onClose={() => {}} onSaved={() => {}} />);
+  it("keeps the edited value and form open when persistence fails", async () => {
+    vi.mocked(updateProject).mockResolvedValue({ ok: false, error: "Registry is read-only" });
+    render(<Form />);
+    expect(baseField().value).toBe("develop");
+    fireEvent.change(baseField(), { target: { value: "release" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText("Registry is read-only");
+    expect(baseField().value).toBe("release");
+    expect(screen.queryByText("Closed")).toBeNull();
+  });
 
-    fireEvent.change(screen.getByPlaceholderText("/path/to/repo"), { target: { value: "/repo/extra" } });
-    fireEvent.change(screen.getByPlaceholderText("blank = inherit global default, then auto-detect"), {
-      target: { value: "develop" },
+  it("stays open until the committed registry refresh finishes", async () => {
+    vi.mocked(updateProject).mockResolvedValue({ ok: true });
+    let finishRefresh!: () => void;
+    const refresh = new Promise<void>((resolve) => {
+      finishRefresh = resolve;
     });
-    fireEvent.click(screen.getByRole("button", { name: "Add" }));
-
-    await waitFor(() =>
-      expect(mockCreate).toHaveBeenCalledWith(
-        expect.objectContaining({ path: "/repo/extra", default_base_branch: "develop" }),
-      ),
-    );
-  });
-
-  it("omits default_base_branch when the field is left blank", async () => {
-    mockCreate.mockResolvedValue({ ok: true });
-    render(<ProjectFormModal onClose={() => {}} onSaved={() => {}} />);
-
-    fireEvent.change(screen.getByPlaceholderText("/path/to/repo"), { target: { value: "/repo/extra" } });
-    fireEvent.click(screen.getByRole("button", { name: "Add" }));
-
-    await waitFor(() => expect(mockCreate).toHaveBeenCalled());
-    expect(mockCreate.mock.calls[0]![0].default_base_branch).toBeUndefined();
-  });
-
-  it("prefills and PATCHes the base branch in edit mode", async () => {
-    mockUpdate.mockResolvedValue({ ok: true });
+    let refreshing = false;
     render(
-      <ProjectFormModal
-        initial={{ name: "extra", path: "/repo/extra", scope: "global", default_base_branch: "develop" }}
-        onClose={() => {}}
-        onSaved={() => {}}
+      <Form
+        saved={() => {
+          refreshing = true;
+          return refresh;
+        }}
       />,
     );
-
-    const input = screen.getByPlaceholderText("blank = inherit global default, then auto-detect") as HTMLInputElement;
-    expect(input.value).toBe("develop");
-    fireEvent.change(input, { target: { value: "release" } });
+    fireEvent.change(baseField(), { target: { value: "release" } });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
-
-    await waitFor(() => expect(mockUpdate).toHaveBeenCalledWith("extra", "global", "release"));
-  });
-
-  it("clears the base branch by saving an empty value in edit mode", async () => {
-    mockUpdate.mockResolvedValue({ ok: true });
-    render(
-      <ProjectFormModal
-        initial={{ name: "extra", path: "/repo/extra", scope: "global", default_base_branch: "develop" }}
-        onClose={() => {}}
-        onSaved={() => {}}
-      />,
-    );
-
-    fireEvent.change(screen.getByPlaceholderText("blank = inherit global default, then auto-detect"), {
-      target: { value: "  " },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
-
-    await waitFor(() => expect(mockUpdate).toHaveBeenCalledWith("extra", "global", null));
-  });
-
-  it("invokes onSaved and onClose after a successful create", async () => {
-    mockCreate.mockResolvedValue({ ok: true });
-    const onSaved = vi.fn();
-    const onClose = vi.fn();
-    render(<ProjectFormModal onClose={onClose} onSaved={onSaved} />);
-
-    fireEvent.change(screen.getByPlaceholderText("/path/to/repo"), { target: { value: "/repo/extra" } });
-    fireEvent.click(screen.getByRole("button", { name: "Add" }));
-
-    await waitFor(() => expect(onSaved).toHaveBeenCalled());
-    expect(onClose).toHaveBeenCalled();
+    await waitFor(() => expect(refreshing).toBe(true));
+    expect(screen.queryByText("Closed")).toBeNull();
+    expect(baseField().value).toBe("release");
+    finishRefresh();
+    await screen.findByText("Closed");
   });
 });

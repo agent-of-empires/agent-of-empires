@@ -783,6 +783,12 @@ fn lookup(session: &str) -> Option<Arc<VtChannel>> {
         .and_then(Weak::upgrade)
 }
 
+/// Keep capture/send-keys fallbacks on the held generation's pane, including
+/// the interval after its socket dies and before its replacement is published.
+pub(crate) fn channel_pane_id(session: &str) -> Option<String> {
+    lookup(session).map(|channel| channel.target.clone())
+}
+
 fn lookup_osc52(session: &str) -> Option<Arc<Osc52Channel>> {
     OSC52_REGISTRY
         .lock()
@@ -2287,7 +2293,7 @@ pub(crate) struct VtChannel {
     input: bool,
     /// Fencing token for this exact pipe generation.
     owner_id: String,
-    /// `name:^.0`, the pane target for tmux commands.
+    /// Server-unique pane ID, fixed for this channel generation.
     target: String,
     parser: Arc<Mutex<vt100::Parser>>,
     /// Writable half of the socket, `Some` once the forwarder connects. Shared
@@ -2528,6 +2534,10 @@ pub(crate) struct VtRowsSample {
 }
 
 impl VtChannel {
+    pub(crate) fn pane_id(&self) -> &str {
+        &self.target
+    }
+
     /// Get the shared channel for `session`, arming a new one if none is live.
     /// Returns `None` if tmux is too old or the pane is gone or any tmux/socket
     /// step fails; callers then use the legacy capture/send-keys path. The
@@ -2606,7 +2616,7 @@ impl VtChannel {
         if !tmux_supports_pipe_pane_io(deadline) {
             return None;
         }
-        let target = format!("{name}:^.0");
+        let target = super::utils::first_pane_id_with_deadline(name, deadline)?;
         // Arming only needs the geometry; the cursor rides along because the
         // probe is shared with `reconcile_grid` and costs one fork either way.
         let (cols, rows, _, _) = pane_size_cursor(&target, deadline)?;
@@ -2716,13 +2726,14 @@ impl VtChannel {
         );
         let input = tmux_supports_pipe_pane_input(deadline);
         let flags = if input { "-IO" } else { "-O" };
-        let armed = session.arm_vt_pipe_if_owner_with_deadline(&owner, flags, &pipe_cmd, deadline);
+        let armed =
+            session.arm_vt_pipe_if_owner_with_deadline(&owner, &target, flags, &pipe_cmd, deadline);
         if !armed {
             tracing::warn!(%target, "vt: tmux pipe-pane failed; falling back to capture");
             stop_and_wake_reader(&stop, &sock_path);
             // Free the owner lock we claimed above so another process can arm
             // right away instead of waiting out the TTL on our failed attempt.
-            session.release_vt_pipe_owner_with_deadline(&owner, deadline);
+            session.release_vt_pipe_owner_with_deadline(&owner, &target, deadline);
             let _ = reader.join();
             let _ = std::fs::remove_dir_all(&sock_dir);
             return None;
@@ -2739,7 +2750,7 @@ impl VtChannel {
         // startup gap, early keystrokes would hit a not-yet-connected socket
         // and be dropped instead of falling back to `send-keys`. If the
         // forwarder never connects, tear down and fall back to capture.
-        let connect_deadline = Instant::now() + Duration::from_millis(500);
+        let connect_deadline = (Instant::now() + Duration::from_millis(500)).min(deadline.deadline);
         while VtLifecycle::load(&lifecycle) != VtLifecycle::Live
             || drain.lock().unwrap().stream.is_none()
         {
@@ -2747,7 +2758,7 @@ impl VtChannel {
                 tracing::warn!(%target, "vt: forwarder did not connect; falling back to capture");
                 stop_and_wake_reader(&stop, &sock_path);
                 let _ = UnixStream::connect(&control_path);
-                session.release_vt_pipe_owner_with_deadline(&owner, deadline);
+                session.release_vt_pipe_owner_with_deadline(&owner, &target, deadline);
                 let _ = reader.join();
                 let _ = std::fs::remove_dir_all(&sock_dir);
                 return None;
@@ -2804,7 +2815,7 @@ impl VtChannel {
             );
             stop_and_wake_reader(&stop, &sock_path);
             let _ = UnixStream::connect(&control_path);
-            session.release_vt_pipe_owner_with_deadline(&owner, deadline);
+            session.release_vt_pipe_owner_with_deadline(&owner, &target, deadline);
             let _ = reader.join();
             let _ = std::fs::remove_dir_all(&sock_dir);
             return None;
@@ -3420,8 +3431,11 @@ impl VtChannel {
         if self.stop.swap(true, Ordering::Relaxed) {
             return;
         }
-        crate::tmux::Session::from_name(&self.name)
-            .release_vt_pipe_owner_with_deadline(&self.owner_id, deadline);
+        crate::tmux::Session::from_name(&self.name).release_vt_pipe_owner_with_deadline(
+            &self.owner_id,
+            &self.target,
+            deadline,
+        );
         let _ = UnixStream::connect(&self.sock_path);
         let _ = UnixStream::connect(self.sock_dir.join("c.sock"));
         if let Some(reader) = self.reader.lock().unwrap().take() {
@@ -3453,6 +3467,7 @@ pub(crate) struct Osc52Channel {
     name: String,
     /// Fencing token for this exact pipe generation.
     owner_id: String,
+    target: String,
     clipboard: Arc<Mutex<Option<String>>>,
     /// Monotonically bumps after publishing a clipboard value. Consumers keep
     /// their own cursor so one dashboard viewer cannot consume an event for
@@ -3515,6 +3530,7 @@ impl Osc52Channel {
         if !tmux_supports_pipe_pane_io(deadline) {
             return None;
         }
+        let target = super::utils::first_pane_id_with_deadline(name, deadline)?;
         let session = crate::tmux::Session::from_name(name);
         let owner = new_pipe_owner_id();
         if !session.claim_vt_owner_with_deadline(
@@ -3565,20 +3581,21 @@ impl Osc52Channel {
             sh_quote(&exe.to_string_lossy()),
             sh_quote(&sock_path.to_string_lossy())
         );
-        let armed = session.arm_vt_pipe_if_owner_with_deadline(&owner, "-O", &pipe_cmd, deadline);
+        let armed =
+            session.arm_vt_pipe_if_owner_with_deadline(&owner, &target, "-O", &pipe_cmd, deadline);
         if !armed {
             stop.store(true, Ordering::Relaxed);
-            session.release_vt_pipe_owner_with_deadline(&owner, deadline);
+            session.release_vt_pipe_owner_with_deadline(&owner, &target, deadline);
             let _ = UnixStream::connect(&sock_path);
             let _ = reader.join();
             let _ = std::fs::remove_dir_all(&sock_dir);
             return None;
         }
-        let connect_deadline = Instant::now() + Duration::from_millis(500);
+        let connect_deadline = (Instant::now() + Duration::from_millis(500)).min(deadline.deadline);
         while !alive.load(Ordering::Relaxed) {
             if Instant::now() >= connect_deadline {
                 stop.store(true, Ordering::Relaxed);
-                session.release_vt_pipe_owner_with_deadline(&owner, deadline);
+                session.release_vt_pipe_owner_with_deadline(&owner, &target, deadline);
                 let _ = UnixStream::connect(&sock_path);
                 let _ = reader.join();
                 let _ = std::fs::remove_dir_all(&sock_dir);
@@ -3589,6 +3606,7 @@ impl Osc52Channel {
         Some(Self {
             name: name.to_string(),
             owner_id: owner,
+            target,
             clipboard,
             clipboard_seq,
             alive,
@@ -3644,8 +3662,11 @@ impl Osc52Channel {
         if self.stop.swap(true, Ordering::Relaxed) {
             return;
         }
-        crate::tmux::Session::from_name(&self.name)
-            .release_vt_pipe_owner_with_deadline(&self.owner_id, deadline);
+        crate::tmux::Session::from_name(&self.name).release_vt_pipe_owner_with_deadline(
+            &self.owner_id,
+            &self.target,
+            deadline,
+        );
         let _ = UnixStream::connect(&self.sock_path);
         if let Some(reader) = self.reader.lock().unwrap().take() {
             let _ = reader.join();
@@ -3731,7 +3752,7 @@ pub(crate) fn dummy_channel_with_input(
         name: name.to_string(),
         input,
         owner_id: new_pipe_owner_id(),
-        target: format!("{name}:^.0"),
+        target: format!("={name}:^"),
         parser: Arc::new(Mutex::new(vt100::Parser::new(4, 20, SCROLLBACK_LINES))),
         stream: Arc::new(Mutex::new(None)),
         app_cursor: Arc::new(AtomicBool::new(false)),
@@ -6079,6 +6100,12 @@ mod tests {
                 "-y",
                 "40",
                 script,
+                ";",
+                "set-option",
+                "-t",
+                guard.name(),
+                "pane-base-index",
+                "0",
             ])
             .output()
             .expect("tmux new-session");
@@ -6159,6 +6186,12 @@ mod tests {
                 "-y",
                 "24",
                 script,
+                ";",
+                "set-option",
+                "-t",
+                guard.name(),
+                "pane-base-index",
+                "0",
             ])
             .output()
             .expect("tmux new-session");

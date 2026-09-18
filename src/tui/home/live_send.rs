@@ -317,6 +317,72 @@ pub(in crate::tui) struct LiveSendState {
     /// the agent). Snapshotted per-entry for the same reason as
     /// `exit_chords`.
     pub leader: Option<(KeyCode, KeyModifiers)>,
+    /// The remote daemon whose session this drives, or `None` for a local
+    /// tmux pane. A remote live-send has no `tmux_name`: keys travel over the
+    /// preview's live socket instead of a local worker.
+    pub remote: Option<String>,
+}
+
+impl LiveSendState {
+    /// Snapshot the configured exit chords and leader for a new live-send.
+    pub(super) fn new(
+        session_id: String,
+        title: String,
+        tmux_name: String,
+        target: LiveSendTarget,
+        remote: Option<String>,
+        config: &crate::session::config::SessionConfig,
+    ) -> Self {
+        // The leader is a single chord, not a list. An empty configured
+        // value disables it (so every key, including the default `C-b`,
+        // passes straight through). A non-empty but unparseable value is
+        // treated as a typo and falls back to the default leader rather
+        // than silently dropping the feature, mirroring how the exit
+        // chord recovers from a bad spec.
+        let leader_spec = &config.live_send_leader;
+        let leader = if leader_spec.trim().is_empty() {
+            None
+        } else {
+            parse_chord(leader_spec).or_else(|| {
+                tracing::warn!(
+                    "live-send: unparseable leader chord '{}'; falling back to default '{}'",
+                    leader_spec,
+                    DEFAULT_LEADER
+                );
+                parse_chord(DEFAULT_LEADER)
+            })
+        };
+        Self {
+            session_id,
+            title,
+            tmux_name,
+            target,
+            exit_chords: parse_chord_list(&config.live_send_exit_chord),
+            leader,
+            remote,
+        }
+    }
+
+    /// `(remote, session id)` when this drives a remote session.
+    pub(in crate::tui) fn remote_key(&self) -> Option<crate::tui::remote_preview::RemoteKey> {
+        self.remote
+            .clone()
+            .map(|remote| (remote, self.session_id.clone()))
+    }
+
+    /// The banner label: the pane, and the machine when it is not this one.
+    pub(super) fn label(&self) -> String {
+        let title = if self.title.is_empty() {
+            "session"
+        } else {
+            self.title.as_str()
+        };
+        let label = format_target_label(title, &self.target);
+        match &self.remote {
+            Some(remote) => format!("{label} @ {remote}"),
+            None => label,
+        }
+    }
 }
 
 /// Which paired tmux pane a live-send dispatch targets. The agent
@@ -362,13 +428,6 @@ pub(in crate::tui) fn format_target_label(title: &str, target: &LiveSendTarget) 
 pub(super) enum TmuxAction {
     Literal(String),
     Named(String),
-    /// `send-keys -N <count> <name>`: the named key repeated `count` times
-    /// in one fork. Consecutive runs of the same key (e.g. several wheel
-    /// notches drained in one batch) fold their counts together.
-    NamedRepeat {
-        name: String,
-        count: usize,
-    },
     HexBytes(Vec<u8>),
     /// A multi-line paste routed through `paste-buffer -p`.
     Paste(String),
@@ -399,16 +458,6 @@ pub(super) fn coalesce(batch: Vec<WorkerMsg>) -> Vec<TmuxAction> {
             WorkerMsg::Send(TmuxKey::Named(name)) => {
                 flush(&mut out, &mut run);
                 out.push(TmuxAction::Named(name));
-            }
-            WorkerMsg::Send(TmuxKey::NamedRepeat { name, count }) => {
-                flush(&mut out, &mut run);
-                match out.last_mut() {
-                    Some(TmuxAction::NamedRepeat {
-                        name: prev_name,
-                        count: prev_count,
-                    }) if *prev_name == name => *prev_count += count,
-                    _ => out.push(TmuxAction::NamedRepeat { name, count }),
-                }
             }
             WorkerMsg::Send(TmuxKey::HexBytes(bytes)) => {
                 flush(&mut out, &mut run);
@@ -531,7 +580,8 @@ impl LiveSendWorker {
             // confirm-read race; the retry on the next resize batch tells
             // those apart (a slow-to-appear pane still gets owned, a real
             // takeover is flagged instead of fought).
-            let mut owned = session.steal_size_owner(&owner_id);
+            let label = crate::tui::view_lock::viewer_label();
+            let mut owned = session.claim_size_lock(&owner_id, &label, crate::tmux::SizeMode::Live);
             // Refresh-or-flag: bump our heartbeat iff we still hold the
             // lock; a failed refresh means another surface took over, which
             // is flagged once and never fought.
@@ -1104,22 +1154,15 @@ impl Drop for LiveCaptureWorker {
 /// introducing one.
 const PANE_COUNT_PROBE_MS: u64 = 1_000;
 
-/// How many panes the worker's target window has, for deciding whether the
-/// preview needs the composite path. Returns 1 on any failure, which keeps the
-/// caller on the cheap single-pane transport.
-///
-/// A zoomed pane (`C-b z`) also reports 1: tmux keeps `window_panes` at its real
-/// count while reporting every pane at the window's full rectangle, so the panes
-/// overlap and the compositor's tiling assumption does not hold. Compositing
-/// there hides the zoomed pane behind border fill, so the single-pane transport
-/// is both cheaper and more correct.
+/// Use the composite preview only for an unzoomed split window.
+/// Missing or malformed observations retain the single-pane transport.
 fn probe_pane_count(name: &str, deadline: &crate::tmux::TmuxCommandDeadline) -> u16 {
     let mut command = crate::tmux::tmux_command();
     command.args([
         "display-message",
         "-p",
         "-t",
-        &format!("{name}:^"),
+        &format!("={name}:^"),
         "-F",
         "#{window_panes} #{window_zoomed_flag}",
     ]);
@@ -1219,6 +1262,11 @@ fn capture_composited_over_grid(
     let Some((_, layout)) = state.layout.as_ref() else {
         return capture_composited(name, lines, forward_empty, deadline);
     };
+    if layout.first_pane_id() != Some(channel.pane_id()) {
+        *state.layout = None;
+        *state.last_pane_probe = None;
+        return capture_composited(name, lines, forward_empty, deadline);
+    }
     let Some(first) = layout.first_pane() else {
         return capture_composited(name, lines, forward_empty, deadline);
     };
@@ -1246,7 +1294,7 @@ fn capture_composited_over_grid(
     cursor.history_size = 0;
     cursor.composite_pane0 = Some(first);
     (
-        Some(layout.composite_with_first_pane_rows(&rows)),
+        Some(layout.composite_with_first_pane_rows(channel.pane_id(), &rows)),
         Some(cursor),
     )
 }
@@ -2322,7 +2370,8 @@ fn dispatch_via_fork(
         }
     }
 
-    let target = format!("{}:^.0", tmux_name);
+    let target = crate::tmux::Session::from_name(tmux_name)
+        .live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())?;
     let mut cmd = crate::tmux::tmux_command();
     cmd.stderr(Stdio::null());
     match action {
@@ -2352,14 +2401,6 @@ fn dispatch_via_fork(
         TmuxAction::Named(name) => {
             cmd.args(["send-keys", "-t", &target, name.as_str()]);
         }
-        TmuxAction::NamedRepeat { name, count } => {
-            // `-N <count>` repeats the key `count` times in one fork. tmux
-            // renders each press in the pane's current cursor-key mode, so
-            // the wheel-forward arrows honor DECCKM just like a single
-            // `Named` does.
-            let count = count.to_string();
-            cmd.args(["send-keys", "-t", &target, "-N", &count, name.as_str()]);
-        }
         TmuxAction::HexBytes(bytes) => {
             // `-H` sends each subsequent arg as the hex byte value of an
             // ASCII character. We use this for control bytes (CR, TAB,
@@ -2381,11 +2422,13 @@ fn dispatch_via_fork(
             // batches; it cannot authorize a later subprocess safely.
             let owner = resize_owner
                 .ok_or_else(|| anyhow::anyhow!("live-send resize has no owner token"))?;
-            if !crate::tmux::Session::from_name(tmux_name)
-                .resize_window_if_owner(owner, *cols, *rows)
-            {
+            let session = crate::tmux::Session::from_name(tmux_name);
+            if !session.resize_window_if_owner(owner, *cols, *rows) {
                 anyhow::bail!("live-send resize lost ownership, failed, or timed out");
             }
+            // This pane now carries a live client's layout, so watchers leave
+            // its geometry alone until it restarts.
+            session.mark_live_sized();
             return Ok(());
         }
     }
@@ -2410,10 +2453,6 @@ fn encode_action_bytes(action: &TmuxAction, app_cursor: bool) -> Vec<u8> {
         // Already raw control bytes (CR/TAB/ESC, bracketed-paste markers).
         TmuxAction::HexBytes(bytes) => bytes.clone(),
         TmuxAction::Named(name) => encode_named_key(name, app_cursor),
-        TmuxAction::NamedRepeat { name, count } => {
-            let one = encode_named_key(name, app_cursor);
-            one.repeat(*count)
-        }
         // Paste never reaches here: the vt fast path is skipped for it so
         // tmux can make the bracketed-paste decision.
         TmuxAction::Paste(_) => Vec::new(),
@@ -2421,9 +2460,34 @@ fn encode_action_bytes(action: &TmuxAction, app_cursor: bool) -> Vec<u8> {
     }
 }
 
+/// Raw bytes for one translated key, for transports that write into the pane
+/// directly instead of forking `tmux send-keys`.
+///
+/// The daemon's live socket re-encodes cursor keys for the pane's DECCKM state
+/// itself (`pane_input_bytes` in `src/server/live_ws.rs`), so callers on that
+/// path pass `app_cursor: false` and let the server apply the mode.
+///
+/// `Paste` is bracketed here because that socket forwards bytes verbatim. The
+/// local path instead hands the payload to `paste-buffer -p` so tmux brackets
+/// only panes that set DECSET 2004, which is why [`encode_action_bytes`]
+/// yields nothing for it.
+pub(super) fn encode_key_bytes(key: &TmuxKey, app_cursor: bool) -> Vec<u8> {
+    match key {
+        TmuxKey::Literal(s) => s.clone().into_bytes(),
+        TmuxKey::Named(name) => encode_named_key(name, app_cursor),
+        TmuxKey::HexBytes(bytes) => bytes.clone(),
+        TmuxKey::Paste(text) => {
+            let mut out = Vec::with_capacity(text.len() + 12);
+            out.extend_from_slice(b"\x1b[200~");
+            out.extend_from_slice(text.as_bytes());
+            out.extend_from_slice(b"\x1b[201~");
+            out
+        }
+    }
+}
+
 /// Strip tmux modifier prefixes (`C-`, `M-`, `S-`, in any order) off a key
 /// name, returning `(ctrl, alt, shift, base)`.
-#[cfg(unix)]
 fn split_mods(name: &str) -> (bool, bool, bool, &str) {
     let (mut ctrl, mut alt, mut shift) = (false, false, false);
     let mut rest = name;
@@ -2447,7 +2511,6 @@ fn split_mods(name: &str) -> (bool, bool, bool, &str) {
 /// Encode one tmux key name (e.g. `Up`, `C-c`, `S-Up`, `M-x`, `F5`) to terminal
 /// bytes. Cursor/nav keys honor `app_cursor` (DECCKM) and the xterm modifier
 /// parameter (`1 + shift + alt*2 + ctrl*4`). Empty vec = unencodable.
-#[cfg(unix)]
 fn encode_named_key(name: &str, app_cursor: bool) -> Vec<u8> {
     let (ctrl, alt, shift, base) = split_mods(name);
     let modp = 1 + u8::from(shift) + 2 * u8::from(alt) + 4 * u8::from(ctrl);
@@ -2636,16 +2699,6 @@ mod vt_input_encode_tests {
             encode_action_bytes(&TmuxAction::Literal("hi".into()), false),
             b"hi"
         );
-        assert_eq!(
-            encode_action_bytes(
-                &TmuxAction::NamedRepeat {
-                    name: "Up".into(),
-                    count: 3
-                },
-                false
-            ),
-            b"\x1b[A\x1b[A\x1b[A"
-        );
         // Resize is never pane input -> empty here (handled by the fork path).
         assert!(encode_action_bytes(&TmuxAction::Resize { cols: 80, rows: 24 }, false).is_empty());
     }
@@ -2690,7 +2743,6 @@ pub(super) fn send_key_oneshot(tmux_name: &str, key: TmuxKey) {
     let action = match key {
         TmuxKey::Literal(s) => TmuxAction::Literal(s),
         TmuxKey::Named(name) => TmuxAction::Named(name),
-        TmuxKey::NamedRepeat { name, count } => TmuxAction::NamedRepeat { name, count },
         TmuxKey::HexBytes(bytes) => TmuxAction::HexBytes(bytes),
         TmuxKey::Paste(text) => TmuxAction::Paste(text),
     };
@@ -2777,8 +2829,7 @@ pub(super) enum LiveDispatch {
 
 /// How the translator wants the keystroke delivered. `Literal` payloads
 /// go through `tmux send-keys -l --`, named keys through `tmux send-keys`,
-/// `NamedRepeat` through `tmux send-keys -N <count>` (one fork for N
-/// presses of the same key), and `HexBytes` through
+/// and `HexBytes` through
 /// `tmux send-keys -H <byte> <byte> ...` for raw bytes that can't ride a
 /// literal payload (control bytes like ESC, CR, TAB, and the
 /// bracketed-paste markers).
@@ -2786,13 +2837,6 @@ pub(super) enum LiveDispatch {
 pub(super) enum TmuxKey {
     Literal(String),
     Named(String),
-    /// A named key sent `count` times in a single fork. The wheel-forward
-    /// path uses this to deliver a notch's worth of arrow presses without
-    /// one fork per press.
-    NamedRepeat {
-        name: String,
-        count: usize,
-    },
     HexBytes(Vec<u8>),
     /// A multi-line paste, delivered through tmux's `paste-buffer -p` so
     /// tmux decides whether the receiving program gets bracketed-paste
@@ -3410,69 +3454,6 @@ mod tests {
             vec![
                 TmuxAction::Named("Up".into()),
                 TmuxAction::Named("Up".into()),
-            ]
-        );
-    }
-
-    fn snd_named_repeat(name: &str, count: usize) -> WorkerMsg {
-        WorkerMsg::Send(TmuxKey::NamedRepeat {
-            name: name.into(),
-            count,
-        })
-    }
-
-    #[test]
-    fn coalesce_same_named_repeats_fold_counts() {
-        // Several wheel notches drained in one batch collapse to a single
-        // `send-keys -N <total>` fork.
-        let out = coalesce(vec![snd_named_repeat("Up", 3), snd_named_repeat("Up", 3)]);
-        assert_eq!(
-            out,
-            vec![TmuxAction::NamedRepeat {
-                name: "Up".into(),
-                count: 6,
-            }]
-        );
-    }
-
-    #[test]
-    fn coalesce_different_named_repeats_do_not_fold() {
-        // A direction change (Up then Down) must not merge; the counts and
-        // order have to survive so the agent scrolls each way in turn.
-        let out = coalesce(vec![snd_named_repeat("Up", 3), snd_named_repeat("Down", 3)]);
-        assert_eq!(
-            out,
-            vec![
-                TmuxAction::NamedRepeat {
-                    name: "Up".into(),
-                    count: 3,
-                },
-                TmuxAction::NamedRepeat {
-                    name: "Down".into(),
-                    count: 3,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn coalesce_named_repeat_flushes_literal_run() {
-        // Order must hold: literals typed before the wheel notch flush
-        // ahead of the arrow repeat, never after it.
-        let out = coalesce(vec![
-            snd_lit("ab"),
-            snd_named_repeat("Down", 3),
-            snd_lit("cd"),
-        ]);
-        assert_eq!(
-            out,
-            vec![
-                TmuxAction::Literal("ab".into()),
-                TmuxAction::NamedRepeat {
-                    name: "Down".into(),
-                    count: 3,
-                },
-                TmuxAction::Literal("cd".into()),
             ]
         );
     }
@@ -4167,7 +4148,7 @@ mod tests {
                 "display-message",
                 "-p",
                 "-t",
-                &format!("{name}:^.0"),
+                &format!("{name}:^"),
                 "-F",
                 "#{pane_width}",
             ])
@@ -4220,7 +4201,19 @@ mod tests {
         assert!(!worker.lock_lost());
 
         // A web live viewer takes over (what live_ws's Claim handler does).
-        assert!(session.steal_size_owner("live-test-thief"));
+        assert!(session.claim_size_lock(
+            "live-test-thief",
+            "phone (web)",
+            crate::tmux::SizeMode::Live
+        ));
+        assert_eq!(
+            session
+                .size_state()
+                .active(crate::util::now_ms(), crate::tmux::SIZE_OWNER_TTL)
+                .map(|lock| lock.describe()),
+            Some("phone (web)".to_string()),
+            "the taker's label is what the displaced client names"
+        );
 
         // The next resize must verify, observe the loss, flag it, and be
         // dropped. (The idle heartbeat may flag it first; either path is
@@ -4423,5 +4416,26 @@ mod tests {
             matches!(session.size_owner(), Some((id, _)) if id.starts_with("tui-")),
             "vacant lock must still be claimed on the retry path"
         );
+    }
+}
+
+#[cfg(test)]
+mod remote_input_tests {
+    use super::*;
+
+    #[test]
+    fn encode_key_bytes_leaves_cursor_mode_to_the_server() {
+        // The live socket applies DECCKM itself, so the client emits the CSI
+        // form and must not pre-translate to SS3.
+        assert_eq!(
+            encode_key_bytes(&TmuxKey::Named("Up".to_string()), false),
+            b"\x1b[A"
+        );
+    }
+
+    #[test]
+    fn encode_key_bytes_brackets_a_paste() {
+        let bytes = encode_key_bytes(&TmuxKey::Paste("a\nb".to_string()), false);
+        assert_eq!(bytes, b"\x1b[200~a\nb\x1b[201~");
     }
 }

@@ -41,7 +41,18 @@ impl SessionResponse {
             Some(description) => (true, description),
             None => (false, None),
         };
+        let status = if inst
+            .lifecycle_reservation
+            .as_ref()
+            .is_some_and(|reservation| reservation.op == crate::session::LifecycleOperation::Purge)
+        {
+            Status::Deleting
+        } else {
+            inst.status
+        };
         Self {
+            agent_pane: inst.agent_pane.clone(),
+            auxiliary: inst.auxiliary.clone(),
             id: inst.id.clone(),
             title: inst.title.clone(),
             project_path: inst.project_path.clone(),
@@ -50,8 +61,14 @@ impl SessionResponse {
                 .unwrap_or_default(),
             group_path: inst.group_path.clone(),
             tool: inst.tool.clone(),
-            status: inst.status.wire_str().to_string(),
+            command: inst.command.clone(),
+            extra_args: inst.extra_args.clone(),
+            status: status.wire_str().to_string(),
+            lifecycle_reservation: inst.lifecycle_reservation.clone(),
+            lifecycle_generation: inst.lifecycle_generation,
             dormant: inst.is_shown_dormant(),
+            idle_dormant_since: inst.idle_dormant_since.map(|t| t.to_rfc3339()),
+            pane_dead_observed: inst.pane_dead_observed,
             yolo_mode: inst.yolo_mode,
             created_at: inst.created_at.to_rfc3339(),
             last_accessed_at: inst.last_accessed_at.map(|t| t.to_rfc3339()),
@@ -67,9 +84,15 @@ impl SessionResponse {
                 .as_ref()
                 .and_then(|w| w.base_branch.clone()),
             base_branch_override: inst.base_branch_override.clone(),
+            worktree_created_at: inst
+                .worktree_info
+                .as_ref()
+                .map(|w| w.created_at.to_rfc3339()),
             is_sandboxed: inst.is_sandboxed(),
+            sandbox_container_name: inst.sandbox_info.as_ref().map(|s| s.container_name.clone()),
             scratch: inst.scratch,
             favorited: inst.is_favorited(),
+            favorited_at: inst.favorited_at.map(|t| t.to_rfc3339()),
             color: inst.color.clone(),
             urgent: inst.is_urgent(),
             pinned_at: inst.pinned_at.map(|t| t.to_rfc3339()),
@@ -152,7 +175,10 @@ impl SessionResponse {
             },
             // The create-time guard calls the same classifier, so the web
             // "Fork" affordance and server-side acceptance cannot drift.
-            acp_can_fork: agent_is_structured_fork_capable(&inst.tool, inst.agent_name.as_deref()),
+            acp_can_fork: crate::session::fork::structured_fork_capable(
+                &inst.tool,
+                inst.agent_name.as_deref(),
+            ),
             // Same agent resolution as `acp_agent` above; computed once here so
             // the web dashboard and native TUI stop mirroring the gate.
             keeps_context: crate::agents::acp_transcript_cli_resumable(
@@ -188,8 +214,24 @@ impl SessionResponse {
                     name: r.name.clone(),
                     source_path: r.source_path.clone(),
                     branch: r.branch.clone(),
+                    worktree_path: r.worktree_path.clone(),
+                    main_repo_path: r.main_repo_path.clone(),
+                    managed_by_aoe: r.managed_by_aoe,
+                    branch_preexisting: r.branch_preexisting,
+                    base_branch: r.base_branch.clone(),
+                    base_branch_override: r.base_branch_override.clone(),
                 })
                 .collect(),
+            workspace_dir: inst
+                .workspace_info
+                .as_ref()
+                .map(|w| w.workspace_dir.clone()),
+            workspace_branch: inst.workspace_info.as_ref().map(|w| w.branch.clone()),
+            workspace_created_at: inst
+                .workspace_info
+                .as_ref()
+                .map(|w| w.created_at.to_rfc3339()),
+            workspace_cleanup_on_delete: inst.workspace_info.as_ref().map(|w| w.cleanup_on_delete),
             warnings: Vec::new(),
             plan_summary,
             next_wakeup_at,
@@ -330,7 +372,6 @@ impl<'a> SessionCfgCache<'a> {
             misses,
         }
     }
-
     /// Resolve `(profile, project_path)`, reading from disk on first miss only.
     pub(super) fn resolve(&mut self, profile: &str, project_path: &str) -> &SessionConfig {
         let misses = self.misses;

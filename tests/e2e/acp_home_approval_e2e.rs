@@ -1,36 +1,12 @@
-//! Full-stack e2e: resolving a structured (ACP) approval from the home list.
-//!
-//! This is the seam #3544 adds: from the home session list (NOT inside the
-//! structured view), pressing `a` on a structured row opens the shared
-//! permission-response dialog, and its choice is resolved through ACP. It
-//! crosses every layer the feature touches that no other test exercises
-//! together: the daemon's `/api/sessions` pending-approval projection, the
-//! TUI's 1 Hz daemon-status poller, the `structured_pending_approvals` map,
-//! the dialog, the background approval worker's HTTP POST, and the
-//! supervisor's `resolve_permission`.
-//!
-//! Determinism comes from the shared Node fake-ACP agent
-//! (`web/tests/helpers/fakeAcpAgent.mjs`): its `permission_request` turn entry
-//! emits a real ACP permission request and GATES the turn awaiting the
-//! client's decision, so the approval stays pending until the home dialog
-//! resolves it, and the turn only completes (recording `ApprovalResolved`)
-//! once the resolve round-trips through the daemon.
-//!
-//! Runs with the plain e2e feature set (ACP and the structured TUI are core;
-//! the `web` feature only adds the dashboard, which this test does not
-//! exercise). The fake agent is a Node script read from
-//! `web/tests/helpers/fakeAcpAgent.mjs` at runtime, not a build dependency.
-//! Auto-skips when Node or tmux is unavailable. Run via:
-//!
-//! ```sh
-//! cargo test --features e2e-tests --test e2e -- acp_home_approval
-//! ```
+//! Two real Home TUIs share approvals through the owner-verified Unix API.
+//! The fake ACP agent gates its turn until a client resolves the approval.
+//! Requires tmux and Node; no dashboard build is needed.
 
 use std::time::{Duration, Instant};
 
 use serial_test::parallel;
 
-use crate::harness::{pick_free_port, require_node, require_tmux, wait_for_port, TuiTestHarness};
+use crate::harness::{require_node, require_tmux, TuiTestHarness};
 
 /// One-turn fake-ACP script: emit a single permission request (which the fake
 /// gates on) so the worker surfaces exactly one pending approval and holds it
@@ -188,20 +164,12 @@ fn tui_home_resolves_structured_approval_with_live_daemon() {
         );
     }
 
-    // Start the daemon.
-    let port = pick_free_port();
-    let port_s = port.to_string();
-    let start = h.run_cli(&["serve", "--daemon", "--port", &port_s, "--no-auth"]);
+    let start = h.run_cli(&["serve", "--core-only", "--daemon"]);
     assert!(
         start.status.success(),
         "aoe serve --daemon failed.\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&start.stdout),
         String::from_utf8_lossy(&start.stderr),
-    );
-    assert!(
-        wait_for_port(port, Duration::from_secs(10)),
-        "daemon never bound port {}",
-        port
     );
 
     // Create the structured view session (daemon picks it up off disk; the
@@ -227,11 +195,26 @@ fn tui_home_resolves_structured_approval_with_live_daemon() {
     // prompt 404s until the worker is live and handshaked.
     prompt_until_accepted(&h, &session_id, Duration::from_secs(30));
 
-    // Attach the native home TUI over tmux. Same HOME, so its daemon-status
-    // poller discovers the local daemon via serve.url / serve.pid.
+    // Both TUIs discover the same core daemon over its private Unix socket.
     h.spawn_tui();
     h.wait_for(" aoe ");
     h.wait_for("home-approval");
+    h.spawn_peer_tui("approval-peer");
+    let peer_deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        h.send_session_keys("approval-peer", "a");
+        std::thread::sleep(Duration::from_millis(300));
+        let screen = h.capture_session_screen("approval-peer");
+        if screen.contains("Edit a file") && screen.contains("Respond to Permission Prompt") {
+            break;
+        }
+        assert!(
+            Instant::now() < peer_deadline,
+            "peer did not receive approval:\n{screen}"
+        );
+        h.send_session_keys("approval-peer", "Escape");
+    }
+    h.send_session_keys("approval-peer", "Escape");
 
     // `a` on the home row opens the shared permission dialog once the poll has
     // surfaced the pending approval.
@@ -250,4 +233,22 @@ fn tui_home_resolves_structured_approval_with_live_daemon() {
     // Proof the turn completed end to end: the durable log records the
     // resolution (only written after the supervisor resolves on the worker).
     wait_for_resolved(&h, &session_id, Duration::from_secs(20));
+    let peer_deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        h.send_session_keys("approval-peer", "a");
+        std::thread::sleep(Duration::from_millis(300));
+        let screen = h.capture_session_screen("approval-peer");
+        if screen.contains("No Pending Approval") {
+            assert!(
+                screen.contains("home-approval"),
+                "peer lost the session:\n{screen}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < peer_deadline,
+            "peer retained resolved approval:\n{screen}"
+        );
+        h.send_session_keys("approval-peer", "Escape");
+    }
 }

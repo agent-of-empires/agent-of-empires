@@ -15,46 +15,28 @@
 //!   frame from a newer daemon and is dropped the same way, never
 //!   parsed as an event frame (#3560). See `parse_text`.
 //!
-//! Auth: the bearer token is sent as a `?token=<>` query string on the
-//! WebSocket URL. Most WS clients do not surface custom headers cleanly,
-//! and the daemon's auth middleware already accepts the query-param
-//! form (see `src/server/auth.rs`). The token is *not* logged anywhere
-//! the URL string is exposed (we log only the base URL).
+//! Native authentication uses a sensitive Authorization header, never the URL.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use thiserror::Error;
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
-use tracing::{debug, warn};
+use tokio_tungstenite::WebSocketStream;
+use tracing::debug;
 
 use super::discovery::DaemonEndpoint;
 use crate::acp::protocol::AcpBroadcastFrame;
 use crate::acp::state::AcpState;
 use crate::acp::transcript::{TranscriptDelta, TranscriptRow};
-
-#[derive(Debug, Error)]
-pub enum WsError {
-    #[error("websocket transport error: {0}")]
-    Transport(#[from] tokio_tungstenite::tungstenite::Error),
-    #[error("invalid websocket URL: {0}")]
-    InvalidUrl(String),
-    #[error("websocket closed unexpectedly (code {0:?})")]
-    UnexpectedClose(Option<CloseCode>),
-    /// A daemon frame failed to deserialise. Surfaced to the caller so
-    /// a toast like "ws: parse error" carries the real reason instead
-    /// of a fabricated transport error.
-    #[error("failed to parse websocket frame: {0}")]
-    Parse(String),
-}
+use crate::daemon::{
+    websocket::{self, NativeSocket},
+    WsError,
+};
 
 /// One message off the structured view WebSocket.
 #[derive(Debug, Clone)]
@@ -158,34 +140,38 @@ pub async fn connect_with(
     since: u64,
     forward_frames: bool,
 ) -> Result<WsHandle, WsError> {
-    let url = ws_url(endpoint, session_id, since, forward_frames);
-    debug!(
-        target: "acp.client.ws",
-        // Log the path without the token query param.
-        url = %sanitize_for_log(&url),
-        "connecting to structured view ws"
-    );
-    let request = url
-        .into_client_request()
-        .map_err(|e| WsError::InvalidUrl(e.to_string()))?;
-    let (stream, _) = connect_async(request).await?;
+    let session_id = crate::daemon::transport::path_segment(session_id)?;
+    let path = format!("/sessions/{session_id}/acp/ws");
+    let query = format!("since={since}&frames={}", u8::from(forward_frames));
+    match websocket::connect(endpoint, &path, Some(&query)).await? {
+        NativeSocket::Unix(stream) => Ok(start_reader(*stream)),
+        NativeSocket::Tcp(stream) => Ok(start_reader(*stream)),
+    }
+}
+
+fn start_reader<S>(stream: WebSocketStream<S>) -> WsHandle
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let (frame_tx, frame_rx) = mpsc::channel(64);
     let shutdown = tokio_util::sync::CancellationToken::new();
     let _drop_guard = shutdown.clone().drop_guard();
     let task = tokio::spawn(reader_loop(stream, frame_tx, shutdown.clone()));
-    Ok(WsHandle {
+    WsHandle {
         rx: frame_rx,
         task,
         shutdown,
         _drop_guard,
-    })
+    }
 }
 
-async fn reader_loop(
-    mut stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+async fn reader_loop<S>(
+    mut stream: WebSocketStream<S>,
     tx: mpsc::Sender<Result<WsMessage, WsError>>,
     shutdown: tokio_util::sync::CancellationToken,
-) {
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     loop {
         tokio::select! {
             biased;
@@ -230,7 +216,7 @@ async fn reader_loop(
                         return;
                     }
                     Some(Err(e)) => {
-                        let _ = tx.send(Err(WsError::Transport(e))).await;
+                        let _ = tx.send(Err(WsError::from(e))).await;
                         return;
                     }
                     None => {
@@ -291,19 +277,19 @@ fn parse_text(raw: &str) -> Result<Option<WsMessage>, WsError> {
             // carries every row; each live event carries its row delta.
             Some("transcript_snapshot") => {
                 let frame: TranscriptSnapshotFrame =
-                    serde_json::from_str(raw).map_err(|e| WsError::Parse(e.to_string()))?;
+                    serde_json::from_str(raw).map_err(|_| WsError::Parse)?;
                 return Ok(Some(WsMessage::TranscriptSnapshot(frame.rows)));
             }
             Some("transcript_delta") => {
                 let frame: TranscriptDeltaFrame =
-                    serde_json::from_str(raw).map_err(|e| WsError::Parse(e.to_string()))?;
+                    serde_json::from_str(raw).map_err(|_| WsError::Parse)?;
                 return Ok(Some(WsMessage::TranscriptDelta(Box::new(frame.delta))));
             }
             // Server-folded control state (Tier 1.3), sent on connect and
             // after every event.
             Some("reduced_state") => {
                 let frame: ReducedStateFrame =
-                    serde_json::from_str(raw).map_err(|e| WsError::Parse(e.to_string()))?;
+                    serde_json::from_str(raw).map_err(|_| WsError::Parse)?;
                 return Ok(Some(WsMessage::ReducedState {
                     seq: frame.seq,
                     state: Box::new(frame.state),
@@ -317,7 +303,6 @@ fn parse_text(raw: &str) -> Result<Option<WsMessage>, WsError> {
             _ => {
                 debug!(
                     target: "acp.client.ws",
-                    kind = %kind,
                     "ignoring unrecognized ws control frame"
                 );
                 return Ok(None);
@@ -327,45 +312,8 @@ fn parse_text(raw: &str) -> Result<Option<WsMessage>, WsError> {
     // No `kind` key (or not a JSON object): parse as a raw event frame. A
     // genuinely malformed frame fails here and surfaces as WsError::Parse,
     // which the consumer treats as a dropped socket.
-    let frame: AcpBroadcastFrame = serde_json::from_str(raw).map_err(|e| {
-        warn!(target: "acp.client.ws", error = %e, "ws frame parse failed");
-        WsError::Parse(e.to_string())
-    })?;
+    let frame: AcpBroadcastFrame = serde_json::from_str(raw).map_err(|_| WsError::Parse)?;
     Ok(Some(WsMessage::Frame(Arc::new(frame))))
-}
-
-fn ws_url(endpoint: &DaemonEndpoint, session_id: &str, since: u64, forward_frames: bool) -> String {
-    let base = endpoint.ws_base_url();
-    let path = format!("/sessions/{session_id}/acp/ws");
-    let mut params: Vec<String> = Vec::new();
-    if since > 0 {
-        params.push(format!("since={since}"));
-    }
-    if !forward_frames {
-        params.push("frames=0".to_string());
-    }
-    if let Some(token) = endpoint.resolved_token() {
-        params.push(format!("token={token}"));
-    }
-    if params.is_empty() {
-        format!("{base}{path}")
-    } else {
-        format!("{base}{path}?{}", params.join("&"))
-    }
-}
-
-fn sanitize_for_log(url: &str) -> String {
-    match url.split_once("token=") {
-        Some((head, tail)) => {
-            let rest = tail.split_once('&').map(|(_, r)| r).unwrap_or("");
-            if rest.is_empty() {
-                format!("{head}token=<redacted>")
-            } else {
-                format!("{head}token=<redacted>&{rest}")
-            }
-        }
-        None => url.to_string(),
-    }
 }
 
 #[cfg(test)]
@@ -374,57 +322,38 @@ mod tests {
     use crate::acp::client::discovery::Source;
     use crate::acp::state::Event;
 
-    fn endpoint(base: &str, token: Option<&str>) -> DaemonEndpoint {
-        DaemonEndpoint::new(base.to_string(), token.map(str::to_string), Source::Env)
-    }
-
-    #[test]
-    fn ws_url_appends_since_and_token() {
-        let e = endpoint("http://127.0.0.1:8080", Some("abc"));
-        let url = ws_url(&e, "s-1", 42, true);
-        assert_eq!(
-            url,
-            "ws://127.0.0.1:8080/sessions/s-1/acp/ws?since=42&token=abc"
-        );
-        // A projections-only consumer asks the daemon to skip the raw frames.
-        assert_eq!(
-            ws_url(&e, "s-1", 42, false),
-            "ws://127.0.0.1:8080/sessions/s-1/acp/ws?since=42&frames=0&token=abc"
-        );
-    }
-
-    #[test]
-    fn ws_url_uses_rotated_token_for_local_daemon() {
-        let dir = tempfile::tempdir().unwrap();
-        let token_path = dir.path().join("serve.token");
-        let rotated = "b".repeat(64);
-        std::fs::write(&token_path, &rotated).unwrap();
+    #[tokio::test]
+    async fn websocket_auth_never_uses_url_credentials() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_hdr_async(
+                tcp,
+                |request: &tokio_tungstenite::tungstenite::handshake::server::Request, response| {
+                    assert_eq!(
+                        request.uri().path_and_query().unwrap().as_str(),
+                        "/sessions/s%2F1%3Fx%23%25/acp/ws?since=42&frames=0"
+                    );
+                    assert_eq!(
+                        request.headers().get("authorization").unwrap(),
+                        format!("Bearer {}", "b".repeat(64)).as_str()
+                    );
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            let _ = ws.next().await;
+        });
         let endpoint = DaemonEndpoint::new(
-            "http://127.0.0.1:8080".into(),
-            Some("a".repeat(64)),
-            Source::LocalDaemon,
-        )
-        .with_local_token_path(token_path);
-
-        assert_eq!(
-            ws_url(&endpoint, "s-1", 0, true),
-            format!("ws://127.0.0.1:8080/sessions/s-1/acp/ws?token={rotated}")
+            format!("http://{address}"),
+            Some("b".repeat(64)),
+            Source::Env,
         );
-    }
-
-    #[test]
-    fn ws_url_omits_since_when_zero() {
-        let e = endpoint("http://127.0.0.1:8080", None);
-        assert_eq!(
-            ws_url(&e, "s-1", 0, true),
-            "ws://127.0.0.1:8080/sessions/s-1/acp/ws"
-        );
-    }
-
-    #[test]
-    fn ws_url_uses_wss_for_https_endpoint() {
-        let e = endpoint("https://remote.example.com", Some("t"));
-        assert!(ws_url(&e, "s-1", 0, true).starts_with("wss://"));
+        let handle = connect_with(&endpoint, "s/1?x#%", 42, false).await.unwrap();
+        handle.shutdown().await;
+        server.await.unwrap();
     }
 
     /// How each `{"kind":...}` frame the daemon can send must classify, and
@@ -588,17 +517,5 @@ mod tests {
             }
             other => panic!("expected reduced state, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn sanitize_for_log_redacts_token() {
-        assert_eq!(
-            sanitize_for_log("ws://127.0.0.1/path?since=1&token=secret"),
-            "ws://127.0.0.1/path?since=1&token=<redacted>"
-        );
-        assert_eq!(
-            sanitize_for_log("ws://127.0.0.1/path?token=secret&since=1"),
-            "ws://127.0.0.1/path?token=<redacted>&since=1"
-        );
     }
 }

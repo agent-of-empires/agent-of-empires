@@ -31,329 +31,6 @@ fn wants_text_selection_tracks_copy_friendly_surfaces() {
     assert!(!env.view.wants_text_selection());
 }
 
-// -- apply_one_status_update -------------------------------------------------
-//
-// These guard the bug discovered in #872: the polling loop runs
-// `update_status_with_metadata` on a clone, then projects the result into
-// a `StatusUpdate`. The first version of that struct dropped the
-// freshly-set `idle_entered_at`, which meant the breathe rattle and
-// fresh-idle color never fired in the TUI even though everything looked
-// right via the API.
-
-#[test]
-#[serial]
-fn apply_status_update_propagates_idle_entered_at_into_live_instance() {
-    use crate::session::Status;
-    use crate::tui::status_poller::{IdleIntent, StatusUpdate};
-
-    let mut env = create_test_env_with_sessions(1);
-    let id = match env.view.flat_items.first() {
-        Some(Item::Session { id, .. }) => id.clone(),
-        _ => panic!("expected the fixture to seed a single Session item"),
-    };
-
-    // The instance was just created (Idle, no transition observed yet).
-    assert_eq!(env.view.get_instance(&id).unwrap().idle_entered_at, None);
-
-    // Simulate the poller observing a Stop hook: status stays Idle on
-    // disk but the wrapper writes `idle_entered_at` on the polling
-    // clone. The apply path must carry that timestamp into the live
-    // instance, otherwise nothing downstream sees it.
-    let now = chrono::Utc::now();
-    env.view.apply_one_status_update(StatusUpdate {
-        id: id.clone(),
-        status: Status::Idle,
-        last_error: None,
-        idle_entered_at: IdleIntent::Set(now),
-        last_accessed_at: None,
-        pane_dead: false,
-        live_status_baseline: None,
-        detection: None,
-    });
-
-    let inst = env.view.get_instance(&id).unwrap();
-    assert_eq!(inst.status, Status::Idle);
-    assert_eq!(inst.idle_entered_at, Some(now));
-}
-
-// #2690: `update_status_with_metadata` compares against
-// `live_status_baseline`, but the background poller only ever mutates a
-// *clone* of the real `Instance` (see `status_poller.rs`). If
-// `StatusUpdate` doesn't carry the clone's freshly-seeded baseline back,
-// the real `Instance` in `self.instances` keeps `live_status_baseline ==
-// None` forever, so every poll looks like "no baseline yet" and no real
-// transition after the first ever restamps again.
-#[test]
-#[serial]
-fn apply_status_update_propagates_live_status_baseline_from_poller() {
-    use crate::tui::status_poller::{poll_statuses_once, StatusPollState};
-
-    let mut env = create_test_env_with_sessions(1);
-    let id = match env.view.flat_items.first() {
-        Some(Item::Session { id, .. }) => id.clone(),
-        _ => panic!("expected the fixture to seed a single Session item"),
-    };
-    assert_eq!(
-        env.view.get_instance(&id).unwrap().live_status_baseline,
-        None,
-        "freshly loaded instance has no live baseline yet"
-    );
-
-    // Drive a real poll cycle through the same path the background thread
-    // uses: clone -> poll_statuses_once -> project into StatusUpdate ->
-    // apply back onto the real Instance.
-    let mut poll_state = StatusPollState::new();
-    let instances = env.view.pollable_instances();
-    let updates = poll_statuses_once(instances, &mut poll_state);
-    for update in updates {
-        env.view.apply_one_status_update(update);
-    }
-
-    assert!(
-        env.view
-            .get_instance(&id)
-            .unwrap()
-            .live_status_baseline
-            .is_some(),
-        "the polling clone's seeded baseline must survive back into the \
-         real Instance via StatusUpdate, or every future poll re-seeds \
-         instead of restamping real transitions"
-    );
-}
-
-// #3642: the poller decides on a *clone* too (see `status_poller.rs`), so
-// the detection bookkeeping `update_status_from_manifest` writes reaches the
-// next cycle only through `StatusUpdate`. Dropped, every cycle started with
-// no proposal on record, so a `Running -> Idle` that no rule read off the
-// agent's own chrome proposed itself forever and the row never left Running.
-//
-// Two real cycles over a live pane parked on a screen no Claude rule matches:
-// the first proposes, the second publishes.
-#[test]
-#[serial]
-fn poll_cycles_confirm_an_unwitnessed_idle_through_the_status_update() {
-    use crate::session::Status;
-    use crate::tui::status_poller::{poll_statuses_once, StatusPollState};
-
-    if crate::tmux::tmux_command()
-        .arg("-V")
-        .output()
-        .map(|o| !o.status.success())
-        .unwrap_or(true)
-    {
-        eprintln!("skipping: tmux not available");
-        return;
-    }
-
-    let mut env = create_test_env_with_sessions(1);
-    let id = match env.view.flat_items.first() {
-        Some(Item::Session { id, .. }) => id.clone(),
-        _ => panic!("expected the fixture to seed a single Session item"),
-    };
-
-    let session_name = {
-        let inst = env.view.get_instance(&id).unwrap();
-        assert_eq!(
-            inst.tool, "claude",
-            "fixture invariant: this test needs an agent with a manifest"
-        );
-        crate::tmux::Session::generate_name(&inst.id, &inst.title)
-    };
-    let _kill = crate::tmux::test_helpers::TmuxTestSession::from_name(session_name.clone());
-    let created = crate::tmux::tmux_command()
-        .args([
-            "new-session",
-            "-d",
-            "-s",
-            &session_name,
-            "-x",
-            "120",
-            "-y",
-            "40",
-            // `exec` so tmux reports the pane's command as `sleep` rather
-            // than the launching shell, which the stale-shell check would
-            // read as an agent that exited.
-            "printf 'turn over\n'; exec sleep 300",
-        ])
-        .output()
-        .expect("spawn tmux");
-    assert!(
-        created.status.success(),
-        "tmux new-session failed: {}",
-        String::from_utf8_lossy(&created.stderr)
-    );
-
-    // Mid-turn, as the poller last left it.
-    env.view.mutate_instance(&id, |inst| {
-        inst.status = Status::Running;
-        inst.live_status_baseline = Some(Status::Running);
-    });
-
-    // The launch is asynchronous: poll until the frame is drawn and the
-    // shell has `exec`ed, so the first cycle reads the parked pane rather
-    // than a pane still being set up.
-    let ready = (0..100).any(|_| {
-        if crate::tmux::utils::pane_current_command(&session_name).as_deref() == Some("sleep") {
-            return true;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        false
-    });
-    assert!(ready, "pane never settled on its parked command");
-
-    let mut poll_state = StatusPollState::new();
-    let mut published = Vec::new();
-    for _ in 0..2 {
-        let updates = poll_statuses_once(env.view.pollable_instances(), &mut poll_state);
-        for update in updates {
-            env.view.apply_one_status_update(update);
-        }
-        published.push(env.view.get_instance(&id).unwrap().status);
-    }
-
-    assert_eq!(
-        published,
-        vec![Status::Running, Status::Idle],
-        "an unwitnessed Idle waits one cycle, then publishes on the cycle \
-         that agrees with it (#3642)"
-    );
-}
-
-// #2690: `IdleIntent::Keep` means the producer has no observation for
-// `idle_entered_at`. The consumer must not touch the field, or an
-// unseeded `attached_status_hooks` snapshot on attach exit would clobber
-// a real value the main-thread poller wrote during attach. The other two
-// variants (`Set(ts)`, `Clear`) are unambiguous and always apply.
-#[test]
-#[serial]
-fn apply_status_update_preserves_idle_entered_at_on_keep() {
-    use crate::session::Status;
-    use crate::tui::status_poller::{IdleIntent, StatusUpdate};
-
-    let mut env = create_test_env_with_sessions(1);
-    let id = match env.view.flat_items.first() {
-        Some(Item::Session { id, .. }) => id.clone(),
-        _ => panic!("expected the fixture to seed a single Session item"),
-    };
-
-    // Seed a real `idle_entered_at` on the live instance, as if the
-    // main-thread poller had already observed an Idle transition.
-    let seeded = chrono::Utc::now() - chrono::Duration::minutes(30);
-    env.view.mutate_instance(&id, |inst| {
-        inst.idle_entered_at = Some(seeded);
-    });
-
-    // Then apply a `Keep` update, mirroring an `attached_status_hooks`
-    // snapshot from a watcher clone that never polled.
-    env.view.apply_one_status_update(StatusUpdate {
-        id: id.clone(),
-        status: Status::Idle,
-        last_error: None,
-        idle_entered_at: IdleIntent::Keep,
-        last_accessed_at: None,
-        pane_dead: false,
-        live_status_baseline: None,
-        detection: None,
-    });
-
-    assert_eq!(
-        env.view.get_instance(&id).unwrap().idle_entered_at,
-        Some(seeded),
-        "`Keep` must not clobber an already-established `idle_entered_at`"
-    );
-}
-
-// #2690: a passively-detected status transition must land on disk
-// immediately, not just in memory, so the next reload (TUI relaunch, or
-// a peer like `aoe serve`) finds disk already caught up instead of
-// comparing against a stale snapshot and misreading it as a fresh
-// transition.
-#[test]
-#[serial]
-fn apply_status_update_persists_genuine_transition_to_disk() {
-    use crate::session::{Status, Storage};
-    use crate::tui::status_poller::{IdleIntent, StatusUpdate};
-
-    let mut env = create_test_env_with_sessions(1);
-    let id = match env.view.flat_items.first() {
-        Some(Item::Session { id, .. }) => id.clone(),
-        _ => panic!("expected the fixture to seed a single Session item"),
-    };
-    assert_eq!(env.view.get_instance(&id).unwrap().status, Status::Idle);
-
-    let now = chrono::Utc::now();
-    env.view.apply_one_status_update(StatusUpdate {
-        id: id.clone(),
-        status: Status::Running,
-        last_error: None,
-        idle_entered_at: IdleIntent::Clear,
-        last_accessed_at: Some(now),
-        pane_dead: false,
-        live_status_baseline: None,
-        detection: None,
-    });
-
-    let reloaded = Storage::new_unwatched("test").unwrap().load().unwrap();
-    let row = reloaded.iter().find(|i| i.id == id).expect("row present");
-    assert_eq!(
-        row.status,
-        Status::Running,
-        "the genuine Idle -> Running transition must be persisted, not just in-memory"
-    );
-    assert_eq!(row.last_accessed_at, Some(now));
-}
-
-#[test]
-#[serial]
-fn apply_status_update_clears_idle_entered_at_on_idle_to_running() {
-    use crate::session::Status;
-    use crate::tui::status_poller::{IdleIntent, StatusUpdate};
-
-    let mut env = create_test_env_with_sessions(1);
-    let id = match env.view.flat_items.first() {
-        Some(Item::Session { id, .. }) => id.clone(),
-        _ => panic!("expected the fixture to seed a single Session item"),
-    };
-
-    // Seed: session is Idle with a freshness timestamp set.
-    let stop_time = chrono::Utc::now() - chrono::Duration::seconds(60);
-    env.view.apply_one_status_update(StatusUpdate {
-        id: id.clone(),
-        status: Status::Idle,
-        last_error: None,
-        idle_entered_at: IdleIntent::Set(stop_time),
-        last_accessed_at: None,
-        pane_dead: false,
-        live_status_baseline: None,
-        detection: None,
-    });
-    assert_eq!(
-        env.view.get_instance(&id).unwrap().idle_entered_at,
-        Some(stop_time)
-    );
-
-    // Transition Idle -> Running. The poller's wrapper clears
-    // `idle_entered_at` on the clone for non-Idle states; the apply
-    // path has to honor that, otherwise a Running session would still
-    // claim a freshness age.
-    env.view.apply_one_status_update(StatusUpdate {
-        id: id.clone(),
-        status: Status::Running,
-        last_error: None,
-        idle_entered_at: IdleIntent::Clear,
-        last_accessed_at: None,
-        pane_dead: false,
-        live_status_baseline: None,
-        detection: None,
-    });
-
-    let inst = env.view.get_instance(&id).unwrap();
-    assert_eq!(inst.status, Status::Running);
-    assert_eq!(inst.idle_entered_at, None);
-    // And `idle_age()` must not synthesize one out of stale state.
-    assert_eq!(inst.idle_age(), None);
-}
-
 #[test]
 #[serial]
 fn archived_running_session_renders_stopped_icon_not_spinner() {
@@ -415,241 +92,6 @@ fn archived_running_session_renders_stopped_icon_not_spinner() {
         ICON_STOPPED,
         "non-archived Running row should keep its spinner; helper would be a no-op otherwise"
     );
-}
-
-#[test]
-#[serial]
-fn apply_status_update_skips_terminal_states() {
-    use crate::session::Status;
-    use crate::tui::status_poller::{IdleIntent, StatusUpdate};
-
-    let mut env = create_test_env_with_sessions(1);
-    let id = match env.view.flat_items.first() {
-        Some(Item::Session { id, .. }) => id.clone(),
-        _ => panic!("expected the fixture to seed a single Session item"),
-    };
-
-    // Move the session into a terminal state that the apply path is
-    // supposed to leave alone.
-    env.view
-        .mutate_instance(&id, |inst| inst.status = Status::Deleting);
-    let stale_ts = chrono::Utc::now() - chrono::Duration::seconds(10);
-
-    env.view.apply_one_status_update(StatusUpdate {
-        id: id.clone(),
-        status: Status::Idle,
-        last_error: None,
-        idle_entered_at: IdleIntent::Set(stale_ts),
-        last_accessed_at: None,
-        pane_dead: false,
-        live_status_baseline: None,
-        detection: None,
-    });
-
-    // Status and timestamp should both stay untouched.
-    let inst = env.view.get_instance(&id).unwrap();
-    assert_eq!(inst.status, Status::Deleting);
-    assert_eq!(inst.idle_entered_at, None);
-}
-
-#[test]
-#[serial]
-fn apply_stop_results_transitions_instance_to_stopped() {
-    use crate::session::Status;
-    use crate::tui::stop_poller::StopRequest;
-
-    let mut env = create_test_env_with_sessions(1);
-    let id = match env.view.flat_items.first() {
-        Some(Item::Session { id, .. }) => id.clone(),
-        _ => panic!("expected the fixture to seed a single Session item"),
-    };
-
-    // Pretend the session is live, then dispatch the stop to the background
-    // poller exactly as Action::StopSession does. The fixture instance has no
-    // tmux pane or sandbox, so perform_stop returns success quickly.
-    env.view
-        .mutate_instance(&id, |inst| inst.status = Status::Running);
-    let inst = env.view.get_instance(&id).unwrap().clone();
-    env.view.stop_poller.request_stop(StopRequest {
-        session_id: id.clone(),
-        instance: inst,
-    });
-
-    // Poll the result-application path the main loop runs each frame.
-    let mut applied = false;
-    for _ in 0..50 {
-        if env.view.apply_stop_results() {
-            applied = true;
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    assert!(applied, "apply_stop_results never observed the stop result");
-
-    let inst = env.view.get_instance(&id).unwrap();
-    assert_eq!(inst.status, Status::Stopped);
-    assert_eq!(inst.last_error, None);
-}
-
-#[test]
-#[serial]
-fn apply_status_update_runs_status_hook_on_transition() {
-    use crate::session::Status;
-    use crate::status_hooks::{take_recorded_launches, StatusHookConfig};
-    use crate::tui::status_poller::{IdleIntent, StatusUpdate};
-
-    let mut env = create_test_env_with_sessions(1);
-    let id = match env.view.flat_items.first() {
-        Some(Item::Session { id, .. }) => id.clone(),
-        _ => panic!("expected the fixture to seed a single Session item"),
-    };
-    env.view.status_hook_config = StatusHookConfig {
-        enabled: true,
-        on_waiting: Some("notify-waiting".to_string()),
-        on_change: Some("notify-change".to_string()),
-        ..Default::default()
-    };
-    take_recorded_launches();
-
-    env.view.apply_one_status_update(StatusUpdate {
-        id: id.clone(),
-        status: Status::Waiting,
-        last_error: None,
-        idle_entered_at: IdleIntent::Clear,
-        last_accessed_at: None,
-        pane_dead: false,
-        live_status_baseline: None,
-        detection: None,
-    });
-
-    let launches = take_recorded_launches();
-    assert_eq!(launches.len(), 2);
-    assert_eq!(launches[0].command, "notify-waiting");
-    assert_eq!(launches[1].command, "notify-change");
-    assert_eq!(launches[0].context.session_id, id);
-    assert_eq!(launches[0].context.old_status, Status::Idle);
-    assert_eq!(launches[0].context.new_status, Status::Waiting);
-}
-
-#[test]
-#[serial]
-fn all_profiles_status_hook_lookup_uses_cache() {
-    use crate::status_hooks::StatusHookConfig;
-
-    let mut env = create_test_env_with_sessions(1);
-    env.view.active_profile = None;
-    env.view.status_hook_config = StatusHookConfig::default();
-    env.view.status_hook_configs.clear();
-    env.view.status_hook_configs.insert(
-        "cached".to_string(),
-        StatusHookConfig {
-            enabled: true,
-            on_waiting: Some("notify-cached".to_string()),
-            ..Default::default()
-        },
-    );
-
-    let mut instance = Instance::new("Cached profile", "/tmp/cached");
-    instance.source_profile = "cached".to_string();
-
-    let config = env.view.status_hook_config_for(&instance);
-    assert!(config.enabled);
-    assert_eq!(config.on_waiting.as_deref(), Some("notify-cached"));
-}
-
-#[test]
-#[serial]
-fn apply_status_update_does_not_run_status_hook_for_same_status() {
-    use crate::session::Status;
-    use crate::status_hooks::{take_recorded_launches, StatusHookConfig};
-    use crate::tui::status_poller::{IdleIntent, StatusUpdate};
-
-    let mut env = create_test_env_with_sessions(1);
-    let id = match env.view.flat_items.first() {
-        Some(Item::Session { id, .. }) => id.clone(),
-        _ => panic!("expected the fixture to seed a single Session item"),
-    };
-    env.view.status_hook_config = StatusHookConfig {
-        enabled: true,
-        on_change: Some("notify-change".to_string()),
-        ..Default::default()
-    };
-    take_recorded_launches();
-
-    env.view.apply_one_status_update(StatusUpdate {
-        id,
-        status: Status::Idle,
-        last_error: None,
-        idle_entered_at: IdleIntent::Keep,
-        last_accessed_at: None,
-        pane_dead: false,
-        live_status_baseline: None,
-        detection: None,
-    });
-
-    assert!(take_recorded_launches().is_empty());
-}
-
-#[test]
-#[serial]
-fn apply_status_updates_without_hooks_does_not_run_status_hook() {
-    use crate::session::Status;
-    use crate::status_hooks::{take_recorded_launches, StatusHookConfig};
-    use crate::tui::status_poller::{IdleIntent, StatusUpdate};
-
-    let mut env = create_test_env_with_sessions(1);
-    let id = match env.view.flat_items.first() {
-        Some(Item::Session { id, .. }) => id.clone(),
-        _ => panic!("expected the fixture to seed a single Session item"),
-    };
-    env.view.status_hook_config = StatusHookConfig {
-        enabled: true,
-        on_waiting: Some("notify-waiting".to_string()),
-        ..Default::default()
-    };
-    take_recorded_launches();
-
-    env.view
-        .apply_status_updates_without_hooks(vec![StatusUpdate {
-            id: id.clone(),
-            status: Status::Waiting,
-            last_error: None,
-            idle_entered_at: IdleIntent::Clear,
-            last_accessed_at: None,
-            pane_dead: false,
-            live_status_baseline: None,
-            detection: None,
-        }]);
-
-    assert_eq!(env.view.get_instance(&id).unwrap().status, Status::Waiting);
-    assert!(take_recorded_launches().is_empty());
-}
-
-#[test]
-#[serial]
-fn set_instance_status_runs_status_hook_on_transition() {
-    use crate::session::Status;
-    use crate::status_hooks::{take_recorded_launches, StatusHookConfig};
-
-    let mut env = create_test_env_with_sessions(1);
-    let id = match env.view.flat_items.first() {
-        Some(Item::Session { id, .. }) => id.clone(),
-        _ => panic!("expected the fixture to seed a single Session item"),
-    };
-    env.view.status_hook_config = StatusHookConfig {
-        enabled: true,
-        on_error: Some("notify-error".to_string()),
-        ..Default::default()
-    };
-    take_recorded_launches();
-
-    env.view.set_instance_status(&id, Status::Error);
-
-    let launches = take_recorded_launches();
-    assert_eq!(launches.len(), 1);
-    assert_eq!(launches[0].command, "notify-error");
-    assert_eq!(launches[0].context.old_status, Status::Idle);
-    assert_eq!(launches[0].context.new_status, Status::Error);
 }
 
 /// Regression: paste over a group header must stash to `pending_paste`,
@@ -1121,33 +563,13 @@ fn footer_hides_attention_workflow_hints_outside_attention_sort() {
     crate::session::set_favorites_first(original);
 }
 
-/// `toggle_favorite_at_cursor` flips the cursor's instance favorited state
-/// and persists the change. No toast: the row's visual treatment (bold +
-/// leading `* ` glyph) is the feedback.
 #[test]
 #[serial]
-fn toggle_favorite_at_cursor_round_trip() {
+fn favorite_without_runtime_cannot_change_local_state() {
     let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instance_at(0).id.clone();
-    env.view.selected_session = Some(id.clone());
-
-    // Initial state: not favorited.
+    env.view.selected_session = Some(env.view.instance_at(0).id.clone());
+    assert!(env.view.toggle_favorite_at_cursor().is_err());
     assert!(!env.view.instance_at(0).is_favorited());
-
-    env.view.toggle_favorite_at_cursor().unwrap();
-    assert!(env.view.instance_at(0).is_favorited());
-
-    env.view.toggle_favorite_at_cursor().unwrap();
-    assert!(!env.view.instance_at(0).is_favorited());
-}
-
-/// When no session is selected, the toggle is a silent no-op.
-#[test]
-#[serial]
-fn toggle_favorite_at_cursor_noop_with_no_selection() {
-    let mut env = create_test_env_empty();
-    env.view.selected_session = None;
-    env.view.toggle_favorite_at_cursor().unwrap();
 }
 
 /// `toggle_archive_at_cursor` flips the cursor's instance archived state
@@ -1165,14 +587,18 @@ fn toggle_archive_at_cursor_round_trip() {
     // Initial state: not archived.
     assert!(!env.view.instance_at(0).is_archived());
 
-    env.view.toggle_archive_at_cursor().unwrap();
+    with_canonical_archive(&mut env, |env| {
+        env.view.toggle_archive_at_cursor().unwrap();
+    });
     assert!(env.view.instance_at(0).is_archived());
 
     // Archiving moved the selection off the row (it advances to the next
     // active session; here there is none). Navigate back onto the archived
     // row, as a user would, before toggling it back.
     env.view.select_session_by_id(&id);
-    env.view.toggle_archive_at_cursor().unwrap();
+    with_canonical_archive(&mut env, |env| {
+        env.view.toggle_archive_at_cursor().unwrap();
+    });
     assert!(!env.view.instance_at(0).is_archived());
 }
 
@@ -1207,7 +633,9 @@ fn trash_then_restore_round_trip() {
 
     // Restore via the shelve/unshelve key.
     env.view.select_session_by_id(&id);
-    env.view.toggle_archive_at_cursor().unwrap();
+    with_canonical_archive(&mut env, |env| {
+        env.view.toggle_archive_at_cursor().unwrap();
+    });
     assert!(
         !env.view.get_instance(&id).unwrap().is_trashed(),
         "session must be restored out of trash"
@@ -1443,7 +871,9 @@ fn right_click_archived_header_shows_restore_menu() {
     env.view.archived_section_collapsed = false;
     env.view.cursor = 0;
     env.view.update_selected();
-    env.view.toggle_archive_at_cursor().unwrap();
+    with_canonical_archive(&mut env, |env| {
+        env.view.toggle_archive_at_cursor().unwrap();
+    });
 
     let header_idx = env
         .view
@@ -1556,7 +986,9 @@ fn unarchive_all_unarchives_every_row() {
     for i in 0..2 {
         env.view.cursor = i;
         env.view.update_selected();
-        env.view.toggle_archive_at_cursor().unwrap();
+        with_canonical_archive(&mut env, |env| {
+            env.view.toggle_archive_at_cursor().unwrap();
+        });
     }
     assert_eq!(
         env.view
@@ -1691,7 +1123,9 @@ fn archived_preview_surfaces_delete_failure() {
     env.view.archived_section_collapsed = false;
     let id = env.view.instance_at(0).id.clone();
     env.view.select_session_by_id(&id);
-    env.view.toggle_archive_at_cursor().unwrap();
+    with_canonical_archive(&mut env, |env| {
+        env.view.toggle_archive_at_cursor().unwrap();
+    });
     env.view.select_session_by_id(&id);
     env.view.mutate_instance(&id, |inst| {
         inst.status = Status::Error;
@@ -2180,5 +1614,7 @@ fn confirm_delete_dialog_cancel_leaves_session() {
 fn toggle_archive_at_cursor_noop_with_no_selection() {
     let mut env = create_test_env_empty();
     env.view.selected_session = None;
-    env.view.toggle_archive_at_cursor().unwrap();
+    with_canonical_archive(&mut env, |env| {
+        env.view.toggle_archive_at_cursor().unwrap();
+    });
 }

@@ -42,14 +42,14 @@ async function mockWizardApis(page: Page, agents: unknown[]) {
   await page.route("**/api/login/status", (route) => route.fulfill({ json: { required: false, authenticated: true } }));
   await page.route("**/api/settings", (route) => route.fulfill({ json: {} }));
   await page.route("**/api/themes", (route) => route.fulfill({ json: [] }));
-  await page.route("**/api/profiles", (route) => route.fulfill({ json: [] }));
+  await page.route("**/api/profiles", (route) => route.fulfill({ json: [{ name: "default", is_default: true }] }));
   await page.route("**/api/groups", (route) => route.fulfill({ json: [] }));
   await page.route("**/api/devices", (route) => route.fulfill({ json: [] }));
   await page.route("**/api/system/update-status", (route) => route.fulfill({ json: {} }));
   await page.route("**/api/about", (route) => route.fulfill({ json: {} }));
   // ProjectStep always mounts now and fetches these.
   await page.route("**/api/recent-projects", (route) => route.fulfill({ json: { projects: [] } }));
-  await page.route("**/api/projects", (route) => route.fulfill({ json: [] }));
+  await page.route("**/api/projects*", (route) => route.fulfill({ json: [] }));
   await page.route("**/api/docker/status", (route) => route.fulfill({ json: { available: false, runtime: null } }));
   await page.route("**/api/agents", (route) => route.fulfill({ json: agents }));
   await page.route("**/api/sessions", (route) => {

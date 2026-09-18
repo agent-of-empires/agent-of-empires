@@ -4,7 +4,7 @@
 use crate::file_watch::{FileMatcher, WatchSpec};
 use std::sync::Arc;
 
-use super::reload::{load_all_instances, reload_state_instances_from_disk};
+use super::reload::{load_all_profiles, reload_state_instances_from_disk};
 use super::state::{AppState, DiskWatchEntry, StatusSource};
 use super::structured_repair::live_structured_worker_records;
 
@@ -272,12 +272,14 @@ pub(super) async fn disk_watcher_consumer(state: Arc<AppState>) {
         let started = std::time::Instant::now();
         // Invariant 8: read before the disk read, so a delete committing
         // during it invalidates this snapshot.
+        let namespace = state.profile_namespace.read().await;
+        let reload_lane = state.reload_lane.lock().await;
         let read_epoch = state
             .mutation_epoch
             .load(std::sync::atomic::Ordering::SeqCst);
         let file_watch_for_load = state.file_watch.clone();
         let loaded = match tokio::task::spawn_blocking(move || {
-            load_all_instances(&file_watch_for_load)
+            load_all_profiles(&file_watch_for_load)
                 .map(|fresh| (fresh, live_structured_worker_records()))
         })
         .await
@@ -289,6 +291,7 @@ pub(super) async fn disk_watcher_consumer(state: Arc<AppState>) {
                     error = %e,
                     "disk reload failed"
                 );
+                state.mark_reload_failure(e.health).await;
                 continue;
             }
             Err(e) => {
@@ -297,19 +300,29 @@ pub(super) async fn disk_watcher_consumer(state: Arc<AppState>) {
                     error = %e,
                     "spawn_blocking joined with error"
                 );
+                state
+                    .mark_reload_failure(crate::daemon::RuntimeHealth::Degraded {
+                        code: crate::daemon::ReloadFailureCode::Metadata,
+                        profiles: Vec::new(),
+                    })
+                    .await;
                 continue;
             }
         };
         let (fresh, live_worker_records) = loaded;
-        let count = fresh.len();
+        let count = fresh.instances.len();
         reload_state_instances_from_disk(
             &state,
-            fresh,
+            fresh.instances,
             live_worker_records,
             StatusSource::DiskOnly,
             read_epoch,
+            fresh.metadata,
+            Default::default(),
         )
         .await;
+        drop(reload_lane);
+        drop(namespace);
         tracing::trace!(
             target: "server.file_watch",
             latency_us = started.elapsed().as_micros() as u64,
@@ -368,7 +381,6 @@ mod tests {
             "startup wiring must leave exactly one live subscription for the single profile"
         );
     }
-
     // Concurrent same-profile rewires must converge to a single
     // consistent map entry and matching live subscription count. The
     // unified helper holds `disk_watch_handles` through the full
@@ -383,13 +395,10 @@ mod tests {
         let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
         let _ = crate::session::get_profile_dir("rewire-race").expect("profile dir");
 
-        let state = test_support::build_test_app_state(Vec::new());
         let live = FileWatchService::new().expect("live svc");
-        let mut state_mut = Arc::try_unwrap(state)
-            .map_err(|_| ())
-            .expect("unique state");
-        state_mut.file_watch = live;
-        let state = Arc::new(state_mut);
+        let state = test_support::build_test_app_state_configured(Vec::new(), |state| {
+            test_support::replace_file_watch(state, live);
+        });
 
         let mut joins = Vec::new();
         for i in 0..50 {
@@ -447,13 +456,10 @@ mod tests {
         let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
         let _ = crate::session::get_profile_dir("race-fix").expect("profile dir");
 
-        let state = test_support::build_test_app_state(Vec::new());
         let live = FileWatchService::new().expect("live svc");
-        let mut state_mut = Arc::try_unwrap(state)
-            .map_err(|_| ())
-            .expect("unique state");
-        state_mut.file_watch = live;
-        let state = Arc::new(state_mut);
+        let state = test_support::build_test_app_state_configured(Vec::new(), |state| {
+            test_support::replace_file_watch(state, live);
+        });
 
         let barrier = Arc::new(DiskWatchBuildBarrier {
             entered: tokio::sync::Notify::new(),
@@ -535,13 +541,10 @@ mod tests {
             .expect("seed p1");
         let _ = crate::session::get_profile_dir("init-gap-p2").expect("p2 dir");
 
-        let state = test_support::build_test_app_state(Vec::new());
         let live = FileWatchService::new().expect("live svc");
-        let mut state_mut = Arc::try_unwrap(state)
-            .map_err(|_| ())
-            .expect("unique state");
-        state_mut.file_watch = live;
-        let state = Arc::new(state_mut);
+        let state = test_support::build_test_app_state_configured(Vec::new(), |state| {
+            test_support::replace_file_watch(state, live);
+        });
 
         init_disk_watch_subscriptions_with_hook(state.clone(), |profile| {
             if profile == "init-gap-p1" {
@@ -574,16 +577,18 @@ mod tests {
             .mutation_epoch
             .load(std::sync::atomic::Ordering::SeqCst);
         let file_watch = state.file_watch.clone();
-        let fresh = tokio::task::spawn_blocking(move || load_all_instances(&file_watch))
+        let fresh = tokio::task::spawn_blocking(move || load_all_profiles(&file_watch))
             .await
             .expect("join")
             .expect("load");
         reload_state_instances_from_disk(
             &state,
-            fresh,
+            fresh.instances,
             Vec::new(),
             StatusSource::DiskOnly,
             read_epoch,
+            fresh.metadata,
+            Default::default(),
         )
         .await;
 
@@ -630,6 +635,11 @@ mod tests {
             Vec::new(),
             StatusSource::DiskOnly,
             read_epoch,
+            {
+                let metadata = state.canonical_metadata.read().await.clone();
+                metadata
+            },
+            Default::default(),
         )
         .await;
 
@@ -677,6 +687,11 @@ mod tests {
             Vec::new(),
             StatusSource::DiskOnly,
             0,
+            {
+                let metadata = state.canonical_metadata.read().await.clone();
+                metadata
+            },
+            Default::default(),
         )
         .await;
 
@@ -703,6 +718,11 @@ mod tests {
             Vec::new(),
             StatusSource::DiskOnly,
             0,
+            {
+                let metadata = unbumped.canonical_metadata.read().await.clone();
+                metadata
+            },
+            Default::default(),
         )
         .await;
         let titles: Vec<String> = unbumped
@@ -751,6 +771,11 @@ mod tests {
                 Vec::new(),
                 StatusSource::DiskOnly,
                 read_epoch,
+                {
+                    let metadata = reload_state.canonical_metadata.read().await.clone();
+                    metadata
+                },
+                Default::default(),
             )
             .await;
         };
@@ -798,6 +823,11 @@ mod tests {
             Vec::new(),
             StatusSource::DiskOnly,
             read_epoch,
+            {
+                let metadata = state.canonical_metadata.read().await.clone();
+                metadata
+            },
+            Default::default(),
         )
         .await;
 
@@ -831,13 +861,10 @@ mod tests {
             })
             .expect("seed write");
 
-        let state = test_support::build_test_app_state(Vec::new());
         let live = FileWatchService::new().expect("live svc");
-        let mut state_mut = Arc::try_unwrap(state)
-            .map_err(|_| ())
-            .expect("unique state");
-        state_mut.file_watch = live;
-        let state = Arc::new(state_mut);
+        let state = test_support::build_test_app_state_configured(Vec::new(), |state| {
+            test_support::replace_file_watch(state, live);
+        });
 
         init_disk_watch_subscriptions(state.clone()).await;
 
@@ -854,16 +881,18 @@ mod tests {
             .mutation_epoch
             .load(std::sync::atomic::Ordering::SeqCst);
         let file_watch = state.file_watch.clone();
-        let fresh = tokio::task::spawn_blocking(move || load_all_instances(&file_watch))
+        let fresh = tokio::task::spawn_blocking(move || load_all_profiles(&file_watch))
             .await
             .expect("join")
             .expect("load");
         reload_state_instances_from_disk(
             &state,
-            fresh,
+            fresh.instances,
             Vec::new(),
             StatusSource::DiskOnly,
             read_epoch,
+            fresh.metadata,
+            Default::default(),
         )
         .await;
 

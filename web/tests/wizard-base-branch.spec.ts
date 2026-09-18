@@ -15,21 +15,23 @@ import { openWizard, selectProject, expandMoreOptions, wizard } from "./helpers/
 async function mockApis(page: Page) {
   await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   for (const path of ["settings", "themes", "profiles", "groups", "devices", "about", "system/update-status"]) {
-    await page.route(`**/api/${path}`, (r) =>
+    await page.route(`**/api/${path}*`, (r) =>
       r.fulfill({
         // worktree.enabled drives the wizard's "Create a worktree" default (#2423);
         // these worktree-flow specs assume it is on.
         json:
-          path === "settings"
-            ? { worktree: { enabled: true } }
-            : path === "about" || path === "system/update-status"
-              ? {}
-              : [],
+          path === "profiles"
+            ? [{ name: "default", is_default: true }]
+            : path === "settings"
+              ? { worktree: { enabled: true } }
+              : path === "about" || path === "system/update-status"
+                ? {}
+                : [],
       }),
     );
   }
   await page.route("**/api/recent-projects", (r) => r.fulfill({ json: { projects: [] } }));
-  await page.route("**/api/projects", (r) => r.fulfill({ json: [] }));
+  await page.route("**/api/projects*", (r) => r.fulfill({ json: [] }));
   await page.route("**/api/docker/status", (r) => r.fulfill({ json: { available: false, runtime: null } }));
   // The wizard's project picker shows a "Recent projects" list driven by
   // /api/sessions. Seed one entry so the test can click it to select a

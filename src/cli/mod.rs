@@ -20,6 +20,7 @@ pub mod plugin;
 pub mod profile;
 pub mod project;
 pub mod ps;
+pub mod remote;
 pub mod remove;
 pub mod sandbox;
 pub mod send;

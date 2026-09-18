@@ -34,11 +34,11 @@ use self::state::{
 };
 use crate::acp::client::{
     require_daemon, ws_connect_with, DaemonEndpoint, HttpClient, HttpError, ManagerError,
-    PluginCommandView, WsError, WsMessage, REPLAY_PAGE_SIZE,
+    PluginCommandView, WsMessage, REPLAY_PAGE_SIZE,
 };
 use crate::acp::elicitations::ElicitationResolution;
 use crate::acp::protocol::ApprovalDecisionWire;
-use crate::daemon::QueuedPromptEntry;
+use crate::daemon::{QueuedPromptEntry, WsError};
 use crate::plugin::ui_state::{Tone, UiSnapshot};
 use crate::session::config::{resolve_theme_name, resolve_theme_palette_mode};
 use crate::tui::styles::Theme;
@@ -163,8 +163,8 @@ pub async fn run(
 }
 
 /// Render the "no daemon running" screen with a one-key recovery:
-/// Enter spawns a localhost daemon (via the serve dialog's shared
-/// spawn path) and waits for it to become healthy, then returns its
+/// Enter starts the localhost daemon the TUI bootstraps and waits for
+/// it to become healthy, then returns its
 /// endpoint so the caller can proceed straight into the view. Any
 /// other key returns `None` (back to the session list). Spawn or
 /// health-check failures render an error screen and also return
@@ -219,10 +219,8 @@ async fn offer_daemon_start(
 }
 
 /// Same as [`run`] but the caller has already located the daemon
-/// endpoint (e.g. the remote-home picker that ran a session discovery
-/// step against a fixed `AOE_DAEMON_URL`). Skips `require_daemon` so
-/// the view doesn't re-run discovery / health-check when the caller
-/// has already done it.
+/// endpoint (e.g. a remote row opened from the home view). Skips
+/// `require_daemon` so the view doesn't re-run discovery / health-check.
 /// Everything a structured-view surface needs after connecting: the
 /// hydrated state, the folded startup error (if any), and the two
 /// side-channel receivers (plugin UI snapshots, session view metadata).
@@ -406,13 +404,19 @@ fn should_retry_plugin_ui_poll(error: &HttpError) -> bool {
     !matches!(error, HttpError::Unauthorized)
 }
 
-pub async fn run_for_endpoint(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+/// Run the full-screen view against `endpoint` until the user exits. Generic
+/// over the backend so the home view can open a remote session with its own
+/// terminal.
+pub async fn run_for_endpoint<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
     event_stream: &mut EventStream,
     theme: &Theme,
     endpoint: DaemonEndpoint,
     session_id: &str,
-) -> Result<()> {
+) -> Result<()>
+where
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     let ViewSetup {
         mut state,
         startup_toast,
@@ -1854,11 +1858,14 @@ async fn refresh_queue(state: &mut StructuredViewState) {
     }
 }
 
-fn redraw(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+fn redraw<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
     theme: &Theme,
     state: &mut StructuredViewState,
-) -> Result<()> {
+) -> Result<()>
+where
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     terminal.draw(|f| {
         // Stash the pane geometry this frame draws with so mouse events
         // hit-test against what is actually on screen. The full-screen

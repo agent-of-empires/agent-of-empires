@@ -25,7 +25,6 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
-use tokio::time::timeout;
 
 use super::session_service::SessionService;
 use super::AppState;
@@ -314,13 +313,7 @@ pub async fn reconcile_acp_workers(
         let instances = state.instances.read().await;
         let targets = instances
             .iter()
-            .filter(|i| {
-                i.is_structured()
-                    && !i.is_archived()
-                    && !i.is_snoozed()
-                    && !i.is_trashed()
-                    && !i.is_idle_dormant()
-            })
+            .filter(|i| accepts_runtime_work(i) && !i.is_idle_dormant())
             .map(|i| {
                 (
                     i.id.clone(),
@@ -532,12 +525,8 @@ pub async fn reconcile_acp_workers(
         return;
     }
 
-    // Resume concurrency cap. Bounded by total worker capacity so it can
-    // never exceed `max_concurrent_workers`. Floor at 1 so a misconfigured
-    // zero doesn't deadlock the reconciler.
-    let cfg = crate::session::config::profile_config::resolve_config_or_warn(&state.profile);
     let resume_limit = MAX_CONCURRENT_RESUMES
-        .min(cfg.acp.max_concurrent_workers)
+        .min(state.acp_supervisor.max_concurrent_workers())
         .max(1);
     let semaphore = Arc::new(Semaphore::new(resume_limit as usize));
 
@@ -860,10 +849,7 @@ async fn reap_idle_workers(state: &Arc<AppState>) {
         instances
             .iter()
             .filter(|i| {
-                i.is_structured()
-                    && !i.is_archived()
-                    && !i.is_snoozed()
-                    && !i.is_trashed()
+                accepts_runtime_work(i)
                     && !i.is_idle_dormant()
                     // A session with queued work waiting to drain is not idle:
                     // reaping it here would fight wake-on-drain, which clears
@@ -1293,12 +1279,7 @@ async fn reap_rate_limit_resumes(
         instances
             .iter()
             .filter(|i| {
-                i.is_structured()
-                    && !i.is_archived()
-                    && !i.is_snoozed()
-                    && !i.is_trashed()
-                    && !i.is_idle_dormant()
-                    && attempted.contains(&i.id)
+                accepts_runtime_work(i) && !i.is_idle_dormant() && attempted.contains(&i.id)
             })
             .map(|i| {
                 (
@@ -1697,20 +1678,18 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
                         .and_then(|i| i.sandbox_info.clone())
                 };
                 let lease = reservation.take().expect("attach lease held");
-                let attach_res = timeout(
-                    Duration::from_secs(3),
-                    supervisor.attach_inner(
+                let attach_res = supervisor
+                    .attach_inner(
                         id.clone(),
                         cwd,
                         vec![],
                         in_flight_turn,
                         sandbox_for_attach,
                         lease,
-                    ),
-                )
-                .await;
+                    )
+                    .await;
                 match attach_res {
-                    Ok(Ok(())) => {
+                    Ok(()) => {
                         // Flagged only once the stale worker is attached: a
                         // failed attach falls through to a fresh spawn on the
                         // current binary, which has nothing to drain.
@@ -1745,25 +1724,23 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
                         }
                         return ResumeOutcome::Attached;
                     }
-                    Ok(Err(SupervisorError::SpawnCancelled(_))) => {
+                    Err(SupervisorError::SpawnCancelled(_)) => {
                         return ResumeOutcome::SpawnFinished;
                     }
-                    Ok(Err(e)) => {
+                    Err(SupervisorError::Acp(crate::acp::acp_client::AcpError::AttachTimedOut)) => {
                         tracing::warn!(
-                            target: "acp.supervisor",
-                            session = %id,
-                            "attach failed; terminating the worker and falling back to fresh spawn: {e}"
-                        );
-                        crate::process::worker_registry::terminate_and_wait(&id).await;
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            target: "acp.supervisor",
-                            session = %id,
-                            "attach timed out after 3s; terminating the worker and falling back to fresh spawn"
+                            target: "acp.supervisor", session = %id,
+                            "attach handshake timed out after 3s; terminating the worker before retry"
                         );
                         crate::process::worker_registry::terminate_and_wait(&id).await;
                         return ResumeOutcome::RetryAfterAttachTimeout;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "acp.supervisor", session = %id,
+                            "attach failed; terminating the worker and falling back to fresh spawn: {e}"
+                        );
+                        crate::process::worker_registry::terminate_and_wait(&id).await;
                     }
                 }
                 // The attach released its lease on failure; the fresh spawn
@@ -1872,13 +1849,7 @@ async fn drain_pending_initial_turns(state: &Arc<AppState>) {
         let instances = state.instances.read().await;
         instances
             .iter()
-            .filter(|i| {
-                i.pending_initial_turn.is_some()
-                    && i.is_structured()
-                    && !i.is_archived()
-                    && !i.is_snoozed()
-                    && !i.is_trashed()
-            })
+            .filter(|i| i.pending_initial_turn.is_some() && accepts_runtime_work(i))
             .map(|i| i.id.clone())
             .collect()
     };
@@ -1887,13 +1858,12 @@ async fn drain_pending_initial_turns(state: &Arc<AppState>) {
             continue;
         }
         let service = Arc::clone(&state.session_service);
-        crate::task_util::spawn_supervised(
-            "acp.pending_initial_turn_drain",
-            crate::task_util::PanicPolicy::Log,
-            async move {
+        state
+            .runtime
+            .work
+            .spawn("acp.pending_initial_turn_drain", async move {
                 service.drain_pending_initial_turn(&id).await;
-            },
-        );
+            });
     }
 }
 
@@ -1919,10 +1889,7 @@ async fn drain_queued_prompts(state: &Arc<AppState>) {
             .filter(|i| {
                 !i.queued_prompts.is_empty()
                     && i.status == crate::session::Status::Idle
-                    && i.is_structured()
-                    && !i.is_archived()
-                    && !i.is_snoozed()
-                    && !i.is_trashed()
+                    && accepts_runtime_work(i)
             })
             .map(|i| (i.id.clone(), i.is_idle_dormant()))
             .collect()
@@ -1934,13 +1901,9 @@ async fn drain_queued_prompts(state: &Arc<AppState>) {
             // delivers under the session's prompt-submission guard, so a
             // mid-respawn worker is simply waited for rather than deadlocked
             // against (#3621).
-            crate::task_util::spawn_supervised(
-                "acp.queue_drain",
-                crate::task_util::PanicPolicy::Log,
-                async move {
-                    service.drain_queued_prompts_once(&id).await;
-                },
-            );
+            state.runtime.work.spawn("acp.queue_drain", async move {
+                service.drain_queued_prompts_once(&id).await;
+            });
         } else if dormant {
             // No live worker and the session was auto-stopped for inactivity:
             // clear the dormant marker so the resume pass respawns it under its
@@ -1948,13 +1911,12 @@ async fn drain_queued_prompts(state: &Arc<AppState>) {
             // above once the worker is live. Waking through the resume pass
             // rather than kicking a resume here is deliberate: it keeps the
             // budget/park guard and never spawns while holding a lock (#3172).
-            crate::task_util::spawn_supervised(
-                "acp.queue_drain_wake",
-                crate::task_util::PanicPolicy::Log,
-                async move {
+            state
+                .runtime
+                .work
+                .spawn("acp.queue_drain_wake", async move {
                     service.wake_dormant_for_queue_drain(&id).await;
-                },
-            );
+                });
         }
         // else: a dead / respawn-budget-parked non-dormant worker. The resume
         // pass already owns its respawn, so there is nothing to do here.
@@ -2002,6 +1964,9 @@ async fn build_spawn_request(
         let Some(inst) = instances.iter().find(|i| i.id == target.id) else {
             return Err(());
         };
+        if !accepts_runtime_work(inst) || inst.is_idle_dormant() {
+            return Err(());
+        }
         (
             PathBuf::from(&inst.project_path),
             inst.import_pending == Some(true),
@@ -2085,6 +2050,18 @@ pub(crate) fn command_override_for_spawn(
     })
 }
 
+fn accepts_runtime_work(instance: &crate::session::Instance) -> bool {
+    instance.is_structured()
+        && !instance.is_archived()
+        && !instance.is_snoozed()
+        && !instance.is_trashed()
+        && !matches!(
+            instance.status,
+            crate::session::Status::Creating | crate::session::Status::Deleting
+        )
+        && !instance.has_fresh_lifecycle_reservation(chrono::Utc::now())
+}
+
 /// Snapshot a single structured view session's resume inputs from the live
 /// instance list. Returns `None` when the session is gone or is not a
 /// structured view session. `in_flight_turn` is always false: this is only used
@@ -2095,19 +2072,10 @@ async fn resume_target_for_session(
     id: &str,
 ) -> Option<ResumeTarget> {
     let instances = service.instances.read().await;
-    // Filter the same triage states the reconciler skips everywhere else.
-    // This runs without `instance_lock` held, so an archive or snooze can
-    // win the race after dormancy was cleared; resolving to None (then
-    // NotFound) keeps us from respawning a session the reconciler
-    // intentionally leaves sunk. See #1748.
-    let inst = instances.iter().find(|i| {
-        i.id == id
-            && i.is_structured()
-            && !i.is_archived()
-            && !i.is_snoozed()
-            && !i.is_trashed()
-            && !i.is_idle_dormant()
-    })?;
+    // Recheck eligibility after prompt wake clears dormancy.
+    let inst = instances
+        .iter()
+        .find(|i| i.id == id && accepts_runtime_work(i) && !i.is_idle_dormant())?;
     Some(ResumeTarget {
         id: inst.id.clone(),
         tool: inst.tool.clone(),
@@ -2173,64 +2141,60 @@ pub(crate) async fn trigger_resume_background(
         drop(reservation);
         return Ok(ResumeTrigger::NotFound);
     };
-    let service = Arc::clone(service);
-    crate::task_util::spawn_supervised(
-        "acp.prompt_wake_resume",
-        crate::task_util::PanicPolicy::Log,
-        async move {
-            // A worker that died mid-turn left the log without a terminal;
-            // close it the way the reconciler's restart path does before a
-            // new prompt is published over it (#3686).
-            let store = Arc::clone(&service.acp_event_store);
-            let id_probe = target.id.clone();
-            let in_flight_turn =
-                tokio::task::spawn_blocking(move || store.has_in_flight_turn(&id_probe))
+    let resume_service = Arc::clone(service);
+    service.work.spawn("acp.prompt_wake_resume", async move {
+        let service = resume_service;
+        // A worker that died mid-turn left the log without a terminal;
+        // close it the way the reconciler's restart path does before a
+        // new prompt is published over it (#3686).
+        let store = Arc::clone(&service.acp_event_store);
+        let id_probe = target.id.clone();
+        let in_flight_turn =
+            tokio::task::spawn_blocking(move || store.has_in_flight_turn(&id_probe))
+                .await
+                .unwrap_or(false);
+        if in_flight_turn {
+            service
+                .acp_supervisor
+                .synthesize_stopped_for_orphan(&target.id, "orphaned_at_restart");
+        }
+        let req = match build_spawn_request(&service, &target).await {
+            // Sandbox failure already published a startup error; the
+            // reservation drops here and wakes any parked send_prompt.
+            Ok(req) => req,
+            Err(()) => return,
+        };
+        let agent = req.agent.clone();
+        if let Err(e) = service.acp_supervisor.spawn_inner(req, reservation).await {
+            // AlreadyRunning / SpawnCancelled are benign: a worker
+            // already exists or the session was intentionally torn
+            // down mid-handshake. Only surface real startup failures.
+            if !matches!(
+                e,
+                crate::acp::supervisor::SupervisorError::AlreadyRunning(_)
+                    | crate::acp::supervisor::SupervisorError::SpawnCancelled(_)
+            ) {
+                let still_present = service
+                    .instances
+                    .read()
                     .await
-                    .unwrap_or(false);
-            if in_flight_turn {
-                service
-                    .acp_supervisor
-                    .synthesize_stopped_for_orphan(&target.id, "orphaned_at_restart");
-            }
-            let req = match build_spawn_request(&service, &target).await {
-                // Sandbox failure already published a startup error; the
-                // reservation drops here and wakes any parked send_prompt.
-                Ok(req) => req,
-                Err(()) => return,
-            };
-            let agent = req.agent.clone();
-            if let Err(e) = service.acp_supervisor.spawn_inner(req, reservation).await {
-                // AlreadyRunning / SpawnCancelled are benign: a worker
-                // already exists or the session was intentionally torn
-                // down mid-handshake. Only surface real startup failures.
-                if !matches!(
-                    e,
-                    crate::acp::supervisor::SupervisorError::AlreadyRunning(_)
-                        | crate::acp::supervisor::SupervisorError::SpawnCancelled(_)
-                ) {
-                    let still_present = service
-                        .instances
-                        .read()
-                        .await
-                        .iter()
-                        .any(|i| i.id == target.id);
-                    if still_present {
-                        let message =
-                            format!("Failed to start structured view agent {agent:?}: {e}");
-                        tracing::warn!(
-                            target: "acp.supervisor",
-                            session = %target.id,
-                            agent = %agent,
-                            "prompt-wake spawn failed: {message}"
-                        );
-                        service
-                            .acp_supervisor
-                            .publish_startup_error(&target.id, message);
-                    }
+                    .iter()
+                    .any(|i| i.id == target.id);
+                if still_present {
+                    let message = format!("Failed to start structured view agent {agent:?}: {e}");
+                    tracing::warn!(
+                        target: "acp.supervisor",
+                        session = %target.id,
+                        agent = %agent,
+                        "prompt-wake spawn failed: {message}"
+                    );
+                    service
+                        .acp_supervisor
+                        .publish_startup_error(&target.id, message);
                 }
             }
-        },
-    );
+        }
+    });
     Ok(ResumeTrigger::Started)
 }
 
@@ -2294,21 +2258,15 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
             pid = record.pid,
             "sweeping orphan worker (no matching session on disk)"
         );
-        // Group-kill with SIGKILL escalation, not a single-pid SIGTERM: the
-        // orphan's node wrapper and `claude` grandchild share the runner's
-        // process group, and a bare SIGTERM to just the leader pid can
-        // leave them alive under PID 1 (part of the leak this fixes). The
-        // escalation runs detached so one stubborn orphan can't stall the
-        // sweep for the grace window. If the daemon exits within the 2s
-        // grace the spawned task is dropped before its SIGKILL fires, so a
-        // grandchild that ignored the SIGTERM survives with only that
-        // signal; the next daemon boot re-sweeps it, so this is acceptable.
-        // See #1921.
+        // Finish group escalation even if shutdown starts during its grace period.
         #[cfg(unix)]
-        tokio::spawn(crate::process::worker::reap_group_escalating(
-            record.pid,
-            std::time::Duration::from_secs(2),
-        ));
+        state.runtime.work.spawn(
+            "acp.orphan_reap",
+            crate::process::worker::reap_group_escalating(
+                record.pid,
+                std::time::Duration::from_secs(2),
+            ),
+        );
         crate::process::worker_registry::delete(&record.session_id).ok();
     }
 }
@@ -2943,9 +2901,6 @@ mod tests {
         inst.agent_name = Some("aoe-no-such-agent-1027".to_string());
         inst
     }
-
-    /// Isolate HOME so the worker registry (and thus the reconciler's orphan
-    /// sweep / capacity count) can't see the developer's real dev-mode
     /// entries. The returned guard owns environment restoration.
     async fn capacity_test_state(
         id: &str,
@@ -3268,29 +3223,38 @@ mod tests {
             yolo_mode: false,
             command: String::new(),
         };
-        {
-            let mut instances = state.instances.write().await;
-            instances
-                .iter_mut()
-                .find(|i| i.id == "s-archived-late")
-                .unwrap()
-                .archive();
+        for transition in ["archive", "purge", "deleting"] {
+            {
+                let mut instances = state.instances.write().await;
+                let row = instances.iter_mut().find(|i| i.id == target.id).unwrap();
+                row.archived_at = None;
+                row.lifecycle_reservation = None;
+                row.status = crate::session::Status::Idle;
+                match transition {
+                    "archive" => row.archive(),
+                    "purge" => {
+                        row.try_acquire_lifecycle_reservation(
+                            crate::session::LifecycleOperation::Purge,
+                            crate::session::Instance::LIFECYCLE_RESERVATION_TTL,
+                            chrono::Utc::now(),
+                        )
+                        .unwrap();
+                    }
+                    _ => row.status = crate::session::Status::Deleting,
+                }
+            }
+            let outcome = super::resume_one(Arc::clone(&state), target.clone()).await;
+            assert!(matches!(outcome, super::ResumeOutcome::SpawnFinished));
+            assert_eq!(
+                state.acp_supervisor.worker_state(&target.id).await,
+                crate::daemon::AcpWorkerState::Absent,
+                "{transition}: lease must be released"
+            );
+            assert!(
+                state.acp_event_store.replay_from(&target.id, 0).is_empty(),
+                "{transition}: an ineligible session must not reach spawn"
+            );
         }
-
-        let outcome = super::resume_one(Arc::clone(&state), target).await;
-        assert!(matches!(outcome, super::ResumeOutcome::SpawnFinished));
-        assert_eq!(
-            state.acp_supervisor.worker_state("s-archived-late").await,
-            crate::daemon::AcpWorkerState::Absent,
-            "the lease is released without a spawn"
-        );
-        assert!(
-            state
-                .acp_event_store
-                .replay_from("s-archived-late", 0)
-                .is_empty(),
-            "an archived session must not reach the spawn path"
-        );
     }
 
     /// The other half: with no marker, an id in `attempted` stays skipped.

@@ -1486,9 +1486,11 @@ fn validate_breadcrumb(
         if header_id.as_deref() != Some(session_id.as_str())
             || header_cwd
                 .as_deref()
-                .map(super::canonicalize_or_raw)
+                .map(crate::session::path_identity::canonicalize_or_raw)
                 .as_ref()
-                != Some(&super::canonicalize_or_raw(breadcrumb.cwd))
+                != Some(&crate::session::path_identity::canonicalize_or_raw(
+                    breadcrumb.cwd,
+                ))
         {
             anyhow::bail!("OMP session header does not match its terminal breadcrumb");
         }

@@ -28,7 +28,8 @@ use super::{
     apply_ws_message, drain_plugin_toast, handle_terminal_event, render, set_toast, setup_view,
     PluginPoll, ViewSetup,
 };
-use crate::acp::client::{DaemonEndpoint, WsError, WsMessage};
+use crate::acp::client::{DaemonEndpoint, WsMessage};
+use crate::daemon::WsError;
 use crate::tui::styles::Theme;
 
 /// One event surfaced by [`EmbeddedView::next_event`], applied by

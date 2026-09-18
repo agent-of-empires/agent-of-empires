@@ -83,7 +83,7 @@ impl HomeView {
     /// header, and that header is not a synthetic one (the Archived/Trash
     /// shelves or the scratch bucket, none of which have a backing repo to pin).
     pub(in crate::tui) fn project_group_at_cursor(&self) -> Option<String> {
-        if self.group_by != GroupByMode::Project {
+        if self.effective_group_by() != GroupByMode::Project {
             return None;
         }
         match self.flat_items.get(self.cursor) {

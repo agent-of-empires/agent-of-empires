@@ -114,6 +114,31 @@ Switching to a different agent session and pressing the same hotkey
 opens a **separate** tool session against that worktree, with its own
 independent state.
 
+Creating or recovering a tool uses the current session and configured
+command. Launch is refused while the session is trashed, being created
+or deleted, or reserved by another lifecycle operation.
+
+Native integrations can call `POST /api/sessions/{id}/tools/ensure` with
+`{"tool_name":"lazygit","size":{"cols":120,"rows":40}}`; size is optional.
+The daemon resolves the command and working directory, and rejects client
+command or directory fields. The response contains `tmux_session` and the
+runtime cursor headers. Before attaching, clients must apply a snapshot in
+the same epoch at that revision or later, require an alive auxiliary observation
+whose `tmux_session` matches the returned target, and recheck their current
+same-host native interaction grant.
+
+Attachment preparation does not block TUI navigation. Leaving the session,
+view or profile, opening an overlay, or pressing Escape cancels the pending
+handoff. A cancelled attachment does not become active when preparation ends.
+
+The daemon reports each tool as alive, dead, absent, or unknown. Unknown
+means ownership or liveness could not be established; targeted launch,
+recovery, and stop requests are refused rather than guessing an owner.
+New tool panes record their full session ID and configured tool name in
+tmux. Panes created by older versions without this identity must be closed
+manually before AoE can recreate them. Renaming a session does not transfer
+ownership to another tool whose generated name happens to match.
+
 Tool sessions are automatically killed when their parent agent session
 is removed (`aoe remove <id>`, "Remove session" in the TUI, or delete
 in the web dashboard). Cleanup sweeps all of the agent's tool sessions
@@ -197,6 +222,6 @@ tool preview.
 ## tmux session naming
 
 Tool sessions are named `aoe_tool_<tool>_<title>_<id8>` (`aoe_dev_tool_` in debug builds; `<id8>` is the
-first 8 characters of the agent session ID). You can attach manually
-with `tmux attach -t <name>`, though AoE's three access paths are
-faster.
+first 8 characters of the agent session ID). For a manual attachment, use
+`tmux attach -t "=<name>:"` so a missing name cannot match another session's
+prefix. Use AoE's tmux socket with `-S <socket>` when it differs from the default.

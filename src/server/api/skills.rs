@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::AppState;
-use crate::server::auth::{handler_elevated, AuthenticatedSession, LoopbackTrusted};
+use crate::server::auth::{handler_elevated, AuthenticatedSession, LocalAuthorization};
 use crate::session::skills_model::{self, SkillError, SkillProvenance};
 
 fn error_response(status: StatusCode, code: &str, message: String) -> Response {
@@ -48,7 +48,7 @@ fn task_error(error: tokio::task::JoinError) -> Response {
 async fn mutation_gate(
     state: &AppState,
     session: Option<&AuthenticatedSession>,
-    loopback_trusted: bool,
+    local: Option<&LocalAuthorization>,
 ) -> Result<(), Response> {
     if state.read_only {
         return Err(super::read_only_response());
@@ -56,7 +56,7 @@ async fn mutation_gate(
     if let Some(response) = super::cityhall_block(state) {
         return Err(response);
     }
-    if !handler_elevated(state, session, loopback_trusted).await {
+    if !handler_elevated(state, session, local).await {
         return Err(error_response(
             StatusCode::FORBIDDEN,
             "elevation_required",
@@ -78,8 +78,8 @@ impl FromRequestParts<std::sync::Arc<AppState>> for SkillMutationGuard {
         state: &std::sync::Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
         let session = parts.extensions.get::<AuthenticatedSession>();
-        let loopback_trusted = parts.extensions.get::<LoopbackTrusted>().is_some();
-        mutation_gate(state, session, loopback_trusted).await?;
+        let local = parts.extensions.get::<LocalAuthorization>();
+        mutation_gate(state, session, local).await?;
         Ok(Self)
     }
 }

@@ -3,6 +3,422 @@
 use serde::{Deserialize, Serialize};
 
 use crate::session::SessionScope;
+
+/// One repository's branch base in a creation request.
+#[derive(Serialize, Deserialize)]
+pub struct RepoBaseInput {
+    pub repo: String,
+    pub base_branch: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct CreationTrustRequest {
+    pub path: String,
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub scratch: bool,
+}
+
+/// Captured configuration, rechecked before approval or provisioning.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreationTrustFingerprint {
+    pub project_path: String,
+    pub base_hooks_hash: String,
+    pub hooks_hash: Option<String>,
+    pub mcp_hash: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CreationTrustReview {
+    pub fingerprint: CreationTrustFingerprint,
+    pub merged_hooks: crate::session::HooksConfig,
+    pub repo_hooks: crate::session::HooksConfig,
+    pub mcp_summaries: Vec<String>,
+    pub hooks_need_trust: bool,
+    pub mcp_need_trust: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct CreateSessionBody {
+    pub title: Option<String>,
+    pub size: Option<TerminalSize>,
+    pub path: String,
+    pub tool: String,
+    #[serde(default)]
+    pub group: String,
+    #[serde(default)]
+    pub yolo_mode: bool,
+    /// An explicit branch also opts into worktree creation.
+    #[serde(default)]
+    pub worktree_enabled: bool,
+    pub worktree_branch: Option<String>,
+    #[serde(default)]
+    pub create_new_branch: bool,
+    /// Used only for new branches; empty selects the repository default.
+    #[serde(default)]
+    pub base_branch: Option<String>,
+    #[serde(default)]
+    pub sandbox: bool,
+    #[serde(default)]
+    pub extra_args: String,
+    #[serde(default)]
+    pub sandbox_image: Option<String>,
+    #[serde(default)]
+    pub extra_env: Vec<String>,
+    #[serde(default)]
+    pub extra_repo_paths: Vec<String>,
+    /// Repository names or paths override the shared base_branch.
+    #[serde(default)]
+    pub repo_bases: Vec<RepoBaseInput>,
+    #[serde(default)]
+    pub command_override: String,
+    #[serde(default)]
+    pub custom_instruction: Option<String>,
+    pub profile: Option<String>,
+    /// Structured view requires an ACP-capable agent.
+    #[serde(default)]
+    pub view: crate::session::View,
+    #[serde(default)]
+    pub agent_name: Option<String>,
+    #[serde(default)]
+    pub agent_model: Option<String>,
+    #[serde(default)]
+    pub agent_effort: Option<String>,
+    /// Provision a scratch directory instead of path; excludes worktrees and extra repos.
+    #[serde(default)]
+    pub scratch: bool,
+    /// Omit to refuse unapproved hooks, false to skip untrusted hooks/MCP, true to approve.
+    /// Skipping preserves already-trusted repository hooks and MCP.
+    #[serde(default)]
+    pub trust_hooks: Option<bool>,
+    /// Require the reviewed configuration to remain unchanged before provisioning.
+    #[serde(default)]
+    pub trust_review: Option<CreationTrustFingerprint>,
+    /// Resume a Claude conversation through ACP; path must be its original cwd.
+    #[serde(default)]
+    pub import_acp_session_id: Option<String>,
+    /// Provider conversation ID to fork, mutually exclusive with other sources.
+    #[serde(default)]
+    pub fork_from: Option<String>,
+    /// Canonical AoE row to fork without supplying its provider conversation ID.
+    #[serde(default)]
+    pub fork_session_id: Option<String>,
+    /// Completion callback; private and loopback destinations are refused.
+    #[serde(default)]
+    pub callback_url: Option<String>,
+    /// Persisted replay key, retained until the created row is hard-deleted.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+}
+
+/// Persisted group identity; empty paths and synthetic sidebar sections are invalid.
+#[derive(Serialize, Deserialize)]
+pub struct GroupLocation {
+    pub profile: String,
+    pub path: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct MoveGroupBody {
+    pub source: GroupLocation,
+    pub target: GroupLocation,
+}
+#[derive(Serialize, Deserialize)]
+pub struct CollapseGroupBody {
+    pub group: GroupLocation,
+    pub collapsed: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeleteGroupMode {
+    EmptyOnly,
+    KeepSessions,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct DeleteGroupBody {
+    pub group: GroupLocation,
+    pub mode: DeleteGroupMode,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct GroupSessionOutcome {
+    pub id: String,
+    #[serde(flatten)]
+    pub outcome: PurgeOutcome,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct DeleteGroupOutcome {
+    pub sessions: Vec<GroupSessionOutcome>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct CreateProfileBody {
+    pub name: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct RenameProfileBody {
+    pub new_name: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct DefaultProfileBody {
+    pub name: String,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+pub struct DeleteProfileQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_default: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct CreateProjectBody {
+    /// Profile placement or cross-scope conflict-check context, even for global writes.
+    pub profile: String,
+    pub scope: crate::session::ProjectScope,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub allow_override: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_base_branch: Option<String>,
+    #[serde(default)]
+    pub pinned: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct TerminalSize {
+    pub cols: std::num::NonZeroU16,
+    pub rows: std::num::NonZeroU16,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+pub struct StartSessionBody {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<TerminalSize>,
+}
+
+/// Explicit relaunch; omitted launch settings preserve the authoritative values.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestartSessionBody {
+    pub size: Option<TerminalSize>,
+    pub profile: Option<String>,
+    pub tool: Option<String>,
+    pub command_override: Option<String>,
+    pub extra_args: Option<String>,
+    #[serde(default)]
+    pub unsnooze: bool,
+    #[serde(default)]
+    pub skip_on_launch: bool,
+    #[serde(default)]
+    pub bound_hooks: bool,
+    #[serde(default)]
+    pub discard_sandbox_container: bool,
+    pub wake_message: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct RestartOutcome {
+    pub lifecycle_generation: u64,
+    pub profile: String,
+    pub target: Option<TerminalTarget>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnsureToolBody {
+    pub tool_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<TerminalSize>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TerminalTargetStatus {
+    Created,
+    Exists,
+    Alive,
+    Restarted,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct TerminalTarget {
+    pub tmux_session: String,
+    pub status: TerminalTargetStatus,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct UpdateArchiveBody {
+    pub archived: bool,
+    /// False preserves tmux panes, not structured workers. Ignored on unarchive.
+    #[serde(default = "default_kill_pane")]
+    pub kill_pane: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct TrashSessionBody {
+    /// False preserves tmux panes, not structured workers.
+    #[serde(default = "default_kill_pane")]
+    pub kill_pane: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TrashOutcome {
+    pub relocation: TrashRelocationOutcome,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum TrashRelocationOutcome {
+    Skipped,
+    Relocated,
+    Failed { reason: String },
+}
+
+fn default_kill_pane() -> bool {
+    true
+}
+
+impl Default for TrashSessionBody {
+    fn default() -> Self {
+        Self {
+            kill_pane: default_kill_pane(),
+        }
+    }
+}
+
+#[derive(Default, Clone, Serialize, Deserialize)]
+pub struct DeleteSessionBody {
+    #[serde(default)]
+    pub delete_worktree: bool,
+    #[serde(default)]
+    pub delete_branch: bool,
+    #[serde(default)]
+    pub delete_sandbox: bool,
+    #[serde(default)]
+    pub force_delete: bool,
+    /// Retain the scratch directory while removing its session row.
+    #[serde(default)]
+    pub keep_scratch: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct AbandonPurgeBody {
+    pub expected_generation: std::num::NonZeroU64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum PurgeOutcome {
+    Deleted {
+        messages: Vec<String>,
+        cleanup_errors: Vec<String>,
+    },
+    Kept {
+        messages: Vec<String>,
+        teardown_started: bool,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct UpdatePinBody {
+    pub pinned: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct UpdateFavoriteBody {
+    pub favorited: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct UpdateColorBody {
+    /// A palette color, or null to clear the label.
+    #[serde(default)]
+    pub color: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct UpdateSnoozeBody {
+    /// Positive minutes within the shared snooze bounds, or null to unsnooze.
+    #[serde(default)]
+    pub minutes: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct UpdateUnreadBody {
+    pub unread: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct UpdateGroupBody {
+    /// Empty means ungrouped; nonempty paths create an implicit group.
+    pub group: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct UpdateDiffBaseBody {
+    /// Null or an empty branch restores the inherited diff base.
+    #[serde(default)]
+    pub base_branch: Option<String>,
+    /// Required for a workspace; absent for a single-repo session.
+    #[serde(default)]
+    pub repo: Option<String>,
+}
+
+/// Missing fields preserve overrides; null restores inherited defaults.
+#[derive(Serialize, Deserialize, Default)]
+pub struct UpdateNotificationsBody {
+    #[serde(
+        default,
+        deserialize_with = "deserialize_tristate",
+        skip_serializing_if = "Tristate::is_unset"
+    )]
+    pub notify_on_waiting: Tristate,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_tristate",
+        skip_serializing_if = "Tristate::is_unset"
+    )]
+    pub notify_on_idle: Tristate,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_tristate",
+        skip_serializing_if = "Tristate::is_unset"
+    )]
+    pub notify_on_error: Tristate,
+}
+
+#[derive(Serialize, Default, Copy, Clone)]
+#[serde(untagged)]
+pub enum Tristate {
+    #[default]
+    Unset,
+    Clear,
+    Set(bool),
+}
+
+impl Tristate {
+    fn is_unset(&self) -> bool {
+        matches!(self, Self::Unset)
+    }
+}
+
+fn deserialize_tristate<'de, D>(deserializer: D) -> Result<Tristate, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match Option::<bool>::deserialize(deserializer)? {
+        None => Tristate::Clear,
+        Some(value) => Tristate::Set(value),
+    })
+}
+
 /// Which ACP `ContentBlock` an attachment maps to. The string form
 /// (`"image"` / `"audio"` / `"resource"`) is the wire contract shared
 /// with the web composer and the prompt-request DTO in `protocol.rs`,
@@ -163,14 +579,8 @@ pub struct PendingApproval {
     pub choice: bool,
 }
 
-/// One session as `GET /api/sessions` reports it.
-///
-/// Decoding requires only `id`: every other field defaults when absent, so an
-/// older daemon that predates a field cannot fail the whole parse and blank a
-/// client's list. `id` identifies the row, so a row without one is unusable
-/// rather than degraded, and no daemon version omits it. Serialization is
-/// unaffected; the JSON the daemon emits is unchanged.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One session from the daemon. Only `id` is required when decoding.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionResponse {
     pub id: String,
     #[serde(default)]
@@ -187,7 +597,15 @@ pub struct SessionResponse {
     #[serde(default)]
     pub tool: String,
     #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub extra_args: String,
+    #[serde(default)]
     pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_reservation: Option<crate::session::LifecycleReservation>,
+    #[serde(default)]
+    pub lifecycle_generation: u64,
     /// True when the session's structured-view worker was auto-stopped for
     /// inactivity (resumable/dormant), as opposed to a deliberate Stop. Lets
     /// the dashboard render a distinct dormant dot instead of a live-idle one.
@@ -195,6 +613,14 @@ pub struct SessionResponse {
     /// See #2250.
     #[serde(default)]
     pub dormant: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_dormant_since: Option<String>,
+    #[serde(default)]
+    pub pane_dead_observed: bool,
+    #[serde(default)]
+    pub agent_pane: crate::session::PaneObservation,
+    #[serde(default)]
+    pub auxiliary: Vec<crate::session::AuxiliaryObservation>,
     #[serde(default)]
     pub yolo_mode: bool,
     #[serde(default)]
@@ -213,6 +639,8 @@ pub struct SessionResponse {
     /// or those that took the repo's default branch. See #948.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_created_at: Option<String>,
     /// Per-session override for the diff base, set via the web "vs &lt;ref&gt;"
     /// picker, the TUI diff view's `b` keybind, or
     /// `aoe session set-base`. Wins over `base_branch`, the profile
@@ -221,6 +649,8 @@ pub struct SessionResponse {
     pub base_branch_override: Option<String>,
     #[serde(default)]
     pub is_sandboxed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_container_name: Option<String>,
     /// True when the session was created with `--scratch`; the
     /// `project_path` points at an auto-provisioned directory under
     /// `<app_dir>/scratch/<id>/` that the deletion path removes. The web
@@ -233,6 +663,8 @@ pub struct SessionResponse {
     /// the predicate. Cross-feature parity with the TUI's `f`/`F` keybind.
     #[serde(default)]
     pub favorited: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub favorited_at: Option<String>,
     /// Per-session color label (`red` / `amber` / `green`), or omitted when
     /// unset. Rendered as a colored status dot in the web sidebar; set via the
     /// sidebar context menu or `aoe session color`. See #2383.
@@ -440,6 +872,14 @@ pub struct SessionResponse {
     /// not need to display.
     #[serde(default)]
     pub workspace_repos: Vec<WorkspaceRepoSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_cleanup_on_delete: Option<bool>,
     /// Non-fatal warnings surfaced by a mutation response. On create these are
     /// worktree-creation warnings (e.g. post-checkout hook failures where the
     /// worktree was still created successfully). On rename these carry the
@@ -481,7 +921,7 @@ pub struct SessionResponse {
     pub monitor_description: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct PlanSummary {
     /// First non-completed step's title, truncated to ~80 chars so the
     /// sidebar row doesn't overflow.
@@ -492,14 +932,26 @@ pub struct PlanSummary {
     pub total: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkspaceRepoSummary {
     pub name: String,
     pub source_path: String,
     pub branch: String,
+    #[serde(default)]
+    pub worktree_path: String,
+    #[serde(default)]
+    pub main_repo_path: String,
+    #[serde(default)]
+    pub managed_by_aoe: bool,
+    #[serde(default)]
+    pub branch_preexisting: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch_override: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct CleanupDefaults {
     pub delete_worktree: bool,
     pub delete_branch: bool,
@@ -515,7 +967,7 @@ pub struct CleanupDefaults {
 // sidebar in the requested order on the first paint, with no extra
 // round-trip. The order is a list of workspace ids; ids not present
 // fall back to the client's default newest-first ordering. See #1169.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionsEnvelope {
     pub sessions: Vec<SessionResponse>,
     #[serde(default)]

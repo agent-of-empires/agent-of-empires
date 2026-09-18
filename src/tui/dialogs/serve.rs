@@ -1,10 +1,8 @@
-//! Serve dialog: drives the `aoe serve --daemon` lifecycle (either Local
-//! network mode on 0.0.0.0, or Cloudflare Tunnel mode) and shows a QR +
-//! URL + (passphrase for Tunnel) + log tail so a phone can connect. The
-//! TUI is a controller here, not a host: it spawns the daemon, reads
-//! `$APP_DIR/serve.{pid,url,log,mode}` files, and runs `aoe serve --stop`
-//! to tear down. The daemon survives across TUI quits, just like tmux
-//! sessions or the CLI-invoked daemon path.
+//! Serve dialog: chooses how far the local daemon is exposed. The daemon
+//! always runs on this machine with at least a localhost listener; this view
+//! switches between Localhost, Local network (0.0.0.0) and an HTTPS tunnel by
+//! replacing it under the lifecycle transaction, and shows the QR, URL and
+//! client command for exposed modes. It never turns the daemon off.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -12,10 +10,10 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent};
 use rand::prelude::IndexedRandom;
-use rand::RngExt;
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
+use crate::cli::serve::{Exposure, ExposureRequest};
 use crate::tui::styles::Theme;
 
 /// Actions returned by [`ServeView::handle_key`], following the
@@ -27,17 +25,7 @@ pub enum ServeAction {
     Close,
 }
 
-/// Which transport the daemon is serving over. Persisted to
-/// `$APP_DIR/serve.mode` so a reattaching TUI can render the right label
-/// and the right set of controls (Tab to cycle is Local-only).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ServeMode {
-    Local,
-    Tunnel,
-}
-
 /// Which HTTPS tunnel backend the user picked on the Confirm screen.
-/// Tunnel mode always has one of these; Local mode doesn't use them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TunnelTransport {
     Tailscale,
@@ -64,31 +52,31 @@ impl TransportStatus {
     }
 }
 
-impl ServeMode {
-    fn file_token(self) -> &'static str {
-        match self {
-            ServeMode::Local => "local",
-            ServeMode::Tunnel => "tunnel",
-        }
-    }
+const EXPOSURES: [Exposure; 3] = [Exposure::Localhost, Exposure::Network, Exposure::Tunnel];
 
-    fn from_file_token(s: &str) -> Option<Self> {
-        match s.trim() {
-            "local" => Some(ServeMode::Local),
-            "tunnel" => Some(ServeMode::Tunnel),
-            _ => None,
-        }
+fn exposure_label(exposure: Exposure) -> &'static str {
+    match exposure {
+        Exposure::Localhost => "Localhost only",
+        Exposure::Network => "Local network",
+        Exposure::Tunnel => "Internet (HTTPS)",
+    }
+}
+
+/// Transport of a running tunnel, from the mode the daemon recorded.
+fn running_transport() -> TunnelTransport {
+    let mode = crate::session::get_app_dir()
+        .ok()
+        .and_then(|dir| std::fs::read_to_string(dir.join("serve.mode")).ok());
+    match mode.as_deref().map(str::trim) {
+        Some("tunnel") => TunnelTransport::Cloudflare,
+        _ => TunnelTransport::Tailscale,
     }
 }
 
 pub use crate::cli::serve::{read_serve_urls, ServeUrl};
 
-/// Passphrase cache for daemons this TUI process spawned, so reopening
-/// the Remote Access dialog after closing it can re-display the same
-/// passphrase instead of the "set at startup" placeholder. Cleared when
-/// the daemon is stopped from this process. A daemon spawned by a
-/// separate `aoe serve` invocation (outside this TUI) leaves this None,
-/// so we correctly fall back to the placeholder for those.
+/// Passphrase of the tunnel this TUI process started, so reopening the
+/// dialog re-displays it instead of the "set at startup" placeholder.
 static LAST_SPAWNED_PASSPHRASE: Mutex<Option<String>> = Mutex::new(None);
 
 fn remember_passphrase(pp: &str) {
@@ -121,16 +109,6 @@ fn recall_passphrase() -> Option<String> {
     } else {
         tracing::debug!(target: "tui.dialog", "passphrase recalled from serve.passphrase on disk");
         Some(trimmed.to_string())
-    }
-}
-
-fn forget_passphrase() {
-    forget_passphrase_in_memory();
-    // Only remove the ephemeral file. The durable saved_passphrase
-    // intentionally survives stop/start so the same passphrase can
-    // be reused on the next launch.
-    if let Ok(dir) = crate::session::get_app_dir() {
-        let _ = std::fs::remove_file(dir.join("serve.passphrase"));
     }
 }
 
@@ -183,80 +161,54 @@ fn load_or_generate_passphrase() -> String {
     pp
 }
 
-fn forget_passphrase_in_memory() {
-    if let Ok(mut guard) = LAST_SPAWNED_PASSPHRASE.lock() {
-        *guard = None;
-    }
-}
-
-/// How long we wait for `serve.url` to appear after spawning the daemon.
-const TUNNEL_STARTUP_TIMEOUT_SECS: u64 = 60;
-/// How much of the configured log file to keep in memory for the tail pane.
+/// How long an exposed daemon may take to publish its URL after it is ready.
+const URL_PUBLISH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Log lines kept for a failure report.
 const LOG_TAIL_LINES: usize = 200;
+/// How long a transient flash stays up.
+const FLASH_TTL: Duration = Duration::from_millis(1500);
 
 pub enum ServeViewState {
-    /// No daemon running; first screen the user sees. They pick Local
-    /// (bind 0.0.0.0, token auth only) or Tunnel (cloudflared + passphrase).
-    /// `tunnel_available` gates the Tunnel card; `local_available`
-    /// is false when the host has no non-loopback interface (dockerized
-    /// dev env with only lo).
-    ModePicker {
-        selected: ServeMode,
-        /// Either tailscale OR cloudflared is available. Gate for the
-        /// Tunnel card; actual transport choice happens on Confirm.
+    /// Where the running daemon is reachable, and the exposure to switch to.
+    Picker {
+        selected: Exposure,
+        /// `None` while no daemon answers (the TUI is reconnecting).
+        current: Option<Exposure>,
+        /// Localhost URL, when the daemon published one.
+        local_url: Option<String>,
+        /// Either tailscale OR cloudflared is available.
         tunnel_available: bool,
-        local_available: bool,
-        /// Transient flash message shown for ~1s after a rejected keypress
-        /// (e.g., picking Tunnel when no tunnel tool is installed).
+        /// First non-loopback interface, when there is one.
+        network_address: Option<String>,
         flash: Option<(String, Instant)>,
     },
-    /// Tunnel-only: risk explanation AND transport picker on one screen.
-    /// User sees security implications + chooses Tailscale vs Cloudflare
-    /// with up-front readiness info, no mid-spawn surprises. Local mode
-    /// never enters Confirm — it goes ModePicker → Starting directly.
+    /// Tunnel-only: risk explanation and transport picker on one screen.
     Confirm {
-        /// Which transport card is currently highlighted.
         selected: TunnelTransport,
-        /// Readiness when opened; refreshable via `[R]`.
         tailscale: TransportStatus,
         cloudflare: TransportStatus,
-        /// Transient message (e.g. "opened admin console").
         flash: Option<(String, Instant)>,
     },
-    /// We issued `aoe serve --daemon`; now polling `serve.url`.
-    /// `passphrase` is Some only for Tunnel spawns from this TUI.
-    /// `log_tail` is a rolling window of the configured log file (since the
-    /// captured offset taken before spawn) so the user sees real progress
-    /// during the 30-60s cert-provisioning wait on a fresh Tailscale node
-    /// instead of a frozen screen.
-    Starting {
-        mode: ServeMode,
-        /// Remembered for restart. None for Local mode or external daemons.
+    /// The daemon is being replaced with the `target` exposure.
+    Applying {
+        target: Exposure,
         transport: Option<TunnelTransport>,
         passphrase: Option<String>,
         started_at: Instant,
-        log_tail: Vec<String>,
-        log_offset: u64,
+        /// `None` once the replacement reported success.
+        result: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
+        ready_at: Option<Instant>,
     },
-    /// Daemon is live. No child field — the TUI does not own it.
+    /// The daemon is exposed beyond localhost.
     Active {
-        mode: ServeMode,
-        /// Which tunnel transport was used (remembered from the Confirm
-        /// screen so we can pass it to restart). None for Local mode or
-        /// daemons started externally.
+        mode: Exposure,
         transport: Option<TunnelTransport>,
         urls: Vec<ServeUrl>,
-        /// Which `urls` entry is the primary QR target. Starts at 0.
-        /// Tab advances; cycles; no-op when urls.len() <= 1.
+        /// Which `urls` entry is the primary QR target; Tab cycles.
         url_index: usize,
-        /// Only known when this TUI started the daemon. For daemons
-        /// started via the CLI we show a "set at startup" placeholder.
-        /// Always None for Local mode.
+        /// Unknown for a tunnel started outside this TUI without a saved passphrase.
         passphrase: Option<String>,
         opened_at: Instant,
-        log_tail: Vec<String>,
-        /// Last-seen log-file length so we only read appended bytes.
-        log_offset: u64,
     },
     Error(String),
 }
@@ -272,15 +224,17 @@ enum PendingConfirm {
 
 pub struct ServeView {
     state: ServeViewState,
-    /// Passphrase we will use if the user picks Tunnel and confirms.
-    /// Loaded from `serve.saved_passphrase` if available, otherwise
-    /// freshly generated and saved.
+    /// Passphrase used when the user picks Tunnel. Loaded from
+    /// `serve.saved_passphrase` if available, otherwise generated and saved.
     pending_passphrase: String,
     /// Destructive action awaiting a second keypress to confirm.
-    /// Cleared on any other key or after a timeout rendered in the footer.
     pending_confirm: Option<(PendingConfirm, Instant)>,
-    /// Whether the help overlay is visible.
     show_help: bool,
+    /// Pairing code and devices, while exposed.
+    pairing: Option<super::pairing::PairingPanel>,
+    /// Narrow terminals show the browser/phone section instead of pairing.
+    show_web: bool,
+    flash: Option<(String, Instant)>,
 }
 
 impl Default for ServeView {
@@ -290,91 +244,83 @@ impl Default for ServeView {
 }
 
 impl ServeView {
-    /// Construct the dialog. If a daemon is already running (detected via
-    /// `$APP_DIR/serve.pid`), jump straight to Active so the user can see
-    /// the URL and stop it; otherwise show ModePicker.
+    /// Open on the exposed view when the daemon is reachable beyond
+    /// localhost, otherwise on the exposure picker.
     pub fn new() -> Self {
-        // Use the saved passphrase if one exists, otherwise generate
-        // a fresh one and save it. This ensures the passphrase stays
-        // constant across stop/start cycles.
-        let pending = load_or_generate_passphrase();
-
-        if crate::cli::serve::daemon_pid().is_some() {
-            // There's already a daemon running. Read its mode from
-            // serve.mode (written by the server). If missing (older daemon
-            // from pre-mode-split version), assume Tunnel — that was the
-            // only mode the TUI could spawn before.
-            let mode = read_serve_mode().unwrap_or(ServeMode::Tunnel);
-            // Recall the passphrase only for Tunnel (Local has no passphrase).
-            let remembered = if matches!(mode, ServeMode::Tunnel) {
-                recall_passphrase()
-            } else {
-                None
-            };
-            let urls = read_serve_urls();
-            if urls.is_empty() {
-                Self {
-                    state: ServeViewState::Starting {
-                        mode,
-                        transport: None, // unknown for reattached daemons
-                        passphrase: remembered,
-                        started_at: Instant::now(),
-                        log_tail: initial_log_tail(),
-                        log_offset: log_file_size(),
-                    },
-                    pending_passphrase: pending,
-                    pending_confirm: None,
-                    show_help: false,
-                }
-            } else {
-                Self {
-                    state: ServeViewState::Active {
-                        mode,
-                        transport: None, // unknown for reattached daemons
-                        urls,
-                        url_index: 0,
-                        passphrase: remembered,
-                        opened_at: Instant::now(),
-                        log_tail: initial_log_tail(),
-                        log_offset: log_file_size(),
-                    },
-                    pending_passphrase: pending,
-                    pending_confirm: None,
-                    show_help: false,
-                }
-            }
-        } else {
-            // Tunnel mode is usable if EITHER a logged-in Tailscale or
-            // cloudflared is installed. Transport-specific readiness is
-            // re-evaluated when the user reaches the Confirm screen.
-            let tailscale_ok = crate::server::tunnel::tailscale_available_sync();
-            let cloudflared_ok = crate::server::tunnel::check_cloudflared().is_ok();
-            let tunnel_available = tailscale_ok || cloudflared_ok;
-            let local_available = !crate::server::discover_tagged_ips().is_empty();
-            // Default highlight: the last mode the user successfully
-            // launched (read from serve.last_mode). Fall back to Local as
-            // safer first-time default. If Local isn't actually available,
-            // prefer Tunnel (and vice versa for cloudflared-missing).
-            let remembered_default = read_last_mode().unwrap_or(ServeMode::Local);
-            let selected = match remembered_default {
-                ServeMode::Local if local_available => ServeMode::Local,
-                ServeMode::Local if tunnel_available => ServeMode::Tunnel,
-                ServeMode::Tunnel if tunnel_available => ServeMode::Tunnel,
-                ServeMode::Tunnel if local_available => ServeMode::Local,
-                _ => ServeMode::Local, // no-op default when neither works; picker handles it
-            };
-            Self {
-                state: ServeViewState::ModePicker {
-                    selected,
-                    tunnel_available,
-                    local_available,
-                    flash: None,
-                },
-                pending_passphrase: pending,
-                pending_confirm: None,
-                show_help: false,
-            }
+        let mut view = Self {
+            state: ServeViewState::Error(String::new()),
+            pending_passphrase: load_or_generate_passphrase(),
+            pending_confirm: None,
+            show_help: false,
+            pairing: None,
+            show_web: false,
+            flash: None,
+        };
+        match crate::cli::serve::current_exposure() {
+            Some(mode @ (Exposure::Network | Exposure::Tunnel)) => view.show_active(mode),
+            current => view.show_picker(current, None),
         }
+        view
+    }
+
+    fn show_picker(&mut self, current: Option<Exposure>, flash: Option<&str>) {
+        let tunnel_available = crate::server::tunnel::tailscale_available_sync()
+            || crate::server::tunnel::check_cloudflared().is_ok();
+        let network_address =
+            crate::server::discover_tagged_ips()
+                .into_iter()
+                .next()
+                .map(|(kind, ip)| match kind {
+                    crate::server::IpKind::Tailscale => format!("{ip} (Tailscale)"),
+                    crate::server::IpKind::Lan => format!("{ip} (LAN)"),
+                    crate::server::IpKind::Loopback => format!("{ip} (loopback)"),
+                });
+        let local_url = matches!(current, Some(Exposure::Localhost))
+            .then(read_serve_urls)
+            .and_then(|urls| urls.into_iter().next())
+            .map(|url| url.url);
+        self.state = ServeViewState::Picker {
+            selected: current.unwrap_or(Exposure::Localhost),
+            current,
+            local_url,
+            tunnel_available,
+            network_address,
+            flash: flash.map(|message| (message.to_string(), Instant::now())),
+        };
+        self.pending_confirm = None;
+        self.show_help = false;
+        self.pairing = None;
+    }
+
+    fn show_active(&mut self, mode: Exposure) {
+        let transport = matches!(mode, Exposure::Tunnel).then(running_transport);
+        let passphrase = matches!(mode, Exposure::Tunnel)
+            .then(recall_passphrase)
+            .flatten();
+        self.state = ServeViewState::Active {
+            mode,
+            transport,
+            urls: read_serve_urls(),
+            url_index: 0,
+            passphrase,
+            opened_at: Instant::now(),
+        };
+        self.pending_confirm = None;
+        self.show_help = false;
+        self.pairing = Some(super::pairing::PairingPanel::open());
+        self.show_web = false;
+    }
+
+    /// Stop the daemon and start it again on the same exposure, or start one
+    /// on localhost when none answers. Rebuilding the binary leaves the
+    /// running daemon on the old code, so this is how a new build takes over.
+    fn restart(&mut self, mode: Option<Exposure>) {
+        let mode = mode.unwrap_or(Exposure::Localhost);
+        let tunnel = mode == Exposure::Tunnel;
+        let transport = tunnel.then(running_transport);
+        let passphrase =
+            tunnel.then(|| recall_passphrase().unwrap_or_else(|| self.pending_passphrase.clone()));
+        self.apply(mode, transport, passphrase);
     }
 
     /// Probe tunnel readiness on entering Confirm or pressing `[R]`
@@ -395,10 +341,8 @@ impl ServeView {
         (tailscale, cloudflare)
     }
 
-    /// Pick the default-highlighted transport on Confirm: a Ready
-    /// Tailscale beats Cloudflare (stable URL wins by default); else
-    /// fall back to whichever is Ready; else default to Tailscale so
-    /// the user sees the fix instructions (they came here on purpose).
+    /// A Ready Tailscale beats Cloudflare (stable URL); else whichever is
+    /// Ready; else Tailscale so the user sees the fix instructions.
     fn default_transport(
         tailscale: TransportStatus,
         cloudflare: TransportStatus,
@@ -410,133 +354,156 @@ impl ServeView {
         }
     }
 
+    /// Replace the daemon in the background; `tick` follows the result.
+    fn apply(
+        &mut self,
+        target: Exposure,
+        transport: Option<TunnelTransport>,
+        passphrase: Option<String>,
+    ) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            self.state = ServeViewState::Error("No async runtime to change the exposure.".into());
+            return;
+        };
+        let request = match target {
+            Exposure::Tunnel => ExposureRequest::Tunnel {
+                cloudflare: transport == Some(TunnelTransport::Cloudflare),
+                passphrase: passphrase
+                    .clone()
+                    .unwrap_or_else(|| self.pending_passphrase.clone()),
+            },
+            Exposure::Network => ExposureRequest::Network,
+            Exposure::Localhost => ExposureRequest::Localhost,
+        };
+        if let Some(passphrase) = &passphrase {
+            remember_passphrase(passphrase);
+            save_passphrase_to_disk(passphrase);
+        }
+        let (sender, result) = tokio::sync::oneshot::channel();
+        runtime.spawn(async move {
+            let outcome = crate::cli::serve::change_exposure(request)
+                .await
+                .map_err(|error| format!("{error:#}"));
+            let _ = sender.send(outcome);
+        });
+        self.state = ServeViewState::Applying {
+            target,
+            transport,
+            passphrase,
+            started_at: Instant::now(),
+            result: Some(result),
+            ready_at: None,
+        };
+        self.pending_confirm = None;
+        self.show_help = false;
+        self.pairing = None;
+    }
+
+    /// Act on a picked exposure: apply it, or open the tunnel confirmation.
+    fn choose(&mut self, target: Exposure) -> ServeAction {
+        let ServeViewState::Picker {
+            current,
+            tunnel_available,
+            network_address,
+            flash,
+            ..
+        } = &mut self.state
+        else {
+            return ServeAction::Continue;
+        };
+        let refusal = match target {
+            _ if *current == Some(target) && target == Exposure::Localhost => {
+                Some("Already reachable from this machine only.")
+            }
+            Exposure::Network if network_address.is_none() => {
+                Some("No non-loopback network interface available.")
+            }
+            Exposure::Tunnel if !*tunnel_available => {
+                Some("Install tailscale or cloudflared to enable Tunnel mode.")
+            }
+            _ => None,
+        };
+        if let Some(message) = refusal {
+            *flash = Some((message.to_string(), Instant::now()));
+            return ServeAction::Continue;
+        }
+        if *current == Some(target) {
+            self.show_active(target);
+            return ServeAction::Continue;
+        }
+        match target {
+            Exposure::Tunnel => {
+                let (tailscale, cloudflare) = Self::assess_transports();
+                self.state = ServeViewState::Confirm {
+                    selected: Self::default_transport(tailscale, cloudflare),
+                    tailscale,
+                    cloudflare,
+                    flash: None,
+                };
+            }
+            target => self.apply(target, None, None),
+        }
+        ServeAction::Continue
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> ServeAction {
         match &mut self.state {
-            ServeViewState::ModePicker {
+            ServeViewState::Picker {
                 selected,
-                tunnel_available,
-                local_available,
+                current,
                 flash,
+                ..
             } => {
-                // Helper: attempt to commit the current `selected` mode,
-                // transitioning to Confirm (Tunnel) or Starting (Local).
-                // Rejects with a flash message if the mode isn't available.
-                let commit = |dialog: &mut ServeView| -> ServeAction {
-                    let ServeViewState::ModePicker {
-                        selected,
-                        tunnel_available,
-                        local_available,
-                        ..
-                    } = &dialog.state
-                    else {
-                        return ServeAction::Continue;
-                    };
-                    let mode = *selected;
-                    let cf = *tunnel_available;
-                    let la = *local_available;
-                    match mode {
-                        ServeMode::Tunnel if !cf => {
-                            if let ServeViewState::ModePicker { flash, .. } = &mut dialog.state {
-                                *flash = Some((
-                                    "Install tailscale or cloudflared to enable Tunnel mode."
-                                        .to_string(),
-                                    Instant::now(),
-                                ));
-                            }
-                            ServeAction::Continue
-                        }
-                        ServeMode::Local if !la => {
-                            if let ServeViewState::ModePicker { flash, .. } = &mut dialog.state {
-                                *flash = Some((
-                                    "No non-loopback network interface available.".to_string(),
-                                    Instant::now(),
-                                ));
-                            }
-                            ServeAction::Continue
-                        }
-                        ServeMode::Tunnel => {
-                            let (tailscale, cloudflare) = ServeView::assess_transports();
-                            let selected = ServeView::default_transport(tailscale, cloudflare);
-                            dialog.state = ServeViewState::Confirm {
-                                selected,
-                                tailscale,
-                                cloudflare,
-                                flash: None,
-                            };
-                            ServeAction::Continue
-                        }
-                        ServeMode::Local => {
-                            // Capture the offset before spawn so the tail
-                            // pane starts at the byte boundary just past any
-                            // pre-existing TUI/runner content; the new
-                            // daemon's startup marker and first events are
-                            // appended past this point and stream in via
-                            // append_new_log_lines.
-                            let offset = log_file_size();
-                            match spawn_daemon(ServeMode::Local, None, None) {
-                                Ok(()) => {
-                                    remember_last_mode(ServeMode::Local);
-                                    dialog.state = ServeViewState::Starting {
-                                        mode: ServeMode::Local,
-                                        transport: None,
-                                        passphrase: None,
-                                        started_at: Instant::now(),
-                                        log_tail: initial_log_tail(),
-                                        log_offset: offset,
-                                    };
-                                }
-                                Err(e) => dialog.state = ServeViewState::Error(e),
-                            }
-                            ServeAction::Continue
-                        }
-                    }
-                };
-
-                // Clear stale flash on any key press (helps the user feel
-                // they're making progress even if the next key is invalid).
                 if flash
                     .as_ref()
-                    .map(|(_, t)| t.elapsed() > Duration::from_millis(1500))
-                    .unwrap_or(false)
+                    .is_some_and(|(_, at)| at.elapsed() > FLASH_TTL)
                 {
                     *flash = None;
                 }
-
+                let index = EXPOSURES.iter().position(|e| e == selected).unwrap_or(0);
                 match key.code {
-                    KeyCode::Left | KeyCode::Char('h') => {
-                        *selected = ServeMode::Local;
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        *selected = EXPOSURES[index.saturating_sub(1)];
                         ServeAction::Continue
                     }
-                    KeyCode::Right | KeyCode::Char('l') => {
-                        // Only move to Tunnel if it's usable; otherwise
-                        // keep Local selected (don't let the user park
-                        // the cursor on a dimmed card).
-                        if *tunnel_available {
-                            *selected = ServeMode::Tunnel;
-                        }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        *selected = EXPOSURES[(index + 1).min(EXPOSURES.len() - 1)];
                         ServeAction::Continue
                     }
                     KeyCode::Tab => {
-                        *selected = match *selected {
-                            ServeMode::Local if *tunnel_available => ServeMode::Tunnel,
-                            ServeMode::Tunnel if *local_available => ServeMode::Local,
-                            other => other,
-                        };
+                        *selected = EXPOSURES[(index + 1) % EXPOSURES.len()];
                         ServeAction::Continue
                     }
-                    KeyCode::Char('t') | KeyCode::Char('T') => {
-                        *selected = ServeMode::Tunnel;
-                        commit(self)
+                    KeyCode::Char(digit @ '1'..='3') => {
+                        let target = EXPOSURES[digit as usize - '1' as usize];
+                        *selected = target;
+                        self.choose(target)
                     }
-                    KeyCode::Char('L') => {
-                        // Capital L as the explicit-Local shortcut. Keep
-                        // lowercase `l` as "→ move right" per the arrow-key
-                        // parallel above, which is the existing convention
-                        // in the rest of the TUI.
-                        *selected = ServeMode::Local;
-                        commit(self)
+                    KeyCode::Enter => {
+                        let target = *selected;
+                        self.choose(target)
                     }
-                    KeyCode::Enter => commit(self),
+                    KeyCode::Char('r') | KeyCode::Char('R') => {
+                        let current = *current;
+                        if self
+                            .pending_confirm
+                            .take()
+                            .filter(|(action, at)| {
+                                *action == PendingConfirm::Restart
+                                    && at.elapsed() <= Duration::from_secs(3)
+                            })
+                            .is_some()
+                        {
+                            self.restart(current);
+                        } else {
+                            self.pending_confirm = Some((PendingConfirm::Restart, Instant::now()));
+                            *flash = Some((
+                                "Press r again to restart the daemon.".to_string(),
+                                Instant::now(),
+                            ));
+                        }
+                        ServeAction::Continue
+                    }
                     KeyCode::Esc | KeyCode::Char('q') => ServeAction::Close,
                     _ => ServeAction::Continue,
                 }
@@ -547,36 +514,28 @@ impl ServeView {
                 cloudflare,
                 flash,
             } => {
-                // Expire stale flash on next key.
                 if flash
                     .as_ref()
-                    .map(|(_, t)| t.elapsed() > Duration::from_millis(1500))
-                    .unwrap_or(false)
+                    .is_some_and(|(_, at)| at.elapsed() > FLASH_TTL)
                 {
                     *flash = None;
                 }
-
-                // Helper: commit the currently-selected transport. Rejects
-                // with a flash if the selected card isn't Ready (keeps the
-                // user on the Confirm screen where they can pivot to the
-                // other transport or hit [E]).
-                let commit = |dialog: &mut ServeView| -> ServeAction {
+                let commit = |dialog: &mut ServeView, pick: TunnelTransport| -> ServeAction {
                     let ServeViewState::Confirm {
-                        selected,
                         tailscale,
                         cloudflare,
+                        flash,
                         ..
-                    } = &dialog.state
+                    } = &mut dialog.state
                     else {
                         return ServeAction::Continue;
                     };
-                    let pick = *selected;
                     let status = match pick {
                         TunnelTransport::Tailscale => *tailscale,
                         TunnelTransport::Cloudflare => *cloudflare,
                     };
                     if !status.is_ready() {
-                        let msg = match (pick, status) {
+                        let message = match (pick, status) {
                             (TunnelTransport::Tailscale, TransportStatus::FunnelNotEnabled) => {
                                 "Tailscale Funnel isn't enabled for this node; pick Cloudflare or update your ACL."
                             }
@@ -587,35 +546,13 @@ impl ServeView {
                                 "cloudflared isn't installed; pick Tailscale."
                             }
                         };
-                        if let ServeViewState::Confirm { flash, .. } = &mut dialog.state {
-                            *flash = Some((msg.to_string(), Instant::now()));
-                        }
+                        *flash = Some((message.to_string(), Instant::now()));
                         return ServeAction::Continue;
                     }
-                    // Capture offset before spawn so the tail pane streams in
-                    // only the new daemon's startup events.
-                    let offset = log_file_size();
-                    match spawn_daemon(
-                        ServeMode::Tunnel,
-                        Some(&dialog.pending_passphrase),
-                        Some(pick),
-                    ) {
-                        Ok(()) => {
-                            remember_last_mode(ServeMode::Tunnel);
-                            dialog.state = ServeViewState::Starting {
-                                mode: ServeMode::Tunnel,
-                                transport: Some(pick),
-                                passphrase: Some(dialog.pending_passphrase.clone()),
-                                started_at: Instant::now(),
-                                log_tail: initial_log_tail(),
-                                log_offset: offset,
-                            };
-                        }
-                        Err(e) => dialog.state = ServeViewState::Error(e),
-                    }
+                    let passphrase = dialog.pending_passphrase.clone();
+                    dialog.apply(Exposure::Tunnel, Some(pick), Some(passphrase));
                     ServeAction::Continue
                 };
-
                 match key.code {
                     KeyCode::Left | KeyCode::Char('h') => {
                         *selected = TunnelTransport::Tailscale;
@@ -633,33 +570,32 @@ impl ServeView {
                         ServeAction::Continue
                     }
                     KeyCode::Char('t') | KeyCode::Char('T') => {
-                        *selected = TunnelTransport::Tailscale;
-                        commit(self)
+                        commit(self, TunnelTransport::Tailscale)
                     }
                     KeyCode::Char('c') | KeyCode::Char('C') => {
-                        *selected = TunnelTransport::Cloudflare;
-                        commit(self)
+                        commit(self, TunnelTransport::Cloudflare)
                     }
-                    KeyCode::Enter => commit(self),
+                    KeyCode::Enter => {
+                        let pick = *selected;
+                        commit(self, pick)
+                    }
                     KeyCode::Char('r') | KeyCode::Char('R') => {
-                        let (new_ts, new_cf) = ServeView::assess_transports();
-                        *tailscale = new_ts;
-                        *cloudflare = new_cf;
+                        let (new_tailscale, new_cloudflare) = ServeView::assess_transports();
+                        *tailscale = new_tailscale;
+                        *cloudflare = new_cloudflare;
                         *flash = Some(("Refreshed.".to_string(), Instant::now()));
                         ServeAction::Continue
                     }
-                    KeyCode::Esc | KeyCode::Char('q') => ServeAction::Close,
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        self.show_picker(crate::cli::serve::current_exposure(), None);
+                        ServeAction::Continue
+                    }
                     _ => ServeAction::Continue,
                 }
             }
-            ServeViewState::Starting { .. } => match key.code {
-                // Esc just closes the dialog; the daemon keeps coming up.
+            // The change keeps going in the background after the view closes.
+            ServeViewState::Applying { .. } => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => ServeAction::Close,
-                KeyCode::Char('s') | KeyCode::Char('S') => {
-                    // Aborting startup: stop the (half-started) daemon.
-                    let _ = stop_daemon();
-                    ServeAction::Close
-                }
                 _ => ServeAction::Continue,
             },
             ServeViewState::Active {
@@ -667,94 +603,59 @@ impl ServeView {
                 transport,
                 urls,
                 url_index,
-                passphrase,
                 ..
             } => {
-                // Help overlay intercepts all keys when visible.
                 if self.show_help {
                     self.show_help = false;
                     return ServeAction::Continue;
                 }
-
-                // Check pending confirmation inline (can't call &mut self
-                // method while self.state is borrowed by the match arm).
-                let confirmed = if let Some((action, when)) = self.pending_confirm {
-                    if when.elapsed() > Duration::from_secs(3) {
-                        self.pending_confirm = None;
-                        None
-                    } else {
-                        let matches = match action {
-                            PendingConfirm::NewPassphrase => {
-                                matches!(key.code, KeyCode::Char('g') | KeyCode::Char('G'))
-                            }
-                            PendingConfirm::Restart => {
-                                matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R'))
-                            }
-                        };
-                        if matches {
-                            Some(action)
-                        } else {
-                            self.pending_confirm = None;
-                            None
+                if self
+                    .pairing
+                    .as_mut()
+                    .is_some_and(|panel| panel.handle_key(key))
+                {
+                    return ServeAction::Continue;
+                }
+                let confirmed = self
+                    .pending_confirm
+                    .take()
+                    .filter(|(_, at)| at.elapsed() <= Duration::from_secs(3))
+                    .map(|(action, _)| action)
+                    .filter(|action| match action {
+                        PendingConfirm::NewPassphrase => {
+                            matches!(key.code, KeyCode::Char('g') | KeyCode::Char('G'))
                         }
-                    }
-                } else {
-                    None
-                };
-
+                        PendingConfirm::Restart => {
+                            matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R'))
+                        }
+                    });
+                let (mode, transport) = (*mode, *transport);
                 match key.code {
-                    // Stop: transition to ModePicker so the user can restart
-                    // with different settings. Esc/q is the way to close.
-                    KeyCode::Char('s') | KeyCode::Char('S') => match stop_daemon() {
-                        Ok(()) => {
-                            self.reset_to_mode_picker();
-                            ServeAction::Continue
-                        }
-                        Err(e) => {
-                            self.state = ServeViewState::Error(format!(
-                                "Stop failed: {}. Daemon may still be running; retry or use `aoe serve --stop` from a shell.",
-                                e
-                            ));
-                            ServeAction::Continue
-                        }
-                    },
-                    // Generate new random passphrase + restart (Tunnel only).
-                    // First press shows confirmation, second press executes.
-                    KeyCode::Char('g') | KeyCode::Char('G')
-                        if matches!(mode, ServeMode::Tunnel) =>
-                    {
+                    KeyCode::Char('g') | KeyCode::Char('G') if mode == Exposure::Tunnel => {
                         if confirmed == Some(PendingConfirm::NewPassphrase) {
-                            let new_pp = generate_passphrase();
-                            save_passphrase_to_disk(&new_pp);
-                            self.pending_passphrase = new_pp.clone();
-                            let m = *mode;
-                            let t = *transport;
-                            self.pending_confirm = None;
-                            self.do_restart(m, t, Some(new_pp));
+                            let passphrase = generate_passphrase();
+                            self.pending_passphrase = passphrase.clone();
+                            self.apply(mode, transport, Some(passphrase));
                         } else {
                             self.pending_confirm =
                                 Some((PendingConfirm::NewPassphrase, Instant::now()));
                         }
                         ServeAction::Continue
                     }
-                    // Restart server. For Tunnel mode this clears all login
-                    // sessions; for Local mode it rebinds the port.
-                    // First press shows confirmation, second press executes.
                     KeyCode::Char('r') | KeyCode::Char('R') => {
                         if confirmed == Some(PendingConfirm::Restart) {
-                            let pp = if matches!(mode, ServeMode::Tunnel) {
-                                let s = passphrase.as_deref().unwrap_or(&self.pending_passphrase);
-                                Some(s.to_string())
-                            } else {
-                                None
-                            };
-                            let m = *mode;
-                            let t = *transport;
-                            self.pending_confirm = None;
-                            self.do_restart(m, t, pp);
+                            self.restart(Some(mode));
                         } else {
                             self.pending_confirm = Some((PendingConfirm::Restart, Instant::now()));
                         }
+                        ServeAction::Continue
+                    }
+                    KeyCode::Char('e') | KeyCode::Char('E') => {
+                        self.show_picker(Some(mode), None);
+                        ServeAction::Continue
+                    }
+                    KeyCode::Char('w') | KeyCode::Char('W') => {
+                        self.show_web = !self.show_web;
                         ServeAction::Continue
                     }
                     KeyCode::Tab if urls.len() > 1 => {
@@ -763,7 +664,6 @@ impl ServeView {
                     }
                     KeyCode::Char('?') => {
                         self.show_help = true;
-                        self.pending_confirm = None;
                         ServeAction::Continue
                     }
                     KeyCode::Esc | KeyCode::Char('q') => ServeAction::Close,
@@ -771,21 +671,10 @@ impl ServeView {
                 }
             }
             ServeViewState::Error(msg) => match key.code {
-                KeyCode::Char('s') | KeyCode::Char('S') => {
-                    // Best-effort stop for a daemon that may still be
-                    // lingering. Ignore the result — if there's no daemon
-                    // to stop, that's the desired state anyway.
-                    let _ = stop_daemon();
-                    ServeAction::Close
-                }
                 KeyCode::Char('r') | KeyCode::Char('R') if error_mentions_tailscale(msg) => {
-                    // Tailscale-related error: offer one-shot recovery
-                    // via `tailscale funnel reset`. Common triggers are a
-                    // stale non-loopback funnel config blocking port 443,
-                    // or a half-configured funnel the user wants to wipe.
-                    // Reset is safe even when the funnel isn't configured.
-                    let result = run_tailscale_funnel_reset();
-                    self.state = match result {
+                    // A stale funnel config commonly blocks port 443; resetting
+                    // is safe even when no funnel is configured.
+                    self.state = match run_tailscale_funnel_reset() {
                         Ok(()) => ServeViewState::Error(
                             "Ran `tailscale funnel reset`. The existing funnel \
                              config (if any) has been cleared.\n\n\
@@ -807,235 +696,129 @@ impl ServeView {
         }
     }
 
-    /// Restart the daemon and transition to Starting (or directly to
-    /// Active if the server comes up fast enough to avoid a flash).
-    fn do_restart(
-        &mut self,
-        mode: ServeMode,
-        transport: Option<TunnelTransport>,
-        passphrase: Option<String>,
-    ) {
-        let pp_ref = passphrase.as_deref();
-        // Capture offset before restart so the tail pane streams in only
-        // the new daemon's events.
-        let offset = log_file_size();
-        match restart_daemon(mode, pp_ref, transport) {
-            Ok(()) => {
-                if let Some(ref pp) = passphrase {
-                    remember_passphrase(pp);
-                }
-                // If the server comes back fast (Tailscale reusing an
-                // existing tunnel), skip the Starting flash entirely.
-                // Give it a brief moment then check for the URL file.
-                std::thread::sleep(Duration::from_millis(200));
-                let urls = read_serve_urls();
-                if !urls.is_empty() {
-                    self.state = ServeViewState::Active {
-                        mode,
-                        transport,
-                        urls,
-                        url_index: 0,
-                        passphrase,
-                        opened_at: Instant::now(),
-                        log_tail: initial_log_tail(),
-                        log_offset: offset,
-                    };
-                } else {
-                    self.state = ServeViewState::Starting {
-                        mode,
-                        transport,
-                        passphrase,
-                        started_at: Instant::now(),
-                        log_tail: initial_log_tail(),
-                        log_offset: offset,
-                    };
-                }
-            }
-            Err(e) => {
-                self.state = ServeViewState::Error(format!("Restart failed: {}", e));
-            }
-        }
+    /// Whether this view replaces the home screen; the exposed daemon's card
+    /// is drawn over it instead.
+    pub fn covers_screen(&self) -> bool {
+        !matches!(self.state, ServeViewState::Active { .. })
     }
 
-    /// Reset to the mode picker (used after stopping the daemon so
-    /// the user can restart with different settings instead of being
-    /// kicked back to the home screen).
-    fn reset_to_mode_picker(&mut self) {
-        let tailscale_ok = crate::server::tunnel::tailscale_available_sync();
-        let cloudflared_ok = crate::server::tunnel::check_cloudflared().is_ok();
-        let tunnel_available = tailscale_ok || cloudflared_ok;
-        let local_available = !crate::server::discover_tagged_ips().is_empty();
-        let remembered_default = read_last_mode().unwrap_or(ServeMode::Local);
-        let selected = match remembered_default {
-            ServeMode::Local if local_available => ServeMode::Local,
-            ServeMode::Local if tunnel_available => ServeMode::Tunnel,
-            ServeMode::Tunnel if tunnel_available => ServeMode::Tunnel,
-            ServeMode::Tunnel if local_available => ServeMode::Local,
-            _ => ServeMode::Local,
-        };
-        self.state = ServeViewState::ModePicker {
-            selected,
-            tunnel_available,
-            local_available,
-            flash: None,
-        };
-        self.pending_confirm = None;
-        self.show_help = false;
-    }
-
-    /// Poll files on disk and drive state transitions. Returns true when
-    /// the visible state changed and a redraw is needed.
+    /// Drive flashes, confirmations and the background exposure change.
+    /// Returns true when a redraw is needed.
     pub fn tick(&mut self) -> bool {
         match &mut self.state {
-            ServeViewState::ModePicker { flash, .. } => {
-                // Expire the flash message after 1.5s so it doesn't stick
-                // around forever without a follow-up key press.
-                if let Some((_, t)) = flash {
-                    if t.elapsed() > Duration::from_millis(1500) {
-                        *flash = None;
-                        return true;
-                    }
+            ServeViewState::Picker { flash, .. } | ServeViewState::Confirm { flash, .. } => {
+                if flash
+                    .as_ref()
+                    .is_some_and(|(_, at)| at.elapsed() > FLASH_TTL)
+                {
+                    *flash = None;
+                    return true;
                 }
                 false
             }
-            ServeViewState::Starting {
-                mode,
-                transport,
-                passphrase,
-                started_at,
-                log_tail,
-                log_offset,
-            } => {
-                // Tail the configured log file so the user watches real
-                // progress (cert generation, tunnel handshake, etc.)
-                // during the 30-60s wait instead of a frozen screen.
-                let log_changed = append_new_log_lines(log_tail, log_offset);
-                let mode = *mode;
-                let xport = *transport;
-                let urls = read_serve_urls();
-                if !urls.is_empty() {
-                    // If we entered Starting without a passphrase (e.g.
-                    // the TUI reattached to a daemon started elsewhere),
-                    // retry the disk fallback now that the server has had
-                    // time to finish startup and write serve.passphrase.
-                    let pp = match passphrase.clone() {
-                        Some(pp) => Some(pp),
-                        None if matches!(mode, ServeMode::Tunnel) => recall_passphrase(),
-                        None => None,
-                    };
-                    self.state = ServeViewState::Active {
-                        mode,
-                        transport: xport,
-                        urls,
-                        url_index: 0,
-                        passphrase: pp,
-                        opened_at: Instant::now(),
-                        log_tail: initial_log_tail(),
-                        log_offset: log_file_size(),
-                    };
-                    return true;
-                }
-                // If the daemon process dies before writing serve.url,
-                // fail fast with the last few log lines so the user can see
-                // why. Common Local mode causes: port in use, EADDRNOTAVAIL
-                // (Tailscale iface went away), permission denied.
-                if crate::cli::serve::daemon_pid().is_none() {
-                    let tail = initial_log_tail();
-                    let raw_joined = tail.join("\n");
-                    let hint = diagnose_daemon_exit(&raw_joined, mode);
-                    let compact: Vec<String> = tail.iter().map(|l| compact_log_line(l)).collect();
-                    let detail = if compact.is_empty() {
-                        String::new()
-                    } else {
-                        format!("\n\nLast log lines:\n{}", compact.join("\n"))
-                    };
-                    let prefix = match mode {
-                        ServeMode::Tunnel => {
-                            "`aoe serve --remote --daemon` exited before the tunnel came up."
-                        }
-                        ServeMode::Local => {
-                            "`aoe serve --daemon` exited before the server started."
-                        }
-                    };
-                    self.state = ServeViewState::Error(format!("{}{}{}", prefix, hint, detail));
-                    return true;
-                }
-                // Local mode comes up ~instantly; no need for the 60s
-                // cloudflared-timeout path. Tunnel mode keeps it.
-                if matches!(mode, ServeMode::Tunnel)
-                    && started_at.elapsed() > Duration::from_secs(TUNNEL_STARTUP_TIMEOUT_SECS)
-                {
-                    // Timeout: the daemon is alive but never produced a
-                    // tunnel URL (cloudflared rate-limited, captive portal,
-                    // etc.). Stop it now so we don't leave a zombie that
-                    // can never serve phones but keeps tripping the status
-                    // bar indicator. Fall through to a log-tail error view.
-                    let stop_note = match stop_daemon() {
-                        Ok(()) => "Stuck daemon stopped.".to_string(),
-                        Err(e) => format!(
-                            "Daemon may still be running \
-                             (tried to stop: {}). Stop manually with `aoe serve --stop`.",
-                            e
-                        ),
-                    };
-                    let tail = initial_log_tail();
-                    let compact: Vec<String> = tail.iter().map(|l| compact_log_line(l)).collect();
-                    let tail_detail = if compact.is_empty() {
-                        String::new()
-                    } else {
-                        format!("\n\nLast log lines:\n{}", compact.join("\n"))
-                    };
-                    self.state = ServeViewState::Error(format!(
-                        "HTTPS tunnel did not announce a URL within {}s. \
-                         {}\n\n\
-                         Most likely cause: Tailscale Funnel needs HTTPS certs \
-                         or ACL approval, OR cloudflared is rate-limited / \
-                         offline. Re-run with AGENT_OF_EMPIRES_DEBUG=1 and \
-                         check debug.log for details.{}",
-                        TUNNEL_STARTUP_TIMEOUT_SECS, stop_note, tail_detail
-                    ));
-                    return true;
-                }
-                log_changed
-            }
-            ServeViewState::Active {
-                log_tail,
-                log_offset,
+            ServeViewState::Applying {
+                target,
+                result,
+                ready_at,
                 ..
             } => {
-                let log_changed = append_new_log_lines(log_tail, log_offset);
-                // Expire stale pending confirmation so the footer hint
-                // disappears after 3s even without a keypress.
-                let confirm_expired = self
-                    .pending_confirm
-                    .as_ref()
-                    .map(|(_, t)| t.elapsed() > Duration::from_secs(3))
-                    .unwrap_or(false);
-                if confirm_expired {
-                    self.pending_confirm = None;
+                let target = *target;
+                if let Some(receiver) = result {
+                    match receiver.try_recv() {
+                        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return false,
+                        Ok(Ok(())) => {
+                            *result = None;
+                            *ready_at = Some(Instant::now());
+                        }
+                        Ok(Err(error)) => {
+                            self.state = ServeViewState::Error(apply_error(target, &error));
+                            return true;
+                        }
+                        Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                            self.state = ServeViewState::Error(
+                                "The exposure change was interrupted.".to_string(),
+                            );
+                            return true;
+                        }
+                    }
+                }
+                if target == Exposure::Localhost {
+                    self.show_picker(Some(Exposure::Localhost), Some("Now localhost only."));
                     return true;
                 }
-                log_changed
+                if !read_serve_urls().is_empty() {
+                    let ServeViewState::Applying {
+                        transport,
+                        passphrase,
+                        ..
+                    } = &mut self.state
+                    else {
+                        return false;
+                    };
+                    self.state = ServeViewState::Active {
+                        mode: target,
+                        transport: *transport,
+                        urls: read_serve_urls(),
+                        url_index: 0,
+                        passphrase: passphrase.take(),
+                        opened_at: Instant::now(),
+                    };
+                    self.pairing = Some(super::pairing::PairingPanel::open());
+                    self.show_web = false;
+                    return true;
+                }
+                if ready_at.is_some_and(|at| at.elapsed() > URL_PUBLISH_TIMEOUT) {
+                    self.state = ServeViewState::Error(
+                        "The daemon restarted but published no URL. Check `aoe serve --status`."
+                            .to_string(),
+                    );
+                    return true;
+                }
+                false
             }
-            _ => false,
+            ServeViewState::Active { .. } => {
+                let panel_changed = self.pairing.as_mut().is_some_and(|panel| panel.tick());
+                let flash_expired = self
+                    .flash
+                    .as_ref()
+                    .is_some_and(|(_, at)| at.elapsed() > FLASH_TTL);
+                if flash_expired {
+                    self.flash = None;
+                }
+                let expired = self
+                    .pending_confirm
+                    .as_ref()
+                    .is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(3));
+                if expired {
+                    self.pending_confirm = None;
+                }
+                expired || panel_changed || flash_expired
+            }
+            ServeViewState::Error(_) => false,
         }
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         match &self.state {
-            ServeViewState::ModePicker {
+            ServeViewState::Picker {
                 selected,
+                current,
+                local_url,
                 tunnel_available,
-                local_available,
+                network_address,
                 flash,
-            } => render_mode_picker(
+            } => render_picker(
                 frame,
                 area,
                 theme,
-                *selected,
-                *tunnel_available,
-                *local_available,
-                flash.as_ref().map(|(m, _)| m.as_str()),
+                PickerModel {
+                    selected: *selected,
+                    current: *current,
+                    local_url: local_url.as_deref(),
+                    tunnel_available: *tunnel_available,
+                    network_address: network_address.as_deref(),
+                    flash: flash.as_ref().map(|(m, _)| m.as_str()),
+                },
             ),
             ServeViewState::Confirm {
                 selected,
@@ -1051,9 +834,9 @@ impl ServeView {
                 *cloudflare,
                 flash.as_ref().map(|(m, _)| m.as_str()),
             ),
-            ServeViewState::Starting {
-                mode, started_at, ..
-            } => render_starting(frame, area, theme, *mode, started_at.elapsed()),
+            ServeViewState::Applying {
+                target, started_at, ..
+            } => render_applying(frame, area, theme, *target, started_at.elapsed()),
             ServeViewState::Active {
                 mode,
                 urls,
@@ -1062,16 +845,27 @@ impl ServeView {
                 opened_at,
                 ..
             } => {
+                let qr = urls
+                    .get(*url_index)
+                    .or_else(|| urls.first())
+                    .map(|url| render_qr(&url.url))
+                    .unwrap_or_default();
                 render_active(
                     frame,
                     area,
                     theme,
-                    *mode,
-                    urls,
-                    *url_index,
-                    passphrase.as_deref(),
-                    opened_at.elapsed(),
-                    self.pending_confirm.as_ref().map(|(a, _)| *a),
+                    &ActiveModel {
+                        mode: *mode,
+                        urls,
+                        url_index: *url_index,
+                        passphrase: passphrase.as_deref(),
+                        elapsed: opened_at.elapsed(),
+                        pending_confirm: self.pending_confirm.as_ref().map(|(a, _)| *a),
+                        pairing: self.pairing.as_ref(),
+                        show_web: self.show_web,
+                        flash: self.flash.as_ref().map(|(text, _)| text.as_str()),
+                        qr: &qr,
+                    },
                 );
                 if self.show_help {
                     render_help_overlay(frame, area, theme, *mode);
@@ -1082,174 +876,45 @@ impl ServeView {
     }
 }
 
-/// Spawn a localhost daemon (the same Local mode as the serve dialog's
-/// quick-start) and poll until discovery resolves it AND it answers a
-/// health check, so callers can drive the daemon API immediately after
-/// this returns. Used by the structured-view entry points to turn the
-/// old "no structured view daemon is running" dead end into a one-key
-/// recovery; remote modes stay behind the full serve dialog.
+/// The local daemon the TUI bootstraps, started when it is missing. Used by
+/// explicit user actions that need the daemon API right away.
 pub(crate) async fn start_local_daemon_and_wait(
 ) -> Result<crate::acp::client::DaemonEndpoint, String> {
-    use crate::acp::client::{discovery::discover, HttpClient};
-
-    spawn_daemon(ServeMode::Local, None, None)?;
-    // The daemonized child double-forks, binds, then writes serve.url;
-    // ~1s on a warm start. 20s covers a cold start on a slow disk
-    // without wedging the UI forever if the daemon dies mid-boot.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    loop {
-        let ready = match discover() {
-            Ok(endpoint) => match HttpClient::new(endpoint.clone()) {
-                Ok(client) => client.health_check().await.is_ok().then_some(endpoint),
-                Err(_) => None,
-            },
-            Err(_) => None,
-        };
-        if let Some(endpoint) = ready {
-            return Ok(endpoint);
-        }
-        if std::time::Instant::now() >= deadline {
-            let tail = initial_log_tail();
-            let hint = if tail.is_empty() {
-                String::new()
-            } else {
-                format!(" Last log lines:\n{}", tail.join("\n"))
-            };
-            return Err(format!(
-                "the daemon was started but never became reachable.{hint}"
-            ));
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    }
+    crate::acp::client::daemon_manager::ensure_local_daemon("")
+        .await
+        .map_err(|error| format!("{error:#}"))
 }
 
-/// Spawn the aoe serve daemon in the requested mode. Tunnel requires a
-/// passphrase (it's public-internet exposure) and a transport choice;
-/// Local ignores both.
-fn spawn_daemon(
-    mode: ServeMode,
-    passphrase: Option<&str>,
-    transport: Option<TunnelTransport>,
-) -> Result<(), String> {
-    use std::process::Command;
-
-    // Guard: refuse to spawn if a daemon is already running. The dialog
-    // constructor checks daemon_pid() and skips to Active, but there is
-    // a window between that check and reaching here (user navigating
-    // ModePicker). A spawn here would overwrite the PID file and orphan
-    // the existing daemon.
-    if crate::cli::serve::daemon_pid().is_some() {
-        return Err(
-            "A daemon is already running. Close this dialog and reopen to see it.".to_string(),
-        );
-    }
-
-    let exe =
-        std::env::current_exe().map_err(|e| format!("Could not resolve aoe binary path: {}", e))?;
-
-    // Delete stale serve.url / serve.mode / serve.passphrase from a
-    // previous hard-killed daemon before launching. Without this,
-    // Starting-state polling could latch onto the old URL before the
-    // new daemon writes the new one, and the TUI could briefly display
-    // the previous tunnel's passphrase before the new one is written.
-    if let Ok(dir) = crate::session::get_app_dir() {
-        let _ = std::fs::remove_file(dir.join("serve.url"));
-        let _ = std::fs::remove_file(dir.join("serve.mode"));
-        let _ = std::fs::remove_file(dir.join("serve.passphrase"));
-    }
-
-    // Reuse the port from the last TUI-launched daemon so the user can
-    // bookmark the URL and not have to re-paste it after every restart.
-    // Only generate a fresh random port on the very first launch (or if
-    // the persisted file is missing). This avoids colliding with a user's
-    // own `aoe serve` on the default 8080.
-    let port: u16 = load_or_generate_port();
-
-    let mut cmd = Command::new(&exe);
-    cmd.args(["serve", "--daemon", "--port", &port.to_string()]);
-    match mode {
-        ServeMode::Tunnel => {
-            cmd.args(["--remote", "--host", "127.0.0.1"]);
-            // User explicitly picked a transport on the Confirm screen:
-            // Cloudflare → force --no-tailscale so the server skips the
-            // auto-detect (they may have tailscale installed but chose
-            // not to use it). Tailscale → no flag needed; auto-detect
-            // will find it.
-            if let Some(TunnelTransport::Cloudflare) = transport {
-                cmd.arg("--no-tailscale");
-            }
-            if let Some(pp) = passphrase {
-                cmd.env("AOE_SERVE_PASSPHRASE", pp);
-            }
-        }
-        ServeMode::Local => {
-            // 0.0.0.0 makes the server reachable on every local
-            // interface (Tailscale, LAN, loopback). The server-side
-            // serve.url writer picks Tailscale > LAN > localhost as the
-            // primary URL in the QR.
-            cmd.args(["--host", "0.0.0.0"]);
-        }
-    }
-    cmd.stdin(std::process::Stdio::null())
-        // The daemon path forks; the child's tracing + stdio land in the
-        // configured log file via stdio_redirect_path. We only need this
-        // wrapper's exit status (synchronous, just double-forks).
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-
-    let status = cmd
-        .status()
-        .map_err(|e| format!("Failed to launch `aoe serve --daemon`: {}", e))?;
-
-    if !status.success() {
-        // If the daemon failed because the port was in use, clear the
-        // persisted port so the next attempt picks a fresh one instead
-        // of getting stuck on the same occupied port forever.
-        let tail = initial_log_tail().join("\n");
-        if tail.contains("EADDRINUSE") || tail.contains("Address already in use") {
-            if let Ok(dir) = crate::session::get_app_dir() {
-                let _ = std::fs::remove_file(dir.join("serve.last_port"));
-            }
-        }
-
-        let hint = match mode {
-            ServeMode::Tunnel => format!(
-                "Most likely no tunnel tool is installed (install tailscale \
-                 or cloudflared) or port {} is in use.",
-                port
-            ),
-            ServeMode::Local => format!("Most likely port {} is in use.", port),
-        };
-        return Err(format!(
-            "`aoe serve --daemon` exited with {:?}. {}",
-            status.code(),
-            hint
-        ));
-    }
-    if let Some(pp) = passphrase {
-        remember_passphrase(pp);
-        save_passphrase_to_disk(pp);
-    }
-    Ok(())
+fn apply_error(target: Exposure, error: &str) -> String {
+    let tail = initial_log_tail();
+    let hint = diagnose_daemon_exit(&tail.join("\n"), target);
+    let compact: Vec<String> = tail.iter().map(|l| compact_log_line(l)).collect();
+    let detail = if compact.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nLast log lines:\n{}", compact.join("\n"))
+    };
+    format!(
+        "Could not switch to {}: {error}{hint}{detail}",
+        exposure_label(target)
+    )
 }
 
-/// Map a common Linux/BSD errno string found in the daemon log tail to a
-/// one-line user hint. Returns either `""` (no recognized error) or a
-/// hint prefixed with a blank line, suitable for string concat into an
-/// error message.
-fn diagnose_daemon_exit(log: &str, mode: ServeMode) -> &'static str {
+/// Map a common errno string in the daemon log tail to a one-line hint,
+/// prefixed with a blank line, or `""` when nothing is recognized.
+fn diagnose_daemon_exit(log: &str, target: Exposure) -> &'static str {
     if log.contains("EADDRNOTAVAIL") || log.contains("Cannot assign requested address") {
-        return match mode {
-            ServeMode::Local => {
+        return match target {
+            Exposure::Network => {
                 "\n\nHint: the interface we tried to bind on went away. \
                  Is Tailscale still up?"
             }
-            ServeMode::Tunnel => "",
+            Exposure::Localhost | Exposure::Tunnel => "",
         };
     }
     if log.contains("EADDRINUSE") || log.contains("Address already in use") {
-        return "\n\nHint: the daemon couldn't bind the picked port. \
-                Reopen the dialog to try again with a fresh random port.";
+        return "\n\nHint: another process holds the daemon's port. \
+                Free it, or delete serve.last_port in the app directory to pick a new one.";
     }
     if log.contains("Permission denied") {
         return "\n\nHint: permission denied on bind. Are you trying a \
@@ -1258,94 +923,36 @@ fn diagnose_daemon_exit(log: &str, mode: ServeMode) -> &'static str {
     ""
 }
 
-fn stop_daemon() -> Result<(), String> {
-    use std::process::Command;
-
-    let exe =
-        std::env::current_exe().map_err(|e| format!("Could not resolve aoe binary path: {}", e))?;
-
-    let output = Command::new(&exe)
-        .args(["serve", "--stop"])
-        .output()
-        .map_err(|e| format!("Failed to invoke `aoe serve --stop`: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(stderr.trim().to_string());
-    }
-    // Only clear the in-memory cache and ephemeral file. The durable
-    // serve.saved_passphrase intentionally survives so the same
-    // passphrase is reused on the next launch.
-    forget_passphrase();
-    Ok(())
+/// The `aoe remote add` line another machine runs, or `None` for a loopback
+/// URL no other machine can use. It prompts for the pairing code.
+fn client_command(url: &str) -> Option<String> {
+    let base = base_url(url)?;
+    let host = base
+        .host_str()?
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    let loopback = host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    (!loopback).then(|| {
+        format!(
+            "aoe remote add {}",
+            crate::daemon::remotes::short_remote_address(base.as_str())
+        )
+    })
 }
 
-/// Stop the running daemon and immediately respawn it with the given
-/// configuration. Used by passphrase-edit and force-logout flows.
-/// Returns `Ok(())` on successful respawn, `Err` if either phase fails.
-fn restart_daemon(
-    mode: ServeMode,
-    passphrase: Option<&str>,
-    transport: Option<TunnelTransport>,
-) -> Result<(), String> {
-    stop_daemon()?;
-    spawn_daemon(mode, passphrase, transport)
-}
-
-/// Read the current daemon's mode marker (`serve.mode`). Returns None
-/// when the file is absent (pre-mode-split daemon) or unparseable.
-fn read_serve_mode() -> Option<ServeMode> {
-    let dir = crate::session::get_app_dir().ok()?;
-    let raw = std::fs::read_to_string(dir.join("serve.mode")).ok()?;
-    ServeMode::from_file_token(&raw)
-}
-
-/// Read the last mode the user picked (across TUI restarts). Used to
-/// default the ModePicker highlight on subsequent opens. Stored in a
-/// separate file from `serve.mode` so it survives `aoe serve --stop`.
-fn read_last_mode() -> Option<ServeMode> {
-    let dir = crate::session::get_app_dir().ok()?;
-    let raw = std::fs::read_to_string(dir.join("serve.last_mode")).ok()?;
-    ServeMode::from_file_token(&raw)
-}
-
-fn remember_last_mode(mode: ServeMode) {
-    if let Ok(dir) = crate::session::get_app_dir() {
-        let _ = std::fs::write(dir.join("serve.last_mode"), mode.file_token());
-    }
-}
-
-/// Load a previously used port from `serve.last_port`, or generate a fresh
-/// random one in the ephemeral range and persist it. This keeps the URL
-/// stable across TUI daemon restarts so users can bookmark it.
-fn load_or_generate_port() -> u16 {
-    if let Ok(dir) = crate::session::get_app_dir() {
-        let port_path = dir.join("serve.last_port");
-        if let Ok(raw) = std::fs::read_to_string(&port_path) {
-            if let Ok(port) = raw.trim().parse::<u16>() {
-                if port >= 49152 {
-                    return port;
-                }
-            }
-        }
-        // No valid persisted port; generate and save one.
-        let port: u16 = rand::rng().random_range(49152..65535);
-        let _ = std::fs::write(&port_path, port.to_string());
-        return port;
-    }
-    // Can't access app dir; fall back to random (won't persist).
-    rand::rng().random_range(49152..65535)
+/// `url` without its path and query, where a credential may ride.
+fn base_url(url: &str) -> Option<reqwest::Url> {
+    let mut base = reqwest::Url::parse(url).ok()?;
+    base.set_query(None);
+    base.set_path("/");
+    Some(base)
 }
 
 fn log_file_path() -> Option<PathBuf> {
     crate::cli::serve::stdio_redirect_path().ok()
-}
-
-fn log_file_size() -> u64 {
-    log_file_path()
-        .and_then(|p| std::fs::metadata(&p).ok())
-        .map(|m| m.len())
-        .unwrap_or(0)
 }
 
 fn initial_log_tail() -> Vec<String> {
@@ -1371,72 +978,16 @@ fn initial_log_tail() -> Vec<String> {
     window[start..].iter().map(|s| s.to_string()).collect()
 }
 
-/// Read any new bytes appended to the log file since `offset` and push the
-/// resulting lines into `tail`, clamped to LOG_TAIL_LINES. Returns true if
-/// new content arrived.
-fn append_new_log_lines(tail: &mut Vec<String>, offset: &mut u64) -> bool {
-    let Some(path) = log_file_path() else {
-        return false;
-    };
-    append_new_log_lines_from(&path, tail, offset)
-}
-
-/// Path-explicit inner helper so tests can exercise the real logic
-/// against a tempfile.
-fn append_new_log_lines_from(
-    path: &std::path::Path,
-    tail: &mut Vec<String>,
-    offset: &mut u64,
-) -> bool {
-    use std::io::{Read, Seek, SeekFrom};
-
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return false;
-    };
-    let Ok(size) = file.metadata().map(|m| m.len()) else {
-        return false;
-    };
-    if size <= *offset {
-        if size < *offset {
-            // File was truncated (daemon restart). Reset.
-            *offset = 0;
-            tail.clear();
-        } else {
-            return false;
-        }
-    }
-
-    if file.seek(SeekFrom::Start(*offset)).is_err() {
-        return false;
-    }
-    let mut buf = String::new();
-    if file.read_to_string(&mut buf).is_err() {
-        return false;
-    }
-    *offset = size;
-
-    let mut changed = false;
-    for line in buf.lines() {
-        tail.push(line.to_string());
-        changed = true;
-    }
-    if tail.len() > LOG_TAIL_LINES {
-        let drop = tail.len() - LOG_TAIL_LINES;
-        tail.drain(..drop);
-    }
-    changed
-}
-
-#[allow(clippy::too_many_arguments)]
-fn render_mode_picker(
-    frame: &mut Frame,
-    area: Rect,
-    theme: &Theme,
-    selected: ServeMode,
+struct PickerModel<'a> {
+    selected: Exposure,
+    current: Option<Exposure>,
+    local_url: Option<&'a str>,
     tunnel_available: bool,
-    local_available: bool,
-    flash: Option<&str>,
-) {
+    network_address: Option<&'a str>,
+    flash: Option<&'a str>,
+}
+
+fn render_picker(frame: &mut Frame, area: Rect, theme: &Theme, model: PickerModel) {
     frame.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1449,8 +1000,160 @@ fn render_mode_picker(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Center the content vertically within the full page
-    let content_height: u16 = 13; // question + spacer + cards(7) + spacer + flash + keybinds
+    // status(4) + spacer + question + spacer + options(3 x 3) + flash + keys
+    let content_height: u16 = 18;
+    let max_width: u16 = 72;
+    let width = max_width.min(inner.width.saturating_sub(2));
+    let body = Rect {
+        x: inner.x + inner.width.saturating_sub(width) / 2,
+        y: inner.y + inner.height.saturating_sub(content_height) / 2,
+        width,
+        height: content_height.min(inner.height),
+    };
+
+    let dimmed = Style::default().fg(theme.dimmed);
+    let text = Style::default().fg(theme.text);
+    let (status, status_style) = match model.current {
+        Some(exposure) => (exposure_label(exposure), Style::default().fg(theme.running)),
+        None => (
+            "Not reachable (reconnecting)",
+            Style::default().fg(theme.error),
+        ),
+    };
+    let heading = if model.current.is_some() {
+        "aoe is running on this machine."
+    } else {
+        "aoe's daemon is not answering on this machine."
+    };
+    let mut lines = vec![
+        Line::from(Span::styled(
+            heading,
+            Style::default().fg(theme.title).bold(),
+        )),
+        Line::from(vec![
+            Span::styled("Exposure: ", dimmed),
+            Span::styled(status, status_style.bold()),
+        ]),
+    ];
+    // The token is what makes the URL usable, so split it rather than truncate.
+    let accent = Style::default().fg(theme.accent);
+    match model.local_url {
+        Some(url) if url.chars().count() > width as usize => {
+            let (base, token) = split_url_and_token(url);
+            lines.push(Line::from(Span::styled(base, accent)));
+            lines.push(Line::from(vec![
+                Span::styled("token ", dimmed),
+                Span::styled(token.unwrap_or_default().to_string(), accent),
+            ]));
+        }
+        Some(url) => lines.extend([Line::from(Span::styled(url, accent)), Line::from("")]),
+        None => lines.extend([Line::from(""), Line::from("")]),
+    }
+    lines.extend([
+        Line::from(""),
+        Line::from(Span::styled(
+            "How should it be reachable?",
+            Style::default().fg(theme.title).bold(),
+        )),
+        Line::from(""),
+    ]);
+
+    let network = model
+        .network_address
+        .map(|address| format!("{address}. Token auth, plain HTTP."))
+        .unwrap_or_else(|| "No non-loopback interface available.".to_string());
+    let tunnel = if model.tunnel_available {
+        "Tailscale or Cloudflare. Token + passphrase."
+    } else {
+        "Install tailscale or cloudflared to enable."
+    };
+    let options = [
+        (
+            Exposure::Localhost,
+            "This machine only. Token auth.".to_string(),
+            true,
+        ),
+        (Exposure::Network, network, model.network_address.is_some()),
+        (Exposure::Tunnel, tunnel.to_string(), model.tunnel_available),
+    ];
+    for (number, (exposure, description, available)) in options.into_iter().enumerate() {
+        let selected = exposure == model.selected;
+        let label_style = match (selected, available) {
+            (true, true) => Style::default().fg(theme.accent).bold(),
+            (_, false) => dimmed,
+            (false, true) => text.bold(),
+        };
+        let mut label = vec![
+            Span::styled(if selected { "\u{25B8} " } else { "  " }, label_style),
+            Span::styled(format!("{} ", number + 1), dimmed),
+            Span::styled(exposure_label(exposure), label_style),
+        ];
+        if model.current == Some(exposure) {
+            label.push(Span::styled(
+                "  current",
+                Style::default().fg(theme.running),
+            ));
+        }
+        lines.push(Line::from(label));
+        lines.push(Line::from(Span::styled(
+            truncate_to_width(&format!("    {description}"), width as usize),
+            if available { text } else { dimmed },
+        )));
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(
+        model.flash.unwrap_or(""),
+        Style::default().fg(theme.waiting).bold(),
+    )));
+    lines.push(Line::from(Span::styled(
+        "[\u{2191}/\u{2193}] choose  [1-3] pick  [Enter] apply  [r] restart daemon  [Esc] close",
+        dimmed,
+    )));
+    frame.render_widget(Paragraph::new(lines), body);
+}
+
+fn truncate_to_width(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(width.saturating_sub(1)).collect();
+    format!("{kept}\u{2026}")
+}
+
+fn render_applying(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    target: Exposure,
+    elapsed: Duration,
+) {
+    frame.render_widget(Clear, area);
+    let (title, wait_line1, wait_line2) = match target {
+        Exposure::Tunnel => (
+            " Starting HTTPS tunnel... ",
+            "Restarting the daemon behind a tunnel",
+            "(first-time Tailscale cert provisioning can take 30\u{2013}60s).",
+        ),
+        Exposure::Network => (
+            " Exposing on the local network... ",
+            "Restarting the daemon on 0.0.0.0",
+            "(usually a few seconds).",
+        ),
+        Exposure::Localhost => (
+            " Returning to localhost... ",
+            "Restarting the daemon on 127.0.0.1",
+            "(usually a few seconds).",
+        ),
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.border))
+        .title(Line::styled(title, Style::default().fg(theme.title).bold()));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let content_height: u16 = 5;
     let v_pad = inner.height.saturating_sub(content_height) / 2;
     let centered = Layout::default()
         .direction(Direction::Vertical)
@@ -1461,179 +1164,22 @@ fn render_mode_picker(
         ])
         .split(inner);
 
-    // Constrain card width to avoid stretching across huge terminals
-    let max_card_width: u16 = 72;
-    let h_pad = centered[1].width.saturating_sub(max_card_width) / 2;
-    let h_centered = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(h_pad),
-            Constraint::Length(max_card_width.min(centered[1].width)),
-            Constraint::Min(0),
-        ])
-        .split(centered[1]);
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // question
-            Constraint::Length(1), // spacer
-            Constraint::Min(7),    // cards
-            Constraint::Length(1), // flash
-            Constraint::Length(1), // keybinds
-        ])
-        .split(h_centered[1]);
-
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "How should this be reachable?",
-            Style::default().fg(theme.title).bold(),
-        )))
-        .alignment(Alignment::Center),
-        rows[0],
-    );
-
-    let cards = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(50),
-            Constraint::Length(1),
-            Constraint::Percentage(50),
-        ])
-        .split(rows[2]);
-
-    // ── Local card ────────────────────────────────────────────────────────
-    let local_primary = crate::server::discover_tagged_ips()
-        .into_iter()
-        .next()
-        .map(|(kind, ip)| match kind {
-            crate::server::IpKind::Tailscale => format!("{} (Tailscale)", ip),
-            crate::server::IpKind::Lan => format!("{} (LAN)", ip),
-            crate::server::IpKind::Loopback => format!("{} (loopback)", ip),
-        })
-        .unwrap_or_else(|| "only localhost available".to_string());
-    let (local_border, local_title_style, local_body_style) =
-        if selected == ServeMode::Local && local_available {
-            (theme.accent, theme.accent, theme.text)
-        } else if !local_available {
-            (theme.dimmed, theme.dimmed, theme.dimmed)
-        } else {
-            (theme.border, theme.title, theme.text)
-        };
-    let local_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(local_border))
-        .padding(Padding::horizontal(1))
-        .title(Line::styled(
-            " Local network ",
-            Style::default().fg(local_title_style).bold(),
-        ));
-    let local_inner = local_block.inner(cards[0]);
-    frame.render_widget(local_block, cards[0]);
-    let local_body = vec![
+    let banner = vec![
+        Line::from(""),
+        Line::from(Span::styled(wait_line1, Style::default().fg(theme.text))),
+        Line::from(Span::styled(wait_line2, Style::default().fg(theme.text))),
         Line::from(""),
         Line::from(Span::styled(
-            local_primary,
-            Style::default().fg(if local_available {
-                theme.accent
-            } else {
-                theme.dimmed
-            }),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Token auth, no passphrase.",
-            Style::default().fg(local_body_style),
-        )),
-        Line::from(Span::styled(
-            "LAN + Tailscale. Instant.",
-            Style::default().fg(local_body_style),
-        )),
-        if !local_available {
-            Line::from(Span::styled(
-                "  (no non-loopback interface)",
-                Style::default().fg(theme.dimmed),
-            ))
-        } else {
-            Line::from("")
-        },
-    ];
-    frame.render_widget(Paragraph::new(local_body), local_inner);
-
-    // ── Tunnel card ───────────────────────────────────────────────────────
-    let (tunnel_border, tunnel_title_style, tunnel_body_style) =
-        if selected == ServeMode::Tunnel && tunnel_available {
-            (theme.accent, theme.accent, theme.text)
-        } else if !tunnel_available {
-            (theme.dimmed, theme.dimmed, theme.dimmed)
-        } else {
-            (theme.border, theme.title, theme.text)
-        };
-    let tunnel_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(tunnel_border))
-        .padding(Padding::horizontal(1))
-        .title(Line::styled(
-            " Internet (HTTPS) ",
-            Style::default().fg(tunnel_title_style).bold(),
-        ));
-    let tunnel_inner = tunnel_block.inner(cards[2]);
-    frame.render_widget(tunnel_block, cards[2]);
-    let status_line = if tunnel_available {
-        "reachable from your phone"
-    } else {
-        "no tunnel tool installed"
-    };
-    let tunnel_body = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            status_line,
-            Style::default().fg(if tunnel_available {
-                theme.accent
-            } else {
-                theme.dimmed
-            }),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Token + passphrase (2FA).",
-            Style::default().fg(tunnel_body_style),
-        )),
-        Line::from(Span::styled(
-            "Pick transport on next screen.",
-            Style::default().fg(tunnel_body_style),
-        )),
-        if !tunnel_available {
-            Line::from(Span::styled(
-                "  (brew install tailscale or cloudflared)",
-                Style::default().fg(theme.dimmed),
-            ))
-        } else {
-            Line::from("")
-        },
-    ];
-    frame.render_widget(Paragraph::new(tunnel_body), tunnel_inner);
-
-    // ── Flash line ────────────────────────────────────────────────────────
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            flash.unwrap_or(""),
-            Style::default().fg(theme.error).bold(),
-        )))
-        .alignment(Alignment::Center),
-        rows[3],
-    );
-
-    // ── Keybinds ──────────────────────────────────────────────────────────
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "[←/→] choose    [L] Local    [T] Tunnel    [Enter] confirm    [Esc] cancel",
+            format!(
+                "Elapsed: {}s    [Esc] close (the change continues)",
+                elapsed.as_secs()
+            ),
             Style::default().fg(theme.dimmed),
-        )))
-        .alignment(Alignment::Center),
-        rows[4],
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(banner).alignment(Alignment::Center),
+        centered[1],
     );
 }
 
@@ -1718,7 +1264,7 @@ fn render_confirm(
             ),
         ]),
         Line::from(Span::styled(
-            "Don't share screenshots with BOTH. Stop with [S] when done.",
+            "Don't share screenshots with BOTH. Press [E] for localhost when done.",
             Style::default().fg(theme.dimmed),
         )),
     ];
@@ -1864,62 +1410,6 @@ fn render_transport_card(
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
-fn render_starting(
-    frame: &mut Frame,
-    area: Rect,
-    theme: &Theme,
-    mode: ServeMode,
-    elapsed: Duration,
-) {
-    frame.render_widget(Clear, area);
-    let (title, wait_line1, wait_line2) = match mode {
-        ServeMode::Tunnel => (
-            " Starting HTTPS tunnel... ",
-            "Waiting for the daemon to bring the tunnel up",
-            "(first-time Tailscale cert provisioning can take 30\u{2013}60s).",
-        ),
-        ServeMode::Local => (
-            " Starting local server... ",
-            "Binding on 0.0.0.0 and discovering interfaces",
-            "(usually under a second).",
-        ),
-    };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme.border))
-        .title(Line::styled(title, Style::default().fg(theme.title).bold()));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    // Center the wait banner vertically
-    let content_height: u16 = 5;
-    let v_pad = inner.height.saturating_sub(content_height) / 2;
-    let centered = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(v_pad),
-            Constraint::Length(content_height),
-            Constraint::Min(0),
-        ])
-        .split(inner);
-
-    let banner = vec![
-        Line::from(""),
-        Line::from(Span::styled(wait_line1, Style::default().fg(theme.text))),
-        Line::from(Span::styled(wait_line2, Style::default().fg(theme.text))),
-        Line::from(""),
-        Line::from(Span::styled(
-            format!("Elapsed: {}s    [Esc close]  [S stop]", elapsed.as_secs()),
-            Style::default().fg(theme.dimmed),
-        )),
-    ];
-    frame.render_widget(
-        Paragraph::new(banner).alignment(Alignment::Center),
-        centered[1],
-    );
-}
-
 /// Shorten a tracing-formatted log line for the in-dialog tail pane.
 ///
 /// Typical input:
@@ -1996,379 +1486,716 @@ fn render_qr(_url: &str) -> String {
 }
 
 /// Shown in place of the QR when the dashboard bundle is not embedded.
-const API_ONLY_NOTICE: &str =
-    "No dashboard bundle in this build: the URL serves the REST API only, and a browser gets a 404.";
+const API_ONLY_NOTICE: &str = "This build has no dashboard; the link serves the REST API only.";
 
-/// Rows [`API_ONLY_NOTICE`] needs once wrapped at a usable terminal width.
-const API_ONLY_ROWS: u16 = 2;
+/// Narrowest content the card lays out for; below it lines are truncated.
+const CARD_MIN_WIDTH: usize = 50;
+/// Widest a single column grows before lines are truncated. The longest line
+/// the card lays out is the token URL indented by two, about 100 columns for
+/// `http://<host>:<port>/?token=<64 hex>`, so this keeps it on one line.
+const CARD_MAX_WIDTH: usize = 112;
+/// Columns between the pairing column and the QR column.
+const COLUMN_GAP: usize = 3;
 
-#[allow(clippy::too_many_arguments)]
-fn render_active(
-    frame: &mut Frame,
-    area: Rect,
-    theme: &Theme,
-    mode: ServeMode,
-    urls: &[ServeUrl],
+struct ActiveModel<'a> {
+    mode: Exposure,
+    urls: &'a [ServeUrl],
     url_index: usize,
-    passphrase: Option<&str>,
+    passphrase: Option<&'a str>,
     elapsed: Duration,
     pending_confirm: Option<PendingConfirm>,
-) {
-    let Some(active_url) = urls.get(url_index).or_else(|| urls.first()) else {
-        let msg = "Daemon started but no URL available yet.";
-        render_error(frame, area, theme, msg);
-        return;
+    pairing: Option<&'a super::pairing::PairingPanel>,
+    show_web: bool,
+    flash: Option<&'a str>,
+    /// The selected URL's QR code, empty when this build draws none.
+    qr: &'a str,
+}
+
+/// A card row and how early it gives way on a short terminal: rows with the
+/// highest `yields` go first, and 0 never does.
+struct Row {
+    line: Line<'static>,
+    yields: u8,
+}
+
+const KEEP: u8 = 0;
+/// A device other than the selected one.
+const OTHER_DEVICE: u8 = 1;
+const EXPOSURE_NOTE: u8 = 2;
+const GAP: u8 = 3;
+const EXPLAIN: u8 = 4;
+
+impl Row {
+    fn keep(line: impl Into<Line<'static>>) -> Self {
+        Self::yields(line, KEEP)
+    }
+
+    fn yields(line: impl Into<Line<'static>>, yields: u8) -> Self {
+        Self {
+            line: line.into(),
+            yields,
+        }
+    }
+
+    fn gap() -> Self {
+        Self::yields(Line::from(""), GAP)
+    }
+}
+
+/// Drop the most expendable rows until `rows` fits `height`, then tidy the
+/// gaps the drops left at the edges or doubled up.
+fn fit_rows(mut rows: Vec<Row>, height: usize, width: usize) -> Vec<Line<'static>> {
+    while rows.len() > height {
+        let Some(most) = rows
+            .iter()
+            .map(|row| row.yields)
+            .max()
+            .filter(|y| *y > KEEP)
+        else {
+            break;
+        };
+        let at = rows.iter().rposition(|row| row.yields == most).unwrap_or(0);
+        rows.remove(at);
+    }
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let blank = row.line.width() == 0;
+        if blank && lines.last().is_none_or(|last| last.width() == 0) {
+            continue;
+        }
+        lines.push(clip(row.line, width));
+    }
+    while lines.last().is_some_and(|last| last.width() == 0) {
+        lines.pop();
+    }
+    lines
+}
+
+/// `text` word-wrapped to `width` after `indent`, every row yielding as an
+/// explanation.
+fn explain(theme: &Theme, indent: &str, text: &str, width: usize) -> Vec<Row> {
+    let room = width.saturating_sub(indent.len()).max(1);
+    let mut lines: Vec<String> = Vec::new();
+    for word in text.split_whitespace() {
+        match lines.last_mut() {
+            Some(line) if line.chars().count() + 1 + word.chars().count() <= room => {
+                line.push(' ');
+                line.push_str(word);
+            }
+            _ => lines.push(word.to_string()),
+        }
+    }
+    lines
+        .into_iter()
+        .map(|line| {
+            Row::yields(
+                Line::styled(format!("{indent}{line}"), Style::default().fg(theme.dimmed)),
+                EXPLAIN,
+            )
+        })
+        .collect()
+}
+
+/// `line` cut to `width` columns, keeping each span's style.
+fn clip(line: Line<'static>, width: usize) -> Line<'static> {
+    if line.width() <= width {
+        return line;
+    }
+    let mut room = width.saturating_sub(1);
+    let mut spans = Vec::new();
+    for span in line.spans {
+        if room == 0 {
+            break;
+        }
+        let text: String = span.content.chars().take(room).collect();
+        room -= text.chars().count();
+        spans.push(Span::styled(text, span.style));
+    }
+    spans.push(Span::raw("…"));
+    Line::from(spans)
+}
+
+fn heading(theme: &Theme, text: &str) -> Row {
+    Row::keep(Line::styled(
+        text.to_string(),
+        Style::default().fg(theme.accent).bold(),
+    ))
+}
+
+/// `text` broken into lines of at most `width` characters, for values like a
+/// tokenized URL that are useless truncated.
+fn chunked(text: &str, width: usize) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    chars
+        .chunks(width.max(1))
+        .map(|chunk| chunk.iter().collect())
+        .collect()
+}
+
+/// Status first: where this machine is shared, since when, and what that
+/// lets other machines do.
+fn status_rows(theme: &Theme, model: &ActiveModel, url: &ServeUrl, width: usize) -> Vec<Row> {
+    let (place, meaning) = match model.mode {
+        Exposure::Tunnel => (
+            "Sharing over the internet",
+            "Anyone with the link and passphrase, or a paired aoe, can connect.",
+        ),
+        Exposure::Network => (
+            "Sharing on local network",
+            "Other aoe clients on this network can connect once paired.",
+        ),
+        Exposure::Localhost => (
+            "Sharing on this machine only",
+            "Nothing else can connect until you change the exposure.",
+        ),
     };
-    let url = &active_url.url;
-    let kind_label = active_url.label.as_deref();
-
-    let qr_text = render_qr(url);
-    let qr_lines: Vec<&str> = qr_text.lines().collect();
-    let qr_height = qr_lines.len() as u16;
-
-    let full_url = url.as_str();
-    let url_prefix = "URL: ";
-    let full_url_len = url_prefix.chars().count() + full_url.chars().count();
-    let (split_url, split_token) = split_url_and_token(full_url);
-
-    // Full-page layout: header / content / footer, matching Settings/Diff.
-    frame.render_widget(Clear, area);
-
-    let page = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // header
-            Constraint::Min(10),   // content
-            Constraint::Length(3), // footer
-        ])
-        .split(area);
-
-    // ── Header ───────────────────────────────────────────────────────────
-    let eight_hours = Duration::from_secs(8 * 3600);
-    let title_color = if elapsed >= eight_hours {
-        theme.waiting
-    } else {
-        theme.title
-    };
-    let header_block = Block::default()
-        .borders(Borders::BOTTOM)
-        .border_style(Style::default().fg(theme.border));
-    let header_inner = header_block.inner(page[0]);
-    frame.render_widget(header_block, page[0]);
-
-    let mode_label = match mode {
-        ServeMode::Local => "local",
-        ServeMode::Tunnel => "tunnel",
-    };
-    // Without the bundle this screen hands out an API endpoint, not a
-    // dashboard, so the title says which one the user is looking at.
-    let title = if cfg!(feature = "web") {
-        format!(" Remote Access ({mode_label})")
-    } else {
-        format!(" Remote API Access ({mode_label})")
-    };
-    let mut header_spans = vec![
-        Span::styled(title, Style::default().fg(title_color).bold()),
+    let address = base_url(&url.url)
+        .map(|base| crate::daemon::remotes::short_remote_address(base.as_str()))
+        .unwrap_or_default();
+    let mut spans = vec![
+        Span::styled("● ", Style::default().fg(theme.running)),
+        Span::styled(place, Style::default().fg(theme.text).bold()),
+        Span::styled(format!(" · {address}"), Style::default().fg(theme.text)),
         Span::styled(
-            format!("  open {}", format_elapsed(elapsed)),
+            format!(" · up {}", format_elapsed(model.elapsed)),
             Style::default().fg(theme.dimmed),
         ),
     ];
-    if elapsed >= eight_hours {
-        header_spans.push(Span::styled(
-            "  still need it?",
+    if model.elapsed >= Duration::from_secs(8 * 3600) {
+        spans.push(Span::styled(
+            " · still need it?",
             Style::default().fg(theme.waiting),
         ));
     }
-    frame.render_widget(Paragraph::new(Line::from(header_spans)), header_inner);
-
-    // ── Content ──────────────────────────────────────────────────────────
-    let content_area = page[1];
-    let url_inner_width = content_area.width.saturating_sub(2).max(1) as usize;
-    let url_fits_one_line = full_url_len <= url_inner_width;
-
-    let show_passphrase = matches!(mode, ServeMode::Tunnel);
-    let show_kind_label = kind_label.is_some();
-    let show_split_token = !url_fits_one_line && split_token.is_some();
-    // No bundle means no QR (nothing would answer a scan) and a 404 for any
-    // browser that follows the URL, so the screen says what it is good for
-    // instead of presenting a bare address.
-    let show_api_only = !cfg!(feature = "web");
-
-    // Calculate total content height for vertical centering.
-    let mut inner_height: u16 = qr_height + 1 /* spacer */ + 1 /* url */;
-    if show_api_only {
-        inner_height += API_ONLY_ROWS;
-    }
-    if show_kind_label {
-        inner_height += 1;
-    }
-    if show_split_token {
-        inner_height += 1;
-    }
-    if show_passphrase {
-        inner_height += 1;
-    }
-
-    let v_pad = content_area.height.saturating_sub(inner_height) / 2;
-
-    let mut constraints = vec![Constraint::Length(v_pad)]; // top padding
-    constraints.push(Constraint::Length(qr_height));
-    if show_api_only {
-        constraints.push(Constraint::Length(API_ONLY_ROWS));
-    }
-    constraints.push(Constraint::Length(1)); // spacer after QR
-    if show_kind_label {
-        constraints.push(Constraint::Length(1));
-    }
-    constraints.push(Constraint::Length(1)); // url
-    if show_split_token {
-        constraints.push(Constraint::Length(1));
-    }
-    if show_passphrase {
-        constraints.push(Constraint::Length(1));
-    }
-    constraints.push(Constraint::Min(0)); // bottom padding
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .horizontal_margin(1)
-        .constraints(constraints)
-        .split(content_area);
-
-    // Skip the top padding chunk
-    let mut idx: usize = 0;
-    idx += 1; // top padding
-
-    // QR code
-    let qr_widget: Vec<Line> = qr_lines
-        .iter()
-        .map(|l| Line::from(Span::styled(*l, Style::default().fg(theme.text))))
-        .collect();
-    frame.render_widget(
-        Paragraph::new(qr_widget).alignment(Alignment::Center),
-        chunks[idx],
-    );
-    idx += 1;
-
-    if show_api_only {
-        frame.render_widget(
-            Paragraph::new(API_ONLY_NOTICE)
-                .style(Style::default().fg(theme.dimmed))
-                .wrap(Wrap { trim: true })
-                .alignment(Alignment::Center),
-            chunks[idx],
-        );
-        idx += 1;
-    }
-
-    // Spacer after QR
-    idx += 1;
-
-    if let Some(label) = kind_label {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                format!("via {}", label),
-                Style::default().fg(theme.dimmed).italic(),
-            )))
-            .alignment(Alignment::Center),
-            chunks[idx],
-        );
-        idx += 1;
-    }
-
-    // URL row(s)
-    if url_fits_one_line {
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(url_prefix, Style::default().fg(theme.dimmed)),
-                Span::styled(full_url, Style::default().fg(theme.accent)),
-            ]))
-            .alignment(Alignment::Center),
-            chunks[idx],
-        );
-        idx += 1;
-    } else {
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(url_prefix, Style::default().fg(theme.dimmed)),
-                Span::styled(split_url.as_str(), Style::default().fg(theme.accent)),
-            ]))
-            .alignment(Alignment::Center),
-            chunks[idx],
-        );
-        idx += 1;
-        if let Some(token) = split_token {
-            frame.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled("Token: ", Style::default().fg(theme.dimmed)),
-                    Span::styled(token, Style::default().fg(theme.accent)),
-                ]))
-                .alignment(Alignment::Center),
-                chunks[idx],
-            );
-            idx += 1;
-        }
-    }
-
-    // Passphrase row (Tunnel only)
-    if show_passphrase {
-        let (pp_label, pp_style) = match passphrase {
-            Some(pp) => (pp.to_string(), Style::default().fg(theme.accent).bold()),
-            None => (
-                "(set when the daemon started; check the shell that ran `aoe serve`)".to_string(),
-                Style::default().fg(theme.dimmed),
-            ),
-        };
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("Passphrase: ", Style::default().fg(theme.dimmed)),
-                Span::styled(pp_label, pp_style),
-            ]))
-            .alignment(Alignment::Center),
-            chunks[idx],
-        );
-    }
-
-    // ── Footer ────────────────────────────────────────────────────────
-    let footer_block = Block::default()
-        .borders(Borders::TOP)
-        .border_style(Style::default().fg(theme.border));
-    let footer_inner = footer_block.inner(page[2]);
-    frame.render_widget(footer_block, page[2]);
-
-    let key_style = Style::default().fg(theme.accent);
-    let desc_style = Style::default().fg(theme.dimmed);
-
-    let footer_line: Line = if let Some(confirm) = pending_confirm {
-        let warn_style = Style::default().fg(theme.waiting).bold();
-        match confirm {
-            PendingConfirm::NewPassphrase => Line::from(Span::styled(
-                "Press G again to confirm new passphrase (clients will need it). Any other key cancels.",
-                warn_style,
-            )),
-            PendingConfirm::Restart => Line::from(Span::styled(
-                "Press R again to confirm restart (clears all sessions). Any other key cancels.",
-                warn_style,
-            )),
-        }
-    } else {
-        let mut spans: Vec<Span> = Vec::new();
-        if urls.len() > 1 {
-            spans.extend([
-                Span::styled("Tab", key_style),
-                Span::styled(": URL  ", desc_style),
-            ]);
-        }
-        if matches!(mode, ServeMode::Tunnel) {
-            spans.extend([
-                Span::styled("G", key_style),
-                Span::styled(": new pass  ", desc_style),
-            ]);
-        }
-        spans.extend([
-            Span::styled("R", key_style),
-            Span::styled(": restart  ", desc_style),
-            Span::styled("S", key_style),
-            Span::styled(": stop  ", desc_style),
-            Span::styled("?", key_style),
-            Span::styled(": help  ", desc_style),
-            Span::styled("Esc", key_style),
-            Span::styled(": close", desc_style),
-        ]);
-        Line::from(spans)
-    };
-    frame.render_widget(
-        Paragraph::new(footer_line).alignment(Alignment::Center),
-        footer_inner,
-    );
+    let mut rows = vec![Row::keep(Line::from(spans))];
+    rows.extend(explain(theme, "", meaning, width));
+    rows
 }
 
-fn render_help_overlay(frame: &mut Frame, area: Rect, theme: &Theme, mode: ServeMode) {
-    // Size the dialog to fit the longest shortcut description plus
-    // the key column (10 chars) plus padding/borders (~6 chars).
-    // Clamp to terminal width so narrow terminals still work.
-    let dialog_width: u16 = 72.min(area.width.saturating_sub(4));
-    let is_tunnel = matches!(mode, ServeMode::Tunnel);
-    let dialog_height: u16 = if is_tunnel { 20 } else { 14 };
-    let dialog_height = dialog_height.min(area.height.saturating_sub(4));
-    let x = area.x + (area.width.saturating_sub(dialog_width)) / 2;
-    let y = area.y + (area.height.saturating_sub(dialog_height)) / 2;
-    let dialog_area = Rect {
-        x,
-        y,
-        width: dialog_width,
-        height: dialog_height,
+/// The code and the two steps that use it, led by any lockout, since a
+/// locked-out machine cannot pair at all.
+fn pair_rows(theme: &Theme, model: &ActiveModel, command: Option<&str>, width: usize) -> Vec<Row> {
+    let dimmed = Style::default().fg(theme.dimmed);
+    let hint = Style::default().fg(theme.hint);
+    let text = Style::default().fg(theme.text);
+    let mut rows = vec![heading(theme, "Pair a device")];
+    let Some(panel) = model.pairing else {
+        return rows;
     };
+    for (ip, left) in panel.lockouts() {
+        rows.push(Row::keep(Line::from(vec![
+            Span::styled(format!("  {ip}"), Style::default().fg(theme.waiting)),
+            Span::styled(
+                format!(" locked out · {} left  ", super::pairing::ago(left)),
+                dimmed,
+            ),
+            Span::styled("u", hint),
+            Span::styled(" unblock", dimmed),
+        ])));
+    }
+    match panel.code() {
+        super::pairing::CodeView::Minting => {
+            rows.push(Row::keep(Line::styled("  creating a code…", dimmed)));
+        }
+        super::pairing::CodeView::Ready { spaced, expires_in } => {
+            let code = Span::styled(
+                format!("  {spaced}"),
+                Style::default().fg(theme.accent).bold(),
+            );
+            let expiry = format!("single use · new code in {expires_in}");
+            if code.width() + 3 + expiry.chars().count() <= width {
+                rows.push(Row::keep(Line::from(vec![
+                    code,
+                    Span::styled(format!("   {expiry}"), dimmed),
+                ])));
+            } else {
+                rows.push(Row::keep(Line::from(code)));
+                rows.push(Row::keep(Line::styled(format!("  {expiry}"), dimmed)));
+            }
+        }
+        super::pairing::CodeView::Failed(error) => {
+            rows.push(Row::keep(Line::styled(
+                truncate_to_width(&format!("  No code: {error}"), width),
+                Style::default().fg(theme.error),
+            )));
+        }
+    }
+    let Some(command) = command else {
+        rows.push(Row::keep(Line::styled(
+            "  Other machines cannot reach this one; press e to share it.",
+            text,
+        )));
+        return rows;
+    };
+    let lead = "  1. On the other machine run  ";
+    let command_style = text.bold();
+    if lead.len() + command.len() <= width {
+        rows.push(Row::keep(Line::from(vec![
+            Span::styled(lead, text),
+            Span::styled(command.to_string(), command_style),
+        ])));
+    } else {
+        rows.push(Row::keep(Line::styled(
+            "  1. On the other machine run",
+            text,
+        )));
+        rows.push(Row::keep(Line::styled(
+            truncate_to_width(&format!("     {command}"), width),
+            command_style,
+        )));
+    }
+    rows.push(Row::keep(Line::styled(
+        "  2. Enter the code above when it asks",
+        text,
+    )));
+    rows
+}
 
+fn device_rows(theme: &Theme, model: &ActiveModel, width: usize) -> Vec<Row> {
+    let dimmed = Style::default().fg(theme.dimmed);
+    let mut rows = vec![heading(theme, "Paired devices")];
+    let devices = match model.pairing.map(|panel| panel.devices()) {
+        None | Some(Err(None)) => {
+            rows.push(Row::keep(Line::styled("  loading…", dimmed)));
+            return rows;
+        }
+        Some(Err(Some(error))) => {
+            rows.push(Row::keep(Line::styled(
+                truncate_to_width(&format!("  {error}"), width),
+                Style::default().fg(theme.error),
+            )));
+            return rows;
+        }
+        Some(Ok(devices)) if devices.is_empty() => {
+            rows.push(Row::keep(Line::styled("  No devices paired yet.", dimmed)));
+            return rows;
+        }
+        Some(Ok(devices)) => devices,
+    };
+    let name_width = devices
+        .iter()
+        .map(|d| d.name.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(20);
+    for device in devices {
+        let name_style = if device.selected {
+            Style::default().fg(theme.text).bold()
+        } else {
+            Style::default().fg(theme.text)
+        };
+        let mut spans = vec![
+            Span::styled(
+                if device.selected { "▸ " } else { "  " },
+                Style::default().fg(theme.accent),
+            ),
+            Span::styled(
+                format!("{:name_width$}", truncate_to_width(device.name, name_width)),
+                name_style,
+            ),
+            Span::styled(
+                format!("  {} · seen {}", device.address, device.seen),
+                dimmed,
+            ),
+        ];
+        if device.armed {
+            spans.push(Span::styled(
+                format!("  press x again to revoke {}", device.name),
+                Style::default().fg(theme.waiting).bold(),
+            ));
+        } else if device.selected {
+            spans.push(Span::styled("  x", Style::default().fg(theme.hint)));
+            spans.push(Span::styled(format!(" revoke {}", device.name), dimmed));
+        }
+        let line = Line::from(spans);
+        let line = if line.width() > width {
+            Line::styled(truncate_to_width(&line.to_string(), width), name_style)
+        } else {
+            line
+        };
+        rows.push(Row::yields(
+            line,
+            if device.selected { KEEP } else { OTHER_DEVICE },
+        ));
+    }
+    rows
+}
+
+/// The dashboard link, what it is for, and the passphrase a tunnel adds.
+fn web_rows(theme: &Theme, model: &ActiveModel, url: &ServeUrl, width: usize) -> Vec<Row> {
+    let dimmed = Style::default().fg(theme.dimmed);
+    let mut rows = vec![heading(theme, "Browser or phone")];
+    if cfg!(feature = "web") {
+        rows.extend(explain(
+            theme,
+            "  ",
+            "Open the dashboard in a browser or scan the QR with a phone. The link \
+             carries the token, which grants full access.",
+            width,
+        ));
+    } else {
+        for row in explain(theme, "  ", API_ONLY_NOTICE, width) {
+            rows.push(Row::keep(row.line));
+        }
+    }
+    if let Some(label) = &url.label {
+        rows.push(Row::yields(
+            Line::styled(format!("  via {label}"), dimmed.italic()),
+            EXPLAIN,
+        ));
+    }
+    for chunk in chunked(&url.url, width.saturating_sub(2)) {
+        rows.push(Row::keep(Line::styled(
+            format!("  {chunk}"),
+            Style::default().fg(theme.accent),
+        )));
+    }
+    if model.mode == Exposure::Tunnel {
+        rows.push(Row::keep(match model.passphrase {
+            Some(passphrase) => Line::from(vec![
+                Span::styled("  Passphrase ", dimmed),
+                Span::styled(
+                    passphrase.to_string(),
+                    Style::default().fg(theme.accent).bold(),
+                ),
+            ]),
+            None => Line::styled("  Passphrase: see the shell that ran `aoe serve`", dimmed),
+        }));
+    }
+    rows
+}
+
+fn exposure_row(theme: &Theme, width: usize) -> Row {
+    let full = " change exposure: localhost only, local network, or internet";
+    let label = if full.len() < width {
+        full
+    } else {
+        " change exposure"
+    };
+    Row::yields(
+        Line::from(vec![
+            Span::styled("e", Style::default().fg(theme.hint)),
+            Span::styled(label, Style::default().fg(theme.dimmed)),
+        ]),
+        EXPOSURE_NOTE,
+    )
+}
+
+fn qr_lines(theme: &Theme, qr: &str) -> Vec<Line<'static>> {
+    qr.lines()
+        .map(|line| Line::styled(line.to_string(), Style::default().fg(theme.text)))
+        .collect()
+}
+
+/// How the card arranges itself for the space it has.
+#[derive(Debug, PartialEq)]
+enum CardLayout {
+    /// Pairing, devices and the link in one column.
+    Single,
+    /// The QR beside everything else.
+    Beside,
+    /// The link and QR alone, toggled with `w` where they do not fit beside.
+    Web,
+}
+
+fn card_layout(model: &ActiveModel, area: Rect, qr: (usize, usize)) -> CardLayout {
+    let (qr_width, qr_height) = qr;
+    if qr_width == 0 {
+        return CardLayout::Single;
+    }
+    let beside = CARD_MIN_WIDTH + COLUMN_GAP + qr_width.max(CARD_MIN_WIDTH / 2) + 4;
+    if area.width as usize >= beside && area.height as usize >= qr_height + 8 {
+        CardLayout::Beside
+    } else if model.show_web {
+        CardLayout::Web
+    } else {
+        CardLayout::Single
+    }
+}
+
+/// The exposed daemon as a centered card sized to its content: status, then
+/// pairing, paired devices and browser access, with the key hints last.
+fn render_active(frame: &mut Frame, area: Rect, theme: &Theme, model: &ActiveModel) {
+    let title = if cfg!(feature = "web") {
+        " Remote Access "
+    } else {
+        " Remote API Access "
+    };
+    let Some(url) = model
+        .urls
+        .get(model.url_index)
+        .or_else(|| model.urls.first())
+    else {
+        let card = centered(area, 60, 3);
+        frame.render_widget(Clear, card);
+        frame.render_widget(
+            Paragraph::new("The daemon started but has not published a URL yet.")
+                .style(Style::default().fg(theme.dimmed))
+                .block(card_block(theme, title)),
+            card,
+        );
+        return;
+    };
+    let command = client_command(&url.url);
+    let qr = qr_lines(theme, model.qr);
+    let qr_size = (qr.iter().map(Line::width).max().unwrap_or(0), qr.len());
+    let layout = card_layout(model, area, qr_size);
+
+    // Borders take two columns and two rows, the padding two columns, and the
+    // footer one row.
+    let max_width = (area.width as usize).saturating_sub(4).max(1);
+    let max_rows = (area.height as usize).saturating_sub(3).max(1);
+    let (width, left, right, right_width) = match layout {
+        CardLayout::Beside => {
+            let right_width = qr_size.0.max(CARD_MIN_WIDTH / 2);
+            let left_width = (max_width - COLUMN_GAP - right_width).min(CARD_MAX_WIDTH);
+            let mut left = status_rows(theme, model, url, left_width);
+            left.push(Row::gap());
+            left.extend(pair_rows(theme, model, command.as_deref(), left_width));
+            left.push(Row::gap());
+            left.extend(device_rows(theme, model, left_width));
+            left.push(Row::gap());
+            left.extend(web_rows(theme, model, url, left_width));
+            left.push(Row::gap());
+            left.push(exposure_row(theme, left_width));
+            let mut right: Vec<Row> = qr.into_iter().map(Row::keep).collect();
+            right.push(Row::keep(Line::styled(
+                "Scan with a phone to open the link",
+                Style::default().fg(theme.dimmed),
+            )));
+            let left = fit_rows(left, max_rows, left_width);
+            let right = fit_rows(right, max_rows, right_width);
+            let used = left.iter().map(Line::width).max().unwrap_or(0);
+            (
+                used + COLUMN_GAP + right_width,
+                left,
+                Some(right),
+                right_width,
+            )
+        }
+        CardLayout::Web => {
+            let width = max_width.min(CARD_MAX_WIDTH);
+            let mut rows = status_rows(theme, model, url, width);
+            rows.push(Row::gap());
+            rows.extend(web_rows(theme, model, url, width));
+            if qr_size.0 <= width && rows.len() + 1 + qr_size.1 <= max_rows {
+                rows.push(Row::gap());
+                rows.extend(qr.into_iter().map(Row::keep));
+            } else {
+                rows.push(Row::keep(Line::styled(
+                    "  The terminal is too small for the QR.",
+                    Style::default().fg(theme.dimmed),
+                )));
+            }
+            (width, fit_rows(rows, max_rows, width), None, 0)
+        }
+        CardLayout::Single => {
+            let width = max_width.min(CARD_MAX_WIDTH);
+            let mut rows = status_rows(theme, model, url, width);
+            rows.push(Row::gap());
+            rows.extend(pair_rows(theme, model, command.as_deref(), width));
+            rows.push(Row::gap());
+            rows.extend(device_rows(theme, model, width));
+            rows.push(Row::gap());
+            rows.extend(web_rows(theme, model, url, width));
+            rows.push(Row::gap());
+            rows.push(exposure_row(theme, width));
+            let lines = fit_rows(rows, max_rows, width);
+            let used = lines.iter().map(Line::width).max().unwrap_or(0);
+            (used.clamp(CARD_MIN_WIDTH.min(width), width), lines, None, 0)
+        }
+    };
+    let footer = active_footer(theme, model, &layout, qr_size.0 > 0, width);
+    let body_rows = left.len().max(right.as_ref().map_or(0, Vec::len));
+    let card = centered(area, width as u16 + 4, body_rows as u16 + 3);
+    frame.render_widget(Clear, card);
+    let block = card_block(theme, title);
+    let inner = block.inner(card);
+    frame.render_widget(block, card);
+    let [body, foot] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    match right {
+        Some(right) => {
+            let [left_area, _, right_area] = Layout::horizontal([
+                Constraint::Min(1),
+                Constraint::Length(COLUMN_GAP as u16),
+                Constraint::Length(right_width as u16),
+            ])
+            .areas(body);
+            frame.render_widget(Paragraph::new(left), left_area);
+            frame.render_widget(Paragraph::new(right), right_area);
+        }
+        None => frame.render_widget(Paragraph::new(left), body),
+    }
+    frame.render_widget(Paragraph::new(footer), foot);
+}
+
+fn card_block(theme: &Theme, title: &'static str) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.accent))
+        .padding(Padding::horizontal(1))
+        .title(Line::styled(
+            title,
+            Style::default().fg(theme.accent).bold(),
+        ))
+}
+
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    }
+}
+
+/// Key hints in reading order, at most `width` wide: the least needed go
+/// first, and `?` lists every key with what it does.
+fn active_footer(
+    theme: &Theme,
+    model: &ActiveModel,
+    layout: &CardLayout,
+    has_qr: bool,
+    width: usize,
+) -> Line<'static> {
+    if let Some(confirm) = model.pending_confirm {
+        return Line::styled(
+            match confirm {
+                PendingConfirm::NewPassphrase => {
+                    "Press g again for a new passphrase (clients need it); any other key cancels"
+                }
+                PendingConfirm::Restart => {
+                    "Press r again to restart (clears all sessions); any other key cancels"
+                }
+            },
+            Style::default().fg(theme.waiting).bold(),
+        );
+    }
+    if let Some(flash) = model.flash {
+        return Line::styled(flash.to_string(), Style::default().fg(theme.accent));
+    }
+    let panel = model.pairing;
+    let has_devices = panel.is_some_and(|p| p.devices().is_ok_and(|d| !d.is_empty()));
+    // (key, label, keep rank): higher ranks survive a narrow footer.
+    let mut keys: Vec<(&str, &str, u8)> = Vec::new();
+    if *layout == CardLayout::Web {
+        keys.push(("w", "back to pairing", 7));
+    } else {
+        if has_devices {
+            keys.push(("↑↓", "select device", 1));
+            keys.push(("x", "revoke device", 5));
+        }
+        if panel.is_some_and(|p| !p.lockouts().is_empty()) {
+            keys.push(("u", "unblock IPs", 6));
+        }
+        if has_qr && *layout == CardLayout::Single {
+            keys.push(("w", "show QR", 4));
+        }
+    }
+    if model.urls.len() > 1 {
+        keys.push(("Tab", "next URL", 2));
+    }
+    keys.extend([
+        ("e", "change exposure", 3),
+        ("?", "help", 8),
+        ("Esc", "back to sessions", 9),
+    ]);
+    let render = |keys: &[(&str, &str, u8)]| {
+        let mut spans = Vec::new();
+        for (i, (key, label, _)) in keys.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw("  "));
+            }
+            spans.push(Span::styled(
+                key.to_string(),
+                Style::default().fg(theme.hint),
+            ));
+            spans.push(Span::styled(
+                format!(" {label}"),
+                Style::default().fg(theme.dimmed),
+            ));
+        }
+        Line::from(spans)
+    };
+    let mut line = render(&keys);
+    while line.width() > width && keys.len() > 1 {
+        let lowest = keys
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (_, _, rank))| *rank)
+            .map_or(0, |(at, _)| at);
+        keys.remove(lowest);
+        line = render(&keys);
+    }
+    line
+}
+
+/// Every key the exposed view takes, with what it does.
+fn help_shortcuts(is_tunnel: bool) -> Vec<(&'static str, &'static str)> {
+    let mut shortcuts = vec![
+        ("↑↓  j k", "Select a paired device."),
+        ("x", "Revoke the selected device (press twice)."),
+        ("u", "Let locked-out IPs try pairing again."),
+        ("w", "Show the browser link and QR code."),
+        ("Tab", "Show the next URL, when there are several."),
+        ("e", "Change exposure: this machine, LAN, internet."),
+        ("r", "Restart the server, ending sessions (twice)."),
+    ];
+    if is_tunnel {
+        shortcuts.push(("g", "New passphrase and restart (press twice)."));
+    }
+    shortcuts.extend([
+        ("?", "Show or hide this help."),
+        ("Esc  q", "Back to sessions; the server keeps running."),
+    ]);
+    shortcuts
+}
+
+fn render_help_overlay(frame: &mut Frame, area: Rect, theme: &Theme, mode: Exposure) {
+    let is_tunnel = mode == Exposure::Tunnel;
+    let key_width = 9;
+    let mut lines: Vec<Line> = help_shortcuts(is_tunnel)
+        .into_iter()
+        .map(|(key, desc)| {
+            Line::from(vec![
+                Span::styled(format!("{key:key_width$}"), Style::default().fg(theme.hint)),
+                Span::styled(desc, Style::default().fg(theme.text)),
+            ])
+        })
+        .collect();
+    if is_tunnel {
+        lines.push(Line::from(""));
+        lines.push(Line::styled(
+            "The passphrase is a second factor for the tunnel",
+            Style::default().fg(theme.dimmed),
+        ));
+        lines.push(Line::styled(
+            "and persists across restarts.",
+            Style::default().fg(theme.dimmed),
+        ));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::styled(
+        "Press any key to close",
+        Style::default().fg(theme.dimmed),
+    ));
+    let width = lines.iter().map(Line::width).max().unwrap_or(0) as u16 + 4;
+    let dialog_area = centered(area, width, lines.len() as u16 + 2);
     frame.render_widget(Clear, dialog_area);
     let block = Block::default()
         .style(Style::default().bg(theme.background))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme.border))
-        .title(" Remote Access Help ")
-        .title_style(
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        );
-    let inner = block.inner(dialog_area);
-    frame.render_widget(block, dialog_area);
-
-    let mut shortcuts: Vec<(&str, &str)> = Vec::new();
-    if is_tunnel {
-        shortcuts.push(("G", "New random passphrase and restart server"));
-    }
-    shortcuts.extend([
-        ("R", "Restart server (clears all client sessions)"),
-        ("S", "Stop server, return to mode picker"),
-        ("Tab", "Cycle URLs (when multiple available)"),
-        ("Esc / q", "Close this view (server keeps running)"),
-        ("?", "Toggle this help"),
-    ]);
-
-    let mut lines: Vec<Line> = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            "Keyboard Shortcuts",
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-    ];
-    for (key, desc) in &shortcuts {
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {:14}", key), Style::default().fg(theme.waiting)),
-            Span::styled(*desc, Style::default().fg(theme.text)),
-        ]));
-    }
-    lines.push(Line::from(""));
-    if is_tunnel {
-        lines.extend([
-            Line::from(Span::styled(
-                "About the passphrase",
-                Style::default()
-                    .fg(theme.accent)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                "  Second factor for internet-exposed tunnels.",
-                Style::default().fg(theme.text),
-            )),
-            Line::from(Span::styled(
-                "  Persists across stop/start. Press G to rotate.",
-                Style::default().fg(theme.text),
-            )),
-        ]);
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "  Press any key to close",
-        Style::default().fg(theme.dimmed),
-    )));
-
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+        .padding(Padding::horizontal(1))
+        .title(Line::styled(
+            " Remote Access Keys ",
+            Style::default().fg(theme.accent).bold(),
+        ));
+    frame.render_widget(Paragraph::new(lines).block(block), dialog_area);
 }
 
 /// Split a URL of the form `https://host/?token=XYZ` into a "clean" base
@@ -2425,9 +2252,9 @@ fn render_error(frame: &mut Frame, area: Rect, theme: &Theme, msg: &str) {
         chunks[0],
     );
     let keybinds = if error_mentions_tailscale(msg) {
-        "[S] Force-stop daemon    [R] Reset tailscale funnel    [Enter] Close"
+        "[R] Reset tailscale funnel    [Enter] Close"
     } else {
-        "[S] Force-stop daemon    [Enter] Close"
+        "[Enter] Close"
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -2595,79 +2422,273 @@ const PASSPHRASE_WORDS: &[&str] = &[
 ];
 
 #[cfg(test)]
-mod qr_seam {
+mod active_screen {
     use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    /// Unicode half-blocks the QR renderer draws with. Their presence is the
-    /// only way to tell a rendered code from an empty panel.
-    const QR_GLYPHS: [char; 3] = ['\u{2588}', '\u{2580}', '\u{2584}'];
+    const TOKEN_URL: &str = "http://192.168.1.42:8081/?token=abc123def456";
 
-    fn active_screen() -> String {
-        let urls = vec![ServeUrl {
-            label: Some("lan".to_string()),
-            url: "http://192.168.1.42:8080/?t=abc123def456".to_string(),
-        }];
-        let mut term = Terminal::new(TestBackend::new(72, 26)).expect("terminal");
-        term.draw(|f| {
-            render_active(
-                f,
-                f.area(),
-                &Theme::default(),
-                ServeMode::Local,
-                &urls,
-                0,
-                None,
-                std::time::Duration::from_secs(42),
-                None,
-            )
-        })
-        .expect("draw");
-        let buf = term.backend().buffer().clone();
-        (0..buf.area.height)
-            .map(|y| {
-                (0..buf.area.width)
-                    .map(|x| buf[(x, y)].symbol())
-                    .collect::<String>()
+    struct Setup {
+        width: u16,
+        height: u16,
+        url: String,
+        show_web: bool,
+        qr: String,
+        panel: super::super::pairing::PairingPanel,
+        mode: Exposure,
+    }
+
+    fn setup(width: u16, height: u16) -> Setup {
+        Setup {
+            width,
+            height,
+            url: TOKEN_URL.to_string(),
+            show_web: false,
+            qr: String::new(),
+            panel: super::super::pairing::PairingPanel::ready("K7F-3QX", &["laptop"]),
+            mode: Exposure::Network,
+        }
+    }
+
+    /// A stand-in the size of the QR a tokenized LAN URL draws.
+    fn fake_qr() -> String {
+        vec!["█".repeat(45); 23].join("\n")
+    }
+
+    impl Setup {
+        fn draw(&self) -> (String, Rect) {
+            let urls = vec![ServeUrl {
+                label: Some("lan".to_string()),
+                url: self.url.clone(),
+            }];
+            let mut term =
+                Terminal::new(TestBackend::new(self.width, self.height)).expect("terminal");
+            term.draw(|f| {
+                render_active(
+                    f,
+                    f.area(),
+                    &Theme::default(),
+                    &ActiveModel {
+                        mode: self.mode,
+                        urls: &urls,
+                        url_index: 0,
+                        passphrase: Some("amber copper navy teal"),
+                        elapsed: Duration::from_secs(42),
+                        pending_confirm: None,
+                        pairing: Some(&self.panel),
+                        show_web: self.show_web,
+                        flash: None,
+                        qr: &self.qr,
+                    },
+                )
             })
-            .collect::<Vec<_>>()
-            .join("\n")
+            .expect("draw");
+            let buf = term.backend().buffer().clone();
+            let rows: Vec<String> = (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect();
+            let top = rows.iter().position(|r| r.contains('╭')).expect("card");
+            let bottom = rows.iter().rposition(|r| r.contains('╰')).expect("card");
+            let left = rows[top].chars().position(|c| c == '╭').unwrap_or(0);
+            let right = rows[top].chars().position(|c| c == '╮').unwrap_or(0);
+            let card = Rect::new(
+                left as u16,
+                top as u16,
+                (right - left + 1) as u16,
+                (bottom - top + 1) as u16,
+            );
+            (rows.join("\n"), card)
+        }
     }
 
-    /// The URL is what a user needs off this screen, so it must survive the
-    /// QR being compiled out. Without the dashboard bundle the code is not
-    /// drawn (nothing would answer a scan of it), and the layout must absorb
-    /// the missing rows rather than leaving a gap or panicking on a
-    /// zero-height chunk.
+    fn position(screen: &str, needle: &str) -> usize {
+        screen
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} missing:\n{screen}"))
+    }
+
+    fn inner_rows(screen: &str, card: Rect) -> Vec<String> {
+        screen
+            .lines()
+            .skip(card.y as usize + 1)
+            .take(card.height.saturating_sub(2) as usize)
+            .map(|row| {
+                row.chars()
+                    .skip(card.x as usize + 1)
+                    .take(card.width.saturating_sub(2) as usize)
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// At every size the card reads status, then the code and its steps,
+    /// then devices, with described hints; nothing is clipped and it carries
+    /// no stretch of empty rows.
     #[test]
-    fn active_screen_keeps_the_url_and_drops_the_code_without_web() {
-        let screen = active_screen();
-        assert!(
-            screen.contains("http://192.168.1.42:8080/?t=abc123def456"),
-            "URL must render in both feature corners:\n{screen}"
+    fn the_card_reads_in_order_at_every_size_without_dead_space() {
+        for (width, height) in [(60, 20), (100, 30), (140, 40)] {
+            let (screen, card) = setup(width, height).draw();
+            let order = [
+                "● Sharing on local network · 192.168.1.42:8081",
+                "Pair a device",
+                "K 7 F - 3 Q X",
+                "1. On the other machine run",
+                "aoe remote add 192.168.1.42:8081",
+                "2. Enter the code above when it asks",
+                "Paired devices",
+                "laptop  192.168.1.9 · seen 2m ago",
+            ];
+            let positions: Vec<usize> = order.iter().map(|n| position(&screen, n)).collect();
+            assert!(
+                positions.windows(2).all(|w| w[0] < w[1]),
+                "{width}x{height}:\n{screen}"
+            );
+            for hint in ["? help", "Esc back to sessions", "x revoke laptop"] {
+                position(&screen, hint);
+            }
+            assert!(
+                !screen.contains('…'),
+                "clipped at {width}x{height}:\n{screen}"
+            );
+            let rows = inner_rows(&screen, card);
+            let blank = rows.iter().filter(|r| r.trim().is_empty()).count();
+            assert!(
+                blank <= 4,
+                "{blank} blank rows at {width}x{height}:\n{screen}"
+            );
+            assert!(
+                !rows
+                    .windows(2)
+                    .any(|w| w[0].trim().is_empty() && w[1].trim().is_empty()),
+                "{width}x{height}:\n{screen}"
+            );
+            assert!(card.width <= width && card.height <= height);
+        }
+        let roomy = setup(100, 30).draw().0;
+        position(
+            &roomy,
+            "Other aoe clients on this network can connect once paired.",
         );
-        let drawn = screen.chars().any(|c| QR_GLYPHS.contains(&c));
-        assert_eq!(
-            drawn,
-            cfg!(feature = "web"),
-            "QR code should be drawn only with the dashboard bundle:\n{screen}"
+        position(
+            &roomy,
+            "e change exposure: localhost only, local network, or internet",
         );
     }
 
-    /// A QR-less screen offering a bare URL reads as a dashboard link, and a
-    /// browser following it gets a bodiless 404. Both the title and the panel
-    /// have to say the endpoint is API-only, and neither may say it in a build
-    /// that does embed the bundle.
+    #[test]
+    fn devices_show_an_empty_state_an_armed_revoke_and_lockouts() {
+        let mut empty = setup(100, 30);
+        empty.panel = super::super::pairing::PairingPanel::ready("K7F-3QX", &[]);
+        let screen = empty.draw().0;
+        position(&screen, "No devices paired yet.");
+        assert!(!screen.contains("revoke"), "{screen}");
+
+        let mut armed = setup(100, 30);
+        armed
+            .panel
+            .handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        position(&armed.draw().0, "press x again to revoke laptop");
+
+        let mut locked = setup(100, 30);
+        locked.panel = super::super::pairing::PairingPanel::ready("K7F-3QX", &["laptop"])
+            .with_lockout("100.89.98.53", 725);
+        let screen = locked.draw().0;
+        let lockout = position(&screen, "100.89.98.53 locked out · 12m left  u unblock");
+        assert!(lockout < position(&screen, "K 7 F - 3 Q X"), "{screen}");
+        position(&screen, "u unblock IPs");
+    }
+
+    /// The QR sits beside pairing when both fit; otherwise it waits behind `w`,
+    /// which swaps the card to the link and QR.
+    #[test]
+    fn the_qr_sits_beside_pairing_when_it_fits_and_behind_w_when_not() {
+        let mut wide = setup(140, 40);
+        wide.qr = fake_qr();
+        let (screen, card) = wide.draw();
+        let row = screen
+            .lines()
+            .find(|row| row.contains("Pair a device"))
+            .expect("pairing row");
+        assert!(row.contains('█'), "beside:\n{screen}");
+        assert!(card.width < 140, "{screen}");
+
+        let mut narrow = setup(100, 30);
+        narrow.qr = fake_qr();
+        let screen = narrow.draw().0;
+        assert!(!screen.contains('█'), "{screen}");
+        position(&screen, "w show QR");
+        narrow.show_web = true;
+        let screen = narrow.draw().0;
+        position(&screen, "Browser or phone");
+        position(&screen, "w back to pairing");
+        assert!(!screen.contains("Pair a device"), "{screen}");
+    }
+
+    /// The card is wide enough for a real token URL to stand on one line,
+    /// and still folds it when the terminal is narrow.
+    #[test]
+    fn a_token_url_stands_on_one_line_when_the_terminal_has_room() {
+        let url = format!("http://192.168.1.42:8081/?token={}", "a1b2c3d4".repeat(8));
+        let mut wide = setup(140, 40);
+        wide.url.clone_from(&url);
+        wide.show_web = true;
+        let (screen, card) = wide.draw();
+        position(&screen, &url);
+        assert!(card.width <= 140, "{screen}");
+
+        let mut narrow = setup(100, 30);
+        narrow.url.clone_from(&url);
+        narrow.show_web = true;
+        let (screen, card) = narrow.draw();
+        assert!(!screen.contains(&url), "folded when narrow:\n{screen}");
+        assert!(card.width <= 100, "{screen}");
+    }
+
+    /// A tunnel adds its passphrase to the link section.
+    #[test]
+    fn a_tunnel_shows_its_passphrase_with_the_link() {
+        let mut tunnel = setup(100, 30);
+        tunnel.mode = Exposure::Tunnel;
+        let screen = tunnel.draw().0;
+        position(&screen, "Passphrase amber copper navy teal");
+        position(&screen, "Sharing over the internet");
+    }
+
+    /// Without the bundle the title and the link section say the endpoint is
+    /// API-only, since a browser following the link gets a 404.
     #[test]
     fn active_screen_says_api_only_without_web() {
-        let screen = active_screen();
-        for needle in ["Remote API Access", "No dashboard bundle in this build:"] {
+        let screen = setup(120, 40).draw().0;
+        for needle in ["Remote API Access", "This build has no dashboard"] {
             assert_eq!(
                 screen.contains(needle),
                 !cfg!(feature = "web"),
-                "{needle:?} belongs on the screen only without the dashboard bundle:\n{screen}"
+                "{needle:?}:\n{screen}"
             );
+        }
+    }
+
+    #[test]
+    fn the_client_command_is_the_short_address_and_never_loopback() {
+        for (url, expected) in [
+            (
+                "http://192.168.1.20:54321/?token=abc123",
+                Some("aoe remote add 192.168.1.20:54321"),
+            ),
+            (
+                "https://aoe-mini.tailnet.ts.net/?token=abc123",
+                Some("aoe remote add aoe-mini.tailnet.ts.net"),
+            ),
+            ("http://127.0.0.1:54321/?token=abc123", None),
+            ("http://[::1]:54321/", None),
+        ] {
+            assert_eq!(client_command(url).as_deref(), expected, "{url}");
         }
     }
 }
@@ -2759,95 +2780,14 @@ mod tests {
         assert_eq!(format_elapsed(Duration::from_secs(3600 + 120)), "1h 02m");
     }
 
-    #[test]
-    fn append_new_log_lines_initial_read() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("debug.log");
-        std::fs::write(&path, "first line\nsecond line\n").unwrap();
-
-        let mut tail: Vec<String> = Vec::new();
-        let mut offset: u64 = 0;
-        let grew = append_new_log_lines_from(&path, &mut tail, &mut offset);
-        assert!(grew);
-        assert_eq!(tail, vec!["first line", "second line"]);
-        assert_eq!(offset, std::fs::metadata(&path).unwrap().len());
-    }
-
-    #[test]
-    fn append_new_log_lines_detects_growth_and_truncation() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("debug.log");
-
-        // Seed.
-        std::fs::write(&path, "one\ntwo\n").unwrap();
-        let mut tail: Vec<String> = Vec::new();
-        let mut offset: u64 = 0;
-        assert!(append_new_log_lines_from(&path, &mut tail, &mut offset));
-        assert_eq!(tail, vec!["one", "two"]);
-        let after_seed_offset = offset;
-
-        // Append only.
-        std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
-        assert!(append_new_log_lines_from(&path, &mut tail, &mut offset));
-        assert_eq!(tail, vec!["one", "two", "three"]);
-        assert!(offset > after_seed_offset);
-
-        // No growth → no change.
-        let before = offset;
-        assert!(!append_new_log_lines_from(&path, &mut tail, &mut offset));
-        assert_eq!(offset, before);
-
-        // Truncation (daemon restart): file shrank, tail resets.
-        std::fs::write(&path, "fresh\n").unwrap();
-        assert!(append_new_log_lines_from(&path, &mut tail, &mut offset));
-        assert_eq!(tail, vec!["fresh"]);
-    }
-
-    #[test]
-    fn append_new_log_lines_clamps_to_max_lines() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("debug.log");
-
-        // Write well over LOG_TAIL_LINES.
-        let mut big = String::new();
-        for i in 0..(LOG_TAIL_LINES + 50) {
-            big.push_str(&format!("line {}\n", i));
-        }
-        std::fs::write(&path, big).unwrap();
-
-        let mut tail: Vec<String> = Vec::new();
-        let mut offset: u64 = 0;
-        assert!(append_new_log_lines_from(&path, &mut tail, &mut offset));
-        assert_eq!(tail.len(), LOG_TAIL_LINES);
-        assert_eq!(
-            tail.last().unwrap(),
-            &format!("line {}", LOG_TAIL_LINES + 49)
-        );
-    }
-
-    // These tests share the module-global LAST_SPAWNED_PASSPHRASE, so they
-    // are combined into one #[test] to avoid cross-test interference when
-    // cargo runs them in parallel. Uses the in-memory helpers so we don't
-    // touch the user's real serve.passphrase file during `cargo test`.
+    // The only test touching the module-global LAST_SPAWNED_PASSPHRASE;
+    // the in-memory helpers keep it off the real serve.passphrase file.
     #[test]
     fn passphrase_cache_roundtrip() {
-        forget_passphrase_in_memory();
-        assert_eq!(recall_passphrase_in_memory(), None);
-
-        remember_passphrase("four word diceware phrase");
-        assert_eq!(
-            recall_passphrase_in_memory().as_deref(),
-            Some("four word diceware phrase")
-        );
-
-        remember_passphrase("a different phrase later");
-        assert_eq!(
-            recall_passphrase_in_memory().as_deref(),
-            Some("a different phrase later")
-        );
-
-        forget_passphrase_in_memory();
-        assert_eq!(recall_passphrase_in_memory(), None);
+        for passphrase in ["four word diceware phrase", "a different phrase later"] {
+            remember_passphrase(passphrase);
+            assert_eq!(recall_passphrase_in_memory().as_deref(), Some(passphrase));
+        }
     }
 
     #[test]
@@ -2873,84 +2813,117 @@ mod tests {
         assert_eq!(token, Some("abc123"));
     }
 
-    /// Exercises the fit logic that the render path uses: full URL on
-    /// one line when it fits, split when it doesn't. Copies the arithmetic
-    /// from render_active (url_inner_width = dialog_width - 4).
-    fn url_fits_one_line(url: &str, dialog_width: u16) -> bool {
-        let url_prefix = "URL: ";
-        let full_url_len = url_prefix.chars().count() + url.chars().count();
-        let url_inner_width = dialog_width.saturating_sub(4).max(1) as usize;
-        full_url_len <= url_inner_width
-    }
-
-    #[test]
-    fn url_fits_one_line_on_wide_terminal() {
-        // Typical tunnel URL: ~115 chars including "URL: " prefix.
-        let url = "https://foo-bar.trycloudflare.com/?token=a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
-        assert!(
-            url_fits_one_line(url, 120),
-            "120-wide should fit ~115 chars"
-        );
-        assert!(
-            url_fits_one_line(url, 115),
-            "exact-fit boundary should pass"
-        );
-    }
-
-    #[test]
-    fn url_splits_on_narrow_terminal() {
-        // 80-col terminal can't fit the combined tunnel URL; force the
-        // split fallback so the token doesn't clip off the edge.
-        let url = "https://foo-bar.trycloudflare.com/?token=a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
-        assert!(!url_fits_one_line(url, 80));
-        // Local URL is shorter (~70 with token) — depends on IP/port.
-        let local = "http://192.168.1.42:54321/?token=a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
-        assert!(!url_fits_one_line(local, 80));
-        assert!(url_fits_one_line(local, 110));
-    }
-
-    #[test]
-    fn serve_mode_file_token_roundtrip() {
-        assert_eq!(ServeMode::from_file_token("local"), Some(ServeMode::Local));
-        assert_eq!(
-            ServeMode::from_file_token("tunnel"),
-            Some(ServeMode::Tunnel)
-        );
-        // Trailing newline (the way the server writes it) still parses.
-        assert_eq!(
-            ServeMode::from_file_token("local\n"),
-            Some(ServeMode::Local)
-        );
-        assert_eq!(ServeMode::from_file_token("garbage"), None);
-        assert_eq!(ServeMode::from_file_token(""), None);
-    }
-
     #[test]
     fn diagnose_daemon_exit_recognizes_common_errnos() {
-        // Tailscale drop on Local: EADDRNOTAVAIL
-        let hint = diagnose_daemon_exit(
-            "ERROR: bind: Cannot assign requested address",
-            ServeMode::Local,
-        );
-        assert!(hint.contains("interface"));
-        // Same errno in Tunnel is not actionable in the same way, so we
-        // don't surface a hint.
-        assert_eq!(
-            diagnose_daemon_exit(
-                "ERROR: bind: Cannot assign requested address",
-                ServeMode::Tunnel,
+        let unavailable = "ERROR: bind: Cannot assign requested address";
+        for (log, target, needle) in [
+            (unavailable, Exposure::Network, Some("interface")),
+            (unavailable, Exposure::Tunnel, None),
+            ("Address already in use", Exposure::Network, Some("port")),
+            ("Permission denied", Exposure::Tunnel, Some("permission")),
+            ("some unrelated line", Exposure::Network, None),
+        ] {
+            let hint = diagnose_daemon_exit(log, target);
+            match needle {
+                Some(needle) => assert!(hint.contains(needle), "{log:?}: {hint:?}"),
+                None => assert_eq!(hint, "", "{log:?}"),
+            }
+        }
+    }
+
+    fn picker(current: Option<Exposure>) -> ServeView {
+        ServeView {
+            state: ServeViewState::Picker {
+                selected: current.unwrap_or(Exposure::Localhost),
+                current,
+                local_url: None,
+                tunnel_available: false,
+                network_address: None,
+                flash: None,
+            },
+            pending_passphrase: "pass".into(),
+            pending_confirm: None,
+            show_help: false,
+            pairing: None,
+            show_web: false,
+            flash: None,
+        }
+    }
+
+    fn press(view: &mut ServeView, code: KeyCode) {
+        view.handle_key(KeyEvent::new(code, crossterm::event::KeyModifiers::NONE));
+    }
+
+    /// Unavailable or unchanged exposures explain themselves instead of
+    /// restarting the daemon.
+    #[test]
+    fn picker_refuses_unusable_choices_without_restarting() {
+        for (current, keys, flash) in [
+            (
+                Some(Exposure::Localhost),
+                vec![KeyCode::Enter],
+                "Already reachable from this machine only.",
             ),
-            ""
-        );
-        // Port-in-use
-        assert!(diagnose_daemon_exit("Address already in use", ServeMode::Local).contains("port"));
-        // Permission denied on privileged port
-        assert!(diagnose_daemon_exit("Permission denied", ServeMode::Tunnel).contains("permission"));
-        // No match
+            (
+                Some(Exposure::Localhost),
+                vec![KeyCode::Down, KeyCode::Enter],
+                "No non-loopback network interface available.",
+            ),
+            (
+                None,
+                vec![KeyCode::Char('3')],
+                "Install tailscale or cloudflared to enable Tunnel mode.",
+            ),
+        ] {
+            let mut view = picker(current);
+            for key in keys {
+                press(&mut view, key);
+            }
+            let ServeViewState::Picker {
+                flash: Some((message, _)),
+                ..
+            } = &view.state
+            else {
+                panic!("expected a flash on the picker for {current:?}");
+            };
+            assert_eq!(message, flash);
+        }
+    }
+
+    /// A rebuilt binary only takes over once the daemon restarts, so the
+    /// picker offers one. It costs every session its connection, so the first
+    /// press only asks.
+    #[test]
+    fn picker_restart_asks_before_it_replaces_the_daemon() {
+        let mut view = picker(Some(Exposure::Localhost));
+        press(&mut view, KeyCode::Char('r'));
+        assert!(matches!(view.state, ServeViewState::Picker { .. }));
         assert_eq!(
-            diagnose_daemon_exit("some unrelated line", ServeMode::Local),
-            ""
+            view.pending_confirm.map(|(action, _)| action),
+            Some(PendingConfirm::Restart)
         );
+
+        press(&mut view, KeyCode::Char('r'));
+        // No async runtime in a unit test, so the restart reports that rather
+        // than reaching the daemon; either way the picker is left behind.
+        assert!(!matches!(view.state, ServeViewState::Picker { .. }));
+    }
+
+    #[test]
+    fn picker_navigation_stays_in_bounds() {
+        let mut view = picker(Some(Exposure::Localhost));
+        let selected = |view: &ServeView| match &view.state {
+            ServeViewState::Picker { selected, .. } => *selected,
+            _ => panic!("left the picker"),
+        };
+        press(&mut view, KeyCode::Up);
+        assert_eq!(selected(&view), Exposure::Localhost);
+        for _ in 0..4 {
+            press(&mut view, KeyCode::Down);
+        }
+        assert_eq!(selected(&view), Exposure::Tunnel);
+        press(&mut view, KeyCode::Tab);
+        assert_eq!(selected(&view), Exposure::Localhost);
     }
 
     // ── read_serve_urls ───────────────────────────────────────────────────
@@ -3023,102 +2996,26 @@ localhost\thttp://localhost:54321/?token=abc\n";
         assert_eq!(out[1].url, "http://no-label-here/");
     }
 
-    // ── load_or_generate_port ────────────────────────────────────────────
-    //
-    // The real function reads from $APP_DIR/serve.last_port, which we can't
-    // control in unit tests. These tests exercise the same parse + validate
-    // + generate logic via a small shim that mirrors the function's core.
-
-    /// Mirrors load_or_generate_port's logic against an arbitrary directory
-    /// so we can test without touching the real app dir.
-    fn load_or_generate_port_from(dir: &std::path::Path) -> u16 {
-        let port_path = dir.join("serve.last_port");
-        if let Ok(raw) = std::fs::read_to_string(&port_path) {
-            if let Ok(port) = raw.trim().parse::<u16>() {
-                if port >= 49152 {
-                    return port;
-                }
+    /// Help names every key the exposed view takes and still fits the
+    /// smallest supported terminal.
+    #[test]
+    fn help_lists_every_key_and_fits_a_small_terminal() {
+        for tunnel in [false, true] {
+            let keys: Vec<&str> = help_shortcuts(tunnel).iter().map(|(k, _)| *k).collect();
+            for key in ["↑↓  j k", "x", "u", "w", "Tab", "e", "r", "?", "Esc  q"] {
+                assert!(keys.contains(&key), "{key} missing: {keys:?}");
             }
+            assert_eq!(keys.contains(&"g"), tunnel);
         }
-        let port: u16 = rand::rng().random_range(49152..65535);
-        let _ = std::fs::write(&port_path, port.to_string());
-        port
-    }
-
-    #[test]
-    fn load_or_generate_port_generates_and_persists() {
-        let tmp = tempfile::tempdir().unwrap();
-        let port = load_or_generate_port_from(tmp.path());
-        assert!(port >= 49152, "generated port should be in ephemeral range");
-        // File was written
-        let raw = std::fs::read_to_string(tmp.path().join("serve.last_port")).unwrap();
-        assert_eq!(raw, port.to_string());
-    }
-
-    #[test]
-    fn load_or_generate_port_reuses_persisted() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("serve.last_port"), "55555").unwrap();
-        let port = load_or_generate_port_from(tmp.path());
-        assert_eq!(port, 55555);
-    }
-
-    #[test]
-    fn load_or_generate_port_rejects_low_port() {
-        let tmp = tempfile::tempdir().unwrap();
-        // A port below the ephemeral range should be ignored and regenerated.
-        std::fs::write(tmp.path().join("serve.last_port"), "8080").unwrap();
-        let port = load_or_generate_port_from(tmp.path());
-        assert!(port >= 49152, "low port should be rejected: got {}", port);
-    }
-
-    #[test]
-    fn load_or_generate_port_handles_garbage_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("serve.last_port"), "not-a-number\n").unwrap();
-        let port = load_or_generate_port_from(tmp.path());
-        assert!(port >= 49152, "garbage content should be regenerated");
-    }
-
-    /// The help overlay has a fixed width. Every shortcut line must fit
-    /// within `dialog_width - borders(2) - padding(0)` columns so text
-    /// doesn't clip. This test catches the bug before it ships.
-    #[test]
-    fn help_overlay_text_fits_within_dialog_width() {
-        let dialog_width: usize = 72;
-        // Inner width = dialog_width - 2 (left/right border)
-        let inner_width = dialog_width - 2;
-        let key_col: usize = 14; // format!("{:14}", key)
-        let indent: usize = 2; // leading "  "
-
-        // All possible shortcut descriptions (union of Tunnel + Local)
-        let descriptions = [
-            "New random passphrase and restart server",
-            "Restart server (clears all client sessions)",
-            "Stop server, return to mode picker",
-            "Cycle URLs (when multiple available)",
-            "Close this view (server keeps running)",
-            "Toggle this help",
-            // Section headers and other lines
-            "Keyboard Shortcuts",
-            "About the passphrase",
-            "Second factor for internet-exposed tunnels.",
-            "Persists across stop/start. Press G to rotate.",
-            "Press any key to close",
-        ];
-
-        for desc in descriptions {
-            let line_len = indent + key_col + desc.len();
-            assert!(
-                line_len <= inner_width,
-                "Help text clips: {:?} needs {} cols but only {} available \
-                 (dialog_width={}, inner={})",
-                desc,
-                line_len,
-                inner_width,
-                dialog_width,
-                inner_width,
-            );
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
+        term.draw(|f| render_help_overlay(f, f.area(), &Theme::default(), Exposure::Tunnel))
+            .unwrap();
+        let buf = term.backend().buffer().clone();
+        let screen: String = (0..20)
+            .map(|y| (0..60).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n")
+            .collect();
+        for (_, desc) in help_shortcuts(true) {
+            assert!(screen.contains(desc), "{desc:?} clipped:\n{screen}");
         }
     }
 }

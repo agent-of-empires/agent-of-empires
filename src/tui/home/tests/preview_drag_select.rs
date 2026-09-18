@@ -74,6 +74,7 @@ fn stage_live_send(env: &mut TestEnv) {
         target: crate::tui::home::live_send::LiveSendTarget::Agent,
         exit_chords: Vec::new(),
         leader: None,
+        remote: None,
     });
 }
 
@@ -734,6 +735,7 @@ fn full_render_pipeline_captures_copy_text_after_finalize() {
         target: crate::tui::home::live_send::LiveSendTarget::Agent,
         exit_chords: Vec::new(),
         leader: None,
+        remote: None,
     });
 
     env.view.preview_cache.content = "alpha beta gamma\nsecond line\nthird line\n".to_string();

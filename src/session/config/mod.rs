@@ -726,6 +726,8 @@ pub enum GroupByMode {
     Manual,
     Project,
     Org,
+    /// One section per machine: this one, then each `aoe remote`.
+    Remote,
 }
 
 impl GroupByMode {
@@ -733,7 +735,8 @@ impl GroupByMode {
         match self {
             GroupByMode::Manual => GroupByMode::Project,
             GroupByMode::Project => GroupByMode::Org,
-            GroupByMode::Org => GroupByMode::Manual,
+            GroupByMode::Org => GroupByMode::Remote,
+            GroupByMode::Remote => GroupByMode::Manual,
         }
     }
 
@@ -742,6 +745,7 @@ impl GroupByMode {
             GroupByMode::Manual => "Manual",
             GroupByMode::Project => "Project",
             GroupByMode::Org => "Org",
+            GroupByMode::Remote => "Remote",
         }
     }
 }
@@ -955,20 +959,6 @@ pub struct SessionConfig {
     #[serde(default)]
     #[setting(label = "Show system health strip", widget = "toggle")]
     pub show_diagnostics_pane: bool,
-
-    /// Read the session state the `aoe serve` daemon owns (structured session
-    /// status) from the running daemon, the way the web dashboard does, instead
-    /// of from the local session store. With no daemon running the sidebar uses
-    /// the local store alone and daemon-owned state keeps its last value. Off
-    /// keeps the sidebar on the local store only.
-    #[serde(default = "default_true")]
-    #[setting(
-        label = "Daemon-sourced sidebar",
-        widget = "toggle",
-        global_only,
-        advanced
-    )]
-    pub daemon_sidebar: bool,
 
     /// Forward AoE's whole environment to host sessions instead of just the
     /// desktop vars (DISPLAY, XDG_*, DBUS). Lets vars like GOPATH reach an
@@ -1731,7 +1721,6 @@ impl Default for SessionConfig {
             yolo_mode_default: false,
             pre_trust_agent_folders: false,
             show_diagnostics_pane: false,
-            daemon_sidebar: true,
             inherit_host_environment: false,
             agent_extra_args: HashMap::new(),
             agent_command_override: HashMap::new(),
@@ -3264,22 +3253,30 @@ fn config_save_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+pub(super) fn read_optional_config(path: &std::path::Path) -> Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(content) => Ok(Some(content)),
+        // A missing file is optional; a broken link or an unreadable path is not.
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && fs::symlink_metadata(path)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 impl Config {
-    /// Read and parse `config.toml` into a raw `toml::Table`, with the
-    /// stale `app_state` section stripped. Shared prelude for [`Config::load`]
-    /// and [`Config::config_ignored_keys`]; keeping the read + strip in one
-    /// place stops the ignored-key probe from ever flagging a section `load`
-    /// silently drops.
+    /// Read config.toml without the obsolete inline app_state table.
     fn load_raw_table() -> Result<toml::Table> {
         let path = config_path()?;
-        let mut table: toml::Table = if path.exists() {
-            toml::from_str(&fs::read_to_string(&path)?)?
-        } else {
-            toml::Table::new()
+        let mut table: toml::Table = match read_optional_config(&path)? {
+            Some(content) => toml::from_str(&content)?,
+            None => toml::Table::new(),
         };
-        // `app_state` now lives in state.toml; strip any stale key left over
-        // from before the split (or written by an out-of-date peer) so it
-        // never shadows the authoritative source below.
+        // state.toml is authoritative even if an older peer writes inline state.
         table.remove("app_state");
         Ok(table)
     }
@@ -3398,10 +3395,9 @@ impl AppStateConfig {
     /// `[app_state]` table). A missing file deserializes to defaults.
     pub fn load() -> Result<Self> {
         let path = state_path()?;
-        let table: toml::Table = if path.exists() {
-            toml::from_str(&fs::read_to_string(&path)?)?
-        } else {
-            toml::Table::new()
+        let table: toml::Table = match read_optional_config(&path)? {
+            Some(content) => toml::from_str(&content)?,
+            None => toml::Table::new(),
         };
         Ok(table.try_into()?)
     }
@@ -3417,16 +3413,15 @@ impl AppStateConfig {
 /// concurrent writer's unrelated edits survive, and the TUI and an `aoe serve`
 /// daemon (or any two `aoe` processes) can call this concurrently without
 /// losing an update. Symlinked `state.toml` files are resolved and written
-/// through, the same as every other `locked_update` file.
+/// through the resolved target protected by `LockedDataFile`.
 pub fn update_app_state<R>(f: impl FnOnce(&mut AppStateConfig) -> R) -> Result<R> {
-    let outcome = super::storage::locked_update(
-        &state_path()?,
+    let outcome = super::storage::LockedDataFile::open(&state_path()?)?.update(
         |content| Ok(content.parse::<toml::Table>()?.try_into()?),
         |state| Ok(toml::to_string_pretty(&toml::Table::try_from(state)?)?),
         |state| -> std::result::Result<R, std::convert::Infallible> { Ok(f(state)) },
     )?;
     match outcome {
-        Ok(result) => Ok(result),
+        Ok((result, _)) => Ok(result),
         Err(never) => match never {},
     }
 }

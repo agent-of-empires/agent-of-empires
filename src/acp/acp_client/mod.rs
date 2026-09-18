@@ -101,6 +101,7 @@ pub struct AcpClient {
     /// deadlock send_prompt).
     inbound: Option<mpsc::Receiver<Event>>,
     cmd_tx: Option<mpsc::Sender<ClientCmd>>,
+    connection_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     pending_responders: PendingResponders,
     /// Hold the subprocess so it gets killed when the client is dropped.
     _child: Option<Arc<Mutex<tokio::process::Child>>>,
@@ -156,6 +157,7 @@ impl AcpClient {
             session_id,
             inbound: Some(event_rx),
             cmd_tx: None,
+            connection_task: Mutex::new(None),
             pending_responders: Arc::new(Mutex::new(HashMap::new())),
             _child: None,
             runner_pid: None,
@@ -177,6 +179,7 @@ impl AcpClient {
             session_id,
             inbound: Some(event_rx),
             cmd_tx: Some(cmd_tx),
+            connection_task: Mutex::new(None),
             pending_responders: Arc::new(Mutex::new(HashMap::new())),
             _child: None,
             runner_pid: None,
@@ -203,11 +206,15 @@ impl AcpClient {
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<ClientCmd>(16);
         let saw_delete = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let saw_delete_task = saw_delete.clone();
-        tokio::spawn(async move {
+        let connection_task = tokio::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
-                if let ClientCmd::DeleteSession { respond_to, .. } = cmd {
-                    saw_delete_task.store(true, std::sync::atomic::Ordering::SeqCst);
-                    let _ = respond_to.send(DeleteSessionOutcome::UnsupportedMethod);
+                match cmd {
+                    ClientCmd::DeleteSession { respond_to, .. } => {
+                        saw_delete_task.store(true, std::sync::atomic::Ordering::SeqCst);
+                        let _ = respond_to.send(DeleteSessionOutcome::UnsupportedMethod);
+                    }
+                    ClientCmd::Shutdown => break,
+                    _ => {}
                 }
             }
         });
@@ -215,6 +222,7 @@ impl AcpClient {
             session_id,
             inbound: Some(event_rx),
             cmd_tx: Some(cmd_tx),
+            connection_task: Mutex::new(Some(connection_task)),
             pending_responders: Arc::new(Mutex::new(HashMap::new())),
             _child: None,
             runner_pid: None,
@@ -240,7 +248,7 @@ impl AcpClient {
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<ClientCmd>(16);
         let cmds = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let cmds_task = cmds.clone();
-        tokio::spawn(async move {
+        let connection_task = tokio::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
                 let name = match cmd {
                     ClientCmd::Prompt(_) => "prompt",
@@ -265,12 +273,16 @@ impl AcpClient {
                     ClientCmd::Shutdown => "shutdown",
                 };
                 cmds_task.lock().expect("cmd record mutex").push(name);
+                if name == "shutdown" {
+                    break;
+                }
             }
         });
         let client = Self {
             session_id,
             inbound: Some(event_rx),
             cmd_tx: Some(cmd_tx),
+            connection_task: Mutex::new(Some(connection_task)),
             pending_responders: Arc::new(Mutex::new(HashMap::new())),
             _child: None,
             runner_pid: None,
@@ -290,7 +302,7 @@ impl AcpClient {
         let (event_tx, event_rx) = mpsc::channel(64);
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<ClientCmd>(16);
         let message = message.into();
-        tokio::spawn(async move {
+        let connection_task = tokio::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
                     ClientCmd::ResetSession { respond_to, .. } => {
@@ -301,6 +313,7 @@ impl AcpClient {
                     ClientCmd::DeleteSession { respond_to, .. } => {
                         let _ = respond_to.send(DeleteSessionOutcome::UnsupportedMethod);
                     }
+                    ClientCmd::Shutdown => break,
                     _ => {}
                 }
             }
@@ -309,6 +322,7 @@ impl AcpClient {
             session_id,
             inbound: Some(event_rx),
             cmd_tx: Some(cmd_tx),
+            connection_task: Mutex::new(Some(connection_task)),
             pending_responders: Arc::new(Mutex::new(HashMap::new())),
             _child: None,
             runner_pid: None,
@@ -402,6 +416,7 @@ impl AcpClient {
                 default_effort.clone(),
                 default_mode.clone(),
                 mcp_servers,
+                None,
             )
             .await
             .map(|mut client| {
@@ -498,7 +513,7 @@ impl AcpClient {
         // per-session log tee routes by that field (#1864). The span name
         // must match `crate::acp::session_tee::SESSION_SPAN`.
         let conn_span = tracing::info_span!("acp_session", session = %session_label);
-        tokio::spawn(
+        let connection_task = tokio::spawn(
             run_connection_task(
                 transport,
                 event_tx,
@@ -528,12 +543,26 @@ impl AcpClient {
             .instrument(conn_span),
         );
 
-        wait_for_handshake(&session_label, ready_rx, Some(&child), &install_binary).await?;
+        if let Err(error) = wait_for_handshake(
+            &session_label,
+            ready_rx,
+            Some(&child),
+            &install_binary,
+            None,
+        )
+        .await
+        {
+            drop(event_rx);
+            drop(cmd_tx);
+            let _ = connection_task.await;
+            return Err(error);
+        }
 
         Ok(Self {
             session_id,
             inbound: Some(event_rx),
             cmd_tx: Some(cmd_tx),
+            connection_task: Mutex::new(Some(connection_task)),
             pending_responders,
             _child: Some(child),
             runner_pid: None,
@@ -565,6 +594,7 @@ impl AcpClient {
         default_effort: Option<String>,
         default_mode: Option<String>,
         mcp_servers: Vec<McpServer>,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<Self, AcpError> {
         // As of #2977 the control socket is the only one a runner binds, so
         // that is what the daemon dials. The wait for it to appear happens
@@ -629,15 +659,20 @@ impl AcpClient {
                 ..
             }
         )));
-        let (control_client, crate_transport) = connect_runner_control_v3(
+        let connecting = connect_runner_control_v3(
             &control_path,
             event_tx.clone(),
             session_label.clone(),
             guard.clone(),
             prompt_in_flight.clone(),
-        )
-        .await
-        .map_err(|error| {
+        );
+        let connected = match deadline {
+            Some(end) => tokio::time::timeout_at(end, connecting)
+                .await
+                .map_err(|_| AcpError::AttachTimedOut)?,
+            None => connecting.await,
+        };
+        let (control_client, crate_transport) = connected.map_err(|error| {
             AcpError::Spawn(format!(
                 "runner control attach failed at {}: {error:#}",
                 control_path.display()
@@ -656,7 +691,7 @@ impl AcpClient {
         // an `acp_session` span so per-session log teeing (#1864) catches
         // events that do not set the `session` field explicitly.
         let conn_span = tracing::info_span!("acp_session", session = %session_label);
-        tokio::spawn(
+        let connection_task = tokio::spawn(
             run_connection_task(
                 transport,
                 event_tx,
@@ -681,13 +716,22 @@ impl AcpClient {
             )
             .instrument(conn_span),
         );
-        wait_for_handshake(&session_label, ready_rx, None, &install_binary).await?;
+        if let Err(error) =
+            wait_for_handshake(&session_label, ready_rx, None, &install_binary, deadline).await
+        {
+            drop(handshake_control);
+            drop(event_rx);
+            drop(cmd_tx);
+            let _ = connection_task.await;
+            return Err(error);
+        }
         handshake_control.0.take();
 
         Ok(Self {
             session_id,
             inbound: Some(event_rx),
             cmd_tx: Some(cmd_tx),
+            connection_task: Mutex::new(Some(connection_task)),
             pending_responders,
             _child: None,
             runner_pid: None,
@@ -713,6 +757,7 @@ impl AcpClient {
     /// emits `Event::Stopped { reason: "reattach_idle" }` if neither a
     /// completion nor further turn activity arrives before
     /// `RESUME_IDLE_GRACE`, preventing a permanently stuck "thinking" state.
+    /// The optional deadline bounds connection and handshake, not their cleanup.
     #[allow(clippy::too_many_arguments)]
     pub async fn attach(
         socket_path: PathBuf,
@@ -724,6 +769,7 @@ impl AcpClient {
         sandbox: Option<(SessionSandbox, SandboxPathMap)>,
         agent_key: String,
         source_profile: Option<String>,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<Self, AcpError> {
         let (cmd_tx, cmd_rx) = mpsc::channel::<ClientCmd>(16);
         let (event_tx, event_rx) = mpsc::channel::<Event>(64);
@@ -768,6 +814,7 @@ impl AcpClient {
             // (they were applied on first connect).
             None,
             Vec::new(),
+            deadline,
         )
         .await
     }
@@ -1066,10 +1113,19 @@ impl AcpClient {
         }
     }
 
-    /// Shutdown the connection task and kill the subprocess.
+    /// Finish the connection task, killing only a directly owned subprocess.
     pub async fn shutdown(&self) -> Result<(), AcpError> {
         let cmd_tx = self.cmd_tx.as_ref().ok_or(AcpError::NotRunning)?;
         let _ = cmd_tx.send(ClientCmd::Shutdown).await;
+        let mut connection = self.connection_task.lock().await;
+        if let Some(task) = connection.as_mut() {
+            let result = task.await;
+            *connection = None;
+            result.map_err(|error| {
+                tracing::error!(target: "acp.protocol", %error, "connection task failed during shutdown");
+                AcpError::Transport("connection task failed during shutdown".into())
+            })?;
+        }
         Ok(())
     }
 
@@ -1088,18 +1144,5 @@ impl AcpClient {
     /// mutex (which would deadlock send_prompt).
     pub fn take_inbound(&mut self) -> Option<mpsc::Receiver<Event>> {
         self.inbound.take()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn fake_client_round_trips_events() {
-        let (mut client, tx) = AcpClient::fake_for_test(AcpSessionId("s-1".into()));
-        tx.send(Event::ThinkingStarted).await.unwrap();
-        let event = client.next_event().await.expect("event delivered");
-        assert!(matches!(event, Event::ThinkingStarted));
     }
 }

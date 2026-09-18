@@ -34,6 +34,7 @@ function renderPicker(over: { repoBases?: Record<string, string>; basesEnabled?:
   const onRepoBasesChange = vi.fn();
   const utils = render(
     <ExtraReposPicker
+      profile="default"
       primaryPath="/src/app"
       selectedPaths={["/src/api", "/src/web"]}
       onChange={onChange}

@@ -301,20 +301,16 @@ pub fn resolve_conflict(
     }
 }
 
-/// Parse the drift store under an exclusive sidecar lock, hand it to `f`, then
-/// persist the (possibly mutated) state atomically while still holding the
-/// lock. The lock serializes concurrent surface opens (web and TUI) so neither
-/// clobbers the other's snapshot; `locked_update` also keeps the store
-/// owner-only, which matters here because it holds the same plaintext secrets
-/// as the user's mcp.json and native configs.
+/// Commit under the sidecar lock, preserving peer edits and owner-only secrets.
 fn with_locked_state<R>(f: impl FnOnce(&mut McpState) -> R) -> Result<R> {
     let path = mcp_state_path()?;
-    crate::session::storage::locked_update(
-        &path,
-        |content| serde_json::from_str(content).context("parsing mcp_state.json"),
-        |state| Ok(serde_json::to_string_pretty(state)?),
-        |state| Ok::<_, anyhow::Error>(f(state)),
-    )?
+    crate::session::storage::LockedDataFile::open(&path)?
+        .update(
+            |content| serde_json::from_str(content).context("parsing mcp_state.json"),
+            |state| Ok(serde_json::to_string_pretty(state)?),
+            |state| Ok::<_, anyhow::Error>(f(state)),
+        )?
+        .map(|(result, _)| result)
 }
 
 #[cfg(test)]

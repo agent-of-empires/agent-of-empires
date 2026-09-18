@@ -15,6 +15,7 @@ mod info;
 mod intro;
 mod new_session;
 mod no_agents;
+mod pairing;
 mod permission_response;
 mod plugin_manager;
 mod profile_picker;
@@ -49,7 +50,9 @@ pub use hooks_install::HooksInstallDialog;
 pub use info::InfoDialog;
 pub use intro::{IntroDialog, IntroOutcome};
 pub(crate) use new_session::project_picker_label;
-pub use new_session::{NewSessionData, NewSessionDialog};
+pub use new_session::{
+    NewSessionData, NewSessionDialog, RemoteMachine, RemoteTarget, RemoteUnavailable,
+};
 pub use no_agents::{NoAgentsAction, NoAgentsDialog};
 pub use permission_response::{PermissionResponseChoice, PermissionResponseDialog};
 pub use plugin_manager::PluginManagerDialog;

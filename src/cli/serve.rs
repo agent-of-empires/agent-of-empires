@@ -3,7 +3,6 @@
 use anyhow::{bail, Context, Result};
 use clap::{Args, ValueEnum};
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 /// How the dashboard authenticates HTTP/WS requests.
 ///
@@ -35,8 +34,12 @@ impl AuthMode {
     }
 }
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 pub struct ServeArgs {
+    /// Serve the private local API without opening TCP or a dashboard.
+    #[arg(long, conflicts_with_all = ["remote", "behind_proxy", "port", "host", "auth", "no_auth", "open", "passphrase", "allowed_host", "allowed_origin"])]
+    pub core_only: bool,
+
     /// Port to listen on (default: 8080; debug builds default to 8081 so a
     /// `cargo run` instance does not collide with an installed release `aoe`).
     #[arg(long)]
@@ -149,7 +152,7 @@ pub struct ServeArgs {
 
     /// Require a passphrase for login (second-factor auth).
     /// Can also be set via AOE_SERVE_PASSPHRASE environment variable.
-    #[arg(long, env = "AOE_SERVE_PASSPHRASE")]
+    #[arg(long)]
     pub passphrase: Option<String>,
 
     /// Open the dashboard URL in the default browser once the server is ready.
@@ -169,17 +172,12 @@ pub struct ServeArgs {
     #[arg(long, hide = true)]
     pub daemon_child: bool,
 
-    /// Restart a running `aoe serve` daemon, replaying the host, port,
-    /// mode, and auth it was launched with (read from `serve.launch`).
-    /// The passphrase is recalled from `serve.passphrase` or
-    /// `AOE_SERVE_PASSPHRASE` before the old daemon is stopped, so a
-    /// passphrase-protected daemon is never left down.
-    /// Incompatible with the flags that would change the daemon's bind
-    /// config: that config comes from the persisted launch state.
+    /// Restart the running managed daemon with its recorded policy.
+    /// Missing credentials are rejected before stopping it.
     #[arg(
         long,
         conflicts_with_all = [
-            "stop", "daemon", "remote",
+            "stop", "status", "daemon", "daemon_child", "core_only", "remote", "rollback",
             "no_auth", "auth", "behind_proxy",
             "read_only", "cityhall", "passphrase", "port", "host",
             "tunnel_name", "no_tailscale", "tunnel_url", "open",
@@ -187,6 +185,15 @@ pub struct ServeArgs {
         ],
     )]
     pub restart: bool,
+
+    /// Restore the retained daemon policy after a failed replacement.
+    #[arg(long, conflicts_with_all = [
+        "stop", "status", "restart", "daemon", "daemon_child", "core_only",
+        "remote", "no_auth", "auth", "behind_proxy", "read_only", "cityhall",
+        "passphrase", "port", "host", "tunnel_name", "no_tailscale",
+        "tunnel_url", "open", "allowed_host", "allowed_origin",
+    ])]
+    pub rollback: bool,
 }
 
 impl ServeArgs {
@@ -428,20 +435,17 @@ pub fn pid_file_path() -> Result<PathBuf> {
 /// `AOE_SERVE_PASSPHRASE` at restart time.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ServeLaunch {
-    /// Informational only: nothing branches on it. Compatibility is handled
-    /// field by field instead (`#[serde(default)]` for fields added later, and
-    /// `launch_authorizes` accepting a record with no `instance_id`), which
-    /// keeps a record written by an older or newer build usable rather than
-    /// rejecting it wholesale.
     pub schema: u32,
     pub pid: u32,
     /// Absent in records written before instance IDs existed (schema 1).
     #[serde(default)]
     pub instance_id: Option<String>,
     pub profile: String,
+    pub core_only: bool,
     pub host: String,
     pub port: u16,
     pub auth_mode: AuthMode,
+    pub has_passphrase: bool,
     pub behind_proxy: bool,
     pub read_only: bool,
     /// CityHall client mode. Persisted so `--restart` and the `aoe update`
@@ -457,9 +461,12 @@ pub struct ServeLaunch {
     pub allowed_host: Vec<String>,
     #[serde(default)]
     pub allowed_origin: Vec<String>,
+    /// Preserve unknown options when a catalogue mutation only changes the profile.
+    #[serde(flatten)]
+    pub additional_fields: serde_json::Map<String, serde_json::Value>,
 }
 
-const SERVE_LAUNCH_SCHEMA: u32 = 2;
+const SERVE_LAUNCH_SCHEMA: u32 = 4;
 const SERVE_INSTANCE_ENV: &str = "AOE_SERVE_INSTANCE_ID";
 
 impl ServeLaunch {
@@ -469,9 +476,10 @@ impl ServeLaunch {
     /// is injected by the caller after recall.
     fn to_serve_args(&self, passphrase: Option<String>) -> ServeArgs {
         ServeArgs {
-            port: Some(self.port),
+            core_only: self.core_only,
+            port: (!self.core_only).then_some(self.port),
             host: self.host.clone(),
-            auth: Some(self.auth_mode),
+            auth: (!self.core_only).then_some(self.auth_mode),
             no_auth: false,
             behind_proxy: self.behind_proxy,
             read_only: self.read_only,
@@ -487,44 +495,141 @@ impl ServeLaunch {
             open: false,
             daemon_child: false,
             restart: false,
+            rollback: false,
             allowed_host: self.allowed_host.clone(),
             allowed_origin: self.allowed_origin.clone(),
         }
     }
 }
 
-/// True when relaunching this config requires a passphrase that must be
-/// recovered before the running daemon is stopped: remote mode mandates
-/// one, and `--auth=passphrase` is meaningless without it.
-fn launch_needs_passphrase(launch: &ServeLaunch) -> bool {
-    launch.remote || matches!(launch.auth_mode, AuthMode::Passphrase)
+fn launch_file(name: &str) -> Result<crate::session::ResolvedDataFile> {
+    crate::session::AnchoredDir::open(&crate::session::get_app_dir()?)?
+        .bind_file(std::ffi::OsStr::new(name))
 }
 
-fn serve_launch_path() -> Result<PathBuf> {
-    let dir = crate::session::get_app_dir()?;
-    Ok(dir.join("serve.launch"))
-}
-
-/// Write `serve.launch` with owner-only (0600) permissions: it records
-/// the daemon's bind host/port, tunnel URL, auth posture, and profile,
-/// which should not be world-readable on a shared machine.
 fn write_serve_launch(state: &ServeLaunch) -> Result<()> {
-    let path = serve_launch_path()?;
-    let json = serde_json::to_string_pretty(state)?;
-    std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
+    launch_file("serve.launch")?.replace(&serde_json::to_vec_pretty(state)?)
 }
 
 fn read_serve_launch() -> Result<ServeLaunch> {
-    let path = serve_launch_path()?;
-    let raw =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
+    let raw = launch_file("serve.launch")?
+        .read()?
+        .context("Missing daemon launch record")?;
+    serde_json::from_str(&raw).context("Invalid daemon launch record")
+}
+
+fn managed_launch(pid: u32) -> Result<ServeLaunch> {
+    let launch = read_serve_launch().context(
+        "No usable managed launch state; foreground and service-supervised daemons must be stopped by their manager",
+    )?;
+    anyhow::ensure!(
+        launch.schema == SERVE_LAUNCH_SCHEMA,
+        "Unsupported daemon launch schema"
+    );
+    let instance_is_live = launch
+        .instance_id
+        .as_deref()
+        .is_some_and(|instance| live_daemon_instance_matches(pid, instance));
+    anyhow::ensure!(
+        launch_authorizes(&launch, pid, instance_is_live),
+        "Refusing stale daemon launch state"
+    );
+    Ok(launch)
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RollbackPassphrase<S> {
+    pid: u32,
+    instance_id: Option<S>,
+    passphrase: Option<S>,
+}
+
+fn retain_rollback_launch(
+    _transaction: &crate::daemon::lifecycle::Transaction,
+    launch: &ServeLaunch,
+    passphrase: Option<&str>,
+) -> Result<()> {
+    anyhow::ensure!(
+        launch.has_passphrase == passphrase.is_some(),
+        "Incomplete rollback credentials"
+    );
+    let record = launch_file("serve.rollback.launch")?;
+    let secret = launch_file("serve.rollback.passphrase")?;
+    let credential = RollbackPassphrase {
+        pid: launch.pid,
+        instance_id: launch.instance_id.as_deref(),
+        passphrase,
+    };
+    // Both slots must commit before stopping the still-valid current launch.
+    secret.replace(&serde_json::to_vec(&credential)?)?;
+    record.replace(&serde_json::to_vec_pretty(launch)?)
+}
+
+async fn rollback_daemon() -> Result<()> {
+    let transaction = crate::daemon::lifecycle::Transaction::acquire().await?;
+    let launch: ServeLaunch = serde_json::from_str(
+        &launch_file("serve.rollback.launch")?
+            .read()?
+            .context("No retained daemon launch")?,
+    )
+    .context("Invalid retained daemon launch")?;
+    anyhow::ensure!(
+        launch.schema == SERVE_LAUNCH_SCHEMA,
+        "Unsupported retained launch schema"
+    );
+    let credential: RollbackPassphrase<String> = serde_json::from_str(
+        &launch_file("serve.rollback.passphrase")?
+            .read()?
+            .context("No retained daemon credentials")?,
+    )
+    .context("Invalid retained daemon credentials")?;
+    anyhow::ensure!(
+        credential.pid == launch.pid
+            && credential.instance_id == launch.instance_id
+            && credential.passphrase.is_some() == launch.has_passphrase,
+        "Retained credentials do not match the retained launch",
+    );
+    let args = launch.to_serve_args(credential.passphrase);
+    validate_launch_args(&launch.profile, &args).await?;
+    match daemon_status() {
+        DaemonStatus::Verified(pid) => {
+            managed_launch(pid)?;
+            stop_daemon_locked(&transaction, true).await?;
+        }
+        DaemonStatus::Unverified => bail!("Cannot verify the existing daemon; refusing rollback"),
+        DaemonStatus::Absent => {}
+    }
+    start_daemon(&launch.profile, &args, &transaction, true).await
+}
+
+pub(crate) struct LaunchProfileUpdates(Vec<(crate::session::ResolvedDataFile, Vec<u8>)>);
+
+impl LaunchProfileUpdates {
+    pub(crate) fn prepare(
+        _transaction: &crate::daemon::lifecycle::Transaction,
+        old_profile: &str,
+        new_profile: &str,
+    ) -> Result<Self> {
+        let mut updates = Vec::new();
+        for name in ["serve.launch", "serve.rollback.launch"] {
+            let file = launch_file(name)?;
+            let Some(raw) = file.read()? else { continue };
+            let mut launch: ServeLaunch =
+                serde_json::from_str(&raw).with_context(|| format!("Invalid {name}"))?;
+            if launch.profile == old_profile {
+                new_profile.clone_into(&mut launch.profile);
+                updates.push((file, serde_json::to_vec_pretty(&launch)?));
+            }
+        }
+        Ok(Self(updates))
+    }
+
+    pub(crate) fn commit(self) -> Result<()> {
+        for (file, content) in self.0 {
+            file.replace(&content)?;
+        }
+        Ok(())
+    }
 }
 
 /// Whether this launch record authorizes aoe to restart the process at `pid`.
@@ -590,25 +695,17 @@ fn live_daemon_instance_matches(pid: u32, instance_id: &str) -> bool {
         .is_some_and(|output| environment_has_daemon_instance(&output.stdout, instance_id))
 }
 
-/// Recall the daemon passphrase for a restart: the plaintext
-/// `serve.passphrase` file the server writes while running first,
-/// then the `AOE_SERVE_PASSPHRASE` env override. Returns None when
-/// neither yields a non-empty value.
-fn recall_serve_passphrase() -> Option<String> {
-    if let Ok(dir) = crate::session::get_app_dir() {
-        if let Ok(raw) = std::fs::read_to_string(dir.join("serve.passphrase")) {
-            let trimmed = raw.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
+fn recall_serve_passphrase(launch: &ServeLaunch) -> Result<Option<String>> {
+    if !launch.has_passphrase {
+        return Ok(None);
     }
-    if let Ok(p) = std::env::var("AOE_SERVE_PASSPHRASE") {
-        if !p.is_empty() {
-            return Some(p);
-        }
-    }
-    None
+    let passphrase = launch_file("serve.passphrase")?
+        .read()?
+        .or_else(|| std::env::var("AOE_SERVE_PASSPHRASE").ok())
+        .context(
+            "Cannot restart: the recorded passphrase is unavailable; leaving the daemon untouched",
+        )?;
+    Ok(Some(passphrase))
 }
 
 /// One URL we can show in the Active state. Tunnel mode has a public primary
@@ -659,37 +756,6 @@ pub fn read_serve_urls() -> Vec<ServeUrl> {
         }
     }
     out
-}
-
-/// Cached read of `$APP_DIR/serve.mode`, keyed on the current daemon
-/// PID. The status bar calls this on every render frame; without
-/// caching, that's a syscall + file read per frame just to compute a
-/// one-word label. We re-read the mode file only when the PID changes
-/// (daemon restart, fresh spawn), which is exactly when the mode could
-/// have changed.
-///
-/// Returns `None` when no daemon is running OR when the mode file is
-/// missing/unparseable. Callers can treat both cases the same way:
-/// "show the generic Serving label, no mode tag."
-pub fn cached_serve_mode_label() -> Option<&'static str> {
-    static CACHE: Mutex<Option<(u32, Option<&'static str>)>> = Mutex::new(None);
-
-    let pid = daemon_pid()?;
-    if let Ok(mut guard) = CACHE.lock() {
-        if let Some((cached_pid, cached_label)) = *guard {
-            if cached_pid == pid {
-                return cached_label;
-            }
-        }
-        let label = read_serve_mode_label();
-        *guard = Some((pid, label));
-        label
-    } else {
-        // Lock poisoned (only happens if a previous holder panicked
-        // while reading the file); fall back to a fresh read so the
-        // status bar still works.
-        read_serve_mode_label()
-    }
 }
 
 fn read_serve_mode_label() -> Option<&'static str> {
@@ -886,6 +952,40 @@ pub fn daemon_pid() -> Option<u32> {
     }
 }
 
+async fn validate_launch_args(profile: &str, args: &ServeArgs) -> Result<AuthMode> {
+    crate::session::require_known_profile(profile)?;
+    let auth_mode = if args.core_only {
+        AuthMode::None
+    } else {
+        resolve_auth_mode(args.auth, args.no_auth)
+    };
+    validate_auth_combination(
+        auth_mode,
+        args.passphrase.is_some(),
+        host_is_localhost(&args.host),
+        args.behind_proxy,
+        args.remote,
+        &args.host,
+    )?;
+    validate_behind_proxy_allowlist(args.behind_proxy, args.remote, &args.allowed_host)?;
+    validate_allowed_hosts(&args.allowed_host)?;
+    validate_allowed_origins(&args.allowed_origin)?;
+    if args.tunnel_name.is_some() && args.tunnel_url.is_none() {
+        bail!("Named tunnels require --tunnel-url to specify the hostname");
+    }
+    if args.remote {
+        if args.passphrase.is_none() {
+            bail!("Remote exposure requires --passphrase or AOE_SERVE_PASSPHRASE");
+        }
+        let tailscale_ok =
+            tokio::task::spawn_blocking(crate::server::tunnel::tailscale_available_sync).await?;
+        if cloudflared_required(args.no_tailscale, args.tunnel_name.is_some(), tailscale_ok) {
+            tokio::task::spawn_blocking(crate::server::tunnel::check_cloudflared).await??;
+        }
+    }
+    Ok(auth_mode)
+}
+
 #[tracing::instrument(target = "cli.serve", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
     if args.stop {
@@ -900,68 +1000,39 @@ pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
         return restart_daemon().await;
     }
 
-    // A fresh start files sessions under `profile`; the lifecycle verbs
-    // above never read it. Refuse an unknown name before any side effect
-    // (#148).
-    crate::session::require_known_profile(profile)?;
+    if args.rollback {
+        return rollback_daemon().await;
+    }
+    let transaction = if args.daemon_child {
+        crate::daemon::lifecycle::Transaction::receive()?
+    } else {
+        crate::daemon::lifecycle::Transaction::acquire().await?
+    };
 
-    // Resolve CityHall mode once: the `--cityhall` flag and the
-    // `AOE_CITYHALL_MODE` env var are equivalent. `main` already seeded the env
-    // var from the flag (before the tokio worker pool), so this is a pure read
-    // that folds the env var back into `args.cityhall` for the child spawn +
-    // ServeLaunch; the env-driven readers (`AppState`, `profile_config`, the
-    // banner) already agree. See #7.
+    if !args.core_only && args.passphrase.is_none() {
+        args.passphrase = std::env::var("AOE_SERVE_PASSPHRASE").ok();
+    }
     args.cityhall = args.cityhall || std::env::var_os("AOE_CITYHALL_MODE").is_some();
 
-    // A fresh start with `aoe.web` disabled never reaches here: `main` rejects
-    // it as an unrecognized subcommand before dispatch (the lifecycle verbs
-    // above are exempt so a running daemon can always be brought down).
-
-    // Refuse to start a second instance (daemon or foreground) while another
-    // aoe serve is already running. Without this gate, a foreground
-    // `aoe serve` would overwrite the existing daemon's PID file in the
-    // non-daemon write below before its own port-bind eventually failed; the
-    // post-exit cleanup would then delete the (now-foreground) PID file and
-    // orphan the real daemon.
-    //
-    // Skip the bail if the PID file already points to our own process: that
-    // means we are the daemonized child that start_daemon() just spawned and
-    // pre-populated the file for, not a competing instance.
-    if let Some(existing) = daemon_pid() {
-        if existing != std::process::id() {
-            bail!(
-                "aoe serve daemon already running (PID {}).\n\n  \
-                 Status:  aoe serve --status\n  \
-                 Open UI: aoe url\n  \
-                 Stop:    aoe serve --stop",
-                existing
-            );
-        }
-    }
-
+    let auth_mode = validate_launch_args(profile, &args).await?;
     let is_localhost = host_is_localhost(&args.host);
+    let predecessor = match daemon_status() {
+        DaemonStatus::Verified(pid) if pid != std::process::id() => {
+            let launch = managed_launch(pid)?;
+            if launch_exposure(&launch) != Exposure::Localhost
+                || args.core_only
+                || args.daemon_child
+            {
+                bail!("aoe serve daemon already running (PID {pid}); use --restart or --stop");
+            }
+            Some(launch)
+        }
+        DaemonStatus::Unverified => {
+            bail!("Cannot verify the existing daemon; refusing replacement")
+        }
+        _ => None,
+    };
 
-    let auth_mode = resolve_auth_mode(args.auth, args.no_auth);
-
-    validate_auth_combination(
-        auth_mode,
-        args.passphrase.is_some(),
-        is_localhost,
-        args.behind_proxy,
-        args.remote,
-        &args.host,
-    )?;
-
-    validate_behind_proxy_allowlist(args.behind_proxy, args.remote, &args.allowed_host)?;
-    validate_allowed_hosts(&args.allowed_host)?;
-    validate_allowed_origins(&args.allowed_origin)?;
-
-    // --behind-proxy + --remote is meaningless: --remote manages its
-    // own ingress, --behind-proxy assumes an external one. Warn but
-    // do not hard-fail; --remote wins for the tunnel-spawn decision
-    // and both set behind_tunnel anyway. Emit on both stderr (for
-    // foreground users) and the tracing pipeline (for daemon users
-    // whose stderr lands inside debug.log unread).
     if args.behind_proxy && args.remote {
         let msg = "--behind-proxy is ignored when --remote is set; \
              --remote already enables the equivalent cookie-Secure and \
@@ -970,34 +1041,7 @@ pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
         tracing::warn!(target: "serve", "{msg}");
     }
 
-    // Named tunnel requires --tunnel-url
-    if args.tunnel_name.is_some() && args.tunnel_url.is_none() {
-        bail!(
-            "Named tunnels require --tunnel-url to specify the hostname.\n\
-             Example: aoe serve --remote --tunnel-name my-tunnel --tunnel-url aoe.example.com\n\
-             \n\
-             Setup steps:\n\
-             1. cloudflared tunnel create my-tunnel\n\
-             2. Add a CNAME record: aoe.example.com -> <tunnel-id>.cfargotunnel.com\n\
-             3. aoe serve --remote --tunnel-name my-tunnel --tunnel-url aoe.example.com"
-        );
-    }
-
-    // Remote mode: check cloudflared (only when Tailscale Funnel can't carry the
-    // traffic) and force localhost binding. start_server() prefers Tailscale when
-    // it's available, so requiring cloudflared up front would falsely reject
-    // Tailscale-only setups (issue #813).
     let host = if args.remote {
-        let tailscale_ok =
-            tokio::task::spawn_blocking(crate::server::tunnel::tailscale_available_sync)
-                .await
-                .unwrap_or(false);
-        if cloudflared_required(args.no_tailscale, args.tunnel_name.is_some(), tailscale_ok) {
-            tokio::task::spawn_blocking(crate::server::tunnel::check_cloudflared)
-                .await
-                .map_err(|e| anyhow::anyhow!(e))??;
-        }
-        // Force localhost since the tunnel connects to localhost
         "127.0.0.1".to_string()
     } else {
         args.host.clone()
@@ -1058,22 +1102,17 @@ pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
         }
     }
 
-    // Block remote mode without passphrase
-    if args.remote && args.passphrase.is_none() {
-        bail!(
-            "Refusing to start in remote mode without a passphrase.\n\
-             --remote exposes terminal access to the internet.\n\
-             Add --passphrase <VALUE> or set AOE_SERVE_PASSPHRASE."
-        );
+    if let Some(launch) = predecessor {
+        let passphrase = recall_serve_passphrase(&launch)?;
+        retain_rollback_launch(&transaction, &launch, passphrase.as_deref())?;
+        stop_daemon_locked(&transaction, true).await?;
     }
 
     if args.daemon {
-        return start_daemon(profile, &args);
+        return start_daemon(profile, &args, &transaction, true).await;
     }
 
-    // Past the daemon fork, so exactly the process that serves applies the
-    // bundle, and before the server resolves any config, because the bundle can
-    // change every setting it is about to read.
+    let _lifetime = transaction.lifetime()?;
     apply_cityhall_bundle().await?;
 
     tracing::info!(
@@ -1092,23 +1131,27 @@ pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
         tracing::debug!(target: "serve.lifecycle", path = %path.display(), pid = std::process::id(), "wrote pid file");
     }
 
-    let result = crate::server::start_server(crate::server::ServerConfig {
-        profile,
-        host: &host,
-        port: args.resolved_port(),
-        auth_mode,
-        read_only: args.read_only,
-        remote: args.remote,
-        tunnel_name: args.tunnel_name.as_deref(),
-        tunnel_url: args.tunnel_url.as_deref(),
-        no_tailscale: args.no_tailscale,
-        is_daemon: false,
-        passphrase: args.passphrase.as_deref(),
-        behind_proxy: args.behind_proxy,
-        open_browser: args.open,
-        extra_allowed_hosts: args.allowed_host.clone(),
-        extra_allowed_origins: args.allowed_origin.clone(),
-    })
+    let result = crate::server::start_server(
+        crate::server::ServerConfig {
+            profile,
+            core_only: args.core_only,
+            host: &host,
+            port: args.resolved_port(),
+            auth_mode,
+            read_only: args.read_only,
+            remote: args.remote,
+            tunnel_name: args.tunnel_name.as_deref(),
+            tunnel_url: args.tunnel_url.as_deref(),
+            no_tailscale: args.no_tailscale,
+            is_daemon: args.daemon_child,
+            passphrase: args.passphrase.as_deref(),
+            behind_proxy: args.behind_proxy,
+            open_browser: args.open,
+            extra_allowed_hosts: args.allowed_host.clone(),
+            extra_allowed_origins: args.allowed_origin.clone(),
+        },
+        transaction,
+    )
     .await;
 
     // Clean up PID and URL files on exit, but only if the PID file
@@ -1198,14 +1241,15 @@ async fn apply_cityhall_bundle() -> Result<()> {
             return Ok(());
         }
         Err(e) => {
-            return Err(e.context(format!(
-                "fetching the CityHall config bundle from {url}. \
-                 The workspace has no cached configuration, so it cannot start."
-            )))
+            return Err(e.context(
+                "fetching the CityHall config bundle. The workspace has no cached configuration, so it cannot start.",
+            ))
         }
     };
 
-    let report = cityhall_bundle::apply(&CityHallBundle::from_toml(&raw)?)?;
+    let bundle = CityHallBundle::from_toml(&raw)
+        .map_err(|_| anyhow::anyhow!("Invalid CityHall config bundle"))?;
+    let report = cityhall_bundle::apply(&bundle)?;
     tracing::info!(
         target: "serve.cityhall",
         settings = report.settings_applied,
@@ -1227,47 +1271,244 @@ async fn apply_cityhall_bundle() -> Result<()> {
 }
 
 async fn fetch_cityhall_bundle(url: &str, token: &str) -> Result<String> {
-    let mut request = reqwest::Client::builder()
-        .timeout(BUNDLE_FETCH_TIMEOUT)
-        .build()?
-        .get(url);
-    if !token.is_empty() {
-        request = request.bearer_auth(token);
+    use crate::daemon::{self, ApiErrorCode, DaemonClientError};
+    let url = daemon::native_url(url)?;
+    let authorization = daemon::authorization_header((!token.is_empty()).then_some(token))?;
+    let client = daemon::native_http_client(&url, authorization.is_some(), false)?;
+    let mut request = client.get(url).timeout(BUNDLE_FETCH_TIMEOUT);
+    if let Some(authorization) = authorization {
+        request = request.header(reqwest::header::AUTHORIZATION, authorization);
     }
-    let response = request.send().await?;
+    let request = request.build().map_err(|_| DaemonClientError::Transport)?;
+    let response = daemon::transport::execute(&client, None, request).await?;
     let status = response.status();
     if !status.is_success() {
-        // On a first boot this error is fatal and is the only thing the operator
-        // sees, so carry CityHall's own explanation (bad token, wrong path, a
-        // validation message) instead of just the status.
-        let body = response.text().await.unwrap_or_default();
-        let body = body.trim();
-        if body.is_empty() {
-            bail!("CityHall returned HTTP {status}");
+        return Err(DaemonClientError::Status {
+            status,
+            code: ApiErrorCode::from_headers(status, response.headers(), false),
+            body: String::new(),
+            truncated: false,
         }
-        bail!(
-            "CityHall returned HTTP {status}: {}",
-            body.chars().take(300).collect::<String>()
-        );
+        .into());
     }
-    Ok(response.text().await?)
+    Ok(daemon::decode_text(response).await?)
 }
 
-fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
+/// Start the localhost baseline when no daemon runs, then verify the runtime.
+/// Every TUI has at least a loopback dashboard and the private socket.
+pub(crate) async fn ensure_local_daemon(
+    profile: &str,
+) -> Result<crate::acp::client::DaemonEndpoint> {
+    let transaction = crate::daemon::lifecycle::Transaction::acquire().await?;
+    if daemon_pid().is_none() {
+        let resolved_profile = crate::session::config::effective_profile(profile);
+        let profile = resolved_profile.as_str();
+        crate::session::require_known_profile(profile)?;
+        start_daemon(profile, &baseline_args(None)?, &transaction, false).await?;
+    }
+    let endpoint = crate::acp::client::DaemonEndpoint::local_unix(
+        crate::daemon::transport::local_socket_path()?,
+    );
+    anyhow::ensure!(
+        endpoint
+            .daemon_client()?
+            .local_runtime_ready((!profile.is_empty()).then_some(profile))
+            .await?,
+        "Local daemon runtime identity or profile readiness does not match"
+    );
+    Ok(endpoint)
+}
+
+/// `aoe serve --daemon` on loopback with token auth. `port` keeps a running
+/// daemon's port; otherwise the persisted baseline port is used.
+fn baseline_args(port: Option<u16>) -> Result<ServeArgs> {
+    use clap::Parser;
+    let port = port.unwrap_or_else(baseline_port).to_string();
+    let cli = crate::cli::Cli::try_parse_from(["aoe", "serve", "--daemon", "--port", &port])?;
+    let Some(crate::cli::Commands::Serve(args)) = cli.command else {
+        unreachable!()
+    };
+    Ok(args)
+}
+
+/// Port persisted in `serve.last_port`, so the localhost URL survives
+/// restarts. A random high port avoids a user's own server on 8080; a busy
+/// or missing one is replaced.
+fn baseline_port() -> u16 {
+    let Ok(dir) = crate::session::get_app_dir() else {
+        return random_high_port();
+    };
+    baseline_port_in(&dir, |port| {
+        std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+    })
+}
+
+fn baseline_port_in(dir: &std::path::Path, is_free: impl Fn(u16) -> bool) -> u16 {
+    let path = dir.join("serve.last_port");
+    if let Some(port) = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u16>().ok())
+        .filter(|port| *port >= 49152 && is_free(*port))
+    {
+        return port;
+    }
+    let port = (0..16)
+        .map(|_| random_high_port())
+        .find(|port| is_free(*port))
+        .unwrap_or_else(random_high_port);
+    let _ = std::fs::write(&path, port.to_string());
+    port
+}
+
+fn random_high_port() -> u16 {
+    use rand::RngExt;
+    rand::rng().random_range(49152..65535)
+}
+
+/// How far the running daemon is reachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Exposure {
+    /// Loopback TCP or the private socket only.
+    Localhost,
+    /// Every interface, token auth.
+    Network,
+    /// Public HTTPS tunnel with a passphrase.
+    Tunnel,
+}
+
+fn launch_exposure(launch: &ServeLaunch) -> Exposure {
+    if launch.remote {
+        Exposure::Tunnel
+    } else if launch.core_only || host_is_localhost(&launch.host) {
+        Exposure::Localhost
+    } else {
+        Exposure::Network
+    }
+}
+
+/// Exposure of the running daemon, or `None` when none runs. Daemons without
+/// a managed launch record fall back to `serve.mode` and `serve.url`.
+pub(crate) fn current_exposure() -> Option<Exposure> {
+    let pid = daemon_pid()?;
+    if let Some(launch) = read_serve_launch().ok().filter(|launch| launch.pid == pid) {
+        return Some(launch_exposure(&launch));
+    }
+    Some(match read_serve_mode_label() {
+        Some("tunnel" | "tailscale") => Exposure::Tunnel,
+        _ if read_serve_urls()
+            .iter()
+            .any(|url| matches!(url.label.as_deref(), Some("lan" | "tailscale"))) =>
+        {
+            Exposure::Network
+        }
+        _ => Exposure::Localhost,
+    })
+}
+
+/// Exposure the TUI asks for.
+pub(crate) enum ExposureRequest {
+    Localhost,
+    Network,
+    Tunnel {
+        cloudflare: bool,
+        passphrase: String,
+    },
+}
+
+/// Replace the running daemon with one exposed as requested, under one
+/// lifecycle transaction so no client can start a daemon in between. A failed
+/// exposed start restores the localhost baseline before reporting the error.
+pub(crate) async fn change_exposure(request: ExposureRequest) -> Result<()> {
+    let transaction = crate::daemon::lifecycle::Transaction::acquire().await?;
+    let current = match daemon_status() {
+        DaemonStatus::Verified(pid) => Some(managed_launch(pid)?),
+        DaemonStatus::Unverified => {
+            bail!("Cannot verify the existing daemon; refusing replacement")
+        }
+        DaemonStatus::Absent => None,
+    };
+    let profile = current
+        .as_ref()
+        .map(|launch| launch.profile.clone())
+        .unwrap_or_else(crate::session::config::resolve_default_profile);
+    let kept_port = current
+        .as_ref()
+        .filter(|launch| !launch.core_only)
+        .map(|launch| launch.port);
+    let mut baseline = baseline_args(kept_port)?;
+    if let Some(launch) = &current {
+        baseline.read_only = launch.read_only;
+        baseline.cityhall = launch.cityhall;
+        baseline.allowed_host.clone_from(&launch.allowed_host);
+        baseline.allowed_origin.clone_from(&launch.allowed_origin);
+    }
+    let mut args = baseline.clone();
+    let exposed = match request {
+        ExposureRequest::Localhost => false,
+        ExposureRequest::Network => {
+            args.host = "0.0.0.0".into();
+            true
+        }
+        ExposureRequest::Tunnel {
+            cloudflare,
+            passphrase,
+        } => {
+            args.remote = true;
+            args.no_tailscale = cloudflare;
+            args.passphrase = Some(passphrase);
+            true
+        }
+    };
+    validate_launch_args(&profile, &args).await?;
+    if let Some(launch) = &current {
+        // Rollback needs the old credentials; without them only rollback is lost.
+        if let Ok(passphrase) = recall_serve_passphrase(launch) {
+            retain_rollback_launch(&transaction, launch, passphrase.as_deref())?;
+        }
+        stop_daemon_locked(&transaction, false).await?;
+    }
+    match start_daemon(&profile, &args, &transaction, false).await {
+        Ok(()) => Ok(()),
+        Err(error) if exposed => {
+            start_daemon(&profile, &baseline, &transaction, false)
+                .await
+                .context("restoring the localhost daemon also failed")?;
+            Err(error.context("kept the daemon on localhost"))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn start_daemon(
+    profile: &str,
+    args: &ServeArgs,
+    transaction: &crate::daemon::lifecycle::Transaction,
+    announce: bool,
+) -> Result<()> {
     use std::process::{Command, Stdio};
+
+    let resolved_profile = profile
+        .is_empty()
+        .then(crate::session::config::resolve_default_profile);
+    let profile = resolved_profile.as_deref().unwrap_or(profile);
 
     let exe = std::env::current_exe()?;
     let instance_id = uuid::Uuid::new_v4().to_string();
     let mut cmd = Command::new(exe);
     cmd.env(SERVE_INSTANCE_ENV, &instance_id);
-    cmd.args([
-        "serve",
-        "--daemon-child",
-        "--port",
-        &args.resolved_port().to_string(),
-        "--host",
-        &args.host,
-    ]);
+    cmd.env_remove("AOE_CITYHALL_MODE")
+        .env_remove("AOE_SERVE_PASSPHRASE");
+    cmd.args(["serve", "--daemon-child"]);
+    if args.core_only {
+        cmd.arg("--core-only");
+    } else {
+        cmd.args([
+            "--port",
+            &args.resolved_port().to_string(),
+            "--host",
+            &args.host,
+        ]);
+    }
 
     if args.no_auth {
         cmd.arg("--no-auth");
@@ -1281,10 +1522,6 @@ fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
     if args.read_only {
         cmd.arg("--read-only");
     }
-    // Replay CityHall mode to the child explicitly (the child gets a fresh env,
-    // so relying on AOE_CITYHALL_MODE inheritance would drop it). The flag is
-    // seeded from the env var at `run` entry, so checking `args.cityhall` here
-    // covers both the flag and env invocations.
     if args.cityhall {
         cmd.arg("--cityhall");
     }
@@ -1314,7 +1551,7 @@ fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
         cmd.args(["--profile", profile]);
     }
 
-    cmd.stdin(Stdio::null());
+    cmd.stdin(transaction.handoff()?);
 
     // Create a new session so the daemon is not killed by SIGHUP when the
     // parent terminal closes. setsid() is async-signal-safe.
@@ -1355,7 +1592,7 @@ fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
         }
     }
 
-    let child = cmd.spawn()?;
+    let mut child = cmd.spawn()?;
     let pid = child.id();
 
     tracing::info!(
@@ -1368,24 +1605,20 @@ fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
         "daemon child spawned",
     );
 
-    // Write PID file
-    if let Ok(path) = pid_file_path() {
-        std::fs::write(&path, pid.to_string())?;
-        tracing::debug!(target: "serve.lifecycle", path = %path.display(), pid, "wrote pid file");
-    }
-
-    // Persist the launch state so `aoe serve --restart` and the
-    // post-update restart can replay this daemon's exact config. Mirrors
-    // the argv reconstruction above; the passphrase is deliberately left
-    // out (recalled from serve.passphrase / the env on restart).
     let launch = ServeLaunch {
         schema: SERVE_LAUNCH_SCHEMA,
         pid,
         instance_id: Some(instance_id),
         profile: profile.to_string(),
+        core_only: args.core_only,
         host: args.host.clone(),
         port: args.resolved_port(),
-        auth_mode: resolve_auth_mode(args.auth, args.no_auth),
+        auth_mode: if args.core_only {
+            AuthMode::None
+        } else {
+            resolve_auth_mode(args.auth, args.no_auth)
+        },
+        has_passphrase: args.passphrase.is_some(),
         behind_proxy: args.behind_proxy,
         read_only: args.read_only,
         cityhall: args.cityhall,
@@ -1395,27 +1628,58 @@ fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
         no_tailscale: args.no_tailscale,
         allowed_host: args.allowed_host.clone(),
         allowed_origin: args.allowed_origin.clone(),
+        additional_fields: serde_json::Map::new(),
     };
-    if let Err(e) = write_serve_launch(&launch) {
-        tracing::warn!(target: "serve.lifecycle", error = %e, "failed to write serve.launch");
+    if let Err(error) = write_serve_launch(&launch) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    let endpoint = crate::acp::client::DaemonEndpoint::local_unix(
+        crate::daemon::transport::local_socket_path()?,
+    );
+    let client = endpoint.daemon_client()?;
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        loop {
+            if let Some(status) = child.try_wait()? {
+                anyhow::bail!("Daemon exited before readiness: {status}");
+            }
+            if client
+                .local_runtime_ready(Some(profile))
+                .await
+                .unwrap_or(false)
+                && daemon_pid() == Some(pid)
+            {
+                return Ok::<(), anyhow::Error>(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    match ready {
+        Ok(Ok(())) => {}
+        result => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return match result {
+                Ok(Err(error)) => Err(error),
+                Err(_) => Err(anyhow::anyhow!("Daemon readiness timed out")),
+                Ok(Ok(())) => unreachable!(),
+            };
+        }
     }
 
-    println!("aoe serve started as daemon (PID {})", pid);
-    println!("Stop with: aoe serve --stop");
+    if announce {
+        println!("aoe serve started as daemon (PID {})", pid);
+        println!("Stop with: aoe serve --stop");
+    }
     Ok(())
 }
 
-/// Restart the running `aoe serve` daemon from its persisted launch state
-/// (`serve.launch`). Everything needed to relaunch is read into memory
-/// before the old daemon is stopped, because `stop_daemon` deletes
-/// `serve.passphrase`; a daemon that needs a passphrase is never killed
-/// without the means to bring it back. The replacement is spawned via
-/// `start_daemon`, which uses the current executable. That is correct
-/// both for a hand-run `aoe serve --restart` and for the post-update
-/// path, where `aoe update` re-execs the freshly installed binary as
-/// `aoe serve --restart` so the new code spawns the new daemon.
+/// Replay the managed launch with the current executable, retaining it before stop.
 #[tracing::instrument(target = "serve.lifecycle", skip_all)]
 pub async fn restart_daemon() -> Result<()> {
+    let transaction = crate::daemon::lifecycle::Transaction::acquire().await?;
     let Some(pid) = daemon_pid() else {
         bail!(
             "No running aoe serve daemon to restart.\n\
@@ -1423,63 +1687,27 @@ pub async fn restart_daemon() -> Result<()> {
         );
     };
 
-    let launch = read_serve_launch().map_err(|e| {
-        anyhow::anyhow!(
-            "Cannot restart: no usable launch state ({e}).\n\
-             This daemon was not started by `aoe serve --daemon`; foreground\n\
-             or service-supervised daemons must be restarted by their manager."
-        )
-    })?;
-
-    if launch.pid != pid {
-        bail!(
-            "serve.launch records PID {} but the running daemon is PID {}; \
-             refusing to restart stale state.",
-            launch.pid,
-            pid
-        );
-    }
-
-    // Recall the passphrase BEFORE stopping: stop_daemon() deletes
-    // serve.passphrase, so reading it afterwards would always fail.
-    let passphrase = recall_serve_passphrase();
-    if launch_needs_passphrase(&launch) && passphrase.is_none() {
-        bail!(
-            "Cannot restart: this daemon uses {} auth but no passphrase is \
-             recoverable (set AOE_SERVE_PASSPHRASE).\n\
-             Leaving the running daemon untouched.",
-            if launch.remote {
-                "remote"
-            } else {
-                "passphrase"
-            }
-        );
-    }
-
-    // Re-validate the persisted config before tearing anything down, so a
-    // config that can no longer start (e.g. policy changed) fails loudly
-    // instead of leaving the user with no daemon.
-    validate_auth_combination(
-        launch.auth_mode,
-        passphrase.is_some(),
-        host_is_localhost(&launch.host),
-        launch.behind_proxy,
-        launch.remote,
-        &launch.host,
-    )?;
-    validate_behind_proxy_allowlist(launch.behind_proxy, launch.remote, &launch.allowed_host)?;
-    validate_allowed_hosts(&launch.allowed_host)?;
-    validate_allowed_origins(&launch.allowed_origin)?;
-
+    let launch = managed_launch(pid)?;
+    let passphrase = recall_serve_passphrase(&launch)?;
     let args = launch.to_serve_args(passphrase);
+    validate_launch_args(&launch.profile, &args).await?;
+    retain_rollback_launch(&transaction, &launch, args.passphrase.as_deref())?;
 
     println!("Restarting aoe serve daemon (PID {pid})…");
-    stop_daemon().await?;
-    start_daemon(&launch.profile, &args)
+    stop_daemon_locked(&transaction, true).await?;
+    start_daemon(&launch.profile, &args, &transaction, true).await
 }
 
 #[tracing::instrument(target = "serve.shutdown", skip_all)]
 pub(crate) async fn stop_daemon() -> Result<()> {
+    let transaction = crate::daemon::lifecycle::Transaction::acquire().await?;
+    stop_daemon_locked(&transaction, true).await
+}
+
+async fn stop_daemon_locked(
+    transaction: &crate::daemon::lifecycle::Transaction,
+    announce: bool,
+) -> Result<()> {
     let path = pid_file_path()?;
 
     if !path.exists() {
@@ -1520,6 +1748,7 @@ pub(crate) async fn stop_daemon() -> Result<()> {
             );
         }
     }
+    let lifetime_owned = transaction.try_lifetime()?.is_none();
 
     // Send SIGTERM
     match nix::sys::signal::kill(
@@ -1527,22 +1756,33 @@ pub(crate) async fn stop_daemon() -> Result<()> {
         nix::sys::signal::Signal::SIGTERM,
     ) {
         Ok(()) => {
-            // Wait for the process to actually exit so the port is
-            // released before a new daemon can be spawned. Without
-            // this, closing the dialog and immediately reopening
-            // races with the dying daemon and can orphan it.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(7);
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                if lifetime_owned && transaction.try_lifetime()?.is_some() {
+                    break;
+                }
                 match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
                     Err(nix::errno::Errno::ESRCH) => break,
                     _ if std::time::Instant::now() >= deadline => {
-                        // Still alive after timeout; escalate.
-                        let _ = nix::sys::signal::kill(
+                        anyhow::ensure!(
+                            matches!(inspect_daemon_process(pid), DaemonProcessIdentity::Verified)
+                                && !serve_launch_contradicts(pid as u32),
+                            "Daemon identity changed during shutdown; refusing escalation"
+                        );
+                        nix::sys::signal::kill(
                             nix::unistd::Pid::from_raw(pid),
                             nix::sys::signal::Signal::SIGKILL,
-                        );
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        )?;
+                        let reap_deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(2);
+                        while lifetime_owned && transaction.try_lifetime()?.is_none() {
+                            anyhow::ensure!(
+                                std::time::Instant::now() < reap_deadline,
+                                "Daemon retained lifetime ownership after shutdown"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                        }
                         break;
                     }
                     _ => {}
@@ -1557,7 +1797,9 @@ pub(crate) async fn stop_daemon() -> Result<()> {
                 let _ = tokio::fs::remove_file(dir.join("serve.passphrase")).await;
                 let _ = tokio::fs::remove_file(dir.join("serve.launch")).await;
             }
-            println!("Stopped aoe serve daemon (PID {})", pid);
+            if announce {
+                println!("Stopped aoe serve daemon (PID {})", pid);
+            }
         }
         Err(nix::errno::Errno::ESRCH) => {
             // Process doesn't exist; clean up stale PID file
@@ -1568,7 +1810,9 @@ pub(crate) async fn stop_daemon() -> Result<()> {
                 let _ = tokio::fs::remove_file(dir.join("serve.passphrase")).await;
                 let _ = tokio::fs::remove_file(dir.join("serve.launch")).await;
             }
-            println!("Daemon was not running (stale PID file cleaned up)");
+            if announce {
+                println!("Daemon was not running (stale PID file cleaned up)");
+            }
         }
         Err(e) => bail!("Failed to stop daemon (PID {}): {}", pid, e),
     }
@@ -1590,7 +1834,6 @@ async fn print_status() -> Result<()> {
         match client.health_check().await {
             Ok(()) => {
                 println!("Daemon: reachable (remote via AOE_DAEMON_URL)");
-                println!("URL:    {}", endpoint.base_url);
                 println!(
                     "Token:  {}",
                     if endpoint.has_token() { "set" } else { "unset" }
@@ -1598,9 +1841,7 @@ async fn print_status() -> Result<()> {
                 Ok(())
             }
             Err(e) => bail!(
-                "AOE_DAEMON_URL is set but the daemon at {} is unreachable ({e}); \
-                 check the address or unset to use a local daemon",
-                endpoint.base_url
+                "AOE_DAEMON_URL is set but the daemon is unreachable ({e}); check the address or unset to use a local daemon"
             ),
         }
     } else {
@@ -1640,6 +1881,76 @@ fn print_local_status() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cityhall_refusal_cannot_reflect_the_bearer_into_errors() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let token = "cityhall-secret-for-reflection";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let read = stream.read(&mut request).await.unwrap();
+            assert!(read > 0, "the client must send its request");
+            stream.write_all(format!("HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{token}", token.len()).as_bytes()).await.unwrap();
+        });
+        let error = fetch_cityhall_bundle(&format!("http://{address}/api/cityhall/bundle"), token)
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert!(!format!("{error:#} {error:?}").contains(token));
+        assert!(
+            matches!(error.downcast_ref::<crate::daemon::DaemonClientError>(),
+            Some(crate::daemon::DaemonClientError::Status { status, .. }) if *status == reqwest::StatusCode::FORBIDDEN)
+        );
+    }
+
+    #[test]
+    fn baseline_port_reuses_a_free_persisted_port_and_replaces_others() {
+        for (persisted, busy, reused) in [
+            (Some("55555"), None, true),
+            (Some("55555"), Some(55555), false),
+            (Some("8080"), None, false),
+            (Some("not-a-number\n"), None, false),
+            (None, None, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            if let Some(raw) = persisted {
+                std::fs::write(dir.path().join("serve.last_port"), raw).unwrap();
+            }
+            let port = baseline_port_in(dir.path(), |port| Some(port) != busy);
+            assert!(port >= 49152, "{persisted:?}: {port}");
+            assert_eq!(port == 55555, reused, "{persisted:?} busy {busy:?}");
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("serve.last_port")).unwrap(),
+                if reused {
+                    "55555".to_string()
+                } else {
+                    port.to_string()
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn launch_exposure_classifies_bind_and_tunnel() {
+        let launch = |host: &str, core_only: bool, remote: bool| ServeLaunch {
+            host: host.into(),
+            core_only,
+            remote,
+            ..sample_launch()
+        };
+        for (launch, expected) in [
+            (launch("127.0.0.1", false, false), Exposure::Localhost),
+            (launch("0.0.0.0", true, false), Exposure::Localhost),
+            (launch("0.0.0.0", false, false), Exposure::Network),
+            (launch("192.168.1.20", false, false), Exposure::Network),
+            (launch("127.0.0.1", false, true), Exposure::Tunnel),
+        ] {
+            assert_eq!(launch_exposure(&launch), expected, "{launch:?}");
+        }
+    }
 
     #[test]
     fn cloudflared_skipped_when_tailscale_available_and_default_flags() {
@@ -1912,9 +2223,11 @@ mod tests {
             pid: 4242,
             instance_id: Some("instance-1".to_string()),
             profile: "work".to_string(),
+            core_only: false,
             host: "0.0.0.0".to_string(),
             port: 9090,
             auth_mode: AuthMode::Passphrase,
+            has_passphrase: true,
             behind_proxy: true,
             read_only: true,
             cityhall: true,
@@ -1924,6 +2237,7 @@ mod tests {
             no_tailscale: true,
             allowed_host: vec!["aoe.example.com".to_string()],
             allowed_origin: vec!["https://aoe.example.com:8443".to_string()],
+            additional_fields: serde_json::Map::new(),
         }
     }
 
@@ -2022,57 +2336,6 @@ mod tests {
                 "authorizes: {label}"
             );
         }
-    }
-
-    #[test]
-    fn serve_launch_json_round_trips() {
-        let launch = sample_launch();
-        let json = serde_json::to_string(&launch).expect("serialize");
-        let back: ServeLaunch = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back.pid, launch.pid);
-        assert_eq!(back.instance_id, launch.instance_id);
-        assert_eq!(back.profile, launch.profile);
-        assert_eq!(back.host, launch.host);
-        assert_eq!(back.port, launch.port);
-        assert_eq!(back.auth_mode, launch.auth_mode);
-        assert_eq!(back.behind_proxy, launch.behind_proxy);
-        assert_eq!(back.read_only, launch.read_only);
-        assert_eq!(back.cityhall, launch.cityhall);
-        assert_eq!(back.remote, launch.remote);
-        assert_eq!(back.tunnel_name, launch.tunnel_name);
-        assert_eq!(back.tunnel_url, launch.tunnel_url);
-        assert_eq!(back.no_tailscale, launch.no_tailscale);
-        assert_eq!(back.allowed_host, launch.allowed_host);
-        assert_eq!(back.allowed_origin, launch.allowed_origin);
-    }
-
-    #[test]
-    fn to_serve_args_replays_launch_config() {
-        let launch = sample_launch();
-        let args = launch.to_serve_args(Some("hunter2".to_string()));
-        // Bind config is replayed; auth goes through --auth, never the
-        // --no-auth alias; daemon mode is forced; the child markers and
-        // restart flag are cleared so re-entry does not loop.
-        assert_eq!(args.port, Some(9090));
-        assert_eq!(args.host, "0.0.0.0");
-        assert_eq!(args.auth, Some(AuthMode::Passphrase));
-        assert!(!args.no_auth);
-        assert!(args.behind_proxy);
-        assert!(args.read_only);
-        assert!(args.cityhall);
-        assert_eq!(args.tunnel_name.as_deref(), Some("named"));
-        assert_eq!(args.tunnel_url.as_deref(), Some("aoe.example.com"));
-        assert!(args.no_tailscale);
-        assert!(args.daemon);
-        assert!(!args.daemon_child);
-        assert!(!args.restart);
-        assert!(!args.stop);
-        assert_eq!(args.passphrase.as_deref(), Some("hunter2"));
-        assert_eq!(args.allowed_host, vec!["aoe.example.com".to_string()]);
-        assert_eq!(
-            args.allowed_origin,
-            vec!["https://aoe.example.com:8443".to_string()]
-        );
     }
 
     #[test]
@@ -2199,22 +2462,6 @@ mod tests {
     #[test]
     fn allowed_hosts_reject_empty() {
         assert!(validate_allowed_hosts(&["   ".to_string()]).is_err());
-    }
-
-    #[test]
-    fn launch_needs_passphrase_for_remote_and_passphrase_auth() {
-        let mut launch = sample_launch();
-        launch.auth_mode = AuthMode::Passphrase;
-        launch.remote = false;
-        assert!(launch_needs_passphrase(&launch));
-
-        launch.auth_mode = AuthMode::Token;
-        launch.remote = true;
-        assert!(launch_needs_passphrase(&launch));
-
-        launch.auth_mode = AuthMode::Token;
-        launch.remote = false;
-        assert!(!launch_needs_passphrase(&launch));
     }
 
     /// Parses real argv and dispatches like `main`, pinning which `serve`

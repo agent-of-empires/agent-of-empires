@@ -42,6 +42,7 @@ fn install_live_for_first_session(env: &mut TestEnv) -> String {
             crate::tui::home::live_send::DEFAULT_EXIT_CHORD,
         ),
         leader: None,
+        remote: None,
     });
     id
 }
@@ -59,6 +60,7 @@ fn install_live_orphan(env: &mut TestEnv) {
             crate::tui::home::live_send::DEFAULT_EXIT_CHORD,
         ),
         leader: None,
+        remote: None,
     });
 }
 
@@ -97,6 +99,20 @@ fn poll_live_send_takeover_exits_live_mode_with_dialog() {
         dialog.message().contains("took over"),
         "dialog must explain the takeover, got: {}",
         dialog.message()
+    );
+    // The notice guards the keyboard: keys typed for the pane before the
+    // take-over land on it, not on the session list.
+    env.view.handle_key(
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('d'),
+            crossterm::event::KeyModifiers::NONE,
+        ),
+        None,
+    );
+    assert!(env.view.confirm_dialog.is_none());
+    assert!(
+        env.view.info_dialog.is_some(),
+        "the notice stays until read"
     );
 }
 
@@ -275,14 +291,7 @@ fn drift_check_stays_when_retitle_did_not_rename_the_tmux_session() {
 #[test]
 #[serial]
 fn drift_check_does_not_exit_for_tool_target_named_via_tool_session() {
-    // Regression guard: the Tool arm of the drift check must resolve
-    // the current name the same way `prepare_live_send` computed
-    // `tmux_name` at entry (via `ToolSession::new(..).session_name()`).
-    // A prior bug instead re-derived the Tool arm's "current name"
-    // through `Session::generate_name`, the agent-pane naming scheme,
-    // which never matches a tool's own tmux name. That mismatch made
-    // every Tool-view live-send look "renamed" on its very first
-    // keystroke and auto-exit immediately.
+    // A tool's transport name must not be confused with the agent-pane name.
     let mut env = create_test_env_with_sessions(1);
     let id = env
         .view
@@ -298,6 +307,19 @@ fn drift_check_does_not_exit_for_tool_target_named_via_tool_session() {
         .session_name()
         .to_string();
     crate::tmux::test_inject_session_into_cache(&tmux_name);
+    env.view.mutate_instance(&id, |instance| {
+        instance
+            .auxiliary
+            .push(crate::session::AuxiliaryObservation {
+                target: crate::session::AuxiliaryTarget::Tool {
+                    tool_name: "lazygit".to_owned(),
+                },
+                pane: crate::session::PaneObservation {
+                    state: crate::session::PanePresence::Alive,
+                    tmux_session: Some("tool".into()),
+                },
+            });
+    });
     env.view.live_send = Some(LiveSendState {
         session_id: inst.id.clone(),
         title: inst.title,
@@ -307,6 +329,7 @@ fn drift_check_does_not_exit_for_tool_target_named_via_tool_session() {
             crate::tui::home::live_send::DEFAULT_EXIT_CHORD,
         ),
         leader: None,
+        remote: None,
     });
 
     env.view
@@ -655,11 +678,7 @@ fn accepted_capture_keeps_content_and_cursor_in_one_cache_frame() {
 #[test]
 #[serial]
 fn warm_predicates_stay_cold_without_a_live_pane() {
-    // The EnterLiveSend / SendMessage handlers skip the "Reviving
-    // session..." toast only when the target pane is provably warm; every
-    // uncertain case must stay cold so a real revive keeps its feedback.
-    // The unit fixture has no tmux server, so even a live-status row must
-    // report cold (pane existence is the load-bearing half).
+    // Only a confirmed live target may skip revival feedback.
     let mut env = create_test_env_with_sessions(1);
     let id = env
         .view
@@ -694,12 +713,32 @@ fn warm_predicates_stay_cold_without_a_live_pane() {
         );
     }
 
-    // Terminal-target warmth is keyed on the paired terminal pane, which
-    // the fixture also lacks: cold.
+    use crate::session::{AuxiliaryObservation, AuxiliaryTarget, PanePresence};
     env.view
-        .set_instance_status(&id, crate::session::Status::Idle);
+        .set_instance_status(&id, crate::session::Status::Stopped);
     env.view.pending_live_send_target = crate::tui::home::live_send::LiveSendTarget::Terminal;
     assert!(!env.view.live_entry_is_warm(&id));
+    for state in [
+        PanePresence::Absent,
+        PanePresence::Dead,
+        PanePresence::Unknown,
+        PanePresence::Alive,
+    ] {
+        env.view.mutate_instance(&id, |instance| {
+            instance.auxiliary = vec![AuxiliaryObservation {
+                target: AuxiliaryTarget::Host { index: 0 },
+                pane: crate::session::PaneObservation {
+                    state,
+                    tmux_session: Some("host".into()),
+                },
+            }];
+        });
+        assert_eq!(
+            env.view.live_entry_is_warm(&id),
+            state == PanePresence::Alive,
+            "{state:?}"
+        );
+    }
 }
 
 #[test]
@@ -961,7 +1000,7 @@ fn stale_observation_published_after_adoption_does_not_invalidate() {
 
 #[test]
 #[serial]
-fn fleet_reconcile_retries_expired_declines() {
+fn fleet_reconcile_parks_a_declined_session_until_its_geometry_changes() {
     let mut env = create_test_env_with_sessions(2);
     let ids: Vec<String> = env
         .view
@@ -985,29 +1024,22 @@ fn fleet_reconcile_retries_expired_declines() {
         .map(|&(_, cols, rows)| (cols, rows))
         .expect("armed epoch covers ids[1]");
 
-    // A decline older than the retry window reads as absent, so the
-    // session recovers once its blocking attach or size owner may have
-    // gone away, instead of staying parked until a geometry change.
-    let expired = std::time::Instant::now()
-        .checked_sub(
-            crate::tui::home::render::PASSIVE_DECLINE_RETRY + std::time::Duration::from_secs(1),
-        )
-        .expect("test clock predates the retry window");
-    env.view
-        .passive_pane_declined
-        .insert(ids[1].clone(), (want, expired));
-    env.view
-        .reconcile_passive_fleet(inner, false, Some(&selected));
-    assert!(env.view.passive_pane_queued.contains_key(&ids[1]));
-
-    // A fresh decline parks it again.
-    env.view.passive_pane_queued.clear();
+    // Another client owns that pane's size, so nothing re-asserts over it.
     env.view
         .passive_pane_declined
         .insert(ids[1].clone(), (want, std::time::Instant::now()));
     env.view
         .reconcile_passive_fleet(inner, false, Some(&selected));
     assert!(!env.view.passive_pane_queued.contains_key(&ids[1]));
+
+    // A different wanted geometry is a new question and is asked once.
+    env.view.passive_pane_declined.insert(
+        ids[1].clone(),
+        ((want.0 + 1, want.1), std::time::Instant::now()),
+    );
+    env.view
+        .reconcile_passive_fleet(inner, false, Some(&selected));
+    assert!(env.view.passive_pane_queued.contains_key(&ids[1]));
 }
 
 #[test]
@@ -1201,4 +1233,114 @@ mod paste_splitting {
         // would still flash through some agents' paste handlers.
         assert!(split_paste_for_live_send("").is_empty());
     }
+}
+
+#[test]
+fn tool_admission_rejects_reserved_rows_and_uses_fresh_configuration() {
+    use std::process::Command;
+    if std::env::var_os("AOE_TEST_TOOL_ADMISSION_CHILD").is_none() {
+        if !Command::new("tmux")
+            .arg("-V")
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return;
+        }
+        let home = TempDir::new().unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tui::home::tests::live_send_mode::tool_admission_rejects_reserved_rows_and_uses_fresh_configuration", "--nocapture"])
+            .env("AOE_TEST_TOOL_ADMISSION_CHILD", "1")
+            .env("AOE_TMUX_SOCKET", home.path().join("tmux.sock"))
+            .env("HOME", home.path())
+            .env("SHELL", "/bin/sh")
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let mut env = create_test_env_empty();
+    let project = env._temp.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let mut instance = Instance::new("tool admission", project.to_str().unwrap());
+    instance.source_profile = "test".into();
+    let id = instance.id.clone();
+    env.view.add_instance(instance.clone());
+    let storage = Storage::open_unwatched("test").unwrap();
+    instance
+        .try_acquire_lifecycle_reservation(
+            LifecycleOperation::Purge,
+            Instance::LIFECYCLE_RESERVATION_TTL,
+            chrono::Utc::now(),
+        )
+        .unwrap();
+    storage
+        .update(|rows, _| {
+            rows.push(instance.clone());
+            Ok(())
+        })
+        .unwrap();
+    let stale_marker = project.join("stale-command");
+    let fresh_marker = project.join("fresh-command");
+    env.view.tool_configs.insert(
+        "probe".into(),
+        crate::session::config::ToolSessionConfig {
+            command: format!(
+                "printf stale > {}; exec sleep 120",
+                crate::session::environment::shell_escape(&stale_marker.to_string_lossy())
+            ),
+            ..Default::default()
+        },
+    );
+    crate::session::config::update_config(|config| {
+        config.tools.insert(
+            "probe".into(),
+            crate::session::config::ToolSessionConfig {
+                command: format!(
+                    "printf fresh > {}; exec sleep 120",
+                    crate::session::environment::shell_escape(&fresh_marker.to_string_lossy())
+                ),
+                ..Default::default()
+            },
+        );
+    })
+    .unwrap();
+    let name = crate::tmux::ToolSession::generate_name(&id, &instance.title, "probe");
+    let _tool = crate::tmux::test_helpers::TmuxTestSession::from_name(name.clone());
+    // The daemon prepares panes through `start_tool_with_size_in`, so the
+    // reservation guard is asserted on that entry point.
+    let mut reserved = env.view.get_instance(&id).cloned().expect("instance");
+    assert!(
+        reserved
+            .start_tool_with_size_in("probe", None, &storage)
+            .is_err(),
+        "a reserved purge admitted a tool"
+    );
+    assert!(!crate::tmux::Session::from_name(&name).exists());
+    storage
+        .update(|rows, _| {
+            rows[0].lifecycle_reservation = None;
+            Ok(())
+        })
+        .unwrap();
+    let mut released = env.view.get_instance(&id).cloned().expect("instance");
+    released
+        .start_tool_with_size_in("probe", None, &storage)
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !fresh_marker.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the freshly configured command did not run"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(std::fs::read(fresh_marker).unwrap(), b"fresh");
+    assert!(
+        !stale_marker.exists(),
+        "the cached command ran instead of durable configuration"
+    );
 }

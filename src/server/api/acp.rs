@@ -1934,7 +1934,8 @@ fn adopt_persisted_structured_instance(
     source_profile: &str,
 ) -> crate::session::Instance {
     persisted.source_profile = source_profile.to_owned();
-    super::super::reload::merge_runtime_fields(cached, persisted)
+    super::super::reload::merge_runtime_fields(cached, &mut persisted);
+    persisted
 }
 pub async fn acp_enable(
     State(state): State<Arc<AppState>>,
@@ -2026,12 +2027,7 @@ pub async fn acp_enable(
         )
         .await;
 
-    // Tear down the tmux side. Best-effort: a stale tmux name should
-    // not block the swap. Run on a blocking pool worker because each
-    // kill shells out. Warn on agent kill failure to keep signal for
-    // this user-initiated action; ancillary kinds delegate to the
-    // shared helper so any future kind picked up by the audit lands
-    // here automatically.
+    // Stop the terminal runtime under its lifecycle lock before switching ownership.
     let inst_for_transition = instance.clone();
     let id_for_log = id.clone();
     let profile_for_transition = profile.clone();
@@ -2044,10 +2040,7 @@ pub async fn acp_enable(
             .map_err(|error| {
                 anyhow::anyhow!("failed to acquire terminal-to-ACP lifecycle lock: {error}")
             })?;
-        if let Err(e) = inst_for_transition.kill_locked() {
-            tracing::warn!(target: "acp.switch", session = %inst_for_transition.id, "kill tmux failed: {e}");
-        }
-        inst_for_transition.kill_ancillary_tmux_sessions_locked();
+        inst_for_transition.kill_all_tmux_sessions_locked()?;
         storage.update(|all, _groups| {
             let Some(slot) = all
                 .iter_mut()
@@ -2165,11 +2158,8 @@ pub async fn acp_enable(
     let tool_for_spawn = instance.tool.clone();
     let state_for_spawn = state.clone();
     let inst_lock_for_spawn = inst_lock.clone();
-    tokio::spawn(async move {
-        // The HTTP response deliberately does not wait for container setup, but
-        // the deferred spawn still belongs to this view transition. Holding the
-        // session lock through spawn prevents a following disable from tearing
-        // down first and then being undone by this late task.
+    state.runtime.work.spawn("acp.enable_spawn", async move {
+        // Serialize the deferred spawn with a following view transition.
         let _transition_guard = inst_lock_for_spawn.lock().await;
         let still_structured = state_for_spawn
             .instances
@@ -2451,6 +2441,7 @@ pub async fn acp_disable(
         Ok(()) | Err(SupervisorError::UnknownSession(_)) => {}
         Err(e) => {
             tracing::warn!(target: "acp.switch", session = %id, "shutdown structured view failed: {e}");
+            return (StatusCode::CONFLICT, Json(serde_json::json!({"error": "structured_shutdown_unproven", "message": "Structured worker shutdown could not be proven"}))).into_response();
         }
     }
     // A future re-enable needs a fresh sequence and replay buffer. The tmux
@@ -2761,11 +2752,10 @@ pub async fn resolve_approval(
         // is allow-shaped whatever the option means.
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(SupervisorError::Acp(crate::acp::acp_client::AcpError::UnknownNonce)) => {
-            // Intentional override of the canonical Acp 500: echo the nonce
-            // so clients (web + native TUI) can confirm the 404 refers to
-            // the card they resolved, not a generic miss. See #1821.
+            // Native clients classify the header without reading reflected content.
             (
                 StatusCode::NOT_FOUND,
+                crate::daemon::ApiErrorCode::PendingTargetGone.header(),
                 format!("no pending approval with nonce {nonce_str}"),
             )
                 .into_response()
@@ -2802,6 +2792,7 @@ pub async fn resolve_elicitation(
         // Intentional override: nonce echo, mirrors resolve_approval. See #1821.
         Err(SupervisorError::Acp(crate::acp::acp_client::AcpError::UnknownNonce)) => (
             StatusCode::NOT_FOUND,
+            crate::daemon::ApiErrorCode::PendingTargetGone.header(),
             format!("no pending elicitation with nonce {nonce_str}"),
         )
             .into_response(),
@@ -3444,15 +3435,9 @@ mod tests {
     ///    `UserPromptSent` with no turn behind it renders as a session
     ///    stuck on "running" that only a stop plus re-send clears.
     ///
-    /// A held `ResumeReservation` stands in for a spawn in flight: it makes
-    /// `wait_for_worker` park exactly as it does mid-respawn, with no
-    /// process, sandbox, or agent involved. It also pins the subtler of the
-    /// two publish branches, because a reservation counts as `is_running`:
-    /// `needs_resume` is false here even though no worker exists, so only
-    /// an unconditional readiness gate catches it. Pre-fix that combination
-    /// published the prompt and then answered 404; it is now a retryable
-    /// 503 with nothing written.
+    /// A held reservation counts as running without providing a ready worker.
     #[tokio::test]
+    #[serial_test::serial]
     async fn wake_prompt_frees_instance_lock_and_publishes_nothing_without_a_worker() {
         let _app_dir = crate::session::test_support::isolate_app_dir();
         use crate::acp::supervisor::{ResumeKind, ResumeReservationOutcome};
@@ -3753,16 +3738,9 @@ mod tests {
         );
     }
 
-    /// #3688: a fresh prompt is the recovery the give-up banner points at, so
-    /// an exhausted park must drive a resume rather than buffer the prompt on
-    /// a queue only a live or idle-dormant worker drains.
-    ///
-    /// No `ResumeReservation` is held here on purpose: one makes `is_running`
-    /// true, which short-circuits the park probe entirely and leaves the test
-    /// asserting nothing about this path. The spawn instead fails on the
-    /// missing project path, and its `AgentStartupError` is the proof that a
-    /// resume ran at all.
+    /// Missing project input makes the resume attempt observable without launching an agent.
     #[tokio::test]
+    #[serial_test::serial]
     async fn exhausted_rate_limit_prompt_resumes_instead_of_queueing() {
         let _app_dir = crate::session::test_support::isolate_app_dir();
         let mut inst = crate::session::Instance::new("exhausted-3688", "/tmp/aoe-3688-project");
@@ -3817,23 +3795,9 @@ mod tests {
         );
     }
 
-    /// #3621: deciding a prompt's disposition and acting on it is one step, so
-    /// a direct prompt cannot slip between a queue drain's idle check and the
-    /// moment its prompt reaches the agent.
-    ///
-    /// The drain reads the control fold, reloads attachments, and only then
-    /// sends; `send_turn` flips the fold to `turn_active` when it publishes. A
-    /// direct prompt whose own fold read landed inside that window also
-    /// decided "idle", so both pushed a `ClientCmd::Prompt`. The agent takes
-    /// the first and answers the second `agent_busy` — but `send_prompt`
-    /// reports success as soon as the command is queued, so the drain has
-    /// already retired the rows it sent. The follow-up is then gone from
-    /// durable queue state having never been delivered.
-    ///
-    /// Both halves are asserted: the direct prompt parks while the drain owns
-    /// the session, and a drain that runs against the turn the direct prompt
-    /// started leaves its row queued instead of retiring it into a rejection.
+    /// Direct prompts and queue drains must serialize ownership of the next turn.
     #[tokio::test]
+    #[serial_test::serial]
     async fn a_direct_prompt_and_the_queue_drain_cannot_both_own_the_same_turn() {
         let _app_dir = crate::session::test_support::isolate_app_dir();
         use std::time::Duration;
@@ -3927,12 +3891,9 @@ mod tests {
         );
     }
 
-    /// #3688: the diff-comments endpoint is the other user surface that opens
-    /// a turn, and the cap park is terminal, so refusing here loses the review
-    /// the user just wrote with nothing scheduled to make a retry work. It
-    /// must wake the park like an ordinary prompt does. Same no-reservation
-    /// reasoning as the prompt test above.
+    /// Diff comments must wake exhausted parks through the same readiness gate.
     #[tokio::test]
+    #[serial_test::serial]
     async fn diff_comments_on_an_exhausted_park_resume_instead_of_refusing() {
         let _app_dir = crate::session::test_support::isolate_app_dir();
         let mut inst = crate::session::Instance::new("dc-3688", "/tmp/aoe-3688-diff");

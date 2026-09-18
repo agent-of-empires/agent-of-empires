@@ -72,7 +72,11 @@ function entry(overrides: Partial<RecentProjectEntry> = {}): RecentProjectEntry 
 
 function renderStep() {
   return render(
-    <ProjectStep data={{ ...initialData, path: "", extraRepoPaths: [], scratch: false }} onChange={vi.fn()} />,
+    <ProjectStep
+      profile="default"
+      data={{ ...initialData, path: "", extraRepoPaths: [], scratch: false }}
+      onChange={vi.fn()}
+    />,
   );
 }
 

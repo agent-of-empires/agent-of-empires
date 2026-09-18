@@ -1766,9 +1766,22 @@ export async function resolvePluginOptions(
   }
 }
 
-export async function fetchProjects(scope?: "global" | "profile"): Promise<ProjectInfo[]> {
-  const url = scope ? `/api/projects?scope=${scope}` : "/api/projects";
-  return (await fetchJson<ProjectInfo[]>(url)) ?? [];
+export type ProjectTarget = { scope: "global" } | { scope: "profile"; profile: string };
+export type ProjectReadContext = ProjectTarget | { scope?: never; profile: string };
+
+export function projectTarget(scope: ProjectInfo["scope"], profile: string): ProjectTarget {
+  return scope === "profile" ? { scope, profile } : { scope };
+}
+
+function projectQuery(context: ProjectReadContext): string {
+  const query = new URLSearchParams();
+  if (context.scope) query.set("scope", context.scope);
+  if ("profile" in context) query.set("profile", context.profile);
+  return query.toString();
+}
+
+export async function fetchProjects(context: ProjectReadContext): Promise<ProjectInfo[] | null> {
+  return fetchJson<ProjectInfo[]>(`/api/projects?${projectQuery(context)}`);
 }
 
 /** Existing Claude Code sessions on disk, newest first, for the import
@@ -1780,12 +1793,10 @@ export async function listClaudeSessions(): Promise<ClaudeSessionSummary[]> {
 export async function createProject(body: {
   path: string;
   name?: string;
-  scope?: "global" | "profile";
+  scope: "global" | "profile";
+  profile: string;
   allow_override?: boolean;
   default_base_branch?: string;
-  /** Pin the project on create (show it as a sessionless sidebar header).
-   *  Defaults to false server-side: the Projects view just saves, the sidebar
-   *  "Pin project" action sends true. See #2208. */
   pinned?: boolean;
 }): Promise<{ ok: boolean; error?: string; project?: ProjectInfo }> {
   try {
@@ -1813,12 +1824,9 @@ export async function createProject(body: {
   }
 }
 
-export async function deleteProject(
-  name: string,
-  scope: "global" | "profile",
-): Promise<{ ok: boolean; error?: string }> {
+export async function deleteProject(name: string, target: ProjectTarget): Promise<{ ok: boolean; error?: string }> {
   try {
-    const res = await fetch(`/api/projects/${encodeURIComponent(name)}?scope=${scope}`, { method: "DELETE" });
+    const res = await fetch(`/api/projects/${encodeURIComponent(name)}?${projectQuery(target)}`, { method: "DELETE" });
     if (!res.ok) {
       const text = await res.text();
       try {
@@ -1837,50 +1845,17 @@ export async function deleteProject(
   }
 }
 
-/** Update a project's default base branch. Pass `null` to clear it. */
+/** Omitted fields are preserved; a null base branch clears it. */
 export async function updateProject(
   name: string,
-  scope: "global" | "profile",
-  defaultBaseBranch: string | null,
+  target: ProjectTarget,
+  patch: { default_base_branch?: string | null; pinned?: boolean },
 ): Promise<{ ok: boolean; error?: string; project?: ProjectInfo }> {
   try {
-    const res = await fetch(`/api/projects/${encodeURIComponent(name)}?scope=${scope}`, {
+    const res = await fetch(`/api/projects/${encodeURIComponent(name)}?${projectQuery(target)}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ default_base_branch: defaultBaseBranch }),
-    });
-    if (!res.ok) {
-      const text = await res.text();
-      try {
-        const data = JSON.parse(text);
-        return {
-          ok: false,
-          error: data.message || `Server error (${res.status})`,
-        };
-      } catch {
-        return { ok: false, error: text || `Server error (${res.status})` };
-      }
-    }
-    const project = (await res.json()) as ProjectInfo;
-    return { ok: true, project };
-  } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : String(e) };
-  }
-}
-
-/** Pin or unpin a saved project. Unpinning (pinned=false) keeps the registry
- *  entry, so the project stays in the Projects view and the wizard; it just
- *  drops from the sidebar. See #2208. */
-export async function setProjectPinned(
-  name: string,
-  scope: "global" | "profile",
-  pinned: boolean,
-): Promise<{ ok: boolean; error?: string; project?: ProjectInfo }> {
-  try {
-    const res = await fetch(`/api/projects/${encodeURIComponent(name)}?scope=${scope}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ pinned }),
+      body: JSON.stringify(patch),
     });
     if (!res.ok) {
       const text = await res.text();

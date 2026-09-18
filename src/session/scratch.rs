@@ -31,13 +31,18 @@ pub fn scratch_root() -> Result<PathBuf> {
     Ok(root)
 }
 
+pub(crate) fn scratch_path(instance_id: &str) -> Result<PathBuf> {
+    super::validate_instance_id(instance_id)?;
+    Ok(super::get_app_dir()?.join(SCRATCH_SUBDIR).join(instance_id))
+}
+
 /// Create a fresh directory for a scratch session and return its absolute
 /// path. Uses `fs::create_dir` (not `create_dir_all`) so a collision with a
 /// pre-existing directory surfaces as an error rather than silently reusing
 /// the directory's contents, which would violate the freshness contract.
 pub fn provision_scratch_dir(instance_id: &str) -> Result<PathBuf> {
-    super::validate_instance_id(instance_id)?;
-    let path = scratch_root()?.join(instance_id);
+    let path = scratch_path(instance_id)?;
+    scratch_root()?;
     fs::create_dir(&path)
         .with_context(|| format!("Failed to create scratch directory at {}", path.display()))?;
     Ok(path)

@@ -146,6 +146,13 @@ const PAGES = [
       "Launch a session in a fresh scratch directory under ~/.agent-of-empires/scratch/ with no project path. The directory is removed when the session is deleted.",
   },
   {
+    source: "docs/guides/remotes.md",
+    dest: "guides/remotes.md",
+    title: "Remote Machines",
+    description:
+      "Register other machines' aoe serve daemons, list their sessions beside local ones, live-send into them, and create sessions on them from the TUI.",
+  },
+  {
     source: "docs/guides/live-mode.md",
     dest: "guides/live-mode.md",
     title: "Live Mode",
@@ -375,6 +382,7 @@ const URL_MAP = {
   "docs/guides/multi-repo-workspaces.md": "/guides/multi-repo-workspaces/",
   "docs/guides/scratch-sessions.md": "/guides/scratch-sessions/",
   "docs/guides/live-mode.md": "/guides/live-mode/",
+  "docs/guides/remotes.md": "/guides/remotes/",
   "docs/guides/tool-sessions.md": "/guides/tool-sessions/",
   "docs/guides/podman.md": "/guides/podman/",
   "docs/guides/apple-containers.md": "/guides/apple-containers/",

@@ -419,6 +419,7 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
           {!nameOnly && (
             <ProjectStep
               data={state.data}
+              profile={state.data.profile || state.profiles.find((profile) => profile.is_default)?.name}
               onChange={handleChange}
               initialTab={prefill?.initialTab}
               agents={state.agents}

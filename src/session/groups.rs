@@ -390,6 +390,15 @@ impl GroupTree {
     }
 }
 
+/// Where a remote session belongs in the sidebar, mirroring how a local one is
+/// placed: trash wins over archive, as in `append_archived_section`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RemoteShelf {
+    Live,
+    Archived,
+    Trashed,
+}
+
 /// Item represents either a group or an instance in the flattened tree view
 #[derive(Debug, Clone)]
 pub enum Item {
@@ -410,6 +419,35 @@ pub enum Item {
         id: String,
         depth: usize,
     },
+    /// Header for this machine's own sessions under "group by remote". Like
+    /// `RemoteGroup`, it has no path, so group actions stay disarmed.
+    LocalGroup {
+        depth: usize,
+        session_count: usize,
+        collapsed: bool,
+    },
+    /// Header for one configured remote daemon. Not a group: it has no path
+    /// and never reaches group-tree logic, so group actions stay disarmed.
+    RemoteGroup {
+        name: String,
+        depth: usize,
+        session_count: usize,
+        collapsed: bool,
+        /// No read has finished yet since the remote was configured.
+        connecting: bool,
+        /// Why the remote's session list could not be read, if it could not.
+        error: Option<String>,
+        /// Which of the remote's sessions this header gathers: its live list,
+        /// or its Archived or Trash rows nested inside the local shelf.
+        shelf: RemoteShelf,
+    },
+    /// A session owned by a remote daemon. `id` is not a key into the local
+    /// instance map; the row renders from the remote's wire snapshot.
+    RemoteSession {
+        remote: String,
+        id: String,
+        depth: usize,
+    },
 }
 
 impl Item {
@@ -417,6 +455,9 @@ impl Item {
         match self {
             Item::Group { depth, .. } => *depth,
             Item::Session { depth, .. } => *depth,
+            Item::LocalGroup { depth, .. } => *depth,
+            Item::RemoteGroup { depth, .. } => *depth,
+            Item::RemoteSession { depth, .. } => *depth,
         }
     }
 }
@@ -434,7 +475,7 @@ where
 
 /// Sort a slice of session references by `sort_order`, reading the
 /// favorites-first preference from config.
-fn sort_sessions(sessions: &mut [&Instance], sort_order: SortOrder) {
+pub fn sort_sessions(sessions: &mut [&Instance], sort_order: SortOrder) {
     sort_sessions_inner(sessions, sort_order, crate::session::favorites_first());
 }
 
@@ -931,6 +972,32 @@ pub fn flatten_tree_all_profiles(
     items
 }
 
+/// This machine's section under "group by remote": a header, then every live
+/// session one level in. Sub-groups are flattened on purpose so the list stays
+/// one indent deep however many machines it spans; archived and trashed rows
+/// still go to the shelf the caller appends.
+pub fn flatten_local_machine(
+    instances: &[Instance],
+    sort_order: SortOrder,
+    collapsed: bool,
+) -> Vec<Item> {
+    let mut live: Vec<&Instance> = instances
+        .iter()
+        .filter(|i| !i.is_archived() && !i.is_trashed())
+        .collect();
+    sort_sessions(&mut live, sort_order);
+    let rows: Vec<String> = live.into_iter().map(|i| i.id.clone()).collect();
+    let mut items = vec![Item::LocalGroup {
+        depth: 0,
+        session_count: rows.len(),
+        collapsed,
+    }];
+    if !collapsed {
+        items.extend(rows.into_iter().map(|id| Item::Session { id, depth: 1 }));
+    }
+    items
+}
+
 /// Flat session list for the Attention sort: skip group hierarchy entirely.
 /// Attention is a cross-cutting priority view, not a folder tree, so a
 /// Waiting session in group A should sort next to a Waiting session in
@@ -1287,6 +1354,43 @@ fn sort_archived_project_buckets(buckets: &mut [(String, Vec<&Instance>)], sort_
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_machine_section_is_a_header_then_live_sessions_one_indent_deep() {
+        let a = Instance::new("a", "/tmp/a");
+        let mut nested = Instance::new("b", "/tmp/b");
+        nested.group_path = "work/deep".to_string();
+        let mut archived = Instance::new("c", "/tmp/c");
+        archived.archived_at = Some(chrono::Utc::now());
+        let instances = vec![a, nested, archived];
+
+        let items = flatten_local_machine(&instances, SortOrder::AZ, false);
+        assert!(matches!(
+            items[0],
+            Item::LocalGroup {
+                session_count: 2,
+                collapsed: false,
+                depth: 0
+            }
+        ));
+        let rows: Vec<_> = items[1..].iter().map(Item::depth).collect();
+        assert_eq!(
+            rows,
+            [1, 1],
+            "sub-groups flatten; archived rows go to the shelf"
+        );
+
+        let collapsed = flatten_local_machine(&instances, SortOrder::AZ, true);
+        assert_eq!(collapsed.len(), 1);
+        assert!(matches!(
+            collapsed[0],
+            Item::LocalGroup {
+                session_count: 2,
+                collapsed: true,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn test_group_tree_creation() {

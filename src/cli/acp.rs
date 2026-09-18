@@ -1080,17 +1080,13 @@ async fn status(session: &str, json: bool) -> Result<()> {
             "highest_seq": probe.highest_seq,
             "lowest_seq": probe.lowest_seq,
             "lost": probe.lost,
-            "daemon_url": endpoint.base_url,
             "daemon_source": format!("{:?}", endpoint.source),
         });
         println!("{}", serde_json::to_string_pretty(&blob)?);
         return Ok(());
     }
     println!("Agent session: {session}");
-    println!(
-        "  daemon       : {} ({:?})",
-        endpoint.base_url, endpoint.source
-    );
+    println!("  daemon source: {:?}", endpoint.source);
     println!("  highest_seq  : {}", probe.highest_seq);
     println!(
         "  lowest_seq   : {}",

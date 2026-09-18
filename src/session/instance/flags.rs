@@ -92,12 +92,8 @@ impl Instance {
     /// sidebar's tier comparator already assumes the server enforces a
     /// single active triage state (see `sidebarSort.ts` in #1581).
     ///
-    /// Archiving tears down the session's tmux (#1868), so a live-interaction
-    /// status (Running/Waiting/Starting) cannot be true of an archived row.
-    /// Left in place, a frozen `Waiting` keeps rendering as a
-    /// pending-permission row forever — the status poller deliberately never
-    /// touches archived rows (#2206), so nothing else can clear it. Degrade
-    /// those statuses to Idle here, matching where v016 settles archived rows.
+    /// Archived rows skip terminal status polling, so settle live statuses to
+    /// Idle. Callers can record Stopped after runtime teardown.
     pub fn archive(&mut self) {
         self.archived_at = Some(Utc::now());
         self.favorited_at = None;
@@ -106,13 +102,7 @@ impl Instance {
         self.settle_archived_status();
     }
 
-    /// Idle is the resting state an archived row can truthfully claim; see
-    /// `archive`. Shared with the status poller's archived short-circuit (so
-    /// a row frozen by an older build heals in memory without waiting for the
-    /// one-shot v028 migration) and with the three disk-write merges that can
-    /// land a status or an archive on a row (`merge_user_action_diff`,
-    /// `merge_passive_status_patch`, `merge_from_tui`), so a stale
-    /// pre-archive observation cannot re-freeze it.
+    /// Clear stale live statuses without replacing an explicit stopped state.
     pub(crate) fn settle_archived_status(&mut self) {
         if matches!(
             self.status,

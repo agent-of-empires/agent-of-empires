@@ -34,22 +34,28 @@ pub fn is_pid_alive(_pid: u32) -> bool {
     false
 }
 
-/// Like `is_pid_alive`, but `EPERM` counts as dead: a pid this daemon
-/// cannot signal belongs to another user, so it is not a runner of ours
-/// (a reused pid). Teardown proofs use this so a stale record cannot pin
-/// a session on someone else's process. A daemon running as a different
-/// user from its own runners would prove them dead here while the CLI's
-/// `is_pid_alive` still reports them; runners inherit the daemon's user.
 #[cfg(unix)]
-pub fn is_pid_alive_and_ours(pid: u32) -> bool {
-    use nix::sys::signal::kill;
-    use nix::unistd::Pid;
-    kill(Pid::from_raw(pid as i32), None).is_ok()
+fn worker_pid(pid: u32) -> Option<nix::unistd::Pid> {
+    i32::try_from(pid)
+        .ok()
+        .filter(|pid| *pid > 0)
+        .map(nix::unistd::Pid::from_raw)
+}
+
+/// A surviving group member or leader prevents exit proof; probe errors fail closed.
+#[cfg(unix)]
+pub fn is_process_group_alive(pid: u32) -> bool {
+    use nix::errno::Errno;
+    use nix::sys::signal::{kill, killpg};
+    let Some(pid) = worker_pid(pid) else {
+        return true;
+    };
+    !matches!(killpg(pid, None), Err(Errno::ESRCH)) || !matches!(kill(pid, None), Err(Errno::ESRCH))
 }
 
 #[cfg(not(unix))]
-pub fn is_pid_alive_and_ours(_pid: u32) -> bool {
-    false
+pub fn is_process_group_alive(_pid: u32) -> bool {
+    true
 }
 
 /// Ask the kernel which process is listening on this Unix domain socket
@@ -58,13 +64,8 @@ pub fn is_pid_alive_and_ours(_pid: u32) -> bool {
 /// (path missing, wrong file type, peer already gone, connect timeout,
 /// or a target other than Linux/Android/macOS).
 ///
-/// Callers (`worker_registry::terminate`, `shutdown_and_wait`) use this
-/// as the fallback source of the runner PID when the on-disk record is
-/// unreadable at the I/O layer (permissions, wrong file type, transient
-/// failure), so an unreadable record no longer means the runner escapes
-/// both SIGTERM and the wait. Note: `worker_registry::load` coerces
-/// `serde_json` parse errors to `Ok(None)`, so corrupt JSON stays in
-/// the "runner already gone" bucket and does not reach this fallback.
+/// Callers can recover the runner PID from its socket when the ownership
+/// record cannot be read or parsed.
 ///
 /// Timeout: connect is bounded at 100ms via non-blocking `connect(2)`
 /// plus `poll(POLLOUT)`. Prevents a wedged runner (D-state kernel
@@ -156,22 +157,13 @@ fn connect_with_timeout(path: &Path) -> Option<std::os::unix::net::UnixStream> {
     Some(UnixStream::from(fd))
 }
 
-/// Signal a worker's entire process group, then the worker pid itself.
-///
-/// A worker is spawned `setsid` (a fresh session, so it is the leader of
-/// a process group whose id equals its pid), and any subprocess it
-/// launches plus their children inherit that group. Signalling the group
-/// reaps the whole tree in one shot. Signalling only the leader pid leaves
-/// descendants orphaned under PID 1, which is the process-leak that
-/// accumulated across daemon restarts and superseded spawns (#1689). The
-/// trailing single-pid signal is a belt-and-suspenders for the unlikely
-/// case `setsid` failed and the leader is not a group leader. Best-effort;
-/// errors are ignored.
+/// Signal the group and its leader, including workers whose group setup failed.
 #[cfg(unix)]
 fn signal_process_group(pid: u32, sig: nix::sys::signal::Signal) {
     use nix::sys::signal::{kill, killpg};
-    use nix::unistd::Pid;
-    let p = Pid::from_raw(pid as i32);
+    let Some(p) = worker_pid(pid) else {
+        return;
+    };
     let _ = killpg(p, sig);
     let _ = kill(p, sig);
 }

@@ -11,12 +11,17 @@ import { openWizard } from "./helpers/wizard";
 
 async function mockBaseApis(page: Page) {
   await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
-  await page.route("**/api/projects", (r) => r.fulfill({ json: [] }));
+  await page.route("**/api/projects*", (r) => r.fulfill({ json: [] }));
   await page.route("**/api/recent-projects", (r) => r.fulfill({ json: { projects: [] } }));
   for (const path of ["settings", "themes", "profiles", "groups", "devices", "about", "system/update-status"]) {
     await page.route(`**/api/${path}`, (r) =>
       r.fulfill({
-        json: path === "settings" || path === "about" || path === "system/update-status" ? {} : [],
+        json:
+          path === "profiles"
+            ? [{ name: "default", is_default: true }]
+            : path === "settings" || path === "about" || path === "system/update-status"
+              ? {}
+              : [],
       }),
     );
   }
@@ -95,7 +100,7 @@ test.describe("Wizard project section (#1219)", () => {
     await mockBaseApis(page);
     await page.route("**/api/sessions", (r) => r.fulfill({ json: { sessions: [], workspace_ordering: [] } }));
     // Saved registry has one project; no live sessions exist.
-    await page.route("**/api/projects", (r) =>
+    await page.route("**/api/projects*", (r) =>
       r.fulfill({ json: [{ name: "my-saved-repo", path: "/srv/my-saved-repo", scope: "global" }] }),
     );
     await page.setViewportSize({ width: 1280, height: 900 });

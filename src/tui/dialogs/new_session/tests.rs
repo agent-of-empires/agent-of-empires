@@ -1911,3 +1911,159 @@ fn branch_picker_mouse_selection_routes_to_the_focused_field() {
         dialog.worktree_branch.value()
     );
 }
+
+fn remote_target(name: &str, machine: Result<(), RemoteUnavailable>) -> RemoteTarget {
+    RemoteTarget {
+        name: name.into(),
+        machine: machine.map(|()| RemoteMachine {
+            home: Some("/Users/remote".into()),
+            profiles: vec!["work".into(), "default".into()],
+            tools: vec!["codex".into(), "gemini".into()],
+            docker_available: true,
+            client: crate::daemon::DaemonClient::new("https://mini.example.ts.net", Some("tok"))
+                .unwrap(),
+        }),
+    }
+}
+
+/// Two local profiles (`personal` the default), then `mini` (ready),
+/// `builder` (unreachable) and `fresh` (connecting…).
+fn remote_dialog() -> NewSessionDialog {
+    let mut dialog = NewSessionDialog::new_with_tools(vec!["claude"], "/local/project".to_string());
+    dialog.available_profiles = vec!["default".into(), "personal".into()];
+    dialog.profile_descriptions = vec![None, None];
+    dialog.profile = "personal".into();
+    dialog.profile_index = 1;
+    dialog.with_remotes(vec![
+        remote_target("mini", Ok(())),
+        remote_target("builder", Err(RemoteUnavailable::Unreachable)),
+        remote_target("fresh", Err(RemoteUnavailable::Connecting)),
+    ])
+}
+
+fn render_dialog_text(dialog: &mut NewSessionDialog) -> String {
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 40)).expect("terminal");
+    let theme = crate::tui::styles::Theme::default();
+    terminal
+        .draw(|frame| dialog.render(frame, frame.area(), &theme))
+        .expect("render");
+    screen_text(terminal.backend().buffer())
+}
+
+#[test]
+fn the_remote_picker_is_hidden_without_remotes() {
+    let mut dialog = NewSessionDialog::new_with_tools(vec!["claude"], TEST_PATH.to_string())
+        .with_remotes(Vec::new());
+    assert!(!dialog.has_remote_selection());
+    assert_eq!(dialog.path_field(), 0);
+    assert!(dialog.selected_remote().is_none());
+    assert!(!render_dialog_text(&mut dialog).contains("Remote:"));
+}
+
+#[test]
+fn the_remote_picker_defaults_to_local_above_profile() {
+    let mut dialog = remote_dialog();
+    assert_eq!(dialog.remote_index, 0);
+    assert_eq!(dialog.focused_field, 0);
+    assert_eq!(dialog.profile_field(), 1);
+    assert_eq!(dialog.path_field(), 2);
+    assert_eq!(dialog.selected_profile(), "personal");
+
+    let text = render_dialog_text(&mut dialog);
+    let remote = text.find("Remote: < Local >").expect(&text);
+    let profile = text.find("Profile:").expect(&text);
+    assert!(remote < profile, "{text}");
+}
+
+#[test]
+fn switching_remote_reshapes_the_dialog_for_that_machine_and_back() {
+    let mut dialog = remote_dialog();
+    dialog.path = Input::new("/local/edited".to_string());
+    dialog.workspace_repos = vec!["/local/other".to_string()];
+
+    dialog.handle_key(key(KeyCode::Right));
+    assert_eq!(
+        dialog.selected_remote().map(|t| t.name.as_str()),
+        Some("mini")
+    );
+    assert_eq!(dialog.available_profiles, ["work", "default"]);
+    assert_eq!(dialog.selected_profile(), "work", "the remote's default");
+    assert_eq!(dialog.available_tools, ["codex", "gemini"]);
+    assert_eq!(dialog.path.value(), "/Users/remote");
+    assert!(dialog.workspace_repos.is_empty());
+    assert!(dialog.docker_available, "sandboxing follows the remote");
+    assert!(render_dialog_text(&mut dialog).contains("< mini >"));
+
+    dialog.handle_key(key(KeyCode::Tab));
+    dialog.handle_key(key(KeyCode::Right));
+    assert_eq!(dialog.selected_profile(), "default");
+
+    dialog.focused_field = 0;
+    dialog.handle_key(key(KeyCode::Left));
+    assert!(dialog.selected_remote().is_none());
+    assert_eq!(dialog.available_profiles, ["default", "personal"]);
+    assert_eq!(dialog.selected_profile(), "personal");
+    assert_eq!(dialog.available_tools, ["claude"]);
+    assert_eq!(dialog.path.value(), "/local/edited");
+    assert!(!dialog.docker_available);
+}
+
+#[test]
+fn submit_carries_the_selected_machine() {
+    // (Right presses on Remote, expected remote, profile, tool, path)
+    let cases: [(usize, Option<&str>, &str, &str, &str); 2] = [
+        (0, None, "personal", "claude", TEST_PATH),
+        (
+            1,
+            Some("mini"),
+            "work",
+            "codex",
+            "/Users/remote/does/not/exist/here",
+        ),
+    ];
+    for (presses, remote, profile, tool, path) in cases {
+        let mut dialog = remote_dialog();
+        for _ in 0..presses {
+            dialog.handle_key(key(KeyCode::Right));
+        }
+        let typed = if remote.is_some() {
+            "~/does/not/exist/here"
+        } else {
+            TEST_PATH
+        };
+        dialog.path = Input::new(typed.to_string());
+        match dialog.handle_key(key(KeyCode::Enter)) {
+            DialogResult::Submit(data) => {
+                assert_eq!(data.remote.as_deref(), remote);
+                assert_eq!(data.profile, profile);
+                assert_eq!(data.tool, tool);
+                assert_eq!(data.path, path);
+            }
+            _ => panic!("{remote:?} should submit without a local path check"),
+        }
+    }
+}
+
+#[test]
+fn an_unavailable_remote_is_listed_but_blocks_submit() {
+    for (presses, status, message) in [
+        (2, "< builder > (unreachable)", "builder is unreachable"),
+        (3, "< fresh > (connecting…)", "fresh is still connecting"),
+    ] {
+        let mut dialog = remote_dialog();
+        for _ in 0..presses {
+            dialog.handle_key(key(KeyCode::Right));
+        }
+        assert!(!dialog.has_profile_selection());
+        assert_eq!(dialog.available_tools, ["claude"]);
+        assert!(dialog.path.value().is_empty(), "no local path carries over");
+        assert!(matches!(
+            dialog.handle_key(key(KeyCode::Enter)),
+            DialogResult::Continue
+        ));
+        let error = dialog.error_message.clone().unwrap_or_default();
+        assert!(error.contains(message), "{error}");
+        assert!(render_dialog_text(&mut dialog).contains(status));
+    }
+}

@@ -19,12 +19,15 @@ pub mod deletion;
 pub(crate) mod environment;
 pub mod fork;
 mod groups;
+pub mod hook_disclosure;
 pub mod idle_reap;
 mod instance;
 pub mod mcp;
 mod move_journal;
+pub(crate) mod path_identity;
 pub mod poller;
 pub mod projects;
+pub(crate) mod purge_owners;
 pub(crate) mod recovery;
 pub mod restart;
 pub mod sandbox_store_reclaim;
@@ -61,28 +64,28 @@ pub use fork::{ForkDenied, ForkSeed};
 pub(crate) use groups::is_live_favorite;
 pub use groups::{
     append_archived_section, append_archived_section_by_project, append_trash_section,
-    archived_project_sub_path, flatten_sessions_by_attention, flatten_tree,
+    archived_project_sub_path, flatten_local_machine, flatten_sessions_by_attention, flatten_tree,
     flatten_tree_all_profiles, is_archived_section_path, is_synthetic_project_header,
     is_trash_section_path, is_within_archived_section, is_within_trash_section,
-    project_group_display_name, Group, GroupTree, Item, ARCHIVED_SECTION_NAME,
-    ARCHIVED_SECTION_PATH, SCRATCH_GROUP_NAME, SCRATCH_GROUP_PATH, TRASH_SECTION_NAME,
-    TRASH_SECTION_PATH,
+    project_group_display_name, sort_sessions, Group, GroupTree, Item, RemoteShelf,
+    ARCHIVED_SECTION_NAME, ARCHIVED_SECTION_PATH, SCRATCH_GROUP_NAME, SCRATCH_GROUP_PATH,
+    TRASH_SECTION_NAME, TRASH_SECTION_PATH,
 };
 pub(crate) use instance::{
-    duplicate_session_error, find_duplicate_session, is_duplicate_session,
-    persist_omp_session_to_storage, persist_session_to_storage, PassiveStatusPatch, ResumeIntent,
-    SidWrite, NEWER_GENERATION_BUSY_REASON,
+    duplicate_session_error, is_duplicate_session, PassiveStatusPatch, ResumeIntent, SidWrite,
+    ToolLaunchUnavailable, NEWER_GENERATION_BUSY_REASON,
 };
 pub(crate) use instance::{
-    generic_host_config_path_for, sidecar_host_config_path_for, ResumeAttemptPolicy,
-    TerminalContextResume,
+    generic_host_config_path_for, sidecar_host_config_path_for, LaunchReservation,
+    ResumeAttemptPolicy, TerminalContextResume,
 };
 pub use instance::{
-    is_valid_session_color, DetectionState, EnsureReadyError, EnsureReadyOutcome, Instance,
-    LaunchSidOutcome, LifecycleOperation, LifecycleReservation, LifecycleReservationError,
+    is_valid_session_color, AuxiliaryObservation, AuxiliaryTarget, DetectionState,
+    EnsureReadyError, EnsureReadyOutcome, Instance, LaunchSidOutcome, LifecycleOperation,
+    LifecycleReservation, LifecycleReservationError, PaneObservation, PanePresence,
     PluginCreateIdempotency, PollerStart, SandboxInfo, SessionBucket, StartOutcome, Status,
     TerminalInfo, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo, SESSION_COLORS,
-    TMUX_SESSION_GONE_ERROR,
+    TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR,
 };
 #[cfg(test)]
 pub(crate) use move_journal::{
@@ -130,6 +133,7 @@ pub fn set_favorites_first(on: bool) {
     FAVORITES_FIRST.store(on, Ordering::Relaxed);
 }
 
+pub(crate) use anchored_fs::ResolvedDataFile;
 pub use config::profile_config::{
     load_profile_config, merge_configs, resolve_config, resolve_config_or_warn,
     save_profile_config, validate_capability_format, validate_check_interval, validate_env_format,
@@ -146,16 +150,18 @@ pub use projects::{Project, ProjectScope};
 pub use recovery::HookTimeoutScope;
 pub use scope::SessionScope;
 pub(crate) use storage::{
-    acquire_session_title_lock, acquire_storage_flock, acquire_storage_shared_flock, atomic_write,
-    read_file_no_follow, replace_file_no_follow, resolve_symlink_chain, try_acquire_storage_flock,
-    GroupMovePlan, StorageFlock, STORAGE_LOCK_FILENAME,
+    acquire_open_storage_flock, acquire_session_title_lock, acquire_storage_flock,
+    acquire_storage_shared_flock, atomic_write, read_file_no_follow, replace_file_no_follow,
+    resolve_symlink_chain, try_acquire_storage_flock, CaptureStorage, GroupMovePlan, LaunchConfig,
+    NativeStoreUnavailable, ProfileMoveRejected, SessionMutation, SessionStore, StorageFlock,
+    StorageTransition, STORAGE_LOCK_FILENAME,
 };
 pub use storage::{
     load_recent_projects, load_workspace_ordering, recent_project_entry_for, record_recent_project,
     update_workspace_ordering, RecentProjectEntry, Storage, WorkspaceOrdering,
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -470,8 +476,9 @@ pub fn list_profiles() -> Result<Vec<String>> {
 /// Presentation only. [`list_profiles`] stays plainly sorted because
 /// [`config::resolve_default_profile`] takes its first entry when
 /// `config.default_profile` is unset.
-pub fn sort_profiles_for_display(profiles: &mut [String]) {
+pub fn sort_profiles_for_display<T: AsRef<str>>(profiles: &mut [T]) {
     profiles.sort_by(|a, b| {
+        let (a, b) = (a.as_ref(), b.as_ref());
         (a == "default")
             .cmp(&(b == "default"))
             .then_with(|| a.cmp(b))
@@ -740,73 +747,126 @@ fn validate_new_profile_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn create_profile(name: &str) -> Result<()> {
-    validate_new_profile_name(name)?;
+pub(crate) struct ProfileCatalogueTransaction {
+    root: PathBuf,
+    _storage: storage::StorageTransition,
+    _identity: storage::StorageFlock,
+    lifecycle: crate::daemon::lifecycle::Transaction,
+}
 
-    let profiles = list_profiles()?;
-    if profiles.contains(&name.to_string()) {
-        anyhow::bail!("Profile '{}' already exists", name);
+impl ProfileCatalogueTransaction {
+    fn acquire() -> Result<Self> {
+        Self::with_transaction(crate::daemon::lifecycle::Transaction::acquire_blocking()?)
     }
 
-    get_profile_dir(name)?;
-    Ok(())
+    // Native callers acquire namespace exclusion first.
+    pub(crate) fn with_transaction(
+        transaction: crate::daemon::lifecycle::Transaction,
+    ) -> Result<Self> {
+        let root = get_app_dir()?;
+        let identity = storage::acquire_session_identity_lock()?;
+        let storage = storage::StorageTransition::acquire_exclusive(&root)?;
+        Ok(Self {
+            root,
+            _storage: storage,
+            _identity: identity,
+            lifecycle: transaction,
+        })
+    }
+
+    pub(crate) fn create(&self, name: &str) -> Result<()> {
+        validate_new_profile_name(name)?;
+        let profiles = self.root.join("profiles");
+        fs::create_dir_all(&profiles)?;
+        fs::create_dir(profiles.join(name))
+            .with_context(|| format!("Cannot create profile '{name}'"))
+    }
+
+    pub(crate) fn delete(&self, name: &str, replacement_default: Option<&str>) -> Result<String> {
+        validate_profile_name(name)?;
+        let profile_dir = self.root.join("profiles").join(name);
+        anyhow::ensure!(profile_dir.exists(), "Profile '{}' does not exist", name);
+        let remaining: Vec<_> = list_profiles()?
+            .into_iter()
+            .filter(|profile| profile != name)
+            .collect();
+        anyhow::ensure!(
+            !remaining.is_empty(),
+            "Cannot delete '{}': at least one profile must exist",
+            name
+        );
+        let configured = Config::load()?.default_profile;
+        let replacement = if let Some(requested) = replacement_default {
+            anyhow::ensure!(
+                remaining.iter().any(|profile| profile == requested),
+                "Replacement default must be a remaining profile"
+            );
+            requested.to_owned()
+        } else if remaining.contains(&configured) {
+            configured
+        } else {
+            remaining[0].clone()
+        };
+        let launches =
+            crate::cli::serve::LaunchProfileUpdates::prepare(&self.lifecycle, name, &replacement)?;
+        fs::remove_dir_all(&profile_dir)?;
+        update_config(|config| replacement.clone_into(&mut config.default_profile))?;
+        launches.commit()?;
+        Ok(replacement)
+    }
+
+    pub(crate) fn rename(&self, old_name: &str, new_name: &str) -> Result<()> {
+        validate_profile_name(old_name)?;
+        validate_new_profile_name(new_name)?;
+        let old_dir = self.root.join("profiles").join(old_name);
+        let new_dir = self.root.join("profiles").join(new_name);
+        anyhow::ensure!(old_dir.exists(), "Profile '{}' does not exist", old_name);
+        anyhow::ensure!(
+            !new_dir.try_exists()?,
+            "Profile '{}' already exists",
+            new_name
+        );
+        Config::load()?;
+        let launches =
+            crate::cli::serve::LaunchProfileUpdates::prepare(&self.lifecycle, old_name, new_name)?;
+        fs::rename(&old_dir, &new_dir)?;
+        update_config(|config| {
+            if config.default_profile == old_name {
+                config.default_profile = new_name.to_owned();
+            }
+        })?;
+        launches.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn set_default(&self, name: &str) -> Result<()> {
+        validate_profile_name(name)?;
+        anyhow::ensure!(
+            list_profiles()?.iter().any(|profile| profile == name),
+            "Profile '{}' does not exist",
+            name
+        );
+        update_config(|config| config.default_profile = name.to_owned())
+    }
+}
+
+pub fn create_profile(name: &str) -> Result<()> {
+    ProfileCatalogueTransaction::acquire()?.create(name)
 }
 
 pub fn delete_profile(name: &str) -> Result<()> {
-    validate_profile_name(name)?;
-
-    let base = get_app_dir()?;
-    let profile_dir = base.join("profiles").join(name);
-
-    if !profile_dir.exists() {
-        anyhow::bail!("Profile '{}' does not exist", name);
-    }
-
-    // The invariant is "at least one profile must exist", a count, not a name.
-    // Any profile is deletable as long as deleting it would not leave zero.
-    if list_profiles()?.len() <= 1 {
-        anyhow::bail!("Cannot delete '{}': at least one profile must exist", name);
-    }
-
-    fs::remove_dir_all(&profile_dir)?;
-    Ok(())
+    ProfileCatalogueTransaction::acquire()?
+        .delete(name, None)
+        .map(|_| ())
 }
 
-/// The source keeps the permissive traversal guard so a stray minted by an
-/// older binary stays renameable; the destination is a new profile and is
-/// held to the create grammar.
+/// Renaming can repair an old source name; the destination uses the create grammar.
 pub fn rename_profile(old_name: &str, new_name: &str) -> Result<()> {
-    validate_profile_name(old_name)?;
-    validate_new_profile_name(new_name)?;
-
-    let base = get_app_dir()?;
-    let old_dir = base.join("profiles").join(old_name);
-    let new_dir = base.join("profiles").join(new_name);
-
-    if !old_dir.exists() {
-        anyhow::bail!("Profile '{}' does not exist", old_name);
-    }
-    if new_dir.exists() {
-        anyhow::bail!("Profile '{}' already exists", new_name);
-    }
-
-    fs::rename(&old_dir, &new_dir)?;
-
-    // Update default profile if the renamed profile was the default
-    if let Some(config) = load_config()? {
-        if config.default_profile == old_name {
-            set_default_profile(new_name)?;
-        }
-    }
-
-    Ok(())
+    ProfileCatalogueTransaction::acquire()?.rename(old_name, new_name)
 }
 
 pub fn set_default_profile(name: &str) -> Result<()> {
-    update_config(|config| {
-        config.default_profile = name.to_string();
-    })?;
-    Ok(())
+    ProfileCatalogueTransaction::acquire()?.set_default(name)
 }
 
 /// One file's probe result: either the parse errored out (per-key values fall
@@ -1575,17 +1635,82 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_delete_profile_named_default_allowed_when_others_exist() {
-        // A profile literally named "default" carries no protection once
-        // other profiles exist; only the count invariant applies.
-        let temp = isolate_app_dir();
-        let dir = app_dir(&temp);
-        fs::create_dir_all(dir.join("profiles").join("default")).unwrap();
-        fs::create_dir_all(dir.join("profiles").join("work")).unwrap();
+    fn test_delete_profile_preserves_a_resolvable_default() {
+        for (configured, replacement, expected) in [
+            ("default", None, "alpha"),
+            ("zeta", None, "zeta"),
+            ("alpha", Some("zeta"), "zeta"),
+        ] {
+            let temp = isolate_app_dir();
+            let dir = app_dir(&temp);
+            for name in ["default", "alpha", "zeta"] {
+                fs::create_dir_all(dir.join("profiles").join(name)).unwrap();
+            }
+            set_default_profile(configured).unwrap();
+            if let Some(replacement) = replacement {
+                let transaction = ProfileCatalogueTransaction::acquire().unwrap();
+                for invalid in ["default", "missing"] {
+                    assert!(transaction.delete("default", Some(invalid)).is_err());
+                    assert!(dir.join("profiles/default").is_dir());
+                    assert_eq!(load_config().unwrap().unwrap().default_profile, configured);
+                }
+                transaction.delete("default", Some(replacement)).unwrap();
+            } else {
+                delete_profile("default").unwrap();
+            }
+            assert!(!dir.join("profiles/default").exists());
+            assert_eq!(resolve_existing_profile("").unwrap(), expected);
+            assert_eq!(load_config().unwrap().unwrap().default_profile, expected);
+        }
+    }
 
-        delete_profile("default").expect("a non-last profile named default is deletable");
-        assert!(!dir.join("profiles").join("default").exists());
-        assert!(dir.join("profiles").join("work").exists());
+    #[test]
+    #[serial_test::serial]
+    fn profile_catalogue_retains_owner_registries_during_resource_cleanup() {
+        for rename in [true, false] {
+            let temp = isolate_app_dir();
+            let dir = app_dir(&temp);
+            create_profile("source").unwrap();
+            create_profile("keep").unwrap();
+            let storage = Storage::new_unwatched("source").unwrap();
+            storage
+                .update(|rows, _| {
+                    rows.push(Instance::new("owner", "/tmp/owned-resource"));
+                    Ok(())
+                })
+                .unwrap();
+            let identity = acquire_session_identity_lock().unwrap();
+            let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                ready_tx.send(()).unwrap();
+                let result = if rename {
+                    rename_profile("source", "target")
+                } else {
+                    delete_profile("source")
+                };
+                done_tx.send(result).unwrap();
+            });
+            ready_rx.recv().unwrap();
+            let premature = done_rx.recv_timeout(std::time::Duration::from_secs(2)).ok();
+            let visible = fs::read(dir.join("profiles/source/sessions.json"));
+            drop(identity);
+            premature
+                .unwrap_or_else(|| {
+                    done_rx
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap()
+                })
+                .unwrap();
+            worker.join().unwrap();
+            let rows: Vec<Instance> = serde_json::from_slice(
+                &visible.expect("catalogue mutation hid resource owners during cleanup"),
+            )
+            .unwrap();
+            assert_eq!(rows[0].project_path, "/tmp/owned-resource");
+            assert!(!dir.join("profiles/source").exists());
+            assert_eq!(dir.join("profiles/target").exists(), rename);
+        }
     }
 
     #[test]

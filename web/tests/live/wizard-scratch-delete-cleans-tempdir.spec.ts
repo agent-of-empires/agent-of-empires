@@ -9,6 +9,7 @@ import { listSessions, spawnAoeServe, waitForSessions } from "../helpers/aoeServ
 base("deleting a scratch session removes its scratch dir", async ({ page }, testInfo) => {
   const serve = await spawnAoeServe({
     authMode: "none",
+    acp: true,
     workerIndex: testInfo.workerIndex,
     parallelIndex: testInfo.parallelIndex,
   });
@@ -27,6 +28,16 @@ base("deleting a scratch session removes its scratch dir", async ({ page }, test
     const sessionId = created!.id as string;
     const projectPath = created!.project_path as string;
     expect(existsSync(projectPath)).toBe(true);
+    // Deletion requires the asynchronous launch to release its reservation.
+    await expect
+      .poll(
+        async () => {
+          const current = (await listSessions(serve.baseUrl)).find((s) => s.id === sessionId);
+          return current !== undefined && current.lifecycle_reservation == null;
+        },
+        { timeout: 15_000 },
+      )
+      .toBe(true);
 
     // Delete via sidebar context menu.
     const row = page.locator("[data-testid='sidebar-session-row']").first();

@@ -255,45 +255,10 @@ pub fn relocate_worktree_to_trash(inst: &mut Instance) -> RelocateOutcome {
     }
 }
 
-/// Bring a freshly-trashed session's sandbox container down, then relocate its
-/// worktree into the holding area.
-///
-/// This is the container + worktree half of trashing (`trash_session_by_id`),
-/// split from [`relocate_worktree_to_trash`] because trashing must first stop
-/// the sandbox container. A sandbox container runs `sleep infinity` for the
-/// life of the session and bind-mounts the worktree dir, so trashing without a
-/// stop leaves it running for the whole retention window and its live mount
-/// makes the relocation's `git worktree move` fail `EBUSY` (the row then stays
-/// in the active dir). Stopping it releases the mount so the relocation's own
-/// [`discard_sandbox_container_after_move`] can then drop it entirely.
-///
-/// `relocate_worktree_to_trash` alone is still the right call for the reconcile
-/// passes (they run on load against already-stopped rows); only the trash
-/// *action*, where the container is still live, needs the stop.
-///
-/// The container stop is injected so the sandbox path is exercisable without a
-/// live docker runtime (mirrors `deletion::perform_deletion_with`).
-///
-/// The container stop blocks for up to the stop grace period (~10s), which is
-/// plenty of time for a restore to land on the durable row (a user who hit `d`
-/// by accident restores immediately; the restore itself is a NoChange because
-/// no relocation has been recorded yet). The durable row is therefore
-/// re-checked between the stop and the move, and the move is skipped when the
-/// row is no longer trashed, was seized by a fresh purge/restore claim, is
-/// gone, or storage cannot be read (fail closed, since a skipped move on a
-/// still-trashed row is healed by the next reconcile pass, while a move on a
-/// restored row strands a live session's worktree in the holding area). The
-/// re-check reads storage via `inst.source_profile`, so callers must pass an
-/// instance whose profile is stamped and must have durably trashed the row
-/// before calling.
-///
-/// BLOCKING: the container stop shells out to `docker stop` (~10s grace period)
-/// and the relocation runs `git worktree move`, so never call this on an event
-/// loop / UI thread. The TUI goes through [`perform_trash`] on the
-/// `TrashPoller`, the server wraps it in `spawn_blocking`, and the CLI is a
-/// one-shot process.
-/// Stop the sandbox container and move a managed worktree into the trash.
-/// The caller must hold the session's lifecycle flock and own its Trash reservation.
+/// Stop the sandbox before moving its managed worktree into the holding area.
+/// Caller holds identity then lifecycle, owns the durable Trash reservation,
+/// and supplies the source profile. Ownership is rechecked after container stop.
+/// Blocking: container stop and git movement must run off the UI/async thread.
 pub fn prepare_trashed_worktree(inst: &mut Instance) -> RelocateOutcome {
     if let Err(error) =
         crate::session::worktree_edit::stop_sandbox_container(&inst.id, is_sandboxed(inst))
@@ -335,7 +300,7 @@ pub struct TrashResult {
     pub relocate_warning: Option<String>,
 }
 
-/// Execute and commit a TUI trash transition under one per-instance flock.
+/// Execute and commit trash under identity and lifecycle exclusion.
 pub fn perform_trash(request: &TrashRequest) -> TrashResult {
     let failed = |reason: String| TrashResult {
         session_id: request.session_id.clone(),
@@ -346,32 +311,42 @@ pub fn perform_trash(request: &TrashRequest) -> TrashResult {
         Ok(storage) => storage,
         Err(error) => return failed(format!("could not open lifecycle storage: {error}")),
     };
+    let _identity = match crate::session::acquire_session_identity_lock() {
+        Ok(lock) => lock,
+        Err(error) => return failed(format!("could not acquire identity lock: {error}")),
+    };
     let _lifecycle_lock = match storage.acquire_instance_lifecycle_lock(&request.session_id) {
         Ok(lock) => lock,
         Err(error) => {
             return failed(format!("could not acquire lifecycle lock: {error}"));
         }
     };
-    let owns = storage
-        .update(|instances, _groups| {
-            Ok(instances
-                .iter()
-                .find(|instance| instance.id == request.session_id)
-                .is_some_and(|instance| {
-                    instance.lifecycle_reservation_is_owned(
-                        crate::session::LifecycleOperation::Trash,
-                        request.generation,
-                    )
-                }))
-        })
-        .unwrap_or(false);
-    if !owns {
-        return failed("trash lifecycle reservation was superseded before teardown".to_string());
-    }
-
-    let mut inst = request.instance.clone();
-    inst.kill_all_tmux_sessions_locked();
-    let outcome = prepare_trashed_worktree(&mut inst);
+    let mut inst = match storage.update(|instances, _groups| {
+        Ok(instances
+            .iter()
+            .find(|instance| instance.id == request.session_id)
+            .filter(|instance| {
+                instance.lifecycle_reservation_is_owned(
+                    crate::session::LifecycleOperation::Trash,
+                    request.generation,
+                )
+            })
+            .cloned())
+    }) {
+        Ok(Some(instance)) => instance,
+        Ok(None) => {
+            return failed("trash lifecycle reservation was superseded before teardown".to_string())
+        }
+        Err(error) => return failed(format!("could not verify trash reservation: {error}")),
+    };
+    inst.source_profile = storage.profile().to_owned();
+    let stopped = inst.kill_all_tmux_sessions_locked();
+    let outcome = match &stopped {
+        Ok(()) => prepare_trashed_worktree(&mut inst),
+        Err(error) => RelocateOutcome::Failed {
+            reason: format!("Tmux teardown failed; worktree retained: {error}"),
+        },
+    };
     let relocation = match &outcome {
         RelocateOutcome::Relocated { .. } => Some(TrashRelocation {
             new_project_path: inst.project_path.clone(),
@@ -387,6 +362,19 @@ pub fn perform_trash(request: &TrashRequest) -> TrashResult {
                 request.generation,
                 relocation,
             );
+        } else if let Err(error) = &stopped {
+            if let Some(row) = instances
+                .iter_mut()
+                .find(|row| row.id == request.session_id)
+            {
+                if row.finish_lifecycle_status(
+                    crate::session::LifecycleOperation::Trash,
+                    request.generation,
+                    crate::session::Status::Error,
+                ) {
+                    row.last_error = Some(error.to_string());
+                }
+            }
         } else {
             crate::session::claim::release_trash_reservation(
                 instances,
@@ -742,6 +730,7 @@ fn reconcile_trashed_batch(
     storage: &crate::session::Storage,
     batch: &[Instance],
 ) -> anyhow::Result<Vec<Instance>> {
+    let _identity = crate::session::acquire_session_identity_lock()?;
     let now = Utc::now();
     let reserved = storage.update(|instances, _groups| {
         let mut reserved: Vec<(u64, Instance)> = Vec::new();
@@ -850,10 +839,7 @@ fn reconcile_trashed_batch(
 /// The caller's snapshot is replaced with the durable row after commit. A
 /// fresh peer reservation refuses the pass; an expired reservation is superseded.
 pub fn reconcile_trashed_transition(inst: &mut Instance) -> anyhow::Result<bool> {
-    // Decide from the caller's snapshot before paying for storage, the
-    // lifecycle flock, and two write cycles. The pass is best-effort and
-    // idempotent, so a snapshot that has gone stale just defers to the next
-    // one (#3611).
+    // A stale no-op snapshot can wait for the next reconciliation pass.
     if plan_trashed_reconcile(inst) == ReconcilePlan::Nothing {
         return Ok(false);
     }
@@ -863,6 +849,7 @@ pub fn reconcile_trashed_transition(inst: &mut Instance) -> anyhow::Result<bool>
         "session has no source profile; refusing trash reconciliation"
     );
     let storage = crate::session::Storage::open_unwatched(&profile)?;
+    let _identity = crate::session::acquire_session_identity_lock()?;
     let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(&inst.id)?;
     let id = inst.id.clone();
     let (generation, mut durable) = storage.update(|instances, _groups| {
@@ -1948,15 +1935,6 @@ mod tests {
         assert!(
             !PathBuf::from(&reloc.new_project_path).exists(),
             "holding area copy must be gone"
-        );
-    }
-
-    /// The container-stop helper is a no-op (and never shells out) when the
-    /// session is not sandboxed, so trashing a plain session stays docker-free.
-    #[test]
-    fn stop_sandbox_container_is_noop_when_not_sandboxed() {
-        assert!(
-            crate::session::worktree_edit::stop_sandbox_container("no-such-session", false).is_ok()
         );
     }
 }

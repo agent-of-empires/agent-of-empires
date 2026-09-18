@@ -18,7 +18,7 @@ use super::access::{host_from_url, resolve_access_policy};
 use super::acp_events::{acp_event_listener, seed_acp_statuses};
 use super::disk_watch::{disk_watcher_consumer, init_disk_watch_subscriptions};
 use super::ip_discovery::{discover_tagged_ips, IpKind};
-use super::reload::load_all_instances;
+use super::reload::load_all_profiles;
 use super::router::build_router;
 use super::serve_snapshot::{
     spawn_serve_snapshot_loop, FormFactorCounters, StructuredTelemetryCounters,
@@ -28,7 +28,7 @@ use super::state::{
     AppState, CleanupDefaultsCache, ACP_CHANNEL_CAPACITY, CLEANUP_DEFAULTS_TTL,
     PENDING_ATTACHMENT_TTL,
 };
-use super::status_poll::status_poll_loop;
+use super::status_poll::{maintenance_loop, status_poll_loop};
 use super::token::{
     load_or_generate_token, test_token_grace_override, test_token_lifetime_override,
     write_secret_file, TokenManager, DEFAULT_TOKEN_GRACE,
@@ -141,10 +141,11 @@ pub(super) fn raise_fd_limit() {
 #[cfg(not(unix))]
 pub(super) fn raise_fd_limit() {}
 
-pub struct ServerConfig<'a> {
+pub(crate) struct ServerConfig<'a> {
     pub profile: &'a str,
     pub host: &'a str,
     pub port: u16,
+    pub core_only: bool,
     /// Auth mode the operator asked for. Carried whole rather than
     /// flattened to a "no token" bool so `start_server` can tell
     /// `--auth=passphrase` (token off, passphrase wall on) apart from
@@ -216,11 +217,15 @@ fn check_auth_gate(
     )
 }
 
-pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
+pub(crate) async fn start_server(
+    config: ServerConfig<'_>,
+    transaction: crate::daemon::lifecycle::Transaction,
+) -> anyhow::Result<()> {
     let ServerConfig {
         profile,
         host,
         port,
+        core_only,
         auth_mode,
         read_only,
         remote,
@@ -250,7 +255,9 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         FileWatchService::noop()
     });
 
-    let instances = load_all_instances(&file_watch)?;
+    let loaded = load_all_profiles(&file_watch)?;
+    let instances = loaded.instances;
+    let canonical_metadata = loaded.metadata;
 
     // Only `--auth=token` issues a URL token. The other two modes are
     // separated below, once the login wall they depend on exists.
@@ -258,10 +265,10 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         AuthMode::Token => Some(load_or_generate_token().await?),
         AuthMode::Passphrase | AuthMode::None => None,
     };
-    if matches!(auth_mode, AuthMode::None) {
+    if matches!(auth_mode, AuthMode::None) && !core_only {
         eprintln!(
             "WARNING: Running without authentication. \
-             Anyone with network access to this port can control your agent sessions."
+         Anyone with network access to this port can control your agent sessions."
         );
     }
 
@@ -308,6 +315,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         login::LoginManager::new(passphrase)
     });
     let rate_limiter = Arc::new(RateLimiter::new());
+    let pairing_limiter = Arc::new(RateLimiter::new());
 
     // Fail closed before anything binds: check the gates that actually
     // came up against the mode that was asked for. See #3843.
@@ -316,7 +324,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     if matches!(auth_mode, AuthMode::Passphrase) {
         eprintln!(
             "Passphrase authentication: no URL token is issued. Callers reaching \
-             this port sign in with the passphrase."
+         this port sign in with the passphrase."
         );
     }
 
@@ -441,7 +449,12 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
                         None
                     }
                 };
-                match crate::plugin::host::PluginHost::new(&app_dir, profile, session_rpc) {
+                match crate::plugin::host::PluginHost::new(
+                    &app_dir,
+                    profile,
+                    session_rpc,
+                    session_service.work.clone(),
+                ) {
                     Ok(host) => Some(host),
                     Err(e) => {
                         tracing::warn!(target: "plugin.host", "plugin host disabled: {e:#}");
@@ -467,9 +480,18 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // telemetry snapshot both read this single value.
     let auth_mode = resolve_auth_mode(&token_manager, &login_manager).await;
 
-    let addr = format!("{}:{}", host, port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    let local_port = listener.local_addr()?.port();
+    let listener = if core_only {
+        None
+    } else {
+        Some(tokio::net::TcpListener::bind((host, port)).await?)
+    };
+    let local_port = listener
+        .as_ref()
+        .map(|listener| listener.local_addr().map(|addr| addr.port()))
+        .transpose()?
+        .unwrap_or(0);
+    let socket_path = crate::daemon::transport::local_socket_path()?;
+    let (unix_listener, _socket_lease) = super::peer::bind_private(&socket_path).await?;
 
     {
         let instances = instances.read().await;
@@ -516,16 +538,16 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
                 .map_err(|e| {
                     anyhow::anyhow!(
                         "Tailscale Funnel setup failed: {e}\n\n\
-                         aoe detected a logged-in Tailscale on this host and did not \
-                         fall back to Cloudflare, because doing so silently would \
-                         give you a rotating URL that breaks installed PWAs (the \
-                         reason Tailscale is the preferred transport).\n\n\
-                         Ways to move forward:\n  \
-                         - Fix the Tailscale issue above and re-run `aoe serve --remote`.\n  \
-                         - Re-run with `aoe serve --remote --no-tailscale` to use \
-                         Cloudflare intentionally (quick-tunnel URL rotates on restart).\n  \
-                         - Re-run with `--tunnel-name <name> --tunnel-url <host>` \
-                         to use a named Cloudflare tunnel."
+                     aoe detected a logged-in Tailscale on this host and did not \
+                     fall back to Cloudflare, because doing so silently would \
+                     give you a rotating URL that breaks installed PWAs (the \
+                     reason Tailscale is the preferred transport).\n\n\
+                     Ways to move forward:\n  \
+                     - Fix the Tailscale issue above and re-run `aoe serve --remote`.\n  \
+                     - Re-run with `aoe serve --remote --no-tailscale` to use \
+                     Cloudflare intentionally (quick-tunnel URL rotates on restart).\n  \
+                     - Re-run with `--tunnel-name <name> --tunnel-url <host>` \
+                     to use a named Cloudflare tunnel."
                     )
                 })?
         } else {
@@ -557,10 +579,10 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             if !handle.is_stable_origin() {
                 eprintln!(
                     "\nNote: this Cloudflare quick tunnel URL changes on every restart.\n\
-                     Installed PWAs (home-screen apps) break when the URL changes.\n\
-                     For a stable installable dashboard, install Tailscale and run\n\
-                     `tailscale up` on this host before `aoe serve --remote`, or use\n\
-                     a named Cloudflare tunnel via --tunnel-name/--tunnel-url.\n"
+                 Installed PWAs (home-screen apps) break when the URL changes.\n\
+                 For a stable installable dashboard, install Tailscale and run\n\
+                 `tailscale up` on this host before `aoe serve --remote`, or use\n\
+                 a named Cloudflare tunnel via --tunnel-name/--tunnel-url.\n"
                 );
             }
         }
@@ -585,8 +607,17 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         handle.spawn_health_monitor();
 
         Some(handle)
+    } else if core_only {
+        println!("aoe core daemon listening on {}", socket_path.display());
+        let app_dir = crate::session::get_app_dir()?;
+        tokio::fs::write(app_dir.join("serve.mode"), "core\n").await?;
+        match tokio::fs::remove_file(app_dir.join("serve.url")).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        None
     } else {
-        // Local mode: print URLs as before.
         let make_url = |h: &str| {
             if let Some(ref token) = auth_token {
                 format!("http://{}:{}/?token={}", h, port, token)
@@ -622,8 +653,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         if auth_token.is_some() && cfg!(feature = "web") {
             println!();
             println!(
-                "Open any URL above in a browser. Share it to access from other devices on your network."
-            );
+            "Open any URL above in a browser. Share it to access from other devices on your network."
+        );
         }
 
         if open_browser && !is_daemon {
@@ -693,15 +724,37 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         "resolved DNS-rebinding allowlist"
     );
 
+    let runtime_namespace = socket_path
+        .parent()
+        .and_then(std::path::Path::parent)
+        .and_then(std::path::Path::to_str)
+        .context("daemon namespace is not UTF-8")?
+        .to_owned();
+    let runtime_tmux_socket = tokio::task::spawn_blocking(crate::tmux::native_socket_locator)
+        .await?
+        .and_then(|path| path.to_str().map(str::to_owned));
+    let shutdown = session_service.work.shutdown.clone();
     let state = Arc::new(AppState {
-        profile: profile.to_string(),
+        core_only,
         read_only,
         cityhall_mode: std::env::var_os("AOE_CITYHALL_MODE").is_some(),
         instances,
+        profile_namespace: Arc::new(RwLock::new(())),
+        publication: Arc::new(RwLock::new(())),
+        reload_lane: tokio::sync::Mutex::new(()),
+        canonical_metadata: RwLock::new(canonical_metadata),
+        canonical_health: RwLock::new(crate::daemon::RuntimeHealth::Healthy),
+        runtime: super::runtime::NativeRuntime::new(
+            runtime_namespace,
+            runtime_tmux_socket,
+            session_service.work.clone(),
+        ),
         session_service,
         token_manager: Arc::clone(&token_manager),
         login_manager: Arc::clone(&login_manager),
         rate_limiter: Arc::clone(&rate_limiter),
+        pairing_limiter: Arc::clone(&pairing_limiter),
+        pairing: Default::default(),
         behind_tunnel: remote || behind_proxy,
         auth_mode,
         serve_mode,
@@ -748,19 +801,16 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         telemetry_session_creates,
         telemetry_structured: StructuredTelemetryCounters::default(),
         telemetry_last_reported: std::sync::Mutex::new(None),
-        shutdown: CancellationToken::new(),
+        shutdown,
         file_watch: Arc::clone(&file_watch),
         disk_changed: Arc::new(tokio::sync::Notify::new()),
         disk_watch_handles: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
     });
+    state.session_service.bind_native_state(&state);
 
     let app = build_router(state.clone());
 
-    // Acp workers for persisted sessions get auto-spawned by the
-    // reconciler in `status_poll_loop`. The poll interval's first tick
-    // fires immediately, so on cold startup this is equivalent to the
-    // old in-place loop here, while also covering sessions added via
-    // `aoe add --acp` while serve is already running.
+    // Maintenance starts persisted ACP workers, including later CLI additions.
 
     // Seed acp sessions' status from the on-disk event log before
     // any background task runs. The status_poll_loop overlay reads
@@ -778,13 +828,19 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // Phase B (the cascade workers) runs in a spawned task and holds
     // the lock until done.
     let recovery_inputs = daemon_startup_recovery_mark(state.clone()).await;
+    state.runtime.publish(&state).await?;
+    {
+        let runtime_state = state.clone();
+        state
+            .runtime
+            .work
+            .spawn("server.runtime_publisher", async move {
+                super::runtime::publish_loop(runtime_state).await;
+            });
+    }
 
-    // Periodic opt-in `usage_snapshot` loop. Spawned after the transport is
-    // resolved (so the first, immediate tick reports the real `serve_mode` and a
-    // daemon whose tunnel failed to start emits nothing) and after acp
-    // status seeding plus the synchronous recovery marking (so that first tick's
-    // session counts reflect the restored state rather than a half-loaded one).
-    spawn_serve_snapshot_loop(state.clone());
+    // Snapshot only after transport setup and restored session state.
+    spawn_serve_snapshot_loop(state.clone()).await;
 
     // GC the recently_restarted suppression map periodically; the TTL
     // check on read filters but does not remove entries. Without this,
@@ -792,10 +848,10 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     {
         let gc_map = state.recently_restarted.clone();
         let shutdown = state.shutdown.clone();
-        crate::task_util::spawn_supervised(
-            "server.gc.recently_restarted",
-            crate::task_util::PanicPolicy::Log,
-            async move {
+        state
+            .runtime
+            .work
+            .spawn("server.gc.recently_restarted", async move {
                 let mut interval =
                     tokio::time::interval(crate::session::recovery::RECENTLY_RESTARTED_GC_INTERVAL);
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -807,8 +863,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
                         _ = shutdown.cancelled() => break,
                     }
                 }
-            },
-        );
+            });
     }
 
     // Trash retention sweep: auto-purge trashed sessions past their
@@ -822,42 +877,38 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     if !state.read_only {
         let sweep_state = state.clone();
         let shutdown = state.shutdown.clone();
-        crate::task_util::spawn_supervised(
-            "server.trash_retention_sweep",
-            crate::task_util::PanicPolicy::Log,
-            async move {
-                // One-shot startup backfill: relocate trashed worktrees still
-                // in the active dir (rows trashed before relocation existed)
-                // and heal any pointer a crash left stale. See #2522.
-                crate::server::api::reconcile_trashed_worktrees(&sweep_state).await;
-                // Same one-shot startup slot: repoint any managed worktree
-                // whose directory was moved outside aoe. See #2002.
-                crate::server::api::reconcile_worktree_paths(&sweep_state).await;
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    tokio::select! {
-                        _ = interval.tick() => {
-                            crate::server::api::purge_expired_trash(&sweep_state).await;
-                            // Q5: reclaim attachment bytes buffered for a queued
-                            // prompt that never drained (a session that never went
-                            // idle again). Removal/clear/drain/session-delete drop
-                            // these already, so this only catches the stranded tail.
-                            let store = sweep_state.acp_event_store.clone();
-                            let pruned = tokio::task::spawn_blocking(move || {
-                                store.prune_pending_attachments_older_than(PENDING_ATTACHMENT_TTL)
-                            })
-                            .await
-                            .unwrap_or(0);
-                            if pruned > 0 {
-                                tracing::info!(target: "acp.queue", pruned, "pruned stale queued-prompt attachments past TTL");
-                            }
+        state.runtime.work.spawn("server.trash_retention_sweep", async move {
+            // One-shot startup backfill: relocate trashed worktrees still
+            // in the active dir (rows trashed before relocation existed)
+            // and heal any pointer a crash left stale. See #2522.
+            crate::server::api::reconcile_trashed_worktrees(&sweep_state).await;
+            // Same one-shot startup slot: repoint any managed worktree
+            // whose directory was moved outside aoe. See #2002.
+            crate::server::api::reconcile_worktree_paths(&sweep_state).await;
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        crate::server::api::purge_expired_trash(&sweep_state).await;
+                        // Q5: reclaim attachment bytes buffered for a queued
+                        // prompt that never drained (a session that never went
+                        // idle again). Removal/clear/drain/session-delete drop
+                        // these already, so this only catches the stranded tail.
+                        let store = sweep_state.acp_event_store.clone();
+                        let pruned = tokio::task::spawn_blocking(move || {
+                            store.prune_pending_attachments_older_than(PENDING_ATTACHMENT_TTL)
+                        })
+                        .await
+                        .unwrap_or(0);
+                        if pruned > 0 {
+                            tracing::info!(target: "acp.queue", pruned, "pruned stale queued-prompt attachments past TTL");
                         }
-                        _ = shutdown.cancelled() => break,
                     }
+                    _ = shutdown.cancelled() => break,
                 }
-            },
-        );
+            }
+        });
     }
 
     if let Some((lock, candidates)) = recovery_inputs {
@@ -871,10 +922,10 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             let pending = state.recovery_pending.clone();
             let recently = state.recently_restarted.clone();
             let shutdown = state.shutdown.clone();
-            crate::task_util::spawn_supervised(
-                "server.startup_recovery_refresher",
-                crate::task_util::PanicPolicy::Log,
-                async move {
+            state
+                .runtime
+                .work
+                .spawn("server.startup_recovery_refresher", async move {
                     let mut interval =
                         tokio::time::interval(crate::session::recovery::RECENTLY_RESTARTED_TTL / 2);
                     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -893,29 +944,36 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
                             _ = shutdown.cancelled() => break,
                         }
                     }
-                },
-            );
+                });
         }
 
         let cascade_state = state.clone();
-        crate::task_util::spawn_supervised(
-            "server.startup_recovery_cascade",
-            crate::task_util::PanicPolicy::Log,
-            async move {
+        state
+            .runtime
+            .work
+            .spawn("server.startup_recovery_cascade", async move {
                 daemon_startup_recovery_cascade(cascade_state, lock, candidates).await;
-            },
-        );
+            });
     }
 
     // Spawn background tasks
+    let (sandbox_health_tx, sandbox_health_rx) =
+        tokio::sync::watch::channel(Arc::new(std::collections::HashMap::new()));
     let poll_state = state.clone();
-    crate::task_util::spawn_supervised(
-        "server.status_poll_loop",
-        crate::task_util::PanicPolicy::Log,
-        async move {
-            status_poll_loop(poll_state).await;
-        },
-    );
+    state
+        .runtime
+        .work
+        .spawn("server.status_poll_loop", async move {
+            status_poll_loop(poll_state, sandbox_health_rx).await;
+        });
+
+    let maintenance_state = state.clone();
+    state
+        .runtime
+        .work
+        .spawn("server.maintenance_loop", async move {
+            maintenance_loop(maintenance_state, sandbox_health_tx).await;
+        });
 
     // File-watch wire-up: register the initial per-profile subscriptions
     // BEFORE the server starts serving requests so cold-start writes do not
@@ -925,13 +983,12 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     init_disk_watch_subscriptions(state.clone()).await;
     {
         let consumer_state = state.clone();
-        crate::task_util::spawn_supervised(
-            "server.disk_watcher_consumer",
-            crate::task_util::PanicPolicy::Log,
-            async move {
+        state
+            .runtime
+            .work
+            .spawn("server.disk_watcher_consumer", async move {
                 disk_watcher_consumer(consumer_state).await;
-            },
-        );
+            });
     }
 
     // Acp broadcast listener: a single subscriber that handles
@@ -943,24 +1000,16 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // matter to both (e.g. AcpSessionAssigned).
     {
         let listener_state = state.clone();
-        crate::task_util::spawn_supervised(
-            "server.acp_event_listener",
-            crate::task_util::PanicPolicy::Log,
-            async move {
+        state
+            .runtime
+            .work
+            .spawn("server.acp_event_listener", async move {
                 acp_event_listener(listener_state).await;
-            },
-        );
+            });
     }
 
-    // Push-notification consumer: subscribes to status_tx, applies
-    // dwell + cooldown, sends pushes. No-op when push_state is None
-    // (feature disabled via web.notifications_enabled=false).
-    push::spawn_consumer(state.clone());
-
-    // Per-session dispatcher callback consumer: subscribes to the same
-    // status_tx broadcast and fires an HTTP POST to any instance's
-    // callback_url on a fire-worthy transition. See #3156.
-    callback::spawn_consumer(state.clone());
+    push::spawn_consumer(state.clone()).await;
+    callback::spawn_consumer(state.clone()).await;
 
     // Launch plugin workers for every active plugin that declares a runtime.
     // Non-blocking: each worker runs in its own supervised task. A daemon with
@@ -977,12 +1026,19 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         .plugin_host
         .clone()
         .map(|h| h as std::sync::Arc<dyn crate::plugin::auto_update::UpdateNotifier>);
-    crate::plugin::auto_update::spawn_if_enabled(
-        &crate::session::Config::load_or_warn(),
-        update_notifier,
-    );
+    state
+        .runtime
+        .work
+        .spawn("server.plugin_auto_update", async move {
+            crate::plugin::auto_update::run_if_enabled(
+                &crate::session::Config::load_or_warn(),
+                update_notifier,
+            )
+            .await;
+        });
 
     rate_limiter.spawn_cleanup_task(state.shutdown.clone());
+    pairing_limiter.spawn_cleanup_task(state.shutdown.clone());
     login_manager.spawn_cleanup_task(state.shutdown.clone());
 
     if remote {
@@ -991,13 +1047,16 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         // restart, which is outside this task's scope). Capture once so
         // the rotation task can rebuild `serve.url` with the new token.
         let rot_base_url: Option<String> = tunnel_handle.as_ref().map(|h| h.url.clone());
-        tokio::spawn(remote_rotation_loop(
-            state.token_manager.clone(),
-            state.push.clone(),
-            state.shutdown.clone(),
-            rot_base_url,
-            local_port,
-        ));
+        state.runtime.work.spawn(
+            "server.token_rotation",
+            remote_rotation_loop(
+                state.token_manager.clone(),
+                state.push.clone(),
+                state.shutdown.clone(),
+                rot_base_url,
+                local_port,
+            ),
+        );
     } else if test_token_lifetime_override().is_some() && auth_token.is_some() {
         // Debug-build test path: live Playwright specs set
         // AOE_TEST_TOKEN_LIFETIME_SECS (and optionally AOE_TEST_TOKEN_GRACE_SECS)
@@ -1007,27 +1066,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         token_manager.spawn_rotation_task();
     }
 
-    // Graceful shutdown: SIGINT (Ctrl-C), SIGTERM (`aoe serve --stop`),
-    // and SIGHUP (parent session died). Without these, the default handler
-    // kills the process immediately, skipping PID/URL file cleanup.
-    //
-    // After the signal fires the future:
-    //   1. Cancels `state.shutdown` so long-lived WS handlers (acp +
-    //      terminal) wake from their `select!` and close cleanly,
-    //      letting `axum::serve` return promptly instead of blocking
-    //      on the open WebSockets the browser hasn't disconnected.
-    //   2. Arms a 5s force-exit deadline, then reaps plugin workers
-    //      within part of that window: if any handler or worker ignores
-    //      the cancel, the process still force-exits, so `Ctrl-C` and
-    //      terminal hangups never hang. See #1198.
-    //
-    // Note: this future is awaited by `with_graceful_shutdown`, which
-    // signals axum to stop accepting new connections once the future
-    // resolves. Wrapping `axum::serve(...).await` itself in a
-    // `tokio::time::timeout` would cap TOTAL server lifetime instead
-    // of just the post-signal drain, which is wrong (the server would
-    // exit after 5s of normal uptime). The deadline lives inside the
-    // signal handler so the clock only starts after the signal fires.
+    // Both listeners drain on the same cancellation signal and deadline.
     let shutdown_state = state.clone();
     let shutdown_signal = async move {
         #[cfg(unix)]
@@ -1036,6 +1075,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             let mut sigterm = signal(SignalKind::terminate()).ok();
             let mut sighup = signal(SignalKind::hangup()).ok();
             tokio::select! {
+                _ = shutdown_state.shutdown.cancelled() => {}
                 _ = tokio::signal::ctrl_c() => {
                     tracing::info!(target: "serve.shutdown", signal = "SIGINT", "received signal, shutting down");
                 }
@@ -1049,8 +1089,12 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         }
         #[cfg(not(unix))]
         {
-            let _ = tokio::signal::ctrl_c().await;
-            tracing::info!(target: "serve.shutdown", "received ctrl-c, shutting down");
+            tokio::select! {
+                _ = shutdown_state.shutdown.cancelled() => {}
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!(target: "serve.shutdown", "received ctrl-c, shutting down");
+                }
+            }
         }
         let plugin_host = shutdown_state.plugin_host.clone();
         run_shutdown_sequence(
@@ -1066,18 +1110,41 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         .await;
     };
 
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal)
-    .await?;
+    drop(transaction);
+    let signal_task = tokio::spawn(shutdown_signal);
+    let unix_shutdown = state.shutdown.clone();
+    let tcp_shutdown = state.shutdown.clone();
+    let tcp_app = app.clone();
+    let serve_result = tokio::try_join!(
+        async {
+            axum::serve(
+                unix_listener,
+                app.into_make_service_with_connect_info::<super::peer::ConnectionPeer>(),
+            )
+            .with_graceful_shutdown(unix_shutdown.cancelled_owned())
+            .await
+        },
+        async {
+            if let Some(listener) = listener {
+                axum::serve(
+                    listener,
+                    tcp_app.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .with_graceful_shutdown(tcp_shutdown.cancelled_owned())
+                .await
+            } else {
+                tcp_shutdown.cancelled().await;
+                Ok(())
+            }
+        }
+    );
+    state.shutdown.cancel();
+    if let Err(error) = signal_task.await {
+        tracing::error!(target: "serve.shutdown", %error, "shutdown task failed");
+    }
+    state.runtime.work.drain().await;
 
-    // Detach (but do NOT kill) every acp ACP worker. The per-session
-    // `aoe __acp-runner` shims outlive this daemon: a fresh
-    // `aoe serve` reattaches via the reconciler on startup, so in-flight
-    // turns survive `aoe serve --stop`. To actually terminate workers,
-    // use `aoe acp stop [--all]`.
+    // ACP runners outlive the daemon; detach only their control sockets.
     acp_supervisor.detach_all().await;
 
     // Clean up tunnel (cancels health monitor, then sends SIGTERM to cloudflared)
@@ -1089,7 +1156,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         let _ = tokio::fs::remove_file(app_dir.join("serve.passphrase")).await;
     }
 
-    Ok(())
+    serve_result.map(|_| ()).map_err(Into::into)
 }
 
 /// Best-effort launch of `url` in the user's default browser. Goes through the

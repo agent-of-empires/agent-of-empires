@@ -9,7 +9,7 @@ dashboard uses the same API surface plus additional internal routes.
 
 All endpoints require a token unless the server was started with
 `--no-auth`. The token is the one printed by `aoe serve` (or visible
-in the TUI's Serve panel). Three transports are accepted:
+in the TUI's Remote Access view, `R`). Three transports are accepted:
 
 | Transport | Example |
 | --- | --- |
@@ -19,6 +19,75 @@ in the TUI's Serve panel). Three transports are accepted:
 
 Read-only mode (`aoe serve --read-only`) blocks every write endpoint
 with `403 read_only`. Read endpoints work normally.
+
+Five wrong tokens from one IP within 15 minutes lock that IP out for 15
+minutes: every request then gets `429 rate_limited` with `Retry-After` in
+seconds. A request that presents no token does not count. Wrong pairing codes
+have their own lockout (see [POST /api/pair](#post-apipair)).
+
+A device-bound login session also authenticates, with no token: send
+`Cookie: aoe_session=<session_id>` plus `X-Aoe-Device-Binding: <secret>` (on
+a WebSocket upgrade the binding may instead ride as the subprotocol
+`aoe-device.<secret>`). Passphrase login and device pairing both mint one.
+Sessions are listed by `GET /api/devices` and revoked with
+`DELETE /api/login/sessions/{id}` or `POST /api/login/logout-all`; rotating
+the token leaves them valid.
+
+## Device pairing
+
+### POST /api/pair/codes
+
+Mints a single-use pairing code valid for 10 minutes. Only a caller on the
+daemon's owner-checked Unix socket may mint; any TCP caller, loopback
+included, gets `403 forbidden`. At most five codes are live at once (the
+oldest is dropped), and codes do not survive a daemon restart.
+
+```json
+{"code": "K7F-3QX", "expires_in_secs": 600}
+```
+
+### POST /api/pair
+
+Redeems a code. Needs no token or session.
+
+```json
+{"code": "K7F-3QX", "device_name": "laptop", "device_binding_secret": "<base64url of 32 random bytes>"}
+```
+
+Codes are case-insensitive and ignore `-` and spaces. On success the code is
+consumed and the response carries a session presented as described under
+[Authentication](#authentication), and `server_name`, the daemon machine's
+hostname (`null` when unknown), which `aoe remote add` uses as the default
+remote name. It passes a `--passphrase` login wall and
+survives passphrase changes; `GET /api/devices` lists it with its
+`device_name`.
+
+```json
+{"session_id": "<64 hex chars>", "device_name": "laptop"}
+```
+
+| Status | Meaning |
+| --- | --- |
+| `400 bad_request` | Malformed code, missing `device_name`, or a binding that is not 32 bytes |
+| `401 invalid_code` | Unknown, used or expired code. Five from one IP lock it out of pairing for 15 minutes; 20 in total invalidate every live code |
+| `429 rate_limited` | The caller's IP is locked out of pairing (`Retry-After` gives seconds) |
+
+Only wrong codes count toward the pairing lockout, so other failed requests
+from the same machine cannot block it. A successful pairing also lifts the
+IP's token lockout.
+
+### GET /api/pair/lockouts
+
+Lists IPs locked out by wrong tokens or pairing codes, longest remaining
+first. Unix socket owner only, like minting.
+
+```json
+[{"ip": "100.89.98.53", "remaining_secs": 725}]
+```
+
+### DELETE /api/pair/lockouts
+
+Lifts every lockout (`204`). Unix socket owner only.
 
 ## Skills
 
@@ -225,11 +294,89 @@ consuming both surfaces must not compare the two directly.
 Create a session. The web dashboard uses this endpoint for the new-session
 dialog, and external orchestrators may call it directly.
 
+Successful creation returns `201`; an idempotent replay returns `200`. Both
+include `aoe-runtime-epoch` and `aoe-runtime-revision`, and the response row
+comes from that published snapshot. The session and its group hierarchy are
+committed before the receipt. A native client must apply a snapshot from the
+same epoch at or beyond that revision before acting on the new row.
+
+An optional `size` object, such as `{"cols":137,"rows":41}`, sets the initial
+terminal dimensions. Both dimensions must be nonzero. Replaying a creation
+does not relaunch or resize its existing pane.
+
+Disconnecting after admission does not cancel creation. Retry with the same
+`idempotency_key` to recover its result without creating another session.
+
+While creation is active, daemon requests to rename or delete its profile
+return `409`. Hooks can still mutate other profiles; no catalogue lock is
+held while they run.
+
+The daemon validates planned resource paths and publishes a reserved `Starting`
+row before provisioning directories or Git worktrees. These references protect
+borrowed repositories and directories during Git hooks and `on_create`. Failed
+provisioning or hooks roll back only the matching creation generation, using
+shared-resource guards and the recorded ownership of checkouts and branches.
+Cleanup failures retain resources.
+Repository hook and MCP approvals are persisted against the source repository
+before provisioning begins. Failure to persist approval aborts creation.
+
+For `trust_hooks`, omission refuses unapproved repository hooks with
+`hooks_need_trust`; `true` approves hooks and project MCP; `false` explicitly
+skips untrusted hooks and MCP. Skipping retains global/profile hooks and any
+already-trusted repository surfaces without granting or revoking approval.
+Plugin creation always refuses unapproved repository hooks.
+
+`POST /api/sessions/creation-trust` reviews `{path, profile?, scratch?}` without
+granting trust or provisioning a session. It returns merged and repository-only
+hooks, MCP summaries with environment/header names but not their values,
+`hooks_need_trust`, `mcp_need_trust`, and a `fingerprint`. Unknown profiles are
+rejected without creating them; read-only and CityHall modes refuse this route.
+
+Pass the returned fingerprint as `trust_review` with the chosen `trust_hooks`
+decision in the creation request. A changed source repository, global/profile
+hooks, repository hooks, or project MCP produces `409` with
+`aoe-error-code: creation_trust_changed`, before approval is persisted or
+resources are provisioned. Review again rather than approving unseen changes.
+Discarding a review requires no cancellation or cleanup.
+
+`POST /api/sessions/{id}/creation/cancel` requests deferred cancellation while
+provisioning or creation/launch hooks are pending. `202 Accepted` carries the
+runtime epoch and revision headers like every other mutation, so a native caller
+can fence the acknowledgement against the snapshot it was applied at. It is not
+a canonical commit receipt: the current phase finishes before the daemon rolls
+back its owned resources. The original creation request then returns `409`
+with `aoe-error-code: creation_cancelled`. Cleanup failures retain resources.
+Repeated requests remain accepted until finalization; after the hook boundary
+or completion, the route returns `409` with `creation_not_pending`. Cancelling
+does not revoke trust or undo arbitrary hook effects. A disconnected client
+does not implicitly cancel admitted work. Read-only mode refuses cancellation;
+CityHall permits only structured targets. Wait for the authoritative snapshot
+before treating the row as removed.
+
+While a creation is in flight the daemon reports its phase, running hook
+command and bounded output tail on the runtime stream
+(`/api/runtime/ws`) as a `creation` frame. It is advisory display state, never
+canonical state: the row's own status and the cancel route remain the only
+sources of truth, and an empty list means no creation is in flight. The frame
+goes only to the stream the daemon authorized as the local owner, because hook
+output is the documented channel for session environment secrets; a loopback
+bearer client and a remote client receive canonical snapshots alone.
+
 **Query parameters**
 
 | Name | Notes |
 | --- | --- |
 | `wait` | Set to `ready` to block the response until the new session's status leaves `Starting` (or a 10s bound elapses), instead of returning immediately while the agent process is still coming up. The response `status` field reflects whatever the session actually reached, including `Error` if startup failed; a timeout does not mean success. |
+
+**Conversation source**
+
+`fork_session_id` names an existing AoE session row. The daemon resolves its
+provider conversation ID; the request must use the same tool, view and resolved
+ACP agent. This field is mutually exclusive with `fork_from` (a provider ID)
+and `import_acp_session_id`. A missing row returns `404`, an active lifecycle
+reservation returns `409`, and a missing conversation or incompatible provider
+returns `400`. CityHall mode refuses canonical forks with `403`. An idempotent
+replay still succeeds when the parent row has since been removed.
 
 **Worktree fields**
 
@@ -242,6 +389,10 @@ dialog, and external orchestrators may call it directly.
 For compatibility, callers that only send `worktree_branch` still opt into
 worktree mode. To get title-derived branch names, send `worktree_enabled` as
 `true` and omit `worktree_branch`.
+
+Workspace creation validates every repository before creating its directory.
+An existing workspace target is refused rather than adopted or removed during
+rollback.
 
 **Dispatcher fields**
 
@@ -268,6 +419,43 @@ embedding a bearer token in the query string.
   "create_new_branch": true
 }
 ```
+
+## POST /api/sessions/{id}/restart
+
+Explicitly relaunch a session, including a running agent. Unlike `/start`, which
+leaves an already-running session alone, `/restart` performs the restart lifecycle.
+Optional `profile`, `tool`, `command_override`, and `extra_args` replace the
+authoritative launch settings within the daemon's admitted operation. Omitted
+settings remain unchanged; a refused operation does not persist these edits.
+
+```json
+{ "command_override": "my-agent", "extra_args": "--verbose", "unsnooze": true }
+```
+
+The response includes the session and an `outcome` containing
+`lifecycle_generation`, `profile`, and the prepared terminal `target` (`null` for
+structured sessions). The receipt cursor is carried in `aoe-runtime-epoch` and
+`aoe-runtime-revision` response headers, not in the JSON body. Native clients
+attach only after applying a snapshot at or beyond that receipt in the same
+epoch, with matching lifecycle generation, profile, and live terminal identity.
+
+## Agent hook acknowledgement
+
+A host (non-sandboxed) session whose agent installs AoE status hooks will not
+launch until the daemon's machine has acknowledged what that install writes.
+Until then `POST /api/sessions` answers `400` with
+`aoe-error-code: agent_hooks_not_acknowledged`.
+
+`GET /api/app-state/agent-hooks-acknowledgement?tool=&profile=` reports it for
+one agent. Both query parameters are optional and default to what a create with
+no explicit choice would use. The response names the resolved `agent`, whether
+the acknowledgement is `required` and already `acknowledged`, and a
+`disclosure` of the settings files the install writes, the hook events it adds,
+and the command each hook runs.
+
+`POST /api/app-state/agent-hooks-acknowledgement` records the acknowledgement.
+It is refused in read-only and CityHall modes: consenting writes into the
+daemon user's own agent settings.
 
 ## POST /api/sessions/{id}/send
 

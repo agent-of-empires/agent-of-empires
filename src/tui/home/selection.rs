@@ -61,9 +61,10 @@ impl HomeView {
         let Some(inst) = self.get_instance(session_id) else {
             return;
         };
-        let group_path = match self.group_by {
+        let group_path = match self.effective_group_by() {
             GroupByMode::Project => Some(project_group_key(inst)),
             GroupByMode::Org => Some(self.org_group_key(inst)),
+            GroupByMode::Remote => None,
             GroupByMode::Manual => {
                 let p = inst.group_path.clone();
                 if p.is_empty() {
@@ -77,14 +78,19 @@ impl HomeView {
         self.selected_session = Some(session_id.to_string());
         self.selected_group = None;
         self.selected_group_profile = None;
+        if self.effective_group_by() == GroupByMode::Remote && self.local_machine_collapsed {
+            self.local_machine_collapsed = false;
+            self.rebuild_flat_items();
+        }
         if let Some(gpath) = group_path {
-            match self.group_by {
+            match self.effective_group_by() {
                 GroupByMode::Project => {
                     self.project_group_collapsed.insert(gpath, false);
                 }
                 GroupByMode::Org => {
                     self.org_group_collapsed.insert(gpath, false);
                 }
+                GroupByMode::Remote => {}
                 GroupByMode::Manual => {
                     if let Some(tree) = self.group_trees.get_mut(&target_profile) {
                         tree.set_collapsed(&gpath, false);

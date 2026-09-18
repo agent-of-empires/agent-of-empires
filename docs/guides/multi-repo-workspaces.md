@@ -195,9 +195,11 @@ From the home view, press `b` (or `B` with strict hotkeys) to open a filterable 
 
 ## Web Dashboard
 
-The Projects page (folder icon in the sidebar footer) is full CRUD over the registry: add, remove, switch scope, opt into `allow_override`. Read-only servers (`aoe serve --read-only`) hide the destructive controls.
+Use the sidebar's **Projects** section to add a saved project, edit its default base branch, or remove its registration. Unpin a project first if it is displayed as a persistent repository header. Changing a registration's name, path, or scope requires removing and adding it again. Read-only servers hide mutation controls.
 
-The new-session wizard surfaces the registry as toggleable chips in the Project section. The free-text input still works for paths that aren't registered.
+Remove targets the registrations represented by that project row, using the profile captured when the action starts. It does not request deletion from unrelated profiles. Global registrations are shared, so removing one changes every profile's merged view.
+
+Saved-project suggestions in the new-session wizard follow the selected profile. An open project form keeps its original profile even if the daemon's default profile changes. The picker for adding a repository to an existing session uses that session's profile. Unregistered paths can still be entered directly.
 
 Multi-repo sessions are bucketed into a single **Multi-repo** group at the bottom of the sidebar, regardless of which repo was chosen as the primary. Each session row shows a chip per repo under the title.
 

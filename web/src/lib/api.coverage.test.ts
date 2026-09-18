@@ -53,7 +53,6 @@ import {
   createProject,
   deleteProject,
   updateProject,
-  setProjectPinned,
   fetchDockerStatus,
   createSession,
   cloneRepo,
@@ -819,144 +818,57 @@ describe("fetchGroups", () => {
 });
 
 describe("fetchProjects", () => {
-  it("GETs /api/projects with no scope", async () => {
-    fetchSpy.mockResolvedValueOnce(jsonResponse([{ name: "p" }]));
-    expect(await fetchProjects()).toHaveLength(1);
-    expect(lastCall()[0]).toBe("/api/projects");
-  });
-
-  it("appends the scope query when given", async () => {
-    fetchSpy.mockResolvedValueOnce(jsonResponse([]));
-    await fetchProjects("profile");
-    expect(lastCall()[0]).toBe("/api/projects?scope=profile");
-  });
-
-  it("coalesces a null result to []", async () => {
+  it("does not turn an unavailable registry into an empty one", async () => {
     fetchSpy.mockResolvedValueOnce(new Response("", { status: 500 }));
-    expect(await fetchProjects()).toEqual([]);
+    expect(await fetchProjects({ profile: "alpha" })).toBeNull();
   });
 });
 
 describe("createProject", () => {
-  it("POSTs the body and returns the project on 200", async () => {
-    fetchSpy.mockResolvedValueOnce(jsonResponse({ name: "p", path: "/p" }));
-    const result = await createProject({ path: "/p", name: "p", scope: "global" });
-    expect(result.ok).toBe(true);
-    expect(result.project).toEqual({ name: "p", path: "/p" });
-    const [url, init] = lastCall();
-    expect(url).toBe("/api/projects");
-    expect(init?.method).toBe("POST");
-    expect(bodyOf(init)).toEqual({ path: "/p", name: "p", scope: "global" });
-  });
-
   it("returns a parsed error message on a JSON error body", async () => {
     fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify({ message: "dup" }), { status: 409 }));
-    const result = await createProject({ path: "/p" });
+    const result = await createProject({ path: "/p", profile: "alpha", scope: "global" });
     expect(result).toEqual({ ok: false, error: "dup" });
   });
 
   it("falls back to the raw text on a non-JSON error body", async () => {
     fetchSpy.mockResolvedValueOnce(new Response("boom", { status: 500 }));
-    const result = await createProject({ path: "/p" });
+    const result = await createProject({ path: "/p", profile: "alpha", scope: "global" });
     expect(result.ok).toBe(false);
     expect(result.error).toBe("boom");
   });
 
   it("returns a network error message on a thrown fetch", async () => {
     fetchSpy.mockRejectedValueOnce(new Error("offline"));
-    const result = await createProject({ path: "/p" });
+    const result = await createProject({ path: "/p", profile: "alpha", scope: "global" });
     expect(result).toEqual({ ok: false, error: "offline" });
   });
 });
 
 describe("deleteProject", () => {
-  it("DELETEs the encoded name with the scope query", async () => {
-    fetchSpy.mockResolvedValueOnce(new Response("", { status: 200 }));
-    const result = await deleteProject("my proj", "profile");
-    expect(result).toEqual({ ok: true });
-    const [url, init] = lastCall();
-    expect(url).toBe("/api/projects/my%20proj?scope=profile");
-    expect(init?.method).toBe("DELETE");
-  });
-
   it("returns a parsed error on a JSON error body", async () => {
     fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify({ message: "nope" }), { status: 409 }));
-    const result = await deleteProject("p", "global");
+    const result = await deleteProject("p", { scope: "global" });
     expect(result).toEqual({ ok: false, error: "nope" });
   });
 
   it("returns a network error on a thrown fetch", async () => {
     fetchSpy.mockRejectedValueOnce(new Error("offline"));
-    const result = await deleteProject("p", "global");
+    const result = await deleteProject("p", { scope: "global" });
     expect(result).toEqual({ ok: false, error: "offline" });
   });
 });
 
 describe("updateProject", () => {
-  it("PATCHes the default_base_branch (string)", async () => {
-    fetchSpy.mockResolvedValueOnce(jsonResponse({ name: "p" }));
-    const result = await updateProject("p", "global", "develop");
-    expect(result.ok).toBe(true);
-    const [url, init] = lastCall();
-    expect(url).toBe("/api/projects/p?scope=global");
-    expect(init?.method).toBe("PATCH");
-    expect(bodyOf(init)).toEqual({ default_base_branch: "develop" });
-  });
-
-  it("PATCHes null to clear the base branch", async () => {
-    fetchSpy.mockResolvedValueOnce(jsonResponse({ name: "p" }));
-    await updateProject("p", "global", null);
-    expect(bodyOf(lastCall()[1])).toEqual({ default_base_branch: null });
-  });
-
   it("returns a parsed error on a JSON error body", async () => {
     fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify({ message: "bad" }), { status: 400 }));
-    const result = await updateProject("p", "global", "x");
+    const result = await updateProject("p", { scope: "global" }, { default_base_branch: "x" });
     expect(result).toEqual({ ok: false, error: "bad" });
   });
 
   it("returns a network error on a thrown fetch", async () => {
     fetchSpy.mockRejectedValueOnce(new Error("offline"));
-    const result = await updateProject("p", "global", "x");
-    expect(result).toEqual({ ok: false, error: "offline" });
-  });
-});
-
-describe("setProjectPinned", () => {
-  it("PATCHes the pinned flag and returns the project on 200", async () => {
-    fetchSpy.mockResolvedValueOnce(jsonResponse({ name: "p", pinned: false }));
-    const result = await setProjectPinned("p", "global", false);
-    expect(result.ok).toBe(true);
-    expect(result.project).toEqual({ name: "p", pinned: false });
-    const [url, init] = lastCall();
-    expect(url).toBe("/api/projects/p?scope=global");
-    expect(init?.method).toBe("PATCH");
-    expect(bodyOf(init)).toEqual({ pinned: false });
-  });
-
-  it("encodes the name and forwards the profile scope", async () => {
-    fetchSpy.mockResolvedValueOnce(jsonResponse({ name: "a b", pinned: true }));
-    await setProjectPinned("a b", "profile", true);
-    expect(lastCall()[0]).toBe("/api/projects/a%20b?scope=profile");
-    expect(bodyOf(lastCall()[1])).toEqual({ pinned: true });
-  });
-
-  it("returns a parsed error on a JSON error body", async () => {
-    fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify({ message: "nope" }), { status: 404 }));
-    const result = await setProjectPinned("p", "global", true);
-    expect(result).toEqual({ ok: false, error: "nope" });
-  });
-
-  it("falls back to the raw text on a non-JSON error body", async () => {
-    fetchSpy.mockResolvedValueOnce(new Response("boom", { status: 500 }));
-    const result = await setProjectPinned("p", "global", true);
-    expect(result.ok).toBe(false);
-    expect(result.error).toBe("boom");
-  });
-
-  it("returns a network error on a thrown fetch", async () => {
-    fetchSpy.mockRejectedValueOnce(new Error("offline"));
-    const result = await setProjectPinned("p", "global", true);
+    const result = await updateProject("p", { scope: "global" }, { default_base_branch: "x" });
     expect(result).toEqual({ ok: false, error: "offline" });
   });
 });

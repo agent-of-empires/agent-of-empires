@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
+use crate::daemon::{CreationPhase, CreationProgress};
 use crate::server::session_spawn::{spawn_structured_session, SpawnOutcome, StructuredSessionSpec};
 use crate::session::{Instance, PluginCreateIdempotency};
 
@@ -148,6 +149,10 @@ fn queue_drain_batch<'a>(
 }
 
 pub struct SessionService {
+    pub(crate) work: Arc<super::runtime::RuntimeWork>,
+    native_state: std::sync::OnceLock<std::sync::Weak<super::AppState>>,
+    creations_by_profile: std::sync::Mutex<HashMap<String, usize>>,
+    active_creations: std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<CreationEntry>>>>,
     /// Live in-memory session list, shared with `AppState.instances`.
     pub instances: Arc<RwLock<Vec<Instance>>>,
     /// Per-instance mutation locks, shared with `AppState.instance_locks`.
@@ -178,9 +183,6 @@ pub struct SessionService {
     pub acp_control_cache: Arc<crate::acp::control_cache::ControlStateCache>,
     /// In-flight plugin creates keyed by `(plugin_id, idempotency_key)`.
     /// Sync mutex: critical sections are tiny and never span an `await`.
-    // ponytail: one daemon process is the only sessions.json writer, so a
-    // process-local registry closes the duplicate-create race; a cross-process
-    // reservation store only becomes necessary if that assumption changes.
     create_in_flight: std::sync::Mutex<HashMap<(String, String), CreateInFlight>>,
     /// Session ids with a pending-initial-turn drain in flight, so the create
     /// fast path and the reconciler tick cannot queue duplicate drains.
@@ -198,13 +200,6 @@ pub struct SessionService {
     /// reaches `prompt_locks`. See [`SessionService::watch_submission_claims`].
     #[cfg(test)]
     submission_claims: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<String>>,
-    #[cfg(test)]
-    pub(super) created_instance_gate: std::sync::Mutex<
-        Option<(
-            tokio::sync::oneshot::Sender<()>,
-            tokio::sync::oneshot::Receiver<()>,
-        )>,
-    >,
 }
 
 /// Who is asking the session service to act. Constructed only by the
@@ -301,6 +296,10 @@ impl SessionService {
         acp: AcpDeps,
     ) -> Self {
         Self {
+            work: Arc::new(super::runtime::RuntimeWork::default()),
+            native_state: std::sync::OnceLock::new(),
+            creations_by_profile: std::sync::Mutex::new(HashMap::new()),
+            active_creations: std::sync::Mutex::new(HashMap::new()),
             instances,
             instance_locks,
             file_watch,
@@ -315,9 +314,142 @@ impl SessionService {
             prompt_locks: RwLock::new(HashMap::new()),
             #[cfg(test)]
             submission_claims: std::sync::OnceLock::new(),
-            #[cfg(test)]
-            created_instance_gate: std::sync::Mutex::new(None),
         }
+    }
+
+    pub(super) fn bind_native_state(&self, state: &Arc<super::AppState>) {
+        assert!(
+            self.native_state.set(Arc::downgrade(state)).is_ok(),
+            "native session context is bound once"
+        );
+    }
+
+    pub(super) fn native_state(&self) -> anyhow::Result<Arc<super::AppState>> {
+        self.native_state
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| crate::session::NativeStoreUnavailable.into())
+    }
+
+    /// The caller holds the profile namespace read lock.
+    pub(super) fn claim_creation_profile(self: &Arc<Self>, profile: &str) -> CreationProfileGuard {
+        *self
+            .creations_by_profile
+            .lock()
+            .expect("creation profiles mutex poisoned")
+            .entry(profile.to_owned())
+            .or_default() += 1;
+        CreationProfileGuard {
+            service: Arc::clone(self),
+            profile: profile.to_owned(),
+        }
+    }
+
+    pub(super) fn has_profile_creation(&self, profile: &str) -> bool {
+        self.creations_by_profile
+            .lock()
+            .expect("creation profiles mutex poisoned")
+            .contains_key(profile)
+    }
+
+    /// Register a creation before it touches shared resources. The returned
+    /// guard owns its published progress and removes both on drop.
+    pub(super) fn register_creation(
+        self: &Arc<Self>,
+        id: &str,
+        title: &str,
+        profile: &str,
+    ) -> anyhow::Result<CreationGuard> {
+        let entry = Arc::new(std::sync::Mutex::new(CreationEntry {
+            lifecycle: CreationLifecycle::Running,
+            progress: CreationProgress {
+                session_id: id.to_owned(),
+                title: title.to_owned(),
+                profile: profile.to_owned(),
+                phase: CreationPhase::Reserving,
+                command: None,
+                output: Vec::new(),
+                cancelled: false,
+            },
+            published_at: std::time::Instant::now(),
+        }));
+        {
+            let mut active = self
+                .active_creations
+                .lock()
+                .expect("creation registry poisoned");
+            let std::collections::hash_map::Entry::Vacant(slot) = active.entry(id.to_owned())
+            else {
+                anyhow::bail!("creation already registered");
+            };
+            slot.insert(Arc::clone(&entry));
+        }
+        self.publish_creation_progress();
+        Ok(CreationGuard {
+            service: Arc::clone(self),
+            entry,
+            id: id.to_owned(),
+        })
+    }
+
+    /// Refuse a cancellation the creation can no longer honor. Accepted
+    /// requests only mark the in-flight phase; the rollback still owns cleanup.
+    pub(crate) fn cancel_creation(&self, id: &str) -> bool {
+        let entry = {
+            let active = self
+                .active_creations
+                .lock()
+                .expect("creation registry poisoned");
+            active.get(id).map(Arc::clone)
+        };
+        let Some(entry) = entry else {
+            return false;
+        };
+        {
+            let mut entry = entry.lock().expect("creation entry poisoned");
+            match entry.lifecycle {
+                CreationLifecycle::Committed => return false,
+                CreationLifecycle::Running | CreationLifecycle::Cancelled => {
+                    entry.lifecycle = CreationLifecycle::Cancelled;
+                    entry.progress.cancelled = true;
+                }
+            }
+        }
+        self.publish_creation_progress();
+        true
+    }
+
+    fn creation_progress(&self) -> Vec<CreationProgress> {
+        let entries: Vec<Arc<std::sync::Mutex<CreationEntry>>> = {
+            let active = self
+                .active_creations
+                .lock()
+                .expect("creation registry poisoned");
+            active.values().map(Arc::clone).collect()
+        };
+        let mut progress: Vec<CreationProgress> = entries
+            .into_iter()
+            .map(|entry| {
+                entry
+                    .lock()
+                    .expect("creation entry poisoned")
+                    .progress
+                    .clone()
+            })
+            .collect();
+        progress.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+        progress
+    }
+
+    /// Advisory display state, so an unbound or shutting-down runtime is not
+    /// an error: the work itself continues and publishes its canonical result.
+    fn publish_creation_progress(&self) {
+        let Ok(state) = self.native_state() else {
+            return;
+        };
+        state
+            .runtime
+            .publish_creation_progress(self.creation_progress());
     }
 
     /// Create a structured session through the shared spawn pipeline,
@@ -327,9 +459,7 @@ impl SessionService {
     /// create path. For a plugin caller it additionally:
     /// - stamps `created_by_plugin` and the idempotency record on the
     ///   instance before it is persisted, atomically with the row itself;
-    /// - forces repo-hook trust fail-closed (`trust_hooks = false`); a plugin
-    ///   cannot pre-approve a repository's hooks, so an untrusted repo
-    ///   refuses the create regardless of install grants;
+    /// - refuses untrusted repo hooks regardless of plugin install grants;
     /// - deduplicates on `(plugin_id, idempotency_key)`: a retry with the
     ///   same payload returns the existing session (`created: false` in the
     ///   returned pair), a retry with a different payload fails with
@@ -360,7 +490,8 @@ impl SessionService {
 
         spec.created_by_plugin = Some(plugin_id.to_string());
         // Fail-closed: install-time plugin consent is not repository trust.
-        spec.trust_hooks = Some(false);
+        spec.trust_hooks = None;
+        spec.trust_review = None;
 
         let Some(key) = idempotency_key else {
             let outcome = spawn_structured_session(self, spec).await?;
@@ -1651,6 +1782,164 @@ impl Drop for PendingDrainGuard {
     }
 }
 
+pub(super) struct CreationProfileGuard {
+    service: Arc<SessionService>,
+    profile: String,
+}
+
+impl Drop for CreationProfileGuard {
+    fn drop(&mut self) {
+        let mut profiles = self
+            .service
+            .creations_by_profile
+            .lock()
+            .expect("creation profiles mutex poisoned");
+        let count = profiles
+            .get_mut(&self.profile)
+            .expect("active creation profile");
+        *count -= 1;
+        if *count == 0 {
+            profiles.remove(&self.profile);
+        }
+    }
+}
+
+/// Bounded live view: creation progress is display-only, so it never grows
+/// with hook output. Output lines are also capped individually, because a
+/// single hook line can be arbitrarily large.
+const CREATION_PROGRESS_LINES: usize = 20;
+const CREATION_PROGRESS_LINE_CHARS: usize = 400;
+/// Minimum spacing between two published output lines, so a chatty hook cannot
+/// drive a snapshot-sized write per line. Phase and command changes publish
+/// immediately.
+const CREATION_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+fn bounded_progress_line(line: &str) -> String {
+    match line
+        .char_indices()
+        .nth(CREATION_PROGRESS_LINE_CHARS)
+        .map(|(end, _)| end)
+    {
+        Some(end) => format!("{}...", &line[..end]),
+        None => line.to_owned(),
+    }
+}
+
+/// Let the next output line publish immediately. A hook that prints one line
+/// and then blocks must not stay invisible behind the rate limit.
+fn allow_immediate_output(entry: &mut CreationEntry) {
+    entry.published_at = std::time::Instant::now()
+        .checked_sub(CREATION_PROGRESS_INTERVAL)
+        .unwrap_or_else(std::time::Instant::now);
+}
+
+/// Whether the creation may still be cancelled or launched.
+enum CreationLifecycle {
+    Running,
+    Cancelled,
+    Committed,
+}
+
+struct CreationEntry {
+    lifecycle: CreationLifecycle,
+    progress: CreationProgress,
+    published_at: std::time::Instant,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Session creation cancelled")]
+pub(crate) struct CreationCancelled;
+
+pub(super) struct CreationGuard {
+    service: Arc<SessionService>,
+    id: String,
+    entry: Arc<std::sync::Mutex<CreationEntry>>,
+}
+
+impl CreationGuard {
+    pub(super) fn check(&self) -> Result<(), CreationCancelled> {
+        if matches!(
+            self.entry
+                .lock()
+                .expect("creation entry poisoned")
+                .lifecycle,
+            CreationLifecycle::Cancelled
+        ) {
+            Err(CreationCancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(super) fn commit(&self) -> Result<(), CreationCancelled> {
+        let mut entry = self.entry.lock().expect("creation entry poisoned");
+        match entry.lifecycle {
+            CreationLifecycle::Cancelled => Err(CreationCancelled),
+            CreationLifecycle::Running | CreationLifecycle::Committed => {
+                entry.lifecycle = CreationLifecycle::Committed;
+                Ok(())
+            }
+        }
+    }
+
+    /// Enter a phase, discarding the previous phase's command and output.
+    pub(super) fn phase(&self, phase: CreationPhase) {
+        {
+            let mut entry = self.entry.lock().expect("creation entry poisoned");
+            entry.progress.phase = phase;
+            entry.progress.command = None;
+            entry.progress.output.clear();
+            allow_immediate_output(&mut entry);
+        }
+        self.service.publish_creation_progress();
+    }
+
+    pub(super) fn command(&self, command: &str) {
+        {
+            let mut entry = self.entry.lock().expect("creation entry poisoned");
+            entry.progress.command = Some(bounded_progress_line(command));
+            allow_immediate_output(&mut entry);
+        }
+        self.service.publish_creation_progress();
+    }
+
+    fn output(&self, line: &str) {
+        {
+            let mut entry = self.entry.lock().expect("creation entry poisoned");
+            let output = &mut entry.progress.output;
+            if output.len() == CREATION_PROGRESS_LINES {
+                output.remove(0);
+            }
+            output.push(bounded_progress_line(line));
+            if entry.published_at.elapsed() < CREATION_PROGRESS_INTERVAL {
+                return;
+            }
+            entry.published_at = std::time::Instant::now();
+        }
+        self.service.publish_creation_progress();
+    }
+
+    /// Route one hook event into the published progress.
+    pub(super) fn hook_event(&self, event: crate::session::config::repo_config::HookProgress) {
+        use crate::session::config::repo_config::HookProgress;
+        match event {
+            HookProgress::Started(command) => self.command(&command),
+            HookProgress::Output(line) => self.output(&line),
+        }
+    }
+}
+
+impl Drop for CreationGuard {
+    fn drop(&mut self) {
+        self.service
+            .active_creations
+            .lock()
+            .expect("creation registry poisoned")
+            .remove(&self.id);
+        self.service.publish_creation_progress();
+    }
+}
+
 /// Releases the in-flight slot and wakes waiters on every exit path of the
 /// winning create, including an error return or a panic unwinding through
 /// the caller.
@@ -1701,11 +1990,8 @@ fn find_idempotent_match(
     IdempotentMatch::None
 }
 
-/// Versioned, restart-stable hash of the semantic create request. Field order
-/// is fixed and every field is length-prefixed by its `Debug`/value rendering
-/// with a separator, so two different requests cannot collide by
-/// concatenation. `trust_hooks` is excluded: it is forced for plugin callers
-/// and never part of the request identity.
+/// Versioned request hash with fixed field order and length-prefixed values.
+/// Plugin trust inputs are forced and are not part of request identity.
 fn spec_payload_hash(spec: &StructuredSessionSpec) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -1817,6 +2103,7 @@ mod tests {
     fn test_spec() -> StructuredSessionSpec {
         StructuredSessionSpec {
             title: Some("nightly".to_string()),
+            size: None,
             path: "/tmp/aoe-2897-project".to_string(),
             group: String::new(),
             tool: "claude".to_string(),
@@ -1834,6 +2121,7 @@ mod tests {
             repo_base_branches: Vec::new(),
             scratch: false,
             trust_hooks: None,
+            trust_review: None,
             custom_instruction: None,
             callback_url: None,
             idempotency_key: None,
@@ -1849,6 +2137,42 @@ mod tests {
             import_acp_session_id: None,
             fork_seed: None,
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn plugin_creation_cannot_approve_or_skip_untrusted_hooks() -> anyhow::Result<()> {
+        let home = crate::session::test_support::isolate_app_dir();
+        let project = home.path().join("project");
+        let config_dir = project.join(".agent-of-empires");
+        std::fs::create_dir_all(&config_dir)?;
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "[hooks]\non_create = [\"false\"]\n",
+        )?;
+        let storage = crate::session::Storage::new_unwatched("default")?;
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        for decision in [Some(false), Some(true)] {
+            let mut spec = test_spec();
+            spec.path = project.to_string_lossy().into_owned();
+            spec.trust_hooks = decision;
+            // Invalid Git input prevents launching a real agent if the trust gate regresses.
+            spec.worktree_enabled = true;
+            spec.worktree_branch = Some("planned".into());
+            spec.create_new_branch = true;
+            let error = state
+                .session_service
+                .create_structured_session(spec, Some("cron"), None, None)
+                .await
+                .err()
+                .expect("plugin trust decisions must be refused");
+            assert!(
+                error.is::<crate::server::api::sessions::HooksNeedTrust>(),
+                "{error:#}"
+            );
+        }
+        assert!(storage.load()?.is_empty());
+        Ok(())
     }
 
     #[test]

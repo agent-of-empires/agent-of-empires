@@ -617,6 +617,10 @@ last_seen_version = "{}"
         self.spawn(&[]);
     }
 
+    pub fn spawn_peer_tui(&self, name: &str) {
+        self.tmux_new_detached(name, self.binary_path.to_str().expect("binary path"));
+    }
+
     /// Spawn `aoe <args>` inside a detached tmux session.
     pub fn spawn(&mut self, args: &[&str]) {
         self.input_barrier = args.first() != Some(&"add");
@@ -725,37 +729,25 @@ last_seen_version = "{}"
         if matches!(keys, "Escape" | "C-[") {
             self.send_hex_keys(ESCAPE_CSI_U);
         } else {
-            self.send_keys_unfenced(keys);
+            self.send_session_keys(&self.session_name, keys);
         }
         self.synchronize_input();
     }
 
-    fn send_hex_keys<S: AsRef<std::ffi::OsStr>>(&self, bytes: &[S]) {
-        assert!(self.spawned, "must call spawn_tui() or spawn() first");
-        let output = Command::new("tmux")
-            .arg("-S")
-            .arg(&self.socket_path)
-            .args(["send-keys", "-t", &self.session_name, "-H"])
-            .args(bytes)
-            .output()
-            .expect("failed to send keys");
-        assert!(
-            output.status.success(),
-            "send-keys failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+    /// The TUI's own tmux session, for [`Self::send_session_keys`].
+    pub fn session_name(&self) -> &str {
+        &self.session_name
     }
 
     /// Native terminal owners cannot receive an outer-TUI F12 fence.
     /// Observe their lifecycle before resuming ordinary TUI input.
-    pub fn send_keys_unfenced(&self, keys: &str) {
-        assert!(self.spawned, "must call spawn_tui() or spawn() first");
+    pub fn send_session_keys(&self, name: &str, keys: &str) {
         let output = Command::new("tmux")
             .arg("-S")
             .arg(&self.socket_path)
             .arg("send-keys")
             .arg("-t")
-            .arg(&self.session_name)
+            .arg(name)
             .arg(keys)
             .output()
             .expect("failed to send keys");
@@ -764,33 +756,6 @@ last_seen_version = "{}"
             "send-keys failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-    }
-
-    pub fn terminal_resume_sequence(&self) -> u64 {
-        match std::fs::read_to_string(self.home_dir.path().join("input-barrier.resumed")) {
-            Ok(value) => value.parse().expect("terminal resume sequence"),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-            Err(error) => panic!("read terminal resume sequence: {error}"),
-        }
-    }
-
-    pub fn wait_for_terminal_resume(&self, previous: u64) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let resumed =
-                std::fs::read_to_string(self.home_dir.path().join("input-barrier.resumed"))
-                    .ok()
-                    .and_then(|value| value.parse::<u64>().ok());
-            if resumed.is_some_and(|sequence| sequence > previous) {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "outer TUI did not regain terminal ownership"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        self.synchronize_input();
     }
 
     /// Send a synthetic mouse event into the inner pane as an SGR
@@ -864,6 +829,88 @@ last_seen_version = "{}"
             "type_text failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        self.synchronize_input();
+    }
+
+    /// Capture the current screen contents as plain text.
+    pub fn capture_screen(&self) -> String {
+        self.capture_pane(&self.session_name, false)
+    }
+
+    /// Same as [`capture_screen`](Self::capture_screen) but keeps the escape
+    /// sequences, so a test can assert on styling the TUI painted (an
+    /// underline, a color) and not just on the text.
+    pub fn capture_screen_styled(&self) -> String {
+        self.capture_pane(&self.session_name, true)
+    }
+
+    /// Whether this tmux stores and re-emits OSC 8 hyperlinks through
+    /// `capture-pane -e`, which arrived in tmux 3.4. aoe still supports older
+    /// tmux on the capture fallback, so a link test skips there rather than
+    /// failing on a capability the host does not have.
+    pub fn tmux_reemits_hyperlinks() -> bool {
+        let Ok(out) = Command::new("tmux").arg("-V").output() else {
+            return false;
+        };
+        if !out.status.success() {
+            return false;
+        }
+        let version = String::from_utf8_lossy(&out.stdout);
+        let digits: String = version
+            .chars()
+            .skip_while(|c| !c.is_ascii_digit())
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        let mut parts = digits.split('.');
+        let major: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        let minor: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        (major, minor) >= (3, 4)
+    }
+
+    pub fn capture_session_screen(&self, name: &str) -> String {
+        self.capture_pane(name, false)
+    }
+
+    fn send_hex_keys<S: AsRef<std::ffi::OsStr>>(&self, bytes: &[S]) {
+        assert!(self.spawned, "must call spawn_tui() or spawn() first");
+        let output = Command::new("tmux")
+            .arg("-S")
+            .arg(&self.socket_path)
+            .args(["send-keys", "-t", &self.session_name, "-H"])
+            .args(bytes)
+            .output()
+            .expect("failed to send keys");
+        assert!(
+            output.status.success(),
+            "send-keys failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    pub fn terminal_resume_sequence(&self) -> u64 {
+        match std::fs::read_to_string(self.home_dir.path().join("input-barrier.resumed")) {
+            Ok(value) => value.parse().expect("terminal resume sequence"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => panic!("read terminal resume sequence: {error}"),
+        }
+    }
+
+    pub fn wait_for_terminal_resume(&self, previous: u64) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let resumed =
+                std::fs::read_to_string(self.home_dir.path().join("input-barrier.resumed"))
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok());
+            if resumed.is_some_and(|sequence| sequence > previous) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "outer TUI did not regain terminal ownership"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         self.synchronize_input();
     }
 
@@ -950,49 +997,14 @@ last_seen_version = "{}"
         }
     }
 
-    /// Capture the current screen contents as plain text.
-    pub fn capture_screen(&self) -> String {
-        self.capture_pane(false)
-    }
-
-    /// Same as [`capture_screen`](Self::capture_screen) but keeps the escape
-    /// sequences, so a test can assert on styling the TUI painted (an
-    /// underline, a color) and not just on the text.
-    pub fn capture_screen_styled(&self) -> String {
-        self.capture_pane(true)
-    }
-
-    /// Whether this tmux stores and re-emits OSC 8 hyperlinks through
-    /// `capture-pane -e`, which arrived in tmux 3.4. aoe still supports older
-    /// tmux on the capture fallback, so a link test skips there rather than
-    /// failing on a capability the host does not have.
-    pub fn tmux_reemits_hyperlinks() -> bool {
-        let Ok(out) = Command::new("tmux").arg("-V").output() else {
-            return false;
-        };
-        if !out.status.success() {
-            return false;
-        }
-        let version = String::from_utf8_lossy(&out.stdout);
-        let digits: String = version
-            .chars()
-            .skip_while(|c| !c.is_ascii_digit())
-            .take_while(|c| c.is_ascii_digit() || *c == '.')
-            .collect();
-        let mut parts = digits.split('.');
-        let major: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
-        let minor: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
-        (major, minor) >= (3, 4)
-    }
-
-    fn capture_pane(&self, styled: bool) -> String {
+    fn capture_pane(&self, name: &str, styled: bool) -> String {
         assert!(self.spawned, "must call spawn_tui() or spawn() first");
         let mut cmd = Command::new("tmux");
         cmd.arg("-S")
             .arg(&self.socket_path)
             .arg("capture-pane")
             .arg("-t")
-            .arg(&self.session_name)
+            .arg(name)
             .arg("-p");
         if styled {
             cmd.arg("-e");
@@ -1162,6 +1174,22 @@ last_seen_version = "{}"
         self.set_env("AOE_E2E_DEBUG", "1");
     }
 
+    /// Wait until the TUI's runtime subscription is live. Requires
+    /// `enable_e2e_debug_signals` before `spawn_tui`.
+    pub fn wait_for_runtime_ready(&self) {
+        let path = app_dir_in(self.home_dir.path()).join(".aoe_e2e_runtime_ready");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the runtime subscription; check that \
+                 enable_e2e_debug_signals() was called before spawn_tui.\n\n{}",
+                self.capture_screen()
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
     /// Read the current watcher-config-refresh counter exported by the
     /// TUI. Returns 0 when the file is missing (TUI has not run any
     /// watcher refresh yet, or `AOE_E2E_DEBUG` was not set on the
@@ -1248,20 +1276,12 @@ last_seen_version = "{}"
 
 impl Drop for TuiTestHarness {
     fn drop(&mut self) {
-        // Stop structured view workers and the daemon before tearing down tmux so
-        // a panicking assertion can't leak a daemon (which holds the test
-        // port / pid file) into the next serial test. Worker first, then
-        // daemon, so the fake-ACP child exits cleanly.
-        if self.stop_daemon_on_drop {
+        // A spawned TUI may have started its isolated daemon.
+        if self.stop_daemon_on_drop || self.spawned {
             let _ = self.run_cli(&["acp", "stop", "--all"]);
             let _ = self.run_cli(&["serve", "--stop"]);
         }
-        // Kill the entire per-test tmux server, not just the primary session:
-        // tests also create tool / terminal / pre-created agent sessions on
-        // this same private socket, and `spawn` may never have been called
-        // (e.g. a CLI-only test that pre-creates sessions via
-        // `tmux_new_detached`). Tearing down the server reaps them all and
-        // stops the run from accumulating orphaned tmux servers.
+        // Reap all sessions on this private socket, including CLI-created panes.
         self.kill_server();
 
         // Convert recording to GIF if one was produced.

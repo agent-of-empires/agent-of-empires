@@ -27,6 +27,7 @@ export const docsNav: NavSection[] = [
       { title: "Podman", href: "/guides/podman/", description: "Use Podman as a rootless alternative to Docker for sandboxing." },
       { title: "Apple Containers", href: "/guides/apple-containers/", description: "Sandbox agents with Apple's native container framework on macOS." },
       { title: "Live Mode", href: "/guides/live-mode/", description: "Watch a session stream live and type into it from the TUI." },
+      { title: "Remote Machines", href: "/guides/remotes/", description: "List and drive sessions on other machines' daemons from the TUI." },
       { title: "Repo Config & Hooks", href: "/guides/repo-config/", description: "Per-repo configuration and lifecycle hooks for sessions." },
       { title: "Git Worktrees", href: "/guides/worktrees/", description: "How AoE creates and cleans up a git worktree per session." },
       { title: "Multi-Repo Workspaces", href: "/guides/multi-repo-workspaces/", description: "Drive one session across several git repositories at once." },

@@ -97,7 +97,10 @@ fn test_live_send_paste_into_non_bracketed_pane_has_no_marker_debris() {
         String::from_utf8_lossy(&add.stderr)
     );
 
+    h.enable_e2e_debug_signals();
     h.spawn_tui();
+    // Native pane preparation refuses an unready runtime.
+    h.wait_for_runtime_ready();
     h.wait_for("Pasty");
     h.send_keys("Enter");
     h.wait_for_timeout("LIVE", Duration::from_secs(10));

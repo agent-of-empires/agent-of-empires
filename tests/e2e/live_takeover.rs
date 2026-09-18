@@ -84,7 +84,10 @@ fn test_web_takeover_exits_tui_live_mode_with_dialog() {
         String::from_utf8_lossy(&add.stderr)
     );
 
+    h.enable_e2e_debug_signals();
     h.spawn_tui();
+    // Native pane preparation refuses an unready runtime.
+    h.wait_for_runtime_ready();
     h.wait_for("Takeover");
 
     // Activate the session; default_attach_mode routes into live-send.

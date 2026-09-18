@@ -127,7 +127,7 @@ volume_ignores = ["node_modules", "target", "**/bin", "**/obj"]
 
 By default, `volume_ignores` paths are mounted as **anonymous volumes** (`volume_ignores_strategy = "anonymous"`). This works on Linux, but on macOS with Docker Desktop's VirtioFS, anonymous volumes may not reliably shadow bind-mount subdirectories, causing host-side directories like `.venv` or `node_modules` to remain visible inside the container.
 
-To fix this on macOS, set `volume_ignores_strategy = "named"`. This mounts each `volume_ignores` path as a **deterministic named Docker/Podman volume** stored entirely inside the Docker VM, bypassing VirtioFS. Named volumes are explicitly removed when the session is deleted.
+To fix this on macOS, set `volume_ignores_strategy = "named"`. This mounts each `volume_ignores` path as a **deterministic named Docker/Podman volume** stored entirely inside the Docker VM, bypassing VirtioFS. Session deletion reclaims named volumes only after the container is removed or confirmed absent. A failed container removal retains them for a later retry.
 
 A volume's name is derived from its mount path, so moving a session's worktree changes it. The recreated container starts from an empty cache for the paths that moved, and the volumes those paths left behind are removed the next time the session starts.
 
@@ -387,10 +387,9 @@ file, so the revoked token stays there until the next login.
 
 ### Reclaiming stores
 
-Permanently deleting a sandboxed session removes its store along with its
-container. Stores stranded before that, by a delete that kept the container, or
-by a delete that failed part-way and kept the session, are found by their
-instance id resolving in no profile:
+Permanently deleting a sandboxed session removes its store after runtime
+teardown succeeds. Reclaim identifies orphan stores by checking live sessions
+and retained purge owners across all profiles and existing app namespaces:
 
 ```bash
 aoe sandbox reclaim            # report what would go, and how much it frees
@@ -403,7 +402,9 @@ installed runtime: a stopped container can be started again, and nothing a
 reclaim can hold would stop it. A store is also kept when a runtime cannot be
 asked, and when it was written to in the last fifteen minutes, since a store is
 seeded before the session that owns it is recorded. The pass refuses to run
-while a store move is in flight.
+while a store move is in flight or an existing namespace has a missing,
+unreadable or unsupported purge-ownership journal. Failed irreversible purges
+retain their stores even when the session row no longer exists.
 
 A session still on the shared legacy store has no private store of its own, so
 deleting it removes its container but leaves that shared store to the

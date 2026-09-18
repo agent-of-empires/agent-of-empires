@@ -8,7 +8,12 @@ use super::DialogResult;
 use crate::session::config::GroupByMode;
 use crate::tui::styles::Theme;
 
-const OPTIONS: &[GroupByMode] = &[GroupByMode::Manual, GroupByMode::Project, GroupByMode::Org];
+const OPTIONS: &[GroupByMode] = &[
+    GroupByMode::Manual,
+    GroupByMode::Project,
+    GroupByMode::Org,
+    GroupByMode::Remote,
+];
 
 pub struct GroupPickerDialog {
     selected: usize,
@@ -198,9 +203,9 @@ mod tests {
         let mut dialog = GroupPickerDialog::new(GroupByMode::Manual);
         dialog.handle_key(key(KeyCode::Up));
         assert_eq!(dialog.selected, 0);
-        dialog.handle_key(key(KeyCode::Down));
-        dialog.handle_key(key(KeyCode::Down));
-        dialog.handle_key(key(KeyCode::Down));
-        assert_eq!(dialog.selected, 2);
+        for _ in 0..OPTIONS.len() + 1 {
+            dialog.handle_key(key(KeyCode::Down));
+        }
+        assert_eq!(dialog.selected, OPTIONS.len() - 1);
     }
 }

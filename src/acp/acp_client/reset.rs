@@ -543,15 +543,20 @@ done
             )
             .await
             .unwrap();
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            // Bound inactivity, not the total time to drain the backlog.
             let mut texts = Vec::new();
             let mut assigned = false;
             let mut failed = false;
             loop {
-                let event = tokio::time::timeout_at(deadline, client.next_event())
-                    .await
-                    .unwrap()
-                    .unwrap();
+                let event = match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    client.next_event(),
+                )
+                .await
+                {
+                    Ok(event) => event.unwrap(),
+                    Err(_) => panic!("no event within 10s of the previous one"),
+                };
                 match event {
                     Event::AgentMessageChunk { text, .. } => texts.push(text),
                     Event::AcpSessionAssigned { .. } => assigned = true,

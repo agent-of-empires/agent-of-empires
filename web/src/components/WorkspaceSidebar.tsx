@@ -1222,8 +1222,16 @@ export const SessionRow = memo(function SessionRow({
   // Attach-a-project modal (#3103) plus the registry snapshot it offers.
   // Fetched when the modal opens rather than on mount: every row would
   // otherwise pull the registry for a menu item most rows never open.
-  const [addProjectOpen, setAddProjectOpen] = useState(false);
-  const [addProjectOptions, setAddProjectOptions] = useState<{ name: string; path: string }[]>([]);
+  const [addProject, setAddProject] = useState<{
+    generation: number;
+    sessionId: string;
+    profile: string;
+    projects: { name: string; path: string }[];
+  } | null>(null);
+  const addProjectGeneration = useRef(0);
+  if (addProject && (addProject.sessionId !== sessionId || addProject.profile !== firstSession?.profile)) {
+    setAddProject(null);
+  }
 
   const togglePin = () => {
     setContextMenu(null);
@@ -1495,19 +1503,30 @@ export const SessionRow = memo(function SessionRow({
   // the in-flight-turn probe and answers 409, which the modal surfaces, so a row
   // that is merely idle between turns stays attachable.
   const canAddProject =
-    !firstSession?.scratch &&
+    !!firstSession?.profile &&
+    !firstSession.scratch &&
     !firstSession?.archived_at &&
     !firstSession?.trashed_at &&
     firstSession?.status !== "Creating" &&
     firstSession?.status !== "Deleting";
 
   const openAddProjectModal = () => {
+    if (!firstSession?.profile) return;
     setContextMenu(null);
-    setAddProjectOpen(true);
-    void fetchProjects().then((projects) =>
-      setAddProjectOptions(projects.map((p) => ({ name: p.name, path: p.path }))),
-    );
+    const generation = ++addProjectGeneration.current;
+    const profile = firstSession.profile;
+    setAddProject({ generation, profile, sessionId: firstSession.id, projects: [] });
+    void fetchProjects({ profile }).then((projects) => {
+      if (generation !== addProjectGeneration.current || projects === null) return;
+      setAddProject((current) =>
+        current?.generation === generation
+          ? { ...current, projects: projects.map((project) => ({ name: project.name, path: project.path })) }
+          : current,
+      );
+    });
   };
+  const closeAddProjectModal = () =>
+    setAddProject((current) => (current?.generation === addProject?.generation ? null : current));
 
   const startGroupEdit = () => {
     setContextMenu(null);
@@ -2127,16 +2146,17 @@ export const SessionRow = memo(function SessionRow({
           />,
           document.body,
         )}
-      {addProjectOpen &&
-        sessionId &&
+      {addProject &&
+        addProject.sessionId === sessionId &&
+        addProject.profile === firstSession?.profile &&
         createPortal(
           <AddProjectModal
             title={label}
-            projects={addProjectOptions}
-            onCancel={() => setAddProjectOpen(false)}
-            onDone={() => setAddProjectOpen(false)}
+            projects={addProject.projects}
+            onCancel={closeAddProjectModal}
+            onDone={closeAddProjectModal}
             onSubmit={(project, attachExistingBranch) =>
-              attachSessionProject(sessionId, project, { attachExistingBranch })
+              attachSessionProject(addProject.sessionId, project, { attachExistingBranch })
             }
           />,
           document.body,

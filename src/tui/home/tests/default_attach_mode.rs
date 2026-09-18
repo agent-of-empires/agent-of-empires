@@ -227,6 +227,7 @@ fn refresh_tool_preview_cache_resizes_live_pane_when_targeted() {
         target: crate::tui::home::live_send::LiveSendTarget::Tool("lazygit".to_string()),
         exit_chords: Vec::new(),
         leader: None,
+        remote: None,
     });
     env.view.selected_session = Some(id);
     assert_eq!(env.view.live_send_last_resize, None);

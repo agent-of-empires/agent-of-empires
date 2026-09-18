@@ -174,19 +174,16 @@ pub async fn send_message(
                 return (StatusCode::OK, Json(serde_json::json!({"sent": true}))).into_response();
             };
             drop(instances);
-            let id_for_save = id.clone();
-            let sync_base_for_save = sync_base.clone();
-            let started_for_save = started.clone();
             let outcome_already_alive = matches!(outcome, EnsureReadyOutcome::AlreadyAlive);
-            tokio::task::spawn_blocking(move || {
+            let persisted = tokio::task::spawn_blocking(move || {
                 if let Ok(storage) = Storage::new(&profile, state.file_watch.clone()) {
                     if let Err(e) = storage.update(|all, _groups| {
-                        if let Some(disk_inst) = all.iter_mut().find(|i| i.id == id_for_save) {
+                        if let Some(disk_inst) = all.iter_mut().find(|i| i.id == id) {
                             if !outcome_already_alive {
                                 apply_post_restart_sync(
                                     disk_inst,
-                                    &sync_base_for_save,
-                                    &started_for_save,
+                                    &sync_base,
+                                    &started,
                                 );
                             }
                             disk_inst.touch_last_accessed();
@@ -196,7 +193,10 @@ pub async fn send_message(
                         tracing::warn!(target: "http.api.sessions", "send_message: persist failed: {e}");
                     }
                 }
-            });
+            }).await;
+            if let Err(error) = persisted {
+                tracing::warn!(target: "http.api.sessions", %error, "send_message persistence task failed");
+            }
             (StatusCode::OK, Json(serde_json::json!({"sent": true}))).into_response()
         }
         Ok(Err(boxed)) => {
@@ -465,13 +465,19 @@ pub async fn paste_image(
             }
         };
 
-    // Best-effort TTL cleanup: the file only needs to outlive the agent
-    // reading it. A detached task keeps the worktree from accumulating blobs
-    // without any teardown bookkeeping.
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-        let _ = tokio::fs::remove_file(&host_path).await;
-    });
+    // Cancel only the timer; an in-progress removal must finish.
+    let shutdown = state.shutdown.clone();
+    state
+        .runtime
+        .work
+        .spawn("server.paste_image_cleanup", async move {
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(3600)) => {}
+            }
+            let _ = tokio::fs::remove_file(&host_path).await;
+        });
 
     let pane_path = pane_visible_paste_path(&project_path, is_sandboxed, &file_name);
     (

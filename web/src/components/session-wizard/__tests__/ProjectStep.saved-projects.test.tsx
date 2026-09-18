@@ -92,7 +92,11 @@ function mockSession(overrides: Partial<SessionResponse> = {}): SessionResponse 
 function renderStep(path = "") {
   const onChange = vi.fn();
   const utils = render(
-    <ProjectStep data={{ ...initialData, path, extraRepoPaths: [], scratch: false }} onChange={onChange} />,
+    <ProjectStep
+      profile="default"
+      data={{ ...initialData, path, extraRepoPaths: [], scratch: false }}
+      onChange={onChange}
+    />,
   );
   return { onChange, ...utils };
 }

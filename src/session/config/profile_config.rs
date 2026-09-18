@@ -5,7 +5,6 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::fs;
 
 use super::Config;
 use crate::session::get_profile_dir;
@@ -48,10 +47,9 @@ impl ProfileConfig {
 /// not pollute `profiles/` with a stub directory.
 pub fn load_profile_config(profile: &str) -> Result<ProfileConfig> {
     let path = crate::session::get_profile_dir_path(profile)?.join("config.toml");
-    if !path.exists() {
+    let Some(content) = super::read_optional_config(&path)? else {
         return Ok(ProfileConfig::default());
-    }
-    let content = fs::read_to_string(&path)?;
+    };
     if content.trim().is_empty() {
         return Ok(ProfileConfig::default());
     }
@@ -345,13 +343,6 @@ mod tests {
         assert!(validate_network_format("container:abc").is_err());
         assert!(validate_network_format("ns:/var/run/netns/x").is_err());
         assert!(validate_network_format("has space").is_err());
-    }
-
-    #[test]
-    fn test_profile_config_default() {
-        let config = ProfileConfig::default();
-        assert!(config.description.is_none());
-        assert!(config.overrides.is_empty());
     }
 
     #[test]

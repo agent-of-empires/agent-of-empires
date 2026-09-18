@@ -26,6 +26,7 @@ use crate::tui::dialogs::{
     WorktreeNameDialog,
 };
 use crate::tui::diff::{DiffAction, DiffView};
+use crate::tui::remote_delete;
 use crate::tui::responsive;
 use crate::tui::settings::{SettingsAction, SettingsView};
 
@@ -267,37 +268,11 @@ fn map_pane_cell(pane: ratatui::layout::Rect, col: u16, row: u16) -> (u16, u16) 
     }
 }
 
-/// Build the mouse-wheel byte sequence to forward to a full-screen app
-/// under the live preview. `up` selects wheel-up (button 64) vs wheel-down
-/// (65); `sgr` selects the SGR (1006) encoding vs the legacy X10 encoding,
-/// matching whatever the app has enabled.
-fn wheel_mouse_bytes(
-    up: bool,
-    sgr: bool,
-    pane: ratatui::layout::Rect,
-    col: u16,
-    row: u16,
-) -> Vec<u8> {
-    let (cx, cy) = map_pane_cell(pane, col, row);
-    let button: u16 = if up { 64 } else { 65 };
-    if sgr {
-        // SGR (1006): textual, press marker `M`. No coordinate limit.
-        format!("\x1b[<{button};{cx};{cy}M").into_bytes()
-    } else {
-        // Legacy X10: `ESC [ M` then three bytes, each the value + 32.
-        // Bytes top out at 255, so coordinates above 223 can't be
-        // encoded; clamp there (preview cells are far below that anyway).
-        let enc = |v: u16| (v.min(223) + 32) as u8;
-        vec![0x1b, b'[', b'M', enc(button), enc(cx), enc(cy)]
-    }
-}
-
 /// Build the byte sequence for a single forwarded mouse button event at
 /// screen cell `(col, row)`, mapped into the app's pane. `base_button` is the
 /// SGR low-bits code (left=0, middle=1, right=2); `release` is a button-up;
 /// `motion` is a drag (button held while moving). `sgr` picks SGR (1006) vs
-/// the legacy X10 encoding, matching the app. Mirrors `wheel_mouse_bytes`,
-/// which is just the wheel buttons (64/65).
+/// the legacy X10 encoding, matching the app.
 fn mouse_event_bytes(
     base_button: u16,
     release: bool,
@@ -308,20 +283,8 @@ fn mouse_event_bytes(
     row: u16,
 ) -> Vec<u8> {
     let (cx, cy) = map_pane_cell(pane, col, row);
-    // The motion bit (32) rides on press/drag reports in both encodings.
     let cb = base_button + if motion { 32 } else { 0 };
-    if sgr {
-        // SGR (1006): press/drag end with `M`, release with `m`; the button
-        // identity survives on release (unlike X10).
-        let end = if release { 'm' } else { 'M' };
-        format!("\x1b[<{cb};{cx};{cy}{end}").into_bytes()
-    } else {
-        // Legacy X10: `ESC [ M` then three bytes, each value + 32 (clamped at
-        // 223). A release can't carry a button, so it uses the agnostic 3.
-        let enc = |v: u16| (v.min(223) + 32) as u8;
-        let btn = if release { 3 } else { cb };
-        vec![0x1b, b'[', b'M', enc(btn), enc(cx), enc(cy)]
-    }
+    crate::tmux::mouse::mouse_report_bytes(cb, release, sgr, cx, cy)
 }
 
 /// The bare mouse-motion (hover) bytes to forward to the previewed pane, or
@@ -344,17 +307,25 @@ fn hover_forward_bytes(
         .then(|| mouse_event_bytes(3, false, true, cursor.mouse_sgr, target, col, row))
 }
 
-/// Page presses delivered per wheel notch for a no-mouse full-screen app.
-/// One page per notch: full-screen apps that scroll on `PageUp`/`PageDown`
-/// (Claude Code's fullscreen renderer is the motivating case) have no finer
-/// keyboard step, and a page per notch reads as a normal "flick to scroll".
-const WHEEL_PAGE_STEP: usize = 1;
+/// The 1-based pane cell a wheel notch over screen cell `(col, row)` forwards
+/// at, or `None` to fall back to the capture-window scroll: the pane is on the
+/// normal screen, or the pointer is outside pane 0 of a composite, where no
+/// pane takes the input. See `forward_wheel_to_preview`.
+fn wheel_forward_cell(
+    cursor: &crate::tmux::PaneCursor,
+    pane: ratatui::layout::Rect,
+    col: u16,
+    row: u16,
+) -> Option<(u16, u16)> {
+    if !cursor.alternate_on {
+        return None;
+    }
+    let target = mouse_target_rect(cursor, pane, col, row)?;
+    Some(map_pane_cell(target, col, row))
+}
 
-/// Decide what to forward to the previewed full-screen pane for one wheel
-/// notch, or `None` to fall back to the capture-window scroll. Pure so the
-/// branch the fix turns on (page keys vs. raw mouse bytes vs. no forward) is
-/// asserted directly, without standing up a worker. See
-/// `forward_wheel_to_preview` for the full rationale.
+/// The key a wheel notch forwards to the previewed pane, or `None` to fall
+/// back to the capture-window scroll.
 fn wheel_forward_key(
     cursor: &crate::tmux::PaneCursor,
     up: bool,
@@ -362,46 +333,8 @@ fn wheel_forward_key(
     col: u16,
     row: u16,
 ) -> Option<live_send::TmuxKey> {
-    if !cursor.alternate_on {
-        return None;
-    }
-    // Outside pane 0 on a composited preview there is nothing to drive: the
-    // pointer is over a pane that receives no input, and paging pane 0 because
-    // the wheel turned somewhere else would be a scroll the user did not aim.
-    let target = mouse_target_rect(cursor, pane, col, row)?;
-    if cursor.mouse_tracking {
-        Some(live_send::TmuxKey::HexBytes(wheel_mouse_bytes(
-            up,
-            cursor.mouse_sgr,
-            target,
-            col,
-            row,
-        )))
-    } else {
-        // No mouse tracking: send `PageUp`/`PageDown`, NOT arrow keys. A
-        // full-screen app reads arrow keys as cursor / input-history
-        // navigation, not scroll (Claude Code 2.1.x even surfaces "Scroll
-        // wheel is sending arrow keys, use PgUp/PgDn to scroll"). The page
-        // keys scroll its transcript regardless of cursor-key mode.
-        Some(live_send::TmuxKey::NamedRepeat {
-            name: if up { "PageUp" } else { "PageDown" }.to_string(),
-            count: WHEEL_PAGE_STEP,
-        })
-    }
-}
-
-fn resolve_hook_install_agent(
-    tool_name: &str,
-    session_config: &crate::session::config::SessionConfig,
-) -> Option<&'static crate::agents::AgentDef> {
-    crate::agents::get_agent(tool_name)
-        .or_else(|| {
-            session_config
-                .agent_detect_as
-                .get(tool_name)
-                .and_then(|detect_as| crate::agents::get_agent(detect_as))
-        })
-        .filter(|agent| agent.hook_config.is_some() || agent.sidecar_hooks.is_some())
+    let (cx, cy) = wheel_forward_cell(cursor, pane, col, row)?;
+    crate::tmux::mouse::wheel_notch_bytes(cursor, up, cx, cy).map(live_send::TmuxKey::HexBytes)
 }
 
 pub(super) fn parse_hotkey(s: &str) -> Option<(KeyCode, KeyModifiers)> {
@@ -534,10 +467,10 @@ impl HomeView {
             if toggle_current
                 && matches!(&self.view_mode, ViewMode::Tool(current) if current == &tool_name)
             {
-                self.view_mode = ViewMode::Structured;
+                self.set_preview_view_mode(ViewMode::Structured);
                 return None;
             } else {
-                self.view_mode = ViewMode::Tool(tool_name);
+                self.set_preview_view_mode(ViewMode::Tool(tool_name));
                 self.preview_scroll_offset = 0;
                 self.tool_preview_cache = super::PreviewCache::default();
             }
@@ -922,7 +855,7 @@ impl HomeView {
         // the way the wheel forward does (#2421). The extent stays pinned to the
         // screen edge; the agent's redraw is what reveals more text under the
         // held selection.
-        if forward_ready && self.forward_scroll_to_preview(at_top, col, row) {
+        if forward_ready && self.forward_wheel_to_preview(at_top, col, row) {
             self.preview_autoscroll_at = Some(now);
             return true;
         }
@@ -1147,18 +1080,13 @@ impl HomeView {
                 None
             }
             "stop_session" => self.pending_stop_session.take().map(Action::StopSession),
-            "stop_terminal" => {
-                if let Some((session_id, mode)) = self.pending_stop_terminal.take() {
-                    if let Err(e) = self.kill_terminal_for(&session_id, mode) {
-                        tracing::error!(target: "tui.input", "Failed to kill terminal: {}", e);
-                    }
-                }
-                None
-            }
-            "stop_tool" => {
-                if let Some((session_id, tool_name)) = self.pending_stop_tool.take() {
-                    if let Err(e) = self.kill_tool_for(&session_id, &tool_name) {
-                        tracing::error!(target: "tui.input", "Failed to kill tool session: {}", e);
+            "stop_terminal" | "stop_tool" => {
+                if let Some((session_id, target)) = self.pending_stop_auxiliary.take() {
+                    if let Err(error) = self.session_feed.submit(
+                        session_id,
+                        crate::daemon::SessionMutation::StopAuxiliary(target),
+                    ) {
+                        self.info_dialog = Some(InfoDialog::new("Stop failed", &error.to_string()));
                     }
                 }
                 None
@@ -1174,6 +1102,12 @@ impl HomeView {
             "trash_session" => {
                 if let Some(session_id) = self.pending_trash_session.take() {
                     self.trash_session_by_id(&session_id);
+                }
+                None
+            }
+            "trash_remote_session" => {
+                if let Some((remote, id)) = self.pending_remote_trash.take() {
+                    self.start_remote_delete(remote, id, remote_delete::DeleteKind::Trash);
                 }
                 None
             }
@@ -1255,10 +1189,11 @@ impl HomeView {
         // Project/Org mode groups by repo/owner, Manual mode by
         // user-assigned path; name the scope accordingly and show the full
         // path so nested groups that share a leaf segment aren't ambiguous.
-        let (title, scope) = match self.group_by {
+        let (title, scope) = match self.effective_group_by() {
             crate::session::config::GroupByMode::Project => ("Archive project", "project"),
             crate::session::config::GroupByMode::Org => ("Archive org", "org"),
-            crate::session::config::GroupByMode::Manual => ("Archive group", "group"),
+            crate::session::config::GroupByMode::Manual
+            | crate::session::config::GroupByMode::Remote => ("Archive group", "group"),
         };
         let noun = if count == 1 { "session" } else { "sessions" };
         self.confirm_dialog = Some(
@@ -1390,10 +1325,10 @@ impl HomeView {
                     DialogResult::Cancel => {
                         self.confirm_dialog = None;
                         self.pending_stop_session = None;
-                        self.pending_stop_terminal = None;
-                        self.pending_stop_tool = None;
+                        self.pending_stop_auxiliary = None;
                         self.pending_force_remove_session = None;
                         self.pending_trash_session = None;
+                        self.pending_remote_trash = None;
                         self.pending_image_pull = None;
                         // The settings close path mirrors the keyboard
                         // route: Cancel here means "don't discard," so
@@ -1494,7 +1429,8 @@ impl HomeView {
                 let sid = self.pending_snooze_session.take();
                 if let Some(id) = sid {
                     if let Err(e) = self.snooze_session_for(&id, minutes) {
-                        tracing::error!("snooze_session_for failed: {}", e);
+                        self.info_dialog =
+                            Some(InfoDialog::new("Snooze not changed", &e.to_string()));
                     }
                 }
             }
@@ -1605,7 +1541,7 @@ impl HomeView {
                 }
                 DialogResult::Submit(mode) => {
                     self.group_picker_dialog = None;
-                    if mode != self.group_by {
+                    if mode != self.effective_group_by() || self.group_by_is_default {
                         self.apply_group_by(mode);
                     }
                 }
@@ -1654,20 +1590,7 @@ impl HomeView {
                         self.pending_hooks_install_data = None;
                     }
                     DialogResult::Submit(_) => {
-                        match crate::session::config::update_app_state(|state| {
-                            state.has_acknowledged_agent_hooks = true;
-                        }) {
-                            Ok(()) => {
-                                self.hooks_install_dialog = None;
-                                if let Some(data) = self.pending_hooks_install_data.take() {
-                                    self.pending_dialog_click_action =
-                                        self.maybe_confirm_volume_ignores_globs(data);
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(target: "tui.input", "Failed to save config: {e}")
-                            }
-                        }
+                        self.pending_dialog_click_action = self.accept_hooks_install();
                     }
                 }
             }
@@ -1711,7 +1634,7 @@ impl HomeView {
                                     hooks_hash,
                                     mcp_hash,
                                     project_path,
-                                    hooks,
+                                    ..
                                 } => {
                                     // If persisting trust fails, abort creation:
                                     // launching anyway leaves a split state where
@@ -1724,13 +1647,16 @@ impl HomeView {
                                         mcp_hash.as_deref(),
                                     ) {
                                         tracing::error!(target: "tui.input", "Failed to persist repo trust; aborting session creation: {}", e);
-                                        None
                                     } else {
-                                        self.create_session_with_hooks(data, hooks)
+                                        // The daemon persists the approval
+                                        // itself before provisioning.
+                                        self.request_creation(data, Some(true));
                                     }
+                                    None
                                 }
-                                RepoTrustAction::Skip { hooks } => {
-                                    self.create_session_with_hooks(data, hooks)
+                                RepoTrustAction::Skip { .. } => {
+                                    self.request_creation(data, Some(false));
+                                    None
                                 }
                             };
                             self.pending_dialog_click_action = emit;
@@ -1751,13 +1677,10 @@ impl HomeView {
         key: KeyEvent,
         update_info: Option<&crate::update::UpdateInfo>,
     ) -> Option<Action> {
-        // Any keystroke drops a finalized preview-pane selection. The
-        // highlight pins to cell coords, so as soon as the user starts
-        // doing anything else (navigating the list, opening a dialog,
-        // typing through live-send, etc.) the cells underneath can
-        // change and the highlight would point at unrelated content.
-        // Doing the clear here covers both the live-send branch below
-        // and the regular home-view path.
+        self.reconcile_native_attachment();
+        if key.code == KeyCode::Esc {
+            self.cancel_native_attachment();
+        }
         self.clear_preview_selection();
 
         // Live-send capture normally wins over every other key handler:
@@ -1860,6 +1783,7 @@ impl HomeView {
                 ServeAction::Continue => return None,
                 ServeAction::Close => {
                     self.serve_view = None;
+                    self.serve_exposure = crate::cli::serve::current_exposure();
                     return None;
                 }
             }
@@ -2036,7 +1960,8 @@ impl HomeView {
                     let sid = self.pending_snooze_session.take();
                     if let Some(id) = sid {
                         if let Err(e) = self.snooze_session_for(&id, minutes) {
-                            tracing::error!("snooze_session_for failed: {}", e);
+                            self.info_dialog =
+                                Some(InfoDialog::new("Snooze not changed", &e.to_string()));
                         }
                     }
                 }
@@ -2083,19 +2008,7 @@ impl HomeView {
                     self.hooks_install_dialog = None;
                     self.pending_hooks_install_data = None;
                 }
-                DialogResult::Submit(_) => {
-                    match crate::session::config::update_app_state(|state| {
-                        state.has_acknowledged_agent_hooks = true;
-                    }) {
-                        Ok(()) => {
-                            self.hooks_install_dialog = None;
-                            if let Some(data) = self.pending_hooks_install_data.take() {
-                                return self.maybe_confirm_volume_ignores_globs(data);
-                            }
-                        }
-                        Err(e) => tracing::warn!(target: "tui.input", "Failed to save config: {e}"),
-                    }
-                }
+                DialogResult::Submit(_) => return self.accept_hooks_install(),
             }
             return None;
         }
@@ -2136,7 +2049,7 @@ impl HomeView {
                                 hooks_hash,
                                 mcp_hash,
                                 project_path,
-                                hooks,
+                                ..
                             } => {
                                 // Abort creation if trust cannot be persisted, to
                                 // avoid a split state (hooks approved but project
@@ -2149,10 +2062,12 @@ impl HomeView {
                                     tracing::error!(target: "tui.input", "Failed to persist repo trust; aborting session creation: {}", e);
                                     return None;
                                 }
-                                return self.create_session_with_hooks(data, hooks);
+                                self.request_creation(data, Some(true));
+                                return None;
                             }
-                            RepoTrustAction::Skip { hooks } => {
-                                return self.create_session_with_hooks(data, hooks);
+                            RepoTrustAction::Skip { .. } => {
+                                self.request_creation(data, Some(false));
+                                return None;
                             }
                         }
                     }
@@ -2184,6 +2099,13 @@ impl HomeView {
                     }
                 }
                 DialogResult::Submit(data) => {
+                    // Hooks, volume globs and the creation poller all act on
+                    // this machine; a remote's daemon does its own.
+                    if let Some(remote) = data.remote.clone() {
+                        self.new_dialog = None;
+                        self.start_remote_create(remote, &data, false);
+                        return None;
+                    }
                     // Check if the tool uses hooks and user hasn't acknowledged yet
                     let tool_name = if data.tool.is_empty() {
                         "claude".to_string()
@@ -2195,25 +2117,19 @@ impl HomeView {
                         &data.profile,
                         std::path::Path::new(&data.path),
                     );
-                    if let Some(hook_agent) =
-                        resolve_hook_install_agent(&tool_name, &resolved_config.session)
-                    {
-                        let config = crate::session::config::load_config().ok().flatten();
+                    if let Some(hook_agent) = crate::session::hook_disclosure::hook_install_agent(
+                        &tool_name,
+                        &resolved_config.session,
+                    ) {
                         let hooks_enabled = resolved_config.session.agent_status_hooks;
-                        let acknowledged = config
-                            .as_ref()
-                            .map(|c| c.app_state.has_acknowledged_agent_hooks)
-                            .unwrap_or(false);
-
                         if crate::agents::hook_install_required(hook_agent, hooks_enabled)
-                            && !acknowledged
+                            && !crate::session::hook_disclosure::agent_hooks_acknowledged()
                         {
-                            self.hooks_install_dialog =
-                                Some(HooksInstallDialog::new_for_profile_resolved(
-                                    &tool_name,
-                                    hook_agent.name,
-                                    Some(&data.profile),
-                                ));
+                            self.hooks_install_dialog = Some(HooksInstallDialog::local(
+                                &tool_name,
+                                hook_agent.name,
+                                Some(&data.profile),
+                            ));
                             self.pending_hooks_install_data = Some(data);
                             return None;
                         }
@@ -2231,10 +2147,10 @@ impl HomeView {
                 DialogResult::Cancel => {
                     self.confirm_dialog = None;
                     self.pending_stop_session = None;
-                    self.pending_stop_terminal = None;
-                    self.pending_stop_tool = None;
+                    self.pending_stop_auxiliary = None;
                     self.pending_force_remove_session = None;
                     self.pending_trash_session = None;
+                    self.pending_remote_trash = None;
                     self.pending_image_pull = None;
                 }
                 DialogResult::Submit(_) => {
@@ -2412,7 +2328,7 @@ impl HomeView {
                 }
                 DialogResult::Submit(mode) => {
                     self.group_picker_dialog = None;
-                    if mode != self.group_by {
+                    if mode != self.effective_group_by() || self.group_by_is_default {
                         self.apply_group_by(mode);
                     }
                 }
@@ -2687,7 +2603,7 @@ impl HomeView {
                 return None;
             }
             KeyCode::Esc if matches!(self.view_mode, ViewMode::Tool(_)) => {
-                self.view_mode = ViewMode::Structured;
+                self.set_preview_view_mode(ViewMode::Structured);
                 return None;
             }
             _ => {}
@@ -2741,8 +2657,9 @@ impl HomeView {
             KeyCode::Char('<') => self.shrink_list(),
             KeyCode::Char('>') => self.grow_list(),
             KeyCode::Enter => {
-                if self.selected_session.is_some() {
+                if self.selected_session.is_some() || self.selected_remote.is_some() {
                     return self.activate_selected_session();
+                } else if self.toggle_machine_header_at_cursor() {
                 } else if let Some(Item::Group { path, .. }) = self.flat_items.get(self.cursor) {
                     let path = path.clone();
                     self.toggle_group_collapsed(&path);
@@ -2752,6 +2669,9 @@ impl HomeView {
             // (live-send, tmux attach) `Enter` doesn't. Only fires when
             // `live_send` is None (the live-send capture short-circuits above).
             KeyCode::Tab => {
+                if self.selected_remote.is_some() {
+                    return self.start_remote_live_send();
+                }
                 // A structured session has neither a tmux pane to attach
                 // nor one to live-send into; both Tab meanings are
                 // vacuous. Say so instead of silently ignoring the press.
@@ -2782,7 +2702,20 @@ impl HomeView {
                 }
             }
             KeyCode::Left | KeyCode::Char('h') => {
-                if let Some(Item::Group {
+                if matches!(
+                    self.flat_items.get(self.cursor),
+                    Some(
+                        Item::LocalGroup {
+                            collapsed: false,
+                            ..
+                        } | Item::RemoteGroup {
+                            collapsed: false,
+                            ..
+                        }
+                    )
+                ) {
+                    self.toggle_machine_header_at_cursor();
+                } else if let Some(Item::Group {
                     path, collapsed, ..
                 }) = self.flat_items.get(self.cursor)
                 {
@@ -2793,7 +2726,20 @@ impl HomeView {
                 }
             }
             KeyCode::Right | KeyCode::Char('l') => {
-                if let Some(Item::Group {
+                if matches!(
+                    self.flat_items.get(self.cursor),
+                    Some(
+                        Item::LocalGroup {
+                            collapsed: true,
+                            ..
+                        } | Item::RemoteGroup {
+                            collapsed: true,
+                            ..
+                        }
+                    )
+                ) {
+                    self.toggle_machine_header_at_cursor();
+                } else if let Some(Item::Group {
                     path, collapsed, ..
                 }) = self.flat_items.get(self.cursor)
                 {
@@ -2826,6 +2772,10 @@ impl HomeView {
         id: ActionId,
         update_info: Option<&crate::update::UpdateInfo>,
     ) -> Option<Action> {
+        if id.needs_canonical_session() && self.is_creating_stub_selected() {
+            self.flash_status("Still creating this session; it has no runtime yet");
+            return None;
+        }
         match id {
             ActionId::Quit => return Some(Action::Quit),
             ActionId::Help => {
@@ -2834,7 +2784,7 @@ impl HomeView {
             }
             ActionId::ToolPicker => {
                 if matches!(self.view_mode, ViewMode::Tool(_)) {
-                    self.view_mode = ViewMode::Structured;
+                    self.set_preview_view_mode(ViewMode::Structured);
                 } else if !self.tool_configs.is_empty() {
                     self.open_tool_picker();
                 }
@@ -2861,10 +2811,10 @@ impl HomeView {
             ActionId::NewFromProject => self.open_project_session_picker(),
             ActionId::AttachTerminal => return self.attach_terminal_for_selected(),
             ActionId::ToggleView => {
-                self.view_mode = match self.view_mode {
+                self.set_preview_view_mode(match self.view_mode {
                     ViewMode::Structured => ViewMode::Terminal,
                     ViewMode::Terminal | ViewMode::Tool(_) => ViewMode::Structured,
-                };
+                });
                 if matches!(self.view_mode, ViewMode::Terminal) {
                     if let Some(action) = self.maybe_auto_start_live_send() {
                         return Some(action);
@@ -2921,17 +2871,18 @@ impl HomeView {
             }
             ActionId::ToggleFavorite => {
                 if let Err(e) = self.toggle_favorite_at_cursor() {
-                    tracing::error!("toggle_favorite_at_cursor failed: {}", e);
+                    self.info_dialog =
+                        Some(InfoDialog::new("Favorite not changed", &e.to_string()));
                 }
             }
             ActionId::ToggleSnooze => {
                 if let Err(e) = self.toggle_snooze_at_cursor() {
-                    tracing::error!("toggle_snooze_at_cursor failed: {}", e);
+                    self.info_dialog = Some(InfoDialog::new("Snooze not changed", &e.to_string()));
                 }
             }
             ActionId::ToggleUnread => {
                 if let Err(e) = self.toggle_unread_at_cursor() {
-                    tracing::error!("toggle_unread_at_cursor failed: {}", e);
+                    self.info_dialog = Some(InfoDialog::new("Unread not changed", &e.to_string()));
                 }
             }
             ActionId::ToggleContainer => self.toggle_container_for_selected(),
@@ -3335,9 +3286,9 @@ impl HomeView {
         }
         self.instances
             .values()
-            .find(|inst| match self.group_by {
+            .find(|inst| match self.effective_group_by() {
                 GroupByMode::Project => super::project_group_key(inst) == group_path,
-                GroupByMode::Org => false,
+                GroupByMode::Org | GroupByMode::Remote => false,
                 GroupByMode::Manual => {
                     inst.group_path == group_path
                         || inst.group_path.starts_with(&format!("{group_path}/"))
@@ -3349,7 +3300,7 @@ impl HomeView {
                 // path from; fall back to the registered project's path so
                 // "New Session" can still launch under it (the point of pinning
                 // an empty project).
-                if self.group_by == GroupByMode::Project {
+                if self.effective_group_by() == GroupByMode::Project {
                     self.registered_projects
                         .iter()
                         .find(|p| crate::session::projects::repo_label(&p.path) == group_path)
@@ -3431,48 +3382,26 @@ impl HomeView {
         } else {
             TerminalMode::Host
         };
-        let terminal_running = match mode {
-            TerminalMode::Container => inst
-                .container_terminal_tmux_session()
-                .map(|s| s.exists())
-                .unwrap_or(false),
-            TerminalMode::Host => inst
-                .terminal_tmux_session()
-                .map(|s| s.exists())
-                .unwrap_or(false),
+        let target = match mode {
+            TerminalMode::Host => crate::session::AuxiliaryTarget::Host { index: 0 },
+            TerminalMode::Container => crate::session::AuxiliaryTarget::Container { index: 0 },
         };
-        if !terminal_running {
+        if !matches!(
+            inst.auxiliary_presence(&target),
+            crate::session::PanePresence::Alive | crate::session::PanePresence::Dead
+        ) {
             return;
         }
         let message = format!(
             "Are you sure you want to kill the terminal for '{}'?",
             inst.title
         );
-        self.pending_stop_terminal = Some((session_id, mode));
+        self.pending_stop_auxiliary = Some((session_id, target));
         self.confirm_dialog = Some(ConfirmDialog::new(
             "Kill Terminal",
             &message,
             "stop_terminal",
         ));
-    }
-
-    /// Kill the paired terminal for `session_id` (host or container per `mode`),
-    /// then refresh so the Terminal-view row drops back to its idle glyph. The
-    /// agent session is left untouched.
-    pub(super) fn kill_terminal_for(
-        &mut self,
-        session_id: &str,
-        mode: TerminalMode,
-    ) -> anyhow::Result<()> {
-        if let Some(inst) = self.get_instance(session_id) {
-            match mode {
-                TerminalMode::Container => inst.kill_container_terminal()?,
-                TerminalMode::Host => inst.kill_terminal()?,
-            }
-        }
-        crate::tmux::refresh_session_cache();
-        self.reload()?;
-        Ok(())
     }
 
     /// Tool-view Stop: confirm, then kill the tool session (lazygit, yazi,
@@ -3485,34 +3414,20 @@ impl HomeView {
         let Some(inst) = self.get_instance(&session_id) else {
             return;
         };
-        let tool_session = crate::tmux::ToolSession::new(&inst.id, &inst.title, tool_name);
-        if !tool_session.exists() || tool_session.is_pane_dead() {
+        if inst.tool_presence(tool_name) != crate::session::PanePresence::Alive {
             return;
         }
         let message = format!(
             "Are you sure you want to kill {} for '{}'?",
             tool_name, inst.title
         );
-        self.pending_stop_tool = Some((session_id, tool_name.to_string()));
+        self.pending_stop_auxiliary = Some((
+            session_id,
+            crate::session::AuxiliaryTarget::Tool {
+                tool_name: tool_name.to_owned(),
+            },
+        ));
         self.confirm_dialog = Some(ConfirmDialog::new("Kill Tool", &message, "stop_tool"));
-    }
-
-    /// Kill the tool session for `session_id`, then refresh so the Tool-view
-    /// row drops back to its idle glyph. The agent session is left untouched.
-    pub(super) fn kill_tool_for(
-        &mut self,
-        session_id: &str,
-        tool_name: &str,
-    ) -> anyhow::Result<()> {
-        if let Some(inst) = self.get_instance(session_id) {
-            let tool_session = crate::tmux::ToolSession::new(&inst.id, &inst.title, tool_name);
-            if tool_session.exists() {
-                tool_session.kill()?;
-            }
-        }
-        crate::tmux::refresh_session_cache();
-        self.reload()?;
-        Ok(())
     }
 
     fn open_diff_for_selected(&mut self) {
@@ -3793,6 +3708,9 @@ impl HomeView {
         // Stop/Delete from the palette will be a no-op for those rows.
         for (idx, item) in self.flat_items.iter().enumerate() {
             match item {
+                Item::LocalGroup { .. } | Item::RemoteGroup { .. } | Item::RemoteSession { .. } => {
+                    continue
+                }
                 Item::Session { id, .. } => {
                     let Some(inst) = self.get_instance(id) else {
                         continue;
@@ -3948,6 +3866,7 @@ impl HomeView {
         if self.selected_session != previous {
             self.preview_scroll_offset = 0;
             self.manual_unread_hold = None;
+            self.unread_dwell = None;
         }
     }
 
@@ -3962,7 +3881,7 @@ impl HomeView {
             .iter()
             .filter_map(|item| match item {
                 Item::Session { id, .. } => Some(id.clone()),
-                Item::Group { .. } => None,
+                _ => None,
             })
             .collect();
         let current_session = self.selected_session.clone();
@@ -4105,6 +4024,18 @@ impl HomeView {
     /// paths can't drift.
     pub(super) fn activate_selected_session(&mut self) -> Option<Action> {
         self.system_health_open = false;
+        if let Some((remote, id)) = self.selected_remote.clone() {
+            // No tmux attach across machines: a terminal row live-sends in the
+            // preview pane, a structured row opens against its daemon.
+            let structured = self.remote_instance(&remote, &id).is_some_and(|inst| {
+                inst.is_structured()
+                    && crate::tui::remote_feed::shelf_of(inst) == crate::session::RemoteShelf::Live
+            });
+            if structured {
+                return Some(Action::OpenRemoteStructuredView { remote, id });
+            }
+            return self.start_remote_live_send();
+        }
         let id = self.selected_session.clone()?;
         if let Some(inst) = self.get_instance(&id) {
             if matches!(inst.status, Status::Deleting | Status::Creating) {
@@ -4213,16 +4144,41 @@ impl HomeView {
         }
     }
 
+    fn set_preview_view_mode(&mut self, mode: ViewMode) {
+        if self.view_mode != mode {
+            self.cancel_native_attachment();
+            self.view_mode = mode;
+        }
+    }
+
     pub(super) fn update_selected(&mut self) {
         if let Some(item) = self.flat_items.get(self.cursor) {
             let prev_session = self.selected_session.clone();
+            let prev_remote = self.selected_remote.clone();
             match item {
                 Item::Session { id, .. } => {
                     self.selected_session = Some(id.clone());
                     self.selected_group = None;
                     self.selected_group_profile = None;
+                    self.selected_remote = None;
+                }
+                // Remote rows disarm every local action the way the synthetic
+                // shelf headers do: nothing keyed on `selected_session` or
+                // `selected_group` can resolve a session this machine doesn't own.
+                Item::RemoteGroup { .. } | Item::LocalGroup { .. } => {
+                    self.selected_session = None;
+                    self.selected_group = None;
+                    self.selected_group_profile = None;
+                    self.selected_remote = None;
+                }
+                Item::RemoteSession { remote, id, .. } => {
+                    self.selected_session = None;
+                    self.selected_group = None;
+                    self.selected_group_profile = None;
+                    self.selected_remote = Some((remote.clone(), id.clone()));
                 }
                 Item::Group { path, .. } => {
+                    self.selected_remote = None;
                     self.selected_session = None;
                     if crate::session::is_within_archived_section(path)
                         || crate::session::is_within_trash_section(path)
@@ -4244,25 +4200,16 @@ impl HomeView {
                     }
                 }
             }
-            if self.selected_session != prev_session {
+            if self.selected_session != prev_session || self.selected_remote != prev_remote {
+                self.cancel_native_attachment();
                 self.system_health_open = false;
                 self.preview_scroll_offset = 0;
-                // A finalized preview selection pins to the previous pane's
-                // cells; carried into a different session it would paint a
-                // stale highlight and, because the preview holds its snapshot
-                // while a selection is live, stop the new session's preview
-                // from following output. Keystroke and click navigation already
-                // drop it upstream; clearing here also covers programmatic
-                // reselects (e.g. a poller) that never ran those paths.
                 self.clear_preview_selection();
-                // Moving off a hand-flagged row ends its manual-unread hold, so
-                // returning to it later dwell-clears like any other unread. Done
-                // here at the cursor->selection sync (every navigation path runs
-                // through it) so the release doesn't hinge on a dwell tick
-                // happening to fire during a quick hop to another row.
                 self.manual_unread_hold = None;
+                self.unread_dwell = None;
             }
         }
+        self.sync_remote_preview();
     }
 
     /// Put the cursor back on `selected_session` after a `flat_items` rebuild
@@ -4274,18 +4221,21 @@ impl HomeView {
     /// the session is no longer in the flat list (e.g., collapsed under a
     /// group header).
     pub(super) fn reseat_cursor_after_rebuild(&mut self) {
-        if let Some(sid) = self.selected_session.clone() {
-            for (idx, item) in self.flat_items.iter().enumerate() {
-                if let Item::Session { id, .. } = item {
-                    if *id == sid {
-                        self.cursor = idx;
-                        self.update_selected();
-                        return;
-                    }
-                }
-            }
+        let selected = self.flat_items.iter().position(|item| match item {
+            Item::Session { id, .. } => self.selected_session.as_ref() == Some(id),
+            Item::RemoteSession { remote, id, .. } => self
+                .selected_remote
+                .as_ref()
+                .is_some_and(|(r, i)| r == remote && i == id),
+            _ => false,
+        });
+        if let Some(idx) = selected {
+            self.cursor = idx;
+            self.update_selected();
+            return;
         }
         if self.flat_items.is_empty() {
+            self.cancel_native_attachment();
             self.cursor = 0;
             self.selected_session = None;
             self.selected_group = None;
@@ -4299,7 +4249,7 @@ impl HomeView {
     pub(super) fn apply_sort_order(&mut self, new_order: SortOrder) {
         self.sort_order = new_order;
         if self.search_active && !self.search_query.value().is_empty() {
-            self.flat_items = self.build_flat_items();
+            self.flat_items = self.build_flat_items_with_remotes();
             self.update_search();
         } else {
             self.rebuild_flat_items();
@@ -4315,6 +4265,7 @@ impl HomeView {
 
     fn apply_group_by(&mut self, new_mode: GroupByMode) {
         self.group_by = new_mode;
+        self.group_by_is_default = false;
         self.rebuild_flat_items();
         self.reseat_cursor_after_rebuild();
         let group_by = self.group_by;
@@ -4331,10 +4282,11 @@ impl HomeView {
     /// where group membership is user-managed and the caller should proceed
     /// with its normal rename/delete flow instead.
     fn automatic_group_hint(&self) -> Option<(String, String)> {
-        let mode_label = match self.group_by {
+        let mode_label = match self.effective_group_by() {
             GroupByMode::Manual => return None,
             GroupByMode::Project => "Project",
             GroupByMode::Org => "Org",
+            GroupByMode::Remote => "Remote",
         };
         let toggle = if self.strict_hotkeys { "Ctrl+G" } else { "'g'" };
         Some((
@@ -4358,7 +4310,7 @@ impl HomeView {
             self.toggle_trashed_section();
             return;
         }
-        if self.group_by == GroupByMode::Project {
+        if self.effective_group_by() == GroupByMode::Project {
             let collapsed = self
                 .project_group_collapsed
                 .get(path)
@@ -4370,7 +4322,7 @@ impl HomeView {
             self.save_project_group_collapsed();
             return;
         }
-        if self.group_by == GroupByMode::Org {
+        if self.effective_group_by() == GroupByMode::Org {
             let collapsed = self.org_group_collapsed.get(path).copied().unwrap_or(false);
             self.org_group_collapsed
                 .insert(path.to_string(), !collapsed);
@@ -4392,60 +4344,32 @@ impl HomeView {
     }
 
     /// Forward one wheel notch to the previewed full-screen (alternate-screen)
-    /// pane so it scrolls its OWN content, exactly as a terminal does on
-    /// direct attach. Active in BOTH live-send and passive preview: the
-    /// alternate screen has no scrollback, so the preview's capture-window
-    /// scroll is inert there (growing the window only exposes the unrelated
-    /// normal-buffer history and bottoms out at the session start), and
-    /// forwarding is the only way to reach the agent's history. Branched on
-    /// what the app asked for (see `wheel_forward_key`):
+    /// pane so it scrolls its OWN content, as a terminal does on direct attach.
+    /// The alternate screen has no scrollback, so the capture-window scroll is
+    /// inert there and forwarding is the only way to reach the app's history.
+    /// A mouse-tracking app gets a wheel report, any other a page key (see
+    /// [`crate::tmux::mouse::wheel_notch_bytes`]). Normal-buffer panes are not
+    /// forwarded, so the caller keeps the capture-window scroll.
     ///
-    /// * **Mouse tracking on**: forward the wheel as a mouse event, encoding
-    ///   following the app (SGR 1006 when `mouse_sgr` is set, else legacy
-    ///   X10). The previewed pane is sized to the preview rect in both modes
-    ///   (`passive_pane_synced` / the live-send sync resize), so the mapped
-    ///   coordinates land inside it.
-    /// * **Mouse tracking off**: send `PageUp`/`PageDown`, not arrow keys. A
-    ///   full-screen app reads arrows as cursor / input-history navigation,
-    ///   not scroll; the page keys scroll its transcript regardless of mode.
-    ///   Claude Code's fullscreen renderer is the motivating case (#2407).
-    ///
-    /// Normal-buffer panes get `None` from `wheel_forward_key`, so the caller
-    /// keeps the capture-window scroll (which reaches real scrollback there).
-    ///
-    /// In live-send the key rides the ordered `LiveSendWorker` so it stays in
-    /// sequence with typed keystrokes. In passive preview there is no worker,
-    /// so it goes out as a one-shot fork to the previewed pane's tmux target.
+    /// Active in live-send and passive preview alike, and for the edge-held
+    /// selection autoscroll. A passive remote pane takes no input from this
+    /// viewer, so the daemon encodes the notch itself from a `wheel` message.
     /// Returns true when the event was forwarded.
     fn forward_wheel_to_preview(&self, up: bool, col: u16, row: u16) -> bool {
-        let cursor = self.active_preview_cursor();
-        let Some(cursor) = cursor else { return false };
-        let Some(key) = wheel_forward_key(&cursor, up, self.preview_text_view.pane, col, row)
-        else {
-            return false;
-        };
-        self.send_to_preview_pane(key)
-    }
-
-    /// During an edge-held preview selection over a full-screen
-    /// (alternate-screen) agent, the aoe capture-window scroll is inert (the
-    /// alternate screen has no scrollback, so `scroll_preview_offset` can't
-    /// move), so forward the SAME scroll input one wheel notch would, scrolling
-    /// the agent's OWN transcript. Mirrors `forward_wheel_to_preview` by reusing
-    /// `wheel_forward_key`: a mouse-tracking app gets a wheel-up/down mouse
-    /// report at the held cell (PageUp does nothing while it owns the mouse), a
-    /// no-mouse app gets `PageUp`/`PageDown`. `wheel_forward_key` also enforces
-    /// the alternate-screen gate, so a normal-buffer pane that has merely
-    /// bottomed out its scrollback never gets scroll input injected into its
-    /// shell. `up` selects the top-edge (scroll back) vs bottom-edge (scroll
-    /// forward) direction; `col`/`row` is the held pointer cell, mapped into the
-    /// pane for the mouse-byte encoding. Returns true when something was sent.
-    fn forward_scroll_to_preview(&self, up: bool, col: u16, row: u16) -> bool {
         let Some(cursor) = self.active_preview_cursor() else {
             return false;
         };
-        let Some(key) = wheel_forward_key(&cursor, up, self.preview_text_view.pane, col, row)
-        else {
+        let pane = self.preview_text_view.pane;
+        if self.selected_remote.is_some() && self.remote_live_key() != self.remote_preview_key {
+            let Some((cx, cy)) = wheel_forward_cell(&cursor, pane, col, row) else {
+                return false;
+            };
+            // A pane taller than the preview is shown bottom-anchored.
+            let clipped = cursor.pane_height.saturating_sub(pane.height);
+            self.send_remote_wheel(up, cx - 1, cy - 1 + clipped);
+            return true;
+        }
+        let Some(key) = wheel_forward_key(&cursor, up, pane, col, row) else {
             return false;
         };
         self.send_to_preview_pane(key)
@@ -4460,6 +4384,15 @@ impl HomeView {
     /// different pane than the one on screen) fork a one-shot send. Returns
     /// true when something was dispatched.
     fn send_to_preview_pane(&self, key: live_send::TmuxKey) -> bool {
+        // A remote pane only takes input from its live-send owner.
+        if self.selected_remote.is_some() {
+            let driving = self.live_send.as_ref().and_then(|l| l.remote_key());
+            if driving.is_none() || driving != self.remote_preview_key {
+                return false;
+            }
+            self.send_remote_input(&key);
+            return true;
+        }
         let Some(target) = self.preview_capture_target.as_deref() else {
             return false;
         };
@@ -4642,7 +4575,7 @@ impl HomeView {
                 return false;
             }
         }
-        if self.selected_session.is_none() {
+        if self.selected_session.is_none() && self.selected_remote.is_none() {
             return false;
         }
         // Full-screen (alternate-screen) app: send the wheel to the app
@@ -4653,28 +4586,7 @@ impl HomeView {
             return true;
         }
 
-        let active_cache = match self.view_mode {
-            ViewMode::Structured => &self.preview_cache,
-            ViewMode::Terminal => {
-                let terminal_mode = self
-                    .selected_session
-                    .as_ref()
-                    .and_then(|id| self.get_instance(id))
-                    .map(|inst| {
-                        if inst.is_sandboxed() {
-                            self.get_terminal_mode(&inst.id)
-                        } else {
-                            TerminalMode::Host
-                        }
-                    })
-                    .unwrap_or(TerminalMode::Host);
-                match terminal_mode {
-                    TerminalMode::Container => &self.container_terminal_preview_cache,
-                    TerminalMode::Host => &self.terminal_preview_cache,
-                }
-            }
-            ViewMode::Tool(_) => &self.tool_preview_cache,
-        };
+        let active_cache = self.active_preview_cache();
 
         let visible_height = active_cache.dimensions.1.saturating_sub(1) as usize;
         let real_max = active_cache.captured_lines.saturating_sub(visible_height) as u16;
@@ -4808,6 +4720,13 @@ impl HomeView {
                 self.cursor = idx;
                 self.update_selected();
             }
+            // The creating stub has no actions yet, so opening a menu whose
+            // every entry would refuse it is worse than saying why. See
+            // `ActionId::needs_canonical_session`.
+            if self.is_creating_stub_selected() {
+                self.flash_status("Still creating this session; it has no runtime yet");
+                return true;
+            }
             // Mirror the row-aware menu copy from the web sidebar so a group
             // row reads as "Rename Group / Delete Group" instead of bare
             // "Rename / Delete".
@@ -4835,6 +4754,15 @@ impl HomeView {
                     return true;
                 }
             }
+            // Every context-menu entry is a local action; a remote row has none.
+            if matches!(
+                self.flat_items[idx],
+                super::Item::LocalGroup { .. }
+                    | super::Item::RemoteGroup { .. }
+                    | super::Item::RemoteSession { .. }
+            ) {
+                return true;
+            }
             let is_group = matches!(self.flat_items[idx], super::Item::Group { .. });
             // A real project header in project view gets the pin menu; the
             // cursor was just moved onto this row, so `project_group_at_cursor`
@@ -4850,7 +4778,7 @@ impl HomeView {
                         .get_instance(id)
                         .map(|inst| (inst.is_archived(), inst.is_snoozed(), inst.is_unread()))
                         .unwrap_or((false, false, false)),
-                    super::Item::Group { .. } => (false, false, false),
+                    _ => (false, false, false),
                 };
                 // Snooze is an Attention-sort triage primitive: the `'h'`
                 // keybinding only fires in Attention sort, so the menu omits
@@ -4866,7 +4794,7 @@ impl HomeView {
                 // refuse. Matches the web sidebar's `acp_can_fork` gating.
                 let can_fork = match &self.flat_items[idx] {
                     super::Item::Session { id, .. } => self.session_can_fork(id),
-                    super::Item::Group { .. } => false,
+                    _ => false,
                 };
                 // View switching mirrors the web sidebar's per-session
                 // switch action: offered when a structured session can go
@@ -4874,7 +4802,7 @@ impl HomeView {
                 // ACP-capable. The swap runs through the daemon.
                 let switch_view = match &self.flat_items[idx] {
                     super::Item::Session { id, .. } => self.session_switch_view_target(id),
-                    super::Item::Group { .. } => None,
+                    _ => None,
                 };
                 ContextMenuDialog::for_session(
                     anchor,
@@ -4942,6 +4870,12 @@ impl HomeView {
     /// new menu action needs to be wired here once, not at each call
     /// site.
     pub(super) fn dispatch_context_menu_action(&mut self, action: ContextMenuAction) {
+        // Every menu action targets the selected session, so the creating stub
+        // refuses the whole menu: see `ActionId::needs_canonical_session`.
+        if self.is_creating_stub_selected() {
+            self.flash_status("Still creating this session; it has no runtime yet");
+            return;
+        }
         match action {
             ContextMenuAction::Rename => self.open_rename_for_selected(),
             ContextMenuAction::Delete => self.open_delete_for_selected(),
@@ -4953,17 +4887,14 @@ impl HomeView {
                 }
             }
             ContextMenuAction::ToggleSnooze => {
-                // Same cursor-on-the-clicked-row guarantee as ToggleArchive:
-                // snoozing an active row opens the duration picker, unsnoozing
-                // wakes it immediately.
                 if let Err(e) = self.toggle_snooze_at_cursor() {
-                    tracing::error!("toggle_snooze_at_cursor (context menu) failed: {}", e);
+                    self.info_dialog = Some(InfoDialog::new("Snooze not changed", &e.to_string()));
                 }
             }
             ContextMenuAction::ToggleUnread => {
                 // Same cursor-on-the-clicked-row guarantee as ToggleArchive.
                 if let Err(e) = self.toggle_unread_at_cursor() {
-                    tracing::error!("toggle_unread_at_cursor (context menu) failed: {}", e);
+                    self.info_dialog = Some(InfoDialog::new("Unread not changed", &e.to_string()));
                 }
             }
             ContextMenuAction::NewSession => self.open_new_session_dialog(),
@@ -5047,12 +4978,15 @@ impl HomeView {
         let current_profile = self.config_profile();
         let profiles =
             list_profiles_for_display().unwrap_or_else(|_| vec![current_profile.clone()]);
-        self.new_dialog = Some(NewSessionDialog::new(
-            self.available_tools.clone(),
-            existing_groups,
-            &current_profile,
-            profiles,
-        ));
+        self.new_dialog = Some(
+            NewSessionDialog::new(
+                self.available_tools.clone(),
+                existing_groups,
+                &current_profile,
+                profiles,
+            )
+            .with_remotes(self.remote_dialog_targets()),
+        );
     }
 
     /// Open the tips overlay (the browsable list from `crate::tips`). Shared by
@@ -5367,10 +5301,36 @@ impl HomeView {
         self.worktree_name_dialog = Some(WorktreeNameDialog::new(&current_dir, &wt.branch));
     }
 
+    /// A "Confirm Delete" prompt the delete key itself accepts, so the
+    /// deliberate gesture stays two taps of one key while a single stray
+    /// keystroke is harmless. The key is read off the binding table so
+    /// relocating Delete cannot drift the hint from the key that opened the
+    /// dialog; a chord that is not a bare character (a hypothetical Ctrl+D)
+    /// cannot be a confirm char, so it falls back to the dialog's y/Enter.
+    pub(super) fn delete_confirm_dialog(&self, prompt: &str, action: &str) -> ConfirmDialog {
+        let delete_key = bindings::label(ActionId::Delete, self.strict_hotkeys);
+        let mut key_chars = delete_key.chars();
+        let accept_char = match (key_chars.next(), key_chars.next()) {
+            (Some(c), None) => Some(c),
+            _ => None,
+        };
+        let hint = match accept_char {
+            Some(_) => format!("Press {delete_key} again to confirm, Esc to cancel."),
+            None => "Press y to confirm, Esc to cancel.".to_string(),
+        };
+        let dialog = ConfirmDialog::new("Confirm Delete", &format!("{prompt}\n{hint}"), action)
+            .buttons("Delete", "Cancel");
+        match accept_char {
+            Some(c) => dialog.confirmed_by(c),
+            None => dialog,
+        }
+    }
+
     /// Open the delete dialog (or a force-remove confirm, or a group
     /// delete-options dialog) for the sidebar's current selection. Mirrors
     /// the gating of the historical `'d'` / `'D'` key handlers:
     ///   - Terminal view rejects deletion with an info dialog,
+    ///   - remote rows go to [`Self::open_remote_delete_for_selected`],
     ///   - Creating sessions are inert,
     ///   - Stuck-Deleting sessions get a force-remove confirm,
     ///   - Project and organization-mode groups can't be deleted (info dialog).
@@ -5386,6 +5346,10 @@ impl HomeView {
                 "Terminals cannot be deleted directly. Switch to Structured View (press 't') and delete the agent session instead."
             };
             self.info_dialog = Some(InfoDialog::new("Cannot Delete Terminal", hint));
+            return;
+        }
+        if self.selected_remote.is_some() {
+            self.open_remote_delete_for_selected();
             return;
         }
         if let Some(session_id) = &self.selected_session {
@@ -5432,37 +5396,17 @@ impl HomeView {
                     // (dispatch_confirm_submit "trash_session") runs the same
                     // trash_session_by_id as the instant path.
                     if session_cfg.confirm_delete {
-                        // Read the accept key off the binding table instead of
-                        // spelling it out here, so relocating Delete can't drift
-                        // the hint (or the key that accepts) from the key that
-                        // opened the dialog. A chord that isn't a bare character
-                        // (a hypothetical Ctrl+D) can't be an opt-in confirm
-                        // char, so it falls back to the dialog's own y/Enter.
-                        let delete_key = bindings::label(ActionId::Delete, self.strict_hotkeys);
-                        let mut key_chars = delete_key.chars();
-                        let accept_char = match (key_chars.next(), key_chars.next()) {
-                            (Some(c), None) => Some(c),
-                            _ => None,
-                        };
-                        let hint = match accept_char {
-                            Some(_) => {
-                                format!("Press {delete_key} again to confirm, Esc to cancel.")
-                            }
-                            None => "Press y to confirm, Esc to cancel.".to_string(),
-                        };
-                        let message = format!("Move '{}' to the trash?\n{hint}", inst.title);
-                        self.pending_trash_session = Some(sid);
                         // Offer the same in-dialog opt-out the quit confirm has:
                         // this guard is on by default, so a user who wants the
                         // one-keystroke trash back shouldn't have to go find the
                         // setting. Ticking it persists confirm_delete = false.
-                        let mut dialog =
-                            ConfirmDialog::new("Confirm Delete", &message, "trash_session")
-                                .buttons("Delete", "Cancel")
-                                .offering_dont_ask_again();
-                        if let Some(c) = accept_char {
-                            dialog = dialog.confirmed_by(c);
-                        }
+                        let dialog = self
+                            .delete_confirm_dialog(
+                                &format!("Move '{}' to the trash?", inst.title),
+                                "trash_session",
+                            )
+                            .offering_dont_ask_again();
+                        self.pending_trash_session = Some(sid);
                         self.confirm_dialog = Some(dialog);
                         return;
                     }
@@ -5593,20 +5537,37 @@ impl HomeView {
             // which tracks `cursor`, not the click target; and we'd open
             // the wrong session.
             return match item {
-                Item::Session { .. } => {
+                Item::Session { .. } | Item::RemoteSession { .. } => {
                     if self.cursor != abs_idx {
                         self.cursor = abs_idx;
                         self.update_selected();
                     }
                     self.activate_selected_session()
                 }
-                Item::Group { .. } => None,
+                Item::Group { .. } | Item::LocalGroup { .. } | Item::RemoteGroup { .. } => None,
             };
         }
 
         match item {
             Item::Group { path, .. } => {
                 self.toggle_group_collapsed(&path);
+                None
+            }
+            // A single click only selects a remote row; opening it takes over
+            // the screen, so that stays on Enter or a double-click.
+            Item::RemoteSession { .. } => {
+                self.system_health_open = false;
+                if self.cursor != abs_idx {
+                    self.cursor = abs_idx;
+                    self.update_selected();
+                }
+                None
+            }
+            Item::LocalGroup { .. } | Item::RemoteGroup { .. } => {
+                self.system_health_open = false;
+                self.cursor = abs_idx;
+                self.update_selected();
+                self.toggle_machine_header_at_cursor();
                 None
             }
             Item::Session { id, .. } => {
@@ -5962,7 +5923,7 @@ impl HomeView {
                 return false;
             }
         }
-        if self.selected_session.is_none() {
+        if self.selected_session.is_none() && self.selected_remote.is_none() {
             return false;
         }
         // Mirror handle_scroll_up: a full-screen app gets the wheel
@@ -6007,10 +5968,8 @@ impl HomeView {
         self.clear_preview_selection();
         if !self.has_non_live_send_overlay() {
             if let Some(state) = self.live_send.clone() {
-                if let Some(worker) = &self.live_send_worker {
-                    for key in split_paste_for_live_send(text) {
-                        worker.send(key);
-                    }
+                for key in split_paste_for_live_send(text) {
+                    self.send_live_key(key);
                 }
                 self.stamp_last_accessed(&state.session_id);
                 return;
@@ -6210,9 +6169,7 @@ impl HomeView {
             if let Some(leader) = state.leader {
                 if live_send::chord_matches(leader, key) {
                     if let live_send::LiveDispatch::Send(tmux_key) = live_send::translate(key) {
-                        if let Some(worker) = &self.live_send_worker {
-                            worker.send(tmux_key);
-                        }
+                        self.send_live_key(tmux_key);
                     }
                     return;
                 }
@@ -6303,9 +6260,7 @@ impl HomeView {
         match live_send::translate(key) {
             live_send::LiveDispatch::Ignore => {}
             live_send::LiveDispatch::Send(tmux_key) => {
-                if let Some(worker) = &self.live_send_worker {
-                    worker.send(tmux_key);
-                }
+                self.send_live_key(tmux_key);
                 if is_ctrl_c {
                     self.flash_ctrl_c_hint();
                 }
@@ -6339,9 +6294,24 @@ impl HomeView {
     /// `window-size latest` is best-effort: failures are swallowed so
     /// a stuck pane never blocks the user's exit.
     fn exit_live_send_and_restore_sizing(&mut self, state: &live_send::LiveSendState) {
+        if state.remote.is_some() {
+            self.teardown_live_send();
+            self.release_remote_pane();
+            return;
+        }
         let session = crate::tmux::Session::from_name(&state.tmux_name);
         session.reset_size_to_latest_client();
         self.teardown_live_send();
+    }
+
+    /// Deliver one translated key to the live-send target: the ordered local
+    /// worker, or the remote pane's socket.
+    fn send_live_key(&self, key: live_send::TmuxKey) {
+        if self.live_send.as_ref().is_some_and(|l| l.remote.is_some()) {
+            self.send_remote_input(&key);
+        } else if let Some(worker) = &self.live_send_worker {
+            worker.send(key);
+        }
     }
 
     /// Shared live-send teardown; touches no tmux sizing. Normal exits
@@ -6350,7 +6320,14 @@ impl HomeView {
     /// that took over has already sized the window to its own grid and
     /// re-asserting `window-size latest` would stomp it (the exact flap
     /// the size-owner lock exists to kill).
-    fn teardown_live_send(&mut self) {
+    pub(super) fn teardown_live_send(&mut self) {
+        self.clear_live_send_state();
+        self.reseat_cursor_after_rebuild();
+    }
+
+    /// Teardown without moving the selection, for callers already reacting
+    /// to a selection change.
+    pub(super) fn clear_live_send_state(&mut self) {
         let live_session_id = self.live_send.take().map(|state| state.session_id);
         self.live_send_worker = None;
         // Leave the capture worker running: the same pane is still
@@ -6373,7 +6350,6 @@ impl HomeView {
         if let Some(id) = &live_session_id {
             self.clear_preview_pane_sync(id);
         }
-        self.reseat_cursor_after_rebuild();
         // Preview selections also work outside live mode now, but a
         // live-mode highlight pins to the live-resized pane coords,
         // and exiting reflows the preview back to its normal size.
@@ -6382,26 +6358,16 @@ impl HomeView {
         self.clear_preview_selection();
     }
 
-    /// Returns `Some(reason)` if the live-send target has drifted out
-    /// from under us between entry and now. Three drift modes:
-    /// - Instance row deleted (peer / web structured view / another aoe killed
-    ///   it).
-    /// - Title renamed AND the tmux session renamed with it, so the worker is
-    ///   now targeting a stale name. A retitle whose tmux rename did not land
-    ///   is not drift: `Session::resolve_name` still resolves onto the pane the
-    ///   worker holds, which is the session's pane.
-    /// - tmux session itself is gone (`tmux kill-session`, server
-    ///   restart) even though our instance row says otherwise. We use
-    ///   the existing `session_exists_from_cache` lookup so this costs
-    ///   a hashmap probe per keystroke (the status poller refreshes
-    ///   the cache every 500ms anyway). If the cache has no entry
-    ///   (`None`, e.g. before first refresh) we don't claim drift; the
-    ///   instance + name checks above are still the load-bearing
-    ///   safety net.
-    ///
-    /// The caller uses the message verbatim in the info dialog, so
-    /// phrase it as a user-facing sentence.
+    /// Detect deletion, a changed transport name, or confirmed pane disappearance.
+    /// Unknown auxiliary observations do not establish disappearance.
     fn live_send_drift_reason(&self, state: &live_send::LiveSendState) -> Option<&'static str> {
+        if let Some((remote, id)) = state.remote_key() {
+            // The socket reports a pane that goes away; only the row can vanish here.
+            return self
+                .remote_instance(&remote, &id)
+                .is_none()
+                .then_some("Session was deleted while live mode was active.");
+        }
         let Some(inst) = self.get_instance(&state.session_id) else {
             return Some("Session was deleted while live mode was active.");
         };
@@ -6424,7 +6390,31 @@ impl HomeView {
         if current_name != state.tmux_name {
             return Some("Session was renamed while live mode was active.");
         }
-        if crate::tmux::session_exists_from_cache(&state.tmux_name) == Some(false) {
+        use crate::session::{AuxiliaryTarget, PanePresence};
+        let gone = match &state.target {
+            live_send::LiveSendTarget::Agent => {
+                // The daemon may have created the pane after this process's
+                // last scan, so a cached miss is not evidence of death (the
+                // asymmetry documented on `session_exists`). Confirm with a
+                // live probe before ending live mode; Unknown stays put.
+                !crate::tmux::session_exists(&state.tmux_name)
+                    && crate::tmux::probe_session_existence(&state.tmux_name)
+                        == crate::tmux::SessionExistence::Absent
+            }
+            live_send::LiveSendTarget::Terminal => matches!(
+                inst.auxiliary_presence(&AuxiliaryTarget::Host { index: 0 }),
+                PanePresence::Absent | PanePresence::Dead
+            ),
+            live_send::LiveSendTarget::ContainerTerminal => matches!(
+                inst.auxiliary_presence(&AuxiliaryTarget::Container { index: 0 }),
+                PanePresence::Absent | PanePresence::Dead
+            ),
+            live_send::LiveSendTarget::Tool(name) => matches!(
+                inst.tool_presence(name),
+                PanePresence::Absent | PanePresence::Dead
+            ),
+        };
+        if gone {
             return Some("tmux pane went away while live mode was active.");
         }
         None
@@ -6469,20 +6459,22 @@ impl HomeView {
         if self.end_live_send_on_drift(&state) {
             return true;
         }
-        // Name the thief where the owner id makes it unambiguous. The web
-        // dashboard's live viewers register as `live-*`
-        // (src/server/live_ws.rs); other aoe TUIs as `tui-*`.
-        let message = match crate::tmux::Session::from_name(&state.tmux_name).size_owner() {
-            Some((id, _)) if id.starts_with("live-") => {
-                "The web dashboard took over this session's live view."
-            }
-            Some((id, _)) if id.starts_with("tui-") => {
-                "Another aoe TUI took over this session's live view."
-            }
-            _ => "Another surface took over this session's live view.",
+        // Name the taker from the label it wrote with the lock. The notice
+        // also guards the keyboard: it swallows every key until dismissed, so
+        // the keystrokes already in flight for the pane cannot land on the
+        // session list as shortcuts.
+        let holder = crate::tmux::Session::from_name(&state.tmux_name)
+            .size_state()
+            .active(crate::util::now_ms(), crate::tmux::SIZE_OWNER_TTL)
+            .map(|lock| lock.describe());
+        // "X took over" rather than "taken over by X": the notice is 48
+        // columns wide, and the shorter phrasing keeps the name off a wrap.
+        let message = match holder {
+            Some(name) => format!("Live mode ended: {name} took over."),
+            None => "Another surface took over this session's live view.".to_string(),
         };
         self.teardown_live_send();
-        self.info_dialog = Some(InfoDialog::new("Live send ended", message));
+        self.info_dialog = Some(InfoDialog::new("Live send ended", &message));
         true
     }
 
@@ -6695,8 +6687,23 @@ impl HomeView {
     /// retains stale indices into the old list, and `n`/`N` cycles jump
     /// to wrong sessions (row highlights follow the stale indices too).
     /// See #2676.
+    /// Text a search matches a sidebar row against.
+    fn item_haystack(&self, item: &Item) -> Option<String> {
+        Some(match item {
+            Item::Group { name, path, .. } => format!("{name} {path}"),
+            Item::RemoteGroup { name, .. } => name.clone(),
+            Item::LocalGroup { .. } => "local".to_string(),
+            Item::Session { .. } => Self::search_haystack_for(self.row_instance(item)?),
+            Item::RemoteSession { remote, .. } => format!(
+                "{} {remote}",
+                Self::search_haystack_for(self.row_instance(item)?)
+            ),
+        })
+    }
+
     pub(super) fn rebuild_flat_items(&mut self) {
-        self.flat_items = self.build_flat_items();
+        self.remote_instances = crate::tui::remote_feed::display_instances(&self.remote_snapshots);
+        self.flat_items = self.build_flat_items_with_remotes();
         if !self.search_matches.is_empty() {
             self.refresh_search_matches();
         }
@@ -6726,17 +6733,8 @@ impl HomeView {
         let mut buf = Vec::new();
 
         for (idx, item) in self.flat_items.iter().enumerate() {
-            let haystack = match item {
-                Item::Session { id, .. } => {
-                    if let Some(inst) = self.get_instance(id) {
-                        Self::search_haystack_for(inst)
-                    } else {
-                        continue;
-                    }
-                }
-                Item::Group { name, path, .. } => {
-                    format!("{} {}", name, path)
-                }
+            let Some(haystack) = self.item_haystack(item) else {
+                continue;
             };
 
             let haystack_utf32 = Utf32Str::new(&haystack, &mut buf);
@@ -6780,17 +6778,8 @@ impl HomeView {
         let mut buf = Vec::new();
 
         for (idx, item) in self.flat_items.iter().enumerate() {
-            let haystack = match item {
-                Item::Session { id, .. } => {
-                    if let Some(inst) = self.get_instance(id) {
-                        Self::search_haystack_for(inst)
-                    } else {
-                        continue;
-                    }
-                }
-                Item::Group { name, path, .. } => {
-                    format!("{} {}", name, path)
-                }
+            let Some(haystack) = self.item_haystack(item) else {
+                continue;
             };
 
             let haystack_utf32 = Utf32Str::new(&haystack, &mut buf);
@@ -6814,6 +6803,34 @@ impl HomeView {
     /// shadow directories a build creates later inside the container (#2045). Shows
     /// the dialog once (unless already acknowledged or no glob is configured),
     /// otherwise proceeds straight to creation.
+    /// Accept the pending hook-install disclosure and resume the create it
+    /// blocked. A local create persists the acknowledgement here; a remote one
+    /// hands it to that machine along with the retried create.
+    fn accept_hooks_install(&mut self) -> Option<Action> {
+        let Some(data) = self.pending_hooks_install_data.take() else {
+            self.hooks_install_dialog = None;
+            return None;
+        };
+        if let Some(remote) = data.remote.clone() {
+            self.hooks_install_dialog = None;
+            self.start_remote_create(remote, &data, true);
+            return None;
+        }
+        match crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        }) {
+            Ok(()) => {
+                self.hooks_install_dialog = None;
+                self.maybe_confirm_volume_ignores_globs(data)
+            }
+            Err(e) => {
+                tracing::warn!(target: "tui.input", "Failed to save config: {e}");
+                self.pending_hooks_install_data = Some(data);
+                None
+            }
+        }
+    }
+
     fn maybe_confirm_volume_ignores_globs(&mut self, data: NewSessionData) -> Option<Action> {
         if data.sandbox && !Self::volume_ignores_globs_acknowledged() {
             if let Some(message) = Self::volume_ignores_glob_confirm_message(&data) {
@@ -6894,8 +6911,10 @@ impl HomeView {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!(target: "tui.input", "Failed to check repo trust: {}", e);
-                let fallback = repo_config::resolve_global_profile_hooks(&data.profile);
-                return self.create_session_with_hooks(data, fallback);
+                // The read failed, so nothing here can approve repository
+                // hooks: skip them and let the daemon keep the global set.
+                self.request_creation(data, Some(false));
+                return None;
             }
         };
 
@@ -6933,7 +6952,14 @@ impl HomeView {
         };
 
         if !trust.needs_prompt() {
-            return self.create_session_with_hooks(data, hooks_on_trust);
+            // Already-trusted repository hooks are approved explicitly so the
+            // daemon runs them; an absent repository surface approves nothing.
+            let decision = match &trust.hooks {
+                TrustSurface::Trusted(_) => Some(true),
+                TrustSurface::NeedsTrust { .. } | TrustSurface::Absent => None,
+            };
+            self.request_creation(data, decision);
+            return None;
         }
 
         use crate::tui::dialogs::RepoTrustDialog;
@@ -6954,95 +6980,28 @@ impl HomeView {
         self.pending_repo_trust_data = Some(data);
         None
     }
-
-    /// Create a session with optional hooks. Delegates to the background
-    /// `CreationPoller` when hooks are present, when the session is sandboxed,
-    /// or when a worktree branch is requested (to avoid freezing the TUI on
-    /// slow git hooks like `post-checkout`).
-    pub(super) fn create_session_with_hooks(
-        &mut self,
-        data: NewSessionData,
-        hooks: Option<crate::session::HooksConfig>,
-    ) -> Option<Action> {
-        let has_hooks = hooks
-            .as_ref()
-            .is_some_and(|h| !h.on_create.is_empty() || !h.on_launch.is_empty());
-        let has_worktree = data.worktree_enabled;
-
-        if data.sandbox || has_hooks || has_worktree {
-            self.request_creation(data, hooks);
-            return None;
-        }
-
-        match self.create_session(data) {
-            Ok(session_id) => {
-                self.new_dialog = None;
-                Some(Action::AttachAfterCreate(session_id))
-            }
-            Err(e) => {
-                tracing::error!(target: "tui.input", "Failed to create session: {}", e);
-                if let Some(dialog) = &mut self.new_dialog {
-                    dialog.set_error(e.to_string());
-                }
-                None
-            }
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::config::{SessionConfig, ToolSessionConfig};
+    use crate::session::config::ToolSessionConfig;
 
     #[test]
-    fn wheel_mouse_bytes_sgr_maps_cell_and_button() {
-        use ratatui::layout::Rect;
-        // Pane at (10,5), 80x24. Wheel up over screen cell (12,7) maps to
-        // 1-based pane cell (3,3): cx = 12-10+1, cy = 7-5+1.
-        let pane = Rect::new(10, 5, 80, 24);
-        assert_eq!(
-            wheel_mouse_bytes(true, true, pane, 12, 7),
-            b"\x1b[<64;3;3M".to_vec()
-        );
-        // Wheel down flips the button to 65.
-        assert_eq!(
-            wheel_mouse_bytes(false, true, pane, 12, 7),
-            b"\x1b[<65;3;3M".to_vec()
-        );
-        // A cell past the pane edge clamps to the last column/row.
-        assert_eq!(
-            wheel_mouse_bytes(true, true, pane, 999, 999),
-            b"\x1b[<64;80;24M".to_vec()
-        );
-        // An unpopulated rect falls back to the top-left cell.
-        assert_eq!(
-            wheel_mouse_bytes(true, true, Rect::new(0, 0, 0, 0), 40, 40),
-            b"\x1b[<64;1;1M".to_vec()
-        );
-    }
-
-    #[test]
-    fn wheel_mouse_bytes_legacy_encodes_x10() {
+    fn wheel_forward_key_maps_the_cell_into_the_pane() {
         use ratatui::layout::Rect;
         let pane = Rect::new(10, 5, 80, 24);
-        // Legacy X10: ESC [ M then (button+32, col+32, row+32). Cell (3,3),
-        // wheel up (button 64) => 0x60, 0x23, 0x23.
-        assert_eq!(
-            wheel_mouse_bytes(true, false, pane, 12, 7),
-            vec![0x1b, b'[', b'M', 64 + 32, 3 + 32, 3 + 32]
-        );
-        // Wheel down => button 65 => 0x61.
-        assert_eq!(
-            wheel_mouse_bytes(false, false, pane, 12, 7),
-            vec![0x1b, b'[', b'M', 65 + 32, 3 + 32, 3 + 32]
-        );
-        // Coordinates above 223 can't be encoded in one byte; clamp there.
-        let wide = Rect::new(0, 0, 400, 400);
-        assert_eq!(
-            wheel_mouse_bytes(true, false, wide, 300, 300),
-            vec![0x1b, b'[', b'M', 64 + 32, 223 + 32, 223 + 32]
-        );
+        let sgr = cursor_for(true, true, true);
+        let bytes = |up, col, row, pane| match wheel_forward_key(&sgr, up, pane, col, row) {
+            Some(live_send::TmuxKey::HexBytes(b)) => b,
+            other => panic!("expected HexBytes, got {other:?}"),
+        };
+        // Screen cell (12,7) is 1-based pane cell (3,3).
+        assert_eq!(bytes(true, 12, 7, pane), b"\x1b[<64;3;3M");
+        assert_eq!(bytes(false, 12, 7, pane), b"\x1b[<65;3;3M");
+        // Past the edge clamps to the last cell; an unpopulated rect is (1,1).
+        assert_eq!(bytes(true, 999, 999, pane), b"\x1b[<64;80;24M");
+        assert_eq!(bytes(true, 40, 40, Rect::default()), b"\x1b[<64;1;1M");
     }
 
     #[test]
@@ -7257,11 +7216,8 @@ mod tests {
         assert!(mouse_target_rect(&cursor, pane, 2, 3).is_some());
     }
 
-    /// The fix for #2407: a full-screen pane with no mouse tracking must
-    /// forward `PageUp`/`PageDown`, NOT arrow keys (which an app reads as
-    /// cursor / input-history navigation, not scroll) and NOT raw mouse
-    /// bytes. Asserting the key variant guards against a regression to
-    /// either that the preview-offset behavioral test can't catch.
+    /// #2407: a full-screen pane with no mouse tracking gets page keys, not
+    /// arrow keys (cursor / input-history navigation) or mouse bytes.
     #[test]
     fn wheel_forward_key_no_mouse_alt_screen_is_page_key() {
         use ratatui::layout::Rect;
@@ -7269,17 +7225,11 @@ mod tests {
         let cursor = cursor_for(true, false, false);
         assert_eq!(
             wheel_forward_key(&cursor, true, pane, 10, 10),
-            Some(live_send::TmuxKey::NamedRepeat {
-                name: "PageUp".into(),
-                count: WHEEL_PAGE_STEP,
-            })
+            Some(live_send::TmuxKey::HexBytes(b"\x1b[5~".to_vec()))
         );
         assert_eq!(
             wheel_forward_key(&cursor, false, pane, 10, 10),
-            Some(live_send::TmuxKey::NamedRepeat {
-                name: "PageDown".into(),
-                count: WHEEL_PAGE_STEP,
-            })
+            Some(live_send::TmuxKey::HexBytes(b"\x1b[6~".to_vec()))
         );
     }
 
@@ -7337,38 +7287,6 @@ mod tests {
             format_target_label("my-session", &LiveSendTarget::ContainerTerminal),
             "my-session (container)",
         );
-    }
-
-    #[test]
-    fn hook_install_agent_uses_detect_as_for_custom_codex_wrapper() {
-        let mut config = SessionConfig::default();
-        config
-            .agent_detect_as
-            .insert("wrapped-codex".to_string(), "codex".to_string());
-
-        let agent = resolve_hook_install_agent("wrapped-codex", &config).unwrap();
-
-        assert_eq!(agent.name, "codex");
-    }
-
-    #[test]
-    fn hook_install_agent_keeps_builtin_agent_resolution_first() {
-        let mut config = SessionConfig::default();
-        config
-            .agent_detect_as
-            .insert("opencode".to_string(), "codex".to_string());
-
-        assert!(resolve_hook_install_agent("opencode", &config).is_none());
-    }
-
-    #[test]
-    fn hook_install_agent_ignores_unknown_detect_as_target() {
-        let mut config = SessionConfig::default();
-        config
-            .agent_detect_as
-            .insert("wrapped-agent".to_string(), "missing-agent".to_string());
-
-        assert!(resolve_hook_install_agent("wrapped-agent", &config).is_none());
     }
 
     #[test]
@@ -7554,6 +7472,7 @@ mod tests {
 
     fn glob_session_data(path: &str) -> NewSessionData {
         NewSessionData {
+            remote: None,
             profile: String::new(),
             title: String::new(),
             path: path.to_string(),

@@ -17,7 +17,12 @@ async function mockApis(page: Page, opts: MockOptions = {}) {
   for (const path of ["settings", "themes", "profiles", "groups", "devices", "about", "system/update-status"]) {
     await page.route(`**/api/${path}`, (r) =>
       r.fulfill({
-        json: path === "settings" || path === "about" || path === "system/update-status" ? {} : [],
+        json:
+          path === "profiles"
+            ? [{ name: "default", is_default: true }]
+            : path === "settings" || path === "about" || path === "system/update-status"
+              ? {}
+              : [],
       }),
     );
   }

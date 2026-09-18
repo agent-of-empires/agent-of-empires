@@ -1,28 +1,21 @@
 import { useState } from "react";
 import type { ProjectInfo } from "../lib/types";
-import { createProject, updateProject } from "../lib/api";
+import { createProject, projectTarget, updateProject } from "../lib/api";
 import { DirectoryBrowser } from "./DirectoryBrowser";
 
 interface Props {
-  /** The project to edit, or null/undefined to add a new one. In edit mode
-   *  only the default base branch is mutable; path, name, and scope are
-   *  fixed (remove and re-add to change them). */
+  profile: string;
+  /** Editing preserves the registration identity and scope. */
   initial?: ProjectInfo | null;
   onClose: () => void;
-  /** Called after a successful create/update so the caller can refresh the
-   *  registry. Awaited before the modal closes, so the section reflects the
-   *  change by the time the form disappears (matching the pin/unpin handlers).
-   *  May be sync or return a promise. */
+  /** Refresh the registry before closing after a commit. */
   onSaved: () => void | Promise<void>;
 }
 
 const lockedFieldClass =
   "w-full px-3 py-2 text-sm bg-surface-900/60 border border-surface-700/30 rounded-md text-text-dim cursor-not-allowed mb-3";
 
-// Add / edit form for a registered project, shared by the sidebar Projects
-// section. Lifted out of the former full-page ProjectsView so the same form
-// renders as a modal next to the sidebar. See #2212.
-export function ProjectFormModal({ initial, onClose, onSaved }: Props) {
+export function ProjectFormModal({ initial, profile, onClose, onSaved }: Props) {
   const isEdit = initial != null;
   const [path, setPath] = useState(initial?.path ?? "");
   const [name, setName] = useState(initial?.name ?? "");
@@ -42,7 +35,9 @@ export function ProjectFormModal({ initial, onClose, onSaved }: Props) {
     if (isEdit) {
       setSubmitting(true);
       setError(null);
-      const result = await updateProject(initial.name, initial.scope, baseBranch.trim() || null);
+      const result = await updateProject(initial.path, projectTarget(initial.scope, profile), {
+        default_base_branch: baseBranch.trim() || null,
+      });
       if (!result.ok) {
         setSubmitting(false);
         setError(result.error || "Update failed");
@@ -61,6 +56,7 @@ export function ProjectFormModal({ initial, onClose, onSaved }: Props) {
       path: trimmedPath,
       name: name.trim() || undefined,
       scope,
+      profile,
       allow_override: allowOverride || undefined,
       default_base_branch: baseBranch.trim() || undefined,
     });

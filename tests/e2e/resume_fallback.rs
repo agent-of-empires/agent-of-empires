@@ -105,14 +105,7 @@ fn read_log_lines(path: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Seed a Claude transcript on disk for `sid` so the Default resume path
-/// attempts `--resume <sid>` (and fires the settle probe) instead of the
-/// empty-thread fresh-pin shortcut from #2700, which launches fresh with
-/// `--session-id` and skips the probe entirely. Mirrors the host location
-/// `claude_host_transcript_confirmed_absent` checks: `$HOME/.claude/projects/
-/// <encoded-canonical-project-path>/<sid>.jsonl`, where the encoding maps every
-/// char that is not ASCII-alphanumeric or `-` to `-`. Models a real prior
-/// Claude session whose sid later fails to resume.
+/// A stored transcript makes this a resume rather than an empty-thread fresh pin.
 fn seed_claude_transcript(h: &TuiTestHarness, project_path: &Path, sid: &str) {
     let canonical = fs::canonicalize(project_path).unwrap_or_else(|_| project_path.to_path_buf());
     let encoded: String = canonical
@@ -141,96 +134,143 @@ impl Drop for StopSessionOnDrop<'_> {
     }
 }
 
-#[test]
+#[tokio::test]
 #[parallel]
-fn stale_resume_failure_persists_loop_breaker_and_next_restart_starts_fresh() {
+async fn stale_resume_failure_persists_loop_breaker_and_next_restart_starts_fresh() {
+    use agent_of_empires::daemon::{ApiErrorCode, DaemonClient, DaemonClientError};
     require_tmux!();
-
-    let mut h = new_harness("resume_fallback_loop_breaker");
-    disable_restart_wake_message(&h);
-    let log_path = install_fake_agent(&mut h);
-    let project = h.project_path();
-
-    let add = h.run_cli(&[
-        "add",
-        project.to_str().unwrap(),
-        "--cmd",
-        "claude",
-        "-t",
-        TITLE,
-    ]);
-    assert!(
-        add.status.success(),
-        "aoe add failed: {}",
-        String::from_utf8_lossy(&add.stderr)
-    );
-    let _cleanup = StopSessionOnDrop { h: &h };
-
-    patch_session(&h, TITLE, |row| {
-        row.insert("command".to_string(), Value::String(FAKE_AGENT.to_string()));
-        row.insert("tool".to_string(), Value::String("claude".to_string()));
-        row.insert("status".to_string(), Value::String("idle".to_string()));
-        row.insert(
-            "agent_session_id".to_string(),
-            Value::String(STALE_SID.to_string()),
+    for native in [false, true] {
+        let mut h = new_harness("resume_fallback_loop_breaker");
+        h.set_env("AGENT_OF_EMPIRES_PROFILE", "default");
+        if native {
+            h.stop_daemon_on_drop();
+        }
+        disable_restart_wake_message(&h);
+        let log_path = install_fake_agent(&mut h);
+        let project = h.project_path();
+        let add = h.run_cli(&[
+            "add",
+            project.to_str().unwrap(),
+            "--cmd",
+            "claude",
+            "-t",
+            TITLE,
+        ]);
+        assert!(
+            add.status.success(),
+            "aoe add failed: {}",
+            String::from_utf8_lossy(&add.stderr)
         );
-        row.remove("resume_probe_failed_sid");
-        row.remove("resume_intent");
-    });
-
-    // Without a transcript on disk, #2700 launches a stale Claude sid fresh
-    // (`--session-id`, no probe), so the resume never fails and this test's
-    // premise collapses. Seed one so the restart takes the `--resume` path.
-    seed_claude_transcript(&h, &project, STALE_SID);
-
-    let first = h.run_cli(&["session", "restart", TITLE]);
-    assert!(
-        !first.status.success(),
-        "first restart should fail after passing stale sid"
-    );
-
-    let sessions = read_sessions(&h);
-    let row = session_by_title(&sessions, TITLE);
-    assert_eq!(row["agent_session_id"].as_str(), Some(STALE_SID));
-    assert_eq!(row["resume_probe_failed_sid"].as_str(), Some(STALE_SID));
-    assert_default_resume_intent(row);
-
-    let first_lines = read_log_lines(&log_path);
-    assert!(
-        first_lines.iter().any(|line| line.contains(STALE_SID)),
-        "first restart must pass stale sid to fake agent; log={first_lines:?}"
-    );
-
-    let before_second = first_lines.len();
-    let second = h.run_cli(&["session", "restart", TITLE]);
-    assert!(
-        second.status.success(),
-        "second restart should start fresh after loop-breaker: {}",
-        String::from_utf8_lossy(&second.stderr)
-    );
-
-    let sessions = read_sessions(&h);
-    let row = session_by_title(&sessions, TITLE);
-    let fresh_sid = row["agent_session_id"]
-        .as_str()
-        .expect("fresh restart should persist a new agent_session_id");
-    assert_ne!(fresh_sid, STALE_SID);
-    assert!(!fresh_sid.trim().is_empty());
-    assert!(
-        row["resume_probe_failed_sid"].is_null(),
-        "fresh restart should clear resume_probe_failed_sid, got {:?}",
-        row["resume_probe_failed_sid"]
-    );
-    assert_default_resume_intent(row);
-
-    let all_lines = read_log_lines(&log_path);
-    let second_lines = &all_lines[before_second..];
-    assert!(
-        !second_lines.is_empty(),
-        "second restart should invoke fake agent; log={all_lines:?}"
-    );
-    assert!(
-        second_lines.iter().all(|line| !line.contains(STALE_SID)),
-        "second restart must not retry stale sid; new log lines={second_lines:?}"
-    );
+        let _cleanup = StopSessionOnDrop { h: &h };
+        patch_session(&h, TITLE, |row| {
+            row.insert("command".into(), Value::String(FAKE_AGENT.into()));
+            row.insert("tool".into(), Value::String("claude".into()));
+            // Exclude daemon startup recovery from this explicit request.
+            row.insert("status".into(), Value::String("stopped".into()));
+            row.insert("agent_session_id".into(), Value::String(STALE_SID.into()));
+            row.remove("resume_probe_failed_sid");
+            row.remove("resume_intent");
+        });
+        seed_claude_transcript(&h, &project, STALE_SID);
+        let runtime = if native {
+            let started = h.run_cli(&["serve", "--core-only", "--daemon"]);
+            assert!(
+                started.status.success(),
+                "{}",
+                String::from_utf8_lossy(&started.stderr)
+            );
+            let sdk = DaemonClient::new_unix(
+                crate::harness::app_dir_in(h.home_path()).join("daemon/api.sock"),
+            )
+            .unwrap();
+            let epoch = sdk.runtime_info().await.unwrap().epoch;
+            Some((sdk, epoch))
+        } else {
+            None
+        };
+        let id = session_by_title(&read_sessions(&h), TITLE)["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let first_succeeded = if let Some((sdk, epoch)) = &runtime {
+            match sdk.ensure_agent(&id, &Default::default(), epoch).await {
+                Err(DaemonClientError::Status {
+                    code: Some(ApiErrorCode::ResumeFailed),
+                    body,
+                    ..
+                }) => {
+                    assert!(
+                        body.is_empty(),
+                        "authenticated error bodies must remain redacted"
+                    );
+                    false
+                }
+                Err(error) => panic!("resume failed without its typed discriminator: {error}"),
+                Ok(_) => true,
+            }
+        } else {
+            h.run_cli(&["session", "restart", TITLE]).status.success()
+        };
+        assert!(
+            !first_succeeded,
+            "first restart should fail after passing stale sid; native={native}; rows={}; log={:?}",
+            read_sessions(&h),
+            read_log_lines(&log_path)
+        );
+        let sessions = read_sessions(&h);
+        let row = session_by_title(&sessions, TITLE);
+        assert_eq!(row["agent_session_id"].as_str(), Some(STALE_SID));
+        assert_eq!(row["resume_probe_failed_sid"].as_str(), Some(STALE_SID));
+        assert_default_resume_intent(row);
+        let first_lines = read_log_lines(&log_path);
+        assert_eq!(
+            first_lines.len(),
+            1,
+            "failed resume must not start fresh automatically"
+        );
+        assert!(
+            first_lines[0].contains(STALE_SID),
+            "first restart must pass stale sid; log={first_lines:?}"
+        );
+        let before_second = first_lines.len();
+        let second = if let Some((sdk, epoch)) = &runtime {
+            sdk.ensure_agent(&id, &Default::default(), epoch)
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        } else {
+            let output = h.run_cli(&["session", "restart", TITLE]);
+            output
+                .status
+                .success()
+                .then_some(())
+                .ok_or_else(|| String::from_utf8_lossy(&output.stderr).into_owned())
+        };
+        assert!(
+            second.is_ok(),
+            "explicit retry should start fresh after the loop-breaker: {second:?}"
+        );
+        let sessions = read_sessions(&h);
+        let row = session_by_title(&sessions, TITLE);
+        let fresh_sid = row["agent_session_id"]
+            .as_str()
+            .expect("fresh restart should persist a new agent_session_id");
+        assert_ne!(fresh_sid, STALE_SID);
+        assert!(
+            row["resume_probe_failed_sid"].is_null(),
+            "fresh restart should clear the resume loop-breaker"
+        );
+        assert_default_resume_intent(row);
+        let all_lines = read_log_lines(&log_path);
+        let second_lines = &all_lines[before_second..];
+        assert_eq!(
+            second_lines.len(),
+            1,
+            "explicit retry should launch exactly once; log={all_lines:?}"
+        );
+        assert!(
+            !second_lines[0].contains(STALE_SID),
+            "explicit retry must not reuse stale sid; log={second_lines:?}"
+        );
+    }
 }

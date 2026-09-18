@@ -1,78 +1,17 @@
-//! Status and metrics refresh: what the pollers report and how a row's
-//! status is applied and hooked.
+//! Canonical runtime projection and local system-health sampling.
 
 use super::*;
 
 impl HomeView {
-    /// Snapshot of `self.instances` eligible for status polling.
-    /// In-flight recovery and restart candidates are excluded; their
-    /// post-cascade `Instance` arrives via `apply_recovery_updates` /
-    /// `apply_restart_results` and skipping the parallel poll prevents racing
-    /// transitions during the suppression window.
+    /// Rows eligible for local system-health sampling. Recovery owns its rows
+    /// on a worker, so in-flight recoveries are skipped; a daemon start in
+    /// flight only reserves the row and never skips the health sample.
     pub(in crate::tui) fn pollable_instances(&self) -> Vec<Instance> {
         self.instances
             .values()
-            .filter(|i| {
-                !self.recovery_in_flight.contains(&i.id) && !self.restart_in_flight.contains(&i.id)
-            })
+            .filter(|i| !self.recovery_in_flight.contains(&i.id))
             .cloned()
             .collect()
-    }
-
-    pub(in crate::tui) fn attached_status_hook_sessions(
-        &self,
-    ) -> Vec<crate::tui::attached_status_hooks::AttachedStatusHookSession> {
-        self.pollable_instances()
-            .into_iter()
-            .filter_map(|instance| {
-                let hook_config = self.status_hook_config_for(&instance);
-                hook_config.enabled.then_some(
-                    crate::tui::attached_status_hooks::AttachedStatusHookSession {
-                        instance,
-                        hook_config,
-                    },
-                )
-            })
-            .collect()
-    }
-
-    /// Request a status refresh in the background (non-blocking).
-    /// Call `apply_status_updates` to check for and apply results.
-    pub fn request_status_refresh(&mut self) {
-        if !self.pending_status_refresh {
-            self.status_poller
-                .request_refresh(self.pollable_instances());
-            self.pending_status_refresh = true;
-        }
-    }
-
-    /// Apply any pending status updates from the background poller.
-    /// Returns true if updates were applied.
-    pub fn apply_status_updates(&mut self) -> bool {
-        use std::sync::mpsc::TryRecvError;
-
-        match self.status_poller.try_recv_updates() {
-            Ok(updates) => {
-                for update in updates {
-                    self.apply_one_status_update(update);
-                }
-                self.pending_status_refresh = false;
-                true
-            }
-            Err(TryRecvError::Empty) => false,
-            Err(TryRecvError::Disconnected) => {
-                // The worker thread is gone (a panic in poll_statuses_once).
-                // Without a respawn, pending_status_refresh stays set and
-                // request_status_refresh never fires again, freezing every
-                // session's live status for the rest of the process.
-                tracing::error!(
-                    target: "tui.home",
-                    "status poller worker gone; respawning a fresh poller",
-                );
-                self.reset_status_refresh();
-                true
-            }
-        }
     }
 
     /// Request a system-health sample in the background while either health
@@ -193,19 +132,10 @@ impl HomeView {
         }
     }
 
-    /// Request the daemon's session list (non-blocking). Skipped when
-    /// `session.daemon_sidebar` is off, and when no structured session is
-    /// loaded: the daemon owns nothing on a terminal-only sidebar yet, so
-    /// that view never talks to it.
-    pub fn request_session_feed_refresh(&mut self) {
-        if !self.daemon_sidebar || self.pending_session_feed {
-            return;
-        }
-        if !self.instances.values().any(|i| i.is_structured()) {
-            return;
-        }
-        self.session_feed.request_refresh();
-        self.pending_session_feed = true;
+    pub fn connect_runtime(&mut self) {
+        self.set_sidebar_source(crate::tui::session_feed::SidebarSource::Connecting, None);
+        self.session_feed
+            .connect(self.active_profile.clone().unwrap_or_default());
     }
 
     /// Record where daemon-owned sidebar state comes from, logging the
@@ -216,203 +146,246 @@ impl HomeView {
         &mut self,
         source: crate::tui::session_feed::SidebarSource,
         reason: Option<&str>,
-    ) {
+    ) -> bool {
         use crate::tui::session_feed::SidebarSource;
 
         if self.sidebar_source == source {
-            return;
+            return false;
         }
         self.sidebar_source = source;
+        export_runtime_ready_for_e2e(source == SidebarSource::Daemon);
+        if source != SidebarSource::Daemon {
+            self.cancel_native_attachment();
+            self.teardown_live_send();
+            self.structured_preview = None;
+            self.preview_capture_worker = None;
+            self.preview_capture_target = None;
+            self.pending_paste = None;
+        }
         match source {
+            SidebarSource::Connecting => {
+                tracing::info!(target: "tui.home", "sidebar: connecting to runtime")
+            }
             SidebarSource::Daemon => tracing::info!(
                 target: "tui.home",
-                "sidebar: daemon reachable; structured rows follow /api/sessions",
+                "sidebar: daemon reachable; rows follow /api/runtime/ws",
             ),
-            SidebarSource::Storage => tracing::info!(
+            SidebarSource::Disconnected => tracing::info!(
                 target: "tui.home",
                 reason = reason.unwrap_or(""),
-                "sidebar: local store only; daemon-owned state keeps its last value",
+                "sidebar: disconnected; session view unavailable",
             ),
         }
-    }
-
-    /// Whether a daemon-sourced status may be applied to `id`, mirroring the
-    /// exclusions the tmux producer applies. A row mid-restart or
-    /// mid-recovery-cascade has its post-cascade `Instance` delivered by
-    /// `apply_restart_results` / `apply_recovery_updates`; letting the daemon's
-    /// copy land during that window races those transitions, so both are
-    /// excluded here just as [`Self::pollable_instances`] excludes them from the
-    /// tmux poller. Recovery already skips structured rows
-    /// (`recovery::is_recovery_candidate`), so in practice this is the restart
-    /// guard, but both are checked so the two producers stay symmetrical.
-    ///
-    /// Archived and trashed rows are also excluded. `/api/sessions` returns
-    /// them unfiltered, and the `is_archived()` short-circuit that keeps the
-    /// tmux producer off a sunk row lives in
-    /// `session::instance::status_update::update_status_with_metadata_inner`,
-    /// which this daemon path never reaches; without this a sunk row would be
-    /// restamped and re-marked unread. See #3201 / #1868 / #2206.
-    ///
-    /// The cost of that exclusion: a sunk structured row that is already in
-    /// `Status::Error` now has no producer able to clear it. The daemon is
-    /// excluded here, the tmux poller bails on structured rows before probing
-    /// (`status_poller.rs`), and `reload_storage_only` carries `prev.status`
-    /// forward across reloads, so the stale value survives. It stays visible
-    /// because `agent_row_icon` lets `Error` and `Deleting` punch through the
-    /// sunk-row mask on purpose (a failed permanent delete has to remain
-    /// legible). The tmux producer has the same property via its own
-    /// `is_archived()` short-circuit, so this is consistent rather than new,
-    /// but unarchiving is the only way back.
-    fn daemon_status_applies_to(&self, inst: &Instance) -> bool {
-        !self.recovery_in_flight.contains(&inst.id)
-            && !self.restart_in_flight.contains(&inst.id)
-            && !inst.is_archived()
-            && !inst.is_trashed()
+        true
     }
 
     /// Apply a pending session-list result from the daemon. Returns true if
     /// the caller should redraw.
     pub fn apply_session_feed(&mut self) -> bool {
-        use crate::tui::session_feed::{self, SessionFeedResult, SidebarSource};
+        use crate::tui::session_feed::{SessionFeedResult, SidebarSource};
         use std::sync::mpsc::TryRecvError;
 
-        match self.session_feed.try_recv() {
-            Ok(result) => {
-                self.pending_session_feed = false;
-                // A result that was in flight when the setting flipped off is
-                // dropped, so "off" means the daemon never drives a row.
-                if !self.daemon_sidebar {
-                    return false;
-                }
-                match result {
-                    SessionFeedResult::Snapshot(rows) => {
-                        self.set_sidebar_source(SidebarSource::Daemon, None);
-                        let updates = session_feed::structured_updates(&rows);
-                        let applied = !updates.is_empty();
-                        for update in updates {
-                            self.apply_daemon_status_update(update);
+        let mut snapshot_applied = false;
+        let updated = match self.session_feed.try_recv() {
+            Ok(result) => match result {
+                SessionFeedResult::Snapshot(snapshot) => {
+                    let mut metadata_changed = false;
+                    // A row this view has never seen, in a profile it tracks,
+                    // was created by a peer. Rows load from storage rather than
+                    // from the wire projection, so reload instead of rebuilding
+                    // a lossy Instance from the response. Only additions
+                    // trigger it: the snapshot's row set can be narrower than
+                    // this view's (CityHall hides terminal rows), and reload
+                    // keeps a still-unpublished creating stub alive on its own.
+                    metadata_changed |=
+                        self.reconcile_in_flight_creation(&snapshot.contents.sessions);
+                    let in_flight = self.in_flight_creation_id();
+                    let unknown_row = snapshot.contents.sessions.iter().any(|row| {
+                        Some(row.id.as_str()) != in_flight
+                            && !self.instances.contains_key(&row.id)
+                            && self.storages.contains_key(&row.profile)
+                    });
+                    for row in &snapshot.contents.sessions {
+                        metadata_changed |= self.apply_daemon_status_update(row);
+                        let Some(instance) = self.instances.get_mut(&row.id) else {
+                            continue;
+                        };
+                        if instance.agent_pane != row.agent_pane {
+                            instance.agent_pane.clone_from(&row.agent_pane);
+                            metadata_changed = true;
                         }
-                        // Drop pending-approval entries for sessions that no longer
-                        // exist locally (deleted/trashed rows the daemon stops
-                        // listing, so `apply_daemon_status_update` never revisits
-                        // them). Otherwise a removed session leaks its entry for the
-                        // life of the TUI process.
-                        let instances = &self.instances;
+                        if instance.auxiliary != row.auxiliary {
+                            instance.auxiliary.clone_from(&row.auxiliary);
+                            metadata_changed = true;
+                        }
+                        if instance.unread != row.unread {
+                            instance.unread = row.unread;
+                            metadata_changed = true;
+                            if !row.unread && self.manual_unread_hold.as_deref() == Some(&row.id) {
+                                self.manual_unread_hold = None;
+                            }
+                        }
+                        for (raw, current) in [
+                            (row.archived_at.as_deref(), &mut instance.archived_at),
+                            (row.favorited_at.as_deref(), &mut instance.favorited_at),
+                            (row.snoozed_until.as_deref(), &mut instance.snoozed_until),
+                            (row.pinned_at.as_deref(), &mut instance.pinned_at),
+                            (
+                                row.last_accessed_at.as_deref(),
+                                &mut instance.last_accessed_at,
+                            ),
+                            (
+                                row.idle_entered_at.as_deref(),
+                                &mut instance.idle_entered_at,
+                            ),
+                            (
+                                row.idle_dormant_since.as_deref(),
+                                &mut instance.idle_dormant_since,
+                            ),
+                        ] {
+                            let next = match raw {
+                                Some(value) => match chrono::DateTime::parse_from_rfc3339(value) {
+                                    Ok(value) => Some(value.with_timezone(&chrono::Utc)),
+                                    Err(_) => continue,
+                                },
+                                None => None,
+                            };
+                            if *current != next {
+                                *current = next;
+                                metadata_changed = true;
+                            }
+                        }
+                    }
+                    if metadata_changed {
+                        self.rebuild_flat_items();
+                        self.reseat_cursor_after_rebuild();
+                        // A rebuild reorders rows under the cursor: resolve the
+                        // selection for the row that now sits there, so a key
+                        // pressed right after a canonical frame acts on what the
+                        // user sees instead of on nothing.
+                        self.update_selected();
+                    }
+                    metadata_changed |= self.set_sidebar_source(SidebarSource::Daemon, None);
+                    if !self.structured_pending_approvals.is_empty() {
+                        let ids: std::collections::HashSet<_> = snapshot
+                            .contents
+                            .sessions
+                            .iter()
+                            .map(|row| row.id.as_str())
+                            .collect();
+                        let count = self.structured_pending_approvals.len();
                         self.structured_pending_approvals
-                            .retain(|id, _| instances.contains_key(id));
-                        applied
+                            .retain(|id, _| ids.contains(id.as_str()));
+                        metadata_changed |= count != self.structured_pending_approvals.len();
                     }
-                    SessionFeedResult::Unavailable(reason) => {
-                        self.set_sidebar_source(SidebarSource::Storage, Some(&reason));
-                        false
+                    metadata_changed |= self.apply_pending_archive_cursor();
+                    metadata_changed |= self.session_feed.mark_snapshot_applied(snapshot);
+                    if unknown_row {
+                        match self.reload() {
+                            Ok(()) => metadata_changed = true,
+                            Err(error) => tracing::warn!(
+                                target: "tui.session_feed",
+                                %error,
+                                "reload after a peer-created session failed"
+                            ),
+                        }
                     }
+                    snapshot_applied = true;
+                    metadata_changed
                 }
-            }
+                SessionFeedResult::Unavailable(reason) => {
+                    self.set_sidebar_source(SidebarSource::Disconnected, Some(&reason))
+                }
+            },
             Err(TryRecvError::Empty) => false,
-            Err(TryRecvError::Disconnected) => {
-                // Same failure mode as the tmux poller: without a respawn the
-                // in-flight flag stays set and every structured row's status
-                // freezes for the rest of the process.
-                tracing::error!(
-                    target: "tui.home",
-                    "session feed worker gone; respawning a fresh feed",
-                );
-                self.session_feed = crate::tui::session_feed::SessionFeed::new();
-                self.pending_session_feed = false;
-                true
+            Err(TryRecvError::Disconnected) => false,
+        };
+        let errors = self.session_feed.drain_command_errors();
+        let command_error = !errors.is_empty();
+        if command_error {
+            if errors.iter().any(|error| {
+                error.marks_unread && self.manual_unread_hold.as_deref() == Some(&error.id)
+            }) {
+                self.manual_unread_hold = None;
             }
+            self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                "Runtime change",
+                &errors
+                    .into_iter()
+                    .map(|error| format!("{}: {}", error.id, error.message))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ));
+        }
+        if snapshot_applied {
+            if let Some(id) = self
+                .live_send
+                .as_ref()
+                .filter(|live| {
+                    self.get_instance(&live.session_id)
+                        .is_some_and(|instance| instance.is_unread())
+                        && self.session_feed.can_submit(&live.session_id)
+                })
+                .map(|live| live.session_id.clone())
+            {
+                self.clear_unread_on_view(&id);
+            }
+        }
+        updated || command_error
+    }
+
+    pub(super) fn auxiliary_presence_for_view(
+        &self,
+        instance: &Instance,
+    ) -> crate::session::PanePresence {
+        use crate::session::{AuxiliaryTarget, PanePresence};
+        match &self.view_mode {
+            ViewMode::Terminal => {
+                let target = if instance.is_sandboxed()
+                    && self.get_terminal_mode(&instance.id) == TerminalMode::Container
+                {
+                    AuxiliaryTarget::Container { index: 0 }
+                } else {
+                    AuxiliaryTarget::Host { index: 0 }
+                };
+                instance.auxiliary_presence(&target)
+            }
+            ViewMode::Tool(name) => instance.tool_presence(name),
+            ViewMode::Structured => PanePresence::Unknown,
         }
     }
 
-    /// Fold one daemon-sourced structured status into the shared apply path,
-    /// so sounds and status hooks fire exactly as they do for a tmux-derived
-    /// transition. Persistence is the deliberate exception: this path only
-    /// handles structured rows, and nothing about one is the TUI's to write, so
-    /// `persist_passive_status_transition` returns early for `is_structured()`.
-    /// The status is a daemon-side overlay with no durable owner (#3201), and
-    /// the automatic unread mark is the daemon's too, written from the live ACP
-    /// turn-end event (#3181).
-    ///
-    /// The row is re-checked against `is_structured()` here rather than
-    /// trusted from the wire: the daemon's `view` and the local row's could
-    /// disagree for a session mid-conversion, and the tmux poller owns
-    /// terminal rows. Dropping the mismatch keeps one producer per row.
     pub(in crate::tui) fn apply_daemon_status_update(
         &mut self,
-        update: crate::tui::session_feed::DaemonStatusUpdate,
-    ) {
-        use crate::session::Status;
-        use crate::tui::status_poller::IdleIntent;
-
-        let (is_structured, applies, was_stopped, sunk) = match self.get_instance(&update.id) {
-            Some(inst) => (
-                inst.is_structured(),
-                self.daemon_status_applies_to(inst),
-                inst.status == Status::Stopped,
-                inst.is_archived() || inst.is_trashed(),
-            ),
-            None => return,
+        row: &crate::daemon::SessionResponse,
+    ) -> bool {
+        let Some(status) = crate::session::Status::from_api_str(&row.status) else {
+            return false;
         };
-        if !is_structured || !applies {
-            // Archived and trashed rows stay in `instances`, so their cached
-            // approvals would outlive every state the daemon can refresh: the
-            // refresh path returns here. Dropping the cache on the transition
-            // keeps the permission action from opening an approval the
-            // resolver can only 404 on.
-            if sunk {
-                self.structured_pending_approvals.remove(&update.id);
-            }
-            return;
+        let Some(instance) = self.instances.get_mut(&row.id) else {
+            return false;
+        };
+        let mut changed = instance.status != status
+            || instance.last_error != row.last_error
+            || instance.pane_dead_observed != row.pane_dead_observed;
+        if instance.status != status {
+            crate::sound::play_for_transition(instance.status, status, &self.sound_config);
         }
-        if update.pending_approvals.is_empty() {
-            self.structured_pending_approvals.remove(&update.id);
-        } else {
+        instance.status = status;
+        instance.last_error.clone_from(&row.last_error);
+        instance.pane_dead_observed = row.pane_dead_observed;
+        if row.view != crate::session::View::Structured
+            || row.archived_at.is_some()
+            || row.trashed_at.is_some()
+            || row.pending_approvals.is_empty()
+        {
+            changed |= self.structured_pending_approvals.remove(&row.id).is_some();
+        } else if self.structured_pending_approvals.get(&row.id) != Some(&row.pending_approvals) {
             self.structured_pending_approvals
-                .insert(update.id.clone(), update.pending_approvals.clone());
+                .insert(row.id.clone(), row.pending_approvals.clone());
+            changed = true;
         }
-        // Lift a locally-`Stopped` row before the shared apply path sees it.
-        // `apply_status_update`'s guard drops every update whose row is
-        // `Stopped`, which is right for tmux rows (nothing but an explicit
-        // start should wake one) but wrong here: stopping a structured session
-        // persists `Stopped`, and reopening it in the structured view does not
-        // clear that (`open_structured_view` only mounts the view), so without
-        // this the pill stays grey through the whole next turn, which is the
-        // bug this producer exists to fix.
-        //
-        // The daemon has already applied its own, stricter `Stopped` guard
-        // (`apply_status_intent`: only a `HealError` from `AcpSessionAssigned`
-        // or `RateLimitAutoResumed` lifts `Stopped`, and both are emitted only
-        // when a fresh worker attaches). So a non-`Stopped` reading from the
-        // daemon provably means a new worker epoch, never a trailing
-        // post-stop event. Reproducing the daemon's own Stopped -> Idle step
-        // here keeps the two ladders identical.
-        if update.status != Status::Stopped && was_stopped {
-            self.mutate_instance(&update.id, |inst| inst.status = Status::Idle);
-        }
-        self.apply_status_update(
-            StatusUpdate {
-                id: update.id,
-                status: update.status,
-                last_error: update.last_error,
-                // Mirror the daemon's own value rather than deriving one, so
-                // the TUI's idle fade matches the web dashboard's for the
-                // same session instead of restarting on the first local
-                // observation.
-                idle_entered_at: match update.idle_entered_at {
-                    Some(ts) => IdleIntent::Set(ts),
-                    None => IdleIntent::Clear,
-                },
-                last_accessed_at: update.last_accessed_at,
-                // Structured rows have no pane, so the Attention sort's
-                // dead-pane tier never applies to them.
-                pane_dead: false,
-                live_status_baseline: Some(update.status),
-                // A structured row has no pane to detect against.
-                detection: None,
-            },
-            true,
-            true,
-        );
+        changed
     }
     /// Queue a structured approval response without blocking input handling.
     pub(super) fn resolve_structured_approval(
@@ -524,205 +497,28 @@ impl HomeView {
             }
         }
     }
+}
 
-    /// Apply a single status update from the poller. Extracted from the
-    /// channel-pulling loop in `apply_status_updates` so tests can drive
-    /// the apply path directly without having to push through the
-    /// background polling thread.
-    pub(in crate::tui) fn apply_one_status_update(&mut self, update: StatusUpdate) {
-        self.apply_status_update(update, true, true);
+/// Mirror runtime readiness to `<app_dir>/.aoe_e2e_runtime_ready` when
+/// `AOE_E2E_DEBUG=1`, so e2e tests can wait for the subscription without a
+/// footer label.
+fn export_runtime_ready_for_e2e(ready: bool) {
+    if std::env::var("AOE_E2E_DEBUG").as_deref() != Ok("1") {
+        return;
     }
-
-    pub(in crate::tui) fn apply_status_updates_without_hooks(
-        &mut self,
-        updates: Vec<StatusUpdate>,
-    ) {
-        for update in updates {
-            self.apply_status_update(update, false, false);
-        }
-    }
-
-    pub(in crate::tui) fn reset_status_refresh(&mut self) {
-        self.status_poller = StatusPoller::new();
-        self.pending_status_refresh = false;
-    }
-
-    fn apply_status_update(&mut self, update: StatusUpdate, play_sound: bool, run_hooks: bool) {
-        use crate::session::Status;
-
-        let old_status = self.get_instance(&update.id).map(|i| i.status);
-        let should_update = old_status.is_some_and(|s| {
-            s != Status::Deleting
-                && s != Status::Creating
-                && s != Status::Stopped
-                && update.status != Status::Stopped
-        });
-
-        let new_last_accessed = update.last_accessed_at;
-        let new_pane_dead = update.pane_dead;
-
-        if should_update {
-            use crate::tui::status_poller::IdleIntent;
-
-            let new_status = update.status;
-            let new_error = update.last_error;
-            let new_idle_entered_at = update.idle_entered_at;
-            let new_live_status_baseline = update.live_status_baseline;
-            let new_detection = update.detection;
-            let status_changed = old_status != Some(new_status);
-            self.mutate_instance(&update.id, |inst| {
-                inst.status = new_status;
-                // The daemon's `last_error` is authoritative only when present:
-                // an incoming `Some` is always applied, so an `Error -> Error`
-                // tick can replace the old text. Gating that write on a status
-                // change froze the first error on the row. A `None` is not
-                // symmetric: the daemon tracks only ACP errors, so it cannot
-                // distinguish "no error" from a locally-set message such as the
-                // delete-failure text from `apply_deletion_results`, and
-                // clearing on every unchanged tick would wipe it. Clear only
-                // across a genuine transition, leaving a stale same-status
-                // message in place until then. See #3201.
-                if let Some(err) = new_error {
-                    inst.last_error = Some(err);
-                } else if status_changed {
-                    inst.last_error = None;
-                }
-                // Match on the producer's stated intent for `idle_entered_at`
-                // instead of overloading `None`. See `IdleIntent` in
-                // `status_poller` for the three-variant contract that
-                // replaces the pre-fix `Option<DateTime<Utc>>` (which
-                // conflated "producer observed a transition out of Idle" with
-                // "producer has no observation"). See #2690.
-                match new_idle_entered_at {
-                    IdleIntent::Set(ts) => inst.idle_entered_at = Some(ts),
-                    IdleIntent::Clear => inst.idle_entered_at = None,
-                    IdleIntent::Keep => {}
-                }
-                if new_last_accessed.is_some() {
-                    inst.last_accessed_at = new_last_accessed;
-                }
-                // A producer that has no baseline yet (`None`) must not
-                // clear one the real instance already has, or every
-                // subsequent poll of that instance re-seeds from `None`
-                // and silently disables restamping on real transitions.
-                // Locked by
-                // [`apply_status_update_propagates_live_status_baseline_from_poller`]
-                // in `src/tui/home/tests/status_rows_menu.rs`. See #2690.
-                if let Some(baseline) = new_live_status_baseline {
-                    inst.live_status_baseline = Some(baseline);
-                }
-                // The poller decided on a clone, so its detection bookkeeping
-                // only reaches the next poll through here. `None` is a
-                // producer that never detected; it must not reset the row.
-                // See #3642.
-                if let Some(detection) = new_detection {
-                    inst.detection = detection;
-                }
-                inst.pane_dead_observed = new_pane_dead;
-            });
-
-            if let Some(old) = old_status {
-                if old != new_status {
-                    // Auto-mark unread when a turn finishes (Running ->
-                    // Idle), unless the user is currently viewing this
-                    // session in live-send. This runs in both the with-
-                    // and without-hooks apply paths, so a *different*
-                    // session finishing while the user is attached
-                    // elsewhere still gets marked. The attached session
-                    // itself is cleared on attach-return, so a turn that
-                    // finishes during an attach nets to read.
-                    let is_live_target = self
-                        .live_send
-                        .as_ref()
-                        .is_some_and(|s| s.session_id == update.id);
-                    // Skip when already unread (the mark is a no-op) so a
-                    // re-finishing session doesn't churn the flock once
-                    // per turn.
-                    let (already_unread, structured) = self
-                        .get_instance(&update.id)
-                        .map(|i| (i.is_unread(), i.is_structured()))
-                        .unwrap_or((false, false));
-                    // Structured rows are the daemon's: `should_mark_acp_unread`
-                    // marks them off the live ACP turn-end event and persists it
-                    // there (#3181). Marking here too would be a second writer of
-                    // the same boolean for no gain, and `is_live_target` cannot
-                    // even earn its keep on one: `start_live_send` returns `None`
-                    // outright for `is_structured()` (`home/input.rs`, matched by
-                    // the guard in `app.rs`), so the exemption is always inert for
-                    // them. Note it is that explicit guard which makes it inert,
-                    // not the absence of a pane: a structured row can own paired
-                    // terminal and tool panes, so `LiveSendTarget` alone would not
-                    // rule live-send out. What clears the mark for a structured
-                    // row the user is actually reading is `tick_unread_dwell`,
-                    // which re-checks `is_unread()` every tick and so picks up a
-                    // daemon-written mark on the row under the cursor.
-                    let should_mark_unread = crate::session::unread_enabled()
-                        && !structured
-                        && old == Status::Running
-                        && new_status == Status::Idle
-                        && !is_live_target
-                        && !already_unread;
-
-                    // One flock for both the status/timestamp patch and the
-                    // unread mark, matching the daemon's per-tick batching
-                    // shape (server/status_poll.rs's status_poll_loop) instead of
-                    // two separate Storage::update calls on the same row.
-                    self.persist_passive_status_transition(&update.id, should_mark_unread);
-                    if should_mark_unread {
-                        self.mutate_instance(&update.id, |inst| inst.mark_unread());
-                    }
-
-                    if let Some(inst) = self.get_instance(&update.id).cloned() {
-                        self.handle_status_transition(
-                            &inst, old, new_status, play_sound, run_hooks,
-                        );
-                    }
-                }
-            }
-        } else if new_last_accessed.is_some() {
-            self.mutate_instance(&update.id, |inst| {
-                inst.last_accessed_at = new_last_accessed;
-                inst.pane_dead_observed = new_pane_dead;
-            });
-        } else {
-            // No status change AND no fresh activity stamp. We still
-            // need to refresh pane_dead_observed: a corpse can sit
-            // unchanged for hours and the sort tier should reflect
-            // current reality. Cheap mutate (one bool write).
-            self.mutate_instance(&update.id, |inst| {
-                inst.pane_dead_observed = new_pane_dead;
-            });
-        }
-    }
-
-    pub(super) fn handle_status_transition(
-        &self,
-        inst: &Instance,
-        old: crate::session::Status,
-        new: crate::session::Status,
-        play_sound: bool,
-        run_hooks: bool,
-    ) {
-        if play_sound {
-            crate::sound::play_for_transition(old, new, &self.sound_config);
-        }
-        if run_hooks {
-            let hook_config = self.status_hook_config_for(inst);
-            crate::status_hooks::run_for_transition(inst, old, new, &hook_config);
-        }
-    }
-
-    pub(super) fn status_hook_config_for(
-        &self,
-        inst: &Instance,
-    ) -> crate::status_hooks::StatusHookConfig {
-        if self.active_profile.is_some() {
-            return self.status_hook_config.clone();
-        }
-        let profile = inst.effective_profile();
-        self.status_hook_configs
-            .get(&profile)
-            .cloned()
-            .unwrap_or_else(|| self.status_hook_config.clone())
+    let Ok(app_dir) = crate::session::get_app_dir() else {
+        return;
+    };
+    let path = app_dir.join(".aoe_e2e_runtime_ready");
+    let result = if ready {
+        std::fs::write(&path, b"ready")
+    } else {
+        std::fs::remove_file(&path).or_else(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => Ok(()),
+            _ => Err(error),
+        })
+    };
+    if let Err(error) = result {
+        tracing::trace!(target: "tui.e2e_debug", %error, "runtime readiness export failed");
     }
 }

@@ -380,9 +380,7 @@ fn plan_conversion(
     let base = builder::resolve_base_branch(
         None,
         builder::project_base_branches(profile)
-            .get(&super::projects::canonical_key(
-                &main_repo.to_string_lossy(),
-            ))
+            .get(&super::projects::canonical_key(main_repo.to_string_lossy()))
             .map(String::as_str),
         config.worktree.default_base_branch.as_deref(),
     );
@@ -417,13 +415,8 @@ fn plan_conversion(
     })
 }
 
-/// Validate the request and create the worktree, without persisting anything.
-///
-/// Split from [`attach`] because the two callers persist differently: the CLI
-/// and the daemon write through [`Storage::update`], while the TUI mutates its
-/// in-memory instance map and saves. Both need the same validation and the same
-/// filesystem work, and both need [`PreparedAttach::rollback`] if their own
-/// persist fails.
+/// Validate an attachment without filesystem changes or persistence.
+/// Callers quiesce moving sessions before [`attach_planned`] revalidates the plan.
 pub fn plan(
     instance: &super::Instance,
     profile: &str,
@@ -503,7 +496,7 @@ pub fn plan(
         None,
         builder::project_base_branches(profile)
             .get(&super::projects::canonical_key(
-                &main_repo_path.to_string_lossy(),
+                main_repo_path.to_string_lossy(),
             ))
             .map(String::as_str),
         config.worktree.default_base_branch.as_deref(),
@@ -540,6 +533,7 @@ pub fn plan(
         added_branch: plan,
         added_worktree: worktree_path,
         init_submodules: config.worktree.init_submodules,
+        on_existing,
     })
 }
 
@@ -565,6 +559,7 @@ pub struct AttachPlan {
     added_branch: BranchPlan,
     added_worktree: PathBuf,
     init_submodules: bool,
+    on_existing: ExistingBranch,
 }
 
 impl AttachPlan {
@@ -834,23 +829,48 @@ pub fn attach(
         .with_context(|| format!("session not found: {session_id}"))?;
 
     let plan = plan(instance, profile, repo_path, on_existing)?;
-    attach_planned(storage, session_id, instance, plan)
+    attach_planned(storage, session_id, instance, plan, None)
 }
 
-/// Execute an already-validated plan and persist it.
-///
-/// Split out so a caller that has to quiesce the session can do so *between*
-/// [`plan`] and here: the moving shapes need the worker stopped and the sandbox
-/// container removed before anything is renamed, and validating first means a
-/// refusal never costs the user a stopped session. The daemon needs this split
-/// because its quiesce is async and cannot run inside a blocking closure.
+/// Revalidate and persist an attachment under identity then lifecycle exclusion.
+/// Caller must quiesce any runtime whose worktree or mount set changes and pass
+/// `quiesced.lifecycle_generation` here: that Stop was committed by this
+/// conversion, so `fresh` is allowed to carry it, and nothing else. A rejected
+/// commit rolls back the filesystem changes.
 pub fn attach_planned(
     storage: &Storage,
     session_id: &str,
     instance: &super::Instance,
     plan: AttachPlan,
+    owned_generation: Option<u64>,
 ) -> Result<AttachOutcome> {
-    let prepared = execute(instance, plan)?;
+    let _identity = super::storage::acquire_session_identity_lock()?;
+    let _lifecycle = storage.acquire_instance_lifecycle_lock(session_id)?;
+    let fresh = storage
+        .load()?
+        .into_iter()
+        .find(|row| row.id == session_id)
+        .with_context(|| format!("session not found: {session_id}"))?;
+    anyhow::ensure!(
+        fresh.lifecycle_reservation.is_none()
+            && fresh.project_path == instance.project_path
+            && fresh.lifecycle_generation
+                == owned_generation.unwrap_or(instance.lifecycle_generation),
+        "session changed while preparing project attachment"
+    );
+    let refreshed = self::plan(
+        &fresh,
+        storage.profile(),
+        &plan.added_main_repo,
+        plan.on_existing,
+    )?;
+    anyhow::ensure!(
+        refreshed.moves_session == plan.moves_session
+            && refreshed.added_worktree == plan.added_worktree
+            && refreshed.added_branch.branch == plan.added_branch.branch,
+        "attachment target changed while preparing project attachment"
+    );
+    let prepared = execute(&fresh, refreshed)?;
 
     let id = session_id.to_string();
     let workspace = prepared.workspace_info.clone();
@@ -914,6 +934,9 @@ pub struct Quiesced {
     /// rather than left alone because the pane's shell (and the agent in it) was
     /// launched in the directory the conversion moves.
     pub pane_was_live: bool,
+    /// Lifecycle generation committed by this conversion's own pane stop.
+    /// `None` when no pane was stopped; never inferred from a later reload.
+    pub lifecycle_generation: Option<u64>,
 }
 
 /// Stop everything holding the session's current working directory.
@@ -943,12 +966,13 @@ pub fn quiesce_for_conversion(storage: &Storage, instance: &super::Instance) -> 
     }
 
     if instance.tmux_session().is_ok_and(|s| s.exists()) {
-        instance.kill_clean().with_context(|| {
+        let generation = instance.kill_clean().with_context(|| {
             format!(
                 "could not stop '{}' before moving it into a workspace",
                 instance.title
             )
         })?;
+        quiesced.lifecycle_generation = Some(generation);
         quiesced.pane_was_live = true;
     }
 
@@ -1098,7 +1122,13 @@ fn attach_and_restart(request: AttachProjectRequest) -> Result<String, String> {
         Quiesced::default()
     };
 
-    let outcome = match attach_planned(&storage, &request.session_id, instance, plan) {
+    let outcome = match attach_planned(
+        &storage,
+        &request.session_id,
+        instance,
+        plan,
+        quiesced.lifecycle_generation,
+    ) {
         Ok(outcome) => outcome,
         Err(e) => {
             // The session was stopped for an attach that then failed. Put it
@@ -1211,7 +1241,22 @@ pub fn reset_sandbox_container(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{Instance, WorkspaceInfo, WorkspaceRepo, WorktreeInfo};
+    use crate::session::{Instance, Status, WorkspaceInfo, WorkspaceRepo, WorktreeInfo};
+    #[test]
+    #[serial_test::serial]
+    fn quiescence_ignores_unreadable_worker_ownership() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = isolated_profile(temp.path(), "attach-owner");
+        let storage = Storage::open_unwatched("attach-owner").unwrap();
+        let instance = Instance::new("Owner", temp.path().to_str().unwrap());
+        let record = crate::process::worker_registry::record_path(&instance.id).unwrap();
+        std::fs::write(&record, "{").unwrap();
+        // `load` is lenient: a corrupt record reads as missing, so there is
+        // no worker to stop and conversion proceeds.
+        let quiesced = quiesce_for_conversion(&storage, &instance).unwrap();
+        assert!(!quiesced.worker_was_running);
+        assert_eq!(std::fs::read_to_string(record).unwrap(), "{");
+    }
 
     fn workspace_instance() -> Instance {
         let mut inst = Instance::new("WS", "/tmp/ws");
@@ -1419,18 +1464,44 @@ mod tests {
         );
         assert_eq!(plan.workspace_dir(), workspace);
 
-        let prepared = execute(&inst, plan).expect("the worktree must be created");
+        let storage = Storage::open_unwatched("attach-append").unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(inst.clone());
+                Ok(())
+            })
+            .unwrap();
+        let identity = super::super::storage::acquire_session_identity_lock().unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            let outcome = attach_planned(&storage, &inst.id, &inst, plan, None);
+            done_tx.send(()).unwrap();
+            outcome
+        });
+        ready_rx.recv().unwrap();
+        let premature = done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .is_ok();
+        let created_during_cleanup = workspace.join("frontend").exists();
+        drop(identity);
+        let outcome = worker
+            .join()
+            .unwrap()
+            .expect("the worktree must be created");
         assert!(
-            prepared.outcome.moved_to.is_none(),
-            "nothing moved, so there is no new project_path to report"
+            !premature && !created_during_cleanup,
+            "attach must not create references during cleanup exclusion"
         );
+        assert!(outcome.moved_to.is_none());
         assert!(workspace.join("frontend/.git").exists());
         assert!(
             backend_wt.join(".git").exists(),
             "the repo the session already had must be untouched"
         );
         assert_eq!(
-            prepared
+            outcome
                 .workspace_info
                 .repos
                 .iter()
@@ -1438,6 +1509,88 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["backend", "frontend"]
         );
+        let third = temp.path().join("src/third");
+        init_repo(&third);
+        let storage = Storage::open_unwatched("attach-append").unwrap();
+        let current = storage.load().unwrap().pop().unwrap();
+        let pending =
+            super::plan(&current, "attach-append", &third, ExistingBranch::Refuse).unwrap();
+        storage
+            .update(|rows, _| {
+                rows[0].trashed_at = Some(Utc::now());
+                Ok(())
+            })
+            .unwrap();
+        let rejected = attach_planned(&storage, &current.id, &current, pending, None);
+        assert!(
+            rejected.is_err(),
+            "a plan cannot attach after the durable row is trashed"
+        );
+        assert!(!workspace.join("third").exists());
+    }
+
+    /// Only the conversion's committed stop may supersede its original baseline.
+    #[test]
+    #[serial_test::serial]
+    fn attaching_adopts_only_the_quiesce_it_committed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _guard = isolated_profile(temp.path(), "attach-generation");
+        let backend = temp.path().join("src/backend");
+        let frontend = temp.path().join("src/frontend");
+        init_repo(&backend);
+        init_repo(&frontend);
+
+        let inst = Instance::new("Moving", backend.to_str().unwrap());
+        let plan = plan(
+            &inst,
+            "attach-generation",
+            &frontend,
+            ExistingBranch::Refuse,
+        )
+        .expect("the plan must be accepted");
+        assert!(plan.moves_session, "this shape stops the session");
+
+        let storage = Storage::open_unwatched("attach-generation").unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(inst.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        // Model a stop after a foreign lifecycle transition.
+        let generation = storage
+            .update(|rows, _| {
+                let row = rows
+                    .iter_mut()
+                    .find(|row| row.id == inst.id)
+                    .expect("the session row exists");
+                row.lifecycle_generation += 2;
+                row.status = Status::Stopped;
+                row.lifecycle_reservation = None;
+                Ok(row.lifecycle_generation)
+            })
+            .unwrap();
+        let foreign_plan = self::plan(
+            &inst,
+            "attach-generation",
+            &frontend,
+            ExistingBranch::Refuse,
+        )
+        .unwrap();
+        let rejected = attach_planned(
+            &storage,
+            &inst.id,
+            &inst,
+            foreign_plan,
+            Some(generation - 1),
+        );
+        assert!(rejected.is_err(), "a foreign generation must be refused");
+        assert!(!plan.workspace_dir().exists());
+
+        let outcome = attach_planned(&storage, &inst.id, &inst, plan, Some(generation))
+            .expect("the conversion's own stop must not reject its attach");
+        assert!(Path::new(&outcome.repo.worktree_path).exists());
     }
 
     /// The in-place shape moves the session's working directory into a new

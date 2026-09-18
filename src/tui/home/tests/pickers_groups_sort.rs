@@ -274,7 +274,9 @@ fn group_header_count_tracks_trash_and_restore() {
     );
 
     env.view.select_session_by_id(&target);
-    env.view.toggle_archive_at_cursor().unwrap();
+    with_canonical_archive(&mut env, |env| {
+        env.view.toggle_archive_at_cursor().unwrap();
+    });
     assert_eq!(work_count(&env), 3, "restored session returns to the count");
 }
 
@@ -1865,7 +1867,7 @@ fn test_non_strict_w_cycles_through_all_idle_sessions_in_attention_sort() {
         .iter()
         .filter_map(|item| match item {
             Item::Session { id, .. } => Some(id.clone()),
-            Item::Group { .. } => None,
+            _ => None,
         })
         .collect();
     assert_eq!(session_ids.len(), 4);
@@ -2283,13 +2285,12 @@ fn test_o_key_flat_items_sorted_az() {
             Item::Group { name, .. } => {
                 in_work_group = name == "work";
             }
-            Item::Session { id, .. } => {
-                if in_work_group {
-                    if let Some(inst) = env.view.get_instance(id) {
-                        session_titles.push(inst.title.as_str());
-                    }
+            Item::Session { id, .. } if in_work_group => {
+                if let Some(inst) = env.view.get_instance(id) {
+                    session_titles.push(inst.title.as_str());
                 }
             }
+            _ => {}
         }
     }
 
@@ -2318,13 +2319,12 @@ fn test_o_key_flat_items_sorted_za() {
             Item::Group { name, .. } => {
                 in_work_group = name == "work";
             }
-            Item::Session { id, .. } => {
-                if in_work_group {
-                    if let Some(inst) = env.view.get_instance(id) {
-                        session_titles.push(inst.title.as_str());
-                    }
+            Item::Session { id, .. } if in_work_group => {
+                if let Some(inst) = env.view.get_instance(id) {
+                    session_titles.push(inst.title.as_str());
                 }
             }
+            _ => {}
         }
     }
 
@@ -2355,13 +2355,12 @@ fn test_o_key_flat_items_newest_preserves_insertion_order() {
             Item::Group { name, .. } => {
                 in_work_group = name == "work";
             }
-            Item::Session { id, .. } => {
-                if in_work_group {
-                    if let Some(inst) = env.view.get_instance(id) {
-                        session_titles.push(inst.title.as_str());
-                    }
+            Item::Session { id, .. } if in_work_group => {
+                if let Some(inst) = env.view.get_instance(id) {
+                    session_titles.push(inst.title.as_str());
                 }
             }
+            _ => {}
         }
     }
 

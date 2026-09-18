@@ -9,7 +9,6 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
-use tracing::warn;
 
 use super::{get_app_dir, get_profile_dir_path};
 
@@ -91,6 +90,18 @@ pub struct Project {
     pub scope: ProjectScope,
 }
 
+#[derive(Debug, Default, PartialEq, Serialize)]
+pub struct ProjectPatch {
+    /// Absent preserves the value; present None clears it.
+    #[serde(
+        rename = "default_base_branch",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub base_branch: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pinned: Option<bool>,
+}
+
 fn default_scope() -> ProjectScope {
     ProjectScope::Global
 }
@@ -113,7 +124,7 @@ impl Project {
     /// Set the project's default base branch, treating an empty/whitespace
     /// string as "unset".
     pub fn with_base_branch(mut self, base: Option<String>) -> Self {
-        self.default_base_branch = base.map(|b| b.trim().to_string()).filter(|b| !b.is_empty());
+        self.default_base_branch = normalize_base_branch(base);
         self
     }
 
@@ -139,6 +150,15 @@ impl Project {
     }
 }
 
+fn normalize_base_branch(base: Option<String>) -> Option<String> {
+    base.and_then(|mut base| {
+        base.truncate(base.trim_end().len());
+        let start = base.len() - base.trim_start().len();
+        base.drain(..start);
+        (!base.is_empty()).then_some(base)
+    })
+}
+
 fn global_path() -> Result<PathBuf> {
     Ok(get_app_dir()?.join("projects.json"))
 }
@@ -147,11 +167,29 @@ fn profile_path(profile: &str) -> Result<PathBuf> {
     Ok(get_profile_dir_path(profile)?.join("projects.json"))
 }
 
-fn registry_path(profile: &str, scope: ProjectScope) -> Result<PathBuf> {
-    match scope {
-        ProjectScope::Global => global_path(),
-        ProjectScope::Profile => profile_path(profile),
+/// The complete committed registry and its retained replacement slot.
+#[derive(Debug)]
+pub struct ProjectCommit<R> {
+    pub result: R,
+    pub projects: Vec<Project>,
+    pub(crate) target: super::anchored_fs::ResolvedDataFile,
+}
+
+impl<R> ProjectCommit<R> {
+    pub(crate) fn map_result<S>(self, map: impl FnOnce(R) -> S) -> ProjectCommit<S> {
+        ProjectCommit {
+            result: map(self.result),
+            projects: self.projects,
+            target: self.target,
+        }
     }
+}
+
+pub(crate) fn open_registry(profile: Option<&str>) -> Result<super::anchored_fs::ResolvedDataFile> {
+    super::anchored_fs::ResolvedDataFile::open(&match profile {
+        Some(profile) => profile_path(profile)?,
+        None => global_path()?,
+    })
 }
 
 /// Parse a registry file's content, stamping the (non-persisted) scope on
@@ -165,20 +203,15 @@ fn parse_projects(content: &str, scope: ProjectScope) -> Result<Vec<Project>> {
 }
 
 fn read_file(path: &Path, scope: ProjectScope) -> Result<Vec<Project>> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let content = fs::read_to_string(path)?;
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
     if content.trim().is_empty() {
         return Ok(Vec::new());
     }
     parse_projects(&content, scope)
-}
-
-fn write_file(path: &Path, projects: &[Project]) -> Result<()> {
-    let content = serde_json::to_string_pretty(projects)?;
-    super::atomic_write(path, content.as_bytes())?;
-    Ok(())
 }
 
 /// Load global registry only.
@@ -194,38 +227,54 @@ pub fn load_profile(profile: &str) -> Result<Vec<Project>> {
 /// Load union of global + profile, deduped by canonical path. Profile entries
 /// shadow global ones with the same path.
 pub fn load_merged(profile: &str) -> Result<Vec<Project>> {
-    let global = load_global().unwrap_or_else(|e| {
-        warn!("Failed to load global projects: {}", e);
-        Vec::new()
-    });
-    let profile = load_profile(profile).unwrap_or_else(|e| {
-        warn!("Failed to load profile projects: {}", e);
-        Vec::new()
-    });
-
-    let mut merged: Vec<Project> = Vec::new();
-    let mut seen_paths: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-
-    for p in global.into_iter().chain(profile) {
-        let canonical = canonical_key(&p.path);
-        if let Some(&idx) = seen_paths.get(&canonical) {
-            // Profile shadows global on path collision.
-            if p.scope == ProjectScope::Profile {
-                merged[idx] = p;
-            }
-        } else {
-            seen_paths.insert(canonical, merged.len());
-            merged.push(p);
-        }
-    }
-    Ok(merged)
+    Ok(merge_project_scopes(
+        load_global()?,
+        load_profile(profile)?,
+        |project| canonical_key(&project.path),
+    ))
 }
 
-pub(crate) fn canonical_key(path: &str) -> String {
-    PathBuf::from(path)
+/// Profile rows replace matching global rows without changing their positions.
+pub(crate) fn merge_project_scopes<T, K: Eq + std::hash::Hash>(
+    global: impl IntoIterator<Item = T>,
+    profile: impl IntoIterator<Item = T>,
+    key: impl Fn(&T) -> K,
+) -> Vec<T> {
+    use std::collections::hash_map::Entry;
+    let global = global.into_iter();
+    let profile = profile.into_iter();
+    let capacity = global.size_hint().0.saturating_add(profile.size_hint().0);
+    let mut merged = Vec::with_capacity(capacity);
+    let mut positions = std::collections::HashMap::with_capacity(capacity);
+    for (project, shadow) in global
+        .map(|project| (project, false))
+        .chain(profile.map(|project| (project, true)))
+    {
+        match positions.entry(key(&project)) {
+            Entry::Occupied(entry) => {
+                if shadow {
+                    merged[*entry.get()] = project;
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(merged.len());
+                merged.push(project);
+            }
+        }
+    }
+    merged
+}
+
+pub(crate) fn canonical_key<'a>(path: impl Into<std::borrow::Cow<'a, str>>) -> String {
+    let path = path.into();
+    Path::new(path.as_ref())
         .canonicalize()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| path.to_string())
+        .map(|path| {
+            path.into_os_string()
+                .into_string()
+                .unwrap_or_else(|path| path.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|_| path.into_owned())
 }
 
 /// Display label for a repo path: its final path segment, with readable
@@ -296,27 +345,82 @@ pub fn unpopulated_projects(
     out
 }
 
-/// Replace the contents of one scope's registry file.
-pub fn save_scope(profile: &str, scope: ProjectScope, projects: &[Project]) -> Result<()> {
-    write_file(&registry_path(profile, scope)?, projects)
-}
-
-/// Read-modify-write one scope's registry under the file's sidecar lock, so
-/// two concurrent mutators (e.g. parallel `aoe project add`) cannot each do
-/// load -> check -> save and silently drop the other's registration.
+// Freeze aliases before acquiring flocks; lock global before profile.
 fn locked_update_scope<R>(
     profile: &str,
     scope: ProjectScope,
-    mutate: impl FnOnce(&mut Vec<Project>) -> std::result::Result<R, RegistryError>,
-) -> std::result::Result<R, RegistryError> {
-    let path = registry_path(profile, scope)?;
-    super::storage::locked_update(
-        &path,
-        |content| parse_projects(content, scope),
-        |projects| Ok(serde_json::to_string_pretty(projects)?),
-        mutate,
-    )
-    .map_err(RegistryError::Other)?
+    check_other_scope: bool,
+    mutate: impl FnOnce(&mut Vec<Project>, &[Project]) -> std::result::Result<R, RegistryError>,
+) -> std::result::Result<ProjectCommit<R>, RegistryError> {
+    use super::storage::LockedDataFile;
+
+    let global = open_registry(None)?;
+    let profile_file = if scope == ProjectScope::Profile || check_other_scope {
+        match open_registry(Some(profile)) {
+            Ok(file) => Some(file),
+            Err(error)
+                if scope == ProjectScope::Global
+                    && error.downcast_ref::<nix::errno::Errno>()
+                        == Some(&nix::errno::Errno::ENOENT) =>
+            {
+                None
+            }
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        None
+    };
+    let shared = profile_file
+        .as_ref()
+        .map(|file| global.same_target(file))
+        .transpose()?
+        .unwrap_or(false);
+    let global = LockedDataFile::lock(global)?;
+    let (profile_file, _shared_profile) = if shared {
+        (None, profile_file)
+    } else {
+        (profile_file.map(LockedDataFile::lock).transpose()?, None)
+    };
+    let target = if scope == ProjectScope::Profile {
+        profile_file.as_ref().unwrap_or(&global)
+    } else {
+        &global
+    };
+    let other = if check_other_scope {
+        let (file, other_scope) = match scope {
+            ProjectScope::Profile => (Some(&global), ProjectScope::Global),
+            ProjectScope::Global => (
+                if shared {
+                    Some(&global)
+                } else {
+                    profile_file.as_ref()
+                },
+                ProjectScope::Profile,
+            ),
+        };
+        match file.map(LockedDataFile::read).transpose()?.flatten() {
+            Some(content) if !content.trim().is_empty() => parse_projects(&content, other_scope)?,
+            _ => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    let (result, projects) = target
+        .update(
+            |content| parse_projects(content, scope),
+            |projects| Ok(serde_json::to_string_pretty(projects)?),
+            |projects| mutate(projects, &other),
+        )
+        .map_err(RegistryError::Other)??;
+    let target = match (scope, profile_file) {
+        (ProjectScope::Profile, Some(profile)) => profile.into_target(),
+        _ => global.into_target(),
+    };
+    Ok(ProjectCommit {
+        result,
+        projects,
+        target,
+    })
 }
 
 /// Append a project to the given scope.
@@ -332,13 +436,13 @@ pub fn add(
     scope: ProjectScope,
     mut project: Project,
     allow_override: bool,
-) -> std::result::Result<Project, RegistryError> {
+) -> std::result::Result<ProjectCommit<usize>, RegistryError> {
     project.scope = scope;
     let path_buf = PathBuf::from(&project.path);
-    let canonical = path_buf.canonicalize().unwrap_or_else(|_| path_buf.clone());
+    let canonical = path_buf.canonicalize().unwrap_or(path_buf);
     project.path = canonical.to_string_lossy().to_string();
 
-    locked_update_scope(profile, scope, |existing| {
+    locked_update_scope(profile, scope, !allow_override, |existing, other| {
         for p in existing.iter() {
             if p.name.eq_ignore_ascii_case(&project.name) {
                 return Err(RegistryError::Conflict(format!(
@@ -348,7 +452,7 @@ pub fn add(
                     p.name,
                 )));
             }
-            if canonical_key(&p.path) == canonical_key(&project.path) {
+            if canonical_key(&p.path) == project.path {
                 return Err(RegistryError::Conflict(format!(
                     "Path '{}' already registered as '{}' in {} scope",
                     project.path,
@@ -363,12 +467,8 @@ pub fn add(
                 ProjectScope::Global => ProjectScope::Profile,
                 ProjectScope::Profile => ProjectScope::Global,
             };
-            let other = match other_scope {
-                ProjectScope::Global => load_global().unwrap_or_default(),
-                ProjectScope::Profile => load_profile(profile).unwrap_or_default(),
-            };
-            for p in &other {
-                if canonical_key(&p.path) == canonical_key(&project.path) {
+            for p in other {
+                if canonical_key(&p.path) == project.path {
                     return Err(RegistryError::Conflict(format!(
                         "Path '{}' is already registered as '{}' in {} scope.\n\
                          Tip: remove it first with `aoe project remove {} --scope {}`,\n\
@@ -383,20 +483,20 @@ pub fn add(
             }
         }
 
-        existing.push(project.clone());
-        Ok(project)
+        let index = existing.len();
+        existing.push(project);
+        Ok(index)
     })
 }
 
-/// Remove the entry matching `name_or_path` from the given scope. Returns the
-/// removed project, or errors if no match was found.
+/// Return the removed project and the complete committed registry.
 pub fn remove(
     profile: &str,
     scope: ProjectScope,
     name_or_path: &str,
-) -> std::result::Result<Project, RegistryError> {
+) -> std::result::Result<ProjectCommit<Project>, RegistryError> {
     let canonical_target = canonical_key(name_or_path);
-    locked_update_scope(profile, scope, |existing| {
+    locked_update_scope(profile, scope, false, |existing, _| {
         let idx = existing
             .iter()
             .position(|p| {
@@ -414,79 +514,37 @@ pub fn remove(
     })
 }
 
-/// Set or clear the default base branch on the entry matching `name_or_path`
-/// in the given scope. `base` is normalized via `Project::with_base_branch`
-/// (trimmed; empty becomes unset). Returns the updated project, or `NotFound`
-/// if no entry matches.
-///
-/// This is a read-modify-write over the scope's registry file. There is no
-/// optimistic-concurrency guard; for a single-user local tool last-writer-wins
-/// across racing `aoe` processes is acceptable.
-pub fn update_base_branch(
+/// Update supplied fields in one commit; unpinning keeps the saved project.
+/// Returns the row index and the complete committed registry.
+pub fn update(
     profile: &str,
     scope: ProjectScope,
     name_or_path: &str,
-    base: Option<String>,
-) -> std::result::Result<Project, RegistryError> {
-    let mut existing = match scope {
-        ProjectScope::Global => load_global().map_err(RegistryError::Other)?,
-        ProjectScope::Profile => load_profile(profile).map_err(RegistryError::Other)?,
-    };
-
+    patch: ProjectPatch,
+) -> std::result::Result<ProjectCommit<usize>, RegistryError> {
     let canonical_target = canonical_key(name_or_path);
-    let idx = existing
-        .iter()
-        .position(|p| {
-            p.name.eq_ignore_ascii_case(name_or_path) || canonical_key(&p.path) == canonical_target
-        })
-        .ok_or_else(|| {
-            RegistryError::NotFound(format!(
-                "No project '{}' in {} scope",
-                name_or_path,
-                scope.as_str()
-            ))
-        })?;
-
-    existing[idx] = existing[idx].clone().with_base_branch(base);
-    let updated = existing[idx].clone();
-    save_scope(profile, scope, &existing).map_err(RegistryError::Other)?;
-    Ok(updated)
-}
-
-/// Set the pin flag on the entry matching `name_or_path` in the given scope.
-/// Unpinning (`pinned = false`) keeps the registry entry, so the project stays
-/// in the Projects view and the new-session wizard; only [`remove`] deletes it.
-/// Returns the updated project, or `NotFound` if no entry matches. Same
-/// read-modify-write, last-writer-wins semantics as [`update_base_branch`].
-pub fn set_pinned(
-    profile: &str,
-    scope: ProjectScope,
-    name_or_path: &str,
-    pinned: bool,
-) -> std::result::Result<Project, RegistryError> {
-    let mut existing = match scope {
-        ProjectScope::Global => load_global().map_err(RegistryError::Other)?,
-        ProjectScope::Profile => load_profile(profile).map_err(RegistryError::Other)?,
-    };
-
-    let canonical_target = canonical_key(name_or_path);
-    let idx = existing
-        .iter()
-        .position(|p| {
-            p.name.eq_ignore_ascii_case(name_or_path) || canonical_key(&p.path) == canonical_target
-        })
-        .ok_or_else(|| {
-            RegistryError::NotFound(format!(
-                "No project '{}' in {} scope",
-                name_or_path,
-                scope.as_str()
-            ))
-        })?;
-
-    existing[idx].pinned = pinned;
-    let updated = existing[idx].clone();
-    save_scope(profile, scope, &existing).map_err(RegistryError::Other)?;
-    Ok(updated)
+    locked_update_scope(profile, scope, false, |existing, _| {
+        let idx = existing
+            .iter()
+            .position(|project| {
+                project.name.eq_ignore_ascii_case(name_or_path)
+                    || canonical_key(&project.path) == canonical_target
+            })
+            .ok_or_else(|| {
+                RegistryError::NotFound(format!(
+                    "No project '{}' in {} scope",
+                    name_or_path,
+                    scope.as_str()
+                ))
+            })?;
+        if let Some(base) = patch.base_branch {
+            existing[idx].default_base_branch = normalize_base_branch(base);
+        }
+        if let Some(pinned) = patch.pinned {
+            existing[idx].pinned = pinned;
+        }
+        Ok(idx)
+    })
 }
 
 /// Resolve a list of project names against the merged registry. Errors on the
@@ -524,6 +582,133 @@ mod tests {
     use crate::session::test_support::isolate_app_dir_at;
     use serial_test::serial;
     use tempfile::tempdir;
+
+    #[test]
+    #[serial]
+    fn metadata_update_waits_for_registry_writer_and_preserves_its_entries() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        add(
+            "default",
+            ProjectScope::Global,
+            Project::new("target", "/tmp/project-target", ProjectScope::Global),
+            false,
+        )
+        .unwrap();
+        std::thread::scope(|scope| {
+            let (finished, completion) = std::sync::mpsc::channel();
+            let mut writer = None;
+            let held =
+                locked_update_scope("default", ProjectScope::Global, false, |projects, _| {
+                    writer = Some(scope.spawn(move || {
+                        let result = update(
+                            "default",
+                            ProjectScope::Global,
+                            "target",
+                            ProjectPatch {
+                                base_branch: Some(Some(" release ".into())),
+                                pinned: Some(true),
+                            },
+                        );
+                        let _ = finished.send(());
+                        result
+                    }));
+                    let escaped = completion
+                        .recv_timeout(std::time::Duration::from_millis(250))
+                        .is_ok();
+                    projects.push(Project::new(
+                        "peer",
+                        "/tmp/project-peer",
+                        ProjectScope::Global,
+                    ));
+                    Ok(escaped)
+                });
+            writer.unwrap().join().unwrap().unwrap();
+            let ProjectCommit {
+                result: escaped,
+                projects: committed,
+                ..
+            } = held.unwrap();
+            assert!(!escaped, "metadata writer bypassed the registry flock");
+            assert!(!committed[0].pinned);
+            assert!(committed[0].default_base_branch.is_none());
+        });
+        let projects = load_global().unwrap();
+        let target = projects
+            .iter()
+            .find(|project| project.name == "target")
+            .unwrap();
+        assert!(target.pinned);
+        assert_eq!(target.default_base_branch.as_deref(), Some("release"));
+        assert!(projects.iter().any(|project| project.name == "peer"));
+    }
+
+    #[test]
+    #[serial]
+    fn registry_add_waits_for_opposite_scope_before_checking_conflicts() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        fs::create_dir_all(profile_path("default").unwrap().parent().unwrap()).unwrap();
+        std::thread::scope(|scope| {
+            let (finished, completion) = std::sync::mpsc::channel();
+            let mut writer = None;
+            let held = super::super::storage::LockedDataFile::open(&global_path().unwrap())
+                .unwrap()
+                .update(
+                    |content| parse_projects(content, ProjectScope::Global),
+                    |projects| Ok(serde_json::to_string_pretty(projects)?),
+                    |projects| {
+                        writer = Some(scope.spawn(move || {
+                            let result = add(
+                                "default",
+                                ProjectScope::Profile,
+                                Project::new(
+                                    "profile",
+                                    "/tmp/shared-project",
+                                    ProjectScope::Profile,
+                                ),
+                                false,
+                            );
+                            let _ = finished.send(());
+                            result
+                        }));
+                        let _ = completion.recv_timeout(std::time::Duration::from_millis(250));
+                        projects.push(Project::new(
+                            "global",
+                            "/tmp/shared-project",
+                            ProjectScope::Global,
+                        ));
+                        Ok::<_, RegistryError>(())
+                    },
+                );
+            let result = writer.unwrap().join().unwrap();
+            held.unwrap().unwrap();
+            assert!(
+                matches!(result, Err(RegistryError::Conflict(_))),
+                "opposite-scope registration ignored the in-flight writer: {result:?}"
+            );
+        });
+        assert!(load_profile("default").unwrap().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn merged_registry_refuses_a_corrupt_scope() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let paths = [global_path().unwrap(), profile_path("default").unwrap()];
+        for path in &paths {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "[]").unwrap();
+        }
+        for path in paths {
+            fs::write(&path, "invalid registry").unwrap();
+            assert!(
+                load_merged("default").is_err(),
+                "corrupt registry {} was advertised as complete",
+                path.display()
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), "invalid registry");
+            fs::write(path, "[]").unwrap();
+        }
+    }
 
     #[test]
     fn repo_label_uses_basename_with_root_fallbacks() {
@@ -590,11 +775,8 @@ mod tests {
     }
 
     #[test]
-    fn new_project_defaults_unpinned_legacy_json_defaults_pinned() {
-        // New entries are saved-but-not-pinned.
-        assert!(!Project::new("r", "/tmp/r", ProjectScope::Global).pinned);
-        // JSON written before #2208 has no `pinned` key: it must deserialize to
-        // pinned so an upgrade keeps existing empty headers visible.
+    fn legacy_registry_entries_remain_pinned() {
+        // Preserve headers for registries written before the pin field existed.
         let legacy = r#"[{"name":"r","path":"/tmp/r"}]"#;
         let parsed: Vec<Project> = serde_json::from_str(legacy).unwrap();
         assert!(parsed[0].pinned);
@@ -672,31 +854,56 @@ mod tests {
         )?;
 
         // Set, looking the project up by name.
-        let updated = update_base_branch(
+        let ProjectCommit {
+            result: index,
+            projects: updated,
+            ..
+        } = update(
             "default",
             ProjectScope::Global,
             "repoUpd",
-            Some("develop".into()),
+            ProjectPatch {
+                base_branch: Some(Some("develop".into())),
+                ..Default::default()
+            },
         )?;
-        assert_eq!(updated.default_base_branch.as_deref(), Some("develop"));
+        assert_eq!(
+            updated[index].default_base_branch.as_deref(),
+            Some("develop")
+        );
         assert_eq!(
             load_global()?[0].default_base_branch.as_deref(),
             Some("develop")
         );
 
         // Whitespace clears it back to unset, looking up by canonical path.
-        let cleared = update_base_branch(
+        let ProjectCommit {
+            result: index,
+            projects: cleared,
+            ..
+        } = update(
             "default",
             ProjectScope::Global,
             &repo.to_string_lossy(),
-            Some("   ".into()),
+            ProjectPatch {
+                base_branch: Some(Some("   ".into())),
+                ..Default::default()
+            },
         )?;
-        assert_eq!(cleared.default_base_branch, None);
+        assert_eq!(cleared[index].default_base_branch, None);
         assert_eq!(load_global()?[0].default_base_branch, None);
 
         // Unknown project is a NotFound.
         assert!(matches!(
-            update_base_branch("default", ProjectScope::Global, "nope", Some("x".into())),
+            update(
+                "default",
+                ProjectScope::Global,
+                "nope",
+                ProjectPatch {
+                    base_branch: Some(Some("x".into())),
+                    ..Default::default()
+                }
+            ),
             Err(RegistryError::NotFound(_))
         ));
         Ok(())
@@ -719,25 +926,52 @@ mod tests {
         )?;
         assert!(load_global()?[0].pinned);
 
-        let unpinned = set_pinned("default", ProjectScope::Global, "repoPin", false)?;
-        assert!(!unpinned.pinned);
+        let ProjectCommit {
+            result: index,
+            projects: unpinned,
+            ..
+        } = update(
+            "default",
+            ProjectScope::Global,
+            "repoPin",
+            ProjectPatch {
+                pinned: Some(false),
+                ..Default::default()
+            },
+        )?;
+        assert!(!unpinned[index].pinned);
         // Unpin keeps the saved project rather than deleting it.
         let loaded = load_global()?;
         assert_eq!(loaded.len(), 1);
         assert!(!loaded[0].pinned);
 
         // Re-pin by canonical path.
-        let repinned = set_pinned(
+        let ProjectCommit {
+            result: index,
+            projects: repinned,
+            ..
+        } = update(
             "default",
             ProjectScope::Global,
             &repo.to_string_lossy(),
-            true,
+            ProjectPatch {
+                pinned: Some(true),
+                ..Default::default()
+            },
         )?;
-        assert!(repinned.pinned);
+        assert!(repinned[index].pinned);
         assert!(load_global()?[0].pinned);
 
         assert!(matches!(
-            set_pinned("default", ProjectScope::Global, "nope", true),
+            update(
+                "default",
+                ProjectScope::Global,
+                "nope",
+                ProjectPatch {
+                    pinned: Some(true),
+                    ..Default::default()
+                }
+            ),
             Err(RegistryError::NotFound(_))
         ));
         Ok(())
@@ -770,6 +1004,7 @@ mod tests {
     fn profile_shadows_global_on_path_collision() -> Result<()> {
         let temp = tempdir()?;
         let _app_dir = isolate_app_dir_at(temp.path());
+        fs::create_dir_all(profile_path("default")?.parent().unwrap())?;
         let repo = temp.path().join("repoX");
         let _ = git2::Repository::init(&repo);
 
@@ -855,7 +1090,7 @@ mod tests {
         assert_eq!(resolved[0].name, "MixedCase");
 
         // Remove via lowercase succeeds.
-        let removed = remove("default", ProjectScope::Global, "mixedcase")?;
+        let removed = remove("default", ProjectScope::Global, "mixedcase")?.result;
         assert_eq!(removed.name, "MixedCase");
         Ok(())
     }
@@ -865,6 +1100,7 @@ mod tests {
     fn cross_scope_path_collision_blocked_by_default() -> Result<()> {
         let temp = tempdir()?;
         let _app_dir = isolate_app_dir_at(temp.path());
+        fs::create_dir_all(profile_path("default")?.parent().unwrap())?;
         let repo = temp.path().join("repoZ");
         let _ = git2::Repository::init(&repo);
 
@@ -880,15 +1116,7 @@ mod tests {
             Project::new("second", repo.to_string_lossy(), ProjectScope::Profile),
             false,
         );
-        assert!(
-            err.is_err(),
-            "cross-scope dup should error without override"
-        );
-        let msg = format!("{}", err.unwrap_err());
-        assert!(
-            msg.contains("--allow-override") && msg.contains("global"),
-            "error should mention --allow-override and the other scope, got: {msg}"
-        );
+        assert!(matches!(err, Err(RegistryError::Conflict(_))));
 
         // With override, succeeds.
         add(
@@ -924,7 +1152,7 @@ mod tests {
             Project::new("repoR", repo.to_string_lossy(), ProjectScope::Global),
             false,
         )?;
-        let removed = remove("default", ProjectScope::Global, "repoR")?;
+        let removed = remove("default", ProjectScope::Global, "repoR")?.result;
         assert_eq!(removed.name, "repoR");
         let loaded = load_global()?;
         assert!(loaded.is_empty());

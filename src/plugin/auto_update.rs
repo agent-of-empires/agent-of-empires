@@ -1,7 +1,7 @@
 //! Opt-in clean-only plugin auto-update sweep at startup.
 //!
 //! Gated on `updates.auto_update_plugins` (off by default). When on, the TUI and
-//! `aoe serve` spawn [`spawn_if_enabled`] at startup; it checks installed
+//! `aoe serve` run [`run_if_enabled`] at startup; it checks installed
 //! external plugins for updates and applies only the ones that need no new
 //! consent. Anything that changes capabilities, build steps, or UI slots is
 //! skipped and left for a manual `aoe plugin update`, so a background sweep never
@@ -63,7 +63,7 @@ pub struct SweepSummary {
 
 /// Check outdated external plugins and apply only the clean updates. Logs each
 /// outcome. Safe to call regardless of the setting; callers gate on it via
-/// [`spawn_if_enabled`].
+/// [`run_if_enabled`].
 ///
 /// When a `notifier` is present (the `aoe serve` daemon), an applied update
 /// restarts its worker there, and an update skipped because it needs fresh
@@ -155,22 +155,17 @@ fn already_dismissed(id: &str, fingerprint: &str) -> bool {
         == Some(fingerprint)
 }
 
-/// Spawn the sweep in the background when the setting opts in. Non-blocking so
-/// startup is never delayed by network or git; the registry is reloaded inside
-/// `install::update_clean` as each update lands. `notifier` is the running
-/// plugin host (`aoe serve`); `None` where there is none.
-pub fn spawn_if_enabled(config: &Config, notifier: Option<Arc<dyn UpdateNotifier>>) {
+/// Run a consent-preserving sweep when enabled. The caller owns its lifetime.
+pub async fn run_if_enabled(config: &Config, notifier: Option<Arc<dyn UpdateNotifier>>) {
     if !config.updates.auto_update_plugins {
         return;
     }
-    tokio::spawn(async move {
-        let summary = sweep(notifier.as_ref()).await;
-        tracing::info!(
-            target: "plugin.auto_update",
-            applied = summary.applied.len(),
-            skipped = summary.skipped.len(),
-            errors = summary.errors.len(),
-            "plugin auto-update sweep complete",
-        );
-    });
+    let summary = sweep(notifier.as_ref()).await;
+    tracing::info!(
+        target: "plugin.auto_update",
+        applied = summary.applied.len(),
+        skipped = summary.skipped.len(),
+        errors = summary.errors.len(),
+        "plugin auto-update sweep complete",
+    );
 }

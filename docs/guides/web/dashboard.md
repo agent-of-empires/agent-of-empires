@@ -94,7 +94,7 @@ Pinned projects are not in this section: a pinned project always renders above a
 
 - **Add** with the **+** on the section header: browse for a path or type one, optionally set a name and a default base branch, choose global or profile scope, then save. The project appears in the section, ready to start work in.
 - **Start a session** by clicking a project row (or its **+**), which opens the new-session flow in that repo. Once it has a session it moves up into the normal group list.
-- **Edit base branch** and **Remove** live in the row's right-click (long-press on touch) menu. Removing deletes every registration for that path. The add / edit / remove controls are hidden in read-only mode.
+- **Edit base branch** and **Remove** live in the row's right-click (long-press on touch) menu. Remove targets that row's registrations; see [project registry scope](../multi-repo-workspaces.md#web-dashboard). The add / edit / remove controls are hidden in read-only mode.
 
 ## Profiles
 

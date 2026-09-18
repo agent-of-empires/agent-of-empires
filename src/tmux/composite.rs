@@ -71,6 +71,7 @@ impl PaneGeom {
 /// A pane's rectangle plus its rows, each already padded to `geom.width`
 /// display columns by [`crate::tmux::vt::capture_rows_padded`].
 pub(crate) struct CapturedPane {
+    pub id: String,
     pub geom: PaneGeom,
     pub rows: Vec<String>,
 }
@@ -100,19 +101,25 @@ impl WindowLayout {
         self.panes.first().map(|p| p.geom)
     }
 
+    pub(crate) fn first_pane_id(&self) -> Option<&str> {
+        self.panes.first().map(|pane| pane.id.as_str())
+    }
+
     /// Composite with the first pane's rows swapped for `rows`, for the live
     /// path's fresh VT-grid frame over a cached layout.
-    pub(crate) fn composite_with_first_pane_rows(&self, rows: &[String]) -> String {
-        let Some(first) = self.panes.first() else {
+    pub(crate) fn composite_with_first_pane_rows(&self, pane_id: &str, rows: &[String]) -> String {
+        let Some(first) = self.panes.first().filter(|first| first.id == pane_id) else {
             return self.composite();
         };
         let mut panes: Vec<CapturedPane> = Vec::with_capacity(self.panes.len());
         panes.push(CapturedPane {
+            id: first.id.clone(),
             geom: first.geom,
             rows: rows.to_vec(),
         });
         for pane in &self.panes[1..] {
             panes.push(CapturedPane {
+                id: pane.id.clone(),
                 geom: pane.geom,
                 rows: pane.rows.clone(),
             });
@@ -271,6 +278,7 @@ mod tests {
 
     fn pane(left: u16, top: u16, width: u16, height: u16, rows: &[&str]) -> CapturedPane {
         CapturedPane {
+            id: format!("%{left}_{top}"),
             geom: PaneGeom {
                 left,
                 top,
@@ -381,11 +389,16 @@ mod tests {
         );
         let fresh = vec!["new1".to_string(), "new2".to_string()];
         assert_eq!(
-            l.composite_with_first_pane_rows(&fresh),
+            l.composite_with_first_pane_rows("%0_0", &fresh),
             "new1│keep\nnew2│same\n"
         );
         // The cached layout is not consumed: the next frame swaps again.
         assert_eq!(l.composite(), "old1│keep\nold2│same\n");
+        assert_eq!(
+            l.composite_with_first_pane_rows("%5_0", &fresh),
+            l.composite(),
+            "a secondary pane's grid must not replace the agent rectangle"
+        );
     }
 
     /// A composite must always count `window_height` lines, whatever the bottom
@@ -504,7 +517,10 @@ mod tests {
     #[test]
     fn swapping_rows_on_an_empty_layout_is_a_no_op() {
         let l = layout(3, 1, vec![]);
-        assert_eq!(l.composite_with_first_pane_rows(&["x".to_string()]), "\n");
+        assert_eq!(
+            l.composite_with_first_pane_rows("%0_0", &["x".to_string()]),
+            "\n"
+        );
     }
 
     #[test]

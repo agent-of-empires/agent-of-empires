@@ -90,15 +90,13 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         std::path::Path::new(&inst.project_path),
     );
 
-    // Trash-first: unless --purge is given (or delete_to_trash is disabled),
-    // stop the live session and mark it trashed, keeping every durable
-    // artifact so it can be restored. Mirrors the archive CLI's tmux
-    // teardown. See #2489.
+    // Trash retains durable artifacts unless the caller explicitly requests purge.
     if config.session.delete_to_trash && !args.purge {
+        let _identity = crate::session::acquire_session_identity_lock()?;
         let _lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&removed_id)
             .map_err(|error| anyhow::anyhow!("failed to acquire instance trash lock: {error}"))?;
-        let trash_generation = storage.update(|all_instances, _groups| {
+        let mut inst = storage.update(|all_instances, _groups| {
             let stored = all_instances
                 .iter_mut()
                 .find(|instance| instance.id == removed_id)
@@ -107,7 +105,7 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
                         "Session {removed_title} was removed by another process before it could be trashed"
                     )
                 })?;
-            let generation = stored
+            stored
                 .try_acquire_lifecycle_reservation(
                     LifecycleOperation::Trash,
                     Instance::LIFECYCLE_RESERVATION_TTL,
@@ -115,26 +113,26 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
                 )
                 .map_err(|error| anyhow::anyhow!("Session {removed_title}: {error}"))?;
             stored.trash();
-            Ok(generation)
+            Ok(stored.clone())
         })?;
-        if let Err(error) = inst.kill_locked() {
-            eprintln!("Warning: failed to kill agent tmux session: {error}");
+        inst.source_profile = storage.profile().to_owned();
+        let trash_generation = inst.lifecycle_generation;
+        if let Err(error) = inst.kill_all_tmux_sessions_locked() {
+            storage.update(|rows, _| {
+                if let Some(row) = rows.iter_mut().find(|row| row.id == removed_id) {
+                    if row.finish_lifecycle_status(
+                        LifecycleOperation::Trash,
+                        trash_generation,
+                        crate::session::Status::Error,
+                    ) {
+                        row.last_error = Some(error.to_string());
+                    }
+                }
+                Ok(())
+            })?;
+            return Err(anyhow::anyhow!("Session {removed_title} trashed, but resources retained because tmux teardown failed: {error}"));
         }
-        inst.kill_ancillary_tmux_sessions_locked();
 
-        // The session is durably trashed; stop its sandbox container (so it
-        // doesn't keep running for the whole retention window) and move its
-        // worktree out of the active dir into the holding area, then persist the
-        // repointed project_path. Stopping the container also releases the
-        // worktree bind mount, without which the git move hits EBUSY. A failure
-        // here never blocks the trash; the worktree just stays in place and a
-        // later reconcile pass can relocate it.
-        let mut inst = inst;
-        inst.trash();
-        // The teardown's still-trashed re-check reads storage via
-        // `source_profile`; stamp it so a `-p <profile>` remove re-checks the
-        // profile it actually trashed the row in, not the default.
-        inst.source_profile = storage.profile().to_string();
         match crate::session::trash::prepare_trashed_worktree(&mut inst) {
             crate::session::trash::RelocateOutcome::Relocated { .. } => {
                 // Atomic durable check-and-commit: a peer restore or purge can
@@ -237,6 +235,7 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
             detach_hooks: false,
             keep_scratch: args.keep_scratch,
         },
+        None,
     )?;
     let transaction = match reservation {
         crate::session::deletion::PurgeReservation::Reserved(transaction) => transaction,
@@ -249,7 +248,7 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
             anyhow::bail!("{detail}: {removed_title}");
         }
     };
-    let result = transaction.run_hooks().complete_with(|instance| {
+    let result = transaction.run_hooks()?.complete_with(|instance| {
         super::purge_acp_transcript(instance).map_err(|error| {
             format!(
                 "Session teardown succeeded but its transcript could not be purged, so the session \

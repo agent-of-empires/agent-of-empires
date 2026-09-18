@@ -3,8 +3,8 @@
 //! Restarting a session re-runs the start cascade. For sandboxed sessions that
 //! shells out to Docker (image pull with no built-in timeout, container
 //! create/start) and runs the `before_start` host hook, any of which can block
-//! for seconds. Running it on the TUI event loop froze the whole UI, so the TUI
-//! drives this off the UI thread via `RestartPoller`, mirroring `StopPoller`.
+//! for seconds. The daemon runs it off the caller's thread; the TUI submits
+//! it as a runtime mutation.
 
 use crate::session::{Instance, StartOutcome};
 

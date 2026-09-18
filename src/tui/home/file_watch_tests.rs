@@ -329,6 +329,7 @@ async fn reload_storage_only_preserves_live_send_state_while_adding_peer_row() {
         target: super::live_send::LiveSendTarget::Agent,
         exit_chords: super::live_send::parse_chord_list(super::live_send::DEFAULT_EXIT_CHORD),
         leader: None,
+        remote: None,
     });
     view.pending_paste = Some("queued paste".to_string());
     view.preview_capture_target = Some(tmux_name.clone());
@@ -443,6 +444,7 @@ async fn reload_storage_only_ends_live_send_when_active_row_is_removed() {
         target: super::live_send::LiveSendTarget::Agent,
         exit_chords: super::live_send::parse_chord_list(super::live_send::DEFAULT_EXIT_CHORD),
         leader: None,
+        remote: None,
     });
 
     writer
@@ -486,6 +488,7 @@ async fn reload_failure_dialog_waits_until_live_send_exits() {
         target: super::live_send::LiveSendTarget::Agent,
         exit_chords: super::live_send::parse_chord_list(super::live_send::DEFAULT_EXIT_CHORD),
         leader: None,
+        remote: None,
     });
     view.reload_failure_state
         .record_storage(&Err::<(), _>(anyhow::anyhow!("disk unreadable")));

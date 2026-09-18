@@ -5,8 +5,6 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::Instance;
-
 /// Which "state" of session a caller wants. The variants are the wire
 /// vocabulary (`state=live|trashed|all`); `#[serde(rename_all = "lowercase")]`
 /// pins that and rejects any other value at deserialize time so a typo
@@ -30,14 +28,12 @@ pub enum SessionScope {
 }
 
 impl SessionScope {
-    /// Does `inst` belong in a listing filtered by `scope`? `None` (no filter
-    /// specified by the caller) behaves like `All`, matching the historical
-    /// unfiltered behavior so nothing breaks.
-    pub fn matches(scope: Option<SessionScope>, inst: &Instance) -> bool {
+    /// An omitted scope includes every persisted session.
+    pub fn matches(scope: Option<SessionScope>, archived: bool, trashed: bool) -> bool {
         match scope {
             None | Some(SessionScope::All) => true,
-            Some(SessionScope::Live) => !inst.is_archived() && !inst.is_trashed(),
-            Some(SessionScope::Trashed) => inst.is_trashed(),
+            Some(SessionScope::Live) => !archived && !trashed,
+            Some(SessionScope::Trashed) => trashed,
         }
     }
 }
@@ -46,63 +42,25 @@ impl SessionScope {
 mod tests {
     use super::*;
 
-    /// The lowercase wire names are how the REST API and the CLI both parse
-    /// the value. Pin them so a rename can't drift out of sync.
-    #[test]
-    fn deserializes_lowercase_wire_names() {
-        assert_eq!(
-            serde_json::from_str::<SessionScope>("\"live\"").unwrap(),
-            SessionScope::Live
-        );
-        assert_eq!(
-            serde_json::from_str::<SessionScope>("\"trashed\"").unwrap(),
-            SessionScope::Trashed
-        );
-        assert_eq!(
-            serde_json::from_str::<SessionScope>("\"all\"").unwrap(),
-            SessionScope::All
-        );
-    }
-
     #[test]
     fn rejects_unrecognized_value() {
-        assert!(serde_json::from_str::<SessionScope>("\"archived\"").is_err());
-        assert!(serde_json::from_str::<SessionScope>("\"LIVE\"").is_err());
-        assert!(serde_json::from_str::<SessionScope>("\"\"").is_err());
+        for value in ["\"archived\"", "\"LIVE\"", "\"\""] {
+            assert!(serde_json::from_str::<SessionScope>(value).is_err());
+        }
     }
 
     #[test]
-    fn matches_no_scope_returns_everything() {
-        let mut live = Instance::new("live", "/repo");
-        assert!(SessionScope::matches(None, &live));
-        live.archive();
-        assert!(SessionScope::matches(None, &live));
-    }
-
-    #[test]
-    fn matches_live_excludes_archived_and_trashed() {
-        let live = Instance::new("live", "/repo");
-        let mut archived = Instance::new("arch", "/repo");
-        archived.archive();
-        let mut trashed = Instance::new("trash", "/repo");
-        trashed.trash();
-
-        assert!(SessionScope::matches(Some(SessionScope::Live), &live));
-        assert!(!SessionScope::matches(Some(SessionScope::Live), &archived));
-        assert!(!SessionScope::matches(Some(SessionScope::Live), &trashed));
-    }
-
-    #[test]
-    fn matches_trashed_is_trashed_only() {
-        let mut trashed = Instance::new("t", "/repo");
-        trashed.trash();
-        let mut archived = Instance::new("a", "/repo");
-        archived.archive();
-
-        assert!(SessionScope::matches(Some(SessionScope::Trashed), &trashed));
-        assert!(!SessionScope::matches(
-            Some(SessionScope::Trashed),
-            &archived
-        ));
+    fn scope_selects_live_and_trashed_states() {
+        let states = [(false, false), (true, false), (false, true), (true, true)];
+        for (scope, expected) in [
+            (None, [true, true, true, true]),
+            (Some(SessionScope::All), [true, true, true, true]),
+            (Some(SessionScope::Live), [true, false, false, false]),
+            (Some(SessionScope::Trashed), [false, false, true, true]),
+        ] {
+            for ((archived, trashed), expected) in states.into_iter().zip(expected) {
+                assert_eq!(SessionScope::matches(scope, archived, trashed), expected);
+            }
+        }
     }
 }

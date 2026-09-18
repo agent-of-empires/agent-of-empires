@@ -1,12 +1,5 @@
-//! Domain core for creating a session: build the instance, persist it, upsert
-//! it into the live state, and (for a structured session) spawn its ACP worker.
-//!
-//! Extracted from the `create_session` HTTP handler so a non-HTTP caller (for
-//! example a scheduler) can create a structured-view ACP session without
-//! duplicating the build/persist/spawn logic. The handler keeps all request
-//! decoding, validation, and response construction; it decodes a request into a
-//! [`StructuredSessionSpec`], calls [`spawn_structured_session`], and builds its
-//! HTTP response from the returned [`SpawnOutcome`].
+//! Native session creation shared by HTTP and plugin callers.
+//! Admitted work owns provisioning, canonical commits and launch completion.
 
 use std::sync::Arc;
 
@@ -14,11 +7,10 @@ use crate::session::Instance;
 
 use super::session_service::SessionService;
 
-/// Already-decoded, already-validated inputs the create core needs. The HTTP
-/// handler fills this in after it has finished request parsing, auth, and
-/// validation; a future non-HTTP caller builds it directly.
+/// Validated creation inputs shared by HTTP and plugin callers.
 pub(crate) struct StructuredSessionSpec {
     pub title: Option<String>,
+    pub size: Option<crate::daemon::TerminalSize>,
     pub path: String,
     pub group: String,
     pub tool: String,
@@ -37,6 +29,7 @@ pub(crate) struct StructuredSessionSpec {
     pub repo_base_branches: Vec<(String, String)>,
     pub scratch: bool,
     pub trust_hooks: Option<bool>,
+    pub trust_review: Option<crate::daemon::CreationTrustFingerprint>,
     pub custom_instruction: Option<String>,
     /// External work-queue dispatcher completion callback, persisted onto
     /// the created instance. See #3156.
@@ -68,9 +61,7 @@ pub(crate) struct StructuredSessionSpec {
     pub fork_seed: Option<crate::session::ForkSeed>,
 }
 
-/// What the create core returns to its caller once the session exists in state.
-/// The HTTP handler builds its `SessionResponse` from `instance` and threads
-/// `warnings` onto it exactly as the inline handler did.
+/// Created session and transient warnings; HTTP row authority is the runtime snapshot.
 pub(crate) struct SpawnOutcome {
     pub instance: Instance,
     pub warnings: Vec<String>,
@@ -99,23 +90,25 @@ pub(crate) async fn spawn_structured_session(
     service: &Arc<SessionService>,
     spec: StructuredSessionSpec,
 ) -> anyhow::Result<SpawnOutcome> {
-    let instances = service.instances.read().await;
-    let existing_titles: Vec<String> = instances.iter().map(|i| i.title.clone()).collect();
-    let existing_branches: Vec<String> = instances
-        .iter()
-        .filter_map(|i| i.worktree_info.as_ref().map(|w| w.branch.clone()))
-        .collect();
-    drop(instances);
-
-    let file_watch_for_create = service.file_watch.clone();
+    let state = service.native_state()?;
+    let worker_state = state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
+        use crate::daemon::CreationPhase;
         use crate::session::builder::{self, InstanceParams};
-        use crate::session::Config;
-        use crate::session::Storage;
+        use crate::session::{LifecycleOperation, SessionStore, Status};
+        let runtime = tokio::runtime::Handle::current();
+        let namespace = runtime.block_on(worker_state.profile_namespace.read());
+        let mut native = super::session_store::NativeSessionStore::open(
+            worker_state.clone(), &spec.profile, None,
+        )?;
+        let creation_profile = worker_state.session_service.claim_creation_profile(&spec.profile);
+        let config = native.configuration(Some(&spec.profile))?;
+        drop(namespace);
 
         let StructuredSessionSpec {
             title,
+            size,
             path,
             group,
             tool,
@@ -133,6 +126,7 @@ pub(crate) async fn spawn_structured_session(
             repo_base_branches,
             scratch,
             trust_hooks,
+            trust_review,
             custom_instruction,
             callback_url,
             idempotency_key,
@@ -149,7 +143,6 @@ pub(crate) async fn spawn_structured_session(
             fork_seed,
         } = spec;
 
-        let config = Config::load_or_warn();
         let sandbox_image = sandbox_image.unwrap_or_else(|| {
             if config.sandbox.default_image.is_empty() {
                 "ubuntu:latest".to_string()
@@ -158,27 +151,26 @@ pub(crate) async fn spawn_structured_session(
             }
         });
 
-        let title_refs: Vec<&str> = existing_titles.iter().map(|s| s.as_str()).collect();
-        let branch_refs: Vec<&str> = existing_branches.iter().map(|s| s.as_str()).collect();
+
         let extra_repo_paths: Vec<String> = extra_repo_paths
             .into_iter()
             .filter(|s| !s.is_empty())
             .collect();
 
-        // Resolve repo hook trust BEFORE building the worktree (#2066): a repo
-        // whose hooks need approval and that was not sent `trust_hooks: true`
-        // is refused here, so the handler never leaves an orphan worktree on
-        // disk. The original `path` is the trust anchor (the same source the
-        // CLI/TUI use); `check_repo_trust` resolves a worktree path to its main
-        // repo, so a worktree created from an already-trusted repo inherits its
-        // trust without a separate prompt.
+        // Persist approval against the source repository before provisioning can run Git hooks.
         let original_path = path.clone();
         let hook_plan = crate::server::api::sessions::resolve_create_hook_plan(
-            &profile,
+            &config.hooks,
             std::path::Path::new(&original_path),
             scratch,
-            trust_hooks.unwrap_or(false),
+            trust_hooks,
+            trust_review.as_ref(),
         )?;
+        if let Some((hooks_hash, mcp_hash)) = &hook_plan.trust_write {
+            crate::session::config::repo_config::trust_repo(
+                std::path::Path::new(&original_path), hooks_hash.as_deref(), mcp_hash.as_deref(),
+            )?;
+        }
 
         let title = title.unwrap_or_default();
         let worktree_branch = worktree_branch
@@ -219,18 +211,26 @@ pub(crate) async fn spawn_structured_session(
             fork_seed,
         };
 
-        let build_result = builder::build_instance(params, &title_refs, &branch_refs, &profile)?;
-        let mut instance = build_result.instance;
+        let namespace = runtime.block_on(worker_state.profile_namespace.read());
+        let identity = crate::session::acquire_session_identity_lock()?;
+        let (existing_titles, existing_branches): (Vec<String>, Vec<String>) = {
+            let rows = worker_state.instances.blocking_read();
+            (rows.iter().map(|row| row.title.clone()).collect(),
+             rows.iter().filter_map(|row| row.worktree_info.as_ref().map(|worktree| worktree.branch.clone())).collect())
+        };
+        let title_refs: Vec<&str> = existing_titles.iter().map(String::as_str).collect();
+        let branch_refs: Vec<&str> = existing_branches.iter().map(String::as_str).collect();
+        let mut plan = builder::plan_instance(params, &title_refs, &branch_refs, &profile)?;
+        let instance = &mut plan.result.instance;
         instance.source_profile = profile.clone();
+        instance.file_watch = Some(worker_state.file_watch.clone());
+        native.set_status_id(instance.id.clone());
         instance.created_by_plugin = created_by_plugin;
         instance.plugin_create_idempotency = plugin_create_idempotency;
         instance.pending_initial_turn = pending_initial_turn;
         instance.acp_mode_id = acp_mode_id;
         instance.callback_url = callback_url;
         instance.idempotency_key = idempotency_key;
-        let build_warnings = build_result.warnings;
-        let created_worktree = build_result.created_worktree;
-        let created_workspace_worktrees = build_result.created_workspace_worktrees;
 
         // Apply per-session sandbox overrides from the request body.
         if let Some(ref mut sandbox) = instance.sandbox_info {
@@ -238,26 +238,56 @@ pub(crate) async fn spawn_structured_session(
                 sandbox.custom_instruction = custom_instruction;
             }
         }
+        instance.view = view;
+        // Imports resume the existing structured conversation.
+        if let Some(import_id) = import_acp_session_id.filter(|id| !id.trim().is_empty()) {
+            instance.view = crate::session::View::Structured;
+            instance.acp_session_id = Some(import_id);
+            instance.import_pending = Some(true);
+        }
+        instance.agent_name = agent_name;
+        let lock = runtime.block_on(worker_state.instance_lock(&instance.id));
+        let store: &dyn SessionStore = &native;
+        let creation_guard = worker_state.session_service.register_creation(
+            &instance.id,
+            &instance.title,
+            &instance.source_profile,
+        )?;
+        let creation_progress = |event| creation_guard.hook_event(event);
+        let generation = {
+            let _submission = runtime.block_on(worker_state.session_service.prompt_submission(&instance.id));
+            let _guard = lock.blocking_lock();
+            native.check_available()?;
+            let _title = crate::session::acquire_session_title_lock(&instance.id)?;
+            let _lifecycle = native.storage().acquire_instance_lifecycle_lock(&instance.id)?;
+            let generation = instance.try_acquire_lifecycle_reservation(
+                LifecycleOperation::Launch, Instance::LIFECYCLE_RESERVATION_TTL, chrono::Utc::now(),
+            )?;
+            instance.status = Status::Starting;
+            store.update(|rows, groups| {
+                anyhow::ensure!(!rows.iter().any(|row| row.id == instance.id), "created session already exists");
+                rows.push(instance.clone());
+                *groups = crate::session::GroupTree::new_with_groups(std::slice::from_ref(instance), groups).get_all_groups();
+                Ok(())
+            })?;
+            generation
+        };
+        drop(identity);
+        drop(namespace);
 
-        // Apply structured-view fields from the request body. structured_view is
-        // re-validated below against real ACP capability; non-ACP tools
-        // fall back to terminal view rather than erroring at spawn time.
-        let agent_effort = {
-            instance.view = view;
-            // #2276: importing an existing Claude session forces the
-            // structured view and adopts the on-disk session id, so the
-            // structured spawn resumes it via session/load and seeds the
-            // transcript from the agent's history replay. `path` is the
-            // session's original cwd (the wizard prefills it).
-            if let Some(import_id) = import_acp_session_id
-                .clone()
-                .filter(|s| !s.trim().is_empty())
-            {
-                instance.view = crate::session::View::Structured;
-                instance.acp_session_id = Some(import_id);
-                instance.import_pending = Some(true);
+        creation_guard.phase(CreationPhase::Provisioning);
+        let (build_result, provision_error) = match plan.provision() {
+            Ok(result) => (result, None),
+            Err(failure) => {
+                let failure = *failure;
+                (failure.result, Some(failure.error))
             }
-            instance.agent_name = agent_name;
+        };
+        let mut instance = build_result.instance;
+        let build_warnings = build_result.warnings;
+        let created_worktree = build_result.created_worktree;
+        let created_workspace_worktrees = build_result.created_workspace_worktrees;
+        let agent_effort = if provision_error.is_none() {
             let resolved_config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
                 &instance.source_profile,
                 std::path::Path::new(&instance.project_path),
@@ -361,85 +391,167 @@ pub(crate) async fn spawn_structured_session(
             }
 
             agent_effort
+        } else {
+            None
         };
 
-        // Run on_create hooks now that the worktree exists, before the session
-        // is persisted or started (#2066). Mirrors the TUI/CLI ordering so the
-        // worktree is bootstrapped (`.env` copies, venv symlinks, DB seeds)
-        // before the agent launches. On failure, tear down the just-built
-        // worktree/container so a broken hook doesn't leave an orphan.
-        if let Err(e) = crate::server::api::sessions::run_create_hooks(
-            &mut instance,
-            &hook_plan,
-            std::path::Path::new(&original_path),
-        ) {
-            builder::cleanup_instance(
-                &instance,
-                created_worktree.as_ref(),
-                &created_workspace_worktrees,
-                None,
-            );
-            return Err(anyhow::anyhow!("on_create hook failed: {e:#}"));
-        }
-
-        // Anything that fails between here and the final `Ok(..)`
-        // would otherwise orphan the scratch directory `build_instance`
-        // already provisioned (Storage::new, storage.update,
-        // instance.start). Wrap the tail in an IIFE-equivalent closure
-        // so we can run cleanup on Err once, regardless of which step
-        // tripped. Matches the CLI cleanup path in
-        // `cleanup_partial_session(... scratch_dir: Some(...))`.
-        let mut persist_and_start = || -> anyhow::Result<()> {
-            let storage = Storage::new(&profile, file_watch_for_create.clone())?;
-            let to_persist = instance.clone();
-            storage.update(|all, _groups| {
-                all.push(to_persist);
+        {
+            let _namespace = runtime.block_on(worker_state.profile_namespace.read());
+            let _submission = runtime.block_on(worker_state.session_service.prompt_submission(&instance.id));
+            let _guard = lock.blocking_lock();
+            store.update(|rows, _| {
+                let row = rows.iter_mut().find(|row| row.id == instance.id)
+                    .ok_or(crate::session::LifecycleReservationError::Superseded)?;
+                anyhow::ensure!(row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation)
+                    && row.project_path == instance.project_path,
+                    crate::session::LifecycleReservationError::Superseded);
+                match (&mut row.worktree_info, &instance.worktree_info) {
+                    (Some(stored), Some(built)) => {
+                        anyhow::ensure!(stored.branch == built.branch && stored.main_repo_path == built.main_repo_path,
+                            crate::session::LifecycleReservationError::Superseded);
+                        stored.managed_by_aoe = built.managed_by_aoe;
+                    }
+                    (None, None) => {}
+                    _ => return Err(crate::session::LifecycleReservationError::Superseded.into()),
+                }
+                match (&mut row.workspace_info, &instance.workspace_info) {
+                    (Some(stored), Some(built)) => {
+                        anyhow::ensure!(stored.workspace_dir == built.workspace_dir && stored.repos.len() == built.repos.len(),
+                            crate::session::LifecycleReservationError::Superseded);
+                        for (stored_repo, built_repo) in stored.repos.iter_mut().zip(&built.repos) {
+                            anyhow::ensure!(stored_repo.worktree_path == built_repo.worktree_path
+                                && stored_repo.main_repo_path == built_repo.main_repo_path && stored_repo.branch == built_repo.branch,
+                                crate::session::LifecycleReservationError::Superseded);
+                            stored_repo.managed_by_aoe = built_repo.managed_by_aoe;
+                            stored_repo.branch_preexisting = built_repo.branch_preexisting;
+                        }
+                        stored.cleanup_on_delete = built.cleanup_on_delete;
+                    }
+                    (None, None) => {}
+                    _ => return Err(crate::session::LifecycleReservationError::Superseded.into()),
+                }
+                row.view = instance.view;
+                row.agent_model = instance.agent_model.clone();
+                row.acp_effort = instance.acp_effort.clone();
+                row.fork_pending = instance.fork_pending.clone();
+                row.import_pending = instance.import_pending;
+                instance = row.clone();
                 Ok(())
             })?;
-
-            // Acp-mode sessions are not backed by tmux; the structured view
-            // supervisor spawns the ACP agent on demand. Skip the tmux
-            // `start()` to avoid creating an empty pane that no one will
-            // attach to.
-            let skip_tmux_start = instance.is_structured();
-            if !skip_tmux_start {
-                instance.start()?;
-            }
-            Ok(())
+        }
+        let provisioning_failed = provision_error.is_some();
+        let creation = match provision_error {
+            Some(error) => Err(error),
+            None => creation_guard
+                .check()
+                .map_err(anyhow::Error::from)
+                .and_then(|()| {
+                    creation_guard.phase(CreationPhase::CreateHooks);
+                    crate::server::api::sessions::run_create_hooks(
+                        &mut instance,
+                        &hook_plan,
+                        store,
+                        Some(&creation_progress),
+                    )
+                    .map_err(|error| anyhow::anyhow!("on_create hook failed: {error:#}"))
+                })
+                .and_then(|()| creation_guard.check().map_err(anyhow::Error::from)),
         };
-
-        if let Err(e) = persist_and_start() {
-            // Guarded the same way as the deletion path: only remove a
-            // path that `is_scratch_path` blesses, so a corrupted
-            // `project_path` cannot trick us into wiping unrelated
-            // state.
-            if instance.scratch {
-                let scratch_path = std::path::PathBuf::from(&instance.project_path);
-                if crate::session::scratch::is_scratch_path(&scratch_path) {
-                    if let Err(rm_err) = std::fs::remove_dir_all(&scratch_path) {
-                        tracing::warn!(
-                            target: "http.api.sessions",
-                            "Failed to clean up orphan scratch dir {} after create failure: {}",
-                            scratch_path.display(),
-                            rm_err
-                        );
-                    }
+        let rollback = |native: super::session_store::NativeSessionStore, instance: Instance, provisioning_failed: bool| { use crate::session::deletion::{DeletionDisposition, DeletionRequest, PurgeReservation, PurgeTransaction};
+        let _namespace = runtime.block_on(worker_state.profile_namespace.read());
+        let _submission = runtime.block_on(worker_state.session_service.prompt_submission(&instance.id));
+        let _guard = lock.blocking_lock();
+        let request = DeletionRequest {
+            session_id: instance.id.clone(),
+            delete_worktree: created_worktree.as_ref().is_some_and(|worktree| worktree.checkout_created)
+                || created_workspace_worktrees.iter().any(|worktree| worktree.checkout_created)
+                || instance.workspace_info.as_ref().is_some_and(|workspace| workspace.cleanup_on_delete),
+            delete_branch: created_worktree.as_ref().is_some_and(|worktree| worktree.owned_branch.is_some())
+                || created_workspace_worktrees.iter().any(|worktree| worktree.owned_branch.is_some()),
+            delete_sandbox: instance.sandbox_info.as_ref().is_some_and(|sandbox| sandbox.enabled),
+            force_delete: true,
+            detach_hooks: true,
+            keep_scratch: provisioning_failed,
+            instance,
+        };
+        let rollback = PurgeTransaction::reserve_failed_creation(native, request, generation)
+            .map(|reservation| match reservation {
+                PurgeReservation::Reserved(transaction) => transaction.complete_creation_rollback(
+                    created_worktree.iter().chain(&created_workspace_worktrees),
+                ),
+                PurgeReservation::Rejected(result) => result,
+            });
+        match rollback {
+            Ok(result) => {
+                if matches!(result.disposition, DeletionDisposition::Removed | DeletionDisposition::AlreadyGone) {
+                    worker_state.instance_locks.blocking_write().remove(&result.session_id);
+                    runtime.block_on(worker_state.session_service.forget_prompt_lock(&result.session_id));
+                }
+                if !result.success {
+                    tracing::warn!(target: "session.create", errors = ?result.errors, "Creation rollback incomplete");
                 }
             }
-            return Err(e);
+            Err(rollback_error) => tracing::warn!(target: "session.create", %rollback_error, "Creation rollback could not acquire ownership"),
+        } }; if let Err(error) = creation { rollback(native, instance, provisioning_failed); return Err(error); }
+
+        let namespace = runtime.block_on(worker_state.profile_namespace.read());
+        let submission = runtime.block_on(worker_state.session_service.prompt_submission(&instance.id));
+        let guard = lock.blocking_lock();
+        native.check_available()?;
+        let title_lock = crate::session::acquire_session_title_lock(&instance.id)?;
+        let lifecycle_lock = native.storage().acquire_instance_lifecycle_lock(&instance.id)?;
+        instance.prepare_reserved_launch_hooks(store, false, crate::session::LaunchReservation {
+            generation, title_lock, lifecycle_lock,
+        })?;
+        drop(guard);
+        drop(submission);
+        drop(namespace);
+
+        creation_guard.phase(CreationPhase::LaunchHooks);
+        let hooks = instance.run_pre_launch_hooks(false, store, Some(&creation_progress));
+        if let Err(error) = creation_guard.commit() {
+            rollback(native, instance, false);
+            return Err(error.into());
         }
 
-        Ok::<(Instance, Vec<String>, Option<String>), anyhow::Error>((
+        let _namespace = runtime.block_on(worker_state.profile_namespace.read());
+        let _submission = runtime.block_on(worker_state.session_service.prompt_submission(&instance.id));
+        let _guard = lock.blocking_lock();
+        if instance.is_structured() {
+            let _ownership = instance.reacquire_launch_locks_after_hooks(store, generation, hooks)?;
+            store.update(|rows, _| {
+                let row = rows.iter_mut().find(|row| row.id == instance.id)
+                    .ok_or(crate::session::LifecycleReservationError::Superseded)?;
+                anyhow::ensure!(row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation),
+                    crate::session::LifecycleReservationError::Superseded);
+                row.sandbox_info = instance.sandbox_info.clone();
+                Ok(())
+            })?;
+            native.adopt_runtime_fields(&instance)?;
+        } else {
+            let outcome = instance.finish_reserved_launch(
+                store, size.map(|size| (size.cols.get(), size.rows.get())), crate::session::ResumeAttemptPolicy::HonorAutoResumeSetting,
+                false, generation, hooks,
+            );
+            let _title = crate::session::acquire_session_title_lock(&instance.id)?;
+            let _lifecycle = native.storage().acquire_instance_lifecycle_lock(&instance.id)?;
+            native.adopt_runtime_fields(&instance)?;
+            native.refresh_pane_observations(&instance)?;
+            outcome?;
+        }
+
+        Ok::<_, anyhow::Error>((
             instance,
             build_warnings,
             agent_effort,
+            native,
+            creation_profile,
         ))
     })
     .await;
 
     match result {
-        Ok(Ok((instance, warnings, agent_effort))) => {
-            let response_instance = instance.clone();
+        Ok(Ok((instance, warnings, agent_effort, native, creation_profile))) => {
             let acp_spawn_target = if instance.is_structured() {
                 Some((
                     instance.id.clone(),
@@ -460,7 +572,7 @@ pub(crate) async fn spawn_structured_session(
             } else {
                 None
             };
-            publish_created_instance(service, instance).await;
+            let response_instance = instance.clone();
 
             // Count the create for the opt-in telemetry trend counter. Bounded
             // accumulator, read-and-decremented by the snapshot loop; no-op for
@@ -507,88 +619,101 @@ pub(crate) async fn spawn_structured_session(
                         .find(|i| i.id == id)
                         .is_some_and(|i| i.pending_initial_turn.is_some())
                 };
-                tokio::spawn(async move {
+                let sandbox_info = response_instance.sandbox_info.clone();
+                let generation = response_instance.lifecycle_generation;
+                let spawn_state = state.clone();
+                service.work.spawn("acp.create_spawn", async move {
+                    let namespace = spawn_state.profile_namespace.read().await;
+                    let submission = service_for_check.prompt_submission(&id).await;
                     let inst_lock = service_for_check.instance_lock(&id).await;
-                    let sandbox_info = match crate::acp::sandbox::ensure_container_for_session(
-                        &service_for_check.instances,
-                        &inst_lock,
-                        &id,
-                        true,
-                    )
-                    .await
-                    {
-                        Ok(info) => info,
-                        Err(e) => {
-                            let message = format!("sandbox container ensure failed: {e}");
-                            tracing::warn!(
-                                target: "acp.supervisor",
-                                session = %id,
-                                "auto-spawn after create failed: {message}"
+                    let guard = inst_lock.lock().await;
+                    let check_id = id.clone();
+                    let checked = tokio::task::spawn_blocking(move || {
+                        use crate::session::{LifecycleOperation, SessionStore};
+                        let validation = (|| -> anyhow::Result<()> {
+                            let _title = crate::session::acquire_session_title_lock(&check_id)?;
+                            let _lifecycle = native
+                                .storage()
+                                .acquire_instance_lifecycle_lock(&check_id)?;
+                            (&native as &dyn SessionStore).launch_configuration(&cwd)?;
+                            let rows = native.load()?;
+                            anyhow::ensure!(
+                                rows.iter().any(|row| row.id == check_id
+                                    && row.lifecycle_reservation_is_owned(
+                                        LifecycleOperation::Launch,
+                                        generation
+                                    )),
+                                crate::session::LifecycleReservationError::Superseded
                             );
-                            supervisor.publish_startup_error(&id, message);
+                            Ok(())
+                        })();
+                        (native, cwd, validation)
+                    })
+                    .await;
+                    drop(guard);
+                    drop(submission);
+                    drop(namespace);
+                    let (native, cwd, validation) = match checked {
+                        Ok(checked) => checked,
+                        Err(error) => {
+                            supervisor.publish_startup_error(
+                                &id,
+                                format!("creation admission failed: {error}"),
+                            );
                             return;
                         }
                     };
-                    let source_profile_for_spawn = Some(source_profile.clone());
-                    match supervisor
-                        .spawn(crate::acp::supervisor::SpawnRequest {
-                            session_id: id.clone(),
-                            agent: agent.clone(),
-                            tool,
-                            cwd,
-                            additional_dirs: vec![],
-                            provider_env: vec![],
-                            model,
-                            effort,
-                            effort_explicit,
-                            stored_acp_session_id,
-                            fork_from,
-                            sandbox_info,
-                            source_profile: source_profile_for_spawn,
-                            yolo_mode,
-                            acp_mode_id,
-                            agent_command_override: command_override,
-                            seed_history_replay,
-                        })
-                        .await
-                    {
-                        Ok(()) => {
-                            // Fast path for a create that carried an initial
-                            // turn: deliver it now that the worker is live.
-                            // The reconciler tick is the retry owner for
-                            // every other case (spawn failure here, daemon
-                            // restart, adopted runner).
-                            if has_pending_initial_turn {
-                                service_for_check.drain_pending_initial_turn(&id).await;
-                            }
+                    let source_profile_for_spawn = Some(source_profile);
+                    let spawned = match validation {
+                        Err(error) => Err(error),
+                        Ok(()) => supervisor
+                            .spawn(crate::acp::supervisor::SpawnRequest {
+                                session_id: id.clone(),
+                                agent: agent.clone(),
+                                tool,
+                                cwd,
+                                additional_dirs: vec![],
+                                provider_env: vec![],
+                                model,
+                                effort,
+                                effort_explicit,
+                                stored_acp_session_id,
+                                fork_from,
+                                sandbox_info,
+                                source_profile: source_profile_for_spawn,
+                                yolo_mode,
+                                acp_mode_id,
+                                agent_command_override: command_override,
+                                seed_history_replay,
+                            })
+                            .await
+                            .map_err(|error| {
+                                anyhow::anyhow!(crate::server::api::structured_spawn_error_message(
+                                    &error, &agent
+                                ))
+                            }),
+                    };
+                    if let Err(error) = &spawned {
+                        tracing::warn!(target: "acp.supervisor", session = %id,
+                            "auto-spawn after create failed: {error}");
+                        supervisor.publish_startup_error(&id, error.to_string());
+                    }
+                    let settled = finish_created_structured_session(
+                        &spawn_state,
+                        native,
+                        &id,
+                        generation,
+                        spawned,
+                    )
+                    .await;
+                    drop(creation_profile);
+                    match settled {
+                        Ok(()) if has_pending_initial_turn => {
+                            service_for_check.drain_pending_initial_turn(&id).await;
                         }
-                        Err(e) => {
-                            let still_present = service_for_check
-                                .instances
-                                .read()
-                                .await
-                                .iter()
-                                .any(|i| i.id == id);
-                            // Capacity-aware banner selection (and the benign
-                            // first-tick duplicate) is documented on
-                            // `structured_spawn_error_message`.
-                            let message =
-                                crate::server::api::structured_spawn_error_message(&e, &agent);
-                            if still_present {
-                                tracing::warn!(
-                                    target: "acp.supervisor",
-                                    session = %id,
-                                    "auto-spawn after create failed: {message}"
-                                );
-                                supervisor.publish_startup_error(&id, message);
-                            } else {
-                                tracing::debug!(
-                                    target: "acp.supervisor",
-                                    session = %id,
-                                    "auto-spawn after create error after session removed (ignored): {message}"
-                                );
-                            }
-                        }
+                        Ok(()) => {}
+                        Err(error) => tracing::warn!(target: "acp.supervisor", session = %id,
+                            "created session completion failed: {error}"),
                     }
                 });
             }
@@ -603,156 +728,41 @@ pub(crate) async fn spawn_structured_session(
     }
 }
 
-async fn publish_created_instance(service: &SessionService, instance: Instance) {
-    let mut instances = service.instances.write().await;
-    crate::server::api::sessions::upsert_instance(&mut instances, instance);
-    #[cfg(test)]
-    {
-        let gate = service.created_instance_gate.lock().unwrap().take();
-        if let Some((arrived, resume)) = gate {
-            arrived.send(()).expect("publication observer");
-            resume.await.expect("publication gate released");
-        }
-    }
-    // Reloads compare this epoch under the same lock as the published row.
-    service
-        .mutation_epoch
-        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-}
-
-#[cfg(test)]
-mod tests {
-    #[tokio::test]
-    async fn the_create_bumps_the_mutation_epoch_under_the_instances_lock() {
-        use axum::extract::{Query, State};
-        use axum::response::IntoResponse;
-        use axum::Json;
-        use std::time::Duration;
-
-        let _home = crate::session::test_support::isolate_app_dir();
-        let old = crate::session::Instance::new("old", "/tmp/old");
-        crate::server::test_support::seed_instances_on_disk_for_test("test", vec![old.clone()]);
-        let state = crate::server::test_support::build_test_app_state(vec![old]);
-        // Capacity prevents an external agent launch without bypassing creation or persistence.
-        state.acp_supervisor.test_insert_worker("occupant").await;
-        let epoch = state
-            .mutation_epoch
-            .load(std::sync::atomic::Ordering::SeqCst);
-        let stale_snapshot = crate::server::test_support::load_instances_from_disk_for_test("test");
-        let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
-        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
-        *state.session_service.created_instance_gate.lock().unwrap() =
-            Some((arrived_tx, resume_rx));
-        let body = serde_json::from_value(serde_json::json!({
-            "title": "created-scratch", "path": "", "tool": "claude",
-            "scratch": true, "view": "structured", "profile": "test",
-        }))
-        .unwrap();
-        let create = tokio::spawn({
-            let state = state.clone();
-            async move {
-                crate::server::api::sessions::create_session(
-                    State(state),
-                    Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
-                    Ok(Json(body)),
-                )
-                .await
-                .into_response()
-            }
-        });
-        tokio::time::timeout(Duration::from_secs(10), arrived_rx)
-            .await
-            .expect("real create reaches publication")
-            .expect("publication observer");
-        assert!(
-            state.instances.try_read().is_err(),
-            "new row remains hidden until its epoch is published"
-        );
-        let created = crate::server::test_support::load_instances_from_disk_for_test("test")
-            .into_iter()
-            .find(|inst| inst.title == "created-scratch")
-            .expect("create persisted its row");
-        assert!(created.scratch);
-        assert!(std::path::Path::new(&created.project_path).is_dir());
-        let id = created.id;
-        let reload = crate::server::reload::reload_state_instances_from_disk(
-            &state,
-            stale_snapshot,
-            Vec::new(),
-            crate::server::state::StatusSource::DiskOnly,
-            epoch,
-        );
-        tokio::pin!(reload);
-        assert!(futures_util::poll!(&mut reload).is_pending());
-        resume_tx.send(()).unwrap();
-        let (response, ()) = tokio::join!(
-            tokio::time::timeout(Duration::from_secs(10), create),
-            reload,
-        );
-        let response = response.expect("creation finishes").expect("creation task");
-        assert_eq!(response.status(), axum::http::StatusCode::CREATED);
-        let response: serde_json::Value = serde_json::from_slice(
-            &axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(response["id"], id);
-        assert!(
-            state
-                .instances
-                .read()
-                .await
-                .iter()
-                .any(|inst| inst.id == id),
-            "a queued stale reload must not erase the session the create route published"
-        );
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if state
-                    .acp_event_store
-                    .replay_from(&id, 0)
-                    .iter()
-                    .any(|(_, event)| matches!(event, crate::acp::Event::AgentStartupError { .. }))
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
+async fn finish_created_structured_session(
+    state: &Arc<super::AppState>,
+    native: super::session_store::NativeSessionStore,
+    id: &str,
+    generation: u64,
+    outcome: anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let namespace = state.profile_namespace.read().await;
+    let submission = state.session_service.prompt_submission(id).await;
+    let lock = state.instance_lock(id).await;
+    let guard = lock.lock().await;
+    let mut instance = state
+        .instances
+        .read()
         .await
-        .expect("capacity-rejected startup finishes before app guard drops");
-        assert!(!state.acp_supervisor.is_running(&id).await);
-        state.acp_supervisor.test_remove_worker("occupant").await;
-    }
-
-    /// The test above runs on a current-thread runtime, where an unlock moved
-    /// above the epoch bump has no await to yield at and still passes (#3968).
-    /// Pin the order instead: the guard must outlive the bump.
-    #[test]
-    fn publication_bumps_the_epoch_before_releasing_the_instances_lock() {
-        // Whitespace-normalised so rustfmt's wrapping cannot change the result.
-        let source = include_str!("session_spawn.rs")
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        let start = source
-            .find("async fn publish_created_instance(")
-            .expect("publication function");
-        let body = &source[start..];
-        let body = &body[..body
-            .find("#[cfg(test)] mod tests")
-            .expect("tests follow publication")];
-        let lock = body
-            .find("let mut instances = service.instances.write().await;")
-            .expect("publication takes the instances write lock");
-        let bump = body
-            .find(".mutation_epoch .fetch_add(")
-            .expect("publication bumps the epoch");
-        assert!(lock < bump, "the bump must happen under the lock");
-        assert!(
-            !body[lock..bump].contains("drop(instances)"),
-            "the instances guard must be held until the epoch is bumped"
-        );
-    }
+        .iter()
+        .find(|row| row.id == id)
+        .cloned()
+        .ok_or(crate::session::LifecycleReservationError::Superseded)?;
+    let result = tokio::task::spawn_blocking(move || {
+        let ownership = instance.reacquire_launch_locks_after_hooks(&native, generation, outcome);
+        if ownership.is_err() {
+            native.adopt_runtime_fields(&instance)?;
+            return ownership.map(|_| ());
+        }
+        instance.status = crate::session::Status::Idle;
+        let result = instance.commit_lifecycle_launch(&native, generation, false);
+        native.adopt_runtime_fields(&instance)?;
+        result
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("structured creation completion failed: {error}"))?;
+    drop(guard);
+    drop(submission);
+    drop(namespace);
+    state.runtime.publish(state).await?;
+    result
 }

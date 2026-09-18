@@ -94,75 +94,6 @@ impl HomeView {
         }
     }
 
-    /// Apply the result of a background stop. Returns true if an instance was
-    /// updated so the caller can trigger a redraw.
-    pub fn apply_stop_results(&mut self) -> bool {
-        use crate::session::Status;
-        use std::sync::mpsc::TryRecvError;
-
-        match self.stop_poller.try_recv_result() {
-            Ok(result) => {
-                // `Instance::stop` committed its terminal state while holding
-                // the cross-process lifecycle lock. Merge that durable row on
-                // both success and failure so the in-memory error message is
-                // attached to the generation that actually failed.
-                let committed = self
-                    .get_instance(&result.session_id)
-                    .map(|instance| instance.source_profile.clone())
-                    .and_then(|profile| self.storages.get(&profile))
-                    .and_then(|storage| storage.load().ok())
-                    .and_then(|instances| {
-                        instances
-                            .into_iter()
-                            .find(|instance| instance.id == result.session_id)
-                    });
-                if let Some(committed) = committed {
-                    self.mutate_instance(&result.session_id, |instance| {
-                        instance.merge_post_start(&committed);
-                    });
-                }
-                if !result.success {
-                    self.set_instance_error(&result.session_id, result.error);
-                    self.set_instance_status(&result.session_id, Status::Error);
-                    if let Err(e) = self.save() {
-                        tracing::error!(target: "tui.home", "Failed to save after stop: {}", e);
-                    }
-                }
-                true
-            }
-            Err(TryRecvError::Empty) => false,
-            Err(TryRecvError::Disconnected) => {
-                // The single worker thread is gone (a panic in perform_stop
-                // dropped result_tx). Rows were optimistically marked Stopped
-                // at request time and Stopped is frozen for the StatusPoller
-                // (tier 0), so a lost failure result would otherwise show
-                // "Stopped" over a still-running container forever; only the
-                // poller's in-flight set knows which rows those are. Mirrors
-                // the Disconnected handling in `apply_restart_results`.
-                let stuck = self.stop_poller.take_pending();
-                if stuck.is_empty() {
-                    return false;
-                }
-                tracing::error!(
-                    target: "tui.home",
-                    rows = stuck.len(),
-                    "stop poller worker gone; marking in-flight stops Error",
-                );
-                for id in &stuck {
-                    self.set_instance_error(
-                        id,
-                        Some("Stop worker crashed; the session may not have stopped".to_string()),
-                    );
-                    self.set_instance_status(id, Status::Error);
-                }
-                if let Err(e) = self.save() {
-                    tracing::error!(target: "tui.home", "Failed to save after stop: {}", e);
-                }
-                true
-            }
-        }
-    }
-
     /// Apply a background trash result. The worker already committed durable
     /// state while holding the lifecycle flock; this drain only refreshes the
     /// in-memory path after confirming the same durable row is still trashed.
@@ -396,8 +327,12 @@ impl HomeView {
         changed
     }
 
-    /// Recreate stopped terminal session-id pollers after a status-refresh
-    /// cadence has refreshed tmux state. This is deliberately separate from
+    /// Recreate stopped terminal session-id pollers on the 500ms repair
+    /// cadence. I5 invariant: this is session-id bookkeeping only and MUST
+    /// NOT write terminal-row status/display fields (`status`, `last_error`,
+    /// `pane_dead_observed`, `agent_pane`, `auxiliary`, `unread`). Those are
+    /// daemon-authoritative and arrive via `apply_session_feed` ->
+    /// `apply_daemon_status_update`. This is deliberately separate from
     /// [`Self::apply_session_id_updates`], which runs on every input/render
     /// wake while live views are open.
     pub fn repair_session_id_pollers(&mut self) {
@@ -410,6 +345,10 @@ impl HomeView {
         for instance in self.instances.values_mut() {
             instance.repair_session_id_poller_if_needed(&live);
         }
+        // Session-id repair only: no status/display field may change here.
+        // (`repair_session_id_poller_if_needed` touches only the
+        // `session_id_poller` slot and its retry schedule, never status
+        // fields; verified against `src/session/instance/polling.rs`.)
     }
 
     /// Drain the startup-recovery channel and apply each `RecoveryUpdate`
@@ -555,135 +494,12 @@ impl HomeView {
         self.update_selected();
     }
 
-    /// Apply results from the restart poller. Writes the post-cascade `Instance`
-    /// snapshot back into memory (so `restart_with_size`'s mutations and the
-    /// `#[serde(skip)]` `last_start_time` survive), clears the in-flight marker,
-    /// and persists. A failed cascade or preserved resume-probe failure surfaces
-    /// as a "Restart Failed" dialog (the user explicitly initiated the restart).
-    /// Returns true if any instance changed.
+    /// Settle from the command lane, never from an unrelated status snapshot.
     pub fn apply_restart_results(&mut self) -> bool {
-        use crate::session::Status;
-        use std::sync::mpsc::TryRecvError;
-
-        let mut touched = false;
-        loop {
-            match self.restart_poller.try_recv_result() {
-                Ok(result) => {
-                    let crate::session::restart::RestartResult {
-                        session_id,
-                        before,
-                        mut instance,
-                        outcome,
-                    } = result;
-
-                    self.restart_in_flight.remove(&session_id);
-                    if self.attach_after_restart.remove(&session_id)
-                        && crate::session::restart::launched_agent(&outcome)
-                    {
-                        self.restarted_attaches.push(session_id.clone());
-                    }
-
-                    match outcome {
-                        Ok(crate::session::StartOutcome::ResumeFailed { sid }) => {
-                            tracing::warn!(
-                                target: "session.restart",
-                                id = %session_id,
-                                %sid,
-                                "resume failed; sid preserved for explicit retry",
-                            );
-                            self.info_dialog = Some(InfoDialog::new(
-                                "Restart Failed",
-                                &format!(
-                                    "Resume failed for sid {sid}; preserved for explicit retry"
-                                ),
-                            ));
-                        }
-                        Ok(crate::session::StartOutcome::FreshAfterFailedResume { sid }) => {
-                            tracing::info!(
-                                target: "session.restart",
-                                id = %session_id,
-                                %sid,
-                                "started fresh; sid previously failed a resume probe",
-                            );
-                            self.info_dialog = Some(InfoDialog::new(
-                                "Restarted",
-                                &format!(
-                                    "Started fresh; a prior resume attempt failed for sid {sid}. \
-                                     The old conversation is still reachable via the agent's \
-                                     own resume/history picker."
-                                ),
-                            ));
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::warn!(
-                                target: "session.restart",
-                                id = %session_id,
-                                error = %e,
-                                "restart cascade failed",
-                            );
-                            instance.status = Status::Error;
-                            instance.last_error = Some(e.clone());
-                            // Surface it: a cascade failure now arrives async, so
-                            // the input handler's "Restart Failed" dialog can no
-                            // longer catch it (restart_selected_session returned
-                            // Ok once the work was enqueued).
-                            self.info_dialog = Some(InfoDialog::new(
-                                "Restart Failed",
-                                &format!("Could not restart session: {e}"),
-                            ));
-                        }
-                    }
-
-                    if let Some(slot) = self.instances.get_mut(&session_id) {
-                        slot.merge_post_restart_with_baseline(&before, &instance);
-                        slot.last_error = if instance.status == Status::Error {
-                            instance.last_error.clone()
-                        } else {
-                            None
-                        };
-                        slot.last_error_check = instance.last_error_check;
-                        slot.last_start_time = instance.last_start_time;
-                        slot.retroactive_capture_excludes =
-                            instance.retroactive_capture_excludes.clone();
-                        touched = true;
-                    }
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    // The single worker thread is gone (a panic in
-                    // perform_restart dropped result_tx). Clear the in-flight set
-                    // defensively so the stuck rows fall back to the StatusPoller
-                    // (which marks them Error) instead of being filtered out of
-                    // polling forever by `pollable_instances`. Mirrors the
-                    // Disconnected handling in `apply_recovery_updates`.
-                    if !self.restart_in_flight.is_empty() {
-                        tracing::error!(
-                            target: "session.restart",
-                            "restart poller worker gone; clearing in-flight set",
-                        );
-                        self.restart_in_flight.clear();
-                        self.attach_after_restart.clear();
-                        touched = true;
-                    }
-                    break;
-                }
-            }
-        }
-
-        if touched {
-            self.refresh_rows_preserving_selection();
-            if let Err(e) = self.save() {
-                tracing::error!(target: "tui.home", "Failed to save after restart: {}", e);
-            }
-        }
-        touched
-    }
-
-    /// Sessions whose `restart_then_attach` restart launched the agent, for
-    /// the event loop to attach.
-    pub fn take_restarted_attaches(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.restarted_attaches)
+        let before = self.restart_in_flight.len();
+        self.restart_in_flight
+            .retain(|id| self.session_feed.has_pending(id));
+        before != self.restart_in_flight.len()
     }
 
     /// Identify recovery candidates and spawn a worker pool. Sets
@@ -791,12 +607,6 @@ impl HomeView {
                 continue;
             }
             if let Some(inst) = self.instances.get_mut(&elig.id) {
-                // Set Status::Starting AND last_start_time: the existing 3s
-                // grace at `update_status_with_metadata_inner` only fires on
-                // the latter, and without it the TUI's StatusPoller (every
-                // 500ms) would observe missing tmux + no last_start_time and
-                // immediately flip the status to `Error` before the worker
-                // has finished its cascade.
                 debug_assert!(inst.status != crate::session::Status::Creating);
                 inst.status = crate::session::Status::Starting;
                 inst.last_error = None;

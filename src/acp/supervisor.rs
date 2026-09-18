@@ -61,10 +61,6 @@ const RESPAWN_BACKOFF: Duration = Duration::from_millis(500);
 const TEARDOWN_TERM_GRACE: Duration = Duration::from_secs(2);
 const TEARDOWN_KILL_GRACE: Duration = Duration::from_millis(500);
 const TEARDOWN_POLL: Duration = Duration::from_millis(50);
-/// Teardown retries after which a runner proven dead is released even
-/// though its registry record could not be settled (unreadable file), so
-/// the session does not stay `stopping` until the daemon restarts.
-const TEARDOWN_RETRY_CAP: u32 = 30;
 /// A teardown still claimed this long after it began has lost its driver
 /// (the request future was dropped mid-await); the retry pass takes it over.
 const TEARDOWN_ORPHAN_GRACE: Duration = Duration::from_secs(15);
@@ -344,9 +340,9 @@ struct WorkerHandle {
     /// turn anyway. The single writer (respawn) replaces the whole
     /// `Arc` rather than mutating the inner client.
     client: Arc<AcpClient>,
-    /// Background task draining events from the client. Aborted on
-    /// shutdown.
-    drain_task: JoinHandle<()>,
+    // Stop between operations; an active launch must settle before detaching.
+    drain_task: Option<JoinHandle<()>>,
+    drain_stop: tokio_util::sync::CancellationToken,
     /// Restart bookkeeping: timestamps of recent respawns (post-
     /// initial-spawn). Used by the watchdog to enforce
     /// `MAX_RESPAWNS_IN_WINDOW`. Empty on first spawn so the initial
@@ -800,6 +796,10 @@ impl<S: BroadcastSink> Supervisor<S> {
             startup_failures: Arc::new(std::sync::Mutex::new(HashSet::new())),
             max_concurrent_workers,
         }
+    }
+
+    pub(crate) fn max_concurrent_workers(&self) -> u32 {
+        self.max_concurrent_workers
     }
 
     #[cfg(test)]
@@ -1381,7 +1381,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
             let remaining = deadline.saturating_sub(start.elapsed());
             if remaining.is_zero() {
-                break;
+                return Err(SupervisorError::TeardownPending(session_id.into()));
             }
             let _ = tokio::time::timeout(remaining, notified).await;
         }
@@ -1392,7 +1392,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         if let Some(pid) = pid_before {
             let start = std::time::Instant::now();
             while start.elapsed() < deadline {
-                if !crate::process::worker_registry::is_pid_alive(pid) {
+                if !self.process_control.is_alive(pid) {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -2044,13 +2044,15 @@ impl<S: BroadcastSink> Supervisor<S> {
         // Retire the previous worker's requests before publishing this worker's events.
         self.cancel_orphaned_approvals(&session_id);
         self.cancel_orphaned_elicitations(&session_id);
-        let drain_task = self.start_drain_task(session_id.clone(), lease.clone(), inbound);
+        let (drain_stop, drain_task) =
+            self.start_drain_task(session_id.clone(), lease.clone(), inbound);
         let client_for_mode = (acp_mode_id.is_some() || yolo_mode).then(|| Arc::clone(&client));
         workers.insert(
             session_id.clone(),
             WorkerHandle {
                 client,
-                drain_task,
+                drain_task: Some(drain_task),
+                drain_stop,
                 // Empty: the initial spawn doesn't count toward the
                 // restart budget.
                 restart_history: vec![],
@@ -2163,20 +2165,6 @@ impl<S: BroadcastSink> Supervisor<S> {
             else {
                 continue;
             };
-            let pid = claim.identity.map(|i| i.pid);
-            if claim.attempts > TEARDOWN_RETRY_CAP
-                && pid.is_none_or(|pid| !self.process_control.is_alive(pid))
-            {
-                warn!(
-                    target: "acp.supervisor",
-                    session = %id,
-                    pid,
-                    attempts = claim.attempts,
-                    "runner is dead but its registry record could not be settled; releasing the session"
-                );
-                self.settle(&claim.lease, Settlement::Proven);
-                continue;
-            }
             match claim.identity {
                 // Loud for the first few ticks; a process that ignores
                 // SIGKILL for longer is in the kernel's hands, not ours.
@@ -2248,7 +2236,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         session_id: String,
         lease: Lease,
         initial_inbound: mpsc::Receiver<Event>,
-    ) -> JoinHandle<()> {
+    ) -> (tokio_util::sync::CancellationToken, JoinHandle<()>) {
         let sink = Arc::clone(&self.sink);
         let workers = Arc::clone(&self.workers);
         let next_seqs = Arc::clone(&self.next_seqs);
@@ -2258,7 +2246,9 @@ impl<S: BroadcastSink> Supervisor<S> {
         let launcher = Arc::clone(&self.launcher);
         let notify = Arc::clone(&self.worker_notify);
         let startup_failures = Arc::clone(&self.startup_failures);
-        crate::task_util::spawn_supervised(
+        let drain_stop = tokio_util::sync::CancellationToken::new();
+        let stop = drain_stop.clone();
+        let drain_task = crate::task_util::spawn_supervised(
             "supervisor.drain",
             crate::task_util::PanicPolicy::Log,
             async move {
@@ -2282,7 +2272,11 @@ impl<S: BroadcastSink> Supervisor<S> {
                     // reconciler re-arms it under its own budget instead.
                     let mut established = false;
                     let mut startup_failed = false;
-                    while let Some(event) = inbound.recv().await {
+                    while let Some(event) = tokio::select! {
+                        biased;
+                        _ = stop.cancelled() => return,
+                        event = inbound.recv() => event,
+                    } {
                         if let Event::Stopped { reason } = &event {
                             if reason == "agent_unresponsive"
                                 || reason == "prompt_orphaned"
@@ -2340,6 +2334,9 @@ impl<S: BroadcastSink> Supervisor<S> {
                         // Tagged with the lease epoch so a frame queued by a
                         // replaced worker cannot mutate runtime state (#3748).
                         sink.publish_from_worker(&session_id, seq, &event, lease.epoch());
+                    }
+                    if stop.is_cancelled() {
+                        return;
                     }
 
                     warn!(
@@ -2488,7 +2485,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                                         .await
                                 {
                                     settlement = match settlement {
-                                        Settlement::Proven => Settlement::Unproven(previous),
+                                        Settlement::Proven => Settlement::Unproven(Some(previous)),
                                         unproven => unproven,
                                     };
                                 }
@@ -2499,7 +2496,11 @@ impl<S: BroadcastSink> Supervisor<S> {
                         }
                     };
 
-                    tokio::time::sleep(RESPAWN_BACKOFF).await;
+                    tokio::select! {
+                        biased;
+                        _ = stop.cancelled() => return,
+                        _ = tokio::time::sleep(RESPAWN_BACKOFF) => {}
+                    }
                     let cancelled = lock_recover(&lifecycle).cancel_requested(&respawn_lease);
                     if let Some(reason) = cancelled {
                         if lock_recover(&lifecycle).convert_to_stopping(&respawn_lease) {
@@ -2625,109 +2626,113 @@ impl<S: BroadcastSink> Supervisor<S> {
                         );
                         Vec::new()
                     });
+                    if stop.is_cancelled() {
+                        return;
+                    }
 
                     let acp_session_id = AcpSessionId(session_id.clone());
                     if let Some((wrapper, base)) = &respawn_config.wrapper_substitution {
                         log_wrapper_substitution(&session_id, &respawn_config.tool, wrapper, base);
                     }
 
-                    let mut new_client = match launcher(respawn_config.clone(), acp_session_id)
-                        .await
-                    {
-                        Ok(c) => c,
-                        Err(e) => {
-                            let publish = |event: Event| {
-                                let seq = next_seq(&next_seqs, &session_id);
-                                sink.publish(&session_id, seq, &event);
-                            };
-                            // A stop that landed during the launch owns the
-                            // outcome: the user asked for a stopped session
-                            // and gets that, not the launch error.
-                            let cancelled =
-                                lock_recover(&lifecycle).cancel_requested(&respawn_lease);
-                            if let Some(reason) = cancelled.clone() {
-                                info!(
-                                    target: "acp.supervisor",
-                                    session = %session_id,
-                                    "respawn launch failed under a pending stop: {e}"
-                                );
-                                publish(Event::Stopped { reason });
-                            } else {
-                                warn!(
-                                    target: "acp.supervisor",
-                                    session = %session_id,
-                                    "respawn failed: {e}"
-                                );
-                            }
-                            match &e {
-                                _ if cancelled.is_some() => {}
-                                AcpError::IncompatibleAgent(payload) => {
-                                    lock_recover(&incompatible_binaries).insert(
-                                        session_id.clone(),
-                                        respawn_config.spec.command.clone(),
+                    let mut new_client =
+                        match launcher(respawn_config.clone(), acp_session_id).await {
+                            Ok(c) => c,
+                            Err(e) => {
+                                let publish = |event: Event| {
+                                    let seq = next_seq(&next_seqs, &session_id);
+                                    sink.publish(&session_id, seq, &event);
+                                };
+                                // A stop that landed during the launch owns the
+                                // outcome: the user asked for a stopped session
+                                // and gets that, not the launch error.
+                                let cancelled =
+                                    lock_recover(&lifecycle).cancel_requested(&respawn_lease);
+                                if let Some(reason) = cancelled.clone() {
+                                    info!(
+                                        target: "acp.supervisor",
+                                        session = %session_id,
+                                        "respawn launch failed under a pending stop: {e}"
                                     );
-                                    publish(Event::IncompatibleAgent {
-                                        detail: payload.detail.clone(),
-                                    });
-                                    publish(Event::AgentStartupError {
-                                        message: payload.message.clone(),
-                                    });
+                                    publish(Event::Stopped { reason });
+                                } else {
+                                    warn!(
+                                        target: "acp.supervisor",
+                                        session = %session_id,
+                                        "respawn failed: {e}"
+                                    );
                                 }
-                                // The respawn hit the provider limit: park
-                                // rather than report a crash (#3514).
-                                AcpError::RateLimited(info) => {
-                                    publish(Event::RateLimit {
-                                        info: (**info).clone(),
-                                    });
-                                    publish(Event::Stopped {
-                                        reason: "rate_limited".into(),
-                                    });
-                                }
-                                _ => publish(Event::AgentStartupError {
-                                    message: format!("ACP agent respawn failed: {e}"),
-                                }),
-                            }
-                            workers.lock().await.remove(&session_id);
-                            // A runner launched under this epoch is retired
-                            // before the epoch is released.
-                            let launched = crate::process::worker_registry::load(&session_id)
-                                .ok()
-                                .flatten()
-                                .filter(|r| r.generation == respawn_lease.epoch())
-                                .map(|r| RunnerIdentity {
-                                    pid: r.pid,
-                                    generation: r.generation,
-                                });
-                            // Under a pending stop the replaced runner is
-                            // retired as well, as `finish_cancelled` does.
-                            let retire_previous = cancelled.is_some();
-                            if (launched.is_some() || retire_previous)
-                                && lock_recover(&lifecycle).convert_to_stopping(&respawn_lease)
-                            {
-                                let mut settlement =
-                                    tear_down_runner(&*process_control, &session_id, launched)
-                                        .await;
-                                if let Some(previous) =
-                                    previous.filter(|p| retire_previous && Some(*p) != launched)
-                                {
-                                    if let Settlement::Unproven(_) = tear_down_runner(
-                                        &*process_control,
-                                        &session_id,
-                                        Some(previous),
-                                    )
-                                    .await
-                                    {
-                                        settlement = match settlement {
-                                            Settlement::Proven => Settlement::Unproven(previous),
-                                            unproven => unproven,
-                                        };
+                                match &e {
+                                    _ if cancelled.is_some() => {}
+                                    AcpError::IncompatibleAgent(payload) => {
+                                        lock_recover(&incompatible_binaries).insert(
+                                            session_id.clone(),
+                                            respawn_config.spec.command.clone(),
+                                        );
+                                        publish(Event::IncompatibleAgent {
+                                            detail: payload.detail.clone(),
+                                        });
+                                        publish(Event::AgentStartupError {
+                                            message: payload.message.clone(),
+                                        });
                                     }
+                                    // The respawn hit the provider limit: park
+                                    // rather than report a crash (#3514).
+                                    AcpError::RateLimited(info) => {
+                                        publish(Event::RateLimit {
+                                            info: (**info).clone(),
+                                        });
+                                        publish(Event::Stopped {
+                                            reason: "rate_limited".into(),
+                                        });
+                                    }
+                                    _ => publish(Event::AgentStartupError {
+                                        message: format!("ACP agent respawn failed: {e}"),
+                                    }),
                                 }
-                                settle_lease(&lifecycle, &notify, &respawn_lease, settlement);
+                                workers.lock().await.remove(&session_id);
+                                // A runner launched under this epoch is retired
+                                // before the epoch is released.
+                                let launched = crate::process::worker_registry::load(&session_id)
+                                    .ok()
+                                    .flatten()
+                                    .filter(|r| r.generation == respawn_lease.epoch())
+                                    .map(|r| RunnerIdentity {
+                                        pid: r.pid,
+                                        generation: r.generation,
+                                    });
+                                // Under a pending stop the replaced runner is
+                                // retired as well, as `finish_cancelled` does.
+                                let retire_previous = cancelled.is_some();
+                                if (launched.is_some() || retire_previous)
+                                    && lock_recover(&lifecycle).convert_to_stopping(&respawn_lease)
+                                {
+                                    let mut settlement =
+                                        tear_down_runner(&*process_control, &session_id, launched)
+                                            .await;
+                                    if let Some(previous) =
+                                        previous.filter(|p| retire_previous && Some(*p) != launched)
+                                    {
+                                        if let Settlement::Unproven(_) = tear_down_runner(
+                                            &*process_control,
+                                            &session_id,
+                                            Some(previous),
+                                        )
+                                        .await
+                                        {
+                                            settlement = match settlement {
+                                                Settlement::Proven => {
+                                                    Settlement::Unproven(Some(previous))
+                                                }
+                                                unproven => unproven,
+                                            };
+                                        }
+                                    }
+                                    settle_lease(&lifecycle, &notify, &respawn_lease, settlement);
+                                }
+                                return;
                             }
-                            return;
-                        }
-                    };
+                        };
                     let new_inbound = match new_client.take_inbound() {
                         Some(rx) => rx,
                         None => {
@@ -2810,7 +2815,8 @@ impl<S: BroadcastSink> Supervisor<S> {
                     inbound = new_inbound;
                 }
             },
-        )
+        );
+        (drain_stop, drain_task)
     }
     /// Wait until the worker for `session_id` is fully spawned, or the
     /// pending spawn drops out (failed/cancelled), or `deadline` elapses.
@@ -3138,11 +3144,9 @@ impl<S: BroadcastSink> Supervisor<S> {
             .await
     }
 
-    /// Shutdown a worker AND release its agent-side persisted state via
-    /// the experimental `session/delete` RPC. Use only when the session
-    /// is being permanently discarded (session delete, or disabling
-    /// structured view mode), never for reversible teardown, which must keep the
-    /// transcript resumable. See #1710 and `shutdown`.
+    /// Permanently discard adapter state through `session/delete` and stop its runner.
+    /// Returns `TeardownPending` while exit or ownership remains unproven.
+    /// Use `shutdown` for reversible teardown that preserves the transcript.
     pub async fn shutdown_and_delete(&self, session_id: &str) -> Result<(), SupervisorError> {
         self.shutdown_with_reason(session_id, "user_stopped", true)
             .await
@@ -3160,33 +3164,39 @@ impl<S: BroadcastSink> Supervisor<S> {
         let decision = lock_recover(&self.lifecycle).begin_stop(session_id, stop_reason);
         match decision {
             StopDecision::TearDown { lease, identity } => {
+                let identity = identity.or_else(|| {
+                    crate::process::worker_registry::load(session_id)
+                        .ok()
+                        .flatten()
+                        .map(|record| RunnerIdentity {
+                            pid: record.pid,
+                            generation: record.generation,
+                        })
+                });
                 let handle = workers.remove(session_id);
                 drop(workers);
                 crate::process::worker_registry::clear_restart_marker(session_id);
-                let Some(handle) = handle else {
-                    self.settle(&lease, Settlement::Proven);
-                    return Ok(());
+                let should_publish = if let Some(handle) = handle {
+                    if delete_adapter_state {
+                        try_session_delete(&handle.client, session_id).await;
+                    }
+                    handle.drain_stop.cancel();
+                    let _ = handle.client.shutdown().await;
+                    if let Some(task) = handle.drain_task {
+                        let _ = task.await;
+                    }
+                    match &handle.kind {
+                        WorkerKind::Runner { .. } | WorkerKind::Attached => true,
+                        #[cfg(test)]
+                        WorkerKind::Stdio => false,
+                    }
+                } else {
+                    false
                 };
-                // Only permanent removal deletes the agent-side transcript;
-                // reversible teardown keeps it so the next respawn resumes
-                // via `session/load`. See #1404 and #1710.
-                if delete_adapter_state {
-                    try_session_delete(&handle.client, session_id).await;
-                }
-                let _ = handle.client.shutdown().await;
-                handle.drain_task.abort();
                 let settlement =
                     tear_down_runner(&*self.process_control, session_id, identity).await;
                 self.settle(&lease, settlement);
-                // Publish `Stopped` so the UI clears any "thinking" state
-                // now rather than on the next reap tick. Stdio fixtures have
-                // no UI and share the seq counter with budget tests.
-                let should_publish = match &handle.kind {
-                    WorkerKind::Runner { .. } | WorkerKind::Attached => true,
-                    #[cfg(test)]
-                    WorkerKind::Stdio => false,
-                };
-                if should_publish {
+                if should_publish && settlement == Settlement::Proven {
                     // The worker's tailer just died with it, so any
                     // background sub-agent still `Running`/`Stalled` on disk
                     // will never get its own terminal event: without this,
@@ -3216,6 +3226,9 @@ impl<S: BroadcastSink> Supervisor<S> {
                         },
                     );
                 }
+                if delete_adapter_state && settlement != Settlement::Proven {
+                    return Err(SupervisorError::TeardownPending(session_id.into()));
+                }
                 Ok(())
             }
             StopDecision::CancelRequested => {
@@ -3226,15 +3239,23 @@ impl<S: BroadcastSink> Supervisor<S> {
                     session = %session_id,
                     "shutdown: resume in flight; it will tear down what it builds"
                 );
-                Ok(())
+                if delete_adapter_state {
+                    Err(SupervisorError::TeardownPending(session_id.into()))
+                } else {
+                    Ok(())
+                }
+            }
+            StopDecision::AlreadyStopping if delete_adapter_state => {
+                Err(SupervisorError::TeardownPending(session_id.into()))
             }
             StopDecision::AlreadyStopping => Ok(()),
             StopDecision::NotOwned => {
                 // No in-memory worker, but a runner from a previous daemon
                 // may still be on disk. Own its teardown so it is proven.
-                let record = crate::process::worker_registry::load(session_id)
-                    .ok()
-                    .flatten();
+                let record = crate::process::worker_registry::load(session_id).map_err(|error| {
+                    warn!(target: "acp.supervisor", session = %session_id, %error, "cannot verify runner ownership during shutdown");
+                    SupervisorError::TeardownPending(session_id.into())
+                })?;
                 let Some(record) = record else {
                     drop(workers);
                     return Err(SupervisorError::UnknownSession(session_id.into()));
@@ -3255,13 +3276,16 @@ impl<S: BroadcastSink> Supervisor<S> {
                 if let Some(lease) = lease {
                     self.settle(&lease, settlement);
                 }
+                if delete_adapter_state && settlement != Settlement::Proven {
+                    return Err(SupervisorError::TeardownPending(session_id.into()));
+                }
                 Ok(())
             }
         }
     }
     /// Shutdown every worker. Called when the user explicitly terminates
     /// all structured view workers (e.g. `aoe acp stop --all`); sends ACP
-    /// shutdown to each connected client, aborts the drain task, AND
+    /// shutdown to each connected client, joins its drain task, AND
     /// signals every per-session `aoe __acp-runner` so the agent
     /// subprocess dies. For the everyday `aoe serve --stop` flow, use
     /// `detach_all` instead so workers outlive the daemon.
@@ -3279,8 +3303,11 @@ impl<S: BroadcastSink> Supervisor<S> {
         };
         for (id, handle) in drained {
             debug!(target: "acp.supervisor", session = %id, "shutting down");
+            handle.drain_stop.cancel();
             let _ = handle.client.shutdown().await;
-            handle.drain_task.abort();
+            if let Some(task) = handle.drain_task {
+                let _ = task.await;
+            }
         }
 
         // Group-SIGTERM every runner we knew about, so detached agents that
@@ -3295,34 +3322,29 @@ impl<S: BroadcastSink> Supervisor<S> {
         let _ = registry_pids;
     }
 
-    /// Drop the daemon-side handle to every worker without killing the
-    /// runner or its agent. Used on `aoe serve` graceful shutdown so the
-    /// agents keep running and the next `aoe serve` reattaches.
-    ///
-    /// Concretely: closes the unix-socket connection (via `client
-    /// .shutdown()` which sends `ClientCmd::Shutdown` to the connection
-    /// task), aborts the drain task, and writes `detached_at` into each
-    /// registry entry. The runner observes EOF on its socket read,
-    /// clears its active outbound, and goes back to accepting.
+    /// Finish active launches and detach control sockets, preserving the runners.
     pub async fn detach_all(&self) {
-        // The table is left as it is: the daemon is exiting, and a resume
-        // still in flight then installs under its own lease and leaves its
-        // runner for the next daemon instead of tearing it down as stale.
-        let drained: Vec<(String, WorkerHandle)> = {
+        // Keep handles installed until their launches finish: removing one early
+        // makes the completed launch stale and tears its runner down.
+        let tasks = {
             let mut workers = self.workers.lock().await;
-            let drained: Vec<(String, WorkerHandle)> = workers.drain().collect();
-            info!(
-                target: "acp.supervisor",
-                count = drained.len(),
-                "detaching structured view workers; they continue running. \
-                 Use `aoe acp stop` to terminate."
-            );
-            drained
+            let mut tasks = Vec::with_capacity(workers.len());
+            for handle in workers.values_mut() {
+                handle.drain_stop.cancel();
+                if let Some(task) = handle.drain_task.take() {
+                    tasks.push(task);
+                }
+            }
+            tasks
         };
+        for task in tasks {
+            let _ = task.await;
+        }
+        let drained: Vec<(String, WorkerHandle)> = self.workers.lock().await.drain().collect();
+        info!(target: "acp.supervisor", count = drained.len(), "detaching structured view workers; runners continue running");
         for (id, handle) in drained {
             debug!(target: "acp.supervisor", session = %id, "detaching");
             let _ = handle.client.shutdown().await;
-            handle.drain_task.abort();
         }
     }
 
@@ -3506,6 +3528,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             sandbox_resources,
             attach_agent_key,
             record.source_profile.clone(),
+            Some(tokio::time::Instant::now() + Duration::from_secs(3)),
         )
         .await?;
 
@@ -3528,12 +3551,14 @@ impl<S: BroadcastSink> Supervisor<S> {
         // in the log and the sweep can no longer tell them apart.
         self.cancel_orphaned_approvals(&session_id);
         self.cancel_orphaned_elicitations(&session_id);
-        let drain_task = self.start_drain_task(session_id.clone(), lease.clone(), inbound);
+        let (drain_stop, drain_task) =
+            self.start_drain_task(session_id.clone(), lease.clone(), inbound);
         workers.insert(
             session_id.clone(),
             WorkerHandle {
                 client,
-                drain_task,
+                drain_task: Some(drain_task),
+                drain_stop,
                 restart_history: vec![],
                 // Attached: if the worker dies, the drain task sees EOF and
                 // the reconciler spawns a fresh runner on the next tick
@@ -3713,7 +3738,8 @@ impl<S: BroadcastSink> Supervisor<S> {
             session_id.to_string(),
             WorkerHandle {
                 client: Arc::new(client),
-                drain_task: tokio::spawn(async {}),
+                drain_task: None,
+                drain_stop: Default::default(),
                 restart_history: vec![],
                 kind,
                 lease: lease.clone(),
@@ -3833,8 +3859,11 @@ impl<S: BroadcastSink> Supervisor<S> {
         );
         // Send ACP Shutdown so the connection task's closure breaks out of
         // its cmd_rx loop and the transport closes cleanly.
+        handle.drain_stop.cancel();
         let _ = handle.client.shutdown().await;
-        handle.drain_task.abort();
+        if let Some(task) = handle.drain_task {
+            let _ = task.await;
+        }
         Some(is_restart)
     }
 }
@@ -3892,8 +3921,6 @@ async fn tear_down_runner_from(
     };
     let pid = identity.pid;
     if !killed_before {
-        // Sent even when the leader is already gone: descendants in its
-        // group only ever receive the signal, never the liveness probe.
         control.terminate_group(pid);
         wait_for_exit(control, pid, TEARDOWN_TERM_GRACE).await;
     }
@@ -3916,7 +3943,7 @@ async fn tear_down_runner_from(
             pid,
             "runner survived SIGKILL; holding the session until it exits"
         );
-        return Settlement::Unproven(identity);
+        return Settlement::Unproven(Some(identity));
     }
     if !crate::process::worker_registry::delete_if_owned_by(session_id, pid, identity.generation) {
         warn!(
@@ -3925,7 +3952,7 @@ async fn tear_down_runner_from(
             pid,
             "runner exited but its registry record could not be read; retrying settlement"
         );
-        return Settlement::Unproven(identity);
+        return Settlement::Unproven(Some(identity));
     }
     Settlement::Proven
 }
@@ -6167,7 +6194,7 @@ cursor-acp-bridge = "agent acp"
         let lease = sup
             .test_install_handle("s-rl", client, WorkerKind::Stdio, None)
             .await;
-        let drain = sup.start_drain_task("s-rl".into(), lease, inbound_rx);
+        let (_stop, drain) = sup.start_drain_task("s-rl".into(), lease, inbound_rx);
 
         // Producer hands off the rate-limit signal before exiting.
         inbound_tx
@@ -6228,7 +6255,7 @@ cursor-acp-bridge = "agent acp"
             let lease = sup
                 .test_install_handle(id, client, WorkerKind::Stdio, None)
                 .await;
-            let drain = sup.start_drain_task(id.into(), lease, inbound_rx);
+            let (_stop, drain) = sup.start_drain_task(id.into(), lease, inbound_rx);
 
             if established {
                 inbound_tx
@@ -6307,7 +6334,7 @@ cursor-acp-bridge = "agent acp"
             .await;
     }
 
-    /// #2102: when the on-disk record is unreadable AND no live socket
+    /// #2102: when the on-disk record is missing AND no live socket
     /// peer is around, `pid_source_for` returns `None` and
     /// `shutdown_and_wait` degrades to a fast no-poll return without
     /// panicking or looping. The peer-PID recovery path itself is
@@ -6320,31 +6347,15 @@ cursor-acp-bridge = "agent acp"
         let tmp = tempfile::TempDir::with_prefix_in("aoe-supervisor-", "/tmp").unwrap();
         let _home = crate::session::test_support::isolate_home(tmp.path());
         let session_id = "sw-err-2102";
-        // Force load() -> Err by replacing the record file with a directory:
-        // path.exists() stays true, but std::fs::read fails for every user,
-        // root included. (Corrupt JSON is coerced to Ok(None) by load itself,
-        // so it can't drive the Err arm.)
-        let socket_path = crate::process::worker_registry::socket_path_for(session_id).unwrap();
-        let record = crate::process::worker_registry::WorkerRecord::new(
-            session_id.into(),
-            std::process::id(),
-            socket_path.clone(),
-            "claude-agent-acp".into(),
-            "claude-code".into(),
-            std::env::temp_dir(),
-            None,
-            vec![],
-            vec![],
-            None,
-            None,
-        );
-        crate::process::worker_registry::save(&record).unwrap();
-        let record_path = crate::process::worker_registry::record_path(session_id).unwrap();
-        std::fs::remove_file(&record_path).unwrap();
-        std::fs::create_dir(&record_path).unwrap();
+        // `load` is lenient (unreadable/corrupt records read as missing);
+        // the missing record yields no PID source, so `shutdown_and_wait`
+        // degrades to a fast no-poll return. No record file at all is the
+        // same `Ok(None)` path through fewer syscalls.
         assert!(
-            crate::process::worker_registry::load(session_id).is_err(),
-            "fixture must force load() to return Err"
+            crate::process::worker_registry::load(session_id)
+                .unwrap()
+                .is_none(),
+            "fixture must yield no record"
         );
         let sink = VecSink::new();
         let sup = Supervisor::new(sink);
@@ -7310,6 +7321,114 @@ cursor-acp-bridge = "agent acp"
         ));
     }
 
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn destructive_shutdown_requires_proven_runner_exit() {
+        let _home = isolate_home();
+        let control = Arc::new(FakeProcessControl::default());
+        control.immortal(5757);
+        let sup = Supervisor::new(VecSink::new()).with_process_control(control.clone());
+        save_record("s-purge-proof", 5757, 4);
+        for _ in 0..2 {
+            assert!(
+                matches!(
+                    sup.shutdown_and_delete("s-purge-proof").await,
+                    Err(SupervisorError::TeardownPending(_))
+                ),
+                "a live runner must prevent destructive cleanup"
+            );
+            assert!(control.is_alive(5757));
+            assert!(crate::process::worker_registry::load("s-purge-proof")
+                .unwrap()
+                .is_some());
+        }
+        assert!(
+            matches!(
+                sup.shutdown_and_wait("s-purge-proof", Duration::ZERO).await,
+                Err(SupervisorError::TeardownPending(_))
+            ),
+            "an expired wait must not authorize a replacement runner"
+        );
+        control.exit(5757);
+        sup.retry_pending_teardowns().await;
+        assert_eq!(
+            sup.worker_state("s-purge-proof").await,
+            AcpWorkerState::Absent
+        );
+        for (id, known_identity, malformed) in [
+            ("s-unreadable-known", true, false),
+            ("s-unreadable-unknown", false, false),
+            ("s-malformed-unknown", false, true),
+        ] {
+            let record = crate::process::worker_registry::record_path(id).unwrap();
+            if malformed {
+                std::fs::write(&record, b"{broken ownership").unwrap();
+            } else {
+                std::fs::create_dir_all(&record).unwrap();
+            }
+            if known_identity {
+                let mut lifecycle = lock_recover(&sup.lifecycle);
+                let lease = lifecycle.admit(id, ResumeKind::Spawn).unwrap();
+                lifecycle
+                    .install(
+                        &lease,
+                        Some(RunnerIdentity {
+                            pid: 5757,
+                            generation: lease.epoch(),
+                        }),
+                    )
+                    .unwrap();
+            } else {
+                insert_stdio_worker(&sup, id).await;
+            }
+            // `load` is lenient: unreadable records read as missing, so a
+            // teardown with no other identity proof settles Proven at once.
+            // Only the in-lifecycle known identity still pends.
+            if known_identity {
+                assert!(
+                    matches!(
+                        sup.shutdown_and_delete(id).await,
+                        Err(SupervisorError::TeardownPending(_))
+                    ),
+                    "known identity must pend until the runner exits"
+                );
+            } else {
+                assert!(
+                    sup.shutdown_and_delete(id).await.is_ok(),
+                    "missing ownership is proof of absence: {id}"
+                );
+                continue;
+            }
+            assert!(
+                matches!(
+                    sup.wait_until_ready(id).await,
+                    Err(SupervisorError::UnknownSession(_))
+                ),
+                "teardown must revoke the worker client even when ownership is unreadable"
+            );
+            for _ in 0..32 {
+                lock_recover(&sup.lifecycle).age_stopping(id, TEARDOWN_ORPHAN_GRACE);
+                sup.retry_pending_teardowns().await;
+                assert_eq!(
+                    sup.worker_state(id).await,
+                    AcpWorkerState::Stopping,
+                    "unreadable ownership must survive every retry: {id}"
+                );
+            }
+            if malformed {
+                std::fs::remove_file(&record).unwrap();
+            } else {
+                std::fs::remove_dir(&record).unwrap();
+            }
+            sup.retry_pending_teardowns().await;
+            assert_eq!(
+                sup.worker_state(id).await,
+                AcpWorkerState::Absent,
+                "readable absence must release ownership: {id}"
+            );
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn shutdown_during_spawn_tears_down_the_late_runner() {
@@ -7379,6 +7498,7 @@ cursor-acp-bridge = "agent acp"
         entered: Arc<tokio::sync::Notify>,
         gate: Arc<tokio::sync::Notify>,
         drain: JoinHandle<()>,
+        drain_stop: tokio_util::sync::CancellationToken,
     }
 
     /// A running worker whose connection has just ended, so its drain task
@@ -7412,7 +7532,7 @@ cursor-acp-bridge = "agent acp"
             )
             .await;
         let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(4);
-        let drain = sup.start_drain_task(session_id.into(), lease, inbound_rx);
+        let (drain_stop, drain) = sup.start_drain_task(session_id.into(), lease, inbound_rx);
         drop(inbound_tx);
         RespawnFixture {
             sup,
@@ -7421,7 +7541,47 @@ cursor-acp-bridge = "agent acp"
             entered,
             gate,
             drain,
+            drain_stop,
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn detach_waits_for_active_respawn_and_preserves_runner() {
+        let _home = isolate_home();
+        let fixture = respawn_fixture("s-detach-respawn").await;
+        fixture.entered.notified().await;
+        {
+            let mut workers = fixture.sup.workers.lock().await;
+            let handle = workers.get_mut("s-detach-respawn").unwrap();
+            handle.drain_task = Some(fixture.drain);
+            handle.drain_stop = fixture.drain_stop;
+        }
+        let sup = fixture.sup.clone();
+        let mut detached = tokio::spawn(async move { sup.detach_all().await });
+        tokio::select! {
+            result = &mut detached => panic!("detach abandoned an active launch: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        fixture.gate.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), detached)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            fixture.control.is_alive(4343),
+            "detach killed the completed replacement"
+        );
+        assert!(
+            fixture.control.signals().is_empty(),
+            "detach must not signal either runner"
+        );
+        assert!(!fixture
+            .sup
+            .workers
+            .lock()
+            .await
+            .contains_key("s-detach-respawn"));
     }
 
     fn stopped_reasons(sink: &VecSink, session_id: &str) -> Vec<String> {
@@ -7780,44 +7940,6 @@ cursor-acp-bridge = "agent acp"
         assert!(crate::process::worker_registry::load("s-orphan")
             .unwrap()
             .is_none());
-    }
-
-    /// A runner that outlived SIGKILL is retried each tick; once it is dead
-    /// but its record cannot be read (here the path is a directory), the
-    /// bounded retry releases the session instead of pinning it in
-    /// `stopping` until the daemon restarts.
-    #[tokio::test(start_paused = true)]
-    #[serial_test::serial]
-    async fn a_dead_runner_with_an_unreadable_record_is_released_after_the_retry_cap() {
-        let _home = isolate_home();
-        let control = Arc::new(FakeProcessControl::default());
-        control.immortal(5757);
-        let sup = Supervisor::new(VecSink::new()).with_process_control(control.clone());
-        save_record("s-stuck", 5757, 4);
-
-        sup.shutdown("s-stuck").await.expect("stop is accepted");
-        assert_eq!(sup.worker_state("s-stuck").await, AcpWorkerState::Stopping);
-
-        control.exit(5757);
-        let record = crate::process::worker_registry::record_path("s-stuck").unwrap();
-        std::fs::remove_file(&record).unwrap();
-        std::fs::create_dir_all(&record).unwrap();
-
-        // The stop itself was attempt one; the cap counts retries after it.
-        for _ in 1..TEARDOWN_RETRY_CAP {
-            sup.retry_pending_teardowns().await;
-            assert_eq!(
-                sup.worker_state("s-stuck").await,
-                AcpWorkerState::Stopping,
-                "an unsettled record keeps the session owned within the cap"
-            );
-        }
-        sup.retry_pending_teardowns().await;
-        assert_eq!(
-            sup.worker_state("s-stuck").await,
-            AcpWorkerState::Absent,
-            "past the cap a dead runner's session is released"
-        );
     }
 
     /// Regression: `publish_startup_error` and a subsequent drain-task

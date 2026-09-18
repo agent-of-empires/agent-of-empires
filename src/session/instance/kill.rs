@@ -1,26 +1,23 @@
 //! Tearing a session down.
 
 use super::*;
+pub(crate) struct PiSidecarUpdate {
+    session_id: Option<String>,
+    path: Option<String>,
+}
+
+impl PiSidecarUpdate {
+    pub(crate) fn apply(self, instance: &mut Instance) {
+        if let Some(id) = self.session_id {
+            instance.agent_session_id = Some(id);
+        }
+        if let Some(path) = self.path {
+            instance.pi_session_path = Some(path);
+        }
+    }
+}
 
 impl Instance {
-    /// Persist the conversation Pi's extension last published, before the
-    /// sidecar is cleaned up with the rest of the instance dir.
-    ///
-    /// Without this a CLI-only lifecycle loses a `/new`: no poller is running
-    /// to observe it, and by the next launch the sidecar is gone.
-    /// Record the transcript path for a conversation whose id has not moved,
-    /// which is the common case: the pane published a path this launch and the
-    /// row was already on that conversation.
-    fn persist_pi_session_path(&self, storage: &crate::session::storage::Storage) {
-        let Some(path) = self.pi_published_session_path() else {
-            return;
-        };
-        if self.pi_session_path.as_deref() == Some(path.as_str()) {
-            return;
-        }
-        self.store_pi_session_path(storage, &path);
-    }
-
     /// Call [`Self::flush_pi_sidecar_conversation`] using this session's storage.
     pub(super) fn flush_pi_sidecar_if_published(&mut self) {
         if self.resolved_capture_backend() != Some(crate::agents::SessionCaptureBackend::Pi) {
@@ -32,7 +29,7 @@ impl Instance {
         else {
             return;
         };
-        self.flush_pi_sidecar_conversation(&storage);
+        let _ = self.flush_pi_sidecar_conversation(&storage);
         // Keep the in-memory row with disk: a restart reads it moments later.
         if let Ok(instances) = storage.load() {
             if let Some(row) = instances.iter().find(|i| i.id == self.id) {
@@ -42,35 +39,51 @@ impl Instance {
         }
     }
 
-    pub(super) fn flush_pi_sidecar_conversation(&self, storage: &crate::session::storage::Storage) {
+    pub(crate) fn read_pi_sidecar_update(&self) -> Option<PiSidecarUpdate> {
         if !self.uses_pi_session_sidecar() {
-            return;
+            return None;
         }
-        // No freshness window here: this is the last read before the sidecar
-        // is deleted, and an idle pane's `/new` can be hours old.
-        let Some(published) = self.pi_published_session_id(true) else {
-            return;
-        };
+        // The final read has no freshness window: an idle pane's /new may be old.
+        let published = self.pi_published_session_id(true)?;
+        let path = self.pi_published_session_path();
         if self.agent_session_id.as_deref() == Some(published.as_str()) {
-            self.persist_pi_session_path(storage);
-            return;
-        }
-        let published_path = self.pi_published_session_path();
-        if let Err(error) = storage.update(|instances, _| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == self.id) {
-                inst.agent_session_id = Some(published.clone());
-                if published_path.is_some() {
-                    inst.pi_session_path = published_path.clone();
-                }
+            if path.is_none() || path == self.pi_session_path {
+                return None;
             }
-            Ok(())
-        }) {
-            tracing::warn!(
-                target: "session.store",
-                instance = %self.id,
-                "could not persist the Pi conversation published at stop: {error}",
-            );
+            return Some(PiSidecarUpdate {
+                session_id: None,
+                path,
+            });
         }
+        Some(PiSidecarUpdate {
+            session_id: Some(published),
+            path,
+        })
+    }
+
+    pub(super) fn flush_pi_sidecar_conversation(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+    ) -> Result<()> {
+        let Some(update) = self.read_pi_sidecar_update() else {
+            return Ok(());
+        };
+        storage.update(|instances, _| {
+            let inst = instances
+                .iter_mut()
+                .find(|i| i.id == self.id)
+                .ok_or(LifecycleReservationError::Superseded)?;
+            update.apply(inst);
+            Ok(())
+        })?;
+        let row = storage
+            .load()?
+            .into_iter()
+            .find(|row| row.id == self.id)
+            .ok_or(LifecycleReservationError::Superseded)?;
+        self.agent_session_id = row.agent_session_id;
+        self.pi_session_path = row.pi_session_path;
+        Ok(())
     }
 
     /// Tear down the current tmux session cleanly so a fresh
@@ -112,7 +125,7 @@ impl Instance {
         Ok(())
     }
 
-    pub(crate) fn kill_clean(&self) -> Result<()> {
+    pub(crate) fn kill_clean(&self) -> Result<u64> {
         let profile = self.effective_profile();
         let storage = crate::session::storage::Storage::new(&profile, self.resolve_file_watch())
             .context("failed to open lifecycle lock storage")?;
@@ -120,17 +133,23 @@ impl Instance {
             .acquire_instance_lifecycle_lock(&self.id)
             .context("failed to acquire instance kill lock")?;
         let mut lifecycle = self.clone();
-        lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)?;
+        let generation =
+            lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)?;
         match self.kill_clean_locked() {
-            Ok(()) => lifecycle.commit_lifecycle_status(
-                &storage,
-                LifecycleOperation::Stop,
-                Status::Stopped,
-            ),
+            Ok(()) => {
+                lifecycle.commit_lifecycle_status(
+                    &storage,
+                    LifecycleOperation::Stop,
+                    generation,
+                    Status::Stopped,
+                )?;
+                Ok(generation)
+            }
             Err(error) => {
                 let _ = lifecycle.commit_lifecycle_status(
                     &storage,
                     LifecycleOperation::Stop,
+                    generation,
                     Status::Error,
                 );
                 Err(error)
@@ -140,11 +159,7 @@ impl Instance {
 
     pub(crate) fn kill_locked(&self) -> Result<()> {
         self.stop_poller();
-        let session = self.tmux_session()?;
-        if session.exists() {
-            session.kill()?;
-        }
-        Ok(())
+        self.tmux_session()?.kill()
     }
 
     pub fn kill(&self) -> Result<()> {
@@ -155,17 +170,20 @@ impl Instance {
             .acquire_instance_lifecycle_lock(&self.id)
             .context("failed to acquire instance kill lock")?;
         let mut lifecycle = self.clone();
-        lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)?;
+        let generation =
+            lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)?;
         match self.kill_locked() {
             Ok(()) => lifecycle.commit_lifecycle_status(
                 &storage,
                 LifecycleOperation::Stop,
+                generation,
                 Status::Stopped,
             ),
             Err(error) => {
                 let _ = lifecycle.commit_lifecycle_status(
                     &storage,
                     LifecycleOperation::Stop,
+                    generation,
                     Status::Error,
                 );
                 Err(error)
@@ -173,11 +191,7 @@ impl Instance {
         }
     }
 
-    /// Kill every tmux session owned by this instance (agent, web
-    /// terminal, container terminal, tool sub-sessions). Best-effort
-    /// and silent; agent/terminal/container terminal failures log at
-    /// `debug!` target `session.tmux_cleanup`. Tool sub-sessions are
-    /// silent by design via `kill_all_tool_sessions_for_id`.
+    /// Best-effort coordinated stop of the agent and every ancillary tmux session.
     pub fn kill_all_tmux_sessions(&self) {
         let profile = self.effective_profile();
         let storage =
@@ -217,10 +231,20 @@ impl Instance {
             );
             return;
         }
-        self.kill_all_tmux_sessions_locked();
-        if let Err(error) =
-            lifecycle.commit_lifecycle_status(&storage, LifecycleOperation::Stop, Status::Stopped)
-        {
+        let stopped = self.kill_all_tmux_sessions_locked();
+        if let Err(error) = &stopped {
+            tracing::warn!(target: "session.tmux_cleanup", session_id = %self.id, %error, "tmux teardown failed");
+        }
+        if let Err(error) = lifecycle.commit_lifecycle_status(
+            &storage,
+            LifecycleOperation::Stop,
+            lifecycle.lifecycle_generation,
+            if stopped.is_ok() {
+                Status::Stopped
+            } else {
+                Status::Error
+            },
+        ) {
             tracing::warn!(
                 target: "session.tmux_cleanup",
                 session_id = %self.id,
@@ -230,41 +254,23 @@ impl Instance {
         }
     }
 
-    /// Kill every tmux session owned by this instance while the caller holds
-    /// the selected profile's per-instance lifecycle lock.
-    ///
-    /// Destructive deletion keeps that guard across tmux/container/worktree
-    /// teardown and the durable row removal, so it must use this helper rather
-    /// than reacquiring the non-reentrant lock via [`Self::kill_all_tmux_sessions`].
-    pub(crate) fn kill_all_tmux_sessions_locked(&self) {
-        self.kill_all_tmux_sessions_uncoordinated();
+    /// Caller holds the per-instance lifecycle lock through teardown and commit.
+    pub(crate) fn kill_all_tmux_sessions_locked(&self) -> Result<()> {
+        self.kill_all_tmux_sessions_uncoordinated()
     }
 
-    /// Tear down tmux resources when no durable lifecycle row exists.
-    ///
-    /// Used after force-removal and when rolling back an instance that failed
-    /// before its row was committed. With no row, lifecycle reservation is
-    /// impossible; callers must already know the id cannot race a launch.
-    pub(crate) fn kill_all_tmux_sessions_without_lifecycle_row(&self) {
-        self.kill_all_tmux_sessions_uncoordinated();
+    /// Caller has excluded launches for an id without a durable lifecycle row.
+    pub(crate) fn kill_all_tmux_sessions_without_lifecycle_row(&self) -> Result<()> {
+        self.kill_all_tmux_sessions_uncoordinated()
     }
 
-    fn kill_all_tmux_sessions_uncoordinated(&self) {
-        if let Err(e) = self.kill_locked() {
-            tracing::debug!(
-                target: "session.tmux_cleanup",
-                session_id = %self.id,
-                kind = "agent",
-                error = %e,
-                "kill_all_tmux_sessions_uncoordinated: kill failed"
-            );
-        }
-        self.kill_ancillary_tmux_sessions_locked();
+    fn kill_all_tmux_sessions_uncoordinated(&self) -> Result<()> {
+        self.kill_locked()?;
+        self.kill_ancillary_tmux_sessions_locked()
     }
 
-    pub(crate) fn kill_ancillary_tmux_sessions_locked(&self) {
-        crate::tmux::kill_all_terminals_for_id(&self.id);
-        crate::tmux::kill_all_tool_sessions_for_id(&self.id);
+    pub(crate) fn kill_ancillary_tmux_sessions_locked(&self) -> Result<()> {
+        crate::tmux::utils::kill_ancillary_sessions_for_id(&self.id)
     }
 
     /// Kill every tmux session owned by this instance EXCEPT the agent
@@ -308,7 +314,9 @@ impl Instance {
             );
             return;
         }
-        self.kill_ancillary_tmux_sessions_locked();
+        if let Err(error) = self.kill_ancillary_tmux_sessions_locked() {
+            tracing::warn!(target: "session.tmux_cleanup", session_id = %self.id, %error, "ancillary tmux teardown failed");
+        }
         if let Err(error) =
             lifecycle.release_lifecycle_reservation(&storage, LifecycleOperation::Stop)
         {
@@ -321,6 +329,11 @@ impl Instance {
         }
     }
 
+    pub(crate) fn stop_resources_locked(&self) -> Result<()> {
+        self.kill_locked()?;
+        crate::session::worktree_edit::stop_sandbox_container(&self.id, self.is_sandboxed())
+    }
+
     /// Stop the session and its sandbox container under the same lifecycle
     /// lock used by launch/restart.
     pub fn stop(&self) -> Result<()> {
@@ -331,18 +344,17 @@ impl Instance {
             .acquire_instance_lifecycle_lock(&self.id)
             .context("failed to acquire instance stop lock")?;
         let mut lifecycle = self.clone();
-        lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)?;
-        let teardown = self.kill_locked().and_then(|()| {
-            crate::session::worktree_edit::stop_sandbox_container(&self.id, self.is_sandboxed())
-        });
-        match teardown {
+        let generation =
+            lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)?;
+        match self.stop_resources_locked() {
             Ok(()) => {
                 lifecycle.commit_lifecycle_status(
                     &storage,
                     LifecycleOperation::Stop,
+                    generation,
                     Status::Stopped,
                 )?;
-                self.flush_pi_sidecar_conversation(&storage);
+                lifecycle.flush_pi_sidecar_if_published();
                 crate::hooks::cleanup_hook_status_dir(&self.id);
                 Ok(())
             }
@@ -350,6 +362,7 @@ impl Instance {
                 let _ = lifecycle.commit_lifecycle_status(
                     &storage,
                     LifecycleOperation::Stop,
+                    generation,
                     Status::Error,
                 );
                 Err(error)
@@ -404,7 +417,7 @@ mod tests {
             "the fixture must be past the freshness window"
         );
 
-        inst.flush_pi_sidecar_conversation(&storage);
+        inst.flush_pi_sidecar_conversation(&storage).unwrap();
 
         assert_eq!(
             storage.load().unwrap()[0].agent_session_id.as_deref(),
@@ -442,7 +455,7 @@ mod tests {
         let published = "01a05234-8889-72e2-a7c9-7ebc27b25b78";
         crate::hooks::write_session_id_via_guard(&inst.id, published).unwrap();
 
-        inst.flush_pi_sidecar_conversation(&storage);
+        inst.flush_pi_sidecar_conversation(&storage).unwrap();
 
         assert_eq!(
             storage.load().unwrap()[0].agent_session_id.as_deref(),
@@ -474,7 +487,7 @@ mod tests {
             .unwrap();
         crate::hooks::write_session_id_via_guard(&inst.id, "published-id").unwrap();
 
-        inst.flush_pi_sidecar_if_published();
+        inst.flush_pi_sidecar_conversation(&storage).unwrap();
 
         assert_eq!(
             storage.load().unwrap()[0].agent_session_id.as_deref(),

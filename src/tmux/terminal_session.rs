@@ -159,18 +159,46 @@ impl PairedTerminal {
         index: u32,
         display_only: bool,
     ) -> String {
+        Self::with_name_shape(kind, id, title, index, |derived, shape| {
+            if display_only {
+                crate::tmux::session_name_for_display(derived, shape)
+            } else {
+                crate::tmux::live_session_name(derived, shape)
+            }
+        })
+    }
+
+    fn with_name_shape<R>(
+        kind: TerminalKind,
+        id: &str,
+        title: &str,
+        index: u32,
+        resolve: impl FnOnce(&str, &crate::tmux::NameShape<'_>) -> R,
+    ) -> R {
         let derived = Self::generate_name(kind, id, title, index);
         let suffix = Self::name_suffix(id, index);
-        let shape = crate::tmux::NameShape {
-            prefix: kind.prefix(),
-            suffix: &suffix,
-            kind: kind.session_kind(),
-        };
-        if display_only {
-            crate::tmux::session_name_for_display(&derived, &shape)
-        } else {
-            crate::tmux::live_session_name(&derived, &shape)
-        }
+        resolve(
+            &derived,
+            &crate::tmux::NameShape {
+                prefix: kind.prefix(),
+                suffix: &suffix,
+                kind: kind.session_kind(),
+            },
+        )
+    }
+
+    fn from_snapshot(
+        kind: TerminalKind,
+        id: &str,
+        title: &str,
+        index: u32,
+        panes: &std::collections::HashMap<String, crate::tmux::PaneMetadata>,
+    ) -> Result<Self> {
+        let name = Self::with_name_shape(kind, id, title, index, |derived, shape| {
+            crate::tmux::pane_metadata_for_shape(panes, derived, shape)
+                .map(|metadata| metadata.map_or(derived, |(name, _)| name).to_owned())
+        })?;
+        Ok(Self { name, kind })
     }
 
     fn new(kind: TerminalKind, id: &str, title: &str, index: u32) -> Self {
@@ -248,15 +276,14 @@ impl PairedTerminal {
             effective_cmd.as_deref(),
             size,
         );
-        append_remain_on_exit_args(&mut args, &self.name);
-        append_pane_base_index_args(&mut args, &self.name);
-        append_window_size_args(&mut args, &self.name);
-        // `default_shell` is `Some` only when `which` resolved an existing
-        // executable, so pinning it can never fail `new-session`.
+        let target = format!("={}:", self.name);
+        append_remain_on_exit_args(&mut args, &target);
+        append_pane_base_index_args(&mut args, &target);
+        append_window_size_args(&mut args, &target);
         if let Some(shell) = default_shell.as_deref() {
-            append_default_shell_args(&mut args, &self.name, shell);
+            append_default_shell_args(&mut args, &target, shell);
         }
-        append_tmux_setting_args(&mut args, &self.name, &config);
+        append_tmux_setting_args(&mut args, &target, &config);
         crate::tmux::append_session_kind_args(&mut args, &self.name, self.kind.session_kind());
 
         let output = crate::tmux::tmux_command().args(&args).output()?;
@@ -278,11 +305,6 @@ impl PairedTerminal {
     }
 
     fn kill(&self) -> Result<()> {
-        if !self.exists() {
-            return Ok(());
-        }
-
-        // Kill the entire process tree first to ensure child processes are terminated
         if let Some(pane_pid) = self.get_pane_pid() {
             process::kill_process_tree(pane_pid);
         }
@@ -299,35 +321,7 @@ impl PairedTerminal {
     }
 
     fn attach(&self) -> Result<()> {
-        if !self.exists() {
-            bail!("{} does not exist: {}", self.kind.label(), self.name);
-        }
-
-        if crate::tmux::utils::inside_tmux() {
-            let status = crate::tmux::tmux_command()
-                .args(["switch-client", "-t", &self.name])
-                .status()?;
-
-            if !status.success() {
-                let status = crate::tmux::tmux_command()
-                    .args(["attach-session", "-t", &self.name])
-                    .status()?;
-
-                if !status.success() {
-                    bail!("Failed to attach to {}", self.kind.label());
-                }
-            }
-        } else {
-            let status = crate::tmux::tmux_command()
-                .args(["attach-session", "-t", &self.name])
-                .status()?;
-
-            if !status.success() {
-                bail!("Failed to attach to {}", self.kind.label());
-            }
-        }
-
-        Ok(())
+        super::Session::from_name(&self.name).attach()
     }
 }
 
@@ -358,6 +352,29 @@ impl TerminalSession {
     /// [`Self::resolve_name`] for the web dashboard's additional terminal tabs.
     pub fn resolve_name_indexed(id: &str, title: &str, index: u32) -> String {
         PairedTerminal::resolve_name(TerminalKind::Host, id, title, index)
+    }
+
+    pub(crate) fn metadata_in<'a>(
+        id: &str,
+        title: &str,
+        index: u32,
+        panes: &'a std::collections::HashMap<String, crate::tmux::PaneMetadata>,
+    ) -> Result<Option<(std::borrow::Cow<'a, str>, &'a crate::tmux::PaneMetadata)>> {
+        PairedTerminal::with_name_shape(TerminalKind::Host, id, title, index, |derived, shape| {
+            Ok(crate::tmux::pane_metadata_for_shape(panes, derived, shape)?
+                .map(|(name, metadata)| (std::borrow::Cow::Borrowed(name), metadata)))
+        })
+    }
+
+    pub(crate) fn from_snapshot(
+        id: &str,
+        title: &str,
+        index: u32,
+        panes: &std::collections::HashMap<String, crate::tmux::PaneMetadata>,
+    ) -> Result<Self> {
+        Ok(Self {
+            inner: PairedTerminal::from_snapshot(TerminalKind::Host, id, title, index, panes)?,
+        })
     }
 
     /// [`Self::resolve_name`] for render paths: snapshot-only, never
@@ -441,6 +458,35 @@ impl ContainerTerminalSession {
         PairedTerminal::resolve_name(TerminalKind::Container, id, title, index)
     }
 
+    pub(crate) fn metadata_in<'a>(
+        id: &str,
+        title: &str,
+        index: u32,
+        panes: &'a std::collections::HashMap<String, crate::tmux::PaneMetadata>,
+    ) -> Result<Option<(std::borrow::Cow<'a, str>, &'a crate::tmux::PaneMetadata)>> {
+        PairedTerminal::with_name_shape(
+            TerminalKind::Container,
+            id,
+            title,
+            index,
+            |derived, shape| {
+                Ok(crate::tmux::pane_metadata_for_shape(panes, derived, shape)?
+                    .map(|(name, metadata)| (std::borrow::Cow::Borrowed(name), metadata)))
+            },
+        )
+    }
+
+    pub(crate) fn from_snapshot(
+        id: &str,
+        title: &str,
+        index: u32,
+        panes: &std::collections::HashMap<String, crate::tmux::PaneMetadata>,
+    ) -> Result<Self> {
+        Ok(Self {
+            inner: PairedTerminal::from_snapshot(TerminalKind::Container, id, title, index, panes)?,
+        })
+    }
+
     /// [`Self::resolve_name`] for render paths: snapshot-only, never
     /// refreshing.
     pub fn resolve_name_for_display(id: &str, title: &str) -> String {
@@ -489,49 +535,6 @@ impl ContainerTerminalSession {
     pub fn attach(&self) -> Result<()> {
         self.inner.attach()
     }
-}
-
-/// Kill every paired terminal tmux session (host and container, any index)
-/// belonging to `id`. The single-index `kill` methods only target one
-/// deterministic name; this scans the live session list so the multi-terminal
-/// web tabs (`_t{N}` suffixes) and any title-change orphans are all reaped on
-/// session teardown. Mirrors [`crate::tmux::kill_all_tool_sessions_for_id`].
-pub fn kill_all_terminals_for_id(id: &str) {
-    let needle = format!("_{}", truncate_id(id, 8));
-
-    let output = crate::tmux::tmux_query_command()
-        .args(["list-sessions", "-F", "#{session_name}"])
-        .output();
-
-    if let Ok(out) = output {
-        if out.status.success() {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            for line in stdout.lines() {
-                if !line.starts_with(TERMINAL_PREFIX)
-                    && !line.starts_with(CONTAINER_TERMINAL_PREFIX)
-                {
-                    continue;
-                }
-                // The id segment is at the end for index 0, or immediately
-                // before the `_t{N}` suffix for additional terminals.
-                let Some(pos) = line.rfind(&needle) else {
-                    continue;
-                };
-                let after = &line[pos + needle.len()..];
-                if !after.is_empty() && !after.starts_with("_t") {
-                    continue;
-                }
-                if let Some(pid) = process::get_pane_pid(line) {
-                    process::kill_process_tree(pid);
-                }
-                let _ = crate::tmux::tmux_command()
-                    .args(["kill-session", "-t", line])
-                    .output();
-            }
-        }
-    }
-
-    refresh_session_cache();
 }
 
 #[cfg(test)]

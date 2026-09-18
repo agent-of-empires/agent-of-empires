@@ -1,11 +1,4 @@
-//! E2E coverage for the serve dialog state machine.
-//!
-//! Targeted regression tests for the `R`-key ModePicker + Confirm flow
-//! introduced with the Tailscale Funnel transport picker. Run via:
-//!
-//! ```sh
-//! cargo test --features e2e-tests --test e2e -- tui_serve_dialog
-//! ```
+//! Real daemon lifecycle and serve-dialog flows.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -31,47 +24,1771 @@ fn pid_alive(pid: i32) -> bool {
     nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
 }
 
-/// Pressing `R` from the home screen opens the serve ModePicker,
-/// which must render both cards (Local + Internet) and surface the
-/// transport-picker-deferred hint on the Tunnel card ("Pick transport
-/// on next screen.").
 #[test]
 #[parallel]
-fn tui_serve_dialog_opens_to_mode_picker() {
+fn tui_disconnect_hides_sessions_and_explicit_reconnect_restores_them() {
+    require_tmux!();
+    let mut h = TuiTestHarness::new_in_tmp("offline_reconnect");
+    h.stop_daemon_on_drop();
+    let row = agent_of_empires::session::Instance::new(
+        "offline-visible-session",
+        h.project_path().to_str().unwrap(),
+    );
+    let app = crate::harness::app_dir_in(h.home_path());
+    std::fs::write(
+        app.join("profiles/default/sessions.json"),
+        serde_json::to_vec(&[row]).unwrap(),
+    )
+    .unwrap();
+    h.spawn_tui();
+    h.wait_for("offline-visible-session");
+    let stopped = h.run_cli(&["serve", "--stop"]);
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    h.wait_for("Runtime unavailable");
+    assert!(!h.capture_screen().contains("offline-visible-session"));
+    h.send_keys("n");
+    assert!(h.capture_screen().contains("Runtime unavailable"));
+    h.send_keys("r");
+    h.wait_for_timeout("offline-visible-session", Duration::from_secs(30));
+    assert!(!h.capture_screen().contains("Runtime unavailable"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[parallel]
+async fn daemon_group_move_preserves_live_terminal_and_restarts_in_target_profile() {
+    use agent_of_empires::{
+        daemon::{
+            CreateProfileBody, DaemonClient, GroupLocation, MoveGroupBody, ProfileMutation,
+            RuntimeSnapshot, SessionMutation, StartSessionBody,
+        },
+        session::{Group, Instance, Status},
+    };
+    require_tmux!();
+    let mut h = TuiTestHarness::new_in_tmp("native_group_move");
+    h.set_env("AGENT_OF_EMPIRES_PROFILE", "default");
+    h.stop_daemon_on_drop();
+    let bin = h.install_path_command("group-agent");
+    let agent = bin.join("group-agent");
+    std::fs::write(&agent, "#!/bin/sh\nwhile true; do sleep 1; done\n").unwrap();
+    let app = crate::harness::app_dir_in(h.home_path());
+    let config_path = app.join("config.toml");
+    let mut config = std::fs::read_to_string(&config_path).unwrap();
+    config.push_str(&format!(
+        "\n[session.custom_agents]\ngroup-agent = {}\n",
+        serde_json::to_string(&agent.to_str().unwrap()).unwrap()
+    ));
+    std::fs::write(config_path, config).unwrap();
+    let mut row = Instance::new("group live", h.project_path().to_str().unwrap());
+    row.tool = "group-agent".into();
+    row.command = agent.to_string_lossy().into_owned();
+    row.status = Status::Stopped;
+    row.group_path = "team/sub".into();
+    let id = row.id.clone();
+    std::fs::write(
+        app.join("profiles/default/sessions.json"),
+        serde_json::to_vec(&[row]).unwrap(),
+    )
+    .unwrap();
+    let mut team = Group::new("team", "team");
+    team.collapsed = true;
+    std::fs::write(
+        app.join("profiles/default/groups.json"),
+        serde_json::to_vec(&[team]).unwrap(),
+    )
+    .unwrap();
+    let migrated = h.run_cli(&["migrate"]);
+    assert!(
+        migrated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&migrated.stderr)
+    );
+    std::fs::write(app.join(".schema_version"), b"30").unwrap();
+    std::fs::remove_file(app.join("pending-purge-owners.json")).unwrap();
+    let started = h.run_cli(&["serve", "--core-only", "--daemon"]);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let sdk = DaemonClient::new_unix(app.join("daemon/api.sock")).unwrap();
+    let epoch = sdk.runtime_info().await.unwrap().epoch;
+    sdk.mutate_profile(
+        &ProfileMutation::Create(CreateProfileBody {
+            name: "destination".into(),
+        }),
+        &epoch,
+    )
+    .await
+    .unwrap();
+    sdk.mutate_session(
+        &id,
+        &SessionMutation::Start(StartSessionBody::default()),
+        &epoch,
+    )
+    .await
+    .unwrap();
+    let panes = || {
+        let output = std::process::Command::new("tmux")
+            .arg("-S")
+            .arg(h.home_path().join("tmux.sock"))
+            .args([
+                "list-panes",
+                "-a",
+                "-F",
+                "#{pane_id} #{pane_pid} #{pane_current_path}",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+    let original_panes = panes();
+    let http = reqwest::Client::builder()
+        .unix_socket(app.join("daemon/api.sock"))
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    sdk.create_group(
+        &GroupLocation {
+            profile: "default".into(),
+            path: "empty".into(),
+        },
+        &epoch,
+    )
+    .await
+    .unwrap();
+    for _ in 0..2 {
+        sdk.collapse_group(
+            &agent_of_empires::daemon::CollapseGroupBody {
+                group: GroupLocation {
+                    profile: "default".into(),
+                    path: "empty".into(),
+                },
+                collapsed: true,
+            },
+            &epoch,
+        )
+        .await
+        .unwrap();
+    }
+    for (source_profile, source_path, target_profile, target_path) in [
+        ("default", "team", "destination", "moved"),
+        ("destination", "moved", "destination", "renamed"),
+        ("default", "empty", "destination", "empty moved"),
+    ] {
+        let receipt = sdk
+            .move_group(
+                &MoveGroupBody {
+                    source: GroupLocation {
+                        profile: source_profile.into(),
+                        path: source_path.into(),
+                    },
+                    target: GroupLocation {
+                        profile: target_profile.into(),
+                        path: target_path.into(),
+                    },
+                },
+                &epoch,
+            )
+            .await
+            .unwrap();
+        let snapshot: RuntimeSnapshot = http
+            .get("http://localhost/api/runtime/snapshot")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(snapshot.cursor.epoch, receipt.epoch);
+        assert!(snapshot.cursor.revision >= receipt.revision);
+        let moved = snapshot
+            .contents
+            .sessions
+            .iter()
+            .find(|row| row.id == id)
+            .unwrap();
+        assert_eq!(moved.profile, "destination");
+        assert_eq!(
+            moved.group_path,
+            if source_path == "team" {
+                "moved/sub"
+            } else {
+                "renamed/sub"
+            }
+        );
+        assert!(snapshot
+            .contents
+            .profiles
+            .iter()
+            .find(|profile| profile.name == target_profile)
+            .unwrap()
+            .groups
+            .iter()
+            .any(|group| group.path == target_path && group.collapsed));
+        assert_eq!(panes(), original_panes);
+    }
+    let rows: Vec<Instance> = serde_json::from_slice(
+        &std::fs::read(app.join("profiles/destination/sessions.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        rows.iter().find(|row| row.id == id).unwrap().group_path,
+        "renamed/sub"
+    );
+    sdk.mutate_session(&id, &SessionMutation::Stop, &epoch)
+        .await
+        .unwrap();
+    sdk.mutate_session(
+        &id,
+        &SessionMutation::Start(StartSessionBody::default()),
+        &epoch,
+    )
+    .await
+    .unwrap();
+    let restarted = panes();
+    assert!(String::from_utf8_lossy(&restarted).contains(h.project_path().to_str().unwrap()));
+    for (path, mode, retains_session) in [
+        (
+            "renamed",
+            agent_of_empires::daemon::DeleteGroupMode::KeepSessions,
+            true,
+        ),
+        (
+            "empty moved",
+            agent_of_empires::daemon::DeleteGroupMode::EmptyOnly,
+            false,
+        ),
+    ] {
+        let receipt = sdk
+            .delete_group(
+                &agent_of_empires::daemon::DeleteGroupBody {
+                    group: GroupLocation {
+                        profile: "destination".into(),
+                        path: path.into(),
+                    },
+                    mode,
+                },
+                &epoch,
+            )
+            .await
+            .unwrap();
+        let ids: Vec<_> = receipt
+            .outcome
+            .sessions
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            if retains_session {
+                vec![id.as_str()]
+            } else {
+                Vec::new()
+            }
+        );
+        let snapshot: RuntimeSnapshot = http
+            .get("http://localhost/api/runtime/snapshot")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(snapshot.cursor.epoch, receipt.cursor.epoch);
+        assert!(snapshot.cursor.revision >= receipt.cursor.revision);
+        let row = snapshot
+            .contents
+            .sessions
+            .iter()
+            .find(|row| row.id == id)
+            .unwrap();
+        assert_eq!(row.profile, "destination");
+        assert!(row.group_path.is_empty());
+        let prefix = format!("{path}/");
+        assert!(!snapshot
+            .contents
+            .profiles
+            .iter()
+            .find(|profile| profile.name == "destination")
+            .unwrap()
+            .groups
+            .iter()
+            .any(|group| group.path == path || group.path.starts_with(&prefix)));
+        assert_eq!(panes(), restarted);
+    }
+    sdk.mutate_session(&id, &SessionMutation::Stop, &epoch)
+        .await
+        .unwrap();
+    let purged = sdk
+        .purge_session(
+            &id,
+            &agent_of_empires::daemon::DeleteSessionBody::default(),
+            &epoch,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(purged.outcome, agent_of_empires::daemon::PurgeOutcome::Deleted { cleanup_errors, .. } if cleanup_errors.is_empty())
+    );
+    let snapshot: RuntimeSnapshot = http
+        .get("http://localhost/api/runtime/snapshot")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(snapshot.cursor.epoch, purged.cursor.epoch);
+    assert!(snapshot.cursor.revision >= purged.cursor.revision);
+    assert!(!snapshot.contents.sessions.iter().any(|row| row.id == id));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[parallel]
+async fn native_creation_hooks_preserve_borrowed_scratch_resources() {
+    use agent_of_empires::daemon::{
+        ApiErrorCode, CreateSessionBody, CreationTrustRequest, DaemonClient, DaemonClientError,
+        RUNTIME_EPOCH_HEADER,
+    };
+    use std::os::unix::fs::PermissionsExt;
+    require_tmux!();
+    if std::process::Command::new("curl")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("Skipping test: curl unavailable");
+        return;
+    }
+    let real_git = which::which("git").expect("git is available");
+    for stage in [
+        "on_create",
+        "post_checkout",
+        "checkout_failure",
+        "invalid_target",
+        "trust_before_git",
+        "cancel_on_launch",
+    ] {
+        let mut h = TuiTestHarness::new_in_tmp("native_creation_resources");
+        h.set_env("AGENT_OF_EMPIRES_PROFILE", "default");
+        h.stop_daemon_on_drop();
+        let bin = h.install_path_command("creation-agent");
+        let agent = bin.join("creation-agent");
+        std::fs::write(&agent, "#!/bin/sh\nexec sleep 120\n").unwrap();
+        let app = crate::harness::app_dir_in(h.home_path());
+        let config_path = app.join("config.toml");
+        let mut config = std::fs::read_to_string(&config_path).unwrap();
+        config.push_str(&format!(
+            "\n[session.custom_agents]\ncreation-agent = {}\n",
+            serde_json::to_string(agent.to_str().unwrap()).unwrap()
+        ));
+        std::fs::write(&config_path, &config).unwrap();
+        let failed_checkout = h.home_path().join("failed-checkout-path");
+        if stage == "checkout_failure" {
+            let git = h.install_path_command("git").join("git");
+            std::fs::write(&git, format!(
+            "#!/bin/sh\nif [ \"$1\" = worktree ] && [ \"$2\" = add ]; then printf preserved > \"$3/foreign-file\"; printf '%s' \"$3\" > {failed_checkout:?}; echo checkout-refused >&2; exit 1; fi\nexec {real_git:?} \"$@\"\n"
+        )).unwrap();
+        }
+        let daemon = h.run_cli(&["serve", "--core-only", "--daemon"]);
+        assert!(
+            daemon.status.success(),
+            "{}",
+            String::from_utf8_lossy(&daemon.stderr)
+        );
+        let socket = app.join("daemon/api.sock");
+        let sdk = DaemonClient::new_unix(&socket).unwrap();
+        let epoch = sdk.runtime_info().await.unwrap().epoch;
+        let owner_body: CreateSessionBody = serde_json::from_value(serde_json::json!({
+            "title":"scratch owner", "path":"", "tool":"creation-agent", "scratch":true,
+            "profile":"default",
+        }))
+        .unwrap();
+        let owner = sdk
+            .create_session(&owner_body, &epoch)
+            .await
+            .unwrap()
+            .outcome;
+        let marker = PathBuf::from(&owner.project_path).join("borrowed-resource");
+        std::fs::write(&marker, "must survive the owner purge").unwrap();
+        if stage != "on_create" {
+            let repo = git2::Repository::init(&owner.project_path).unwrap();
+            let signature = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
+            let tree_id = repo.index().unwrap().write_tree().unwrap();
+            let tree = repo.find_tree(tree_id).unwrap();
+            repo.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+                .unwrap();
+        }
+        if stage == "invalid_target" {
+            let blocked = h.home_path().join("not-a-directory");
+            std::fs::write(&blocked, "preserve the obstruction").unwrap();
+            config.push_str(&format!(
+                "\n[worktree]\npath_template = {}\n",
+                serde_json::to_string(blocked.join("checkout").to_str().unwrap()).unwrap()
+            ));
+            std::fs::write(&config_path, &config).unwrap();
+        }
+        let entered = h.home_path().join("launch-entered");
+        let release = h.home_path().join("launch-release");
+        if stage == "cancel_on_launch" {
+            let command = format!("touch {entered:?}; i=0; while [ ! -f {release:?} ] && [ \"$i\" -lt 200 ]; do i=$((i+1)); sleep 0.05; done; test -f {release:?}");
+            config.push_str(&format!(
+                "\n[hooks]\non_launch = [{}]\n",
+                serde_json::to_string(&command).unwrap()
+            ));
+            std::fs::write(&config_path, &config).unwrap();
+        }
+        let hook = h.home_path().join("purge-owner.sh");
+        std::fs::write(&hook, format!(r#"#!/bin/sh
+set -eu
+curl --max-time 5 -fsS --unix-socket "{socket}" -H '{header}: {epoch}' -H 'Content-Type: application/json' -X DELETE --data '{{}}' http://localhost/api/sessions/{id} > /dev/null
+"#, socket = socket.display(), header = RUNTIME_EPOCH_HEADER, id = owner.id)).unwrap();
+        if stage == "on_create" {
+            config.push_str(&format!(
+                "\n[hooks]\non_create = [{}]\n",
+                serde_json::to_string(&format!("sh {hook:?}")).unwrap()
+            ));
+            std::fs::write(&config_path, config).unwrap();
+        } else if stage == "post_checkout" {
+            let git_hook = PathBuf::from(&owner.project_path).join(".git/hooks/post-checkout");
+            std::fs::copy(&hook, &git_hook).unwrap();
+            std::fs::set_permissions(&git_hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let trust_seen = h.home_path().join("trust-seen");
+        if stage == "trust_before_git" {
+            let source = PathBuf::from(&owner.project_path);
+            let repo_config = source.join(".agent-of-empires/config.toml");
+            std::fs::create_dir_all(repo_config.parent().unwrap()).unwrap();
+            std::fs::write(repo_config, "[hooks]\non_create = [\"true\"]\n").unwrap();
+            let hooks = agent_of_empires::session::HooksConfig {
+                on_create: vec!["true".into()],
+                ..Default::default()
+            };
+            let hash = agent_of_empires::session::config::repo_config::compute_hooks_hash(&hooks);
+            let trust = app.join("trusted_repos.toml");
+            let git_hook = source.join(".git/hooks/post-checkout");
+            std::fs::write(&git_hook, format!(r#"#!/bin/sh
+if grep -Fq 'hooks_hash = "{hash}"' {trust:?}; then printf approved > {trust_seen:?}; else printf missing > {trust_seen:?}; fi
+"#)).unwrap();
+            std::fs::set_permissions(git_hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut borrower_body: CreateSessionBody = serde_json::from_value(serde_json::json!({
+            "title":"scratch borrower", "path":owner.project_path, "tool":"creation-agent",
+            "profile":"default",
+            "worktree_enabled": stage != "on_create",
+            "worktree_branch": (stage != "on_create").then_some("borrower"),
+            "create_new_branch": stage != "on_create",
+            "trust_hooks": (stage == "trust_before_git").then_some(true),
+        }))
+        .unwrap();
+        if stage == "trust_before_git" {
+            let source = PathBuf::from(&owner.project_path);
+            let mcp_path = source.join(".mcp.json");
+            let mcp = r#"{"mcpServers":{"local":{"command":"fixture-mcp","env":{"API_TOKEN":"secret-before-review"}},"remote":{"type":"http","url":"https://example.invalid/mcp","headers":{"Authorization":"secret-header"}}}}"#;
+            std::fs::write(&mcp_path, mcp).unwrap();
+            let request = CreationTrustRequest {
+                path: owner.project_path.clone(),
+                profile: Some("default".into()),
+                scratch: false,
+            };
+            let review = sdk.review_creation_trust(&request, &epoch).await.unwrap();
+            let wire = serde_json::to_string(&review).unwrap();
+            assert!(
+                wire.contains("API_TOKEN")
+                    && wire.contains("Authorization")
+                    && wire.contains("fixture-mcp")
+            );
+            assert!(!wire.contains("secret-before-review") && !wire.contains("secret-header"));
+            assert!(!app.join("trusted_repos.toml").exists());
+            borrower_body.trust_review = Some(review.fingerprint);
+            std::fs::write(
+                &mcp_path,
+                mcp.replace("secret-before-review", "secret-after-review"),
+            )
+            .unwrap();
+            assert!(matches!(sdk.create_session(&borrower_body, &epoch).await,
+                Err(DaemonClientError::Status { code: Some(ApiErrorCode::CreationTrustChanged), body, .. }) if body.is_empty()));
+            assert!(!app.join("trusted_repos.toml").exists());
+            let repo = git2::Repository::open(&source).unwrap();
+            assert!(repo
+                .find_branch("borrower", git2::BranchType::Local)
+                .is_err());
+            let rows = sdk.list_sessions(None).await.unwrap().sessions;
+            assert_eq!(
+                rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+                [owner.id.as_str()]
+            );
+            borrower_body.trust_review = Some(
+                sdk.review_creation_trust(&request, &epoch)
+                    .await
+                    .unwrap()
+                    .fingerprint,
+            );
+        }
+        let creation = if stage == "cancel_on_launch" {
+            let cancel = async {
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    while !entered.exists() {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                let rows = sdk.list_sessions(None).await.unwrap().sessions;
+                let pending = rows.iter().find(|row| row.id != owner.id).unwrap();
+                sdk.cancel_creation(&pending.id, &epoch).await.unwrap();
+                std::fs::write(&release, "continue").unwrap();
+            };
+            let (result, ()) = tokio::join!(sdk.create_session(&borrower_body, &epoch), cancel);
+            assert!(
+                matches!(&result, Err(DaemonClientError::Status { code: Some(ApiErrorCode::CreationCancelled), body, .. }) if body.is_empty())
+            );
+            result
+        } else {
+            sdk.create_session(&borrower_body, &epoch).await
+        };
+        if matches!(
+            stage,
+            "checkout_failure" | "invalid_target" | "cancel_on_launch"
+        ) {
+            assert!(creation.is_err());
+            if stage == "checkout_failure" {
+                let checkout = std::fs::read_to_string(&failed_checkout).unwrap();
+                assert_eq!(
+                    std::fs::read(PathBuf::from(checkout).join("foreign-file")).unwrap(),
+                    b"preserved"
+                );
+            }
+            let repo = git2::Repository::open(&owner.project_path).unwrap();
+            assert!(repo
+                .find_branch("borrower", git2::BranchType::Local)
+                .is_err());
+            let rows = sdk.list_sessions(None).await.unwrap().sessions;
+            assert_eq!(
+                rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+                vec![owner.id.as_str()]
+            );
+            assert_eq!(
+                std::fs::read_to_string(marker).unwrap(),
+                "must survive the owner purge"
+            );
+            continue;
+        }
+        let borrower = creation.unwrap().outcome;
+        assert_eq!(
+            std::fs::read_to_string(marker).unwrap(),
+            "must survive the owner purge"
+        );
+        let rows = sdk.list_sessions(None).await.unwrap().sessions;
+        if stage == "trust_before_git" {
+            assert_eq!(std::fs::read(&trust_seen).unwrap(), b"approved");
+            assert!(rows.iter().any(|row| row.id == owner.id));
+        } else {
+            assert!(!rows.iter().any(|row| row.id == owner.id));
+        }
+        assert!(rows.iter().any(|row| row.id == borrower.id));
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[parallel]
+async fn native_creation_progress_reports_phases_to_the_local_stream() {
+    use agent_of_empires::{
+        acp::client::DaemonEndpoint,
+        daemon::{
+            CreateSessionBody, CreationPhase, CreationProgress, DaemonClient, RuntimeConnection,
+            RuntimeEvent,
+        },
+    };
+    require_tmux!();
+    let mut h = TuiTestHarness::new_in_tmp("native_creation_progress");
+    h.set_env("AGENT_OF_EMPIRES_PROFILE", "default");
+    h.stop_daemon_on_drop();
+    let bin = h.install_path_command("progress-agent");
+    let agent = bin.join("progress-agent");
+    std::fs::write(&agent, "#!/bin/sh\nexec sleep 120\n").unwrap();
+    let app = crate::harness::app_dir_in(h.home_path());
+    let config_path = app.join("config.toml");
+    let release = h.home_path().join("hook-release");
+    // One line then block: the first output line must reach the stream even
+    // though the hook never finishes on its own.
+    let command = format!(
+        "echo building dependency graph; i=0; while [ ! -f {release:?} ] && [ \"$i\" -lt 400 ]; do i=$((i+1)); sleep 0.05; done"
+    );
+    let mut config = std::fs::read_to_string(&config_path).unwrap();
+    config.push_str(&format!(
+        "\n[session.custom_agents]\nprogress-agent = {}\n",
+        serde_json::to_string(agent.to_str().unwrap()).unwrap()
+    ));
+    config.push_str(&format!(
+        "\n[hooks]\non_create = [{}]\n",
+        serde_json::to_string(&command).unwrap()
+    ));
+    std::fs::write(&config_path, &config).unwrap();
+    let daemon = h.run_cli(&["serve", "--core-only", "--daemon"]);
+    assert!(
+        daemon.status.success(),
+        "{}",
+        String::from_utf8_lossy(&daemon.stderr)
+    );
+    let socket = app.join("daemon/api.sock");
+    let sdk = DaemonClient::new_unix(&socket).unwrap();
+    let epoch = sdk.runtime_info().await.unwrap().epoch;
+    let endpoint = DaemonEndpoint::local_unix(socket);
+    let mut connection = RuntimeConnection::connect(&endpoint, None).await.unwrap();
+    assert!(
+        connection.creation_progress().is_empty(),
+        "an idle daemon must not report progress"
+    );
+    let body: CreateSessionBody = serde_json::from_value(serde_json::json!({
+        "title": "progress", "path": "", "tool": "progress-agent", "scratch": true,
+        "profile": "default",
+    }))
+    .unwrap();
+
+    async fn read_progress(
+        connection: &mut RuntimeConnection,
+        ready: impl Fn(&CreationProgress) -> bool,
+    ) -> CreationProgress {
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(20), connection.next_event())
+                .await
+                .expect("creation progress arrived")
+                .expect("runtime stream stayed connected")
+            {
+                RuntimeEvent::Progress(progress) => {
+                    if let Some(entry) = progress.iter().find(|entry| ready(entry)) {
+                        return entry.clone();
+                    }
+                }
+                RuntimeEvent::Snapshot(_) => {}
+            }
+        }
+    }
+
+    let creator = sdk.clone();
+    let create_epoch = epoch.clone();
+    let create = tokio::spawn(async move { creator.create_session(&body, &create_epoch).await });
+    // The phase change publishes before the command starts, so wait for the
+    // frame that actually names the hook and its output.
+    let observed = read_progress(&mut connection, |entry| {
+        entry.phase == CreationPhase::CreateHooks
+            && !entry.cancelled
+            && entry.command.is_some()
+            && !entry.output.is_empty()
+    })
+    .await;
+    assert_eq!(
+        observed.command.as_deref(),
+        Some(command.as_str()),
+        "progress must name the running hook"
+    );
+    assert!(
+        observed
+            .output
+            .iter()
+            .any(|line| line.contains("building dependency graph")),
+        "progress must carry the hook's first line, got: {:?}",
+        observed.output
+    );
+    let pending = sdk
+        .list_sessions(None)
+        .await
+        .unwrap()
+        .sessions
+        .into_iter()
+        .find(|row| row.title == "progress")
+        .expect("the reservation is published while provisioning");
+    assert!(
+        sdk.cancel_creation(&pending.id, &epoch).await.is_ok(),
+        "a pending creation accepts cancellation"
+    );
+    let observed = read_progress(&mut connection, |entry| entry.cancelled).await;
+    assert_eq!(
+        observed.session_id, pending.id,
+        "the pending cancellation must name the creation it fences"
+    );
+    std::fs::write(&release, "continue").unwrap();
+    let cancelled = create.await.unwrap();
+    assert!(
+        cancelled.is_err(),
+        "a cancelled creation must not report success"
+    );
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(20), connection.next_event())
+            .await
+            .expect("progress cleared")
+            .expect("runtime stream stayed connected")
+        {
+            RuntimeEvent::Progress(progress) if progress.is_empty() => break,
+            _ => {}
+        }
+    }
+    assert!(connection.creation_progress().is_empty());
+    let rows = sdk.list_sessions(None).await.unwrap().sessions;
+    assert!(
+        !rows.iter().any(|row| row.id == pending.id),
+        "the cancelled creation left its reservation behind"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[parallel]
+async fn native_agent_hooks_can_reenter_without_releasing_launch_ownership() {
+    use agent_of_empires::{
+        daemon::{
+            DaemonClient, RuntimeSnapshot, StartSessionBody, RUNTIME_EPOCH_HEADER,
+            RUNTIME_REVISION_HEADER,
+        },
+        session::{Instance, Status},
+    };
+    require_tmux!();
+    if std::process::Command::new("curl")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("Skipping test: curl unavailable");
+        return;
+    }
+    for operation in ["ensure", "start"] {
+        let mut h = TuiTestHarness::new_in_tmp("native_agent_hooks");
+        h.set_env("AGENT_OF_EMPIRES_PROFILE", "default");
+        h.stop_daemon_on_drop();
+        let bin = h.install_path_command("hook-agent");
+        let agent = bin.join("hook-agent");
+        let launched = h.home_path().join("agent-launched");
+        std::fs::write(
+            &agent,
+            format!("#!/bin/sh\nprintf started >> {launched:?}\nexec sleep 120\n"),
+        )
+        .unwrap();
+        let hook = h.home_path().join("reenter.sh");
+        let completed = h.home_path().join("hook-completed");
+        let app = crate::harness::app_dir_in(h.home_path());
+        let config_path = app.join("config.toml");
+        let mut config = std::fs::read_to_string(&config_path).unwrap();
+        config.push_str(&format!(
+            "\n[session.custom_agents]\nhook-agent = {}\n[hooks]\non_launch = [{}]\n",
+            serde_json::to_string(&agent.to_str().unwrap()).unwrap(),
+            serde_json::to_string(&format!("sh {hook:?}")).unwrap(),
+        ));
+        std::fs::write(config_path, config).unwrap();
+        let mut row = Instance::new("hook launch", h.project_path().to_str().unwrap());
+        row.tool = "hook-agent".into();
+        row.command = agent.to_string_lossy().into_owned();
+        row.status = Status::Stopped;
+        let id = row.id.clone();
+        std::fs::write(
+            app.join("profiles/default/sessions.json"),
+            serde_json::to_vec(&[row]).unwrap(),
+        )
+        .unwrap();
+        let daemon = h.run_cli(&["serve", "--core-only", "--daemon"]);
+        assert!(
+            daemon.status.success(),
+            "{}",
+            String::from_utf8_lossy(&daemon.stderr)
+        );
+        let socket = app.join("daemon/api.sock");
+        let sdk = DaemonClient::new_unix(&socket).unwrap();
+        let epoch = sdk.runtime_info().await.unwrap().epoch;
+        let http = reqwest::Client::builder()
+            .unix_socket(socket.as_path())
+            .no_proxy()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .unwrap();
+        let terminal: serde_json::Value = http
+            .post(format!("http://localhost/api/sessions/{id}/terminal"))
+            .header(RUNTIME_EPOCH_HEADER, &epoch)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let terminal_name = terminal["tmux_session"].as_str().unwrap();
+        std::fs::write(&hook, format!(r#"#!/bin/sh
+set -eu
+if [ -f "{completed}" ]; then exit 0; fi
+curl --max-time 3 -fsS --unix-socket "{socket}" -H '{header}: {epoch}' -H 'Content-Type: application/json' --data '{{"name":"hook-created"}}' http://localhost/api/profiles > /dev/null
+test "$(curl --max-time 3 -sS -o /dev/null -w '%{{http_code}}' --unix-socket "{socket}" -H '{header}: {epoch}' -X POST http://localhost/api/sessions/{id}/stop)" = 409
+tmux -S "$AOE_TMUX_SOCKET" kill-session -t "={terminal_name}"
+printf done > "{completed}"
+"#, completed = completed.display(), socket = socket.display(), header = RUNTIME_EPOCH_HEADER)).unwrap();
+        let response = http
+            .post(format!("http://localhost/api/sessions/{id}/{operation}"))
+            .header(RUNTIME_EPOCH_HEADER, &epoch)
+            .json(&serde_json::json!({"size": {"cols": 137, "rows": 41}}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let receipt_epoch = response
+            .headers()
+            .get(RUNTIME_EPOCH_HEADER)
+            .expect("missing publication epoch")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let receipt_revision: u64 = response
+            .headers()
+            .get(RUNTIME_REVISION_HEADER)
+            .expect("missing publication revision")
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let started_response: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&completed).expect("hook could not reenter the daemon"),
+            "done"
+        );
+        if operation == "start" {
+            assert_eq!(
+                started_response["auxiliary"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|item| item["target"]["kind"] == "host" && item["target"]["index"] == 0)
+                    .and_then(|item| item["state"].as_str()),
+                Some("absent"),
+                "start republished a pre-hook observation"
+            );
+        }
+        let snapshot: RuntimeSnapshot = http
+            .get("http://localhost/api/runtime/snapshot")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(snapshot.cursor.epoch, receipt_epoch);
+        assert!(snapshot.cursor.revision >= receipt_revision);
+        let started = snapshot
+            .contents
+            .sessions
+            .iter()
+            .find(|row| row.id == id)
+            .unwrap();
+        assert!(started.lifecycle_reservation.is_none());
+        assert_eq!(
+            started.agent_pane.state,
+            agent_of_empires::session::PanePresence::Alive
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !launched.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "owner did not launch after its hook"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let ready = sdk
+            .ensure_agent(&id, &StartSessionBody::default(), &epoch)
+            .await
+            .unwrap();
+        assert_eq!(
+            started.agent_pane.tmux_session.as_deref(),
+            Some(ready.outcome.tmux_session.as_str())
+        );
+        let grid = std::process::Command::new("tmux")
+            .arg("-S")
+            .arg(h.home_path().join("tmux.sock"))
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                &format!("={}:^.0", ready.outcome.tmux_session),
+                "#{pane_width}x#{pane_height}",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            grid.status.success(),
+            "{}",
+            String::from_utf8_lossy(&grid.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&grid.stdout).trim(), "137x41");
+        assert_eq!(ready.cursor.epoch, epoch);
+        assert_eq!(
+            std::fs::read_to_string(&launched).unwrap(),
+            "started",
+            "warm ensure relaunched the agent"
+        );
+        if operation == "ensure" {
+            let first = agent_of_empires::tmux::Session::generate_name(&id, "first");
+            let second = agent_of_empires::tmux::Session::generate_name(&id, "second");
+            let tmux = |args: &[&str]| {
+                let output = std::process::Command::new("tmux")
+                    .arg("-S")
+                    .arg(h.home_path().join("tmux.sock"))
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            };
+            tmux(&[
+                "rename-session",
+                "-t",
+                &format!("={}:", ready.outcome.tmux_session),
+                &first,
+            ]);
+            tmux(&["new-session", "-d", "-s", &second, "sleep 120"]);
+            assert!(
+                sdk.ensure_agent(&id, &StartSessionBody::default(), &epoch)
+                    .await
+                    .is_err(),
+                "ambiguous existing agents admitted another launch"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&launched).unwrap(),
+                "started",
+                "ambiguous observation relaunched the agent"
+            );
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let observed: RuntimeSnapshot = http
+                    .get("http://localhost/api/runtime/snapshot")
+                    .send()
+                    .await
+                    .unwrap()
+                    .error_for_status()
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                let agent = &observed
+                    .contents
+                    .sessions
+                    .iter()
+                    .find(|row| row.id == id)
+                    .unwrap()
+                    .agent_pane;
+                if agent.state == agent_of_empires::session::PanePresence::Unknown {
+                    assert!(
+                        agent.tmux_session.is_none(),
+                        "unknown identity retained a transport target"
+                    );
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "ambiguous Agent remained attachable: {agent:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            tmux(&["kill-session", "-t", &format!("={second}:")]);
+            tmux(&[
+                "rename-session",
+                "-t",
+                &format!("={first}:"),
+                &ready.outcome.tmux_session,
+            ]);
+            assert!(h.run_cli(&["serve", "--stop"]).status.success());
+            let readonly = h.run_cli(&["serve", "--core-only", "--read-only", "--daemon"]);
+            assert!(
+                readonly.status.success(),
+                "{}",
+                String::from_utf8_lossy(&readonly.stderr)
+            );
+            let readonly_epoch = sdk.runtime_info().await.unwrap().epoch;
+            let viewing = sdk
+                .ensure_agent(&id, &StartSessionBody::default(), &readonly_epoch)
+                .await
+                .unwrap();
+            let killed = std::process::Command::new("tmux")
+                .arg("-S")
+                .arg(h.home_path().join("tmux.sock"))
+                .args([
+                    "kill-session",
+                    "-t",
+                    &format!("={}:", viewing.outcome.tmux_session),
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                killed.status.success(),
+                "{}",
+                String::from_utf8_lossy(&killed.stderr)
+            );
+            assert!(matches!(
+                sdk.ensure_agent(&id, &StartSessionBody::default(), &readonly_epoch)
+                    .await,
+                Err(agent_of_empires::daemon::DaemonClientError::Status {
+                    code: Some(agent_of_empires::daemon::ApiErrorCode::ReadOnly),
+                    ..
+                })
+            ));
+            assert_eq!(
+                std::fs::read_to_string(&launched).unwrap(),
+                "started",
+                "read-only ensure revived the agent"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[parallel]
+async fn daemon_trash_restore_purge_preserves_collisions_and_allows_retry() {
+    use agent_of_empires::{
+        daemon::RuntimeSnapshot,
+        session::{Instance, Status, WorktreeInfo},
+    };
+
+    let mut h = TuiTestHarness::new_in_tmp("native_restore_collision");
+    h.set_env("AGENT_OF_EMPIRES_PROFILE", "default");
+    h.stop_daemon_on_drop();
+    let repo = h.project_path();
+    let worktree = h.home_path().join("worktree");
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "-c",
+                "user.name=E2E",
+                "-c",
+                "user.email=e2e@example.invalid",
+            ])
+            .args(args)
+            .env("HOME", h.home_path())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "--initial-branch=main"]);
+    std::fs::write(repo.join("payload.txt"), "restore payload\n").unwrap();
+    git(&["add", "payload.txt"]);
+    git(&["commit", "-m", "fixture"]);
+    git(&[
+        "worktree",
+        "add",
+        "-b",
+        "feature/restore",
+        worktree.to_str().unwrap(),
+    ]);
+    let mut row = Instance::new("restore collision", worktree.to_str().unwrap());
+    row.status = Status::Stopped;
+    row.worktree_info = Some(WorktreeInfo {
+        branch: "feature/restore".into(),
+        main_repo_path: repo.to_string_lossy().into_owned(),
+        managed_by_aoe: true,
+        created_at: chrono::Utc::now(),
+        base_branch: None,
+    });
+    let id = row.id.clone();
+    let app = crate::harness::app_dir_in(h.home_path());
+    std::fs::write(
+        app.join("profiles/default/sessions.json"),
+        serde_json::to_vec(&[row]).unwrap(),
+    )
+    .unwrap();
+    let started = h.run_cli(&["serve", "--core-only", "--daemon"]);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let client = reqwest::Client::builder()
+        .unix_socket(app.join("daemon/api.sock"))
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let base = format!("http://localhost/api/sessions/{id}");
+    let sdk =
+        agent_of_empires::daemon::DaemonClient::new_unix(app.join("daemon/api.sock")).unwrap();
+    let initial: RuntimeSnapshot = client
+        .get("http://localhost/api/runtime/snapshot")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let epoch = initial.cursor.epoch;
+    let moved = sdk
+        .trash_session(
+            &id,
+            &agent_of_empires::daemon::TrashSessionBody::default(),
+            &epoch,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        moved.outcome.relocation,
+        agent_of_empires::daemon::TrashRelocationOutcome::Relocated
+    ));
+    let moved: RuntimeSnapshot = client
+        .get("http://localhost/api/runtime/snapshot")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let holding = PathBuf::from(
+        &moved
+            .contents
+            .sessions
+            .iter()
+            .find(|row| row.id == id)
+            .unwrap()
+            .project_path,
+    );
+    assert!(!worktree.exists());
+    assert_eq!(
+        std::fs::read_to_string(holding.join("payload.txt")).unwrap(),
+        "restore payload\n"
+    );
+    std::fs::create_dir(&worktree).unwrap();
+    let sentinel = worktree.join("unrelated.txt");
+    std::fs::write(&sentinel, "keep me").unwrap();
+    let rejected = client.post(format!("{base}/restore")).send().await.unwrap();
+    assert_eq!(rejected.status(), reqwest::StatusCode::CONFLICT);
+    assert!(!rejected
+        .headers()
+        .contains_key(agent_of_empires::daemon::RUNTIME_REVISION_HEADER));
+    assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "keep me");
+    let snapshot: RuntimeSnapshot = client
+        .get("http://localhost/api/runtime/snapshot")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let row = snapshot
+        .contents
+        .sessions
+        .iter()
+        .find(|row| row.id == id)
+        .unwrap();
+    assert!(row.trashed_at.is_some());
+    assert_eq!(std::path::Path::new(&row.project_path), holding);
+    std::fs::remove_file(sentinel).unwrap();
+    std::fs::remove_dir(&worktree).unwrap();
+    let restored = client.post(format!("{base}/restore")).send().await.unwrap();
+    assert_eq!(
+        restored.status(),
+        reqwest::StatusCode::OK,
+        "{}",
+        restored.text().await.unwrap()
+    );
+    let snapshot: RuntimeSnapshot = client
+        .get("http://localhost/api/runtime/snapshot")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let row = snapshot
+        .contents
+        .sessions
+        .iter()
+        .find(|row| row.id == id)
+        .unwrap();
+    assert!(row.trashed_at.is_none());
+    assert_eq!(row.status, Status::Stopped.wire_str());
+    assert_eq!(std::path::Path::new(&row.project_path), worktree);
+    assert!(!holding.exists());
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("payload.txt")).unwrap(),
+        "restore payload\n"
+    );
+    std::fs::create_dir(&holding).unwrap();
+    let sentinel = holding.join("unrelated.txt");
+    std::fs::write(&sentinel, "keep holding").unwrap();
+    let response = client.post(format!("{base}/trash")).send().await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let outcome: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(outcome["outcome"]["relocation"]["status"], "failed");
+    assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "keep holding");
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("payload.txt")).unwrap(),
+        "restore payload\n"
+    );
+    let snapshot: RuntimeSnapshot = client
+        .get("http://localhost/api/runtime/snapshot")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let row = snapshot
+        .contents
+        .sessions
+        .iter()
+        .find(|row| row.id == id)
+        .unwrap();
+    assert!(row.trashed_at.is_some());
+    assert_eq!(std::path::Path::new(&row.project_path), worktree);
+    use agent_of_empires::daemon::{
+        DaemonClientError, DeleteSessionBody, PurgeOutcome, RuntimeFrame,
+    };
+    use futures_util::StreamExt;
+    let stream = tokio::net::UnixStream::connect(app.join("daemon/api.sock"))
+        .await
+        .unwrap();
+    let (mut updates, _) = tokio_tungstenite::client_async("ws://localhost/api/runtime/ws", stream)
+        .await
+        .unwrap();
+    let dirty = worktree.join("dirty.txt");
+    std::fs::write(&dirty, "preserve until forced").unwrap();
+    let refused = sdk
+        .purge_session(
+            &id,
+            &DeleteSessionBody {
+                delete_worktree: true,
+                ..Default::default()
+            },
+            &epoch,
+        )
+        .await
+        .expect_err("dirty worktree purge must fail");
+    assert!(
+        matches!(refused, DaemonClientError::Status { status, .. } if status == reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&dirty).unwrap(),
+        "preserve until forced"
+    );
+    let retained: RuntimeSnapshot = client
+        .get("http://localhost/api/runtime/snapshot")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let retained = retained
+        .contents
+        .sessions
+        .iter()
+        .find(|row| row.id == id)
+        .unwrap();
+    assert_eq!(retained.status, Status::Error.wire_str());
+    assert!(retained.lifecycle_reservation.is_none());
+    let receipt = sdk
+        .purge_session(
+            &id,
+            &DeleteSessionBody {
+                delete_worktree: true,
+                delete_branch: true,
+                force_delete: true,
+                ..Default::default()
+            },
+            &epoch,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(receipt.outcome, PurgeOutcome::Deleted { ref cleanup_errors, .. } if cleanup_errors.is_empty())
+    );
+    let reflected = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let message = updates.next().await.unwrap().unwrap();
+            let tokio_tungstenite::tungstenite::Message::Text(text) = message else {
+                continue;
+            };
+            if let RuntimeFrame::Snapshot(snapshot) =
+                serde_json::from_str::<RuntimeFrame>(&text).unwrap()
+            {
+                if snapshot.cursor.revision >= receipt.cursor.revision {
+                    break snapshot;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(reflected.cursor.epoch, receipt.cursor.epoch);
+    assert!(!reflected.contents.sessions.iter().any(|row| row.id == id));
+    assert!(!worktree.exists());
+    assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "keep holding");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("payload.txt")).unwrap(),
+        "restore payload\n"
+    );
+    let branch = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["show-ref", "--verify", "refs/heads/feature/restore"])
+        .output()
+        .unwrap();
+    assert!(!branch.status.success());
+    updates.close(None).await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[parallel]
+async fn daemon_terminal_commands_apply_dimensions_archive_and_abandon_policy() {
+    use agent_of_empires::session::{Instance, Status};
+
+    require_tmux!();
+    let mut h = TuiTestHarness::new_in_tmp("native_start_dimensions");
+    h.set_env("AGENT_OF_EMPIRES_PROFILE", "default");
+    h.stop_daemon_on_drop();
+    let bin = h.install_path_command("terminal-agent");
+    let agent = bin.join("terminal-agent");
+    std::fs::write(&agent, "#!/bin/sh\nwhile true; do sleep 1; done\n").unwrap();
+
+    struct ReleaseHook(std::path::PathBuf);
+    impl Drop for ReleaseHook {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, []);
+        }
+    }
+    let entered = h.home_path().join("purge-entered");
+    let release = ReleaseHook(h.home_path().join("purge-release"));
+    let finished = h.home_path().join("purge-finished");
+    let hook = h.home_path().join("purge-hook.sh");
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\n: > '{}'\nwhile [ ! -e '{}' ]; do sleep 0.01; done\n: > '{}'\n",
+            entered.display(),
+            release.0.display(),
+            finished.display()
+        ),
+    )
+    .unwrap();
+    let repo = h.project_path();
+    let worktree = h.home_path().join("native-worktree");
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "-c",
+                "user.name=E2E",
+                "-c",
+                "user.email=e2e@example.invalid",
+            ])
+            .args(args)
+            .env("HOME", h.home_path())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "--initial-branch=main"]);
+    std::fs::write(repo.join("payload.txt"), "retained after abandon\n").unwrap();
+    git(&["add", "payload.txt"]);
+    git(&["commit", "-m", "fixture"]);
+    git(&[
+        "worktree",
+        "add",
+        "-b",
+        "feature/native-terminal",
+        worktree.to_str().unwrap(),
+    ]);
+
+    let app = crate::harness::app_dir_in(h.home_path());
+    let config_path = app.join("config.toml");
+    let mut config = std::fs::read_to_string(&config_path).unwrap();
+    config.push_str(&format!(
+        "\n[session.custom_agents]\nterminal-agent = {}\n",
+        serde_json::to_string(&agent.to_str().unwrap()).unwrap()
+    ));
+    config.push_str(&format!(
+        "\n[hooks]\non_destroy = [{}]\n",
+        serde_json::to_string(&format!("sh '{}'", hook.display())).unwrap()
+    ));
+    std::fs::write(config_path, config).unwrap();
+    let mut row = Instance::new("native dimensions", worktree.to_str().unwrap());
+    row.tool = "terminal-agent".into();
+    row.command = agent.to_string_lossy().into_owned();
+    row.status = Status::Stopped;
+    row.worktree_info = Some(agent_of_empires::session::WorktreeInfo {
+        branch: "feature/native-terminal".into(),
+        main_repo_path: repo.to_string_lossy().into_owned(),
+        managed_by_aoe: true,
+        created_at: chrono::Utc::now(),
+        base_branch: None,
+    });
+    let id = row.id.clone();
+    std::fs::write(
+        app.join("profiles/default/sessions.json"),
+        serde_json::to_vec(&[row]).unwrap(),
+    )
+    .unwrap();
+    let started = h.run_cli(&["serve", "--core-only", "--daemon"]);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let client = reqwest::Client::builder()
+        .unix_socket(app.join("daemon/api.sock"))
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let url = format!("http://localhost/api/sessions/{id}/start");
+    let rejected = client
+        .post(&url)
+        .json(&serde_json::json!({"size": {"cols": 0, "rows": 49}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    let response = client
+        .post(&url)
+        .json(&serde_json::json!({"size": {"cols": 170, "rows": 49}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::OK,
+        "{}",
+        response.text().await.unwrap()
+    );
+    let panes = std::process::Command::new("tmux")
+        .arg("-S")
+        .arg(h.home_path().join("tmux.sock"))
+        .args([
+            "list-panes",
+            "-a",
+            "-F",
+            "#{pane_id} #{pane_pid} #{pane_width}x#{pane_height}",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        panes.status.success(),
+        "{}",
+        String::from_utf8_lossy(&panes.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&panes.stdout)
+            .split_whitespace()
+            .last(),
+        Some("170x49")
+    );
+    let archive_url = format!("http://localhost/api/sessions/{id}/archive");
+    for (body, retained) in [
+        (
+            serde_json::json!({"archived": true, "kill_pane": false}),
+            true,
+        ),
+        (serde_json::json!({"archived": true}), false),
+    ] {
+        let response = client.patch(&archive_url).json(&body).send().await.unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::OK,
+            "{}",
+            response.text().await.unwrap()
+        );
+        for unarchive in [false, true] {
+            if unarchive {
+                let response = client
+                    .patch(&archive_url)
+                    .json(&serde_json::json!({"archived": false}))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    reqwest::StatusCode::OK,
+                    "{}",
+                    response.text().await.unwrap()
+                );
+            }
+            let current = std::process::Command::new("tmux")
+                .arg("-S")
+                .arg(h.home_path().join("tmux.sock"))
+                .args([
+                    "list-panes",
+                    "-a",
+                    "-F",
+                    "#{pane_id} #{pane_pid} #{pane_width}x#{pane_height}",
+                ])
+                .output()
+                .unwrap();
+            assert_eq!(current.status.success(), retained, "unarchive={unarchive}");
+            if retained {
+                assert_eq!(current.stdout, panes.stdout);
+            }
+        }
+    }
+
+    let sdk =
+        agent_of_empires::daemon::DaemonClient::new_unix(app.join("daemon/api.sock")).unwrap();
+    let initial: agent_of_empires::daemon::RuntimeSnapshot = client
+        .get("http://localhost/api/runtime/snapshot")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let epoch = initial.cursor.epoch;
+    sdk.mutate_session(
+        &id,
+        &agent_of_empires::daemon::SessionMutation::Start(Default::default()),
+        &epoch,
+    )
+    .await
+    .unwrap();
+    let live = std::process::Command::new("tmux")
+        .arg("-S")
+        .arg(h.home_path().join("tmux.sock"))
+        .args(["list-panes", "-a", "-F", "#{pane_id}"])
+        .output()
+        .unwrap();
+    assert!(
+        live.status.success(),
+        "{}",
+        String::from_utf8_lossy(&live.stderr)
+    );
+    let pane_id = String::from_utf8(live.stdout).unwrap().trim().to_string();
+    let mut connection = tokio::net::UnixStream::connect(app.join("daemon/api.sock"))
+        .await
+        .unwrap();
+    let body = serde_json::to_string(&agent_of_empires::daemon::DeleteSessionBody {
+        delete_worktree: true,
+        delete_branch: true,
+        delete_sandbox: true,
+        force_delete: true,
+        keep_scratch: false,
+    })
+    .unwrap();
+    let request = format!("DELETE /api/sessions/{id} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n{}: {epoch}\r\nContent-Length: {}\r\n\r\n{body}",
+        agent_of_empires::daemon::RUNTIME_EPOCH_HEADER, body.len());
+    tokio::io::AsyncWriteExt::write_all(&mut connection, request.as_bytes())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !entered.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("purge must enter the held on_destroy hook");
+    drop(connection);
+    let pending: agent_of_empires::daemon::RuntimeSnapshot = client
+        .get("http://localhost/api/runtime/snapshot")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let reservation = pending
+        .contents
+        .sessions
+        .iter()
+        .find(|row| row.id == id)
+        .unwrap()
+        .lifecycle_reservation
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        reservation.op,
+        agent_of_empires::session::LifecycleOperation::Purge
+    );
+    let receipt = tokio::time::timeout(
+        Duration::from_secs(5),
+        sdk.mutate_session(
+            &id,
+            &agent_of_empires::daemon::SessionMutation::AbandonPurge(
+                agent_of_empires::daemon::AbandonPurgeBody {
+                    expected_generation: std::num::NonZeroU64::new(reservation.generation).unwrap(),
+                },
+            ),
+            &epoch,
+        ),
+    )
+    .await
+    .expect("abandon must not wait for the disconnected purge")
+    .unwrap();
+    let reflected: agent_of_empires::daemon::RuntimeSnapshot = client
+        .get("http://localhost/api/runtime/snapshot")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(receipt.epoch, reflected.cursor.epoch);
+    assert!(reflected.cursor.revision >= receipt.revision);
+    assert!(!reflected.contents.sessions.iter().any(|row| row.id == id));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let current = std::process::Command::new("tmux")
+                .arg("-S")
+                .arg(h.home_path().join("tmux.sock"))
+                .args(["display-message", "-p", "-t", &pane_id, "#{pane_id}"])
+                .output()
+                .unwrap();
+            if !current.status.success() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("daemon-owned abandon cleanup must remove the real pane");
+    assert!(
+        !finished.exists(),
+        "abandon must not claim that the original hook completed"
+    );
+    std::fs::write(&release.0, []).unwrap();
+    let stopped = h.run_cli(&["serve", "--stop"]);
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    assert!(
+        finished.exists(),
+        "shutdown must drain the disconnected purge"
+    );
+    git(&["show-ref", "--verify", "refs/heads/feature/native-terminal"]);
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("payload.txt")).unwrap(),
+        "retained after abandon\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("payload.txt")).unwrap(),
+        "retained after abandon\n"
+    );
+    let restarted = h.run_cli(&["serve", "--core-only", "--daemon"]);
+    assert!(
+        restarted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restarted.stderr)
+    );
+    let client = reqwest::Client::builder()
+        .unix_socket(app.join("daemon/api.sock"))
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let after: agent_of_empires::daemon::RuntimeSnapshot = client
+        .get("http://localhost/api/runtime/snapshot")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_ne!(after.cursor.epoch, epoch);
+    assert!(
+        !after.contents.sessions.iter().any(|row| row.id == id),
+        "the disconnected purge must not resurrect a row after abandon"
+    );
+}
+
+/// `R` opens the exposure picker on the running localhost daemon: it offers
+/// the three exposures and never an off switch.
+#[test]
+#[parallel]
+fn tui_serve_dialog_opens_to_exposure_picker() {
     require_tmux!();
 
     let mut h = TuiTestHarness::new("serve_mode_picker");
+    h.enable_e2e_debug_signals();
     h.spawn_tui();
-
-    h.wait_for(" aoe ");
+    h.wait_for_runtime_ready();
     h.send_keys("R");
 
-    h.wait_for("How should this be reachable?");
+    h.wait_for("How should it be reachable?");
+    h.assert_screen_contains("Exposure: Localhost only");
     h.assert_screen_contains("Local network");
     h.assert_screen_contains("Internet (HTTPS)");
-    // The Tunnel card defers the transport choice to the next screen.
-    // If this line disappears, the ModePicker copy is out of sync with
-    // the Confirm-screen picker it hands off to.
-    h.assert_screen_contains("Pick transport on next screen.");
-}
-
-/// Esc dismisses the serve dialog and returns to the home screen
-/// without spawning anything. Regression guard against state-transition
-/// bugs where ModePicker might latch onto a stale mode.
-#[test]
-#[parallel]
-fn tui_serve_dialog_escape_returns_home() {
-    require_tmux!();
-
-    let mut h = TuiTestHarness::new("serve_mode_picker_esc");
-    h.spawn_tui();
-
-    h.wait_for(" aoe ");
-    h.send_keys("R");
-    h.wait_for("How should this be reachable?");
+    h.assert_screen_not_contains("stop");
 
     h.send_keys("Escape");
-    // Home-screen footer is the tell that we've returned.
+    h.wait_for("No sessions yet");
+}
+
+/// Switching to the local network restarts the daemon on 0.0.0.0 and lights
+/// the footer; switching back returns to loopback, clears the indicator and
+/// the TUI reconnects on its own.
+#[test]
+#[parallel]
+fn tui_serve_dialog_switches_exposure_and_reconnects() {
+    require_tmux!();
+    if agent_of_empires::server::discover_tagged_ips().is_empty() {
+        eprintln!("skipping: no non-loopback interface");
+        return;
+    }
+
+    let mut h = TuiTestHarness::new("serve_exposure_roundtrip");
+    h.enable_e2e_debug_signals();
+    h.spawn_tui();
+    h.wait_for_runtime_ready();
+    let launch = || -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(daemon_launch_path(&h)).unwrap()).unwrap()
+    };
+    assert_eq!(launch()["host"], "127.0.0.1");
+    assert_eq!(launch()["core_only"], false);
+
+    h.send_keys("R");
+    h.wait_for("How should it be reachable?");
+    h.send_keys("2");
+    h.wait_for_timeout("Sharing on local network", Duration::from_secs(30));
+    h.assert_screen_contains("aoe remote add");
+    assert_eq!(launch()["host"], "0.0.0.0");
+    h.send_keys("Escape");
+    h.wait_for_timeout("Serving LAN", Duration::from_secs(10));
+    h.wait_for_runtime_ready();
+
+    h.send_keys("R");
+    h.wait_for("Sharing on local network");
+    h.send_keys("E");
+    h.wait_for("How should it be reachable?");
+    h.send_keys("1");
+    h.wait_for_timeout("Now localhost only.", Duration::from_secs(30));
+    assert_eq!(launch()["host"], "127.0.0.1");
+    h.send_keys("Escape");
+    h.wait_for_absent("Serving LAN", Duration::from_secs(10));
+    h.wait_for_runtime_ready();
     h.wait_for("No sessions yet");
 }
 
@@ -140,17 +1857,510 @@ fn cli_serve_daemon_starts_and_stops_cleanly() {
         pid_path.display()
     );
 }
+#[cfg(target_os = "linux")]
+#[test]
+#[parallel]
+fn migration_contention_does_not_block_runtime_publication() {
+    use fs2::FileExt;
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
 
-/// `aoe serve --restart` must stop the running daemon and spawn a fresh
-/// one from the persisted launch state: a new PID, the old one gone, the
-/// same port rebound, and `serve.launch` rewritten. Locks in #1794's
-/// restart primitive end to end.
+    require_tmux!();
+    let mut h = TuiTestHarness::new_in_tmp("runtime_migration_contention");
+    h.set_env("AGENT_OF_EMPIRES_PROFILE", "default");
+    h.stop_daemon_on_drop();
+    let project = h.project_path();
+    let added = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "--title",
+        "blocked-metadata",
+    ]);
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let app = crate::harness::app_dir_in(h.home_path());
+    let rows_path = app.join("profiles/default/sessions.json");
+    let mut rows: Vec<serde_json::Value> =
+        serde_json::from_slice(&std::fs::read(&rows_path).unwrap()).unwrap();
+    let row = rows
+        .iter_mut()
+        .find(|row| row["title"] == "blocked-metadata")
+        .unwrap();
+    let id = row["id"].as_str().unwrap().to_owned();
+    row["status"] = serde_json::json!("stopped");
+    std::fs::write(&rows_path, serde_json::to_vec(&rows).unwrap()).unwrap();
+    let started = h.run_cli(&["serve", "--core-only", "--daemon"]);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let pid: u32 = std::fs::read_to_string(app.join("serve.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let lock_path = app.join(".v027-sandbox-transition.lock");
+    let transition = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    transition.lock_exclusive().unwrap();
+    let socket = app.join("daemon/api.sock");
+    let mut mutation = UnixStream::connect(&socket).unwrap();
+    mutation
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let body = r#"{"color":"red"}"#;
+    write!(mutation, "PATCH /api/sessions/{id}/color HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let waiting = std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .unwrap()
+            .flatten()
+            .any(|entry| {
+                std::fs::read_link(entry.path()).ok().as_deref() == Some(lock_path.as_path())
+            });
+        if waiting {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "mutation never reached the held transition lock"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut capture = UnixStream::connect(&socket).unwrap();
+    capture
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    capture
+        .write_all(b"GET /api/runtime HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut response = String::new();
+    capture
+        .read_to_string(&mut response)
+        .expect("waiting for migration must not hold publication");
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    fs2::FileExt::unlock(&transition).unwrap();
+    response.clear();
+    mutation.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response
+        .to_ascii_lowercase()
+        .contains("aoe-runtime-revision:"));
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_slice(&std::fs::read(rows_path).unwrap()).unwrap();
+    assert_eq!(
+        rows.iter().find(|row| row["id"] == id).unwrap()["color"],
+        "red"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[parallel]
+fn daemon_stop_reports_docker_failure_without_blocking_publication() {
+    use std::io::{Read, Write};
+    use std::os::unix::{fs::PermissionsExt, net::UnixStream};
+
+    require_tmux!();
+    let mut h = TuiTestHarness::new_in_tmp("runtime_stop_failure");
+    h.set_env("AGENT_OF_EMPIRES_PROFILE", "default");
+    h.stop_daemon_on_drop();
+    let entered = h.home_path().join("stop-entered");
+    let release = h.home_path().join("stop-release");
+    let missing = h.home_path().join("container-missing");
+    struct ReleaseOnDrop(PathBuf);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, b"");
+        }
+    }
+    let _release = ReleaseOnDrop(release.clone());
+    let bin = h.home_path().join("docker-fixture");
+    std::fs::create_dir(&bin).unwrap();
+    let docker = bin.join("docker");
+    std::fs::write(
+        &docker,
+        format!(
+            r#"#!/bin/sh
+case " $* " in
+  *" inspect "*) echo 'simulated inspect failure' >&2; exit 17 ;;
+  *" stop "*)
+    if [ -e '{}' ]; then
+      echo 'Error response from daemon: No such container: fixture' >&2
+      exit 1
+    fi
+    touch '{}'
+    tries=0
+    while [ ! -e '{}' ]; do
+      tries=$((tries + 1))
+      [ "$tries" -lt 1000 ] || exit 124
+      sleep 0.01
+    done
+    echo 'simulated stop failure' >&2
+    exit 19 ;;
+esac
+exit 0
+"#,
+            missing.display(),
+            entered.display(),
+            release.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    h.add_path_dir(&bin);
+    let project = h.project_path();
+    let added = h.run_cli(&["add", project.to_str().unwrap(), "--title", "stop-failure"]);
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let app = crate::harness::app_dir_in(h.home_path());
+    let rows_path = app.join("profiles/default/sessions.json");
+    let mut rows: Vec<serde_json::Value> =
+        serde_json::from_slice(&std::fs::read(&rows_path).unwrap()).unwrap();
+    let row = rows
+        .iter_mut()
+        .find(|row| row["title"] == "stop-failure")
+        .unwrap();
+    let id = row["id"].as_str().unwrap().to_owned();
+    row["status"] = serde_json::json!("idle");
+    row["sandbox_info"] = serde_json::json!({"enabled": true, "image": "fixture", "container_name": format!("aoe-{id}")});
+    std::fs::write(&rows_path, serde_json::to_vec(&rows).unwrap()).unwrap();
+    let started = h.run_cli(&["serve", "--core-only", "--daemon"]);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let socket = app.join("daemon/api.sock");
+    let mut stopping = UnixStream::connect(&socket).unwrap();
+    stopping
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    write!(stopping, "POST /api/sessions/{id}/stop HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !entered.exists() {
+        assert!(Instant::now() < deadline, "stop never reached Docker");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut capture = UnixStream::connect(&socket).unwrap();
+    capture
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    capture
+        .write_all(b"GET /api/runtime HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut response = String::new();
+    capture
+        .read_to_string(&mut response)
+        .expect("resource teardown must not hold publication");
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    std::fs::write(&release, b"").unwrap();
+    response.clear();
+    stopping.read_to_string(&mut response).unwrap();
+    assert!(
+        response.starts_with("HTTP/1.1 500"),
+        "failed teardown was acknowledged: {response}"
+    );
+    assert!(!response
+        .to_ascii_lowercase()
+        .contains("aoe-runtime-revision:"));
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_slice(&std::fs::read(&rows_path).unwrap()).unwrap();
+    let row = rows.iter().find(|row| row["id"] == id).unwrap();
+    assert_eq!(row["status"], "error");
+    assert!(row
+        .get("lifecycle_reservation")
+        .is_none_or(serde_json::Value::is_null));
+    std::fs::write(&missing, b"").unwrap();
+    let mut retry = UnixStream::connect(&socket).unwrap();
+    retry
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    write!(retry, "POST /api/sessions/{id}/stop HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+    response.clear();
+    retry.read_to_string(&mut response).unwrap();
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "absent container prevented recovery: {response}"
+    );
+    let body: serde_json::Value =
+        serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(body["status"], "Stopped");
+    assert!(response
+        .to_ascii_lowercase()
+        .contains("aoe-runtime-revision:"));
+}
+
+#[cfg(unix)]
+#[test]
+#[parallel]
+fn daemon_retains_cancelled_commit_through_shutdown() {
+    use fs2::FileExt;
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let mut h = TuiTestHarness::new_in_tmp("runtime_commit_lifetime");
+    h.set_env("AGENT_OF_EMPIRES_PROFILE", "default");
+    h.stop_daemon_on_drop();
+    let project = h.project_path();
+    let added = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "--title",
+        "cancelled-commit",
+    ]);
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let app = crate::harness::app_dir_in(h.home_path());
+    let profile = app.join("profiles/default");
+    let rows_path = profile.join("sessions.json");
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_slice(&std::fs::read(&rows_path).unwrap()).unwrap();
+    let id = rows
+        .iter()
+        .find(|row| row["title"] == "cancelled-commit")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let started = h.run_cli(&["serve", "--core-only", "--daemon"]);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let socket = app.join("daemon/api.sock");
+    let pid_path = daemon_pid_path(&h);
+    let pid = std::fs::read_to_string(&pid_path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+
+    let capture_blocked = || {
+        let mut stream = UnixStream::connect(&socket).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        stream
+            .write_all(b"GET /api/runtime HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        match stream.read_exact(&mut [0]) {
+            Ok(()) => false,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                true
+            }
+            Err(error) => panic!("runtime capture failed: {error}"),
+        }
+    };
+    let storage_lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(profile.join(".storage.lock"))
+        .unwrap();
+    storage_lock.lock_exclusive().unwrap();
+    let body = r#"{"color":"red"}"#;
+    let mut mutation = UnixStream::connect(&socket).unwrap();
+    write!(mutation, "PATCH /api/sessions/{id}/color HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !capture_blocked() {
+        assert!(
+            Instant::now() < deadline,
+            "mutation never reached its commit boundary"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    mutation.shutdown(std::net::Shutdown::Both).unwrap();
+    drop(mutation);
+    assert!(
+        capture_blocked(),
+        "disconnect exposed a snapshot while the commit was blocked"
+    );
+
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while UnixStream::connect(&socket).is_ok() {
+        assert!(
+            Instant::now() < deadline,
+            "listener stayed open after shutdown"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(250));
+    let lifetime = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(app.join("daemon/lifetime.lock"))
+        .unwrap();
+    assert_eq!(
+        lifetime.try_lock_exclusive().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "ownership ended before the blocked commit"
+    );
+    fs2::FileExt::unlock(&storage_lock).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while pid_path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "daemon did not finish after commit unblocked"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let committed: Vec<serde_json::Value> =
+        serde_json::from_slice(&std::fs::read(rows_path).unwrap()).unwrap();
+    assert_eq!(
+        committed.iter().find(|row| row["id"] == id).unwrap()["color"],
+        "red"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[parallel]
+fn read_only_terminal_view_does_not_create_shell() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    require_tmux!();
+    let mut h = TuiTestHarness::new_in_tmp("readonly_terminal_lifecycle");
+    h.set_env("AGENT_OF_EMPIRES_PROFILE", "default");
+    h.stop_daemon_on_drop();
+    let project = h.project_path();
+    let added = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "--title",
+        "readonly-shell",
+    ]);
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let app = crate::harness::app_dir_in(h.home_path());
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_slice(&std::fs::read(app.join("profiles/default/sessions.json")).unwrap())
+            .unwrap();
+    let id = rows
+        .iter()
+        .find(|row| row["title"] == "readonly-shell")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let started = h.run_cli(&["serve", "--core-only", "--read-only", "--daemon"]);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let mut wire = UnixStream::connect(app.join("daemon/api.sock")).unwrap();
+    wire.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    write!(wire, "GET /sessions/{id}/terminal/live-ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").unwrap();
+    let mut headers = Vec::new();
+    while !headers.ends_with(b"\r\n\r\n") {
+        assert!(headers.len() < 8192);
+        let mut byte = [0];
+        wire.read_exact(&mut byte).unwrap();
+        headers.push(byte[0]);
+    }
+    assert!(headers.starts_with(b"HTTP/1.1 101 "));
+    let mut frame = [0; 2];
+    wire.read_exact(&mut frame).unwrap();
+    assert_eq!(
+        frame[0], 0x88,
+        "missing shell must close, not stream a new pane"
+    );
+    assert!(frame[1] <= 125);
+    let mut close = vec![0; usize::from(frame[1])];
+    wire.read_exact(&mut close).unwrap();
+    assert_eq!(close.get(..2), Some(1013u16.to_be_bytes().as_slice()));
+    let panes = std::process::Command::new("tmux")
+        .arg("-S")
+        .arg(h.home_path().join("tmux.sock"))
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output()
+        .unwrap();
+    assert!(
+        panes.stdout.is_empty(),
+        "read-only viewing created a shell: {}",
+        String::from_utf8_lossy(&panes.stdout)
+    );
+}
+
+/// Restart retains exposure policy after renaming the bootstrap profile.
 #[test]
 #[parallel]
 fn cli_serve_restart_replays_launch_state() {
     let h = TuiTestHarness::new("serve_restart_replays");
     let port = pick_free_port();
     let port_s = port.to_string();
+
+    let core = h.run_cli(&["serve", "--daemon", "--core-only"]);
+    assert!(
+        core.status.success(),
+        "{}",
+        String::from_utf8_lossy(&core.stderr)
+    );
+    let core_pid: i32 = std::fs::read_to_string(daemon_pid_path(&h))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let invalid = h.run_cli(&["serve", "--daemon", "--host", "0.0.0.0", "--no-auth"]);
+    assert!(!invalid.status.success());
+    assert!(
+        pid_alive(core_pid),
+        "invalid exposure stopped the running core"
+    );
+
+    let provisional = h.run_cli(&["serve", "--daemon", "--port", &port_s, "--no-auth"]);
+    assert!(
+        provisional.status.success(),
+        "{}",
+        String::from_utf8_lossy(&provisional.stderr)
+    );
+    let stop = h.run_cli(&["serve", "--stop"]);
+    assert!(
+        stop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    let rollback = h.run_cli(&["serve", "--rollback"]);
+    assert!(
+        rollback.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rollback.stderr)
+    );
+    assert!(
+        std::net::TcpStream::connect(("127.0.0.1", port)).is_err(),
+        "rollback retained TCP exposure"
+    );
+    let core_pid: i32 = std::fs::read_to_string(daemon_pid_path(&h))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
 
     let start = h.run_cli(&["serve", "--daemon", "--port", &port_s, "--no-auth"]);
     assert!(
@@ -171,11 +2381,57 @@ fn cli_serve_restart_replays_launch_state() {
         .trim()
         .parse()
         .expect("serve.pid holds an integer");
+    assert_ne!(core_pid, pid1);
+    assert!(!pid_alive(core_pid), "core predecessor survived promotion");
+    let launch: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&launch_path).unwrap()).unwrap();
+    let rename = h.run_cli(&[
+        "profile",
+        "rename",
+        launch["profile"].as_str().unwrap(),
+        "renamed-bootstrap",
+    ]);
     assert!(
-        launch_path.exists(),
-        "serve.launch should be written on daemon start, missing at {}",
-        launch_path.display()
+        rename.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rename.stderr)
     );
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let url = format!("http://127.0.0.1:{port}/api/runtime/snapshot");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let snapshot: serde_json::Value = client
+                .get(&url)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if snapshot["profiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|profile| profile["name"] == "renamed-bootstrap")
+            {
+                assert_eq!(snapshot["default_profile"], "renamed-bootstrap");
+                assert_eq!(snapshot["health"]["state"], "healthy");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "renamed catalogue was not published: {snapshot}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
 
     let restart = h.run_cli(&["serve", "--restart"]);
     assert!(
@@ -191,7 +2447,6 @@ fn cli_serve_restart_replays_launch_state() {
         "restarted daemon never rebound port {port}"
     );
 
-    // serve.pid now names a different, live process; the old one is gone.
     let pid2: i32 = std::fs::read_to_string(&pid_path)
         .expect("serve.pid after restart")
         .trim()
@@ -211,10 +2466,6 @@ fn cli_serve_restart_replays_launch_state() {
         !pid_alive(pid1),
         "old daemon PID {pid1} still alive after restart"
     );
-    assert!(
-        launch_path.exists(),
-        "serve.launch should be rewritten by the restart"
-    );
 
     let stop = h.run_cli(&["serve", "--stop"]);
     assert!(
@@ -222,6 +2473,80 @@ fn cli_serve_restart_replays_launch_state() {
         "--stop after restart failed.\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&stop.stdout),
         String::from_utf8_lossy(&stop.stderr),
+    );
+}
+
+#[test]
+#[parallel]
+fn cli_serve_replay_rejects_missing_or_unbound_passphrases() {
+    let h = TuiTestHarness::new("serve_restart_secondary_passphrase");
+    let port = pick_free_port().to_string();
+    let start = h.run_cli(&[
+        "serve",
+        "--daemon",
+        "--port",
+        &port,
+        "--auth",
+        "token",
+        "--passphrase",
+        "retained-secondary-gate",
+    ]);
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let pid_path = daemon_pid_path(&h);
+    let pid: i32 = std::fs::read_to_string(&pid_path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let launch_path = daemon_launch_path(&h);
+    let original = std::fs::read(&launch_path).unwrap();
+    let mut legacy: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    legacy.as_object_mut().unwrap().remove("has_passphrase");
+    legacy.as_object_mut().unwrap().remove("instance_id");
+    legacy["schema"] = 3.into();
+    std::fs::write(&launch_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    legacy["port"] = pick_free_port().into();
+    std::fs::write(
+        launch_path.with_file_name("serve.rollback.launch"),
+        serde_json::to_vec(&legacy).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(launch_path.with_file_name(".schema_version"), "29").unwrap();
+    let migrate = h.run_cli(&["profile", "list"]);
+    assert!(
+        migrate.status.success(),
+        "{}",
+        String::from_utf8_lossy(&migrate.stderr)
+    );
+    let rollback = h.run_cli(&["serve", "--rollback"]);
+    assert!(
+        !rollback.status.success(),
+        "rollback borrowed credentials using only a historical PID"
+    );
+    assert!(
+        pid_alive(pid),
+        "unbound rollback stopped the protected daemon"
+    );
+    std::fs::write(&launch_path, original).unwrap();
+    std::fs::remove_file(pid_path.with_file_name("serve.passphrase")).unwrap();
+    let restart = h.run_cli(&["serve", "--restart"]);
+    assert!(
+        !restart.status.success(),
+        "restart silently removed the secondary login gate"
+    );
+    assert!(
+        pid_alive(pid),
+        "missing credentials stopped the protected daemon"
+    );
+    let stop = h.run_cli(&["serve", "--stop"]);
+    assert!(
+        stop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
     );
 }
 
@@ -266,23 +2591,7 @@ fn cli_serve_daemon_writes_marker_to_debug_log_not_serve_log() {
     let _ = h.run_cli(&["serve", "--stop"]);
 }
 
-/// `--auth=passphrase` is the load-bearing new mode: no URL token, the
-/// passphrase wall is the only human gate. Exercises the wall end-to-end
-/// against a real daemon so the new `run_passphrase_wall` middleware
-/// branch is locked in CI rather than relying on manual smoke tests.
-///
-/// Flow:
-///   1. GET `/api/about` from a simulated non-loopback caller (loopback
-///      socket + `X-Forwarded-For: 10.0.0.5`, which `resolve_client_ip`
-///      trusts because the socket itself is loopback) -> 401
-///      `login_required`. Proves the wall still blocks remote API
-///      traffic after the #1525 loopback bypass landed.
-///   2. POST `/api/login` with the correct passphrase + a fresh
-///      device-binding secret -> 200 with `Set-Cookie: aoe_session=`.
-///   3. GET `/api/about` carrying the session cookie + binding header
-///      (no XFF so the caller is loopback) -> 200, body has
-///      `"auth_mode":"passphrase"`. Proves both the wall handoff and
-///      the `/api/about` mode-derivation surface.
+/// Proxy ingress requires passphrase login and a bound browser session.
 #[test]
 #[parallel]
 fn cli_serve_auth_passphrase_login_round_trip() {
@@ -290,6 +2599,7 @@ fn cli_serve_auth_passphrase_login_round_trip() {
     let port = pick_free_port();
     let port_s = port.to_string();
 
+    // XFF is trusted only on configured proxy ingress.
     let start = h.run_cli(&[
         "serve",
         "--daemon",
@@ -299,6 +2609,9 @@ fn cli_serve_auth_passphrase_login_round_trip() {
         "passphrase",
         "--passphrase",
         "e2e-pass",
+        "--behind-proxy",
+        "--allowed-host",
+        "aoe.test",
     ]);
     assert!(
         start.status.success(),
@@ -329,11 +2642,7 @@ fn cli_serve_auth_passphrase_login_round_trip() {
             .build()
             .map_err(|e| format!("build client: {e}"))?;
 
-        // 1. Unauthenticated GET from a simulated remote caller must
-        //    come back with 401 + login_required body. The daemon
-        //    binds loopback, so `resolve_client_ip` trusts XFF; we
-        //    pin a non-loopback last-hop IP so the #1525 loopback
-        //    bypass does not fire.
+        // Unauthenticated forwarded callers must receive login_required.
         let about_unauth = client
             .get(format!("{base}/api/about"))
             .header("x-forwarded-for", "10.0.0.5")

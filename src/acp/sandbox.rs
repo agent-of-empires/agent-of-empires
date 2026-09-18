@@ -83,7 +83,8 @@ pub async fn ensure_container_for_session_locked(
             let workdir = instance_clone.container_workdir();
             let hooks = if run_on_launch_hooks {
                 let profile = instance_clone.source_profile.clone();
-                instance_clone.resolve_on_launch_hooks(false, &profile)
+                let config = crate::session::resolve_config_or_warn(&profile);
+                instance_clone.resolve_on_launch_hooks(config.hooks.on_launch)
             } else {
                 None
             };

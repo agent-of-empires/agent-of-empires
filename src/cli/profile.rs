@@ -144,12 +144,6 @@ async fn show_default_profile() -> Result<()> {
 }
 
 async fn set_default_profile(name: &str) -> Result<()> {
-    // Verify profile exists
-    let profiles = session::list_profiles()?;
-    if !profiles.contains(&name.to_string()) {
-        bail!("Profile '{}' does not exist", name);
-    }
-
     session::set_default_profile(name)?;
     println!("✓ Default profile set to: {}", name);
     Ok(())

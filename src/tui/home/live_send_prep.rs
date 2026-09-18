@@ -37,29 +37,23 @@ impl HomeView {
         inst.tmux_session().is_ok_and(|s| s.exists())
     }
 
-    /// Whether the target pane is already live, so its entry can skip the
-    /// transient revive toast. Terminal and tool targets check their own pane's
-    /// existence and ignore the agent's status, because a stopped agent can
-    /// have a live paired terminal.
+    /// Auxiliary warmth follows its own observation, independently of agent status.
     fn target_pane_is_warm(&self, session_id: &str, target: &live_send::LiveSendTarget) -> bool {
         let Some(inst) = self.get_instance(session_id) else {
             return false;
         };
-        let tmux_name = match target {
+        use crate::session::{AuxiliaryTarget, PanePresence};
+        let presence = match target {
             live_send::LiveSendTarget::Agent => return self.agent_pane_is_warm(session_id),
             live_send::LiveSendTarget::Terminal => {
-                crate::tmux::TerminalSession::resolve_name(&inst.id, &inst.title)
+                inst.auxiliary_presence(&AuxiliaryTarget::Host { index: 0 })
             }
             live_send::LiveSendTarget::ContainerTerminal => {
-                crate::tmux::ContainerTerminalSession::resolve_name(&inst.id, &inst.title)
+                inst.auxiliary_presence(&AuxiliaryTarget::Container { index: 0 })
             }
-            live_send::LiveSendTarget::Tool(name) => {
-                crate::tmux::ToolSession::new(&inst.id, &inst.title, name)
-                    .session_name()
-                    .to_string()
-            }
+            live_send::LiveSendTarget::Tool(name) => inst.tool_presence(name),
         };
-        crate::tmux::Session::from_name(&tmux_name).exists()
+        presence == PanePresence::Alive
     }
 
     pub fn live_entry_is_warm(&self, session_id: &str) -> bool {
@@ -76,7 +70,7 @@ impl HomeView {
     /// through the size-owning worker. Falls back to the terminal size for the
     /// rare entry with no prior preview frame, and to `None` if neither is
     /// available so tmux keeps its default.
-    pub(super) fn live_send_boot_size(&self) -> Option<(u16, u16)> {
+    pub(in crate::tui) fn live_send_boot_size(&self) -> Option<(u16, u16)> {
         let pane = self.preview_pane_area;
         if pane.width > 0 && pane.height > 0 {
             Some((pane.width, pane.height))
@@ -88,95 +82,27 @@ impl HomeView {
         }
     }
 
-    /// Stage live-send mode against `session_id`. Mirrors
-    /// `execute_send_message`'s revive cascade so a cold-start (Docker
-    /// pull, agent splash) is handled before the user starts typing,
-    /// then installs `live_send` state so subsequent keystrokes are
-    /// captured by `handle_live_send_key`.
-    ///
-    /// Geometry is settled by the caller's post-toast draw. Render queues the
-    /// final `preview_pane_area` through `LiveSendWorker`, which verifies
-    /// size ownership before resizing; this preparation path never waits on
-    /// tmux merely to align the first frame.
-    ///
-    /// Returns `Err(())` if the pane could not be readied (`info_dialog` is
-    /// set with the underlying error so the caller only has to clear its toast).
-    pub fn prepare_live_send(&mut self, session_id: &str) -> Result<(), ()> {
-        let target = std::mem::replace(
+    /// Take the target the next live-send entry should prepare.
+    pub(in crate::tui) fn take_live_send_target(
+        &mut self,
+    ) -> crate::tui::home::live_send::LiveSendTarget {
+        std::mem::replace(
             &mut self.pending_live_send_target,
-            live_send::LiveSendTarget::Agent,
-        );
-        // Agent targets revive the agent pane via the full
-        // ensure_pane_ready cascade (Docker, splash, resume). Terminal
-        // targets are simpler: the paired terminal is a plain shell,
-        // so we just ensure the tmux session exists and re-spawn it if
-        // the pane has died (matches `attach_terminal`).
-        //
-        // Boot every target at the size it will be shown at, not tmux's 80x24
-        // default. The first post-toast draw sends any settled geometry change
-        // through the size-owning worker, so startup never races an unowned
-        // synchronous resize. See `Instance::ensure_pane_ready_with_size`.
-        let boot_size = self.live_send_boot_size();
-        match &target {
-            live_send::LiveSendTarget::Agent => {
-                let outcome = self.try_mutate_instance_writeback_on_err(session_id, |inst| {
-                    inst.ensure_pane_ready_with_size(boot_size)
-                        .map_err(Into::into)
-                });
-                match outcome {
-                    Ok(Some(EnsureReadyOutcome::ResumeFailed { sid })) => {
-                        self.info_dialog = Some(InfoDialog::new(
-                            "Live send failed",
-                            &format!("Resume failed for sid {sid}; preserved for explicit retry"),
-                        ));
-                        return Err(());
-                    }
-                    Ok(_) => {}
-                    Err(err) => {
-                        self.info_dialog = Some(InfoDialog::new(
-                            "Live send failed",
-                            &format!("Cannot prepare session: {}", err),
-                        ));
-                        return Err(());
-                    }
-                }
-            }
-            live_send::LiveSendTarget::Terminal => {
-                if let Err(e) = self.ensure_terminal_pane_ready(session_id, boot_size) {
-                    self.info_dialog = Some(InfoDialog::new(
-                        "Live send failed",
-                        &format!("Cannot prepare terminal: {}", e),
-                    ));
-                    return Err(());
-                }
-            }
-            live_send::LiveSendTarget::ContainerTerminal => {
-                if let Err(e) = self.ensure_container_terminal_pane_ready(session_id, boot_size) {
-                    self.info_dialog = Some(InfoDialog::new(
-                        "Live send failed",
-                        &format!("Cannot prepare container terminal: {}", e),
-                    ));
-                    return Err(());
-                }
-            }
-            live_send::LiveSendTarget::Tool(name) => {
-                let name = name.clone();
-                if let Err(e) = self.ensure_tool_pane_ready(session_id, &name, boot_size) {
-                    self.info_dialog = Some(InfoDialog::new(
-                        "Live send failed",
-                        &format!("Cannot prepare tool '{}': {}", name, e),
-                    ));
-                    return Err(());
-                }
-            }
-        };
+            crate::tui::home::live_send::LiveSendTarget::Agent,
+        )
+    }
+
+    /// Enter live send against a pane the daemon has already confirmed ready.
+    /// `tmux_name` is the receipt's target, so nothing is resolved locally.
+    pub(in crate::tui) fn enter_live_send_with(
+        &mut self,
+        session_id: &str,
+        tmux_name: &str,
+        target: crate::tui::home::live_send::LiveSendTarget,
+    ) -> Result<(), ()> {
         let inst = match self.get_instance(session_id) {
             Some(inst) => inst.clone(),
             None => {
-                // Defensive: ensure_pane_ready succeeded but the
-                // instance is gone (deleted by a peer process between
-                // those two calls). Without a dialog the user would
-                // press Tab and see nothing happen, with no clue why.
                 self.info_dialog = Some(InfoDialog::new(
                     "Live send failed",
                     "Session disappeared before live mode could start.",
@@ -184,42 +110,11 @@ impl HomeView {
                 return Err(());
             }
         };
-        // Resolve the tmux session name up front so the worker thread
-        // can reconstruct a Session without re-touching HomeView.
-        let tmux_name = match &target {
-            live_send::LiveSendTarget::Agent => {
-                match crate::tmux::Session::new(&inst.id, &inst.title) {
-                    Ok(s) => s.name().to_string(),
-                    Err(e) => {
-                        self.info_dialog = Some(InfoDialog::new(
-                            "Live send failed",
-                            &format!("Cannot resolve tmux session: {}", e),
-                        ));
-                        return Err(());
-                    }
-                }
-            }
-            live_send::LiveSendTarget::Terminal => {
-                crate::tmux::TerminalSession::resolve_name(&inst.id, &inst.title)
-            }
-            live_send::LiveSendTarget::ContainerTerminal => {
-                crate::tmux::ContainerTerminalSession::resolve_name(&inst.id, &inst.title)
-            }
-            live_send::LiveSendTarget::Tool(name) => {
-                crate::tmux::ToolSession::new(&inst.id, &inst.title, name)
-                    .session_name()
-                    .to_string()
-            }
-        };
-        // Switching live mode from session A to session B (click on a
-        // different row while already live): we need to drop the old
-        // worker BEFORE resetting the old session's window-size,
-        // otherwise any `Resize` still queued in the old worker can
-        // fire after the reset and flip the old pane back to manual
-        // sizing. The worker thread is intentionally not joined, so
-        // dropping its `Sender` is the only way to know its dispatch
-        // loop has finished (its `recv` returns Err and the thread
-        // exits on the next iteration).
+        // A remote live-send owns no local pane to reset; leave it first.
+        if self.live_send.as_ref().is_some_and(|s| s.remote.is_some()) {
+            self.exit_live_send_if_active();
+        }
+        let tmux_name = tmux_name.to_string();
         let prev_tmux_name = self
             .live_send
             .as_ref()
@@ -246,41 +141,18 @@ impl HomeView {
                 crate::tmux::Session::from_name(name).reset_size_to_latest_client();
             }
         }
-        // Parse the configured exit-chord list now so the per-keystroke
-        // dispatch path doesn't re-parse on every event. Config edits
-        // during live mode aren't possible (settings_view participates
-        // in has_dialog and lives in its own takeover), so a snapshot
-        // at entry time is sufficient.
-        let resolved_config = resolve_config_or_warn(&self.config_profile());
-        let exit_chord_spec = resolved_config.session.live_send_exit_chord;
-        let exit_chords = live_send::parse_chord_list(&exit_chord_spec);
-        // The leader is a single chord, not a list. An empty configured
-        // value disables it (so every key, including the default `C-b`,
-        // passes straight through). A non-empty but unparseable value is
-        // treated as a typo and falls back to the default leader rather
-        // than silently dropping the feature, mirroring how the exit
-        // chord recovers from a bad spec.
-        let leader_spec = resolved_config.session.live_send_leader;
-        let leader = if leader_spec.trim().is_empty() {
-            None
-        } else {
-            live_send::parse_chord(&leader_spec).or_else(|| {
-                tracing::warn!(
-                    "live-send: unparseable leader chord '{}'; falling back to default '{}'",
-                    leader_spec,
-                    live_send::DEFAULT_LEADER
-                );
-                live_send::parse_chord(live_send::DEFAULT_LEADER)
-            })
-        };
-        self.live_send = Some(live_send::LiveSendState {
-            session_id: inst.id.clone(),
-            title: inst.title.clone(),
-            tmux_name: tmux_name.clone(),
+        // Snapshot the configured chords now so the per-keystroke dispatch
+        // path doesn't re-parse on every event. Config edits during live mode
+        // aren't possible (settings_view participates in has_dialog and lives
+        // in its own takeover), so a snapshot at entry time is sufficient.
+        self.live_send = Some(live_send::LiveSendState::new(
+            inst.id.clone(),
+            inst.title.clone(),
+            tmux_name.clone(),
             target,
-            exit_chords,
-            leader,
-        });
+            None,
+            &resolve_config_or_warn(&self.config_profile()).session,
+        ));
         // Entering live-send means the user is now viewing this session, so
         // clear any unread marker.
         self.clear_unread_on_view(&inst.id);

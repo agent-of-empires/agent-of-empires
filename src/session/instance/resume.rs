@@ -16,6 +16,12 @@ pub(crate) enum ResumeAttemptPolicy {
     Allow,
 }
 
+pub(crate) struct LaunchReservation {
+    pub(crate) generation: u64,
+    pub(crate) title_lock: crate::session::storage::StorageFlock,
+    pub(crate) lifecycle_lock: crate::session::storage::StorageFlock,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProbeResult {
     Alive,
@@ -222,56 +228,135 @@ impl Instance {
             self.last_error = None;
             self.last_error_check = None;
         }
-        self.acquire_lifecycle_reservation(
+        let generation = self.acquire_lifecycle_reservation(
             &storage,
             LifecycleOperation::Launch,
             Some(Status::Starting),
         )?;
-        if restart {
-            self.stop_and_flush_poller_lifecycle_locked();
-            self.capture_omp_before_restart(&profile);
-        }
         if discard_sandbox_container {
             if let Err(error) = self.discard_stale_sandbox_container() {
-                self.fail_reserved_launch(&storage, &error, false);
+                self.fail_reserved_launch(&storage, generation, &error, false);
+                return Err(error);
+            }
+        }
+        self.resume_reserved_launch(
+            &storage,
+            size,
+            skip_on_launch,
+            resume_policy,
+            restart,
+            LaunchReservation {
+                generation,
+                title_lock,
+                lifecycle_lock,
+            },
+        )
+    }
+
+    pub(crate) fn resume_reserved_launch(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+        size: Option<(u16, u16)>,
+        skip_on_launch: bool,
+        resume_policy: ResumeAttemptPolicy,
+        restart: bool,
+        reservation: LaunchReservation,
+    ) -> Result<StartOutcome> {
+        let generation = self.prepare_reserved_launch_hooks(storage, restart, reservation)?;
+        let hook_result = self.run_pre_launch_hooks(skip_on_launch, storage, None);
+        self.finish_reserved_launch(
+            storage,
+            size,
+            resume_policy,
+            restart,
+            generation,
+            hook_result,
+        )
+    }
+    pub(crate) fn capture_before_restart_in(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+    ) -> Result<()> {
+        self.stop_and_flush_poller_lifecycle_locked(storage)?;
+        self.capture_omp_before_restart(storage)
+    }
+
+    pub(crate) fn discard_reserved_restart_container(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+        generation: u64,
+    ) -> Result<()> {
+        if let Err(error) = self.discard_stale_sandbox_container() {
+            self.fail_reserved_launch(storage, generation, &error, false);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn prepare_reserved_launch_hooks(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+        restart: bool,
+        reservation: LaunchReservation,
+    ) -> Result<u64> {
+        let LaunchReservation {
+            generation,
+            title_lock,
+            lifecycle_lock,
+        } = reservation;
+        if restart {
+            let capture = self
+                .stop_and_flush_poller_lifecycle_locked(storage)
+                .and_then(|()| self.capture_omp_before_restart(storage));
+            if let Err(error) = capture {
+                self.fail_reserved_launch(storage, generation, &error, false);
                 return Err(error);
             }
         }
 
-        // Keep the generation reservation durable, but allow hooks to invoke
-        // aoe against this session without waiting on either flock. Reacquire
-        // title before lifecycle and reload (`reconcile_from_disk`) before
-        // deriving the launch name: `spawn_prepared_launch`'s `tmux_session()`
-        // reads `self.title`, so the reload guarantees the tmux name comes
-        // from the authoritative committed title, not a pre-hook value.
         drop(lifecycle_lock);
         drop(title_lock);
-        let hook_result = self.run_pre_launch_hooks(skip_on_launch, &profile);
-        let (_title_lock, _lifecycle_lock) =
-            self.reacquire_launch_locks_after_hooks(&storage, hook_result)?;
-        let skipped_failed_resume_sid = self.apply_resume_policy(resume_policy);
-        self.apply_fresh_launch_intent();
+        Ok(generation)
+    }
 
-        let mut prepared = match self.prepare_launch_command() {
+    pub(crate) fn finish_reserved_launch(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+        size: Option<(u16, u16)>,
+        resume_policy: ResumeAttemptPolicy,
+        restart: bool,
+        generation: u64,
+        hook_result: Result<()>,
+    ) -> Result<StartOutcome> {
+        let (_title_lock, _lifecycle_lock) =
+            self.reacquire_launch_locks_after_hooks(storage, generation, hook_result)?;
+        let skipped_failed_resume_sid = self.apply_resume_policy(resume_policy);
+        let mut prepared = match self
+            .apply_fresh_launch_intent(storage)
+            .and_then(|()| self.prepare_launch_command(storage))
+        {
             Ok(prepared) => prepared,
             Err(error) => {
-                self.fail_reserved_launch(&storage, &error, false);
+                self.fail_reserved_launch(storage, generation, &error, false);
                 return Err(error);
             }
         };
         let result = (|| {
             if restart {
                 self.kill_clean_locked()?;
-                prepared = self.refresh_prepared_prime_launch_after_pane_stop(prepared)?;
+                prepared = self.refresh_prepared_prime_launch_after_pane_stop(
+                    prepared,
+                    crate::session::storage::CaptureStorage::Scoped(storage),
+                )?;
             }
-            let launch_outcome = self.spawn_prepared_launch(size, &profile, prepared)?;
+            let launch_outcome = self.spawn_prepared_launch(size, storage, prepared)?;
             let outcome =
-                self.finish_resume_launch(launch_outcome, skipped_failed_resume_sid, &profile)?;
-            self.commit_lifecycle_launch(&storage, restart)?;
+                self.finish_resume_launch(launch_outcome, skipped_failed_resume_sid, storage)?;
+            self.commit_lifecycle_launch(storage, generation, restart)?;
             Ok(outcome)
         })();
         if let Err(error) = result {
-            self.fail_reserved_launch(&storage, &error, true);
+            self.fail_reserved_launch(storage, generation, &error, true);
             return Err(error);
         }
         result
@@ -392,7 +477,7 @@ impl Instance {
         &mut self,
         launch_outcome: LaunchSidOutcome,
         skipped_failed_resume_sid: Option<String>,
-        profile: &str,
+        storage: &dyn crate::session::SessionStore,
     ) -> Result<StartOutcome> {
         let (attempted_sid, pinned_prior_sid) = match launch_outcome {
             LaunchSidOutcome::Existing { sid }
@@ -439,13 +524,7 @@ impl Instance {
         self.stop_poller();
         self.session_id_poller = None;
         self.resume_probe_failed_sid = Some(stale_sid.clone());
-        if self.mark_resume_probe_failed(profile, &stale_sid) == SidWrite::Failed {
-            anyhow::bail!(
-                "resume probe failed for sid {} for {}, but marker could not be persisted",
-                stale_sid,
-                self.id,
-            );
-        }
+        self.mark_resume_probe_failed(storage, &stale_sid)?;
         self.kill_clean_locked()
             .with_context(|| format!("kill_clean before resume fallback for {}", self.id))?;
         self.status = Status::Error;
@@ -512,6 +591,9 @@ mod tests {
 
     #[test]
     fn resume_and_capture_capabilities_control_each_path() {
+        let root = tempdir().unwrap();
+        let storage =
+            crate::session::Storage::new_for_test_path("test", root.path().join("sessions.json"));
         let sid = "11111111-1111-1111-1111-111111111111";
         let cases = [
             ("cursor", true, true),
@@ -549,7 +631,13 @@ mod tests {
                 .unwrap()
                 .launch_base_command();
             let base_command = command.clone();
-            let resumed = inst.apply_session_flags(&mut command, "test").unwrap();
+            let resumed = inst
+                .apply_session_flags(
+                    &mut command,
+                    "test",
+                    CaptureStorage::Profiles(&crate::file_watch::FileWatchService::noop()),
+                )
+                .unwrap();
             assert_eq!(resumed, resume_supported, "{tool}: launch resume decision");
             assert_eq!(
                 command != base_command,
@@ -568,7 +656,7 @@ mod tests {
                             pinned_prior_sid: Some(sid.to_string()),
                         },
                         None,
-                        "test",
+                        &storage,
                     )
                     .unwrap(),
                     StartOutcome::Fresh,
@@ -712,7 +800,7 @@ mod tests {
                 sid: launched_sid.to_string(),
             },
             None,
-            "marker-before-cleanup",
+            &storage,
         );
         assert!(
             result.is_err(),

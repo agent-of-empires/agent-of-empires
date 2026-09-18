@@ -60,10 +60,108 @@ pub(crate) fn now_ms() -> u64 {
     system_time_to_ms(SystemTime::now())
 }
 
+/// Fail-closed check for an owner-only credential store: the parent dir must
+/// exist, not be a symlink, and not be group/world writable; the file, when
+/// present, must be a regular owner-only file rather than a symlink, so a
+/// secret is never read from or written through a planted link. A missing
+/// file passes. `label` names the store in errors, e.g. `"login sessions"`.
+pub(crate) fn check_owner_only_file(path: &std::path::Path, label: &str) -> anyhow::Result<()> {
+    use anyhow::{bail, Context};
+
+    if let Some(parent) = path.parent() {
+        let meta = std::fs::symlink_metadata(parent)
+            .with_context(|| format!("stat {label} parent dir"))?;
+        if meta.file_type().is_symlink() {
+            bail!("{label} parent dir is a symlink; refusing");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if meta.permissions().mode() & 0o022 != 0 {
+                bail!("{label} parent dir is group/world writable; refusing");
+            }
+        }
+    }
+
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                bail!("{label} path is a symlink; refusing");
+            }
+            if !meta.file_type().is_file() {
+                bail!("{label} path is not a regular file; refusing");
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if meta.permissions().mode() & 0o077 != 0 {
+                    bail!("{label} file is group/world accessible; refusing");
+                }
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("stat {label} file")),
+    }
+}
+
+/// This machine's hostname, when it has a usable one.
+pub fn hostname() -> Option<String> {
+    nix::unistd::gethostname()
+        .ok()
+        .and_then(|name| name.into_string().ok())
+        .filter(|name| !name.trim().is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_only_file_check_rejects_symlink_dir_and_loose_perms() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // A symlink at the path is rejected (no following).
+        let target = dir.path().join("real.toml");
+        std::fs::write(&target, "x").unwrap();
+        let link = dir.path().join("link.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(
+            check_owner_only_file(&link, "store").is_err(),
+            "symlink must be rejected"
+        );
+
+        // A world/group-accessible file is rejected.
+        let loose = dir.path().join("loose.toml");
+        std::fs::write(&loose, "x").unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            check_owner_only_file(&loose, "store").is_err(),
+            "0644 file must be rejected"
+        );
+
+        // A directory at the path is rejected.
+        let subdir = dir.path().join("dir.toml");
+        std::fs::create_dir(&subdir).unwrap();
+        assert!(check_owner_only_file(&subdir, "store").is_err());
+
+        // A 0600 file under a private dir passes.
+        let ok = dir.path().join("ok.toml");
+        std::fs::write(&ok, "x").unwrap();
+        std::fs::set_permissions(&ok, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // tempfile dirs are 0700, so the parent check passes too.
+        assert!(
+            check_owner_only_file(&ok, "store").is_ok(),
+            "0600 file should pass"
+        );
+
+        // A missing file (not yet created) passes: the parent is fine.
+        assert!(check_owner_only_file(&dir.path().join("missing.toml"), "store").is_ok());
+    }
 
     #[test]
     fn collapse_home_requires_a_separator_after_home() {

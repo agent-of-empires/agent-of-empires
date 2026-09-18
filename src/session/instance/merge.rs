@@ -4,6 +4,39 @@
 use super::*;
 
 impl Instance {
+    pub(crate) fn inherit_runtime(&mut self, mut prior: Self, preserve_errors: bool) {
+        if preserve_errors {
+            self.last_error = prior.last_error.take();
+            self.last_error_check = prior.last_error_check;
+        }
+        self.live_status_baseline = prior.live_status_baseline;
+        self.ever_confirmed_present = prior.ever_confirmed_present;
+        self.unknown_since = prior.unknown_since;
+        self.detection = prior.detection;
+        self.pane_dead_observed = prior.pane_dead_observed;
+        self.agent_pane = std::mem::take(&mut prior.agent_pane);
+        self.auxiliary = std::mem::take(&mut prior.auxiliary);
+        self.inherit_process_runtime(prior);
+    }
+
+    /// Keep launch-owned process state without replacing a fresh status observation.
+    pub(crate) fn inherit_process_runtime(&mut self, prior: Self) {
+        self.last_start_time = prior.last_start_time;
+        self.session_id_poller = prior.session_id_poller;
+        self.poller_repair = prior.poller_repair;
+        self.session_id_poller_retry_after = prior.session_id_poller_retry_after;
+        self.retroactive_capture_excludes = prior.retroactive_capture_excludes;
+        self.acp_load_session_capable = prior.acp_load_session_capable;
+        self.force_fresh_next_launch = prior.force_fresh_next_launch;
+        self.pending_host_env = prior.pending_host_env;
+        self.pi_extension_launched = prior.pi_extension_launched;
+        self.identity_publisher_launched = prior.identity_publisher_launched;
+        self.file_watch = self.file_watch.take().or(prior.file_watch);
+        if let (Some(fresh), Some(previous)) = (self.sandbox_info.as_mut(), prior.sandbox_info) {
+            fresh.before_start_env = previous.before_start_env;
+        }
+    }
+
     /// Mutates launch-owned state. A strictly newer lifecycle generation also
     /// imports its status timestamps, capture floor, and error snapshot as one unit.
     pub fn merge_post_start(&mut self, src: &Self) {
@@ -76,26 +109,11 @@ impl Instance {
         }
     }
 
-    /// Carry runtime-only state across a storage reload without constructing a
-    /// lifecycle snapshot from two different generations.
-    ///
-    /// `status` and `idle_entered_at` ARE generation-governed: a strictly newer
-    /// disk snapshot (a peer's `commit_reserved_lifecycle_status`) must win over
-    /// the stale in-memory copy. A Purge reservation is the exception: its
-    /// generation bump deliberately leaves the durable status unchanged, so an
-    /// in-memory `Deleting` overlay stays authoritative until the result
-    /// arrives. `last_error`/`last_error_check`,
-    /// `ever_confirmed_present`, and
-    /// `unknown_since` are NOT generation-governed: no lifecycle writer
-    /// (`reserve_/commit_/advance_lifecycle_generation`) produces an
-    /// authoritative peer value for them. The reachability sentinels are
-    /// serde-skipped, and the only on-disk error value is the one
-    /// `reconcile_from_disk` round-trips back from this same in-memory poller
-    /// state. The in-memory values therefore always win. Gating them on the
-    /// generation would let an unrelated bump discard a poller's confirmed
-    /// reachability and unknown streak, or a freshly derived
-    /// `TMUX_SESSION_GONE_ERROR`, leaving the row stuck at `Error`+`None`.
+    /// Preserve runtime observations; newer lifecycle state owns status and pane liveness.
+    /// A purge reservation retains its in-memory Deleting overlay.
     pub(crate) fn merge_runtime_from_reload(&mut self, previous: &Self) {
+        self.agent_pane.clone_from(&previous.agent_pane);
+        self.auxiliary.clone_from(&previous.auxiliary);
         let purge_in_flight = previous.status == Status::Deleting
             && self.lifecycle_reservation_is_owned(
                 LifecycleOperation::Purge,
@@ -104,12 +122,10 @@ impl Instance {
         if self.lifecycle_generation <= previous.lifecycle_generation || purge_in_flight {
             self.status = previous.status;
             self.idle_entered_at = previous.idle_entered_at;
+            self.live_status_baseline = previous.live_status_baseline;
+            self.pane_dead_observed = previous.pane_dead_observed;
         }
-        // Reachability sentinels and detection bookkeeping are runtime-only
-        // just like poller errors. A lifecycle generation bump does not make
-        // serde-skipped defaults from disk authoritative, and the TUI's
-        // heartbeat reload lands between two poll cycles: dropping `detection`
-        // here loses the proposal awaiting its confirming poll (#3642).
+        // Storage does not contain detection proposals or runtime diagnostics.
         self.ever_confirmed_present = previous.ever_confirmed_present;
         self.unknown_since = previous.unknown_since;
         self.detection = previous.detection;
@@ -123,11 +139,8 @@ impl Instance {
         self.acp_load_session_capable = previous.acp_load_session_capable;
     }
 
-    /// Carry every in-process field from a pre-move live row onto the
-    /// committed disk-derived candidate published by `HomeView`.
-    /// Adding a new `#[serde(skip)]` field requires deciding whether
-    /// `merge_runtime_from_reload`, this function, and
-    /// `server::merge_runtime_fields` must carry it.
+    /// Carry live launch and polling state across a committed profile move.
+    /// Keep reload and move merging aligned when adding runtime-only fields.
     pub(crate) fn merge_runtime_for_profile_move(&mut self, previous: &Self) {
         self.merge_runtime_from_reload(previous);
         self.live_status_baseline = previous.live_status_baseline;
@@ -828,7 +841,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_post_restart_clears_repair_backoff_when_restart_poller_runs() {
+    fn test_merge_post_restart_clears_repair_backoff_when_the_restart_cascade_runs() {
         let mut before = Instance::new("omp-session", "/tmp/test");
         before.omp_capture_generation = Some("generation-a".to_string());
         let now = std::time::Instant::now();

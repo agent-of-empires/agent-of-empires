@@ -78,7 +78,7 @@ impl HomeView {
 
     /// Show the group-by picker dialog seeded with the current mode.
     pub(in crate::tui) fn show_group_picker(&mut self) {
-        self.group_picker_dialog = Some(GroupPickerDialog::new(self.group_by));
+        self.group_picker_dialog = Some(GroupPickerDialog::new(self.effective_group_by()));
     }
 
     /// Open the saved-project picker that starts a new session pre-filled with
@@ -189,7 +189,7 @@ impl HomeView {
                 inst.title.clone(),
                 taken
                     .iter()
-                    .map(|p| crate::session::projects::canonical_key(p))
+                    .map(crate::session::projects::canonical_key)
                     .collect::<Vec<_>>(),
                 // The session's own profile, not the view's filter: a session
                 // belongs to one profile and its registry is that profile's.

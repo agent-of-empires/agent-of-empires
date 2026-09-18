@@ -29,6 +29,8 @@ Copy relies on the browser Clipboard API, which only works in a secure context: 
 
 Each session can open a **paired terminal**: a host (or, for sandboxed sessions, in-container) shell rooted at the session's working directory. On desktop it shares the split with the agent terminal; on mobile it is one of the right-panel picker's views. It stays alive in the background when you switch away, preserving scrollback and focus.
 
+On a writable server, opening or reconnecting either paired shell is refused while the session is held by a lifecycle operation such as purge. A live shell is preserved. Host recovery uses the current project directory; container recovery keeps its pinned working directory and reuses minted values while the container remains running.
+
 For sandboxed sessions, the **Container** tab launches the container user's preferred shell, resolved inside the container (passwd entry, then `$SHELL`, then bash, sh). Candidates must be regular executable files and either have a recognized shell name or be listed exactly in `/etc/shells`. Known-compatible shells run in login mode; other authorized shells run plain. Minimal images without `getent` read `/etc/passwd` directly.
 
 ## Reconnect
@@ -44,6 +46,19 @@ When the browser fails to reach a working terminal, the disconnect banner shows 
 | 1001 | `server shutdown` | Daemon is shutting down (SIGINT/SIGTERM).                                                 | Retry with normal backoff. |
 | 1013 | `tmux_not_ready`  | Pane did not become capturable within 2s. Usually a benign warm-up on first session open. | Retry with normal backoff. |
 | 4001 | `pty_dead`        | The live view was running but the pane permanently exited.                                | Show "Click retry" banner. |
+
+## Who sets the pane size
+
+One client at a time sets a session's pane size, and every surface follows the
+same rule: the TUI, the web live view, a remote client, and `aoe attach`.
+
+Opening a session live, or attaching a terminal to it, takes that right and
+sizes the pane to your grid; whoever held it is told who took over and drops
+back to watching. Merely selecting or previewing a session takes it only while
+nobody else holds it and no live client has sized the pane, so a second device
+renders at the size the first one set instead of fighting it. Letting go, by
+leaving live mode, deselecting, or disconnecting, never resizes the pane again;
+it keeps the size it was given until the session restarts.
 
 ## Read-only mode
 

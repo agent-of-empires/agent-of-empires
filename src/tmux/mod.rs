@@ -3,9 +3,11 @@
 pub(crate) mod composite;
 pub(crate) mod detect;
 pub(crate) mod env;
+pub(crate) mod mouse;
 pub(crate) mod osc8;
 mod session;
 mod session_kind;
+pub mod size_lock;
 pub mod status_bar;
 pub(crate) mod status_detection;
 pub(crate) mod status_rules;
@@ -18,15 +20,19 @@ pub(crate) mod utils;
 pub(crate) mod vt;
 
 pub use composite::PaneGeom;
-pub use session::{PaneCursor, PaneEnvMutation, Session, SIZE_OWNER_HEARTBEAT, SIZE_OWNER_TTL};
+pub use session::{
+    PaneCursor, PaneEnvMutation, Session, SIZE_OWNER_HEARTBEAT, SIZE_OWNER_TTL,
+    TERMINAL_ATTACH_LABEL,
+};
+pub use size_lock::{SizeMode, SizeState};
 pub use status_bar::{get_session_info_for_current, get_status_for_current_session};
 pub use status_detection::{
     detect_claude, detect_status_from_content, detect_status_from_content_in, detect_via_manifest,
     detect_with_rules,
 };
-pub use terminal_session::{kill_all_terminals_for_id, ContainerTerminalSession, TerminalSession};
-pub use tool_session::{kill_all_tool_sessions_for_id, ToolSession};
-pub use utils::{attach_return_hint, tmux_prefix_display};
+pub use terminal_session::{ContainerTerminalSession, TerminalSession};
+pub use tool_session::ToolSession;
+pub use utils::{attach_return_hint, first_pane_id, tmux_prefix_display};
 
 pub(crate) use session_kind::{append_session_kind_args, SessionKind};
 
@@ -252,6 +258,36 @@ pub(crate) fn tmux_query_command() -> Command {
     cmd
 }
 
+pub(crate) fn native_socket_locator() -> Option<PathBuf> {
+    let output = run_tmux_command_with_timeout(tmux_query_command().args([
+        "display-message",
+        "-p",
+        "#{socket_path}",
+    ]))
+    .ok()?;
+    let text = if output.status.success() {
+        std::str::from_utf8(&output.stdout).ok()?
+    } else {
+        if !tmux_no_server_running(&output.stderr) {
+            return None;
+        }
+        std::str::from_utf8(&output.stderr).ok()?
+    };
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    // A missing server still reports its selected socket in the C-locale diagnostic.
+    let path = if output.status.success() {
+        text
+    } else if let Some(path) = text.strip_prefix("no server running on ") {
+        path
+    } else {
+        text.strip_prefix("error connecting to ")?
+            .rsplit_once(" (")?
+            .0
+    };
+    let path = PathBuf::from(path);
+    path.is_absolute().then_some(path)
+}
+
 // Debug builds use `aoe_dev_*` prefixes so `cargo run` and an installed
 // release `aoe` never mistake each other's sessions. Debug builds also run on
 // their own tmux socket (see `tmux_socket`), so the two builds no longer
@@ -278,9 +314,20 @@ pub const TOOL_PREFIX: &str = if cfg!(debug_assertions) {
     "aoe_tool_"
 };
 
+#[derive(Debug, Clone)]
+pub enum ToolPaneOwner {
+    Unmarked,
+    Named {
+        instance_id: String,
+        tool_name: String,
+    },
+    Invalid,
+}
+
 /// Pre-fetched pane metadata from a single `tmux list-panes -a` call.
 #[derive(Debug, Clone)]
 pub struct PaneMetadata {
+    pub tool_owner: ToolPaneOwner,
     pub pane_dead: bool,
     pub pane_current_command: Option<String>,
     pub pane_start_command_is_protected: bool,
@@ -1123,9 +1170,9 @@ fn unmarked<'a>(
 /// ambiguous, so `derived` wins there as well.
 pub(crate) fn resolve_session_name<'a>(
     live: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
-    derived: &str,
+    derived: &'a str,
     shape: &NameShape,
-) -> String {
+) -> &'a str {
     let mut adopted: Option<&str> = None;
     let mut ambiguous = false;
     let mut derived_is_live = false;
@@ -1151,9 +1198,32 @@ pub(crate) fn resolve_session_name<'a>(
         }
     }
     match adopted {
-        Some(name) if !derived_is_live && !ambiguous => name.to_string(),
-        _ => derived.to_string(),
+        Some(name) if !derived_is_live && !ambiguous => name,
+        _ => derived,
     }
+}
+
+pub(crate) fn pane_metadata_for_shape<'a>(
+    panes: &'a HashMap<String, PaneMetadata>,
+    derived: &str,
+    shape: &NameShape,
+) -> anyhow::Result<Option<(&'a str, &'a PaneMetadata)>> {
+    if let Some((name, metadata)) = panes.get_key_value(derived) {
+        return Ok(Some((name.as_str(), metadata)));
+    }
+    let mut matches = panes.iter().filter(|(name, _)| shape.matches(name));
+    let found = matches.next();
+    anyhow::ensure!(matches.next().is_none(), "Pane identity is ambiguous");
+    Ok(found.map(|(name, metadata)| (name.as_str(), metadata)))
+}
+
+pub(crate) fn agent_pane_metadata_in<'a>(
+    panes: &'a HashMap<String, PaneMetadata>,
+    id: &str,
+    title: &str,
+) -> anyhow::Result<Option<(&'a str, &'a PaneMetadata)>> {
+    let derived = Session::generate_name(id, title);
+    pane_metadata_for_shape(panes, &derived, &NameShape::agent(&id_suffix(id)))
 }
 
 /// `resolve_session_name` for the agent pane, against names alone: with no
@@ -1163,7 +1233,7 @@ pub(crate) fn resolve_session_name<'a>(
 pub fn resolve_agent_session_name<'a>(
     live_names: impl IntoIterator<Item = &'a str>,
     session_id: &str,
-    derived: &str,
+    derived: &'a str,
 ) -> String {
     let suffix = id_suffix(session_id);
     resolve_session_name(
@@ -1171,6 +1241,7 @@ pub fn resolve_agent_session_name<'a>(
         derived,
         &NameShape::agent(&suffix),
     )
+    .to_owned()
 }
 
 /// [`resolve_agent_session_name`] against a [`batch_pane_metadata`] snapshot
@@ -1256,6 +1327,7 @@ fn resolve_session_name_from_snapshot(
         derived,
         shape,
     )
+    .to_owned()
 }
 
 /// Resolve from the current authoritative cache snapshot without spawning.
@@ -1279,10 +1351,8 @@ fn session_name_from_cache(derived: &str, shape: &NameShape) -> Option<String> {
     ))
 }
 
-/// Force-stop every aoe-owned tmux session (agent, terminal, container
-/// terminal, tool) in this namespace. Mirrors `kill_all_tool_sessions_for_id`
-/// but sweeps the whole `SESSION_PREFIX` namespace. Returns the number of
-/// sessions killed. Refreshes the session cache once at the end.
+/// Force-stop every aoe-owned tmux session in this namespace.
+/// Return the number killed and refresh the session cache once.
 ///
 /// `Err` means the `tmux list-sessions` process could not be spawned (e.g.
 /// tmux is not installed), which callers should treat as a failed surface. A
@@ -1345,14 +1415,11 @@ pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
         "list-panes",
         "-a",
         "-F",
-        // `pane_pid` stays at the end of the pipe-separated head, where
-        // the parser splits it back off the start command's tail; the two
-        // fields after it ride [`TAIL_SEP`], because a start command or a
-        // title may carry a pipe of its own.
+        // Tail fields use TAIL_SEP because commands and titles may contain pipes.
         concat!(
             "#{session_name}|#{pane_index}|#{pane_dead}|#{window_width}|#{window_height}",
             "|#{pane_current_command}",
-            "|#{pane_start_command}|#{pane_pid}\x1f#{window_activity}\x1f#{pane_title}"
+            "|#{pane_start_command}|#{pane_pid}\x1f#{window_activity}\x1f#{@aoe_tool_owner}\x1f#{pane_title}"
         ),
     ]);
     let output = run_tmux_command_with_timeout(&mut command);
@@ -1468,31 +1535,30 @@ fn find_escaped_tail_sep(line: &str, from: usize) -> Option<usize> {
     None
 }
 
-fn split_pane_metadata_tail(line: &str) -> (&str, Option<&str>, Option<&str>) {
-    if let Some(first) = line.find(TAIL_SEP) {
-        let rest = &line[first + TAIL_SEP.len_utf8()..];
-        return match rest.find(TAIL_SEP) {
-            Some(second) => (
-                &line[..first],
-                Some(&rest[..second]),
-                Some(&rest[second + 1..]),
-            ),
-            None => (&line[..first], Some(rest), None),
-        };
+fn split_pane_metadata_field(line: &str) -> (&str, Option<&str>) {
+    if let Some((field, rest)) = line.split_once(TAIL_SEP) {
+        return (field, Some(rest));
     }
-
-    let Some(first) = find_escaped_tail_sep(line, 0) else {
-        return (line, None, None);
-    };
-    let rest_start = first + ESCAPED_TAIL_SEP.len();
-    match find_escaped_tail_sep(line, rest_start) {
-        Some(second) => (
-            &line[..first],
-            Some(&line[rest_start..second]),
-            Some(&line[second + ESCAPED_TAIL_SEP.len()..]),
+    match find_escaped_tail_sep(line, 0) {
+        Some(index) => (
+            &line[..index],
+            Some(&line[index + ESCAPED_TAIL_SEP.len()..]),
         ),
-        None => (&line[..first], Some(&line[rest_start..]), None),
+        None => (line, None),
     }
+}
+
+fn split_pane_metadata_tail(line: &str) -> (&str, Option<&str>, Option<&str>, Option<&str>) {
+    let (head, tail) = split_pane_metadata_field(line);
+    let Some(tail) = tail else {
+        return (head, None, None, None);
+    };
+    let (activity, tail) = split_pane_metadata_field(tail);
+    let Some(tail) = tail else {
+        return (head, Some(activity), None, None);
+    };
+    let (owner, title) = split_pane_metadata_field(tail);
+    (head, Some(activity), Some(owner), title)
 }
 
 /// Parse the output of `tmux list-panes -a` into a map of session name to pane metadata.
@@ -1501,11 +1567,18 @@ fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
     let mut map = HashMap::new();
 
     for line in output.lines() {
-        // The two trailing fields ride their own separator (see TAIL_SEP), so
-        // the pipe-separated head parses exactly as it did before them; a line
-        // with no tail is all head. Accept tmux 3.4's octal rendering as well
-        // as the raw byte emitted by newer versions.
-        let (line, activity, pane_title) = split_pane_metadata_tail(line);
+        // tmux 3.4 renders TAIL_SEP in octal; newer versions emit the raw byte.
+        let (line, activity, tool_owner, pane_title) = split_pane_metadata_tail(line);
+        let tool_owner = match tool_owner {
+            None | Some("") => ToolPaneOwner::Unmarked,
+            Some(value) => match serde_json::from_str::<(String, String)>(value) {
+                Ok((instance_id, tool_name)) => ToolPaneOwner::Named {
+                    instance_id,
+                    tool_name,
+                },
+                Err(_) => ToolPaneOwner::Invalid,
+            },
+        };
         let window_activity = activity.and_then(|a| a.trim().parse::<i64>().ok());
         let pane_title = pane_title.unwrap_or("");
         let mut parts = line.splitn(7, FIELD_SEP);
@@ -1557,6 +1630,7 @@ fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
         map.insert(
             session_name.to_string(),
             PaneMetadata {
+                tool_owner,
                 pane_dead: pane_dead == "1",
                 pane_pid,
                 pane_current_command: if pane_current_command.is_empty() {
@@ -1625,6 +1699,7 @@ pub fn test_inject_pane_window_size_at(name: &str, size: (u16, u16), taken_at: I
         map.insert(
             name.to_string(),
             PaneMetadata {
+                tool_owner: ToolPaneOwner::Unmarked,
                 pane_dead: false,
                 pane_current_command: None,
                 pane_start_command_is_protected: false,
@@ -2051,7 +2126,7 @@ pub fn session_exists(name: &str) -> bool {
     }
 
     let mut command = tmux_command();
-    command.args(["has-session", "-t", name]);
+    command.args(["has-session", "-t"]).arg(format!("={name}"));
     run_tmux_command_with_timeout(&mut command)
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -2187,6 +2262,9 @@ fn pane_snapshot_refresh_due() -> bool {
 pub(crate) struct PassiveResizeIntent {
     pub session_id: String,
     pub session_name: String,
+    /// Size-lock identity of the TUI asking, so the shared rule can tell its
+    /// own lock from another client's.
+    pub who: String,
     pub cols: u16,
     pub rows: u16,
     /// Resize before any queued non-priority work: this is the session the
@@ -2344,16 +2422,18 @@ pub(crate) fn take_passive_resize_dones() -> Vec<PassiveResizeDone> {
 }
 
 /// Execute one queued passive resize under an atomic final tmux guard. The
-/// worker first rejects a missing session; the Session helper then fences both
-/// a newly attached client and a size-owner takeover at resize execution. A
-/// resize the guard refuses (or that errors) still completes, as declined, so
-/// render can park the geometry instead of retrying it every frame.
+/// worker first rejects a missing session; the Session helper then applies the
+/// shared size-lock rule and fences an attach or takeover that arrives at
+/// resize execution. A resize the guard refuses (or that errors) still
+/// completes, as declined, so render can park the geometry instead of retrying
+/// it every frame.
 fn execute_passive_resize(work: &PassiveResizeWork) -> PassiveResizeDone {
     let intent = &work.intent;
     let deadline = TmuxCommandDeadline::new();
     let session = Session::from_name(&intent.session_name);
     let applied_window_rows = if session.exists_with_deadline(&deadline) {
-        session.resize_window_if_detached_without_active_owner_after_exists_with_deadline(
+        session.resize_window_for_viewer_with_deadline(
+            &intent.who,
             intent.cols,
             intent.rows,
             &deadline,
@@ -3144,6 +3224,7 @@ mod tests {
             intent: PassiveResizeIntent {
                 session_id: session_id.to_string(),
                 session_name: format!("aoe_test_{session_id}"),
+                who: "tui-view-test".to_string(),
                 cols,
                 rows,
                 priority: false,
@@ -3270,6 +3351,7 @@ mod tests {
             intent: PassiveResizeIntent {
                 session_id: ID.to_string(),
                 session_name: name.clone(),
+                who: "tui-view-test".to_string(),
                 cols: 100,
                 rows: 30,
                 priority: false,
@@ -3707,6 +3789,7 @@ mod tests {
                     (
                         n.to_string(),
                         PaneMetadata {
+                            tool_owner: ToolPaneOwner::Unmarked,
                             pane_dead: false,
                             pane_current_command: None,
                             pane_start_command_is_protected: false,
@@ -3778,6 +3861,7 @@ mod tests {
 
     fn dead_pane_meta(dead: bool) -> PaneMetadata {
         PaneMetadata {
+            tool_owner: ToolPaneOwner::Unmarked,
             pane_dead: dead,
             pane_current_command: None,
             pane_start_command_is_protected: false,
@@ -4217,6 +4301,31 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn session_exists_does_not_accept_a_sibling_name_prefix() {
+        if !tmux_available() {
+            return;
+        }
+        let guard = SessionCacheGuard::capture();
+        let primary = test_helpers::TmuxTestSession::new(&format!("{TERMINAL_PREFIX}exact_probe"));
+        let sibling = test_helpers::TmuxTestSession::from_name(format!("{}_t1", primary.name()));
+        let created = tmux_command()
+            .args(["new-session", "-d", "-s", sibling.name(), "sleep 60"])
+            .output()
+            .expect("tmux new-session");
+        assert!(created.status.success());
+        guard.force_present(&[]);
+        assert!(session_exists(sibling.name()));
+        assert!(
+            !session_exists(primary.name()),
+            "an extra tab does not establish primary-terminal existence"
+        );
+        assert!(
+            !Session::from_name(primary.name()).exists_with_deadline(&TmuxCommandDeadline::new())
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn a_forced_cache_snapshot_survives_a_concurrent_refresh() {
         // See `forced_session_cache_active`: a refresh a parallel test
         // started must not land inside a guarded window.
@@ -4292,11 +4401,8 @@ mod tests {
 
     #[test]
     fn test_parse_pane_metadata_reads_the_tail_fields() {
-        // Built from TAIL_SEP itself, so a drift between the constant and the
-        // `list-panes` format literal fails here instead of degrading silently
-        // (no activity gate, every title rule dark).
         let output = format!(
-            "{P}proj_abc12345|0|0|190|52|claude|claude{TAIL_SEP}1770000000{TAIL_SEP}✶ Working\n"
+            "{P}proj_abc12345|0|0|190|52|claude|claude{TAIL_SEP}1770000000{TAIL_SEP}{TAIL_SEP}✶ Working\n"
         );
         let meta = parse_pane_metadata(&output)
             .remove(&format!("{P}proj_abc12345"))
@@ -4307,7 +4413,7 @@ mod tests {
         // tmux 3.4 renders the control separators as unescaped octal tokens.
         // A doubled backslash belongs to the title and must not split it.
         let escaped_output = format!(
-            "{P}proj_escaped_abc12345|0|0|190|52|claude|claude literal{}{ESCAPED_TAIL_SEP}|4242{ESCAPED_TAIL_SEP}1770000001{ESCAPED_TAIL_SEP}literal{}{ESCAPED_TAIL_SEP}title{}",
+            "{P}proj_escaped_abc12345|0|0|190|52|claude|claude literal{}{ESCAPED_TAIL_SEP}|4242{ESCAPED_TAIL_SEP}1770000001{ESCAPED_TAIL_SEP}{ESCAPED_TAIL_SEP}literal{}{ESCAPED_TAIL_SEP}title{}",
             char::from(92),
             char::from(92),
             char::from(10)
@@ -4322,16 +4428,27 @@ mod tests {
             Some(format!("literal{}{ESCAPED_TAIL_SEP}title", char::from(92)))
         );
 
-        // An unparsable activity or window size reads as absent, an empty
-        // title as `None`, and a head with no tail at all parses as it did
-        // before the fields.
-        let odd = format!("{P}proj_def67890|0|0|||claude|claude{TAIL_SEP}{TAIL_SEP}\n");
+        let odd = format!("{P}proj_def67890|0|0|||claude|claude{TAIL_SEP}{TAIL_SEP}{TAIL_SEP}\n");
         let meta = parse_pane_metadata(&odd)
             .remove(&format!("{P}proj_def67890"))
             .unwrap();
         assert_eq!(meta.window_activity, None);
         assert_eq!(meta.pane_title, None);
         assert_eq!(meta.window_size, None);
+        let id = "abc12345full";
+        let name = ToolSession::generate_name(id, "T", "git|log");
+        let owner = serde_json::to_string(&(id, "git|log")).unwrap();
+        for separator in ["\x1f", ESCAPED_TAIL_SEP] {
+            let output = format!("{name}|0|0|80|24|sh|sh|4242{separator}1770000000{separator}{owner}{separator}title\n");
+            let panes = parse_pane_metadata(&output);
+            assert_eq!(
+                ToolSession::from_snapshot(id, "renamed", "git|log", &panes)
+                    .unwrap()
+                    .session_name(),
+                name
+            );
+            assert!(ToolSession::from_snapshot(id, "T", "git_log", &panes).is_err());
+        }
     }
 
     #[test]
@@ -4769,7 +4886,7 @@ mod tests {
                 .args([
                     "capture-pane",
                     "-t",
-                    &format!("{}:^.0", session_name),
+                    &format!("={}:^", session_name),
                     "-p",
                     "-S",
                     "-10",

@@ -11,21 +11,23 @@ import { openWizard, selectProject, expandMoreOptions, wizard } from "./helpers/
 async function mockApis(page: Page) {
   await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   for (const path of ["settings", "themes", "profiles", "groups", "devices", "about", "system/update-status"]) {
-    await page.route(`**/api/${path}`, (r) =>
+    await page.route(`**/api/${path}*`, (r) =>
       r.fulfill({
         // worktree.enabled drives the wizard's "Create a worktree" default (#2423);
         // the attach-existing toggle only renders while worktree is on.
         json:
-          path === "settings"
-            ? { worktree: { enabled: true } }
-            : path === "about" || path === "system/update-status"
-              ? {}
-              : [],
+          path === "profiles"
+            ? [{ name: "default", is_default: true }]
+            : path === "settings"
+              ? { worktree: { enabled: true } }
+              : path === "about" || path === "system/update-status"
+                ? {}
+                : [],
       }),
     );
   }
   await page.route("**/api/recent-projects", (r) => r.fulfill({ json: { projects: [] } }));
-  await page.route("**/api/projects", (r) => r.fulfill({ json: [] }));
+  await page.route("**/api/projects*", (r) => r.fulfill({ json: [] }));
   await page.route("**/api/docker/status", (r) => r.fulfill({ json: { available: false, runtime: null } }));
   await page.route("**/api/agents", (r) =>
     r.fulfill({

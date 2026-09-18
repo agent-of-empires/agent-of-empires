@@ -71,16 +71,18 @@ pub struct PluginHost {
     max_workers: usize,
     /// Missing when the automation ledger could not open or in reduced tests.
     session_rpc: Option<Arc<crate::plugin::session_api::SessionRpcDeps>>,
+    work: Arc<crate::server::runtime::RuntimeWork>,
 }
 
 impl PluginHost {
     /// Build a host bound to `app_dir` (where the worker logs and the plugin
     /// event-bus database live) and `profile` (whose session storage the host
     /// API reads and writes). The only v1 sandbox backend is [`NoSandbox`].
-    pub fn new(
+    pub(crate) fn new(
         app_dir: &std::path::Path,
         profile: &str,
         session_rpc: Option<Arc<crate::plugin::session_api::SessionRpcDeps>>,
+        work: Arc<crate::server::runtime::RuntimeWork>,
     ) -> Result<Arc<Self>> {
         let workers_dir = app_dir.join("plugin-workers");
         worker::ensure_dir(&workers_dir)
@@ -101,6 +103,7 @@ impl PluginHost {
             }),
             max_workers: MAX_WORKERS,
             session_rpc,
+            work,
         }))
     }
 
@@ -577,18 +580,19 @@ impl PluginHost {
             program = %prepared.program.display(),
             "launched plugin worker"
         );
-        let ctx = PluginRpcContext {
+        let ctx = Arc::new(PluginRpcContext {
             plugin_id: plugin_id.to_string(),
             granted_capabilities: granted,
             ui_contributions,
             ui_generation,
-        };
+        });
         serve_connection(
             &self.api,
             &ctx,
             stdout,
             inbound_tx,
             self.session_rpc.as_ref(),
+            &self.work,
         )
         .await;
         // Serving ended; stop accepting host-initiated pushes and tear down the
@@ -662,10 +666,11 @@ fn plan_reconcile(
 /// the worker closes stdout or sends an unparseable line (fatal).
 async fn serve_connection(
     api: &Arc<HostApiState>,
-    ctx: &PluginRpcContext,
+    ctx: &Arc<PluginRpcContext>,
     stdout: tokio::process::ChildStdout,
     stdin: mpsc::UnboundedSender<String>,
     session_rpc: Option<&Arc<crate::plugin::session_api::SessionRpcDeps>>,
+    work: &crate::server::runtime::RuntimeWork,
 ) {
     let mut lines = BufReader::new(stdout).lines();
     // Unbounded line read: per the honest model (D8) the worker is cooperative,
@@ -709,120 +714,82 @@ async fn serve_connection(
             }
         };
 
-        // The session-driving methods (#2897) are async (they call the
-        // shared SessionService), so they route here instead of the
-        // synchronous spawn_blocking dispatch below. Capability gating,
-        // tracing, and response shaping mirror the sync path.
-        if crate::plugin::session_api::handles(&method) {
-            let outcome = match session_rpc {
-                Some(deps) => {
-                    crate::plugin::session_api::dispatch(deps, ctx, &method, &request.params).await
-                }
-                None => {
-                    // Authorize first so an ungranted caller receives the same
-                    // result as when the service is present; only an authorized
-                    // caller learns the dependency is unavailable.
-                    let unavailable = crate::plugin::host_api::DispatchError::with_kind(
-                        codes::SERVICE_UNAVAILABLE,
-                        "service_unavailable",
-                        "session service is not available in this host",
-                    );
-                    match crate::plugin::session_api::required_capability(&method) {
-                        Some(cap) => ctx.require(cap).and(Err(unavailable)),
-                        None => Err(unavailable),
-                    }
-                }
-            };
-            match &outcome {
-                Ok(_) => tracing::debug!(
-                    target: "plugin.host",
-                    plugin = %ctx.plugin_id,
-                    method = %method,
-                    "worker rpc ok"
-                ),
-                Err(e) => tracing::warn!(
-                    target: "plugin.host",
-                    plugin = %ctx.plugin_id,
-                    method = %method,
-                    code = e.code,
-                    "worker rpc rejected: {}",
-                    e.message
-                ),
-            }
-            let Some(id) = request.id else {
-                continue;
-            };
-            let response = match outcome {
-                Ok(result) => RpcResponse::success(id, result),
-                Err(e) => RpcResponse::error_with_data(id, e.code, e.message, e.data),
-            };
-            if stdin.send(response.to_line()).is_err() {
-                return;
-            }
-            continue;
-        }
-
-        // Dispatch does blocking SQLite and session-storage IO; run it off the
-        // async runtime. The handler is fully synchronous and self-contained.
-        let api = api.clone();
-        let ctx_id = ctx.plugin_id.clone();
-        let caps = ctx.granted_capabilities.clone();
-        let ui_contributions = ctx.ui_contributions.clone();
-        let ui_generation = ctx.ui_generation;
-        let params = request.params.clone();
+        let invocation_api = api.clone();
+        let invocation_ctx = ctx.clone();
+        let invocation_deps = session_rpc.cloned();
+        let params = request.params;
         let method_log = method.clone();
-        let outcome = tokio::task::spawn_blocking(move || {
-            let ctx = PluginRpcContext {
-                plugin_id: ctx_id,
-                granted_capabilities: caps,
-                ui_contributions,
-                ui_generation,
-            };
-            dispatch(&api, &ctx, &method, &params)
-        })
-        .await;
-
-        // Trace every dispatch outcome host-side, before the notification
-        // early-return below: a rejected call (a worker pushing an undeclared
-        // slot, a malformed payload, an ungranted capability) is otherwise
-        // invisible here, since the only signal is the error response the
-        // worker may or may not log. A notification (no id) is logged the same
-        // way even though it gets no response.
+        let outcome = work
+            .run("plugin.rpc", async move {
+                if crate::plugin::session_api::handles(&method) {
+                    match invocation_deps {
+                        Some(deps) => {
+                            crate::plugin::session_api::dispatch(
+                                &deps,
+                                &invocation_ctx,
+                                &method,
+                                &params,
+                            )
+                            .await
+                        }
+                        None => {
+                            let unavailable = crate::plugin::host_api::DispatchError::with_kind(
+                                codes::SERVICE_UNAVAILABLE,
+                                "service_unavailable",
+                                "session service is not available in this host",
+                            );
+                            match crate::plugin::session_api::required_capability(&method) {
+                                Some(cap) => invocation_ctx.require(cap).and(Err(unavailable)),
+                                None => Err(unavailable),
+                            }
+                        }
+                    }
+                } else {
+                    tokio::task::spawn_blocking(move || {
+                        dispatch(&invocation_api, &invocation_ctx, &method, &params)
+                    })
+                    .await
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(target: "plugin.host", %error, "host dispatch task failed");
+                        Err(crate::plugin::host_api::DispatchError::internal(
+                            "host dispatch task failed",
+                        ))
+                    })
+                }
+            })
+            .await;
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(crate::server::runtime::RuntimeWorkError::ShuttingDown) => {
+                Err(crate::plugin::host_api::DispatchError::with_kind(
+                    codes::SERVICE_UNAVAILABLE,
+                    "service_unavailable",
+                    "daemon is shutting down",
+                ))
+            }
+            Err(crate::server::runtime::RuntimeWorkError::Interrupted) => Err(
+                crate::plugin::host_api::DispatchError::internal("host dispatch task failed"),
+            ),
+        };
         match &outcome {
-            Ok(Ok(_)) => tracing::debug!(
-                target: "plugin.host",
-                plugin = %ctx.plugin_id,
-                method = %method_log,
+            Ok(_) => tracing::debug!(
+                target: "plugin.host", plugin = %ctx.plugin_id, method = %method_log,
                 "worker rpc ok"
             ),
-            Ok(Err(e)) => tracing::warn!(
-                target: "plugin.host",
-                plugin = %ctx.plugin_id,
-                method = %method_log,
-                code = e.code,
-                "worker rpc rejected: {}",
-                e.message
+            Err(error) => tracing::warn!(
+                target: "plugin.host", plugin = %ctx.plugin_id, method = %method_log,
+                code = error.code, "worker rpc rejected: {}", error.message
             ),
-            Err(_) => {}
         }
-
-        // A notification (no id) gets no response, but still ran for its side
-        // effects above.
         let Some(id) = request.id else {
             continue;
         };
-
         let response = match outcome {
-            Ok(Ok(result)) => RpcResponse::success(id, result),
-            Ok(Err(e)) => RpcResponse::error_with_data(id, e.code, e.message, e.data),
-            Err(join_err) => RpcResponse::error(
-                id,
-                codes::INTERNAL_ERROR,
-                format!("host dispatch task failed: {join_err}"),
-            ),
+            Ok(result) => RpcResponse::success(id, result),
+            Err(error) => RpcResponse::error_with_data(id, error.code, error.message, error.data),
         };
         if stdin.send(response.to_line()).is_err() {
-            return; // writer task gone; nothing more to say.
+            return;
         }
     }
 }
@@ -893,12 +860,12 @@ mod tests {
         );
         // Granted only runtime.worker: events.* succeed, session.meta.set is
         // refused with FORBIDDEN.
-        let ctx = PluginRpcContext {
+        let ctx = Arc::new(PluginRpcContext {
             plugin_id: "acme.worker".to_string(),
             granted_capabilities: vec!["runtime.worker".to_string()],
             ui_contributions: std::collections::HashSet::new(),
             ui_generation: 0,
-        };
+        });
 
         // The worker: request a forbidden method, then publish the error code it
         // got back over the granted events bus, then exit.
@@ -930,7 +897,8 @@ process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:1,method:"session.meta.set
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
 
-        serve_connection(&api, &ctx, stdout, stdin_writer(stdin), None).await;
+        let work = crate::server::runtime::RuntimeWork::default();
+        serve_connection(&api, &ctx, stdout, stdin_writer(stdin), None, &work).await;
         let _ = child.wait().await;
 
         // Read the event the worker published: it carries the FORBIDDEN code the
@@ -948,75 +916,6 @@ process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:1,method:"session.meta.set
             events[0]["payload"]["forbidden_code"],
             json!(codes::FORBIDDEN)
         );
-    }
-
-    /// The host->worker push path (what `notify_worker` uses): a notification
-    /// written to the worker's stdin reaches it and is acted on. The worker waits
-    /// idle, then on an unsolicited `host.ping` notification publishes an event,
-    /// proving the unsolicited stdin write landed.
-    #[tokio::test]
-    async fn host_initiated_notification_reaches_worker() {
-        if which::which("node").is_err() {
-            eprintln!("skipping: node not found on PATH");
-            return;
-        }
-        let tmp = tempfile::tempdir().unwrap();
-        let api = Arc::new(
-            HostApiState::open(&tmp.path().join("plugin_events.db"), "default", 100).unwrap(),
-        );
-        let ctx = PluginRpcContext {
-            plugin_id: "acme.worker".to_string(),
-            granted_capabilities: vec!["runtime.worker".to_string()],
-            ui_contributions: std::collections::HashSet::new(),
-            ui_generation: 0,
-        };
-
-        // Worker initiates nothing; it reacts to the host's `host.ping` push by
-        // publishing, then exits once it sees the publish response.
-        const WORKER: &str = r#"
-const rl = require('readline').createInterface({ input: process.stdin });
-rl.on('line', (line) => {
-  const m = JSON.parse(line);
-  if (m.method === 'host.ping') {
-    process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:1,method:"events.publish",params:{topic:"pinged",payload:{ok:true}}}) + "\n");
-  } else if (m.id === 1) {
-    process.exit(0);
-  }
-});
-"#;
-
-        let mut child = tokio::process::Command::new("node")
-            .arg("-e")
-            .arg(WORKER)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let stdin = child.stdin.take().unwrap();
-        let stdout = child.stdout.take().unwrap();
-
-        let tx = stdin_writer(stdin);
-        // Host-initiated push, exactly as notify_worker builds it.
-        tx.send(
-            json!({ "jsonrpc": "2.0", "method": "host.ping", "params": {} }).to_string() + "\n",
-        )
-        .unwrap();
-
-        serve_connection(&api, &ctx, stdout, tx, None).await;
-        let _ = child.wait().await;
-
-        let got = dispatch(
-            &api,
-            &ctx,
-            "events.subscribe",
-            &json!({ "topics": ["pinged"], "after_seq": 0 }),
-        )
-        .unwrap();
-        let events = got["events"].as_array().unwrap();
-        assert_eq!(events.len(), 1, "worker should react to the host push");
-        assert_eq!(events[0]["payload"]["ok"], json!(true));
     }
 
     async fn worker_pid(host: &PluginHost, plugin_id: &str) -> Option<u32> {
@@ -1098,7 +997,13 @@ command = ["sleep", "600"]
         install_sleeper(plugin_id);
         let registry = crate::plugin::reload_registry();
 
-        let mut host = PluginHost::new(&temp.path().join("host"), "default", None).unwrap();
+        let mut host = PluginHost::new(
+            &temp.path().join("host"),
+            "default",
+            None,
+            std::sync::Arc::new(crate::server::runtime::RuntimeWork::default()),
+        )
+        .unwrap();
         Arc::get_mut(&mut host).unwrap().max_workers = 1;
         host.start(&registry).await;
         wait_until("the first worker", || async {

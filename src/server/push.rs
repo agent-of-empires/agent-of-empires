@@ -427,18 +427,14 @@ struct DwellState {
 /// behind the semaphore and are processed in FIFO order.
 pub const SEND_CONCURRENCY: usize = 8;
 
-/// Spawn the consumer task. Subscribes to `state.status_tx`, applies
-/// dwell + cooldown logic, and fans out pushes to all still-valid
-/// subscriptions when a session stays in `Waiting` past DWELL_MS.
-///
-/// The task runs for the lifetime of the server; no clean shutdown
-/// path is required since `broadcast::Receiver` is drained on drop.
-pub fn spawn_consumer(state: std::sync::Arc<super::AppState>) {
+/// Apply status dwell and cooldown before dispatching push notifications.
+pub async fn spawn_consumer(state: std::sync::Arc<super::AppState>) {
     if state.push.is_none() {
         return; // feature disabled, nothing to spawn
     }
 
-    tokio::spawn(async move {
+    let work = state.runtime.work.clone();
+    work.spawn("server.push_consumer", async move {
         let client = match super::push_send::build_client() {
             Ok(c) => c,
             Err(e) => {
@@ -466,6 +462,8 @@ pub fn spawn_consumer(state: std::sync::Arc<super::AppState>) {
 
         loop {
             tokio::select! {
+                biased;
+                _ = state.shutdown.cancelled() => return,
                 recv = rx.recv() => {
                     match recv {
                         Ok(change) => handle_status_change(&mut dwell, change),
@@ -481,10 +479,6 @@ pub fn spawn_consumer(state: std::sync::Arc<super::AppState>) {
                 }
                 _ = tick.tick() => {
                     fire_due_pushes(state.clone(), &client, &semaphore, &mut dwell, &mut last_suppress_reason).await;
-                }
-                _ = state.shutdown.cancelled() => {
-                    tracing::info!(target: "http.middleware", "push: shutdown signaled, consumer exiting");
-                    return;
                 }
             }
         }
@@ -717,7 +711,7 @@ async fn fire_due_pushes(
                 tag: tag.clone(),
                 session_id: instance_id.clone(),
             };
-            tokio::spawn(async move {
+            app_state.runtime.work.spawn("server.push_send", async move {
                 let Ok(_permit) = permit_sem.acquire_owned().await else {
                     return;
                 };
@@ -814,11 +808,7 @@ pub async fn fire_wake_fired_push(
             tag: tag.clone(),
             session_id: session_id.to_string(),
         };
-        tokio::spawn(async move {
-            // Acquire from the same SEND_CONCURRENCY budget that
-            // `spawn_consumer`'s fire_due_pushes uses, so a wake
-            // fire with many subscribers cannot outrun the gateway
-            // concurrency cap the rest of the pipeline expects.
+        state.runtime.work.spawn("server.wake_push", async move {
             let Ok(_permit) = permit_sem.acquire_owned().await else {
                 return;
             };
@@ -933,11 +923,18 @@ pub async fn get_vapid_public_key(
 /// concurrent 410 arrives for the old generation).
 pub async fn subscribe(
     State(state): State<Arc<AppState>>,
-    Extension(auth): Extension<AuthenticatedTokenHash>,
+    auth: Option<Extension<AuthenticatedTokenHash>>,
     headers: HeaderMap,
     body: Result<Json<SubscribeBody>, axum::extract::rejection::JsonRejection>,
 ) -> Result<StatusCode, axum::response::Response> {
     use axum::response::IntoResponse;
+    let Some(Extension(auth)) = auth else {
+        return Err((
+            StatusCode::CONFLICT,
+            "Push subscriptions require browser ownership",
+        )
+            .into_response());
+    };
     if state.read_only {
         return Err(StatusCode::FORBIDDEN.into_response());
     }
@@ -1012,10 +1009,17 @@ pub fn extract_request_origin(headers: &HeaderMap) -> Option<String> {
 /// my disable working" without leaking whether the endpoint exists).
 pub async fn unsubscribe(
     State(state): State<Arc<AppState>>,
-    Extension(auth): Extension<AuthenticatedTokenHash>,
+    auth: Option<Extension<AuthenticatedTokenHash>>,
     body: Result<Json<EndpointBody>, axum::extract::rejection::JsonRejection>,
 ) -> Result<StatusCode, axum::response::Response> {
     use axum::response::IntoResponse;
+    let Some(Extension(auth)) = auth else {
+        return Err((
+            StatusCode::CONFLICT,
+            "Push subscriptions require browser ownership",
+        )
+            .into_response());
+    };
     if state.read_only {
         return Err(StatusCode::FORBIDDEN.into_response());
     }
@@ -1048,10 +1052,17 @@ pub async fn unsubscribe(
 /// every subscriber.
 pub async fn test(
     State(state): State<Arc<AppState>>,
-    Extension(auth): Extension<AuthenticatedTokenHash>,
+    auth: Option<Extension<AuthenticatedTokenHash>>,
     body: Result<Json<EndpointBody>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<TestResult>, axum::response::Response> {
     use axum::response::IntoResponse;
+    let Some(Extension(auth)) = auth else {
+        return Err((
+            StatusCode::CONFLICT,
+            "Push subscriptions require browser ownership",
+        )
+            .into_response());
+    };
     if state.read_only {
         return Err(StatusCode::FORBIDDEN.into_response());
     }

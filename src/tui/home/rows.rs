@@ -114,16 +114,6 @@ impl HomeView {
             })
     }
 
-    #[cfg(test)]
-    #[track_caller]
-    pub(in crate::tui) fn instance_at_mut(&mut self, idx: usize) -> &mut Instance {
-        let len = self.instances.len();
-        self.instances
-            .get_index_mut(idx)
-            .map(|(_, v)| v)
-            .unwrap_or_else(|| panic!("instance_at_mut: idx {idx} out of bounds (len={len})"))
-    }
-
     /// Returns true if any session has an animated status (Running, Waiting, Starting,
     /// Creating), which means the TUI needs periodic redraws for spinner animation.
     pub fn has_animated_sessions(&self) -> bool {
@@ -150,7 +140,7 @@ impl HomeView {
                 crate::session::is_within_archived_section(path)
                     || crate::session::is_within_trash_section(path)
             }
-            Item::Session { .. } => false,
+            _ => false,
         })
     }
 
@@ -161,10 +151,10 @@ impl HomeView {
         // by sort_groups + attention_group_key in flatten_tree). Check these
         // first so Project/Org + Attention doesn't fall through to the flat
         // Attention branch and lose the group headers.
-        if self.group_by == GroupByMode::Project {
+        if self.effective_group_by() == GroupByMode::Project {
             return self.build_flat_items_by_project();
         }
-        if self.group_by == GroupByMode::Org {
+        if self.effective_group_by() == GroupByMode::Org {
             return self.build_flat_items_by_org();
         }
 

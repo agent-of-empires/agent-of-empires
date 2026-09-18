@@ -68,7 +68,15 @@ pub async fn resolve_option_source(
     depends: &[String],
 ) -> anyhow::Result<Vec<SelectOption>> {
     match source {
-        OptionSource::AcpAgents => Ok(acp_agent_options(&state.profile).await),
+        OptionSource::AcpAgents => {
+            let profile = state
+                .canonical_metadata
+                .read()
+                .await
+                .default_profile
+                .clone();
+            Ok(acp_agent_options(&profile).await)
+        }
         OptionSource::AcpModels => {
             // When the resolved profile pins the selected agent's model
             // (`acp.acp_defaults.<agent>.pin_model`), the picker collapses to
@@ -78,7 +86,13 @@ pub async fn resolve_option_source(
             // offer choices the create call will refuse. The catalog supplies
             // the display label when it knows the pinned model.
             if let Some(agent) = depends.first().filter(|a| !a.is_empty()) {
-                if let Some(model) = pinned_model_for_agent(&state.profile, agent).await {
+                let profile = state
+                    .canonical_metadata
+                    .read()
+                    .await
+                    .default_profile
+                    .clone();
+                if let Some(model) = pinned_model_for_agent(&profile, agent).await {
                     let label = catalog_options(Some(agent), CatalogCategory::Model)
                         .into_iter()
                         .find(|opt| opt.value == model)
@@ -92,7 +106,15 @@ pub async fn resolve_option_source(
         OptionSource::AcpModes => {
             Ok(catalog_options_probing(depends.first(), CatalogCategory::Mode).await)
         }
-        OptionSource::Projects => project_options(&state.profile).await,
+        OptionSource::Projects => {
+            let profile = state
+                .canonical_metadata
+                .read()
+                .await
+                .default_profile
+                .clone();
+            project_options(&profile).await
+        }
         OptionSource::Groups => Ok(group_options(state).await),
     }
 }

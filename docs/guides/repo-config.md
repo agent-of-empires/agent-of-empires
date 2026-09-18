@@ -43,6 +43,8 @@ on_launch = "npm install"
 
 **`on_launch`** runs every time a session starts (including the first time, and every restart). Failures are logged as warnings and do not prevent user-initiated starts. During startup recovery, a timed-out `on_launch` hook marks the recovered session as errored instead of silently launching with partial setup. Use this for things like ensuring dependencies are up to date.
 
+Native starts release their API locks while pre-launch hooks run, so hooks can call the daemon. The session keeps its lifecycle reservation: a competing start or stop returns a conflict rather than taking ownership. The launcher revalidates that reservation after the hook, before spawning the agent.
+
 **`on_destroy`** runs when a session is deleted, before worktree and sandbox cleanup. This lets teardown commands access resources that are still available (e.g. running containers). Failures are logged as warnings but never prevent deletion. Use this for cleanup like stopping Docker services or removing temporary resources.
 
 For sandboxed sessions, hooks run inside the Docker container.

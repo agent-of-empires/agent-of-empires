@@ -1,31 +1,13 @@
-//! Full-stack e2e: the native TUI structured view renders a completed Edit as
-//! a compact path and line-count summary instead of an expanded output card.
-//!
-//! Per-kind dispatch is unit-tested at `src/tui/structured_view/render.rs`;
-//! this proves the same end-to-end: a real `aoe serve --daemon`, a real
-//! structured view worker bridging a scripted ACP `tool_call` (kind `edit`,
-//! carrying `old_string`/`new_string` in `rawInput`), and the native TUI
-//! attached over tmux rendering the summary through the production path.
-//!
-//! Mirrors the web Edit-card story `edit-card-diff-scroll.spec.ts`: the
-//! fake-ACP `tool_call` shape (toolCallId / kind / status / rawInput) is
-//! identical, so the TUI and the dashboard exercise the same wire data.
-//!
-//! Run via:
-//!
-//! ```sh
-//! cargo test --features e2e-tests --test e2e -- acp_tool_cards
-//! ```
+//! Native structured rendering consumes replay and then a live Unix WebSocket event.
+//! The daemon is core-only, so no TCP or dashboard fallback can satisfy the test.
 
 use std::time::{Duration, Instant};
 
 use serial_test::parallel;
 
-use crate::harness::{pick_free_port, require_node, require_tmux, wait_for_port, TuiTestHarness};
+use crate::harness::{require_node, require_tmux, TuiTestHarness};
 
-/// One-turn fake-ACP script: emit a single completed `edit` tool call
-/// whose `rawInput` carries the before/after text the structured view turns into
-/// a diff. The turn ends immediately (no gating).
+/// Two edits distinguish the initial replay from a subsequent live event.
 const EDIT_SCRIPT: &str = r#"{
   "turns": [
     {
@@ -47,6 +29,29 @@ const EDIT_SCRIPT: &str = r#"{
           "toolCallId": "tc-edit-1",
           "status": "completed",
           "rawOutput": { "content": "updated greeting.txt" }
+        }
+      ],
+      "stopReason": "end_turn"
+    },
+    {
+      "updates": [
+        {
+          "sessionUpdate": "tool_call",
+          "toolCallId": "tc-edit-live",
+          "title": "edit live-followup.txt",
+          "kind": "edit",
+          "status": "pending",
+          "rawInput": {
+            "file_path": "live-followup.txt",
+            "old_string": "before",
+            "new_string": "after"
+          }
+        },
+        {
+          "sessionUpdate": "tool_call_update",
+          "toolCallId": "tc-edit-live",
+          "status": "completed",
+          "rawOutput": { "content": "updated live-followup.txt" }
         }
       ],
       "stopReason": "end_turn"
@@ -106,8 +111,6 @@ fn tui_acp_renders_compact_edit_summary_with_live_daemon() {
     std::fs::write(&script_path, EDIT_SCRIPT).expect("write fake-acp script");
     h.install_acp_shim(&script_path);
 
-    // Tear down the worker + daemon on Drop so a panicking assertion can't
-    // leak a daemon onto the test port between serial tests.
     h.stop_daemon_on_drop();
 
     // A structured view session needs a git repo as its workspace; create one.
@@ -116,15 +119,17 @@ fn tui_acp_renders_compact_edit_summary_with_live_daemon() {
         vec!["init", "-q"],
         vec!["commit", "--allow-empty", "-q", "-m", "init"],
     ] {
-        let out = std::process::Command::new("git")
-            .args(&args)
-            .current_dir(&project)
+        let mut git = std::process::Command::new("git");
+        git.current_dir(&project)
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@t")
             .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t")
-            .output()
-            .expect("run git");
+            .env("GIT_COMMITTER_EMAIL", "t@t");
+        if args[0] == "commit" {
+            git.arg("-c").arg("commit.gpgsign=false");
+        }
+        git.args(&args);
+        let out = git.output().expect("run git");
         assert!(
             out.status.success(),
             "git {:?} failed: {}",
@@ -133,20 +138,12 @@ fn tui_acp_renders_compact_edit_summary_with_live_daemon() {
         );
     }
 
-    // Start the daemon.
-    let port = pick_free_port();
-    let port_s = port.to_string();
-    let start = h.run_cli(&["serve", "--daemon", "--port", &port_s, "--no-auth"]);
+    let start = h.run_cli(&["serve", "--core-only", "--daemon"]);
     assert!(
         start.status.success(),
         "aoe serve --daemon failed.\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&start.stdout),
         String::from_utf8_lossy(&start.stderr),
-    );
-    assert!(
-        wait_for_port(port, Duration::from_secs(10)),
-        "daemon never bound port {}",
-        port
     );
 
     // Create the structured view session (daemon picks it up off disk; the
@@ -172,8 +169,7 @@ fn tui_acp_renders_compact_edit_summary_with_live_daemon() {
     // prompt 404s until the worker is live and handshaked.
     prompt_until_accepted(&h, &session_id, Duration::from_secs(30));
 
-    // Attach the native TUI structured view over tmux. Same HOME, so it
-    // discovers the local daemon via serve.url / serve.pid.
+    // Native attach discovers the owner-verified Unix API.
     h.spawn(&["acp", "attach", &session_id]);
 
     // The edit summary must surface through the full stack (replay + WS):
@@ -185,4 +181,11 @@ fn tui_acp_renders_compact_edit_summary_with_live_daemon() {
         !screen.contains("hello from before"),
         "diff should be collapsed"
     );
+    let followup = h.run_cli(&["acp", "prompt", &session_id, "live followup"]);
+    assert!(
+        followup.status.success(),
+        "live prompt failed: {}",
+        String::from_utf8_lossy(&followup.stderr)
+    );
+    h.wait_for("live-followup.txt");
 }

@@ -73,6 +73,7 @@ pub struct UnifiedDeleteDialog {
 }
 
 impl UnifiedDeleteDialog {
+    /// Seed the checkboxes from `profile`'s config on this machine.
     pub fn new(session_title: String, config: DeleteDialogConfig, profile: &str) -> Self {
         let user_config = match config.project_path.as_ref() {
             Some(p) => crate::session::config::repo_config::resolve_config_with_repo_or_warn(
@@ -82,16 +83,35 @@ impl UnifiedDeleteDialog {
             None => crate::session::config::profile_config::resolve_config_or_warn(profile),
         };
 
-        let options = DeleteOptions {
-            delete_worktree: config.worktree_branch.is_some() && user_config.worktree.auto_cleanup,
-            force_delete: false,
-            delete_branch: config.worktree_branch.is_some()
-                && user_config.worktree.delete_branch_on_cleanup,
-            delete_sandbox: config.has_sandbox && user_config.sandbox.auto_cleanup,
-            // Scratch sessions default to remove. The user has to explicitly
-            // opt in to keep the directory.
-            keep_scratch: false,
-        };
+        Self::with_options(
+            session_title,
+            config,
+            DeleteOptions {
+                delete_worktree: user_config.worktree.auto_cleanup,
+                force_delete: false,
+                delete_branch: user_config.worktree.delete_branch_on_cleanup,
+                delete_sandbox: user_config.sandbox.auto_cleanup,
+                // Scratch sessions default to remove. The user has to explicitly
+                // opt in to keep the directory.
+                keep_scratch: false,
+            },
+        )
+    }
+
+    /// [`Self::new`] with the defaults supplied, for a session whose config
+    /// this machine cannot resolve. Each option is dropped when the artifact
+    /// it cleans up is absent, so no hidden checkbox can submit as ticked.
+    pub fn with_options(
+        session_title: String,
+        config: DeleteDialogConfig,
+        mut options: DeleteOptions,
+    ) -> Self {
+        let has_worktree = config.worktree_branch.is_some();
+        options.delete_worktree &= has_worktree;
+        options.delete_branch &= has_worktree;
+        options.force_delete &= options.delete_worktree;
+        options.delete_sandbox &= config.has_sandbox;
+        options.keep_scratch &= config.is_scratch;
 
         let initial_focus = if config.worktree_branch.is_some() {
             FocusElement::WorktreeCheckbox

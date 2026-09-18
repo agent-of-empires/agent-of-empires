@@ -17,14 +17,14 @@ interface Calls {
 async function mockApis(page: Page, calls: Calls) {
   await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   for (const path of ["themes", "groups", "devices", "about", "system/update-status"]) {
-    await page.route(`**/api/${path}`, (r) =>
+    await page.route(`**/api/${path}*`, (r) =>
       r.fulfill({ json: path === "about" || path === "system/update-status" ? {} : [] }),
     );
   }
   await page.route("**/api/settings**", (r) => r.fulfill({ json: {} }));
-  await page.route("**/api/profiles", (r) => r.fulfill({ json: [] }));
+  await page.route("**/api/profiles", (r) => r.fulfill({ json: [{ name: "default", is_default: true }] }));
   await page.route("**/api/recent-projects", (r) => r.fulfill({ json: { projects: [] } }));
-  await page.route("**/api/projects", (r) => r.fulfill({ json: [] }));
+  await page.route("**/api/projects*", (r) => r.fulfill({ json: [] }));
   await page.route("**/api/docker/status", (r) => r.fulfill({ json: { available: false, runtime: null } }));
   await page.route("**/api/agents", (r) =>
     r.fulfill({

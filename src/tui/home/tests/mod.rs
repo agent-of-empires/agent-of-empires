@@ -21,6 +21,7 @@ fn key(code: KeyCode) -> KeyEvent {
 mod apply_session_id_updates;
 mod archive_restart_grouping;
 mod click_to_select;
+mod creation_fence;
 mod default_attach_mode;
 mod divider_drag;
 mod footer_toolbar;
@@ -34,6 +35,7 @@ mod post_create_attach_mode;
 mod preview_drag_select;
 mod preview_links;
 mod profile_duplicate_reconciliation;
+mod remote_rows;
 mod render_and_save;
 mod right_click_context_menu;
 mod save_field_merge;
@@ -528,14 +530,10 @@ fn rendered_single_session_text(
         .expect("session row should render")
 }
 
-/// Shared fixture for the async-creation finalization tests: a fresh
-/// single-commit git repo under a temp `$HOME`, a `HomeView` bound to the
-/// `default` profile in manual-group mode, and an unwatched `Storage` handle
-/// onto the same profile. Each test spawns a real background builder against
-/// this repo, so the setup is factored out rather than duplicated.
+/// Fixture for the creation tests: a temp home with a project directory and a
+/// `HomeView` bound to the `default` profile in manual-group mode.
 struct CreationTestEnv {
     view: HomeView,
-    storage: Storage,
     project_dir: std::path::PathBuf,
     _guard: AppDirGuard,
     _temp: TempDir,
@@ -547,19 +545,6 @@ fn setup_creation_test_env() -> CreationTestEnv {
 
     let project_dir = temp.path().join("project");
     std::fs::create_dir_all(&project_dir).unwrap();
-    {
-        let repo = git2::Repository::init(&project_dir).unwrap();
-        let signature = git2::Signature::now("Test", "test@example.com").unwrap();
-        std::fs::write(project_dir.join("README.md"), "test\n").unwrap();
-        let tree_id = {
-            let mut index = repo.index().unwrap();
-            index.add_path(std::path::Path::new("README.md")).unwrap();
-            index.write_tree().unwrap()
-        };
-        let tree = repo.find_tree(tree_id).unwrap();
-        repo.commit(Some("HEAD"), &signature, &signature, "init", &tree, &[])
-            .unwrap();
-    }
 
     let tools = AvailableTools::with_tools(&["claude"]);
     let mut view = HomeView::new_for_test(
@@ -572,10 +557,8 @@ fn setup_creation_test_env() -> CreationTestEnv {
     view.flat_items = view.build_flat_items();
     view.update_selected();
 
-    let storage = Storage::new_unwatched("default").unwrap();
     CreationTestEnv {
         view,
-        storage,
         project_dir,
         _guard,
         _temp: temp,
@@ -586,6 +569,7 @@ fn setup_creation_test_env() -> CreationTestEnv {
 /// title/group and worktree fields per scenario.
 fn creation_data(project_dir: &std::path::Path, title: &str, group: &str) -> NewSessionData {
     NewSessionData {
+        remote: None,
         profile: "default".to_string(),
         title: title.to_string(),
         path: project_dir.to_str().unwrap().to_string(),
@@ -605,29 +589,6 @@ fn creation_data(project_dir: &std::path::Path, title: &str, group: &str) -> New
         scratch: false,
         fork_seed: None,
         structured: false,
-    }
-}
-
-/// Pump `apply_creation_results` until the background builder delivers a
-/// result, returning the finalized session id (`Some`) or the rollback outcome
-/// (`None`). Consuming the result clears `is_creation_pending`, so this
-/// terminates once a result lands; it fails the test on timeout rather than
-/// looping forever. Centralizes the poll so the tests carry no bespoke timing
-/// loops of their own.
-fn drain_creation_result(view: &mut HomeView) -> Option<String> {
-    let start = std::time::Instant::now();
-    loop {
-        if let Some(id) = view.apply_creation_results() {
-            return Some(id);
-        }
-        if !view.is_creation_pending() {
-            return None;
-        }
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(10),
-            "background creation timed out"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
@@ -805,4 +766,73 @@ fn create_test_env_same_owner_two_hosts() -> TestEnv {
         _guard,
         _temp: temp,
     }
+}
+
+/// Run an archive-flipping interaction and settle what it submitted through the
+/// native lane: drain the submission, then apply the snapshot the daemon would
+/// publish. Interactions that submit nothing (no selection, or a trashed row
+/// that restores instead) are left to their own path.
+fn with_canonical_archive(env: &mut TestEnv, action: impl FnOnce(&mut TestEnv)) {
+    use crate::daemon::{RuntimeCursor, SessionMutation};
+    let mut respond = env.view.session_feed.command_driver_for_test();
+    action(env);
+    let Some((id, SessionMutation::Archive(body))) = respond(Ok(RuntimeCursor {
+        epoch: "test".into(),
+        revision: 2,
+    })) else {
+        return;
+    };
+    publish_canonical_rows(env, &id, body.archived);
+}
+
+/// Publish the view's rows as the daemon would report them, with `stamped`'s
+/// archive marker set to `archived`.
+fn publish_canonical_rows(env: &mut TestEnv, stamped: &str, archived: bool) {
+    use crate::tui::session_feed::SessionFeedResult;
+    let now = chrono::Utc::now().to_rfc3339();
+    let sessions: Vec<crate::daemon::SessionResponse> = env
+        .view
+        .instances()
+        .map(|inst| {
+            let archived_at = if inst.id == stamped {
+                archived.then(|| now.clone())
+            } else {
+                inst.archived_at.map(|at| at.to_rfc3339())
+            };
+            serde_json::from_value(serde_json::json!({
+                "id": inst.id,
+                "title": inst.title,
+                "project_path": inst.project_path,
+                "profile": inst.source_profile,
+                "tool": inst.tool,
+                "status": format!("{:?}", inst.status),
+                "view": if inst.is_structured() { "structured" } else { "terminal" },
+                "group_path": inst.group_path,
+                "archived_at": archived_at,
+            }))
+            .expect("a canonical row")
+        })
+        .collect();
+    let snapshot = crate::daemon::RuntimeSnapshot {
+        cursor: crate::daemon::RuntimeCursor {
+            epoch: "test".into(),
+            revision: 2,
+        },
+        contents: crate::daemon::RuntimeContents {
+            health: crate::daemon::RuntimeHealth::Healthy,
+            capabilities: crate::daemon::RuntimeCapabilities {
+                mutations: true,
+                native_interaction: true,
+            },
+            default_profile: "test".into(),
+            sessions,
+            profiles: Vec::new(),
+            workspace_ordering: Vec::new(),
+            global_projects: Vec::new(),
+        },
+    };
+    env.view
+        .session_feed
+        .publish_for_test(SessionFeedResult::Snapshot(std::sync::Arc::new(snapshot)));
+    env.view.apply_session_feed();
 }

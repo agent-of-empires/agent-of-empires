@@ -17,9 +17,8 @@ stay in sync.
   with a `[structured]` badge. Pressing Enter opens the native structured view,
   which requires an `aoe serve` daemon to be already running. If one
   isn't, the view shows an actionable error pointing at
-  `aoe serve --daemon` (localhost), `aoe serve --daemon --remote`
-  (Tailscale/Cloudflare), or `AOE_DAEMON_URL` (attach to a remote daemon
-  you already have running). The TUI does not start a daemon for you, so
+  `aoe serve --daemon` (localhost) or `aoe serve --daemon --remote`
+  (Tailscale/Cloudflare). The TUI does not start a daemon for you, so
   the choice between localhost, tunnel, and named tunnel stays explicit.
 - **Sessions started in tmux mode** work in both surfaces. The TUI
   attaches to the pane; the dashboard streams the pane's rendered rows and

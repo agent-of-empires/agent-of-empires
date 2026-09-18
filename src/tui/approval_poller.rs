@@ -6,7 +6,7 @@
 
 use std::sync::mpsc::TryRecvError;
 
-use crate::acp::client::{require_daemon, HttpClient, HttpError};
+use crate::acp::client::{require_local_daemon, HttpClient, HttpError};
 use crate::acp::protocol::ApprovalDecisionWire;
 use crate::tui::worker::Worker;
 
@@ -31,7 +31,7 @@ pub(super) struct ApprovalResult {
 async fn resolve(request: ApprovalRequest) -> ApprovalResult {
     let session_id = request.session_id;
     let nonce = request.nonce;
-    let resolution = match require_daemon().await {
+    let resolution = match require_local_daemon() {
         Ok(endpoint) => match HttpClient::new(endpoint) {
             Ok(client) => match client
                 .resolve_approval(&session_id, &nonce, request.decision, None)

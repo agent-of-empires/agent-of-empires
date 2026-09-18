@@ -158,13 +158,14 @@ impl Preview {
         frame: &mut Frame,
         area: Rect,
         instance: &Instance,
-        terminal_running: bool,
+        terminal_presence: crate::session::PanePresence,
         cached_output: CachedPreview<'_>,
         scroll_offset: u16,
         theme: &Theme,
         compact: bool,
         show_info: bool,
     ) {
+        use crate::session::PanePresence;
         // One source of truth for the header / banner / output split. Compact
         // viewports and the hidden-header toggle both collapse to "output owns
         // the whole area" inside `PreviewLayout::compute`, symmetric with the
@@ -189,12 +190,13 @@ impl Preview {
                 Line::from(vec![
                     Span::styled("Status:  ", Style::default().fg(theme.dimmed)),
                     Span::styled(
-                        if terminal_running {
-                            "Running"
-                        } else {
-                            "Not started"
+                        match terminal_presence {
+                            PanePresence::Alive => "Running",
+                            PanePresence::Dead => "Exited",
+                            PanePresence::Absent => "Not started",
+                            PanePresence::Unknown => "Unknown",
                         },
-                        Style::default().fg(if terminal_running {
+                        Style::default().fg(if terminal_presence == PanePresence::Alive {
                             theme.terminal_active
                         } else {
                             theme.dimmed
@@ -216,10 +218,8 @@ impl Preview {
         // `output.height` is the authoritative visible-row count; no separate
         // banner subtraction (that lives entirely in `PreviewLayout::compute`).
         let visible_height = layout.output.height as usize;
-        // Use the pre-parsed cache when the terminal is up; suppress
-        // it otherwise so the "press Enter to start terminal" hint
-        // can take the inner area instead of a stale capture.
-        let parsed_output = if terminal_running {
+        // Preserve captured output for exited or temporarily unobservable panes.
+        let parsed_output = if terminal_presence != PanePresence::Absent {
             cached_output.text
         } else {
             None
@@ -249,7 +249,7 @@ impl Preview {
         }
 
         let inner = layout.output;
-        if !terminal_running {
+        if terminal_presence == PanePresence::Absent {
             let hint = Paragraph::new("Press Enter to start terminal")
                 .style(Style::default().fg(theme.dimmed))
                 .alignment(Alignment::Center);
@@ -265,9 +265,13 @@ impl Preview {
                 Style::default().fg(theme.text),
             );
         } else if !cached_output.pending {
-            let hint = Paragraph::new("No output available")
-                .style(Style::default().fg(theme.dimmed))
-                .alignment(Alignment::Center);
+            let hint = Paragraph::new(match terminal_presence {
+                PanePresence::Unknown => "Terminal status unavailable",
+                PanePresence::Dead => "Terminal exited; press Enter to restart",
+                _ => "No output available",
+            })
+            .style(Style::default().fg(theme.dimmed))
+            .alignment(Alignment::Center);
             frame.render_widget(hint, inner);
         }
     }
@@ -933,7 +937,7 @@ mod tests {
                     frame,
                     frame.area(),
                     &instance,
-                    true,
+                    crate::session::PanePresence::Alive,
                     CachedPreview::new(None, pending),
                     0,
                     &theme,
