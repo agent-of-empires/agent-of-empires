@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import type { AgentInfo, ProfileInfo } from "../../../lib/types";
 import { fetchSettings } from "../../../lib/api";
 import { isAcpEligible } from "../../../lib/acpCapableTools";
@@ -21,6 +21,9 @@ interface WizardData {
   commandOverride: string;
   useStructuredView: boolean;
   structuredOffered: boolean;
+  /** Non-empty while importing an existing agent session, which resumes a
+   *  session that is already structured on disk. */
+  importAcpSessionId?: string;
   [key: string]: unknown;
 }
 
@@ -64,28 +67,32 @@ function ViewNotice({
   customAgent,
   policyDenied,
   notOffered,
+  imported,
 }: {
   tool: string;
   customAgent: boolean;
   policyDenied: boolean;
   notOffered: boolean;
+  imported: boolean;
 }) {
   return (
     <div className="mb-5 rounded-lg border border-surface-700 bg-surface-950 px-3 py-2.5">
       <div className="flex items-center gap-2">
-        <span className="text-sm font-semibold text-text-primary">Terminal</span>
+        <span className="text-sm font-semibold text-text-primary">{imported ? "Structured view" : "Terminal"}</span>
         <span className="rounded px-1.5 py-px text-[10px] font-mono uppercase tracking-wide bg-surface-700 text-text-dim">
-          Fallback
+          {imported ? "Resumed" : "Fallback"}
         </span>
       </div>
       <p className="mt-1 text-xs text-text-dim leading-snug">
-        {notOffered
-          ? "The structured view is turned off in settings, so this session runs in the terminal view. Turn on \u201cOffer structured view when creating a session\u201d to choose per session."
-          : policyDenied
-            ? `${tool} is not on the operator's allowed agents list, so this session runs in the terminal view. Pick a permitted agent to use the structured view.`
-            : customAgent
-              ? "Custom agents run in the terminal unless they define agent_acp_cmd in config or TUI settings."
-              : `${tool} has no ACP adapter yet, so this session runs in the terminal view. Pick a tool with an ACP adapter (e.g. claude, opencode, gemini) to use the structured view.`}
+        {imported
+          ? "This session is already structured on disk, so it resumes in the structured view. Turning the structured view off in settings does not affect resuming an existing session."
+          : notOffered
+            ? "The structured view is turned off in settings, so this session runs in the terminal view. Turn on \u201cOffer structured view when creating a session\u201d to choose per session."
+            : policyDenied
+              ? `${tool} is not on the operator's allowed agents list, so this session runs in the terminal view. Pick a permitted agent to use the structured view.`
+              : customAgent
+                ? "Custom agents run in the terminal unless they define agent_acp_cmd in config or TUI settings."
+                : `${tool} has no ACP adapter yet, so this session runs in the terminal view. Pick a tool with an ACP adapter (e.g. claude, opencode, gemini) to use the structured view.`}
       </p>
     </div>
   );
@@ -169,10 +176,17 @@ export function AgentOptions({
   }).full;
   const extraArgsIgnored = willUseStructuredView && data.extraArgs.trim().length > 0;
 
+  // Each selection claims a ticket; only the newest one may apply its
+  // settings, so a slow response for an abandoned profile cannot land last
+  // and overwrite the selection the user actually made.
+  const profileRequestRef = useRef(0);
   const handleProfileChange = useCallback(
     async (profileName: string) => {
-      // If user had manual edits, confirm before overwriting
-      if (data.profileDirty && profileName) {
+      const requestId = ++profileRequestRef.current;
+      // If user had manual edits, confirm before overwriting. "Server default"
+      // (an empty name) now resolves and applies its own settings, so it needs
+      // the same confirmation as a named profile rather than silently winning.
+      if (data.profileDirty) {
         const ok = window.confirm("Selecting a profile will reset your settings to that profile's defaults. Continue?");
         if (!ok) return;
       }
@@ -184,7 +198,7 @@ export function AgentOptions({
       // values, including the view choice, in state.
       try {
         const settings = await fetchSettings(profileName || undefined);
-        if (settings) {
+        if (settings && requestId === profileRequestRef.current) {
           const session = settings.session as Record<string, unknown> | undefined;
           const sandbox = settings.sandbox as Record<string, unknown> | undefined;
           const worktree = settings.worktree as Record<string, unknown> | undefined;
@@ -331,7 +345,7 @@ export function AgentOptions({
       {/* View picker. ACP-capable tools get a per-session structured-view
           toggle (default on, see #1580); other tools show a read-only
           terminal fallback notice. Lives under More options (#2210). */}
-      {acpCapable && structuredOffered ? (
+      {acpCapable && structuredOffered && !data.importAcpSessionId ? (
         <ViewPickerCard
           checked={data.useStructuredView}
           onChange={(v) => onChange("useStructuredView", v)}
@@ -343,6 +357,7 @@ export function AgentOptions({
           customAgent={selectedCustomAgent}
           policyDenied={selectedAgent?.acp_allowed === false}
           notOffered={acpCapable && !structuredOffered}
+          imported={Boolean(data.importAcpSessionId)}
         />
       )}
 

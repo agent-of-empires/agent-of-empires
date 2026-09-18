@@ -84,6 +84,7 @@ function renderAgentStep(overrides: {
   useStructuredView?: boolean;
   sandboxEnabled?: boolean;
   structuredOffered?: boolean;
+  importAcpSessionId?: string;
 }) {
   const onChange = vi.fn();
   const utils = render(
@@ -93,6 +94,7 @@ function renderAgentStep(overrides: {
         tool: overrides.tool ?? "claude",
         useStructuredView: overrides.useStructuredView ?? true,
         structuredOffered: overrides.structuredOffered ?? true,
+        importAcpSessionId: overrides.importAcpSessionId ?? "",
         sandboxEnabled: overrides.sandboxEnabled ?? false,
       }}
       onChange={onChange}
@@ -151,6 +153,18 @@ describe("AgentStep structured-view view card", () => {
     });
     expect(queryByRole("switch", { name: "Use structured view" })).toBeNull();
     expect(getByText(/turned off in settings/)).toBeTruthy();
+  });
+
+  it("tells an import it will resume in the structured view, not fall back (#3517)", () => {
+    const { queryByRole, getByText } = renderAgentStep({
+      tool: "claude",
+      structuredOffered: false,
+      importAcpSessionId: "abc123",
+    });
+    // An import submits `view: "structured"` whatever the opt-in says, so the
+    // terminal fallback copy would be telling the user the opposite.
+    expect(queryByRole("switch", { name: "Use structured view" })).toBeNull();
+    expect(getByText(/already structured on disk/)).toBeTruthy();
   });
 
   it("shows no switch for a non-ACP built-in, only the terminal fallback notice", () => {
