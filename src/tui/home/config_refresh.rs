@@ -54,15 +54,6 @@ impl HomeView {
     /// to defaults. The Err is consumed by `handle_tick_reload_config` in
     /// `App::run` and surfaced in the aggregated reload-failure dialog.
     ///
-    /// Peer profile coverage: `apply_config_to_state` calls
-    /// `refresh_status_hook_config_cache` which loads status_hook
-    /// configs for every storage'd profile, so a peer-process edit to
-    /// any `<profile>/config.toml` updates the visible status-hook
-    /// state even in unified mode. Peer-profile status_hooks load
-    /// through the lenient `resolve_config_or_warn` and fall back to
-    /// `Default::default()` on parse error; the strict-resolve
-    /// guarantee applies to the active profile only.
-    ///
     /// Error attribution: `resolve_config` loads the global
     /// `<app_dir>/config.toml` first then merges per-profile overrides,
     /// so a Reload Failed dialog body rendered from this path can name
@@ -91,8 +82,6 @@ impl HomeView {
             DefaultTerminalMode::Container => TerminalMode::Container,
         };
         self.sound_config = config.sound.clone();
-        self.status_hook_config = config.status_hooks.clone();
-        self.refresh_status_hook_config_cache();
         self.strict_hotkeys = config.session.strict_hotkeys;
         self.confirm_before_quit = config.session.confirm_before_quit;
         self.host_tab_title = config.session.host_tab_title;
@@ -100,13 +89,6 @@ impl HomeView {
         // Keep the strip in sync when the Settings UI or a config-file edit
         // flips the toggle from any settings surface.
         self.show_diagnostics = config.session.show_diagnostics_pane;
-        self.daemon_sidebar = config.session.daemon_sidebar;
-        if !self.daemon_sidebar {
-            self.set_sidebar_source(
-                crate::tui::session_feed::SidebarSource::Storage,
-                Some("session.daemon_sidebar is off"),
-            );
-        }
         self.agent_clipboard_forward =
             config.tmux.clipboard != crate::session::config::TmuxSettingMode::Disabled;
         self.vt_live_enabled = config.tmux.vt_live;
@@ -193,47 +175,6 @@ impl HomeView {
                 path = %path.display(),
                 "AOE_E2E_DEBUG export failed"
             );
-        }
-    }
-
-    pub(super) fn status_hook_profile_names(
-        active_profile: Option<&str>,
-        storages: &HashMap<String, Storage>,
-    ) -> Vec<String> {
-        let mut profile_names = match active_profile {
-            Some(profile) => vec![profile.to_string()],
-            None => storages.keys().cloned().collect(),
-        };
-        // Make sure the user's default profile is always probed so its status
-        // hooks load even when it currently has no sessions on disk.
-        let default_profile = crate::session::config::resolve_default_profile();
-        if !profile_names.contains(&default_profile) {
-            profile_names.push(default_profile);
-        }
-        profile_names.sort();
-        profile_names.dedup();
-        profile_names
-    }
-
-    pub(super) fn load_status_hook_configs(
-        profile_names: Vec<String>,
-    ) -> HashMap<String, crate::status_hooks::StatusHookConfig> {
-        profile_names
-            .into_iter()
-            .map(|profile| {
-                let status_hooks = resolve_config_or_warn(&profile).status_hooks;
-                (profile, status_hooks)
-            })
-            .collect()
-    }
-
-    pub(super) fn refresh_status_hook_config_cache(&mut self) {
-        let profile_names =
-            Self::status_hook_profile_names(self.active_profile.as_deref(), &self.storages);
-        self.status_hook_configs = Self::load_status_hook_configs(profile_names);
-        let profile = self.config_profile();
-        if let Some(status_hooks) = self.status_hook_configs.get(&profile) {
-            self.status_hook_config = status_hooks.clone();
         }
     }
 }

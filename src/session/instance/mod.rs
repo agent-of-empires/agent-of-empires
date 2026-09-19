@@ -4,6 +4,7 @@
 //! The struct lives here; every slice of its behavior lives in a submodule
 //! and adds its own `impl Instance` block.
 
+use crate::session::CaptureStorage;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -70,19 +71,19 @@ pub(crate) use accessors::resolved_agent_for;
 pub use flags::{is_valid_session_color, SessionBucket, SESSION_COLORS};
 pub(crate) use lifecycle::NEWER_GENERATION_BUSY_REASON;
 pub use lifecycle::{LifecycleOperation, LifecycleReservation, LifecycleReservationError};
-pub(crate) use omp::persist_omp_session_to_storage;
 pub use polling::PollerStart;
 pub use ready::{EnsureReadyError, EnsureReadyOutcome};
-pub(crate) use resume::ResumeAttemptPolicy;
-pub(crate) use sid_persist::{persist_session_to_storage, SidPersistOutcome, SidWrite};
+pub(crate) use resume::{LaunchReservation, ResumeAttemptPolicy, ResumeLaunchOptions};
+pub(crate) use sid_persist::{
+    persist_session_to_storage, persist_session_to_store_guarded, SidPersistOutcome, SidWrite,
+};
 pub use start::{LaunchSidOutcome, StartOutcome};
 pub(crate) use status::PassiveStatusPatch;
 pub use status::{Status, TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR};
+pub(crate) use terminal::ToolLaunchUnavailable;
 #[cfg(test)]
 pub(crate) use test_helpers::install_aliases;
-pub(crate) use tmux_session::{
-    duplicate_session_error, find_duplicate_session, is_duplicate_session, AgentSeed,
-};
+pub(crate) use tmux_session::{duplicate_session_error, is_duplicate_session, AgentSeed};
 /// Why a session can never resume, decided from the registry alone and
 /// before any runtime probe. `Agent` covers both an unresolved tool and one
 /// with no verified native resume contract; `Sandbox` and `Command` name the
@@ -109,8 +110,8 @@ pub(crate) enum TerminalContextResume {
     PreviousFailure,
 }
 pub use types::{
-    PluginCreateIdempotency, SandboxInfo, TerminalInfo, View, WorkspaceInfo, WorkspaceRepo,
-    WorktreeInfo,
+    AuxiliaryObservation, AuxiliaryTarget, PaneObservation, PanePresence, PluginCreateIdempotency,
+    SandboxInfo, TerminalInfo, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
 };
 pub(crate) use types::{
     PrimeAgentCapturePlan, PriorToolSession, ResumeIntent, SandboxStoreTransitionPath,
@@ -126,7 +127,7 @@ use launch_command::{
 };
 use omp::{gate_omp_launch, wrap_omp_host_launch, wrap_omp_launch};
 use pane_status::{resolve_detected_status, summarize_error_from_pane};
-use sid_persist::{override_if_distinct, persist_session_to_storage_guarded};
+use sid_persist::override_if_distinct;
 use status::{UNKNOWN_ERROR_WINDOW_CONFIRMED_PRESENT, UNKNOWN_ERROR_WINDOW_NEVER_PRESENT};
 use tmux_session::tmux_env_session_name_for_instance_id;
 use types::{deserialize_session_id, is_zero_u64, is_zero_u8};
@@ -669,7 +670,7 @@ pub struct Instance {
     #[serde(skip)]
     pi_extension_launched: bool,
     #[serde(skip)]
-    identity_publisher_launched: bool,
+    pub(crate) identity_publisher_launched: bool,
     /// Absolute transcript path this Pi pane last published. Pi indexes
     /// sessions by their starting cwd, so this is what resumes a conversation
     /// whose managed worktree has since moved; the id alone would resolve to
@@ -705,6 +706,11 @@ pub struct Instance {
     /// will re-set it within one tick if the pane is genuinely dead).
     #[serde(skip)]
     pub pane_dead_observed: bool,
+
+    #[serde(skip)]
+    pub agent_pane: PaneObservation,
+    #[serde(skip)]
+    pub auxiliary: Vec<AuxiliaryObservation>,
 
     /// Live FileWatchService handle for in-process Local fast-path
     /// notifications when this Instance's storage is mutated. `None` for

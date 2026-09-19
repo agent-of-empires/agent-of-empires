@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+pub(crate) use crate::session::path_identity::canonicalize_or_raw;
 use anyhow::{Context, Result};
 use uuid::Uuid;
 mod omp;
@@ -64,16 +65,6 @@ pub(crate) fn claude_home_for_host_environment(
 /// path so the read side and the write side cannot drift on precedence.
 fn claude_config_dir_override(host_env: &[String]) -> Option<String> {
     crate::hooks::resolve_config_dir_override("CLAUDE_CONFIG_DIR", host_env)
-}
-
-/// Resolve a path to a comparable identity: canonicalize when the directory
-/// exists, otherwise fall back to lexical `.`/`..` normalization so a
-/// historical unnormalized spelling (a pre-#2858 worktree `project_path` like
-/// `/repos/x/../x-worktrees/b`) still compares equal to the plain spelling
-/// after the directory has been deleted.
-pub(crate) fn canonicalize_or_raw(path: &str) -> PathBuf {
-    std::fs::canonicalize(path)
-        .unwrap_or_else(|_| crate::git::template::lexical_normalize(Path::new(path)))
 }
 
 /// Validate a captured session ID, logging a warning if it fails.
@@ -324,30 +315,12 @@ fn compose_exclusion_in(
 pub(crate) fn compose_exclusion_with_persisted_peers(
     current_instance_id: &str,
     current_project_path: &str,
-    profile: &str,
+    instances: &[crate::session::Instance],
     retroactive_capture_excludes: &HashSet<String>,
 ) -> HashSet<String> {
-    // One observation for the whole pass. Both halves consult tmux: the
-    // cross-instance scan needs the live session names, and the walk below
-    // visits every stored session sharing the project path, trashed ones
-    // included, so a per-instance liveness probe costs a fork each. A store of
-    // a few hundred sessions made that the dominant cost of the pass.
-    // `names() == None` (server unreachable) reads as "no live pane" here,
-    // which is what the per-item probe already did when its own
-    // `list-sessions` failed, and this pass re-runs.
     let live = crate::tmux::LiveSessionSnapshot::new();
     let mut set = compose_exclusion_in(current_instance_id, retroactive_capture_excludes, &live);
-    let Ok(storage) = crate::session::storage::Storage::new_unwatched(profile) else {
-        return set;
-    };
-    let Ok(instances) = storage.load() else {
-        return set;
-    };
-    // Compare canonicalized paths, not raw strings: worktree sessions created
-    // from `../`-style templates historically stored an unnormalized
-    // `project_path` (e.g. `/repos/x/../x-worktrees/b`), and a raw comparison
-    // silently drops them from this exclusion even though they share the
-    // directory — re-opening the #2355 steal for exactly those peers (#2858).
+    // Equivalent worktree paths must share the same ownership boundary.
     let canonical_current = canonicalize_or_raw(current_project_path);
     for inst in instances {
         if inst.id == current_instance_id {
@@ -356,10 +329,7 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
         if canonicalize_or_raw(&inst.project_path) != canonical_current {
             continue;
         }
-        // A peer that swapped away still owns the conversation it parked and
-        // intends to resume it on a swap back. It is excluded regardless of the
-        // peer's current tool or liveness: its pane is running another engine,
-        // so the live tmux ownership scan cannot discover this id.
+        // Parked IDs remain owned after the peer switches engines.
         for parked in inst.prior_tool_session_ids.values() {
             if let Some(sid) = parked
                 .agent_session_id
@@ -1652,8 +1622,15 @@ mod tests {
         // both facts rather than being reconstructed from current config.
         crate::tmux::status_rules::install_from_config(PROFILE, &crate::session::Config::default());
 
-        let exclusions =
-            compose_exclusion_with_persisted_peers("current", project, PROFILE, &HashSet::new());
+        let exclusions = compose_exclusion_with_persisted_peers(
+            "current",
+            project,
+            &crate::session::Storage::new_unwatched(PROFILE)
+                .unwrap()
+                .load()
+                .unwrap(),
+            &HashSet::new(),
+        );
         assert!(
             exclusions.contains(parked_sid),
             "a conversation parked under an alias belongs to the same built-in store"
@@ -1720,7 +1697,12 @@ mod tests {
     #[test]
     fn test_claude_host_transcript_confirmed_absent() {
         let tmp = tempfile::tempdir().unwrap();
-        let project_dir = tmp.path().join("projects").join("-tmp-myproject");
+        // The lookup resolves existing ancestors even for a missing project:
+        // on macOS, /tmp/myproject is rooted under /private/tmp.
+        let project_path = "/tmp/myproject";
+        let project_dir = tmp.path().join("projects").join(encode_claude_project_path(
+            &canonicalize_or_raw(project_path).to_string_lossy(),
+        ));
         std::fs::create_dir_all(&project_dir).unwrap();
 
         let present = "11111111-2222-3333-4444-555555555555";
@@ -1741,11 +1723,11 @@ mod tests {
             crate::session::test_support::EnvGuard::set(&[("CLAUDE_CONFIG_DIR", tmp.path())]);
 
         assert!(
-            !claude_host_transcript_confirmed_absent("/tmp/myproject", present, &[], None),
+            !claude_host_transcript_confirmed_absent(project_path, present, &[], None),
             "a transcript on disk (even stale) must not be reported absent"
         );
         assert!(
-            claude_host_transcript_confirmed_absent("/tmp/myproject", missing, &[], None),
+            claude_host_transcript_confirmed_absent(project_path, missing, &[], None),
             "an unwritten sid must be reported confirmed-absent"
         );
         // A project dir that was never created is also confirmed-absent.

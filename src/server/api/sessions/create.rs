@@ -2,119 +2,6 @@
 
 use super::*;
 
-// --- Create session ---
-
-/// One repo's creation base in a create-session request. See #3329.
-#[derive(Deserialize)]
-pub struct RepoBaseInput {
-    pub repo: String,
-    pub base_branch: String,
-}
-
-#[derive(Deserialize)]
-pub struct CreateSessionBody {
-    pub title: Option<String>,
-    pub path: String,
-    pub tool: String,
-    #[serde(default)]
-    pub group: String,
-    #[serde(default)]
-    pub yolo_mode: bool,
-    /// Explicit worktree opt-in. When omitted or false, legacy callers that
-    /// send `worktree_branch` still opt into worktree mode.
-    #[serde(default)]
-    pub worktree_enabled: bool,
-    pub worktree_branch: Option<String>,
-    #[serde(default)]
-    pub create_new_branch: bool,
-    /// Branch the new worktree branch is based on. Only honored when
-    /// `create_new_branch` is true; the server ignores it otherwise.
-    /// `None` (or empty) falls back to the repository's detected
-    /// default branch. See #948.
-    #[serde(default)]
-    pub base_branch: Option<String>,
-    #[serde(default)]
-    pub sandbox: bool,
-    #[serde(default)]
-    pub extra_args: String,
-    #[serde(default)]
-    pub sandbox_image: Option<String>,
-    #[serde(default)]
-    pub extra_env: Vec<String>,
-    #[serde(default)]
-    pub extra_repo_paths: Vec<String>,
-    /// Base branch for individual repos, as `{ repo, base_branch }` entries.
-    /// `repo` is a repo directory name or one of the paths in `path` /
-    /// `extra_repo_paths`. Outranks `base_branch`, which stays the base for
-    /// every repo no entry names. See #3329.
-    #[serde(default)]
-    pub repo_bases: Vec<RepoBaseInput>,
-    #[serde(default)]
-    pub command_override: String,
-    #[serde(default)]
-    pub custom_instruction: Option<String>,
-    pub profile: Option<String>,
-    /// How the new session should render: `structured` or `terminal`. The
-    /// bundled wizard sends an explicit value (`structured` for ACP-capable
-    /// tools, `terminal` otherwise); other API callers may omit it, in which
-    /// case it defaults to `terminal`. The value is re-validated against real
-    /// ACP capability below before being persisted, so a tampered request
-    /// can't force the structured view on a non-ACP tool.
-    #[serde(default)]
-    pub view: crate::session::View,
-    #[serde(default)]
-    pub agent_name: Option<String>,
-    #[serde(default)]
-    pub agent_model: Option<String>,
-    #[serde(default)]
-    pub agent_effort: Option<String>,
-    /// Scratch session: server provisions a fresh directory under
-    /// `<app_dir>/scratch/<id>/` and ignores `path`. Mutually exclusive with
-    /// `worktree_branch` and `extra_repo_paths`; the handler returns 400
-    /// on either combination.
-    #[serde(default)]
-    pub scratch: bool,
-    /// Approve the repo's `on_create` lifecycle hooks (and any project MCP) for
-    /// this non-interactive create, mirroring the CLI `--trust-hooks` flag and
-    /// the TUI trust dialog (#2066). When a repo defines hooks that need
-    /// approval and this is unset/false, the handler returns a structured
-    /// `hooks_need_trust` error so the caller can prompt and resubmit with
-    /// `trust_hooks: true`. Already-trusted hooks run regardless.
-    #[serde(default)]
-    pub trust_hooks: Option<bool>,
-    /// Import an existing Claude Code session: the on-disk session id (the
-    /// `<sessionId>.jsonl` stem) to resume via `session/load`. When set, the
-    /// new session adopts this id as its `acp_session_id`, is forced to the
-    /// structured view, and seeds its transcript from the agent's history
-    /// replay. `path` must be the session's original cwd. See #2276.
-    #[serde(default)]
-    pub import_acp_session_id: Option<String>,
-    /// Fork an existing session: the source session's captured session id to
-    /// resume and diverge from. The new session resumes that conversation as an
-    /// independent session (the original is left untouched). The kind of fork
-    /// follows `view`/the tool: when `view == Structured` and the tool is
-    /// ACP-capable, this drives a structured ACP `session/fork` against the
-    /// parent's `acp_session_id`; otherwise it drives a terminal fork that
-    /// resumes the parent `agent_session_id` with the agent's fork flag. A
-    /// structured fork requested for a non-ACP agent is rejected rather than
-    /// silently downgraded.
-    #[serde(default)]
-    pub fork_from: Option<String>,
-    /// External work-queue dispatcher completion callback: an HTTP POST
-    /// fires here when the session transitions to Idle, Waiting, or Error.
-    /// Must be `http`/`https` and not resolve to a loopback/private/
-    /// link-local address; validated at create time, re-validated on every
-    /// dispatch. See #3156.
-    #[serde(default)]
-    pub callback_url: Option<String>,
-    /// Idempotency key for `POST /api/sessions`: a retry using the same key
-    /// (even across a daemon restart, since it's persisted on the created
-    /// instance) returns the existing session instead of creating a
-    /// duplicate. See #3156.
-    #[serde(default)]
-    pub idempotency_key: Option<String>,
-}
-
 /// Hard cap on a single `idempotency_key`'s length, so one request cannot
 /// persist an arbitrarily large string onto its instance. This bounds key
 /// SIZE, not the number of distinct keys; entry count is bounded separately
@@ -143,13 +30,7 @@ pub(super) fn create_body_combines_scratch_and_worktree(body: &CreateSessionBody
     body.scratch && create_body_uses_worktree(body)
 }
 
-/// Resolve the one-shot fork seed for a `fork_from` create request. A
-/// structured request (`structured == true`) forks through ACP `session/fork`
-/// against the parent's `acp_session_id`; a terminal request resumes the
-/// parent agent id with the agent's fork flag, generating a fresh child id.
-/// `Err` reports an unforkable terminal agent or missing parent id; a
-/// structured request is already rejected by the caller's
-/// `agent_is_structured_fork_capable` guard before it reaches here.
+/// Build the provider fork seed after capability and source validation.
 pub(super) fn resolve_create_fork_seed(
     tool: &str,
     parent_id: &str,
@@ -167,21 +48,69 @@ pub(super) fn resolve_create_fork_seed(
     )
 }
 
-/// True when a create request asks to both import an existing session and fork
-/// a parent. The two seed the new session from different sources, so allowing
-/// both would produce a contradictory half-imported, half-forked session.
-/// Trailing whitespace is treated as unset, matching the per-field guards.
-pub(super) fn both_import_and_fork_set(body: &CreateSessionBody) -> bool {
-    let set = |v: &Option<String>| v.as_deref().map(str::trim).is_some_and(|s| !s.is_empty());
-    set(&body.import_acp_session_id) && set(&body.fork_from)
+pub(super) fn create_body_has_conflicting_sources(body: &CreateSessionBody) -> bool {
+    [
+        &body.import_acp_session_id,
+        &body.fork_from,
+        &body.fork_session_id,
+    ]
+    .into_iter()
+    .filter(|value| {
+        value
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    })
+    .take(2)
+    .count()
+        == 2
 }
 
-/// Thin server-side alias for [`crate::session::fork::structured_fork_capable`],
-/// the single source of truth for "can this agent run the ACP `session/fork`
-/// handshake?". Shared by the `SessionResponse.acp_can_fork` projection (the web
-/// "Fork" affordance) and the create-time guard so they cannot drift.
-pub(super) fn agent_is_structured_fork_capable(tool: &str, agent_name: Option<&str>) -> bool {
-    crate::session::fork::structured_fork_capable(tool, agent_name)
+async fn resolve_canonical_fork_seed(
+    state: &Arc<AppState>,
+    body: &CreateSessionBody,
+    source_id: &str,
+) -> Result<crate::session::ForkSeed, axum::response::Response> {
+    let _namespace = state.profile_namespace.read().await;
+    if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
+        return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
+    }
+    let lock = state.instance_lock(source_id).await;
+    let _guard = lock.lock().await;
+    let instances = state.instances.read().await;
+    let source = instances
+        .iter()
+        .find(|row| row.id == source_id)
+        .ok_or_else(|| StatusCode::NOT_FOUND.into_response())?;
+    if source.has_fresh_lifecycle_reservation(chrono::Utc::now()) {
+        return Err((
+            StatusCode::CONFLICT,
+            crate::daemon::ApiErrorCode::LifecycleLocked.header(),
+        )
+            .into_response());
+    }
+    if source.tool != body.tool
+        || source.view != body.view
+        || (source.is_structured()
+            && acp_agent_key(&source.tool, source.agent_name.as_deref())
+                != acp_agent_key(&body.tool, body.agent_name.as_deref()))
+    {
+        return Err(StatusCode::BAD_REQUEST.into_response());
+    }
+    let parent_id = if source.is_structured() {
+        if !crate::session::fork::structured_fork_capable(
+            &source.tool,
+            source.agent_name.as_deref(),
+        ) {
+            return Err(StatusCode::BAD_REQUEST.into_response());
+        }
+        source.acp_session_id.as_deref()
+    } else {
+        source.agent_session_id.as_deref()
+    }
+    .filter(|id| crate::session::capture::is_valid_session_id(id))
+    .ok_or_else(|| StatusCode::BAD_REQUEST.into_response())?;
+    resolve_create_fork_seed(&source.tool, parent_id, source.is_structured())
+        .map_err(|_| StatusCode::BAD_REQUEST.into_response())
 }
 
 /// The ACP registry key a create request resolves to: an explicit `agent_name`
@@ -253,71 +182,12 @@ pub(super) fn validate_session_tool_identity(
     }
 }
 
-/// Insert `instance` into the live registry, replacing any entry that
-/// already carries the same id rather than blind-pushing a second copy.
-///
-/// `create_session` persists the new session to disk (in `persist_and_start`)
-/// before it pushes the in-memory copy here. A `status_poll_loop` tick that
-/// fires in that window calls `load_all_instances`, reads the just-persisted
-/// row, and inserts it first. A blind `push` would then leave two entries
-/// with the same id in `state.instances` until the next poll tick collapses
-/// them, and `GET /api/sessions` would briefly return the session twice.
-pub(crate) fn upsert_instance(
-    instances: &mut Vec<crate::session::Instance>,
-    instance: crate::session::Instance,
-) {
-    if let Some(existing) = instances.iter_mut().find(|i| i.id == instance.id) {
-        *existing = instance;
-    } else {
-        instances.push(instance);
-    }
-}
-
-/// Remove `id` from the live registry, bumping `mutation_epoch` when a row was
-/// actually removed.
-///
-/// The delete path removes a row from `state.instances` in three places: the
-/// `AlreadyGone` short-circuit, the structured purge's early mirror removal
-/// (which then awaits ACP teardown before the handler finishes), and the final
-/// commit block. Every one of them has to bump, and has to bump while the
-/// caller still holds the `instances` write lock, because a reloader compares
-/// the epoch under that same lock. A removal that skips the bump leaves a
-/// window where a disk reload carrying a pre-delete snapshot rebuilds
-/// `state.instances` from it and puts the deleted row back, so
-/// `GET /api/sessions` lists a session the user just deleted.
-///
-/// Bumping only on an actual removal keeps the final commit block from
-/// spending an epoch when the early removal already took the row; if a stale
-/// reload DID restore it in between, the retain here finds it, removes it
-/// again, and bumps as it should.
-pub(crate) fn remove_instance(
-    instances: &mut Vec<crate::session::Instance>,
-    id: &str,
-    mutation_epoch: &std::sync::atomic::AtomicU64,
-) {
-    let before = instances.len();
-    instances.retain(|i| i.id != id);
-    if instances.len() != before {
-        mutation_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-/// Carried out of `create_session` to mark a create that was refused because
-/// the repo's hooks (or project MCP) need approval and the request did not pass
-/// `trust_hooks: true` (#2066). The outer match downcasts this to emit a
-/// structured `hooks_need_trust` response instead of the generic
-/// `create_failed`, so a caller can show the commands and resubmit.
+/// Missing approval for repository hooks, including all commands it would cover.
 #[derive(Debug)]
 pub(crate) struct HooksNeedTrust {
-    /// The `on_create` commands that would run, for display in the prompt.
     pub(crate) on_create: Vec<String>,
-    /// The `on_launch` commands the same approval would trust. They don't run
-    /// on this create, but the recorded trust covers them for every later
-    /// session (TUI/CLI included), so the prompt must show them too.
     pub(crate) on_launch: Vec<String>,
-    /// Likewise for `on_destroy`, run when a session is deleted.
     pub(crate) on_destroy: Vec<String>,
-    /// True when the repo's `.mcp.json` also needs approval at this fingerprint.
     pub(crate) needs_mcp_trust: bool,
 }
 
@@ -332,80 +202,189 @@ impl std::fmt::Display for HooksNeedTrust {
 
 impl std::error::Error for HooksNeedTrust {}
 
-/// Resolved plan for a web-API create's `on_create` lifecycle hooks (#2066).
-/// Computed before the worktree is built so an untrusted repo fails fast
-/// without leaving an orphan worktree; executed after the build once the
-/// session directory exists.
+#[derive(Debug, thiserror::Error)]
+#[error("Repository trust review changed")]
+pub(crate) struct CreationTrustChanged;
+
+pub async fn cancel_creation(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    if state.read_only {
+        return crate::server::api::read_only_response();
+    }
+    if let Some(response) = cityhall_block_non_structured(&state, &id).await {
+        return response;
+    }
+    if state.session_service.cancel_creation(&id) {
+        // The acknowledgement is a mutation response like any other, so the
+        // caller can fence it against the snapshot it was applied at.
+        let cursor = state
+            .runtime
+            .snapshot(&state)
+            .await
+            .map(|snapshot| snapshot.value.cursor.clone());
+        match cursor {
+            Ok(cursor) => crate::server::runtime::mutation_response(&cursor, StatusCode::ACCEPTED),
+            Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
+    } else {
+        let code = crate::daemon::ApiErrorCode::CreationNotPending;
+        (code.status(), code.header()).into_response()
+    }
+}
+
+fn read_creation_trust(
+    project_path: &std::path::Path,
+    scratch: bool,
+) -> anyhow::Result<crate::session::config::repo_config::RepoTrust> {
+    use crate::session::config::repo_config::{self, RepoTrust, TrustSurface};
+    if scratch {
+        Ok(RepoTrust {
+            project_path: String::new(),
+            hooks: TrustSurface::Absent,
+            mcp: TrustSurface::Absent,
+        })
+    } else {
+        repo_config::check_repo_trust(project_path)
+    }
+}
+
+fn creation_trust_fingerprint(
+    base: &crate::session::HooksConfig,
+    trust: &crate::session::config::repo_config::RepoTrust,
+) -> crate::daemon::CreationTrustFingerprint {
+    use crate::session::config::repo_config::{compute_hooks_hash, TrustSurface};
+    crate::daemon::CreationTrustFingerprint {
+        project_path: trust.project_path.clone(),
+        base_hooks_hash: compute_hooks_hash(base),
+        hooks_hash: match &trust.hooks {
+            TrustSurface::Absent => None,
+            TrustSurface::Trusted(hooks) => Some(compute_hooks_hash(hooks)),
+            TrustSurface::NeedsTrust { hash, .. } => Some(hash.clone()),
+        },
+        mcp_hash: match &trust.mcp {
+            TrustSurface::Absent => None,
+            TrustSurface::Trusted(servers) => {
+                Some(crate::session::mcp::project_mcp::fingerprint(servers))
+            }
+            TrustSurface::NeedsTrust { hash, .. } => Some(hash.clone()),
+        },
+    }
+}
+
+pub async fn review_creation_trust(
+    State(state): State<Arc<AppState>>,
+    body: Result<
+        Json<crate::daemon::CreationTrustRequest>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> axum::response::Response {
+    if state.read_only {
+        return crate::server::api::read_only_response();
+    }
+    if state.cityhall_mode {
+        return crate::server::api::cityhall_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
+    };
+    let _namespace = state.profile_namespace.read().await;
+    if !matches!(
+        *state.canonical_health.read().await,
+        crate::daemon::RuntimeHealth::Healthy
+    ) {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let profile = match body.profile {
+        Some(profile) => profile,
+        None => state
+            .canonical_metadata
+            .read()
+            .await
+            .default_profile
+            .clone(),
+    };
+    let result = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<crate::daemon::CreationTrustReview> {
+            use crate::session::config::repo_config::{self, TrustSurface};
+            anyhow::ensure!(!profile.is_empty(), "Missing profile");
+            let profile = crate::session::resolve_existing_profile(&profile)?;
+            let path = std::path::Path::new(&body.path);
+            anyhow::ensure!(body.scratch || path.is_dir(), "Project path does not exist");
+            let base = crate::session::resolve_config(&profile)?.hooks;
+            let trust = read_creation_trust(path, body.scratch)?;
+            let fingerprint = creation_trust_fingerprint(&base, &trust);
+            let hooks_need_trust = trust.hooks.needs_trust();
+            let mcp_need_trust = trust.mcp.needs_trust();
+            let repo_hooks = match trust.hooks {
+                TrustSurface::Trusted(hooks) | TrustSurface::NeedsTrust { config: hooks, .. } => {
+                    hooks
+                }
+                TrustSurface::Absent => Default::default(),
+            };
+            let mcp_summaries = match trust.mcp {
+                TrustSurface::Trusted(servers)
+                | TrustSurface::NeedsTrust {
+                    config: servers, ..
+                } => servers
+                    .iter()
+                    .map(|server| server.redacted_summary())
+                    .collect(),
+                TrustSurface::Absent => Vec::new(),
+            };
+            Ok(crate::daemon::CreationTrustReview {
+                fingerprint,
+                merged_hooks: repo_config::apply_repo_hook_overrides(base, &repo_hooks),
+                repo_hooks,
+                mcp_summaries,
+                hooks_need_trust,
+                mcp_need_trust,
+            })
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(review)) => Json(review).into_response(),
+        Ok(Err(_)) => StatusCode::BAD_REQUEST.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// Creation hooks captured before worktree provisioning.
 #[derive(Debug)]
 pub(crate) struct CreateHookPlan {
     /// Commands to run, already merged (repo overrides global/profile per type).
     pub(crate) on_create: Vec<String>,
-    /// `(hooks_hash, mcp_hash)` to persist into `trusted_repos.toml` when the
-    /// caller passed `trust_hooks: true` and a surface needed approval. `None`
-    /// when nothing new needs recording (already trusted, or no hooks/MCP).
+    /// Approved hashes to persist before provisioning; absent when no new trust is needed.
     pub(crate) trust_write: Option<(Option<String>, Option<String>)>,
 }
 
-/// Resolve the repo's `on_create` hooks and the trust decision for a web-API
-/// create. Returns `Err(HooksNeedTrust)` when a surface needs approval and the
-/// caller did not pass `trust_hooks: true`; the surrounding handler maps that to
-/// a structured `hooks_need_trust` response. Mirrors the CLI `--trust-hooks`
-/// path in `src/cli/add.rs`, adapted for the API's non-interactive context.
+/// Resolve hooks under the caller’s explicit approval or skip decision.
 pub(crate) fn resolve_create_hook_plan(
-    profile: &str,
+    base: &crate::session::HooksConfig,
     project_path: &std::path::Path,
     scratch: bool,
-    trust_hooks_requested: bool,
+    trust_hooks_requested: Option<bool>,
+    expected_review: Option<&crate::daemon::CreationTrustFingerprint>,
 ) -> anyhow::Result<CreateHookPlan> {
     use crate::session::config::repo_config::{self, TrustSurface};
 
-    // Scratch sessions have no `.agent-of-empires/config.toml` anchored on a
-    // repo path, so skip the repo trust check entirely and fall back to
-    // profile-level hooks (matching the CLI scratch branch).
-    if scratch {
-        let on_create = repo_config::resolve_global_profile_hooks(profile)
-            .map(|h| h.on_create)
-            .unwrap_or_default();
-        return Ok(CreateHookPlan {
-            on_create,
-            trust_write: None,
-        });
+    let trust = read_creation_trust(project_path, scratch)?;
+    if expected_review.is_some_and(|expected| *expected != creation_trust_fingerprint(base, &trust))
+    {
+        return Err(CreationTrustChanged.into());
     }
 
-    let trust = match repo_config::check_repo_trust(project_path) {
-        Ok(t) => t,
-        Err(e) => {
-            // A failed trust check must not silently drop already-trusted hooks
-            // run via global/profile; degrade to profile hooks like the CLI does.
-            tracing::warn!(target: "http.api.sessions", "Failed to check repo trust: {e:#}");
-            let on_create = repo_config::resolve_global_profile_hooks(profile)
-                .map(|h| h.on_create)
-                .unwrap_or_default();
-            return Ok(CreateHookPlan {
-                on_create,
-                trust_write: None,
-            });
-        }
-    };
-
-    // Refuse only when HOOKS need approval and the caller did not opt in.
-    // Project MCP is deliberately not a gate here: the supervisor skips an
-    // untrusted `.mcp.json` at spawn (it's the real MCP gate), so blocking
-    // creation on it would be more aggressive than the CLI, which still
-    // creates the session when MCP is declined. A passed `trust_hooks` still
-    // records MCP trust below, bundling approval the way the CLI does.
-    if trust.hooks.needs_trust() && !trust_hooks_requested {
-        // Approving trusts the repo's whole hooks hash, so the refusal must
-        // carry every hook type the trust would cover (on_launch runs on every
-        // later session start, on_destroy on delete), not just on_create;
-        // mirrors hook_display_groups in the CLI/TUI prompts.
+    // MCP is gated at spawn; an omitted decision refuses unapproved hooks only.
+    if trust.hooks.needs_trust() && trust_hooks_requested.is_none() {
+        // Approval covers every hook type, not just on_create.
         let merged = match &trust.hooks {
             TrustSurface::Trusted(h) | TrustSurface::NeedsTrust { config: h, .. } => {
-                repo_config::merge_hooks_for_display(profile, h)
+                repo_config::apply_repo_hook_overrides(base.clone(), h)
             }
-            TrustSurface::Absent => {
-                repo_config::resolve_global_profile_hooks(profile).unwrap_or_default()
-            }
+            TrustSurface::Absent => base.clone(),
         };
         return Err(anyhow::Error::new(HooksNeedTrust {
             on_create: merged.on_create,
@@ -415,12 +394,14 @@ pub(crate) fn resolve_create_hook_plan(
         }));
     }
 
-    // Approved (nothing needed prompting, or the caller passed trust_hooks).
     let repo_hooks = match &trust.hooks {
-        TrustSurface::Trusted(h) | TrustSurface::NeedsTrust { config: h, .. } => Some(h.clone()),
-        TrustSurface::Absent => None,
+        TrustSurface::Trusted(h) => Some(h),
+        TrustSurface::NeedsTrust { config, .. } if trust_hooks_requested == Some(true) => {
+            Some(config)
+        }
+        _ => None,
     };
-    let trust_write = if trust_hooks_requested {
+    let trust_write = if trust_hooks_requested == Some(true) {
         let hooks_hash = match &trust.hooks {
             TrustSurface::NeedsTrust { hash, .. } => Some(hash.clone()),
             _ => None,
@@ -437,55 +418,43 @@ pub(crate) fn resolve_create_hook_plan(
     } else {
         None
     };
-    let on_create = match repo_hooks {
-        Some(h) => repo_config::merge_hooks_with_config(profile, h)
-            .map(|m| m.on_create)
-            .unwrap_or_default(),
-        None => repo_config::resolve_global_profile_hooks(profile)
-            .map(|h| h.on_create)
-            .unwrap_or_default(),
-    };
+    let on_create = repo_hooks
+        .map(|hooks| &hooks.on_create)
+        .filter(|hooks| !hooks.is_empty())
+        .unwrap_or(&base.on_create)
+        .clone();
     Ok(CreateHookPlan {
         on_create,
         trust_write,
     })
 }
 
-/// Record any pending trust and run the planned `on_create` hooks for a
-/// web-API create (#2066). Runs after the worktree exists. Hook output is
-/// streamed to a discarded channel so the shared streamed executor's
-/// terminal-detach (credential-prompt suppression) applies; failures surface
-/// through the returned `Result` with a captured output tail.
+/// Run captured creation hooks with streamed error-tail capture. `progress`,
+/// when present, receives the live command and output for the requesting
+/// surface.
 pub(crate) fn run_create_hooks(
     instance: &mut Instance,
     plan: &CreateHookPlan,
-    project_path: &std::path::Path,
+    store: &dyn crate::session::SessionStore,
+    progress: Option<&dyn Fn(crate::session::config::repo_config::HookProgress)>,
 ) -> anyhow::Result<()> {
     use crate::session::config::repo_config;
-
-    if let Some((hooks_hash, mcp_hash)) = &plan.trust_write {
-        repo_config::trust_repo(project_path, hooks_hash.as_deref(), mcp_hash.as_deref())?;
-    }
 
     if plan.on_create.is_empty() {
         return Ok(());
     }
 
     let hook_env = repo_config::lifecycle_env_vars(instance);
-    // No live consumer: drop the receiver so the executor's sends no-op while
-    // its detach-tty behavior and error-tail capture still apply.
-    let (progress_tx, progress_rx) = std::sync::mpsc::channel::<repo_config::HookProgress>();
-    drop(progress_rx);
 
     if instance.sandbox_info.is_some() {
-        instance.get_container_for_instance()?;
+        instance.ensure_container_in(store)?;
         let workdir = instance.container_workdir();
         if let Some(sandbox) = instance.sandbox_info.as_ref() {
             repo_config::execute_hooks_in_container_streamed(
                 &plan.on_create,
                 &sandbox.container_name,
                 &workdir,
-                &progress_tx,
+                progress,
                 &hook_env,
             )?;
         }
@@ -493,7 +462,7 @@ pub(crate) fn run_create_hooks(
         repo_config::execute_hooks_streamed(
             &plan.on_create,
             std::path::Path::new(&instance.project_path),
-            &progress_tx,
+            progress,
             &hook_env,
         )?;
     }
@@ -628,6 +597,12 @@ pub async fn create_session(
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
+    let default_profile = state
+        .canonical_metadata
+        .read()
+        .await
+        .default_profile
+        .clone();
 
     if state.cityhall_mode {
         // CityHall sessions are server-derived and locked down: they span every
@@ -635,7 +610,18 @@ pub async fn create_session(
         // ACP-capable agent. Every client-supplied field that could escape the
         // mode (path/repos/view/scratch plus the spawn/branch fields reset
         // below) is neutralized so a crafted request cannot escape it. See #7.
-        let projects = crate::session::projects::load_merged(&state.profile).unwrap_or_default();
+        if body
+            .fork_session_id
+            .as_deref()
+            .is_some_and(|id| !id.trim().is_empty())
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                crate::daemon::ApiErrorCode::CityhallMode.header(),
+            )
+                .into_response();
+        }
+        let projects = crate::session::projects::load_merged(&default_profile).unwrap_or_default();
         if projects.is_empty() {
             return (
                 StatusCode::BAD_REQUEST,
@@ -670,6 +656,7 @@ pub async fn create_session(
         // would run (and persist durable trust for) operator-repo commands from
         // a locked-down user. Reset to the untrusted default. See #7 review.
         body.trust_hooks = None;
+        body.trust_review = None;
         // The "primary" repo is the first entry in merged registry order; the
         // rest ride along as workspace repos. With multiple projects that pick
         // is arbitrary but deterministic (registry order is stable), and the
@@ -686,7 +673,7 @@ pub async fn create_session(
         let profile = body
             .profile
             .clone()
-            .unwrap_or_else(|| state.profile.clone());
+            .unwrap_or_else(|| default_profile.clone());
         if !agent_is_acp_capable(
             &profile,
             std::path::Path::new(&body.path),
@@ -816,7 +803,7 @@ pub async fn create_session(
         }
     }
 
-    let validation_profile = body.profile.as_deref().unwrap_or(&state.profile);
+    let validation_profile = body.profile.as_deref().unwrap_or(&default_profile);
     if !validate_session_tool_identity(
         &body.tool,
         validation_profile,
@@ -872,16 +859,13 @@ pub async fn create_session(
         }
     }
 
-    // Import and fork are mutually exclusive: each seeds the new session from a
-    // different source (import adopts an on-disk session id; fork resumes a
-    // parent's captured id), and honoring both would leave the session in a
-    // contradictory half-imported, half-forked state. Reject up front.
-    if both_import_and_fork_set(&body) {
+    // A new session has exactly one conversation source.
+    if create_body_has_conflicting_sources(&body) {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": "invalid_request",
-                "message": "Cannot set both import_acp_session_id and fork_from",
+                "message": "Choose only one import or fork source",
             })),
         )
             .into_response();
@@ -945,7 +929,7 @@ pub async fn create_session(
     // later. The builder applies the seed: a structured seed forces the
     // structured view and sets the one-shot `fork_pending`/`import_pending`
     // markers; a terminal seed pre-pins the child id and the Fork intent.
-    let fork_seed = match body
+    let mut fork_seed = match body
         .fork_from
         .as_deref()
         .map(str::trim)
@@ -971,7 +955,10 @@ pub async fn create_session(
             // capability check silently downgrade it to a non-forked terminal
             // session (the fork markers would be cleared, dropping the fork).
             if structured
-                && !agent_is_structured_fork_capable(&body.tool, body.agent_name.as_deref())
+                && !crate::session::fork::structured_fork_capable(
+                    &body.tool,
+                    body.agent_name.as_deref(),
+                )
             {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -1034,22 +1021,35 @@ pub async fn create_session(
         let guard = lock.lock_owned().await;
         let existing = {
             let instances = state.instances.read().await;
-            find_by_idempotency_key(&instances, key).map(|inst| {
-                SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
-            })
+            find_by_idempotency_key(&instances, key).map(|inst| inst.id.clone())
         };
-        if let Some(resp) = existing {
-            return (StatusCode::OK, Json(resp)).into_response();
+        if let Some(id) = existing {
+            return created_session_response(&state, &id, Vec::new(), StatusCode::OK).await;
         }
         Some(guard)
     } else {
         None
     };
 
-    let profile = body.profile.unwrap_or_else(|| state.profile.clone());
+    if let Some(source_id) = body
+        .fork_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        fork_seed = Some(
+            match resolve_canonical_fork_seed(&state, &body, source_id).await {
+                Ok(seed) => seed,
+                Err(response) => return response,
+            },
+        );
+    }
+
+    let profile = body.profile.unwrap_or(default_profile);
 
     let spec = crate::server::session_spawn::StructuredSessionSpec {
         title: body.title,
+        size: body.size,
         path: body.path,
         group: body.group,
         tool: body.tool,
@@ -1071,6 +1071,7 @@ pub async fn create_session(
             .collect(),
         scratch: body.scratch,
         trust_hooks: body.trust_hooks,
+        trust_review: body.trust_review,
         custom_instruction: body.custom_instruction,
         callback_url: body.callback_url,
         idempotency_key: body.idempotency_key,
@@ -1096,49 +1097,24 @@ pub async fn create_session(
     {
         Ok((outcome, _created)) => {
             let instance = outcome.instance;
-            let mut resp = SessionResponse::from_instance(
-                &instance,
-                crate::claude_settings::read_tui_fullscreen(),
-            );
-            resp.warnings = outcome.warnings;
-            // Carry the resolved tie value (#1927); list_sessions' overlay does
-            // not run on this create response, so a managed worktree would
-            // otherwise report untied until the next list refresh.
-            if resp.has_managed_worktree {
-                resp.tie_workdir_to_name =
-                    crate::session::config::profile_config::resolve_config_or_warn(
-                        &instance.source_profile,
-                    )
-                    .session
-                    .tie_workdir_to_name;
-            }
-            if !resp.acp_capable {
-                let session =
-                    crate::session::config::repo_config::resolve_config_with_repo_or_warn(
-                        &instance.source_profile,
-                        std::path::Path::new(&instance.project_path),
-                    )
-                    .session;
-                resp.acp_capable = custom_agent_acp_capable(&session, &instance.tool);
-            }
-
             if query.wait.as_deref() == Some("ready") && instance.status == Status::Starting {
-                if let Some(fresh) =
-                    wait_until_left_starting(&state, &instance.id, WAIT_READY_TIMEOUT).await
-                {
-                    // `wire_str`, not `as_str`: this must match the casing the
-                    // same endpoint returns without `?wait=ready`, or a
-                    // dispatcher comparing against a `GET /api/sessions` poll
-                    // never matches. See #3187.
-                    resp.status = fresh.status.wire_str().to_string();
-                    resp.last_error = fresh.last_error;
-                }
+                let _ = wait_until_left_starting(&state, &instance.id, WAIT_READY_TIMEOUT).await;
             }
-
-            (StatusCode::CREATED, Json(resp)).into_response()
+            created_session_response(&state, &instance.id, outcome.warnings, StatusCode::CREATED)
+                .await
         }
         Err(e) => {
-            // A build-task panic keeps its 500; a plain build failure is a 400.
+            if e.is::<crate::server::session_service::CreationCancelled>() {
+                let code = crate::daemon::ApiErrorCode::CreationCancelled;
+                return (code.status(), code.header()).into_response();
+            }
+            if e.is::<CreationTrustChanged>() {
+                let code = crate::daemon::ApiErrorCode::CreationTrustChanged;
+                return (code.status(), code.header()).into_response();
+            }
+            if e.is::<crate::session::NativeStoreUnavailable>() {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
             if let Some(panicked) =
                 e.downcast_ref::<crate::server::session_spawn::SessionBuildPanicked>()
             {
@@ -1174,6 +1150,31 @@ pub async fn create_session(
                 .into_response()
         }
     }
+}
+async fn created_session_response(
+    state: &Arc<AppState>,
+    id: &str,
+    warnings: Vec<String>,
+    status: StatusCode,
+) -> axum::response::Response {
+    let snapshot = match state.runtime.publish(state).await {
+        Ok(snapshot) => snapshot,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let Some(row) = snapshot
+        .value
+        .contents
+        .sessions
+        .iter()
+        .find(|row| row.id == id)
+    else {
+        return crate::server::api::session_gone_after_persist();
+    };
+    let mut response = std::borrow::Cow::Borrowed(row);
+    if !warnings.is_empty() {
+        response.to_mut().warnings = warnings;
+    }
+    crate::server::runtime::mutation_response(&snapshot.value.cursor, (status, Json(response)))
 }
 
 /// Pick the client-facing message for a failed session creation.

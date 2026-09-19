@@ -16,21 +16,7 @@ pub struct ToolSession {
 }
 
 impl ToolSession {
-    /// The tool sub-session name to ACT on. Resolves onto the live sub-session
-    /// for this session id and tool when the stored title has moved out from
-    /// under its name, so reopening a tool after a retitle reattaches to the
-    /// running pane instead of spawning a second one beside it (the same defect
-    /// #3157 fixed for the agent pane).
-    ///
-    /// Known limit, inherited from the name format rather than introduced here:
-    /// the tool/title boundary is not recoverable from the name, so tool `git`
-    /// with title `log_T` and tool `git_log` with title `T` produce the same
-    /// name. Resolving `git` can therefore see a `git_log` pane as a candidate.
-    /// When both tools' panes are live the ambiguity guard in
-    /// `crate::tmux::resolve_session_name` keeps the derived name, so the only
-    /// exposure is a retitled session where the extension-named tool's pane is
-    /// live and the shorter one's is not. Resolution is skipped entirely rather
-    /// than guessing whenever more than one candidate matches.
+    /// Transport name only; lifecycle operations require verified snapshot ownership.
     pub fn new(session_id: &str, session_title: &str, tool_name: &str) -> Self {
         Self::from_resolution(session_id, session_title, tool_name, false)
     }
@@ -49,22 +35,97 @@ impl ToolSession {
         tool_name: &str,
         display_only: bool,
     ) -> Self {
-        // The tool name sits in the prefix, so it discriminates between a
-        // session's several tool sub-sessions without reference to the title.
+        let name = Self::with_name_shape(session_id, session_title, tool_name, |derived, shape| {
+            if display_only {
+                crate::tmux::session_name_for_display(&derived, shape)
+            } else {
+                crate::tmux::live_session_name(&derived, shape)
+            }
+        });
+        Self { name }
+    }
+
+    fn with_name_shape<R>(
+        session_id: &str,
+        session_title: &str,
+        tool_name: &str,
+        resolve: impl FnOnce(String, &crate::tmux::NameShape<'_>) -> R,
+    ) -> R {
         let prefix = Self::name_prefix(tool_name);
         let suffix = format!("_{}", truncate_id(session_id, 8));
         let derived = Self::generate_name(session_id, session_title, tool_name);
-        let shape = crate::tmux::NameShape {
-            prefix: &prefix,
-            suffix: &suffix,
-            kind: crate::tmux::SessionKind::Tool,
-        };
-        let name = if display_only {
-            crate::tmux::session_name_for_display(&derived, &shape)
-        } else {
-            crate::tmux::live_session_name(&derived, &shape)
-        };
-        Self { name }
+        resolve(
+            derived,
+            &crate::tmux::NameShape {
+                prefix: &prefix,
+                suffix: &suffix,
+                kind: crate::tmux::SessionKind::Tool,
+            },
+        )
+    }
+
+    fn resolve_snapshot<'a>(
+        id: &str,
+        title: &str,
+        tool_name: &str,
+        panes: &'a std::collections::HashMap<String, crate::tmux::PaneMetadata>,
+    ) -> Result<(
+        std::borrow::Cow<'a, str>,
+        Option<&'a crate::tmux::PaneMetadata>,
+    )> {
+        use crate::tmux::ToolPaneOwner;
+        let owns = |metadata: &crate::tmux::PaneMetadata| matches!(&metadata.tool_owner, ToolPaneOwner::Named { instance_id, tool_name: owner } if instance_id == id && owner == tool_name);
+        Self::with_name_shape(id, title, tool_name, |derived, shape| {
+            if let Some((name, metadata)) = panes
+                .get_key_value(&derived)
+                .filter(|(_, metadata)| owns(metadata))
+            {
+                return Ok((std::borrow::Cow::Borrowed(name.as_str()), Some(metadata)));
+            }
+            let mut found = None;
+            for (name, metadata) in panes.iter().filter(|(name, _)| shape.matches(name)) {
+                match &metadata.tool_owner {
+                    ToolPaneOwner::Unmarked | ToolPaneOwner::Invalid => {
+                        bail!("Tool session ownership is unavailable")
+                    }
+                    ToolPaneOwner::Named { .. } if owns(metadata) => {
+                        anyhow::ensure!(found.is_none(), "Tool session ownership is ambiguous");
+                        found = Some((name, metadata));
+                    }
+                    ToolPaneOwner::Named { .. } => {}
+                }
+            }
+            if let Some((name, metadata)) = found {
+                return Ok((std::borrow::Cow::Borrowed(name.as_str()), Some(metadata)));
+            }
+            anyhow::ensure!(
+                !panes.contains_key(&derived),
+                "Tool session name belongs to another owner"
+            );
+            Ok((std::borrow::Cow::Owned(derived), None))
+        })
+    }
+
+    pub(crate) fn metadata_in<'a>(
+        id: &str,
+        title: &str,
+        tool_name: &str,
+        panes: &'a std::collections::HashMap<String, crate::tmux::PaneMetadata>,
+    ) -> Result<Option<(std::borrow::Cow<'a, str>, &'a crate::tmux::PaneMetadata)>> {
+        let (name, metadata) = Self::resolve_snapshot(id, title, tool_name, panes)?;
+        Ok(metadata.map(|metadata| (name, metadata)))
+    }
+
+    pub(crate) fn from_snapshot(
+        id: &str,
+        title: &str,
+        tool_name: &str,
+        panes: &std::collections::HashMap<String, crate::tmux::PaneMetadata>,
+    ) -> Result<Self> {
+        let (name, _) = Self::resolve_snapshot(id, title, tool_name, panes)?;
+        Ok(Self {
+            name: name.into_owned(),
+        })
     }
 
     /// Purely derive the sub-session name, with no reference to what is live.
@@ -101,10 +162,9 @@ impl ToolSession {
         command: &str,
         size: Option<(u16, u16)>,
         profile: &str,
+        instance_id: &str,
+        tool_name: &str,
     ) -> Result<()> {
-        if self.exists() {
-            return Ok(());
-        }
         let config = crate::tmux::tmux_option_config(profile);
 
         let mut args = vec![
@@ -125,24 +185,25 @@ impl ToolSession {
 
         args.push(command.to_string());
 
-        append_remain_on_exit_args(&mut args, &self.name);
-        append_pane_base_index_args(&mut args, &self.name);
-        append_window_size_args(&mut args, &self.name);
-        append_tmux_setting_args(&mut args, &self.name, &config);
-        crate::tmux::append_session_kind_args(
-            &mut args,
-            &self.name,
-            crate::tmux::SessionKind::Tool,
-        );
+        let target = format!("={}:", self.name);
+        append_remain_on_exit_args(&mut args, &target);
+        append_pane_base_index_args(&mut args, &target);
+        append_window_size_args(&mut args, &target);
+        append_tmux_setting_args(&mut args, &target, &config);
+        args.extend([
+            ";".into(),
+            "set-option".into(),
+            "-t".into(),
+            target.clone(),
+            "@aoe_tool_owner".into(),
+            serde_json::to_string(&(instance_id, tool_name))?,
+        ]);
+        crate::tmux::append_session_kind_args(&mut args, &target, crate::tmux::SessionKind::Tool);
 
         let output = crate::tmux::tmux_command().args(&args).output()?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            if stderr.contains("duplicate session") {
-                refresh_session_cache();
-                return Ok(());
-            }
             bail!("Failed to create tool session '{}': {}", self.name, stderr);
         }
 
@@ -151,10 +212,6 @@ impl ToolSession {
     }
 
     pub fn kill(&self) -> Result<()> {
-        if !self.exists() {
-            return Ok(());
-        }
-
         if let Some(pane_pid) = self.get_pane_pid() {
             process::kill_process_tree(pane_pid);
         }
@@ -194,35 +251,7 @@ impl ToolSession {
     }
 
     pub fn attach(&self) -> Result<()> {
-        if !self.exists() {
-            bail!("Tool session does not exist: {}", self.name);
-        }
-
-        if crate::tmux::utils::inside_tmux() {
-            let status = crate::tmux::tmux_command()
-                .args(["switch-client", "-t", &self.name])
-                .status()?;
-
-            if !status.success() {
-                let status = crate::tmux::tmux_command()
-                    .args(["attach-session", "-t", &self.name])
-                    .status()?;
-
-                if !status.success() {
-                    bail!("Failed to attach to tool session '{}'", self.name);
-                }
-            }
-        } else {
-            let status = crate::tmux::tmux_command()
-                .args(["attach-session", "-t", &self.name])
-                .status()?;
-
-            if !status.success() {
-                bail!("Failed to attach to tool session '{}'", self.name);
-            }
-        }
-
-        Ok(())
+        super::Session::from_name(&self.name).attach()
     }
 
     pub fn capture_pane(&self, lines: usize) -> Result<String> {
@@ -234,35 +263,6 @@ impl ToolSession {
     }
 }
 
-/// Kill all tool sessions associated with a given agent session ID.
-/// Uses tmux list-sessions to find matches by ID suffix, so it works
-/// even if tools have been removed from the config since creation.
-pub fn kill_all_tool_sessions_for_id(session_id: &str) {
-    let id_suffix = format!("_{}", truncate_id(session_id, 8));
-
-    let output = crate::tmux::tmux_query_command()
-        .args(["list-sessions", "-F", "#{session_name}"])
-        .output();
-
-    if let Ok(out) = output {
-        if out.status.success() {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            for line in stdout.lines() {
-                if line.starts_with(TOOL_PREFIX) && line.ends_with(&id_suffix) {
-                    if let Some(pid) = process::get_pane_pid(line) {
-                        process::kill_process_tree(pid);
-                    }
-                    let _ = crate::tmux::tmux_command()
-                        .args(["kill-session", "-t", line])
-                        .output();
-                }
-            }
-        }
-    }
-
-    refresh_session_cache();
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::TmuxTestSession;
@@ -270,6 +270,54 @@ mod tests {
 
     /// A session id long enough that `truncate_id(.., 8)` truncates.
     const ID: &str = "abc12345deadbeef";
+
+    #[test]
+    fn snapshot_resolution_rejects_other_tool_ownership_but_keeps_retitles() {
+        let sibling = ToolSession::generate_name(ID, "T", "git_log");
+        let mut panes = std::collections::HashMap::from([(
+            sibling.clone(),
+            crate::tmux::PaneMetadata {
+                tool_owner: crate::tmux::ToolPaneOwner::Unmarked,
+                pane_dead: false,
+                pane_current_command: None,
+                pane_start_command_is_protected: false,
+                pane_pid: None,
+                pane_title: None,
+                window_activity: None,
+                window_size: None,
+            },
+        )]);
+        assert!(ToolSession::from_snapshot(ID, "T", "git", &panes).is_err());
+        assert!(ToolSession::metadata_in(ID, "T", "git_log", &panes).is_err());
+        panes.get_mut(&sibling).unwrap().tool_owner = crate::tmux::ToolPaneOwner::Named {
+            instance_id: ID.into(),
+            tool_name: "git_log".into(),
+        };
+        assert!(ToolSession::metadata_in(ID, "T", "git", &panes)
+            .unwrap()
+            .is_none());
+        assert!(ToolSession::from_snapshot(ID, "log_T", "git", &panes).is_err());
+        assert!(ToolSession::from_snapshot("abc12345different", "T", "git_log", &panes).is_err());
+        assert_eq!(
+            ToolSession::from_snapshot(ID, "T", "git_log", &panes)
+                .unwrap()
+                .session_name(),
+            sibling
+        );
+        let mut metadata = panes.remove(&sibling).unwrap();
+        metadata.tool_owner = crate::tmux::ToolPaneOwner::Named {
+            instance_id: ID.into(),
+            tool_name: "yazi".into(),
+        };
+        let old_name = ToolSession::generate_name(ID, "Old title", "yazi");
+        panes.insert(old_name.clone(), metadata);
+        assert_eq!(
+            ToolSession::from_snapshot(ID, "New title", "yazi", &panes)
+                .unwrap()
+                .session_name(),
+            old_name
+        );
+    }
 
     #[test]
     #[serial_test::serial]
@@ -350,6 +398,8 @@ mod tests {
             "sh -c 'echo boom; exit 1'",
             Some((80, 24)),
             "default",
+            ID,
+            "dead",
         )
         .expect("create_with_size");
 
@@ -370,30 +420,68 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn wait_until_ready_ok_when_pane_stays_alive() {
+    fn creation_owns_the_tool_not_the_inherited_tmux_context() {
         if !tmux_available() {
-            eprintln!("Skipping test: tmux not available");
             return;
         }
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let guard = TmuxTestSession::new("aoe_test_tool_alive");
+        let dir = tempfile::tempdir().unwrap();
+        let ui = TmuxTestSession::new("aoe_test_tool_context");
+        let output = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                ui.name(),
+                "-P",
+                "-F",
+                "#{socket_path},#{pid},#{session_id}\t#{pane_id}",
+                "sleep 30",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let context = String::from_utf8(output.stdout).unwrap();
+        let (context, pane) = context.trim().split_once('\t').unwrap();
+        let context = context.replace(",$", ",");
+        let guard =
+            TmuxTestSession::from_name(ToolSession::generate_name(ID, ui.name(), "context"));
         let tool = ToolSession {
-            name: guard.name().to_string(),
+            name: guard.name().into(),
         };
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("TMUX", context.as_str()),
+            ("TMUX_PANE", pane),
+        ]);
         tool.create_with_size(
-            dir.path().to_str().expect("utf8 path"),
-            "sleep 5",
+            dir.path().to_str().unwrap(),
+            "sleep 30",
             Some((80, 24)),
             "default",
+            ID,
+            "context",
         )
-        .expect("create_with_size");
-
-        let result = tool.wait_until_ready();
-
+        .unwrap();
+        let panes = crate::tmux::batch_pane_metadata().unwrap();
+        let resolved = ToolSession::from_snapshot(ID, "retitled", "context", &panes).unwrap();
+        assert_eq!(resolved.session_name(), tool.session_name());
+        let ui_owner = crate::tmux::tmux_command()
+            .args([
+                "show-options",
+                "-qv",
+                "-t",
+                &format!("={}:", ui.name()),
+                "@aoe_tool_owner",
+            ])
+            .output()
+            .unwrap();
+        assert!(ui_owner.status.success());
         assert!(
-            result.is_ok(),
-            "wait_until_ready should succeed for a still-running pane, got: {result:?}"
+            ui_owner.stdout.is_empty(),
+            "creation changed the inherited session owner"
         );
     }
 

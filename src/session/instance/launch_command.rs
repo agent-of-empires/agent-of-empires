@@ -365,11 +365,18 @@ impl Instance {
         }
     }
 
-    pub(super) fn prepare_launch_command(&mut self) -> Result<PreparedLaunch> {
+    pub(super) fn prepare_launch_command(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+    ) -> Result<PreparedLaunch> {
+        if let Some(path) = self.published_pi_session_path_update() {
+            self.store_pi_session_path(storage, path)?;
+        }
         let expected_prior_sid = self.agent_session_id.clone();
         let expected_prior_intent = self.resume_intent.clone();
         let expected_prior_omp_generation = self.omp_capture_generation.clone();
-        let (command, is_existing, omp_capture_plan, launch_env) = self.build_launch_command()?;
+        let (command, is_existing, omp_capture_plan, launch_env) =
+            self.build_launch_command(CaptureStorage::Scoped(storage))?;
         Ok(PreparedLaunch {
             command,
             is_existing,
@@ -385,15 +392,16 @@ impl Instance {
     pub(super) fn refresh_prepared_prime_launch_after_pane_stop(
         &mut self,
         mut prepared: PreparedLaunch,
+        stores: CaptureStorage<'_>,
     ) -> Result<PreparedLaunch> {
-        if self.absorb_published_prime_session() {
+        if self.absorb_published_prime_session(stores) {
             // Refresh launch data without changing the durable CAS baseline.
             (
                 prepared.command,
                 prepared.is_existing,
                 prepared.omp_capture_plan,
                 prepared.launch_env,
-            ) = self.build_launch_command()?;
+            ) = self.build_launch_command(stores)?;
         }
         Ok(prepared)
     }
@@ -401,23 +409,37 @@ impl Instance {
     /// Construct the command only after hook execution has completed. Keeping
     /// this phase hook-free prevents a revalidation retry from replaying user
     /// code while the lifecycle lock is held.
-    pub(super) fn build_launch_command(&mut self) -> Result<LaunchCommandParts> {
+    pub(super) fn build_launch_command(
+        &mut self,
+        stores: CaptureStorage<'_>,
+    ) -> Result<LaunchCommandParts> {
         if self.tool == "omp" && !self.has_command_override() {
             reject_omp_secret_args(&crate::session::config::quote_model_value_in_args(
                 &self.extra_args,
             ))?;
         }
-        let agent = self.resolved_agent();
-        let detect_as = self.effective_detect_as().into_owned();
+        let launch_config = stores.launch_configuration(
+            &self.effective_profile(),
+            std::path::Path::new(&self.project_path),
+        )?;
+        let global_config = &launch_config.global;
+        let profile_config = &launch_config.profile;
+        let agent = self.resolved_agent_in(&profile_config.session);
+        let detect_as = self
+            .effective_detect_as_in(&profile_config.session)
+            .to_owned();
 
         let (cmd, is_existing, omp_capture_plan, launch_env) = if self.is_sandboxed() {
-            let image = self
+            let image = &self
                 .sandbox_info
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("sandbox_info missing for sandboxed instance"))?
-                .image
-                .clone();
-            let container = DockerContainer::new(&self.id, &image);
+                .image;
+            let container = DockerContainer::new(
+                &self.id,
+                image,
+                global_config.sandbox.container_runtime.into(),
+            );
 
             // Snapshot only after container hooks have had their final chance
             // to mutate OMP dotenv/config routing, but before any executable
@@ -471,14 +493,14 @@ impl Instance {
             }
 
             let extension_backend = self.resolved_capture_backend();
-            let identity_extension = self.identity_extension_launch();
+            let identity_extension = self.identity_extension_launch(&launch_config);
             let extension_configured = identity_extension.is_some();
             self.pi_extension_launched = extension_configured
                 && extension_backend == Some(crate::agents::SessionCaptureBackend::Pi);
             if let Some((ref flag, _)) = identity_extension {
                 tool_cmd.push_str(flag);
             }
-            let is_existing = self.apply_session_flags(&mut tool_cmd, "sandboxed")?;
+            let is_existing = self.apply_session_flags(&mut tool_cmd, "sandboxed", stores)?;
             apply_agent_launch_env(&mut tool_cmd, agent);
 
             let sandbox = self
@@ -488,13 +510,12 @@ impl Instance {
             let managed_codex_home = container_config::managed_codex_home(
                 &self.tool,
                 Some(detect_as.as_str()),
-                &self.source_profile,
+                &profile_config.session,
                 &self.id,
             )?;
             let mut env_info = build_docker_env_args_with_managed_codex_home(
-                &self.source_profile,
+                launch_config.sandbox(),
                 sandbox,
-                std::path::Path::new(&self.project_path),
                 managed_codex_home.as_deref(),
             );
             let profile = self.effective_profile();
@@ -558,7 +579,7 @@ impl Instance {
                 },
             )
         } else {
-            let result = self.build_host_command(agent)?;
+            let result = self.build_host_command(agent, stores, &launch_config)?;
             let mut env = crate::session::environment::resolve_host_environment_pairs(
                 &self.profile_host_environment(),
             )
@@ -601,15 +622,18 @@ impl Instance {
     fn build_host_command(
         &mut self,
         agent: Option<&'static crate::agents::AgentDef>,
+        stores: CaptureStorage<'_>,
+        config: &crate::session::LaunchConfig,
     ) -> Result<(Option<String>, bool, Option<OmpCapturePlan>)> {
-        let identity_extension = self.identity_extension_launch();
-        self.build_host_command_with_identity_extension(agent, identity_extension)
+        let identity_extension = self.identity_extension_launch(config);
+        self.build_host_command_with_identity_extension(agent, identity_extension, stores)
     }
 
     fn build_host_command_with_identity_extension(
         &mut self,
         agent: Option<&'static crate::agents::AgentDef>,
         identity_extension: Option<(String, String)>,
+        stores: CaptureStorage<'_>,
     ) -> Result<(Option<String>, bool, Option<OmpCapturePlan>)> {
         // Resolve after `on_launch`. The snapshot is checked inside the
         // profile environment assignment scope executed by the login shell;
@@ -652,7 +676,7 @@ impl Instance {
                             apply_yolo_mode(&mut cmd, yolo, false);
                         }
                     }
-                    let is_existing = self.apply_session_flags(&mut cmd, "host agent")?;
+                    let is_existing = self.apply_session_flags(&mut cmd, "host agent", stores)?;
                     apply_agent_launch_env(&mut cmd, agent);
                     let raw_command = format!("{}{}", env_prefix, cmd);
                     let command = if let Some(plan) = omp_capture_plan.as_ref() {
@@ -682,7 +706,7 @@ impl Instance {
                     apply_yolo_mode(&mut cmd, yolo, false);
                 }
             }
-            let is_existing = self.apply_session_flags(&mut cmd, "host custom")?;
+            let is_existing = self.apply_session_flags(&mut cmd, "host custom", stores)?;
             apply_agent_launch_env(&mut cmd, agent);
             let raw_command = format!("{}{}", env_prefix, cmd);
             let command = if let Some(plan) = omp_capture_plan.as_ref() {
@@ -701,7 +725,31 @@ impl Instance {
 }
 
 #[cfg(test)]
+impl Instance {
+    /// Test-only `prepare_launch_command` without a store: the prime-agent
+    /// session-id tests only need the command line, never the pi sidecar path.
+    pub(super) fn prepare_launch_command_for_test(&mut self) -> Result<PreparedLaunch> {
+        let expected_prior_sid = self.agent_session_id.clone();
+        let expected_prior_intent = self.resume_intent.clone();
+        let expected_prior_omp_generation = self.omp_capture_generation.clone();
+        let (command, is_existing, omp_capture_plan, launch_env) = self.build_launch_command(
+            CaptureStorage::Profiles(&crate::file_watch::FileWatchService::noop()),
+        )?;
+        Ok(PreparedLaunch {
+            command,
+            is_existing,
+            omp_capture_plan,
+            launch_env,
+            expected_prior_sid,
+            expected_prior_intent,
+            expected_prior_omp_generation,
+        })
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use super::*;
 
     // The sidecar env var has to survive into the docker argv, not just be
     // computed: nothing in CI runs a container to catch it going missing.
@@ -728,7 +776,9 @@ mod tests {
         });
 
         let (cmd, _, _, _) = inst
-            .build_launch_command()
+            .build_launch_command(CaptureStorage::Profiles(
+                &crate::file_watch::FileWatchService::noop(),
+            ))
             .expect("a sandboxed launch line");
         let cmd = cmd.expect("a command");
         assert!(
@@ -776,7 +826,10 @@ mod tests {
         });
 
         let (flag, env) = inst
-            .identity_extension_launch()
+            .identity_extension_launch(&crate::session::storage::local_launch_configuration(
+                &inst.effective_profile(),
+                std::path::Path::new(&inst.project_path),
+            ))
             .expect("sandboxed pi publishes");
         assert!(flag.is_empty(), "no `-e` may reach a container launch");
         assert_eq!(
@@ -806,6 +859,7 @@ mod tests {
                     " -e '/tmp/pi-aoe-session-id.js'".to_string(),
                     "AOE_SESSION_ID_FILE='/tmp/pi-session-id' ".to_string(),
                 )),
+                CaptureStorage::Profiles(&crate::file_watch::FileWatchService::noop()),
             )
             .unwrap();
         let command = command.unwrap();
@@ -827,8 +881,21 @@ mod tests {
         inst.command = "echo not-pi".to_string();
         let agent = inst.resolved_agent();
 
-        assert!(inst.identity_extension_launch().is_none());
-        let (command, _, _) = inst.build_host_command(agent).unwrap();
+        let config = crate::session::storage::local_launch_configuration(
+            &inst.effective_profile(),
+            std::path::Path::new(&inst.project_path),
+        );
+        assert!(inst.identity_extension_launch(&config).is_none());
+        let (command, _, _) = inst
+            .build_host_command(
+                agent,
+                CaptureStorage::Profiles(&crate::file_watch::FileWatchService::noop()),
+                &crate::session::storage::local_launch_configuration(
+                    &inst.effective_profile(),
+                    std::path::Path::new(&inst.project_path),
+                ),
+            )
+            .unwrap();
         let command = command.unwrap();
 
         assert!(!command.contains("pi-aoe-session-id.js"));
@@ -846,14 +913,21 @@ mod tests {
         inst.extra_args = "--".to_string();
         let agent = inst.resolved_agent();
 
-        let (command, _, _) = inst.build_host_command(agent).unwrap();
+        let (command, _, _) = inst
+            .build_host_command(
+                agent,
+                CaptureStorage::Profiles(&crate::file_watch::FileWatchService::noop()),
+                &crate::session::storage::local_launch_configuration(
+                    &inst.effective_profile(),
+                    std::path::Path::new(&inst.project_path),
+                ),
+            )
+            .unwrap();
         let command = command.unwrap();
 
         assert!(!command.contains(" -e "), "extension follows --: {command}");
         assert!(!inst.pi_extension_launched);
     }
-
-    use super::*;
 
     use crate::session::test_support::EnvGuard;
 
@@ -1141,7 +1215,12 @@ mod tests {
             from: "parent-1234".to_string(),
         };
         let mut cmd = "codex --some-flag".to_string();
-        inst.apply_session_flags(&mut cmd, "test").unwrap();
+        inst.apply_session_flags(
+            &mut cmd,
+            "test",
+            CaptureStorage::Profiles(&crate::file_watch::FileWatchService::noop()),
+        )
+        .unwrap();
         assert_eq!(cmd, "codex fork parent-1234 --some-flag");
     }
 
@@ -1187,7 +1266,12 @@ mod tests {
             let mut cmd = command.to_string();
 
             assert!(
-                inst.apply_session_flags(&mut cmd, "test").unwrap(),
+                inst.apply_session_flags(
+                    &mut cmd,
+                    "test",
+                    CaptureStorage::Profiles(&crate::file_watch::FileWatchService::noop())
+                )
+                .unwrap(),
                 "{name}"
             );
             assert_eq!(cmd, expected, "{name}");
@@ -1209,7 +1293,13 @@ mod tests {
         wrapper.resume_intent = ResumeIntent::Use("SID".to_string());
         let mut cmd = wrapper.command.clone();
 
-        assert!(wrapper.apply_session_flags(&mut cmd, "test").unwrap());
+        assert!(wrapper
+            .apply_session_flags(
+                &mut cmd,
+                "test",
+                CaptureStorage::Profiles(&crate::file_watch::FileWatchService::noop())
+            )
+            .unwrap());
         assert_eq!(cmd, "codex-personal resume SID");
 
         // A launcher still hides the binary, so the token would reach `ssh`.
@@ -1222,7 +1312,11 @@ mod tests {
         let mut launcher_cmd = launcher.command.clone();
 
         assert!(!launcher
-            .apply_session_flags(&mut launcher_cmd, "test")
+            .apply_session_flags(
+                &mut launcher_cmd,
+                "test",
+                CaptureStorage::Profiles(&crate::file_watch::FileWatchService::noop())
+            )
             .unwrap());
         assert_eq!(launcher_cmd, "ssh -t host codex");
     }
@@ -1236,7 +1330,12 @@ mod tests {
             from: "parent-9999".to_string(),
         };
         let mut cmd = "opencode".to_string();
-        inst.apply_session_flags(&mut cmd, "test").unwrap();
+        inst.apply_session_flags(
+            &mut cmd,
+            "test",
+            CaptureStorage::Profiles(&crate::file_watch::FileWatchService::noop()),
+        )
+        .unwrap();
         assert_eq!(cmd, "opencode --session parent-9999 --fork");
     }
 
@@ -1336,7 +1435,14 @@ mod tests {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "codex".to_string();
         let (cmd, _, _) = inst
-            .build_host_command(crate::agents::get_agent("codex"))
+            .build_host_command(
+                crate::agents::get_agent("codex"),
+                CaptureStorage::Profiles(&crate::file_watch::FileWatchService::noop()),
+                &crate::session::storage::local_launch_configuration(
+                    &inst.effective_profile(),
+                    std::path::Path::new(&inst.project_path),
+                ),
+            )
             .unwrap();
         assert!(cmd.is_some());
         assert!(cmd.as_ref().unwrap().contains("codex"));
@@ -1348,7 +1454,14 @@ mod tests {
         inst.tool = "codex".to_string();
         inst.yolo_mode = true;
         let (cmd, _, _) = inst
-            .build_host_command(crate::agents::get_agent("codex"))
+            .build_host_command(
+                crate::agents::get_agent("codex"),
+                CaptureStorage::Profiles(&crate::file_watch::FileWatchService::noop()),
+                &crate::session::storage::local_launch_configuration(
+                    &inst.effective_profile(),
+                    std::path::Path::new(&inst.project_path),
+                ),
+            )
             .unwrap();
         let cmd_str = cmd.unwrap();
         let agent = crate::agents::get_agent("codex").unwrap();
@@ -1365,7 +1478,14 @@ mod tests {
         inst.tool = "claude".to_string();
         inst.agent_session_id = Some("ses_abc123def456".to_string());
         let (cmd, _, _) = inst
-            .build_host_command(crate::agents::get_agent("claude"))
+            .build_host_command(
+                crate::agents::get_agent("claude"),
+                CaptureStorage::Profiles(&crate::file_watch::FileWatchService::noop()),
+                &crate::session::storage::local_launch_configuration(
+                    &inst.effective_profile(),
+                    std::path::Path::new(&inst.project_path),
+                ),
+            )
             .unwrap();
         let cmd_str = cmd.unwrap();
         assert!(cmd_str.contains("ses_abc123def456"));
@@ -1377,7 +1497,14 @@ mod tests {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "antigravity".to_string();
         let (cmd, _, _) = inst
-            .build_host_command(crate::agents::get_agent("antigravity"))
+            .build_host_command(
+                crate::agents::get_agent("antigravity"),
+                CaptureStorage::Profiles(&crate::file_watch::FileWatchService::noop()),
+                &crate::session::storage::local_launch_configuration(
+                    &inst.effective_profile(),
+                    std::path::Path::new(&inst.project_path),
+                ),
+            )
             .unwrap();
         let cmd_str = cmd.unwrap();
 
@@ -1394,7 +1521,14 @@ mod tests {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "kiro".to_string();
         let (cmd, _, _) = inst
-            .build_host_command(crate::agents::get_agent("kiro"))
+            .build_host_command(
+                crate::agents::get_agent("kiro"),
+                CaptureStorage::Profiles(&crate::file_watch::FileWatchService::noop()),
+                &crate::session::storage::local_launch_configuration(
+                    &inst.effective_profile(),
+                    std::path::Path::new(&inst.project_path),
+                ),
+            )
             .unwrap();
         assert!(cmd.unwrap().contains("kiro-cli chat"));
     }
@@ -1406,7 +1540,14 @@ mod tests {
         inst.tool = "kiro".to_string();
         inst.yolo_mode = true;
         let (cmd, _, _) = inst
-            .build_host_command(crate::agents::get_agent("kiro"))
+            .build_host_command(
+                crate::agents::get_agent("kiro"),
+                CaptureStorage::Profiles(&crate::file_watch::FileWatchService::noop()),
+                &crate::session::storage::local_launch_configuration(
+                    &inst.effective_profile(),
+                    std::path::Path::new(&inst.project_path),
+                ),
+            )
             .unwrap();
         let cmd_str = cmd.unwrap();
         let chat_pos = cmd_str
@@ -1430,7 +1571,14 @@ mod tests {
         inst.tool = "kiro".to_string();
         inst.command = "kiro-cli chat --trust-all-tools".to_string();
         let (cmd, _, _) = inst
-            .build_host_command(crate::agents::get_agent("kiro"))
+            .build_host_command(
+                crate::agents::get_agent("kiro"),
+                CaptureStorage::Profiles(&crate::file_watch::FileWatchService::noop()),
+                &crate::session::storage::local_launch_configuration(
+                    &inst.effective_profile(),
+                    std::path::Path::new(&inst.project_path),
+                ),
+            )
             .unwrap();
         let cmd_str = cmd.unwrap();
         // Exactly one "chat" token (no doubled `chat chat`).
@@ -1478,7 +1626,14 @@ mod tests {
         inst.tool = "antigravity".to_string();
         inst.command = "agy --some-flag".to_string();
         let (cmd, _, _) = inst
-            .build_host_command(crate::agents::get_agent("antigravity"))
+            .build_host_command(
+                crate::agents::get_agent("antigravity"),
+                CaptureStorage::Profiles(&crate::file_watch::FileWatchService::noop()),
+                &crate::session::storage::local_launch_configuration(
+                    &inst.effective_profile(),
+                    std::path::Path::new(&inst.project_path),
+                ),
+            )
             .unwrap();
         let cmd_str = cmd.unwrap();
 
@@ -1493,7 +1648,14 @@ mod tests {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "codex".to_string();
         let (cmd, _, _) = inst
-            .build_host_command(crate::agents::get_agent("codex"))
+            .build_host_command(
+                crate::agents::get_agent("codex"),
+                CaptureStorage::Profiles(&crate::file_watch::FileWatchService::noop()),
+                &crate::session::storage::local_launch_configuration(
+                    &inst.effective_profile(),
+                    std::path::Path::new(&inst.project_path),
+                ),
+            )
             .unwrap();
         let cmd_str = cmd.unwrap();
 
@@ -1508,7 +1670,14 @@ mod tests {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "cursor".to_string();
         let (cmd, _, _) = inst
-            .build_host_command(crate::agents::get_agent("cursor"))
+            .build_host_command(
+                crate::agents::get_agent("cursor"),
+                CaptureStorage::Profiles(&crate::file_watch::FileWatchService::noop()),
+                &crate::session::storage::local_launch_configuration(
+                    &inst.effective_profile(),
+                    std::path::Path::new(&inst.project_path),
+                ),
+            )
             .unwrap();
         let cmd_str = cmd.unwrap();
 

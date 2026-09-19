@@ -101,7 +101,13 @@ fn status_left_format(prefix: &str, accent: &str, fg: &str, hint: &str) -> Strin
 /// Remove a session-scoped option override so the global value applies.
 fn set_session_option_unset(session_name: &str, option: &str) -> Result<()> {
     let output = crate::tmux::tmux_command()
-        .args(["set-option", "-u", "-t", session_name, option])
+        .args([
+            "set-option",
+            "-u",
+            "-t",
+            &format!("={session_name}:"),
+            option,
+        ])
         .output()?;
     if !output.status.success() {
         anyhow::bail!(
@@ -114,11 +120,15 @@ fn set_session_option_unset(session_name: &str, option: &str) -> Result<()> {
 }
 
 fn set_session_option(session_name: &str, option: &str, value: &str) -> Result<()> {
-    // Deadline-bounded like every other tmux call aoe makes: `rekey_session`
-    // reaches this from a rename the TUI and the HTTP handler both wait on, so
-    // a wedged server must not hold the rename open.
+    // Renames wait for this path, so bound the tmux command.
     let mut command = crate::tmux::tmux_command();
-    command.args(["set-option", "-t", session_name, option, value]);
+    command.args([
+        "set-option",
+        "-t",
+        &format!("={session_name}:"),
+        option,
+        value,
+    ]);
     let output = crate::tmux::run_tmux_command_with_timeout(&mut command)?;
 
     if !output.status.success() {
@@ -282,7 +292,13 @@ pub fn get_status_for_current_session() -> Option<String> {
 /// Get a tmux option value for a session.
 fn get_session_option(session_name: &str, option: &str) -> Option<String> {
     let output = crate::tmux::tmux_command()
-        .args(["show-options", "-t", session_name, "-v", option])
+        .args([
+            "show-options",
+            "-t",
+            &format!("={session_name}:"),
+            "-v",
+            option,
+        ])
         .output()
         .ok()?;
 

@@ -11,9 +11,14 @@ import { openWizard } from "./helpers/wizard";
 async function mockApis(page: Page) {
   await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   for (const path of ["settings", "themes", "profiles", "groups", "devices", "about", "system/update-status"]) {
-    await page.route(`**/api/${path}`, (r) =>
+    await page.route(`**/api/${path}*`, (r) =>
       r.fulfill({
-        json: path === "settings" || path === "about" || path === "system/update-status" ? {} : [],
+        json:
+          path === "profiles"
+            ? [{ name: "default", is_default: true }]
+            : path === "settings" || path === "about" || path === "system/update-status"
+              ? {}
+              : [],
       }),
     );
   }

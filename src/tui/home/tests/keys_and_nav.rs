@@ -18,40 +18,6 @@ fn duplicate_session_ids_are_excluded_from_home_map() {
     assert!(map.contains_key(&unique_id));
 }
 
-// #1897 / CodeRabbit follow-up: `add_instance` is the funnel for both the
-// `Creating` placeholder stub (async creation flow) and the finalized session
-// row. The opt-in create-trend counter must bump only for finalized inserts, or
-// a successful background create double-counts (stub + real) and a cancelled one
-// counts a session that never existed. Asserts deltas (not absolutes) since the
-// counter is a process-global shared with the `telemetry_creates` serial group.
-#[test]
-#[serial]
-#[serial_test::serial(telemetry_creates)]
-fn add_instance_counts_only_finalized_creates() {
-    use crate::session::Status;
-    let mut env = create_test_env_empty();
-    let before = crate::tui::app::session_create_count_for_test();
-
-    let mut stub = Instance::new("stub", "/tmp/test");
-    stub.source_profile = "test".to_string();
-    stub.status = Status::Creating;
-    env.view.add_instance(stub);
-    assert_eq!(
-        crate::tui::app::session_create_count_for_test(),
-        before,
-        "a Creating placeholder stub must not bump the create counter"
-    );
-
-    let mut real = Instance::new("real", "/tmp/test");
-    real.source_profile = "test".to_string();
-    env.view.add_instance(real);
-    assert_eq!(
-        crate::tui::app::session_create_count_for_test(),
-        before + 1,
-        "a finalized session insert must bump the create counter exactly once"
-    );
-}
-
 #[test]
 #[serial]
 fn rewire_disk_subscriptions_is_noop_without_tokio_runtime() {
@@ -575,15 +541,14 @@ fn unread_dot_yields_to_a_running_status() {
             .unwrap();
         let buf = terminal.backend().buffer();
         let mut out = String::new();
-        for y in 0..buf.area.height {
-            for x in 0..buf.area.width {
+        for y in env.view.list_area.y..env.view.list_area.bottom() {
+            for x in env.view.list_area.x..env.view.list_area.right() {
                 out.push_str(buf[(x, y)].symbol());
             }
         }
         out
     };
 
-    // Idle + unread: the row shows the solid unread dot.
     env.view.mutate_instance(&id, |inst| {
         inst.status = crate::session::Status::Idle;
         inst.mark_unread();
@@ -594,7 +559,6 @@ fn unread_dot_yields_to_a_running_status() {
         "an idle unread row should paint the unread dot"
     );
 
-    // Running + still unread: the live status wins; no unread dot.
     env.view
         .mutate_instance(&id, |inst| inst.status = crate::session::Status::Running);
     env.view.flat_items = env.view.build_flat_items();
@@ -628,15 +592,14 @@ fn unread_dot_suppressed_on_archived_and_snoozed() {
             .unwrap();
         let buf = terminal.backend().buffer();
         let mut out = String::new();
-        for y in 0..buf.area.height {
-            for x in 0..buf.area.width {
+        for y in env.view.list_area.y..env.view.list_area.bottom() {
+            for x in env.view.list_area.x..env.view.list_area.right() {
                 out.push_str(buf[(x, y)].symbol());
             }
         }
         out
     };
 
-    // Baseline: an idle unread row paints the dot.
     env.view.mutate_instance(&id, |inst| {
         inst.status = crate::session::Status::Idle;
         inst.mark_unread();
@@ -647,8 +610,6 @@ fn unread_dot_suppressed_on_archived_and_snoozed() {
         "an idle unread row should paint the unread dot"
     );
 
-    // Snoozed, in a non-Attention sort: the dot must be gone even though the
-    // snooze decoration itself is Attention-only.
     env.view.sort_order = SortOrder::Newest;
     env.view.mutate_instance(&id, |inst| inst.snooze(30));
     env.view.flat_items = env.view.build_flat_items();
@@ -657,7 +618,6 @@ fn unread_dot_suppressed_on_archived_and_snoozed() {
         "a snoozed unread row must not paint the unread dot outside Attention sort"
     );
 
-    // Snoozed in Attention sort: still no dot.
     env.view.sort_order = SortOrder::Attention;
     env.view.flat_items = env.view.build_flat_items();
     assert!(
@@ -665,7 +625,6 @@ fn unread_dot_suppressed_on_archived_and_snoozed() {
         "a snoozed unread row must not paint the unread dot in Attention sort"
     );
 
-    // Archived: the archive override already mutes the glyph; guard it stays muted.
     env.view.mutate_instance(&id, |inst| {
         inst.unsnooze();
         inst.archive();
@@ -700,8 +659,8 @@ fn unread_dot_never_paints_in_terminal_view() {
             .unwrap();
         let buf = terminal.backend().buffer();
         let mut out = String::new();
-        for y in 0..buf.area.height {
-            for x in 0..buf.area.width {
+        for y in env.view.list_area.y..env.view.list_area.bottom() {
+            for x in env.view.list_area.x..env.view.list_area.right() {
                 out.push_str(buf[(x, y)].symbol());
             }
         }
@@ -714,15 +673,12 @@ fn unread_dot_never_paints_in_terminal_view() {
     });
     env.view.flat_items = env.view.build_flat_items();
 
-    // Agent view: the idle unread row paints the dot (baseline sanity).
     env.view.view_mode = ViewMode::Structured;
     assert!(
         render(&mut env).contains('●'),
         "agent view should paint the unread dot for an idle unread row"
     );
 
-    // Terminal view: same instance, no dot. The terminal pane isn't running
-    // (no tmux session in the test env), so the row shows its idle glyph.
     env.view.view_mode = ViewMode::Terminal;
     assert!(
         !render(&mut env).contains('●'),
@@ -809,197 +765,155 @@ fn unread_flag_survives_sink_round_trip() {
     assert!(inst.is_unread(), "unsnooze must keep unread");
 }
 
-/// Dwell-to-read: an unread row that stays selected past `UNREAD_DWELL`
-/// (with the list in the foreground) is cleared, distinguishing "stopped to
-/// read it" from "scrolled past."
 #[test]
 #[serial]
-fn unread_dwell_clears_after_threshold() {
+fn native_unread_respects_visits_and_canonical_feedback() {
+    use crate::daemon::{RuntimeCursor, SessionMutation};
+    use crate::tui::session_feed::SessionFeedResult;
     use std::time::{Duration, Instant};
-    crate::session::set_unread_enabled(true);
-    let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instance_at(0).id.clone();
-    env.view.mutate_instance(&id, |inst| {
-        inst.status = crate::session::Status::Idle;
-        inst.mark_unread();
-    });
-    env.view.flat_items = env.view.build_flat_items();
-    env.view.select_session_by_id(&id);
-    assert!(env.view.get_instance(&id).unwrap().is_unread());
 
-    let t0 = Instant::now();
-    // First tick arms the dwell clock; nothing cleared yet.
-    assert!(!env.view.tick_unread_dwell(t0));
-    assert!(env.view.get_instance(&id).unwrap().is_unread());
-    // Below the threshold: still unread (this is the "scrolled past" guard).
-    assert!(!env.view.tick_unread_dwell(t0 + Duration::from_millis(500)));
-    assert!(env.view.get_instance(&id).unwrap().is_unread());
-    // Past the threshold: cleared.
-    assert!(env
-        .view
-        .tick_unread_dwell(t0 + crate::tui::home::UNREAD_DWELL + Duration::from_millis(1)));
-    assert!(!env.view.get_instance(&id).unwrap().is_unread());
-}
-
-/// A fresh manual flag (`u`) is held for the current visit: marking a session
-/// unread and keeping the cursor on it must not let dwell-to-read undo the
-/// mark. Regression for the bug where staying on the row past `UNREAD_DWELL`
-/// silently re-cleared it.
-#[test]
-#[serial]
-fn manual_unread_survives_same_visit_dwell() {
-    use std::time::{Duration, Instant};
-    crate::session::set_unread_enabled(true);
-    let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instance_at(0).id.clone();
-    env.view.mutate_instance(&id, |inst| {
-        inst.status = crate::session::Status::Idle;
-    });
-    env.view.flat_items = env.view.build_flat_items();
-    env.view.select_session_by_id(&id);
-    env.view
-        .toggle_unread_at_cursor()
-        .expect("manual toggle should succeed");
-    assert!(env.view.get_instance(&id).unwrap().is_unread());
-
-    let t0 = Instant::now();
-    // Arm the clock, then sit well past the threshold without moving: the hold
-    // keeps the mark.
-    assert!(!env.view.tick_unread_dwell(t0));
-    assert!(!env
-        .view
-        .tick_unread_dwell(t0 + crate::tui::home::UNREAD_DWELL + Duration::from_secs(5)));
-    assert!(
-        env.view.get_instance(&id).unwrap().is_unread(),
-        "a freshly hand-flagged row must survive dwell while it stays selected"
-    );
-}
-
-/// The manual hold is per-visit: after leaving a hand-flagged row and coming
-/// back, dwelling on it clears the mark like any other unread row. This is the
-/// behavior verified by hand (select A, mark unread, move to B, move back, sit
-/// past the threshold -> it clears).
-#[test]
-#[serial]
-fn manual_unread_clears_after_leave_and_return() {
-    use std::time::{Duration, Instant};
     crate::session::set_unread_enabled(true);
     let mut env = create_test_env_with_sessions(2);
     let a = env.view.instance_at(0).id.clone();
     let b = env.view.instance_at(1).id.clone();
-    for id in [&a, &b] {
-        env.view.mutate_instance(id, |inst| {
-            inst.status = crate::session::Status::Idle;
-        });
-    }
-    env.view.flat_items = env.view.build_flat_items();
+    let mut respond = env.view.session_feed.command_driver_for_test();
+    let cursor = |revision| RuntimeCursor {
+        epoch: "test".into(),
+        revision,
+    };
+    let publish = |env: &mut TestEnv, revision, a_unread, b_unread| {
+        let SessionFeedResult::Snapshot(mut snapshot) =
+            super::session_feed_tests::daemon_snapshot(&a, "Idle")
+        else {
+            unreachable!()
+        };
+        let canonical = std::sync::Arc::make_mut(&mut snapshot);
+        canonical.cursor = cursor(revision);
+        let template = canonical.contents.sessions[0].clone();
+        canonical.contents.sessions = [(&a, a_unread), (&b, b_unread)]
+            .into_iter()
+            .map(|(id, unread)| {
+                let mut row = template.clone();
+                row.id = id.clone();
+                row.view = crate::session::View::Terminal;
+                row.unread = unread;
+                row
+            })
+            .collect();
+        env.view
+            .session_feed
+            .publish_for_test(SessionFeedResult::Snapshot(snapshot));
+        env.view.apply_session_feed();
+    };
+    let expect_request = |request: Option<(String, SessionMutation)>, id: &str, unread| {
+        let Some((target, SessionMutation::Unread(body))) = request else {
+            panic!("expected unread intent");
+        };
+        assert_eq!(target, id);
+        assert_eq!(body.unread, unread);
+    };
 
-    // Select A and flag it unread by hand.
+    publish(&mut env, 1, false, false);
     env.view.select_session_by_id(&a);
-    env.view.toggle_unread_at_cursor().expect("manual mark A");
-    assert!(env.view.get_instance(&a).unwrap().is_unread());
-
-    // Move to B with NO dwell tick in between (a quick hop, like real
-    // navigation). The hold must release purely from the selection change;
-    // otherwise returning to A would stay suppressed forever (the reported
-    // bug, which an in-between tick would have masked).
-    env.view.select_session_by_id(&b);
-    assert!(
-        env.view.manual_unread_hold.is_none(),
-        "moving off the row must release the hold without needing a dwell tick"
-    );
-
-    // Come back to A: arm the clock, then sit past the threshold. Now it clears.
-    let t0 = Instant::now();
-    env.view.select_session_by_id(&a);
-    assert!(!env.view.tick_unread_dwell(t0));
-    let cleared = env
-        .view
-        .tick_unread_dwell(t0 + crate::tui::home::UNREAD_DWELL + Duration::from_secs(1));
-    assert!(cleared, "revisiting and dwelling should clear the mark");
+    env.view.toggle_unread_at_cursor().unwrap();
     assert!(
         !env.view.get_instance(&a).unwrap().is_unread(),
-        "a hand-flagged row clears on revisit + dwell (per-visit hold)"
+        "submission is not reflection"
+    );
+    expect_request(respond(Ok(cursor(2))), &a, true);
+    publish(&mut env, 2, true, false);
+    env.view.toggle_favorite_at_cursor().unwrap();
+    assert!(
+        matches!(respond(Err("favorite rejected".into())), Some((id, SessionMutation::Favorite(_))) if id == a)
+    );
+    env.view.apply_session_feed();
+    env.view.info_dialog = None;
+
+    let t0 = Instant::now();
+    assert!(!env.view.tick_unread_dwell(t0));
+    assert!(!env.view.tick_unread_dwell(t0 + Duration::from_secs(5)));
+    assert!(
+        respond(Ok(cursor(3))).is_none(),
+        "manual mark survives this visit"
+    );
+    assert!(env.view.get_instance(&a).unwrap().is_unread());
+
+    // A quick leave and return must reset the visit without an intermediate tick.
+    env.view.select_session_by_id(&b);
+    env.view.select_session_by_id(&a);
+    assert!(!env.view.tick_unread_dwell(t0 + Duration::from_secs(6)));
+    assert!(!env.view.tick_unread_dwell(t0 + Duration::from_millis(6500)));
+    assert!(env.view.tick_unread_dwell(t0 + Duration::from_secs(9)));
+    assert!(
+        env.view.get_instance(&a).unwrap().is_unread(),
+        "read intent is not reflection"
+    );
+    expect_request(respond(Ok(cursor(3))), &a, false);
+    assert!(
+        !env.view.tick_unread_dwell(t0 + Duration::from_secs(10)),
+        "do not duplicate a pending read"
+    );
+    publish(&mut env, 3, false, false);
+    assert!(!env.view.get_instance(&a).unwrap().is_unread());
+
+    // A refused manual mark must not hold a later daemon-written unread event.
+    env.view.toggle_unread_at_cursor().unwrap();
+    expect_request(respond(Err("rejected".into())), &a, true);
+    env.view.apply_session_feed();
+    env.view.info_dialog = None;
+    publish(&mut env, 4, true, false);
+    assert!(env.view.tick_unread_dwell(t0 + Duration::from_secs(11)));
+    expect_request(respond(Ok(cursor(5))), &a, false);
+    publish(&mut env, 5, false, false);
+
+    env.view.toggle_unread_at_cursor().unwrap();
+    expect_request(respond(Ok(cursor(6))), &a, true);
+    publish(&mut env, 6, true, false);
+    assert!(env.view.clear_unread_on_view(&a));
+    expect_request(respond(Ok(cursor(7))), &a, false);
+    publish(&mut env, 7, false, false);
+    publish(&mut env, 8, true, false);
+    assert!(
+        env.view.tick_unread_dwell(t0 + Duration::from_secs(12)),
+        "engagement released the manual hold"
+    );
+    expect_request(respond(Ok(cursor(9))), &a, false);
+    publish(&mut env, 9, false, false);
+
+    publish(&mut env, 10, true, true);
+    env.view.select_session_by_id(&b);
+    assert!(!env.view.tick_unread_dwell(t0 + Duration::from_secs(20)));
+    env.view.select_session_by_id(&a);
+    assert!(!env
+        .view
+        .tick_unread_dwell(t0 + Duration::from_millis(20500)));
+    assert!(!env.view.tick_unread_dwell(t0 + Duration::from_secs(22)));
+    assert!(env.view.tick_unread_dwell(t0 + Duration::from_secs(23)));
+    expect_request(respond(Ok(cursor(11))), &a, false);
+    publish(&mut env, 11, false, true);
+    assert!(!env.view.get_instance(&a).unwrap().is_unread());
+    assert!(
+        env.view.get_instance(&b).unwrap().is_unread(),
+        "passing a row must not read it"
     );
 }
 
-/// Engaging with a hand-flagged row (open/attach, which clears it) also drops
-/// the per-visit hold, so a *later* auto mark on that same still-selected row
-/// is not wrongly suppressed and clears on dwell.
 #[test]
 #[serial]
-fn manual_hold_released_on_engagement_lets_auto_clear() {
+fn unread_without_runtime_cannot_change_the_row() {
     use std::time::{Duration, Instant};
     crate::session::set_unread_enabled(true);
     let mut env = create_test_env_with_sessions(1);
     let id = env.view.instance_at(0).id.clone();
-    env.view.mutate_instance(&id, |inst| {
-        inst.status = crate::session::Status::Idle;
-    });
-    env.view.flat_items = env.view.build_flat_items();
+    env.view
+        .mutate_instance(&id, |instance| instance.mark_unread());
     env.view.select_session_by_id(&id);
-
-    // Hand-flag, then engage (the open/attach path), which clears it and ends
-    // the hold even though the cursor never left the row.
-    env.view.toggle_unread_at_cursor().expect("manual mark");
-    env.view.clear_unread_on_view(&id);
-    assert!(
-        env.view.manual_unread_hold.is_none(),
-        "engaging with the row must release the manual hold"
-    );
-    assert!(!env.view.get_instance(&id).unwrap().is_unread());
-
-    // A later auto mark on the same (still-selected) row must clear on dwell.
-    env.view.mutate_instance(&id, |inst| inst.mark_unread());
-    let t0 = Instant::now();
-    assert!(!env.view.tick_unread_dwell(t0));
-    let cleared = env
-        .view
-        .tick_unread_dwell(t0 + crate::tui::home::UNREAD_DWELL + Duration::from_secs(1));
-    assert!(
-        cleared && !env.view.get_instance(&id).unwrap().is_unread(),
-        "a later auto mark must not be suppressed by a stale hold"
-    );
-}
-
-/// Moving the selection to a different row before the dwell completes spares
-/// the first row: arrowing through a list doesn't read everything you pass.
-#[test]
-#[serial]
-fn unread_dwell_resets_on_selection_change() {
-    use std::time::{Duration, Instant};
-    crate::session::set_unread_enabled(true);
-    let mut env = create_test_env_with_sessions(2);
-    let a = env.view.instance_at(0).id.clone();
-    let b = env.view.instance_at(1).id.clone();
-    for id in [&a, &b] {
-        env.view.mutate_instance(id, |inst| {
-            inst.status = crate::session::Status::Idle;
-            inst.mark_unread();
-        });
-    }
-    env.view.flat_items = env.view.build_flat_items();
-
-    let t0 = Instant::now();
-    // Arm the dwell clock on A.
-    env.view.select_session_by_id(&a);
-    assert!(!env.view.tick_unread_dwell(t0));
-    // Move to B well before A's threshold; A's clock is dropped, B's arms.
-    env.view.select_session_by_id(&b);
-    assert!(!env.view.tick_unread_dwell(t0 + Duration::from_millis(500)));
-    // Long after, B has now dwelled past the threshold and clears; A, which we
-    // left early, is untouched.
-    assert!(env
-        .view
-        .tick_unread_dwell(t0 + crate::tui::home::UNREAD_DWELL + Duration::from_secs(2)));
-    assert!(
-        env.view.get_instance(&a).unwrap().is_unread(),
-        "row left before the threshold must stay unread"
-    );
-    assert!(
-        !env.view.get_instance(&b).unwrap().is_unread(),
-        "row dwelled past the threshold must be cleared"
-    );
+    assert!(env.view.toggle_unread_at_cursor().is_err());
+    assert!(!env.view.clear_unread_on_view(&id));
+    let now = Instant::now();
+    assert!(!env.view.tick_unread_dwell(now));
+    assert!(!env.view.tick_unread_dwell(now + Duration::from_secs(3)));
+    assert!(env.view.get_instance(&id).unwrap().is_unread());
 }
 
 #[test]

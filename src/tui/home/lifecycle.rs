@@ -29,6 +29,7 @@ impl HomeView {
             })?;
         // Unit fixtures do not own background disk healing or agent recovery.
         view.startup_recovery_gate = None;
+        view.sidebar_source = crate::tui::session_feed::SidebarSource::Daemon;
         Ok(view)
     }
 
@@ -152,14 +153,6 @@ impl HomeView {
             DefaultTerminalMode::Container => TerminalMode::Container,
         };
         let sound_config = resolved.sound.clone();
-        let status_hook_configs = Self::load_status_hook_configs(Self::status_hook_profile_names(
-            active_profile.as_deref(),
-            &storages,
-        ));
-        let status_hook_config = status_hook_configs
-            .get(&config_profile)
-            .cloned()
-            .unwrap_or_else(|| resolved.status_hooks.clone());
         let strict_hotkeys = resolved.session.strict_hotkeys;
         let confirm_before_quit = resolved.session.confirm_before_quit;
         let host_tab_title = resolved.session.host_tab_title;
@@ -296,6 +289,7 @@ impl HomeView {
             pending_send_session: None,
             pending_send_target: live_send::LiveSendTarget::Agent,
             pending_live_send_target: live_send::LiveSendTarget::Agent,
+            pending_native_attachment: None,
             live_send: None,
             live_send_worker: None,
             preview_capture_worker: None,
@@ -325,8 +319,7 @@ impl HomeView {
             pending_paste_for_structured_view: HashMap::new(),
             pending_attach_after_warning: None,
             pending_stop_session: None,
-            pending_stop_terminal: None,
-            pending_stop_tool: None,
+            pending_stop_auxiliary: None,
             pending_image_pull: None,
             pending_switch_view_session: None,
             pending_daemon_start_session: None,
@@ -340,8 +333,6 @@ impl HomeView {
             search_matches: Vec::new(),
             search_match_index: 0,
             available_tools,
-            status_poller: StatusPoller::new(),
-            pending_status_refresh: false,
             show_diagnostics: resolved.session.show_diagnostics_pane,
             metrics_poller: crate::tui::metrics_poller::MetricsPoller::new(),
             pending_metrics_refresh: false,
@@ -361,31 +352,23 @@ impl HomeView {
             structured_approval_poller: crate::tui::approval_poller::StructuredApprovalPoller::new(
             ),
             session_feed: crate::tui::session_feed::SessionFeed::new(),
-            pending_session_feed: false,
-            daemon_sidebar: resolved.session.daemon_sidebar,
-            sidebar_source: crate::tui::session_feed::SidebarSource::Storage,
+            sidebar_source: crate::tui::session_feed::SidebarSource::Disconnected,
             deletion_poller: DeletionPoller::new(),
-            stop_poller: StopPoller::new(),
             trash_poller: crate::tui::trash_poller::TrashPoller::new(),
             reconcile_poller: make_reconcile(),
             startup_recovery_gate: None,
             pending_reconcile_reload: false,
             reconcile_reload_retry_at: None,
-            restart_poller: RestartPoller::new(),
             restart_in_flight: std::collections::HashSet::new(),
-            attach_after_restart: std::collections::HashSet::new(),
-            restarted_attaches: Vec::new(),
             store_move_poller: crate::tui::store_move_poller::StoreMovePoller::new(),
             store_move_in_flight: None,
             store_move_bypass: None,
             attach_project_poller: crate::tui::attach_project_poller::AttachProjectPoller::new(),
             attach_project_in_flight: std::collections::HashSet::new(),
-            creation_poller: CreationPoller::new(),
-            creation_cancelled: false,
-            on_launch_hooks_ran: HashSet::new(),
+            pending_creation: None,
             creating_hook_progress: HashMap::new(),
             creating_stub_id: None,
-            creating_provisional_group_paths: HashSet::new(),
+            pending_archive_cursor: None,
             preview_cache: PreviewCache::default(),
             preview_timings: PreviewTimings::default(),
             terminal_preview_cache: PreviewCache::default(),
@@ -409,8 +392,6 @@ impl HomeView {
             terminal_modes: HashMap::new(),
             default_terminal_mode,
             sound_config,
-            status_hook_config,
-            status_hook_configs,
             strict_hotkeys,
             confirm_before_quit,
             host_tab_title,
@@ -613,7 +594,6 @@ impl HomeView {
     /// `sessions.json` / `groups.json`; the config watcher drives
     /// `refresh_from_config` independently.
     pub fn reload(&mut self) -> anyhow::Result<()> {
-        self.refresh_status_hook_config_cache();
         self.reload_storage_only()
     }
 
@@ -731,9 +711,7 @@ impl HomeView {
         let storage_keys: Vec<String> = self.storages.keys().cloned().collect();
         self.group_trees.retain(|k, _| storage_keys.contains(k));
 
-        // Snapshot the in-flight Creating stub before `self.instances` is
-        // overwritten. An intervening save may have persisted it, but while it
-        // is still memory-only it would otherwise vanish across reload.
+        // Preserve the display-only placeholder across a canonical row reload.
         let creating_stub_snapshot: Option<Instance> = self
             .creating_stub_id
             .as_ref()
@@ -743,6 +721,11 @@ impl HomeView {
 
         if let Some(stub) = creating_stub_snapshot {
             self.instances.entry(stub.id.clone()).or_insert(stub);
+        }
+        // The creation in flight is displayed by its placeholder alone; its own
+        // reservation row stays out of the model until the daemon commits.
+        if let Some(id) = self.in_flight_creation_id().map(str::to_owned) {
+            self.instances.shift_remove(&id);
         }
 
         // Refresh the project registry so project view's empty pinned headers

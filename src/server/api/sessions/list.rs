@@ -23,27 +23,15 @@ pub async fn get_recent_projects() -> Json<RecentProjectsResponse> {
     Json(RecentProjectsResponse { projects })
 }
 
-pub async fn list_sessions(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Query(query): axum::extract::Query<ListSessionsQuery>,
-) -> Json<SessionsEnvelope> {
+pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionResponse> {
     let instances = state.instances.read().await;
     let claude_fullscreen = crate::claude_settings::read_tui_fullscreen();
-    // Snapshot the supervisor's worker lifecycle map once per request
-    // rather than locking it per row. See #1088.
     let worker_states = state.acp_supervisor.worker_states_snapshot().await;
-    // Filtered once up front; every positional zip with `instances` below
-    // (ACP capability overlay, smart-rename overlay) must walk this same
-    // filtered view so indices stay aligned with `sessions`.
+    // Every positional overlay shares this filtered view.
     let scoped_instances: Vec<&Instance> = instances
         .iter()
-        // CityHall only ever creates structured sessions; a plain/terminal
-        // session (from the TUI, `aoe add`, or another client on the same
-        // daemon) must not be visible or actionable to a locked-down client, so
-        // it never appears in the list. The lifecycle routes apply the matching
-        // structured-target gate. See #7.
+        // CityHall cannot expose terminal sessions.
         .filter(|inst| !state.cityhall_mode || inst.is_structured())
-        .filter(|inst| crate::session::SessionScope::matches(query.state, inst))
         .collect();
     let mut sessions: Vec<SessionResponse> = scoped_instances
         .iter()
@@ -361,16 +349,48 @@ pub async fn list_sessions(
         }
     }
 
-    let workspace_ordering =
-        merge_workspace_ordering(&sessions, state.read_only).unwrap_or_else(|e| {
-            tracing::error!(target: "http.api.sessions", "Failed to merge workspace ordering: {e}");
-            Vec::new()
-        });
+    sessions
+}
 
-    Json(SessionsEnvelope {
-        sessions,
-        workspace_ordering,
+struct ScopedSessions<'a> {
+    rows: &'a [SessionResponse],
+    scope: Option<crate::session::SessionScope>,
+}
+
+impl serde::Serialize for ScopedSessions<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.rows.iter().filter(|row| {
+            crate::session::SessionScope::matches(
+                self.scope,
+                row.archived_at.is_some(),
+                row.trashed_at.is_some(),
+            )
+        }))
+    }
+}
+
+#[derive(serde::Serialize)]
+struct SessionsView<'a> {
+    sessions: ScopedSessions<'a>,
+    workspace_ordering: &'a [String],
+}
+
+pub async fn list_sessions(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(query): axum::extract::Query<ListSessionsQuery>,
+) -> axum::response::Response {
+    let snapshot = match state.runtime.snapshot(&state).await {
+        Ok(snapshot) => snapshot,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    Json(SessionsView {
+        sessions: ScopedSessions {
+            rows: &snapshot.value.contents.sessions,
+            scope: query.state,
+        },
+        workspace_ordering: &snapshot.value.contents.workspace_ordering,
     })
+    .into_response()
 }
 // Workspace id derivation. Mirrors the client logic in `useWorkspaces.ts`:
 // a session with a branch collapses to `${repoPath}::${branch}`; a
@@ -386,78 +406,37 @@ fn workspace_id_for_session(s: &SessionResponse) -> String {
     }
 }
 
-// Prepend any workspace id we haven't seen before to the persisted
-// ordering and return the merged list. Done server-side so concurrent
-// clients (multiple tabs, multiple devices) converge on a single
-// ordering without each racing to PUT their own prepend. In read-only
-// mode we still compute the merge for the response, but we skip the
-// disk write.
-// Pure helper: merges newly observed workspace ids on top of the
-// existing ordering, deduplicating and putting unknowns first
-// (newest-first). Extracted so the merge math can run from both the
-// read-only path (no lock) and the locked closure (where it operates
-// on `ord.order` directly to avoid the read-modify-write race that
-// `merge_workspace_ordering` originally had on a pre-lock snapshot).
-fn compute_merged_ordering(sessions: &[SessionResponse], current_order: &[String]) -> Vec<String> {
-    let known: std::collections::HashSet<&str> = current_order.iter().map(String::as_str).collect();
-    let mut seen_unknown: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut new_ids: Vec<String> = Vec::new();
-    for s in sessions {
-        let id = workspace_id_for_session(s);
-        if known.contains(id.as_str()) {
-            continue;
-        }
-        if seen_unknown.insert(id.clone()) {
-            new_ids.push(id);
-        }
-    }
-    if new_ids.is_empty() {
-        return current_order.to_vec();
-    }
-    new_ids.reverse();
-    new_ids.extend_from_slice(current_order);
-    new_ids
-}
-
-fn merge_workspace_ordering(
+// Unknown workspaces precede the manual order, newest first.
+pub(crate) fn compute_merged_ordering(
     sessions: &[SessionResponse],
-    read_only: bool,
-) -> anyhow::Result<Vec<String>> {
-    if read_only {
-        let current = crate::session::load_workspace_ordering()
-            .map(|w| w.order)
-            .unwrap_or_default();
-        return Ok(compute_merged_ordering(sessions, &current));
+    current_order: &[String],
+) -> Vec<String> {
+    let known: std::collections::HashSet<&str> = current_order.iter().map(String::as_str).collect();
+    let mut new_ids = indexmap::IndexSet::new();
+    for session in sessions {
+        let id = workspace_id_for_session(session);
+        if !known.contains(id.as_str()) {
+            new_ids.insert(id);
+        }
     }
-    crate::session::update_workspace_ordering(|ord| {
-        let merged = compute_merged_ordering(sessions, &ord.order);
-        ord.order = merged.clone();
-        Ok(merged)
-    })
+    new_ids
+        .into_iter()
+        .rev()
+        .chain(current_order.iter().cloned())
+        .collect()
 }
 
-// --- Workspace ordering ---
-//
-// `PUT /api/workspace-ordering` overwrites the persisted workspace order
-// with a fresh client-supplied list. Workspaces are a client construct
-// (a group of sessions keyed on `repoPath::branch`), so the server
-// treats the entries as opaque strings. New workspaces are folded in
-// server-side by `merge_workspace_ordering` on every `GET /api/sessions`,
-// so the file always covers every observed workspace; this PUT just
-// reorders existing entries. Persisted globally (not per-profile)
-// because the sidebar shows sessions across all profiles. See #1169.
-
-// Caps on the inbound body. The order list is one entry per workspace
-// row and workspaces map 1:1 to sessions in the worst case, so 4096 is
-// comfortably above any realistic ceiling. Per-entry cap covers a
-// long repo path plus a long branch name; ids longer than this can't
-// come from the client's workspace id derivation in any sane setup.
 const MAX_ORDER_ENTRIES: usize = 4096;
 const MAX_ORDER_ENTRY_LEN: usize = 1024;
 
 #[derive(Deserialize)]
 pub struct UpdateWorkspaceOrderingBody {
     pub order: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+struct WorkspaceOrderingResponse<'a> {
+    order: &'a [String],
 }
 
 pub async fn update_workspace_ordering(
@@ -491,24 +470,53 @@ pub async fn update_workspace_ordering(
             .into_response();
     }
 
-    let new_order = body.order;
-    let result = crate::session::update_workspace_ordering(|ord| {
-        ord.order = new_order.clone();
-        Ok(())
-    });
-    if let Err(e) = result {
-        tracing::error!(target: "http.api.sessions", "Failed to persist workspace ordering: {e}");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "message": "Failed to persist ordering" })),
-        )
-            .into_response();
+    let namespace = state.profile_namespace.read().await;
+    let publication = state.publication.write().await;
+    if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({ "order": new_order })),
+    let result = tokio::task::spawn_blocking(move || {
+        crate::session::update_workspace_ordering(move |ordering| {
+            ordering.order = body.order;
+            Ok(())
+        })
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(std::convert::identity);
+    let (_, ordering) = match result {
+        Ok(committed) => committed,
+        Err(error) => {
+            tracing::error!(target: "http.api.sessions", %error, "workspace ordering commit failed");
+            *state.canonical_health.write().await = crate::daemon::RuntimeHealth::Degraded {
+                code: crate::daemon::ReloadFailureCode::Metadata,
+                profiles: Vec::new(),
+            };
+            state.runtime.request_publish();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "message": "Failed to persist ordering" })),
+            )
+                .into_response();
+        }
+    };
+    state.canonical_metadata.write().await.workspace_ordering = ordering.order;
+    state
+        .mutation_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    state.runtime.request_publish();
+    drop(publication);
+    drop(namespace);
+    let snapshot = match state.runtime.publish(&state).await {
+        Ok(snapshot) => snapshot,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    crate::server::runtime::mutation_response(
+        &snapshot.value.cursor,
+        Json(WorkspaceOrderingResponse {
+            order: &snapshot.value.contents.workspace_ordering,
+        }),
     )
-        .into_response()
 }
 
 #[cfg(test)]
@@ -581,14 +589,22 @@ mod workspace_ordering_tests {
 
     fn mock_response(id: &str, project_path: &str, branch: Option<&str>) -> SessionResponse {
         SessionResponse {
+            agent_pane: Default::default(),
+            auxiliary: Vec::new(),
             id: id.to_string(),
             title: id.to_string(),
             project_path: project_path.to_string(),
             artifact_dir: String::new(),
             group_path: String::new(),
             tool: "claude".to_string(),
+            command: String::new(),
+            extra_args: String::new(),
             status: "Idle".to_string(),
+            lifecycle_reservation: None,
+            lifecycle_generation: 0,
             dormant: false,
+            idle_dormant_since: None,
+            pane_dead_observed: false,
             yolo_mode: false,
             created_at: "2025-01-01T00:00:00Z".to_string(),
             last_accessed_at: None,
@@ -598,7 +614,9 @@ mod workspace_ordering_tests {
             main_repo_path: None,
             base_branch: None,
             base_branch_override: None,
+            worktree_created_at: None,
             is_sandboxed: false,
+            sandbox_container_name: None,
             scratch: false,
             has_managed_worktree: false,
             has_cleanable_worktree: false,
@@ -636,6 +654,10 @@ mod workspace_ordering_tests {
             clear_aliases: Vec::new(),
             claude_fullscreen: false,
             workspace_repos: Vec::new(),
+            workspace_dir: None,
+            workspace_branch: None,
+            workspace_created_at: None,
+            workspace_cleanup_on_delete: None,
             warnings: Vec::new(),
             plan_summary: None,
             next_wakeup_at: None,
@@ -643,6 +665,7 @@ mod workspace_ordering_tests {
             monitor_active: false,
             monitor_description: None,
             favorited: false,
+            favorited_at: None,
             color: None,
             urgent: false,
             pinned_at: None,
@@ -682,101 +705,56 @@ mod workspace_ordering_tests {
         assert_eq!(workspace_id_for_session(&r), "/tmp/repo::main");
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn merge_prepends_unseen_newest_first() -> anyhow::Result<()> {
+    async fn listing_uses_canonical_rows_and_order_without_persisting() -> anyhow::Result<()> {
         let temp = tempdir()?;
         let _guard = setup_test_home(temp.path());
-
-        // Persisted ordering already contains `b`. Sessions come in
-        // creation order (oldest first) `[b, a, c]`; `a` and `c` are
-        // unseen and should land at the top in newest-first order: `[c, a, b]`.
-        crate::session::update_workspace_ordering(|ord| {
-            ord.order = vec!["/tmp/repo::b".to_string()];
-            Ok(())
-        })?;
-
-        let sessions = vec![
-            mock_response("sb", "/tmp/repo", Some("b")),
-            mock_response("sa", "/tmp/repo", Some("a")),
-            mock_response("sc", "/tmp/repo", Some("c")),
-        ];
-
-        let merged = merge_workspace_ordering(&sessions, /* read_only */ false)?;
+        let live = Instance::new("live", "/repo");
+        let mut archived = Instance::new("archived", "/repo");
+        archived.archive();
+        let mut trashed = Instance::new("trashed", "/repo");
+        trashed.trash();
+        let ids = [live.id.clone(), archived.id.clone(), trashed.id.clone()];
+        let state =
+            crate::server::test_support::build_test_app_state(vec![live, archived, trashed]);
+        async fn json(response: impl IntoResponse) -> serde_json::Value {
+            let response = response.into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 16 * 1024 * 1024)
+                .await
+                .unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+        let snapshot =
+            json(crate::server::runtime::get_runtime_snapshot(State(state.clone())).await).await;
+        let response = json(
+            list_sessions(
+                State(state.clone()),
+                axum::extract::Query(ListSessionsQuery { state: None }),
+            )
+            .await,
+        )
+        .await;
         assert_eq!(
-            merged,
-            vec![
-                "/tmp/repo::c".to_string(),
-                "/tmp/repo::a".to_string(),
-                "/tmp/repo::b".to_string(),
-            ]
+            crate::session::load_workspace_ordering()?.order,
+            Vec::<String>::new(),
+            "GET must not persist implicit workspaces"
         );
-
-        // And the merge was persisted.
-        let on_disk = crate::session::load_workspace_ordering()?;
-        assert_eq!(on_disk.order, merged);
-
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn merge_dedupes_within_a_single_request() -> anyhow::Result<()> {
-        let temp = tempdir()?;
-        let _guard = setup_test_home(temp.path());
-
-        // Two sessions on the same workspace (rare but legal: multiple
-        // agents in one worktree). The workspace id appears once.
-        let sessions = vec![
-            mock_response("sa1", "/tmp/repo", Some("main")),
-            mock_response("sa2", "/tmp/repo", Some("main")),
-        ];
-
-        let merged = merge_workspace_ordering(&sessions, false)?;
-        assert_eq!(merged, vec!["/tmp/repo::main".to_string()]);
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn merge_no_op_when_all_known() -> anyhow::Result<()> {
-        let temp = tempdir()?;
-        let _guard = setup_test_home(temp.path());
-
-        crate::session::update_workspace_ordering(|ord| {
-            ord.order = vec!["/tmp/repo::a".to_string(), "/tmp/repo::b".to_string()];
-            Ok(())
-        })?;
-
-        let sessions = vec![
-            mock_response("sa", "/tmp/repo", Some("a")),
-            mock_response("sb", "/tmp/repo", Some("b")),
-        ];
-
-        let merged = merge_workspace_ordering(&sessions, false)?;
         assert_eq!(
-            merged,
-            vec!["/tmp/repo::a".to_string(), "/tmp/repo::b".to_string()]
+            response["workspace_ordering"],
+            snapshot["workspace_ordering"]
         );
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn merge_read_only_returns_merged_but_does_not_write() -> anyhow::Result<()> {
-        let temp = tempdir()?;
-        let _guard = setup_test_home(temp.path());
-
-        // Empty starting state. Read-only request observes a new
-        // workspace; the response includes it but disk is untouched.
-        let sessions = vec![mock_response("sa", "/tmp/repo", Some("a"))];
-
-        let merged = merge_workspace_ordering(&sessions, /* read_only */ true)?;
-        assert_eq!(merged, vec!["/tmp/repo::a".to_string()]);
-
-        let on_disk = crate::session::load_workspace_ordering()?;
-        assert!(on_disk.order.is_empty(), "read-only path must not persist");
-
+        assert_eq!(response["sessions"], snapshot["sessions"]);
+        let expected_order: Vec<_> = ids
+            .iter()
+            .rev()
+            .map(|id| format!("/repo::__session__::{id}"))
+            .collect();
+        assert_eq!(
+            snapshot["workspace_ordering"],
+            serde_json::to_value(expected_order)?
+        );
         Ok(())
     }
 

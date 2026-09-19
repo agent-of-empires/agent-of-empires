@@ -290,21 +290,20 @@ impl Default for ServeView {
 }
 
 impl ServeView {
-    /// Construct the dialog. If a daemon is already running (detected via
-    /// `$APP_DIR/serve.pid`), jump straight to Active so the user can see
-    /// the URL and stop it; otherwise show ModePicker.
+    /// Construct the dialog. If a *serve* daemon is already running, jump
+    /// straight to Active so the user can see the URL and stop it; otherwise
+    /// show ModePicker. A running daemon only counts as a serve daemon when it
+    /// recorded its mode: the TUI's own core daemon writes a pid file but no
+    /// mode, and reattaching a tunnel view to it would announce a tunnel that
+    /// was never started.
     pub fn new() -> Self {
         // Use the saved passphrase if one exists, otherwise generate
         // a fresh one and save it. This ensures the passphrase stays
         // constant across stop/start cycles.
         let pending = load_or_generate_passphrase();
 
-        if crate::cli::serve::daemon_pid().is_some() {
-            // There's already a daemon running. Read its mode from
-            // serve.mode (written by the server). If missing (older daemon
-            // from pre-mode-split version), assume Tunnel — that was the
-            // only mode the TUI could spawn before.
-            let mode = read_serve_mode().unwrap_or(ServeMode::Tunnel);
+        if let Some(mode) = read_serve_mode().filter(|_| crate::cli::serve::daemon_pid().is_some())
+        {
             // Recall the passphrase only for Tunnel (Local has no passphrase).
             let remembered = if matches!(mode, ServeMode::Tunnel) {
                 recall_passphrase()

@@ -145,7 +145,11 @@ fn test_container_lifecycle() {
             .as_millis()
     );
 
-    let container = DockerContainer::new(&session_id, "alpine:latest");
+    let container = DockerContainer::new(
+        &session_id,
+        "alpine:latest",
+        containers::get_container_runtime(),
+    );
 
     assert!(!container.exists().unwrap());
 
@@ -191,7 +195,11 @@ fn test_container_force_remove() {
             .as_millis()
     );
 
-    let container = containers::DockerContainer::new(&session_id, "alpine:latest");
+    let container = containers::DockerContainer::new(
+        &session_id,
+        "alpine:latest",
+        containers::get_container_runtime(),
+    );
 
     let config = containers::ContainerConfig {
         working_dir: "/workspace".to_string(),

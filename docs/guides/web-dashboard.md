@@ -43,6 +43,20 @@ Open it in any browser. The token is set as a cookie on first visit, so you don'
 
 `--open` is suppressed with `--daemon` or `--remote`, and whenever no browser you could see is reachable: over SSH without a forwarded `DISPLAY`, and on Linux/BSD with no display server. Setting `BROWSER` overrides the check on platforms whose browser launcher reads it, which excludes macOS. The preview's link handling uses the same rules.
 
+### Private core and recovery
+
+Run only the private local API, without TCP or a dashboard, with:
+
+```bash
+aoe serve --core-only --daemon
+```
+
+An explicit `aoe serve` request replaces an existing managed core under the daemon lifecycle lock. It validates the requested exposure before stopping the core, then waits for the replacement to become ready. Existing terminal sessions remain running.
+
+`aoe serve --restart` replays the current managed launch. If a replacement fails after stopping the daemon, there is no automatic fallback. Run `aoe serve --rollback` to restore the retained launch explicitly. Rollback also works after `--stop`; it refuses missing or mismatched credentials instead of dropping authentication. The retained launch can still fail if its prerequisites are no longer available.
+
+The retained policy and any passphrase remain in private application storage until a later managed replacement overwrites them. Foreground and service-supervised processes must be stopped through their owning shell or service manager before rollback can replace them.
+
 ### Retrieving the live URL
 
 In `--remote` mode the auth token rotates every 4 hours, so a URL captured at startup eventually stops working. Use `aoe url` against a running daemon (exits non-zero if none is running):

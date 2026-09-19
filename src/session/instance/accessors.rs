@@ -91,8 +91,22 @@ impl Instance {
             session_id_poller_retry_after: None,
             retroactive_capture_excludes: HashSet::new(),
             pane_dead_observed: false,
+            agent_pane: PaneObservation::default(),
+            auxiliary: Vec::new(),
             file_watch: None,
         }
+    }
+
+    pub fn auxiliary_presence(&self, target: &AuxiliaryTarget) -> PanePresence {
+        self.auxiliary
+            .iter()
+            .find(|observation| &observation.target == target)
+            .map_or(PanePresence::Unknown, |observation| observation.pane.state)
+    }
+
+    pub fn tool_presence(&self, name: &str) -> PanePresence {
+        self.auxiliary.iter().find(|observation| matches!(&observation.target, AuxiliaryTarget::Tool { tool_name } if tool_name == name))
+            .map_or(PanePresence::Unknown, |observation| observation.pane.state)
     }
 
     /// Inject the live FileWatchService Arc into this Instance for
@@ -168,29 +182,31 @@ impl Instance {
         crate::session::config::effective_profile(&self.source_profile)
     }
 
-    /// The `agent_detect_as` alias that actually applies to this session.
-    ///
-    /// `detect_as` is resolved once at session build and persisted, so it is
-    /// empty on a row created before its tool gained an
-    /// `[session.agent_detect_as]` entry. Treat the stored field as a cache
-    /// and let [`tmux::status_rules::effective_detect_as`] consult the live
-    /// registry when it is empty, the same way the pane detector, hook
-    /// reconciliation, and the status-change log line already do (#3398).
-    pub(super) fn effective_detect_as(&self) -> std::borrow::Cow<'_, str> {
-        tmux::status_rules::effective_detect_as(&self.source_profile, &self.tool, &self.detect_as)
-    }
-
-    /// The built-in agent backing this session: its own tool when that names
-    /// one, else the agent its `agent_detect_as` alias points at.
-    ///
-    /// Every launch-time consumer resolves through here rather than reading
-    /// `detect_as` raw, because a miss is silent and permanent. `None` drops
-    /// the `AOE_PROFILE`/`AOE_INSTANCE_ID` prefix from the launch line
-    /// ([`status_hook_env_prefix`]) and skips hook install, so every hook the
-    /// agent does have bails on `[ -n "$AOE_INSTANCE_ID" ]` and the session
-    /// reports Idle forever with nothing logged.
+    /// Resolve a built-in agent through the installed profile registry.
     pub(crate) fn resolved_agent(&self) -> Option<&'static crate::agents::AgentDef> {
         resolved_agent_for(&self.source_profile, &self.tool, &self.detect_as)
+    }
+
+    pub(super) fn effective_detect_as_in<'a>(
+        &'a self,
+        config: &'a crate::session::config::SessionConfig,
+    ) -> &'a str {
+        if self.detect_as.is_empty() {
+            config
+                .agent_detect_as
+                .get(&self.tool)
+                .map_or("", String::as_str)
+        } else {
+            &self.detect_as
+        }
+    }
+
+    pub(super) fn resolved_agent_in(
+        &self,
+        config: &crate::session::config::SessionConfig,
+    ) -> Option<&'static crate::agents::AgentDef> {
+        crate::agents::get_agent(&self.tool)
+            .or_else(|| crate::agents::get_agent(self.effective_detect_as_in(config)))
     }
 
     /// The built-in identity used to compare capture stores and aliases.
@@ -381,7 +397,16 @@ impl Instance {
         &'static crate::agents::SessionCaptureSpec,
         crate::agents::SessionCaptureContext,
     )> {
-        let agent = self.resolved_agent()?;
+        self.resolved_session_support_for(self.resolved_agent()?)
+    }
+
+    pub(super) fn resolved_session_support_for(
+        &self,
+        agent: &'static crate::agents::AgentDef,
+    ) -> Option<(
+        &'static crate::agents::SessionCaptureSpec,
+        crate::agents::SessionCaptureContext,
+    )> {
         let support = agent.session_support.as_ref()?;
         let capture = support.capture.as_ref()?;
         let context = if self.is_sandboxed() {
@@ -392,13 +417,7 @@ impl Instance {
         if context == crate::agents::SessionCaptureContext::Unsupported {
             return None;
         }
-        // These backends publish under this pane's own `AOE_INSTANCE_ID`, so
-        // the write proves its own attribution and a renamed wrapper cannot
-        // claim another pane's conversation. The rest infer ownership from the
-        // launch itself: OMP reads a store it routed through the launch
-        // environment, OpenCode mirrors the binary under `opencode serve`, and
-        // the managed stores match on cwd and a launch floor. Those need the
-        // agent's own binary on the command line to mean anything.
+        // Self-attributing publishers also authorize bare wrappers.
         let self_attributing = matches!(
             capture.backend,
             crate::agents::SessionCaptureBackend::Claude
@@ -464,26 +483,73 @@ impl Instance {
         let config = crate::session::config::profile_config::resolve_config_or_warn(
             &self.effective_profile(),
         );
-        let declared = config.session.agent_config_dir_for(&self.tool, &home);
-        let agent = self.resolved_agent()?;
+        self.sandbox_capture_store_dir_for(self.resolved_agent()?, &config, &home)
+    }
+
+    pub(super) fn sandbox_capture_store_dir_for(
+        &self,
+        agent: &crate::agents::AgentDef,
+        config: &crate::session::config::Config,
+        home: &Path,
+    ) -> Option<std::path::PathBuf> {
+        let declared = config.session.agent_config_dir_for(&self.tool, home);
         if self.sandbox_store_generation
             < crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION
         {
             return crate::session::config::container_config::legacy_sandbox_store_dir(
                 agent.name,
-                &home,
+                home,
                 declared.as_deref(),
                 (self.sandbox_store_generation == 0).then_some(self.id.as_str()),
             );
         }
         crate::session::config::container_config::sandbox_store_dir(
             agent.name,
-            &home,
+            home,
             declared.as_deref(),
             &self.id,
         )
         .ok()
         .flatten()
+    }
+
+    pub(crate) fn is_managed_capture_peer(
+        &self,
+        current_id: &str,
+        is_current_profile: bool,
+    ) -> bool {
+        !(is_current_profile && self.id == current_id)
+            && self.is_sandboxed()
+            && self.archived_at.is_none()
+            && self.trashed_at.is_none()
+            && !matches!(self.status, Status::Stopped | Status::Deleting)
+    }
+
+    pub(crate) fn managed_capture_store_conflicts(
+        &self,
+        backend: crate::agents::SessionCaptureBackend,
+        current_store: &Path,
+        config: &crate::session::config::Config,
+        home: &Path,
+    ) -> bool {
+        let agent = crate::agents::get_agent(&self.tool).or_else(|| {
+            let detect_as = if self.detect_as.is_empty() {
+                config.session.agent_detect_as.get(&self.tool)?.as_str()
+            } else {
+                &self.detect_as
+            };
+            crate::agents::get_agent(detect_as)
+        });
+        let Some(agent) = agent else { return false };
+        if !self
+            .resolved_session_support_for(agent)
+            .is_some_and(|(capture, _)| capture.backend == backend)
+        {
+            return false;
+        }
+        self.sandbox_capture_store_dir_for(agent, config, home)
+            .and_then(|path| std::fs::canonicalize(path).ok())
+            .is_none_or(|path| path == current_store)
     }
     pub fn is_sub_session(&self) -> bool {
         self.parent_session_id.is_some()

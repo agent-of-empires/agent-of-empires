@@ -1,20 +1,19 @@
 //! The status poll loop and the passive transitions it decides and writes.
 
-use crate::server::push::StatusChange;
 use crate::session::Instance;
 use crate::session::Status;
 use std::sync::Arc;
 
 use super::idle_reap::reap_idle_sessions;
 use super::reload::{
-    apply_tick_status_decisions, load_all_instances, observed_transitions,
+    apply_tick_status_decisions, load_all_profiles, observed_transitions,
     reload_state_instances_from_disk, seed_tick_tracking, PriorTickTracking,
 };
 use super::session_identity::drain_session_id_updates_in_state;
 use super::sleep_inhibit::update_sleep_inhibit;
 use super::state::{AppState, StatusSource};
 use super::structured_repair::live_structured_worker_records;
-use crate::server::{acp_reconciler, api};
+use crate::server::acp_reconciler;
 
 /// What to do with one instance's status_poll_loop diff, once a genuine
 /// `old != inst.status` transition (against the tick's `prev` snapshot) has
@@ -65,63 +64,23 @@ pub(super) fn decide_passive_transition(
     PassiveTransitionDecision { patch, mark_unread }
 }
 
-/// Per-profile bundle of passive-status writes accumulated in one
-/// `status_poll_loop` tick. `patches` is keyed by instance id so the
-/// persistence closure resolves each row in O(1); `unread_ids` stays a
-/// small `Vec` because per-tick cardinality is low and `Vec::contains`
-/// beats `HashSet` at that N.
-///
-/// ## Persistence divergence between daemon and TUI (#2690 follow-up)
-///
-/// The daemon batches transitions here (one `Storage::update` per profile
-/// per tick, via `persist_session_update`). The TUI's
-/// [`crate::tui::home::HomeView::persist_passive_status_transition`]
-/// writes one transition at a time. Both funnel through
-/// [`crate::session::Instance::merge_passive_status_patch`], whose field
-/// semantics are: `last_accessed_at` is monotone non-decreasing (guarded
-/// by `>=`, so an older-or-equal incoming value is dropped);
-/// `status` and `idle_entered_at` are unconditional writes
-/// (last-writer-wins). The two paths are safe to interleave today because
-/// the poller is the sole authority on those two fields and both writers
-/// read the same live source, so they converge within one poll interval
-/// of the slower cadence (daemon at 2s, TUI at ~500ms) even when their
-/// observations disagree mid-cadence.
-///
-/// A future field added to [`crate::session::PassiveStatusPatch`] that is
-/// neither monotone (like `last_accessed_at`) nor single-authority (like
-/// the current `status`/`idle_entered_at`) would diverge silently
-/// between the daemon's batched replay and the TUI's per-transition
-/// writes. Any such addition must either unify the two paths first, or
-/// explicitly document why the two-writer shape stays safe.
+/// Passive observations batched by profile. Lifecycle generations protect
+/// patches and their unread marks from concurrent lifecycle commits.
 #[derive(Default)]
 pub(super) struct PassiveTransitionWrites {
-    /// Keyed by instance id for O(1) lookup inside the persist closure.
-    /// The patch value carries no id of its own; the flush site reads the
-    /// map key (via `get_key_value`) and threads it into
-    /// [`crate::session::Instance::merge_passive_status_patch`].
     patches: std::collections::HashMap<String, crate::session::PassiveStatusPatch>,
     unread_ids: Vec<String>,
 }
 
-/// Flush one tick's per-profile passive-status writes: persist each bundle,
-/// then mirror its unread marks into the live `instances` slice ONLY for the
-/// bundles whose durable write returned `Ok`.
-///
-/// The ordering is load-bearing. `instances` is the vec that
-/// `reload_state_instances_from_disk` folds straight into `state.instances`,
-/// so a mark applied here is what makes the unread indicator visible this
-/// tick. Marking before the flock write landed stranded that mark on a failed
-/// persist: disk stayed unmarked, the next tick reloaded the unmarked row,
-/// and the `prev == inst.status` short-circuit blocked any re-mark, so a
-/// Running -> Idle transition whose write failed silently lost its unread
-/// indicator with no user-visible recovery path. Deferring the in-memory mark
-/// to a persisted `Ok` keeps memory and disk in lockstep: on failure neither
-/// is marked. See #2755 (follow-up to #2729).
+/// Apply passive writes and retain their exact rows/groups before publication.
 pub(super) async fn flush_passive_transition_writes(
     file_watch: std::sync::Arc<crate::file_watch::FileWatchService>,
-    instances: &mut [Instance],
+    instances: &mut Vec<Instance>,
+    metadata: &mut super::reload::CanonicalMetadata,
     bundles: std::collections::HashMap<String, PassiveTransitionWrites>,
-) {
+    transition: &Arc<crate::session::StorageTransition>,
+    _publication: &tokio::sync::RwLockWriteGuard<'_, ()>,
+) -> Result<(), super::reload::ReloadFailure> {
     for (
         profile,
         PassiveTransitionWrites {
@@ -130,33 +89,41 @@ pub(super) async fn flush_passive_transition_writes(
         },
     ) in bundles
     {
-        // The closure moves `unread_ids`; keep a copy to mirror into the live
-        // vec once the write is durable.
-        let unread_ids_for_local = unread_ids.clone();
         let patch_count = patches.len();
         let unread_count = unread_ids.len();
-        let persisted = api::persist_session_update(
-            profile.clone(),
-            "passive-status",
-            file_watch.clone(),
-            move |insts| {
+        let file_watch = file_watch.clone();
+        let storage_profile = profile.clone();
+        let transition = transition.clone();
+        let persisted = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let storage = crate::session::Storage::open(&storage_profile, file_watch)?;
+            transition.update_with_snapshot(&storage, |insts, _| {
                 for inst in insts.iter_mut() {
+                    if inst.is_structured() {
+                        continue;
+                    }
                     if let Some((id, patch)) = patches.get_key_value(&inst.id) {
                         inst.merge_passive_status_patch(id, patch);
                     }
-                    if unread_ids.contains(&inst.id) {
-                        inst.mark_unread();
-                    }
                 }
-            },
-        )
-        .await;
-        // Per-tick roll-up of the passive-status batch this flush persisted.
-        // `merge_passive_status_patch` only logs when it drops a stale
-        // `last_accessed_at`, so without this there is no per-tick anchor for
-        // "why did N rows change on this tick". `ok` reports the durable
-        // write's outcome; on a failure the counts are what was attempted, not
-        // what landed, and the unread mirror below is skipped. See #2760.
+                for id in unread_ids {
+                    let Some(inst) = insts.iter_mut().find(|inst| inst.id == id) else {
+                        continue;
+                    };
+                    if inst.is_structured()
+                        || patches.get(&id).is_some_and(|patch| {
+                            patch.lifecycle_generation < inst.lifecycle_generation
+                        })
+                    {
+                        continue;
+                    }
+                    inst.mark_unread();
+                }
+                Ok(patches)
+            })
+        })
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|result| result);
         tracing::debug!(
             target: "session.store",
             profile = %profile,
@@ -165,14 +132,25 @@ pub(super) async fn flush_passive_transition_writes(
             ok = persisted.is_ok(),
             "persisted passive-status batch"
         );
-        if persisted.is_ok() {
-            for inst in instances.iter_mut() {
-                if unread_ids_for_local.contains(&inst.id) {
-                    inst.mark_unread();
-                }
-            }
-        }
+        let (patches, rows, groups) = persisted.map_err(|error| super::reload::ReloadFailure {
+            health: crate::daemon::RuntimeHealth::Degraded {
+                code: crate::daemon::ReloadFailureCode::ProfileData,
+                profiles: vec![profile.clone()],
+            },
+            source: error,
+        })?;
+        super::reload::replace_committed_profiles(
+            instances,
+            metadata,
+            [(&profile, rows, groups)],
+            |id| {
+                patches
+                    .contains_key(id)
+                    .then_some(super::reload::StatusCommit::Passive)
+            },
+        )?;
     }
+    Ok(())
 }
 
 /// Drop entries whose session id is no longer live from the persistent
@@ -201,68 +179,260 @@ pub(super) fn gc_reconciler_session_maps(
     capacity_deferred.retain(|id| live_ids.contains(id.as_str()));
 }
 
-/// Background task that periodically refreshes session statuses. On each
-/// tick, diffs pre- and post-refresh statuses and emits a `StatusChange`
-/// on `state.status_tx` for every transition. Keeping the diff here,
-/// rather than pushing it into `Instance::update_status_with_metadata`,
-/// leaves the session module free of any broadcast-channel dependency
-/// and keeps TUI/CLI callers unchanged.
-pub(super) async fn status_poll_loop(state: Arc<AppState>) {
-    // `Delay` re-arms the next tick `period` after the current one returns,
-    // so a stall (suspend, scheduler stall, flock contention) does not drain
-    // queued ticks and collapse the 2s cooldown the per-tick work expects.
+async fn sample_sandbox_health(
+    state: &AppState,
+) -> Arc<std::collections::HashMap<String, super::reload::SandboxHealth>> {
+    let candidates: Vec<_> = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .filter(|row| {
+            row.is_sandboxed()
+                && !row.is_trashed()
+                && !matches!(
+                    row.status,
+                    Status::Starting | Status::Creating | Status::Deleting
+                )
+                && !row.has_fresh_lifecycle_reservation(chrono::Utc::now())
+        })
+        .filter_map(|row| {
+            row.sandbox_info.as_ref().map(|sandbox| {
+                (
+                    row.id.clone(),
+                    row.lifecycle_generation,
+                    sandbox.container_name.clone(),
+                )
+            })
+        })
+        .collect();
+    if candidates.is_empty() {
+        return Arc::default();
+    }
+    match tokio::task::spawn_blocking(move || {
+        let states = crate::containers::batch_container_health();
+        candidates
+            .into_iter()
+            .filter_map(|(id, generation, container_name)| {
+                states.get(&container_name).copied().map(|running| {
+                    (
+                        id,
+                        super::reload::SandboxHealth {
+                            generation,
+                            container_name,
+                            running,
+                        },
+                    )
+                })
+            })
+            .collect()
+    })
+    .await
+    {
+        Ok(health) => Arc::new(health),
+        Err(error) => {
+            tracing::error!(target: "server.maintenance", %error, "sandbox health worker failed");
+            Arc::default()
+        }
+    }
+}
+
+async fn refresh_sandbox_stores(state: &Arc<AppState>) {
+    use crate::session::config::container_config::{self, CredentialFold};
+    use crate::session::SessionStore;
+    let candidates: Vec<_> = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .filter(|row| row.is_sandboxed() && !row.is_trashed())
+        .map(|row| row.id.clone())
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+    let auto_propagate = match tokio::task::spawn_blocking(|| {
+        crate::session::Config::load().map(|config| config.skills.auto_propagate)
+    })
+    .await
+    {
+        Ok(Ok(enabled)) => enabled,
+        result => {
+            tracing::warn!(target: "server.maintenance", ?result, "sandbox refresh configuration unavailable");
+            return;
+        }
+    };
+    for id in candidates {
+        if state.shutdown.is_cancelled() {
+            return;
+        }
+        let namespace = state.profile_namespace.read().await;
+        let worker_state = state.clone();
+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let _identity = crate::session::acquire_session_identity_lock()?;
+            let profile = worker_state
+                .instances
+                .blocking_read()
+                .iter()
+                .find(|row| row.id == id)
+                .map(|row| row.source_profile.clone());
+            let Some(profile) = profile else {
+                return Ok(());
+            };
+            let store = super::session_store::NativeSessionStore::open(
+                worker_state.clone(),
+                &profile,
+                None,
+            )?;
+            let _lifecycle = store.storage().acquire_instance_lifecycle_lock(&id)?;
+            store.check_available()?;
+            let Some(row) = store.load()?.into_iter().find(|row| row.id == id) else {
+                return Ok(());
+            };
+            if !row.is_sandboxed()
+                || row.is_trashed()
+                || matches!(
+                    row.status,
+                    Status::Starting | Status::Creating | Status::Deleting
+                )
+                || row.has_fresh_lifecycle_reservation(chrono::Utc::now())
+                || row.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION
+            {
+                return Ok(());
+            }
+            let config = store.configuration(Some(store.storage().profile()))?;
+            let container = crate::containers::DockerContainer::from_session_id(&id);
+            if row.predates_shared_credential(&container, &row.detect_as, &config.session)? {
+                return Ok(());
+            }
+            store.check_available()?;
+            if worker_state.shutdown.is_cancelled() {
+                return Ok(());
+            }
+            container_config::refresh_agent_configs_for_instance(
+                &config,
+                &id,
+                &row.tool,
+                Some(&row.detect_as),
+                CredentialFold::SeedOnly,
+                auto_propagate,
+            );
+            Ok(())
+        })
+        .await;
+        drop(namespace);
+        match result {
+            Ok(Ok(())) => {}
+            result => {
+                tracing::warn!(target: "server.maintenance", ?result, "sandbox store refresh failed")
+            }
+        }
+    }
+}
+
+/// Slow maintenance never delays the native terminal sampler.
+pub(super) async fn maintenance_loop(
+    state: Arc<AppState>,
+    health: tokio::sync::watch::Sender<
+        Arc<std::collections::HashMap<String, super::reload::SandboxHealth>>,
+    >,
+) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut attempted_acp_spawns: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     let mut acp_reap_cadence = acp_reconciler::ReapCadence::default();
     let mut last_session_idle_reap: Option<std::time::Instant> = None;
-    // Loop-local, single-owner sleep-inhibit assertion (single global toggle,
-    // so one slot for the whole daemon). Kept off `AppState`, which is for
-    // cross-task shared state; this is owned solely by the poll loop, like
-    // `last_session_idle_reap`.
     let mut sleep_inhibitor: Option<Box<dyn crate::process::SleepInhibit>> = None;
     let mut last_sleep_inhibit_reconcile: Option<std::time::Instant> = None;
-    // Per-session reconciler respawn budget + crash-loop park set (#1945).
-    // Owned by the loop so they persist across ticks, swept against live
-    // sessions inside the reconciler.
     let mut acp_respawn_history: std::collections::HashMap<String, Vec<std::time::Instant>> =
         std::collections::HashMap::new();
     let mut acp_parked: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // Per-session capacity-deferred marker (#1027). A structured session
-    // refused by `CapacityFull` is re-armed for retry every tick; this set
-    // gates the capacity banner to publish once per transition and is cleared
-    // once the session's worker comes online or leaves the live set.
     let mut acp_capacity_deferred: std::collections::HashSet<String> =
         std::collections::HashSet::new();
+    let mut last_container_check: Option<std::time::Instant> = None;
+    let mut last_credential_refresh = std::time::Instant::now();
     loop {
-        interval.tick().await;
-
-        let prev: std::collections::HashMap<String, crate::session::Status> = {
-            let instances = state.instances.read().await;
-            instances.iter().map(|i| (i.id.clone(), i.status)).collect()
-        };
-
-        // GC the reconciler's persistent per-session maps against the live
-        // instance set (keyed by `prev`, the full snapshot above) so a
-        // long-uptime daemon's footprint stays bounded by live-session count,
-        // not by lifetime-observed sessions (#2758). Above the scrape guard so
-        // the sweep still runs on a tick whose tmux scrape fails.
-        let live_ids: std::collections::HashSet<&str> = prev.keys().map(String::as_str).collect();
-        gc_reconciler_session_maps(
-            &live_ids,
+        tokio::select! {
+            _ = state.shutdown.cancelled() => return,
+            _ = interval.tick() => {}
+        }
+        {
+            let rows = state.instances.read().await;
+            let live_ids = rows.iter().map(|row| row.id.as_str()).collect();
+            gc_reconciler_session_maps(
+                &live_ids,
+                &mut attempted_acp_spawns,
+                &mut acp_respawn_history,
+                &mut acp_parked,
+                &mut acp_capacity_deferred,
+            );
+        }
+        if last_container_check
+            .is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(5))
+        {
+            health.send_replace(sample_sandbox_health(&state).await);
+            last_container_check = Some(std::time::Instant::now());
+        }
+        if last_credential_refresh.elapsed() >= std::time::Duration::from_secs(1800) {
+            refresh_sandbox_stores(&state).await;
+            last_credential_refresh = std::time::Instant::now();
+        }
+        drain_session_id_updates_in_state(&state).await;
+        acp_reconciler::reconcile_acp_workers(
+            &state,
             &mut attempted_acp_spawns,
+            &mut acp_reap_cadence,
             &mut acp_respawn_history,
             &mut acp_parked,
             &mut acp_capacity_deferred,
-        );
-        // Snapshot of the prior tick's status bookkeeping, taken from the same
-        // in-memory `state.instances` this tick's `load_all_instances()` call
-        // is about to reset to defaults. Fed to `seed_tick_tracking` below,
-        // before `update_status_with_metadata` runs, so the Unknown->Error
-        // escalation window can accumulate elapsed time across ticks (#2865)
-        // and a detection awaiting confirmation survives to meet the poll that
-        // confirms it (#3642), instead of both restarting every 2s.
+        )
+        .await;
+        reap_idle_sessions(&state, &mut last_session_idle_reap).await;
+        update_sleep_inhibit(
+            &state,
+            &mut sleep_inhibitor,
+            &mut last_sleep_inhibit_reconcile,
+        )
+        .await;
+    }
+}
+
+pub(super) async fn status_poll_loop(
+    state: Arc<AppState>,
+    health: tokio::sync::watch::Receiver<
+        Arc<std::collections::HashMap<String, super::reload::SandboxHealth>>,
+    >,
+) {
+    let mut first = true;
+    loop {
+        if !first {
+            let period = if state.runtime.has_subscribers() {
+                std::time::Duration::from_millis(500)
+            } else {
+                std::time::Duration::from_secs(2)
+            };
+            tokio::select! {
+                _ = state.shutdown.cancelled() => return,
+                _ = state.runtime.wait_for_terminal_subscriber() => {},
+                _ = tokio::time::sleep(period) => {},
+            }
+        }
+        first = false;
+        // Fence every input, including the prior runtime observations.
+        let namespace = state.profile_namespace.read().await;
+        let reload_lane = state.reload_lane.lock().await;
+        let read_epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let prev: std::collections::HashMap<String, Status> = {
+            let instances = state.instances.read().await;
+            instances
+                .iter()
+                .map(|row| (row.id.clone(), row.status))
+                .collect()
+        };
+        // Carry detection confirmations and the Unknown escalation clock across disk loads.
         let prev_tracking: std::collections::HashMap<String, PriorTickTracking> = {
             let instances = state.instances.read().await;
             instances
@@ -279,25 +449,11 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
         let suppressed_ids =
             crate::session::recovery::snapshot_recently_restarted(&state.recently_restarted);
         let file_watch_for_poll = state.file_watch.clone();
-        // Seed each freshly-disk-loaded instance's live status baseline from
-        // `prev` (the true previous-tick live status) rather than letting
-        // `update_status_with_metadata` fall back to comparing against its
-        // own possibly-stale disk-loaded `status`. Without this, every tick
-        // that finds disk out of sync with live reality (the common case,
-        // since nothing persists a passive transition until the patch below
-        // lands) misreads that mismatch as a brand new transition and
-        // restamps idle_entered_at. See #2690.
-        let prev_for_poll = prev.clone();
-        // Invariant 8: read before `load_all_instances()` below. The tmux
-        // scrape that follows it can block for seconds when the tmux server is
-        // unreachable, which is exactly when a concurrent delete has time to
-        // land and this tick's snapshot goes stale.
-        let read_epoch = state
-            .mutation_epoch
-            .load(std::sync::atomic::Ordering::SeqCst);
+        let sandbox_health = health.borrow().clone();
         let updated = tokio::task::spawn_blocking(move || {
-            let mut instances = load_all_instances(&file_watch_for_poll).unwrap_or_default();
-            seed_tick_tracking(&mut instances, &prev_tracking);
+            let loaded = load_all_profiles(&file_watch_for_poll)?;
+            let mut instances = loaded.instances;
+            seed_tick_tracking(&mut instances, prev_tracking);
             crate::tmux::refresh_session_cache();
             let pane_metadata = crate::tmux::batch_pane_metadata();
             if let Err(error) = &pane_metadata {
@@ -309,48 +465,54 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
             }
             apply_tick_status_decisions(
                 &mut instances,
-                &prev_for_poll,
+                &prev,
                 &suppressed_ids,
                 pane_metadata.as_ref().ok(),
+                &sandbox_health,
             );
-            (instances, live_structured_worker_records())
+            for row in &mut instances {
+                let tools = loaded
+                    .metadata
+                    .auxiliary_tools
+                    .get(&row.source_profile)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                super::pane::sample_panes(row, tools, pane_metadata.as_ref().ok());
+            }
+            Ok::<_, super::reload::ReloadFailure>((
+                instances,
+                loaded.metadata,
+                live_structured_worker_records(),
+                prev,
+            ))
         })
         .await;
 
-        if let Ok((mut instances, live_worker_records)) = updated {
-            // Diff BEFORE `reload_state_instances_from_disk`: for a tmux-backed
-            // row, status_tx must observe the raw post-suppression,
-            // post-tmux-scrape value, never the acp overlay that helper
-            // re-applies. A structured row is the deliberate exception:
-            // `skip_tmux_decision_for_structured` above already put the live acp
-            // status on it, which is what makes it compare equal to `prev` here
-            // instead of reporting a phantom transition every tick.
-            let now = chrono::Utc::now();
+        let updated = match updated {
+            Ok(Ok(updated)) => updated,
+            Ok(Err(error)) => {
+                tracing::warn!(target: "server.status", %error, "retaining last complete session state after reload failure");
+                state.mark_reload_failure(error.health).await;
+                continue;
+            }
+            Err(error) => {
+                tracing::error!(target: "server.status", %error, "session reload task failed");
+                state
+                    .mark_reload_failure(crate::daemon::RuntimeHealth::Degraded {
+                        code: crate::daemon::ReloadFailureCode::Metadata,
+                        profiles: Vec::new(),
+                    })
+                    .await;
+                continue;
+            }
+        };
+        {
+            let (instances, metadata, live_worker_records, prev) = updated;
             let unread_enabled = crate::session::unread_enabled();
-            // Passive status transitions observed this tick, batched per
-            // profile so one `Storage::update` flock covers every
-            // transitioned session on that profile (plus its unread mark
-            // when applicable). Persisting promptly is what keeps the next
-            // reload (this loop's next tick, or a TUI relaunch) from
-            // comparing against a stale snapshot and restamping again. See
-            // #2690.
             let mut bundles: std::collections::HashMap<String, PassiveTransitionWrites> =
                 std::collections::HashMap::new();
             for (idx, old) in observed_transitions(&instances, &prev) {
                 let inst = &instances[idx];
-                // First turn's `Running -> Idle` edge: best-effort auto-name a
-                // still-default-named terminal session. Detached and
-                // self-gating, so ineligible sessions cost only the cheap gate.
-                if old == Status::Running && inst.status == Status::Idle {
-                    crate::session::smart_rename::maybe_spawn_terminal_smart_rename(inst);
-                }
-                let _ = state.status_tx.send(StatusChange {
-                    instance_id: inst.id.clone(),
-                    instance_title: inst.title.clone(),
-                    old,
-                    new: inst.status,
-                    at: now,
-                });
                 let decision = decide_passive_transition(inst, old, unread_enabled);
                 if decision.patch.is_none() && !decision.mark_unread {
                     continue;
@@ -360,45 +522,51 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
                     bundle.patches.insert(inst.id.clone(), patch);
                 }
                 if decision.mark_unread {
-                    // Record the id only; the in-memory mark on `instances`
-                    // is deferred to `flush_passive_transition_writes` so it
-                    // fires only after the durable write returns Ok. See
-                    // #2755.
                     bundle.unread_ids.push(inst.id.clone());
                 }
             }
-            flush_passive_transition_writes(state.file_watch.clone(), &mut instances, bundles)
-                .await;
-
-            reload_state_instances_from_disk(
+            let changes = reload_state_instances_from_disk(
                 &state,
                 instances,
                 live_worker_records,
                 StatusSource::TmuxApplied,
                 read_epoch,
+                metadata,
+                bundles,
             )
             .await;
-
-            drain_session_id_updates_in_state(&state).await;
-
-            acp_reconciler::reconcile_acp_workers(
-                &state,
-                &mut attempted_acp_spawns,
-                &mut acp_reap_cadence,
-                &mut acp_respawn_history,
-                &mut acp_parked,
-                &mut acp_capacity_deferred,
-            )
-            .await;
-
-            reap_idle_sessions(&state, &mut last_session_idle_reap).await;
-
-            update_sleep_inhibit(
-                &state,
-                &mut sleep_inhibitor,
-                &mut last_sleep_inhibit_reconcile,
-            )
-            .await;
+            drop(reload_lane);
+            drop(namespace);
+            if let Err(error) = state.runtime.publish(&state).await {
+                tracing::error!(target: "server.status", %error, "terminal snapshot publication failed");
+                continue;
+            }
+            for change in changes {
+                if change.old == Status::Running && change.new == Status::Idle {
+                    let candidate = {
+                        let instances = state.instances.read().await;
+                        instances
+                            .iter()
+                            .find(|row| row.id == change.instance_id)
+                            .filter(|row| {
+                                crate::session::smart_rename::terminal_smart_rename_candidate(row)
+                            })
+                            .map(|row| (row.source_profile.clone(), row.id.clone()))
+                    };
+                    if let Some((profile, id)) = candidate {
+                        state.runtime.work.spawn(
+                            "server.terminal_smart_rename",
+                            crate::session::smart_rename::try_terminal_smart_rename(
+                                state.clone(),
+                                profile,
+                                id,
+                                false,
+                            ),
+                        );
+                    }
+                }
+                let _ = state.status_tx.send(change);
+            }
         }
     }
 }
@@ -406,6 +574,106 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn queued_tick_preserves_an_auxiliary_created_while_waiting_for_reload() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let mut row = Instance::new("tick auxiliary", project.path().to_str().unwrap());
+        row.source_profile = "work".into();
+        row.status = Status::Stopped;
+        let storage = crate::session::Storage::new_unwatched("work").unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(row.clone());
+                Ok(())
+            })
+            .unwrap();
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        *state.canonical_metadata.write().await =
+            load_all_profiles(&state.file_watch).unwrap().metadata;
+        let (_health_tx, health_rx) =
+            tokio::sync::watch::channel(Arc::new(std::collections::HashMap::new()));
+        let lane = state.reload_lane.lock().await;
+        let mut polling = Box::pin(status_poll_loop(state.clone(), health_rx));
+        assert!(futures_util::poll!(polling.as_mut()).is_pending());
+        let name = crate::server::pane::respawn_paired_if_dead(&state, &row.id, &row, 1)
+            .await
+            .unwrap();
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(name);
+        drop(lane);
+        let completed_tick = async {
+            loop {
+                let snapshot = state.runtime.publish(&state).await.unwrap();
+                if snapshot
+                    .value
+                    .contents
+                    .sessions
+                    .iter()
+                    .find(|item| item.id == row.id)
+                    .is_some_and(|item| {
+                        item.auxiliary.iter().any(|observation| {
+                            observation.target == crate::session::AuxiliaryTarget::Host { index: 0 }
+                        })
+                    })
+                {
+                    break snapshot;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        };
+        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::select! {
+                _ = &mut polling => panic!("status loop ended before its tick"),
+                snapshot = completed_tick => snapshot,
+            }
+        })
+        .await
+        .unwrap();
+        state.shutdown.cancel();
+        drop(polling);
+        let published = snapshot
+            .value
+            .contents
+            .sessions
+            .iter()
+            .find(|item| item.id == row.id)
+            .unwrap();
+        assert!(
+            published
+                .auxiliary
+                .iter()
+                .any(|observation| observation.target
+                    == crate::session::AuxiliaryTarget::Host { index: 1 }
+                    && observation.pane.state == crate::session::PanePresence::Alive),
+            "a queued tick discarded the live extra terminal: {:?}",
+            published.auxiliary
+        );
+    }
+
+    async fn flush_test_rows(
+        instances: &mut Vec<Instance>,
+        bundles: std::collections::HashMap<String, PassiveTransitionWrites>,
+    ) {
+        let file_watch = crate::file_watch::FileWatchService::noop();
+        let mut metadata = load_all_profiles(&file_watch).unwrap().metadata;
+        let publication = tokio::sync::RwLock::new(());
+        let transition = Arc::new(crate::session::StorageTransition::acquire().unwrap());
+        let guard = publication.write().await;
+        flush_passive_transition_writes(
+            file_watch,
+            instances,
+            &mut metadata,
+            bundles,
+            &transition,
+            &guard,
+        )
+        .await
+        .unwrap();
+    }
 
     /// #2758: the reconciler's persistent per-session maps must be swept
     /// against the live instance set every tick, so a deleted session's id
@@ -568,11 +836,6 @@ mod tests {
         );
     }
 
-    // #2755 (follow-up to #2729): the poller must not strand an in-memory
-    // unread mark on a persist that never landed. `flush_passive_transition_writes`
-    // applies the mark to the live vec only after `persist_session_update`
-    // returns Ok; on failure the row stays unmarked so memory and disk agree,
-    // rather than showing a phantom unread that the next reload silently drops.
     #[tokio::test]
     #[serial_test::serial]
     async fn flush_passive_transition_defers_unread_until_persist_ok() {
@@ -581,8 +844,9 @@ mod tests {
         let profile = "flush-persist-failure";
         // Force the flock write to fail: making `sessions.json` a directory
         // makes the store's read-modify-write error out during `update`.
+        // (`dir` is bound here but blocked below, after the metadata preload:
+        // the preload reads this same profile, so it must run first.)
         let dir = crate::session::get_profile_dir(profile).expect("profile dir");
-        std::fs::create_dir_all(dir.join("sessions.json")).expect("sessions.json dir");
 
         let mut inst = Instance::new("idle-session", "/tmp/idle");
         inst.source_profile = profile.to_string();
@@ -596,14 +860,28 @@ mod tests {
             .or_default()
             .unread_ids
             .push(id.clone());
-
-        flush_passive_transition_writes(
-            crate::file_watch::FileWatchService::noop(),
+        let file_watch = crate::file_watch::FileWatchService::noop();
+        let mut metadata = load_all_profiles(&file_watch).unwrap().metadata;
+        let publication = tokio::sync::RwLock::new(());
+        let transition = Arc::new(crate::session::StorageTransition::acquire().unwrap());
+        // Block the data file only now: the preload above must read this
+        // profile successfully so the failure surfaces at persist time,
+        // where the flush defers the unread mark, not at reload.
+        std::fs::create_dir_all(dir.join("sessions.json")).expect("sessions.json dir");
+        let guard = publication.write().await;
+        let persisted = flush_passive_transition_writes(
+            file_watch,
             &mut instances,
+            &mut metadata,
             bundles,
+            &transition,
+            &guard,
         )
         .await;
-
+        assert!(
+            persisted.is_err(),
+            "blocking sessions.json must fail the passive-status persist"
+        );
         assert!(
             !instances[0].unread,
             "a failed persist must not leave a phantom in-memory unread mark (see #2755)"
@@ -641,12 +919,7 @@ mod tests {
             .unread_ids
             .push(id.clone());
 
-        flush_passive_transition_writes(
-            crate::file_watch::FileWatchService::noop(),
-            &mut instances,
-            bundles,
-        )
-        .await;
+        flush_test_rows(&mut instances, bundles).await;
 
         assert!(
             instances[0].unread,
@@ -730,12 +1003,7 @@ mod tests {
             );
 
         let mut instances = vec![a1, b1];
-        flush_passive_transition_writes(
-            crate::file_watch::FileWatchService::noop(),
-            &mut instances,
-            bundles,
-        )
-        .await;
+        flush_test_rows(&mut instances, bundles).await;
 
         let disk_a = crate::session::Storage::new_unwatched("flush-a")
             .expect("storage")

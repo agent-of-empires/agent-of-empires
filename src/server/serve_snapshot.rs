@@ -10,8 +10,9 @@ use super::state::AppState;
 /// `process_start` is emitted separately by the caller before transport setup.
 /// All sends are best-effort and swallow errors; nothing leaves the box unless
 /// the user opted in and an endpoint is configured.
-pub(super) fn spawn_serve_snapshot_loop(state: Arc<AppState>) {
-    tokio::spawn(async move {
+pub(super) async fn spawn_serve_snapshot_loop(state: Arc<AppState>) {
+    let work = state.runtime.work.clone();
+    work.spawn("server.usage_snapshot", async move {
         // Jittered period (4h + up to 30m) so installs that boot together don't
         // snapshot in lockstep; the first tick is still immediate (boot
         // snapshot). `Delay` avoids a burst of catch-up ticks after a stall.
@@ -29,6 +30,7 @@ pub(super) fn spawn_serve_snapshot_loop(state: Arc<AppState>) {
         let mut aggregator = crate::telemetry::aggregate::UsageAggregator::default();
         loop {
             tokio::select! {
+                biased;
                 _ = state.shutdown.cancelled() => {
                     // Deduped: a serve process that starts and stops between
                     // periodic ticks would otherwise emit the initial first-tick

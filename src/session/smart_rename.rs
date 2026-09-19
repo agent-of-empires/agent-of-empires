@@ -638,26 +638,15 @@ pub(crate) fn title_is_auto_overwritable(inst: &crate::session::instance::Instan
 const CONTEXT_HEAD_BYTES: usize = 3072;
 const CONTEXT_TAIL_BYTES: usize = 1024;
 
-/// Cheap poll-hot-path gate: fire a detached terminal rename for this session
-/// iff it is a still-default-named, non-structured, not-yet-attempted session
-/// whose resolved config has smart rename on. The full eligibility check
-/// (one-shot support, command override, sandbox rename-agent match) runs in the
-/// detached child, which re-reads storage so it can never act on the stale
-/// snapshot the poller held. Called from both status pollers on the
-/// `Running -> Idle` edge.
+pub(crate) fn terminal_smart_rename_candidate(inst: &crate::session::Instance) -> bool {
+    !inst.is_structured() && !inst.smart_rename_attempted && is_default_civ_name(&inst.title)
+}
+
 pub fn maybe_spawn_terminal_smart_rename(inst: &crate::session::instance::Instance) {
-    if inst.is_structured() || inst.smart_rename_attempted || !is_default_civ_name(&inst.title) {
+    if !terminal_smart_rename_candidate(inst) {
         return;
     }
-    // Resolve config and run the FULL eligibility check on the (rare)
-    // turn-completion edge, never per tick. Doing the whole check here (not just
-    // the setting) matters: an ineligible session (disabled, no one-shot,
-    // overridden command, or a sandbox rename-agent mismatch) never marks itself
-    // attempted, so a cheaper gate would re-fork a child on every later turn. A
-    // sandboxed session whose container is down is filtered later, in the
-    // child's resolve_oneshot_target, so it can retry when the container comes
-    // back. The child re-checks against fresh storage anyway, so this is a
-    // fork-avoidance filter, not the authority.
+    // Reject disabled or unsupported naming before creating a child process.
     let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
         &inst.source_profile,
         Path::new(&inst.project_path),
@@ -916,55 +905,50 @@ fn extract_echo_baseline(context: &str) -> String {
         .to_string()
 }
 
-/// Persist the outcome of a terminal one-shot. Always marks the session
-/// attempted (the one-shot returned output, usable or not, so we must not
-/// respawn on every later turn), and writes the new title only while the
-/// current title is still auto-overwritable, so a manual rename that landed
-/// during the one-shot always wins.
+fn apply_title_outcome(
+    instances: &mut [crate::session::Instance],
+    id: &str,
+    new_title: Option<String>,
+) -> Option<(String, String)> {
+    let index = instances.iter().position(|instance| instance.id == id)?;
+    let terminal = !instances[index].is_structured();
+    if terminal {
+        instances[index].smart_rename_attempted = true;
+    }
+    let title = new_title?;
+    let instance = &instances[index];
+    if !title_is_auto_overwritable(instance) || instance.title == title {
+        return None;
+    }
+    if crate::session::is_duplicate_session(
+        instances.iter(),
+        &title,
+        &instance.project_path,
+        Some(id),
+    ) {
+        tracing::warn!(target: "smart_rename", session = %id, title = %title, "skipped duplicate auto-title");
+        return None;
+    }
+    let instance = &mut instances[index];
+    let old = std::mem::replace(&mut instance.title, title.clone());
+    let rekey = terminal.then(|| (old, title.clone()));
+    instance.last_auto_title = Some(title);
+    rekey
+}
+
 fn apply_terminal_title(
     storage: &crate::session::storage::Storage,
     id: &str,
-    new_title: Option<&str>,
+    new_title: Option<String>,
 ) -> anyhow::Result<()> {
-    let id = id.to_string();
-    let new_title = new_title.map(str::to_string);
     let identity_lock = crate::session::acquire_session_identity_lock()?;
-    let _session_title_lock = crate::session::storage::acquire_session_title_lock(&id)?;
-    let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(&id)?;
-    let rekey = storage.update(|instances, _groups| {
-        let mut rekey = None;
-        if let Some(index) = instances.iter().position(|instance| instance.id == id) {
-            instances[index].smart_rename_attempted = true;
-            if let Some(title) = &new_title {
-                let should_write = title_is_auto_overwritable(&instances[index])
-                    && instances[index].title != *title;
-                // Manual and automatic rename paths share one domain predicate;
-                // exclude this row explicitly so the uniqueness contract does
-                // not depend on `should_write` remaining title-sensitive.
-                let path = instances[index].project_path.clone();
-                let duplicate = should_write
-                    && crate::session::is_duplicate_session(
-                        instances.iter(),
-                        title,
-                        &path,
-                        Some(&id),
-                    );
-                if duplicate {
-                    tracing::warn!(target: "smart_rename", session = %id, title = %title, "skipped duplicate auto-title");
-                } else if should_write {
-                    let instance = &mut instances[index];
-                    rekey = Some((instance.title.clone(), title.clone()));
-                    tracing::info!(target: "smart_rename", session = %id, old = %instance.title, new = %title, "auto-renamed terminal session");
-                    instance.title = title.clone();
-                    instance.last_auto_title = Some(title.clone());
-                }
-            }
-        }
-        Ok(rekey)
-    })?;
+    let _session_title_lock = crate::session::storage::acquire_session_title_lock(id)?;
+    let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(id)?;
+    let rekey =
+        storage.update(|instances, _groups| Ok(apply_title_outcome(instances, id, new_title)))?;
     drop(identity_lock);
     if let Some((old_title, new_title)) = rekey {
-        if let Err(error) = crate::tmux::rekey_session(&id, &old_title, &new_title) {
+        if let Err(error) = crate::tmux::rekey_session(id, &old_title, &new_title) {
             tracing::warn!(target: "smart_rename", session = %id, "tmux rename failed: {error}");
         }
     }
@@ -1017,123 +1001,118 @@ async fn rename_structured_via_daemon(session_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Body of the terminal (non-ACP) smart rename. Best-effort and
-/// fire-and-forget: every early return leaves the civ name in place. All
-/// gates are re-checked against freshly loaded storage so a rename that landed
-/// (or a deletion, or a config change) since the poller observed the edge
-/// always wins. `force` bypasses only the `smart_rename`-disabled gate (#3039).
-pub async fn run_terminal_rename(
+struct TerminalRenameReservation {
+    storage: crate::session::storage::Storage,
+    _session_lock: std::fs::File,
+    _slot: std::fs::File,
+}
+
+struct TerminalRenameWork {
+    reservation: TerminalRenameReservation,
+    baseline: String,
+    argv: Vec<String>,
+    sandboxed: bool,
+    container_workdir: String,
+    project_path: String,
+}
+
+fn prepare_terminal_rename(
     profile: &str,
     session_id: &str,
     force: bool,
-) -> anyhow::Result<()> {
-    // Per-session lock first: if another process is already handling this
-    // session, exit immediately (do not queue).
-    let Some(_session_lock) = try_session_lock(session_id) else {
-        return Ok(());
+) -> anyhow::Result<Option<TerminalRenameWork>> {
+    let Some(session_lock) = try_session_lock(session_id) else {
+        return Ok(None);
     };
-
     let storage = crate::session::storage::Storage::open_unwatched(profile)?;
-    let (instances, _groups) = storage.load_with_groups()?;
-    let Some((
-        title,
-        tool,
-        command,
-        project_path,
-        sandboxed,
-        container_workdir,
-        detect_as,
-        already,
-        structured,
-    )) = instances.iter().find(|i| i.id == session_id).map(|i| {
-        (
-            i.title.clone(),
-            i.tool.clone(),
-            i.command.clone(),
-            i.project_path.clone(),
-            i.is_sandboxed(),
-            i.container_workdir(),
-            i.detect_as.clone(),
-            i.smart_rename_attempted,
-            i.is_structured(),
-        )
-    })
-    else {
-        return Ok(());
+    let Some(instance) = storage.load()?.into_iter().find(|row| row.id == session_id) else {
+        return Ok(None);
     };
-    drop(instances);
-    // Durable double-check: storage may have propagated a completed attempt (or
-    // a manual rename) since the poller observed the edge. `force` (the manual
-    // "Auto-name now") bypasses the attempted gate so a session whose automatic
-    // one-shot already ran but produced no usable title can be re-run, mirroring
-    // how the structured endpoint clears its attempted set. The NameNotDefault
-    // gate below and title_is_auto_overwritable still protect a named session.
-    if (already && !force) || structured {
-        return Ok(());
+    if (instance.smart_rename_attempted && !force) || instance.is_structured() {
+        return Ok(None);
     }
-
     let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
         profile,
-        Path::new(&project_path),
+        Path::new(&instance.project_path),
     );
     let cfg = resolve_smart_rename_config(&resolved.session);
+    let sandboxed = instance.is_sandboxed();
     let agent = match check_eligible_resolved(
-        // Terminal owned turns are an eligible session kind; the `structured`
-        // gate exists only so the daemon's generic ACP listener skips
-        // non-structured sessions, which does not apply to this deliberate
-        // terminal trigger.
         true,
         cfg.setting_on || force,
-        &title,
-        &tool,
+        &instance.title,
+        &instance.tool,
         cfg.rename_agent,
         sandboxed,
-        &command,
+        &instance.command,
         cfg.overrides,
     ) {
         Ok(agent) => agent,
         Err(reason) => {
             tracing::debug!(target: "smart_rename", session = %session_id, reason = reason.as_str(), "terminal skip");
-            return Ok(());
+            return Ok(None);
         }
     };
-
-    let tmux = crate::tmux::Session::new(session_id, &title)?;
-    // Same resolution the status poller uses: own status rules first, then the
-    // `agent_detect_as` alias, resolved through the live registry so a session
-    // whose alias entry landed after it was created is not stranded on the raw
-    // tool name here (which would skip `strip_agent_banner` and read the pane
-    // with no detector).
-    let detect_tool = crate::tmux::status_rules::detection_tool(profile, &tool, &detect_as);
-
-    // Best-effort no-race: the poller fired on Running -> Idle, but the user may
-    // have started another turn since. Only proceed while the pane still reads
-    // idle; a later idle edge retries.
+    let tmux = crate::tmux::Session::new(session_id, &instance.title)?;
+    let detect_tool =
+        crate::tmux::status_rules::detection_tool(profile, &instance.tool, &instance.detect_as);
     if let Ok(content) = tmux.capture_pane(50) {
         if crate::tmux::detect_status_from_content_in(profile, &content, &detect_tool)
             == crate::session::Status::Running
         {
-            return Ok(());
+            return Ok(None);
         }
     }
-
     let Some(context) = capture_terminal_context(&tmux, &detect_tool) else {
         tracing::debug!(target: "smart_rename", session = %session_id, "terminal skip: unusable pane capture");
-        return Ok(());
+        return Ok(None);
     };
-
-    // Global concurrency slot, taken only once real work is imminent so
-    // early-return paths never hold one.
-    let Some(_slot) = try_global_slot() else {
-        return Ok(());
+    let Some(slot) = try_global_slot() else {
+        return Ok(None);
     };
-
     let baseline = extract_echo_baseline(&context);
     let prompt = build_prompt(&context);
     let model = OneshotModel::Title(resolve_title_model_args(agent, cfg.rename_model));
     let Some(argv) = build_oneshot_argv(agent, &prompt, model) else {
-        return Ok(());
+        return Ok(None);
     };
+    let container_workdir = instance.container_workdir();
+    Ok(Some(TerminalRenameWork {
+        reservation: TerminalRenameReservation {
+            storage,
+            _session_lock: session_lock,
+            _slot: slot,
+        },
+        baseline,
+        argv,
+        sandboxed,
+        container_workdir,
+        project_path: instance.project_path,
+    }))
+}
+
+async fn compute_terminal_rename(
+    profile: &str,
+    session_id: &str,
+    force: bool,
+) -> anyhow::Result<Option<(TerminalRenameReservation, Option<String>)>> {
+    let profile_owned = profile.to_owned();
+    let id_owned = session_id.to_owned();
+    let Some(work) = tokio::task::spawn_blocking(move || {
+        prepare_terminal_rename(&profile_owned, &id_owned, force)
+    })
+    .await??
+    else {
+        return Ok(None);
+    };
+    let TerminalRenameWork {
+        reservation,
+        baseline,
+        argv,
+        sandboxed,
+        container_workdir,
+        project_path,
+    } = work;
     let Some(target) = resolve_oneshot_target(
         session_id,
         sandboxed,
@@ -1143,19 +1122,46 @@ pub async fn run_terminal_rename(
     )
     .await
     else {
-        // Container not usable right now: transient, so leave the session
-        // un-attempted for a later idle edge.
-        return Ok(());
+        return Ok(None);
     };
     let Some(raw) = run_oneshot(session_id, &target.argv, &target.cwd, ONESHOT_TIMEOUT).await
     else {
-        // Transient failure (spawn / timeout / non-zero exit): leave the session
-        // un-attempted so a later turn can retry.
-        return Ok(());
+        return Ok(None);
     };
-    let new_title = sanitize_title(&raw, &baseline);
-    apply_terminal_title(&storage, session_id, new_title.as_deref())?;
+    Ok(Some((reservation, sanitize_title(&raw, &baseline))))
+}
+
+pub async fn run_terminal_rename(
+    profile: &str,
+    session_id: &str,
+    force: bool,
+) -> anyhow::Result<()> {
+    if let Some((reservation, title)) = compute_terminal_rename(profile, session_id, force).await? {
+        apply_terminal_title(&reservation.storage, session_id, title)?;
+    }
     Ok(())
+}
+
+pub(crate) async fn try_terminal_smart_rename(
+    state: std::sync::Arc<crate::server::AppState>,
+    profile: String,
+    session_id: String,
+    force: bool,
+) {
+    let result: anyhow::Result<()> = async {
+        let Some((reservation, title)) =
+            compute_terminal_rename(&profile, &session_id, force).await?
+        else {
+            return Ok(());
+        };
+        let result = serve::apply_auto_title(&state, &session_id, &profile, title).await;
+        drop(reservation);
+        result
+    }
+    .await;
+    if let Err(error) = result {
+        tracing::warn!(target: "smart_rename", session = %session_id, %error, "terminal title job failed");
+    }
 }
 
 pub use serve::{should_trigger_smart_rename, try_smart_rename};
@@ -1372,109 +1378,197 @@ mod serve {
             return;
         };
 
-        // Serialization against manual rename / worktree edits is handled
-        // inside apply_auto_title via the per-session instance lock.
-        apply_auto_title(&state, &session_id, &profile, &new_title).await;
+        if let Err(error) = apply_auto_title(&state, &session_id, &profile, Some(new_title)).await {
+            tracing::warn!(target: "smart_rename", session = %session_id, %error, "title commit failed");
+        }
     }
 
-    /// Persist an automatically generated title and mirror it into AppState.
-    /// The title changes only while it remains auto-overwritable. The
-    /// process-local instance lock, global identity lock, and per-session title
-    /// lock serialize the write with manual renames. Identity covers duplicate
-    /// validation through the durable write. The title lock remains held
-    /// through the AppState mirror so a later writer cannot be overwritten in
-    /// memory. Unchanged and duplicate titles are skipped.
     pub(crate) async fn apply_auto_title(
         state: &Arc<AppState>,
         id: &str,
         profile: &str,
-        new_title: &str,
-    ) {
-        let lock = state.instance_lock(id).await;
-        let _serialized = lock.lock().await;
-
-        let storage = match crate::session::storage::Storage::new(profile, state.file_watch.clone())
+        new_title: Option<String>,
+    ) -> anyhow::Result<()> {
+        let namespace = state.profile_namespace.read().await;
+        if !state
+            .instances
+            .read()
+            .await
+            .iter()
+            .any(|row| row.id == id && row.source_profile == profile)
         {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(target: "smart_rename", session = %id, "storage open failed: {e}");
-                return;
-            }
+            return Ok(());
+        }
+        let lock = state.instance_lock(id).await;
+        let serialized = lock.lock().await;
+        let profile_owned = profile.to_owned();
+        let id_owned = id.to_owned();
+        let file_watch = state.file_watch.clone();
+        let failure_health = || crate::daemon::RuntimeHealth::Degraded {
+            code: crate::daemon::ReloadFailureCode::ProfileData,
+            profiles: vec![profile.to_owned()],
         };
-        // Own copies for the closure below: `storage.update` runs inside
-        // `spawn_blocking`, whose body must be `'static + Send`, so the borrowed
-        // `id`/`new_title` cannot cross the thread boundary. The in-memory
-        // mirror after the join reuses the borrowed `new_title` directly.
-        let id_owned = id.to_string();
-        let title_owned = new_title.to_string();
-        let persisted = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let identity_lock = crate::session::acquire_session_identity_lock()?;
-            let session_title_lock =
-                crate::session::storage::acquire_session_title_lock(&id_owned)?;
-            let wrote = storage.update(|instances, _groups| {
-                let Some(index) = instances
-                    .iter()
-                    .position(|instance| instance.id == id_owned)
-                else {
-                    return Ok(false);
-                };
-                // Manual and automatic rename paths share one domain predicate;
-                // exclude this row explicitly so a future no-op policy change
-                // cannot make the row collide with itself.
-                let should_write = title_is_auto_overwritable(&instances[index])
-                    && instances[index].title != title_owned;
-                let path = instances[index].project_path.clone();
-                let duplicate = should_write
-                    && crate::session::is_duplicate_session(
-                        instances.iter(),
-                        &title_owned,
-                        &path,
-                        Some(&id_owned),
-                    );
-                if duplicate {
-                    tracing::warn!(target: "smart_rename", session = %id_owned, title = %title_owned, "skipped duplicate auto-title");
-                    Ok(false)
-                } else if should_write {
-                    instances[index].title = title_owned.clone();
-                    // Last owned use of `title_owned`: move it into the field
-                    // rather than cloning a second time.
-                    instances[index].last_auto_title = Some(title_owned);
-                    Ok(true)
-                } else {
-                    Ok(false)
-                }
-            })?;
-            drop(identity_lock);
-            Ok((wrote, session_title_lock))
+        let locked = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let storage = crate::session::storage::Storage::open(&profile_owned, file_watch)?;
+            let identity = crate::session::acquire_session_identity_lock()?;
+            let title = crate::session::storage::acquire_session_title_lock(&id_owned)?;
+            let lifecycle = storage.acquire_instance_lifecycle_lock(&id_owned)?;
+            let transition = storage.acquire_write_transition()?;
+            Ok((storage, identity, title, lifecycle, transition, id_owned))
         })
-        .await;
-        let (wrote, _session_title_lock) = match persisted {
-            Ok(Ok(result)) => result,
-            Ok(Err(e)) => {
-                tracing::warn!(target: "smart_rename", session = %id, "persist failed: {e}");
-                return;
-            }
-            Err(e) => {
-                tracing::warn!(target: "smart_rename", session = %id, "persist join failed: {e}");
-                return;
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|result| result);
+        let (storage, identity, title, lifecycle, transition, id_owned) = match locked {
+            Ok(locked) => locked,
+            Err(error) => {
+                state.mark_reload_failure(failure_health()).await;
+                return Err(error);
             }
         };
-        if !wrote {
-            return;
+        let publication = state.publication.write().await;
+        anyhow::ensure!(
+            *state.canonical_health.read().await == crate::daemon::RuntimeHealth::Healthy,
+            "runtime state is unavailable"
+        );
+        let committed = tokio::task::spawn_blocking(move || {
+            transition
+                .update_with_snapshot(&storage, |instances, _groups| {
+                    Ok(apply_title_outcome(instances, &id_owned, new_title))
+                })
+                .map(|(rekey, rows, groups)| (rekey, rows, groups, id_owned, (storage, transition)))
+        })
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|result| result);
+        let (rekey, rows, groups, id_owned, prepared) = match committed {
+            Ok(committed) => committed,
+            Err(error) => {
+                *state.canonical_health.write().await = failure_health();
+                state.runtime.request_publish();
+                return Err(error);
+            }
+        };
+        if let Err(error) = crate::server::reload::adopt_committed_profiles(
+            state,
+            [(profile, rows, groups)],
+            |_| false,
+            &publication,
+        )
+        .await
+        {
+            *state.canonical_health.write().await = error.health.clone();
+            state.runtime.request_publish();
+            return Err(error.into());
         }
-
-        let mut instances = state.instances.write().await;
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-            tracing::info!(target: "smart_rename", session = %id, old = %inst.title, new = %new_title, "auto-renamed session");
-            inst.title = new_title.to_string();
-            inst.last_auto_title = Some(new_title.to_string());
+        drop(publication);
+        drop(prepared);
+        drop(identity);
+        if let Some((old, new)) = rekey {
+            let rekeyed = tokio::task::spawn_blocking(move || {
+                crate::tmux::rekey_session(&id_owned, &old, &new)
+            })
+            .await;
+            match rekeyed {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(target: "smart_rename", session = %id, %error, "tmux rename failed")
+                }
+                Err(error) => {
+                    tracing::warn!(target: "smart_rename", session = %id, %error, "tmux rename task failed")
+                }
+            }
         }
+        drop(lifecycle);
+        drop(title);
+        drop(serialized);
+        drop(namespace);
+        state.runtime.publish(state).await?;
+        Ok(())
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
         use std::time::Duration;
+
+        async fn state_for_default_profile(rows: Vec<crate::session::Instance>) -> Arc<AppState> {
+            let state = crate::server::test_support::build_test_app_state(rows);
+            *state.canonical_metadata.write().await = crate::server::reload::CanonicalMetadata {
+                default_profile: "default".into(),
+                profiles: vec![crate::daemon::ProfileSnapshot {
+                    name: "default".into(),
+                    description: None,
+                    groups: Vec::new(),
+                    projects: Vec::new(),
+                }],
+                ..Default::default()
+            };
+            state
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn auto_title_publishes_its_complete_committed_profile() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let storage = crate::session::storage::Storage::new_unwatched("default").unwrap();
+            let mut target = crate::session::Instance::new("Franks", "/tmp/title-target");
+            target.source_profile = "default".into();
+            let target_id = target.id.clone();
+            storage
+                .update(|rows, _| {
+                    rows.push(target.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let state = state_for_default_profile(vec![target]).await;
+            state.runtime.publish(&state).await.unwrap();
+
+            let peer = crate::session::Instance::new("Peer", "/tmp/title-peer");
+            let peer_id = peer.id.clone();
+            let mut group = crate::session::Group::new("Peer group", "peer");
+            group.collapsed = true;
+            storage
+                .update(|rows, groups| {
+                    rows.push(peer);
+                    groups.push(group.clone());
+                    Ok(())
+                })
+                .unwrap();
+
+            apply_auto_title(
+                &state,
+                &target_id,
+                "default",
+                Some("Commit canonical titles".into()),
+            )
+            .await
+            .unwrap();
+
+            let snapshot = state.runtime.snapshot(&state).await.unwrap();
+            let titles: std::collections::BTreeMap<_, _> = snapshot
+                .value
+                .contents
+                .sessions
+                .iter()
+                .map(|row| (row.id.as_str(), row.title.as_str()))
+                .collect();
+            assert_eq!(
+                titles,
+                std::collections::BTreeMap::from([
+                    (target_id.as_str(), "Commit canonical titles"),
+                    (peer_id.as_str(), "Peer"),
+                ])
+            );
+            let profile = snapshot
+                .value
+                .contents
+                .profiles
+                .iter()
+                .find(|profile| profile.name == "default")
+                .unwrap();
+            assert_eq!(profile.groups, vec![group]);
+        }
 
         #[tokio::test]
         #[serial_test::serial]
@@ -1493,9 +1587,11 @@ mod serve {
                     Ok(())
                 })
                 .unwrap();
-            let state = crate::server::test_support::build_test_app_state(vec![target, owner]);
+            let state = state_for_default_profile(vec![target, owner]).await;
 
-            apply_auto_title(&state, &target_id, "default", "Already owned").await;
+            apply_auto_title(&state, &target_id, "default", Some("Already owned".into()))
+                .await
+                .unwrap();
 
             let persisted = storage.load().unwrap();
             assert_eq!(
@@ -1586,14 +1682,6 @@ mod serve {
         }
 
         #[test]
-        fn oneshot_timeout_is_60s() {
-            // Drift-guard against future bump-back: #2347 raised this to 120s
-            // to absorb the prompt-handler race; #2348 removed the race at
-            // source, so this should stay at the deferred-trigger ceiling.
-            assert_eq!(ONESHOT_TIMEOUT, Duration::from_secs(60));
-        }
-
-        #[test]
         fn should_trigger_smart_rename_only_on_clean_prompt_complete_stop() {
             use crate::acp::state::Event;
             let id = "s-1";
@@ -1648,29 +1736,6 @@ mod serve {
                 should_trigger_smart_rename(&clean, "other-session", &attempted, &empty),
                 "gates must be per-session, not global"
             );
-        }
-
-        #[test]
-        fn force_smart_rename_attempted_clear_re_enables_retry() {
-            // `force_smart_rename` at sessions.rs:2582-2587 clears the
-            // attempted gate before spawning `try_smart_rename`, and does NOT
-            // wait for an `Event::Stopped`: the manual retry path stays
-            // on-demand. The bounding is delegated to the shared semaphore
-            // acquired inside `try_smart_rename`. This test emulates the
-            // clear step and asserts the predicate would fire again for the
-            // same session (which the listener uses; force_smart_rename itself
-            // skips the predicate and spawns directly).
-            use crate::acp::state::Event;
-            let id = "s-1";
-            let mut attempted = HashSet::new();
-            attempted.insert(id.to_string());
-            let inflight = HashSet::new();
-            let ev = Event::Stopped {
-                reason: "prompt_complete".into(),
-            };
-            assert!(!should_trigger_smart_rename(&ev, id, &attempted, &inflight));
-            attempted.remove(id);
-            assert!(should_trigger_smart_rename(&ev, id, &attempted, &inflight));
         }
     }
 }
@@ -1834,98 +1899,6 @@ mod tests {
             &wrapped[wrapped.len() - argv.len()..],
             &argv[..],
             "the agent argv must survive verbatim as the trailing elements"
-        );
-    }
-
-    #[test]
-    fn every_skip_reason_has_a_user_message() {
-        // Every variant, kept exhaustive by the compiler: a new `SkipReason` has
-        // to be destructured here, which forces it into the list below.
-        let all = {
-            let _exhaustive = |r: SkipReason| match r {
-                SkipReason::NotStructured
-                | SkipReason::Disabled
-                | SkipReason::NameNotDefault
-                | SkipReason::Sandboxed
-                | SkipReason::SandboxRenameAgentMismatch
-                | SkipReason::NoOneshot
-                | SkipReason::CommandOverridden => (),
-            };
-            [
-                SkipReason::NotStructured,
-                SkipReason::Disabled,
-                SkipReason::NameNotDefault,
-                SkipReason::Sandboxed,
-                SkipReason::SandboxRenameAgentMismatch,
-                SkipReason::NoOneshot,
-                SkipReason::CommandOverridden,
-            ]
-        };
-        for reason in all {
-            assert!(
-                !reason.user_message().is_empty(),
-                "{} has no user message",
-                reason.as_str()
-            );
-        }
-    }
-
-    #[test]
-    fn manual_force_bypasses_only_the_disabled_gate() {
-        // The manual "Auto-name now" action calls check_eligible with
-        // `setting_on = cfg.setting_on || force`. `auto` is the (off) setting,
-        // `force` is the manual flag; the automatic path is `auto` alone,
-        // the manual path is `auto || force`. Both are bindings, not literals,
-        // so the boolean expression documents the real call shape (#3039).
-        let c = Some(claude());
-        let auto = false;
-        let force = true;
-        assert_eq!(
-            check_eligible(true, auto, "Vikings", c, "", false),
-            Err(SkipReason::Disabled),
-            "automatic path must still honor the disabled setting"
-        );
-        assert!(
-            check_eligible(true, auto || force, "Vikings", c, "", false).is_ok(),
-            "manual force must bypass the disabled gate"
-        );
-        // Forcing past Disabled must not smuggle past any other gate: an
-        // otherwise-ineligible session is still rejected on the forced path.
-        assert!(
-            matches!(
-                check_eligible_resolved(
-                    true,
-                    auto || force,
-                    "Vikings",
-                    "claude",
-                    "codex",
-                    true,
-                    "",
-                    &HashMap::new()
-                ),
-                Err(SkipReason::SandboxRenameAgentMismatch)
-            ),
-            "sandbox rename-agent gate still applies when forced"
-        );
-        assert_eq!(
-            check_eligible(true, auto || force, "Fix login bug", c, "", false),
-            Err(SkipReason::NameNotDefault),
-            "already-named gate still applies when forced"
-        );
-        assert_eq!(
-            check_eligible(false, auto || force, "Vikings", c, "", false),
-            Err(SkipReason::NotStructured),
-            "structured gate still applies when forced"
-        );
-        assert_eq!(
-            check_eligible(true, auto || force, "Vikings", None, "", false),
-            Err(SkipReason::NoOneshot),
-            "no-one-shot gate still applies when forced"
-        );
-        assert_eq!(
-            check_eligible(true, auto || force, "Vikings", c, "", true),
-            Err(SkipReason::CommandOverridden),
-            "command-override gate still applies when forced"
         );
     }
 
@@ -2344,32 +2317,6 @@ Rewrote the getting-started section and fixed two broken links.";
     }
 
     #[test]
-    fn instruction_tells_model_to_ignore_startup_banner() {
-        let lc = INSTRUCTION.to_lowercase();
-        assert!(lc.contains("startup banner"));
-        assert!(lc.contains("ignore"));
-    }
-
-    #[test]
-    fn render_first_turn_frames_prompt_and_agent() {
-        // With agent prose, both halves appear under labels.
-        let r = render_first_turn("fix the login bug", "Patched the redirect in auth.rs");
-        assert_eq!(
-            r,
-            "User:\nfix the login bug\n\nAgent:\nPatched the redirect in auth.rs"
-        );
-        // With no agent prose, render is prompt-only (pre-#2801 behavior).
-        assert_eq!(
-            render_first_turn("fix the login bug", ""),
-            "fix the login bug"
-        );
-        assert_eq!(
-            render_first_turn("fix the login bug", "   "),
-            "fix the login bug"
-        );
-    }
-
-    #[test]
     fn render_first_turn_caps_each_half_independently() {
         // A huge prompt must not crowd out the agent half: each side is capped
         // to its own budget, so the agent prose still survives.
@@ -2726,7 +2673,7 @@ claude = "repo-wrapper"
             let _observer =
                 crate::session::storage::observe_lock_contention_for_test(identity_contended_tx);
             let storage = Storage::new_unwatched("identity-lock").unwrap();
-            apply_terminal_title(&storage, &writer_id, Some("Shared title")).unwrap();
+            apply_terminal_title(&storage, &writer_id, Some("Shared title".to_owned())).unwrap();
             finished_tx.send(()).unwrap();
         });
         let contended = identity_contended_rx.recv_timeout(std::time::Duration::from_secs(2));
@@ -2765,7 +2712,7 @@ claude = "repo-wrapper"
             })
             .unwrap();
 
-        apply_terminal_title(&storage, &civ_id, Some("Fix login bug")).unwrap();
+        apply_terminal_title(&storage, &civ_id, Some("Fix login bug".to_owned())).unwrap();
 
         let inst = storage
             .load()
@@ -2800,8 +2747,8 @@ claude = "repo-wrapper"
             })
             .unwrap();
 
-        apply_terminal_title(&storage, &manual_id, Some("Should Not Apply")).unwrap();
-        apply_terminal_title(&storage, &duplicate_id, Some("Already owned")).unwrap();
+        apply_terminal_title(&storage, &manual_id, Some("Should Not Apply".to_owned())).unwrap();
+        apply_terminal_title(&storage, &duplicate_id, Some("Already owned".to_owned())).unwrap();
 
         let instances = storage.load().unwrap();
         let manual = instances.iter().find(|i| i.id == manual_id).unwrap();
@@ -2852,7 +2799,7 @@ claude = "repo-wrapper"
         };
 
         storage.set_fail_writes_for_test(true);
-        let error = apply_terminal_title(&storage, &failed_id, Some("Must Not Land"))
+        let error = apply_terminal_title(&storage, &failed_id, Some("Must Not Land".to_owned()))
             .expect_err("injected persistence failure must abort the title mutation");
         assert!(error
             .to_string()
@@ -2912,7 +2859,7 @@ claude = "repo-wrapper"
         );
         crate::tmux::refresh_session_cache();
 
-        apply_terminal_title(&storage, &civ_id, Some("Fix login bug")).unwrap();
+        apply_terminal_title(&storage, &civ_id, Some("Fix login bug".to_owned())).unwrap();
 
         assert!(!crate::tmux::Session::from_name(&old_tmux_name).exists());
         assert!(

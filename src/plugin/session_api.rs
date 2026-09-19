@@ -464,6 +464,7 @@ async fn admit_and_create(
 
     let spec = StructuredSessionSpec {
         title: req.title,
+        size: None,
         path: project_path,
         group: req.group.unwrap_or_default(),
         tool: req.agent_id.clone(),
@@ -485,9 +486,8 @@ async fn admit_and_create(
         // no per-repo base to honor.
         repo_base_branches: Vec::new(),
         scratch,
-        // The service forces this to Some(false) for plugin callers; set
-        // explicitly anyway so the intent is local.
-        trust_hooks: Some(false),
+        trust_hooks: None,
+        trust_review: None,
         custom_instruction: None,
         // Plugin-created sessions have no request-level dispatcher callback
         // or idempotency key; that surface is REST-only (#3156). Plugin
@@ -719,14 +719,7 @@ mod tests {
         }
     }
 
-    fn test_deps(prior: Vec<Instance>) -> (Arc<SessionRpcDeps>, tempfile::TempDir) {
-        let (deps, _state, dir) = test_deps_with_state(prior);
-        (deps, dir)
-    }
-
-    /// [`test_deps`] keeping the app state, for a test that has to publish
-    /// events through the real sink to move a session's control fold.
-    fn test_deps_with_state(
+    fn test_deps(
         prior: Vec<Instance>,
     ) -> (
         Arc<SessionRpcDeps>,
@@ -761,7 +754,7 @@ mod tests {
     /// touching any state.
     #[tokio::test]
     async fn authz_matrix_capability_gates() {
-        let (deps, _dir) = test_deps(Vec::new());
+        let (deps, _state, _dir) = test_deps(Vec::new());
         let none = ctx_with(&[]);
         for method in [
             "acp.capabilities.get",
@@ -788,7 +781,7 @@ mod tests {
     /// Uses a trusted-table bypass id so the decision is catalog-independent.
     #[tokio::test]
     async fn unattended_mode_requires_the_distinct_grant() {
-        let (deps, _dir) = test_deps(Vec::new());
+        let (deps, _state, _dir) = test_deps(Vec::new());
         let params = serde_json::json!({
             "agent_id": "claude",
             "project_path": "/tmp",
@@ -806,7 +799,7 @@ mod tests {
     /// rejected at decode, before any capability-gated work.
     #[tokio::test]
     async fn create_rejects_unknown_payload_fields() {
-        let (deps, _dir) = test_deps(Vec::new());
+        let (deps, _state, _dir) = test_deps(Vec::new());
         let ctx = ctx_with(&["session.create"]);
         let err = dispatch(
             &deps,
@@ -827,7 +820,7 @@ mod tests {
     /// error, refused before any spawn work.
     #[tokio::test]
     async fn probe_rejects_unknown_params() {
-        let (deps, _dir) = test_deps(Vec::new());
+        let (deps, _state, _dir) = test_deps(Vec::new());
         let ctx = ctx_with(&["acp.capabilities.probe"]);
         let err = dispatch(
             &deps,
@@ -845,7 +838,7 @@ mod tests {
     /// with a clear invalid-params error, before any spawn.
     #[tokio::test]
     async fn scratch_with_extra_repos_is_rejected() {
-        let (deps, _dir) = test_deps(Vec::new());
+        let (deps, _state, _dir) = test_deps(Vec::new());
         let ctx = ctx_with(&["session.create"]);
         let err = dispatch(
             &deps,
@@ -879,7 +872,7 @@ mod tests {
             "[acp.acp_defaults.claude]\nmodel = \"claude-pinned\"\npin_model = true\n",
         )
         .expect("write pinned config");
-        let (deps, _dir) = test_deps(Vec::new());
+        let (deps, _state, _dir) = test_deps(Vec::new());
         let ctx = ctx_with(&["session.create"]);
 
         let err = dispatch(
@@ -948,7 +941,7 @@ mod tests {
         // also needs the unattended grant to reach the pin gate.
         crate::acp::option_catalog::record("my-claude", &[], "2026-01-01T00:00:00Z".into())
             .expect("seed catalog");
-        let (deps, _dir) = test_deps(Vec::new());
+        let (deps, _state, _dir) = test_deps(Vec::new());
         let ctx = ctx_with(&["session.create", "session.unattended"]);
 
         let err = dispatch(
@@ -974,7 +967,7 @@ mod tests {
     /// end to end and confirming it returns the capability catalog shape.
     #[tokio::test]
     async fn probe_unknown_agent_is_noop_and_returns_catalog() {
-        let (deps, _dir) = test_deps(Vec::new());
+        let (deps, _state, _dir) = test_deps(Vec::new());
         let ctx = ctx_with(&["acp.capabilities.probe"]);
         let out = dispatch(
             &deps,
@@ -1003,7 +996,7 @@ mod tests {
                 i
             })
             .collect();
-        let (deps, _dir) = test_deps(prior);
+        let (deps, _state, _dir) = test_deps(prior);
         let ctx = ctx_with(&["session.create"]);
         // "claude" with no mode classifies Interactive (reviewed adapter), so no
         // unattended grant is needed and the request reaches the limit check.
@@ -1028,7 +1021,7 @@ mod tests {
         let mut other_session = Instance::new("other-owned", "/tmp/aoe-2897-project");
         other_session.id = "sess-other".to_string();
         other_session.created_by_plugin = Some("other-plugin".to_string());
-        let (deps, _dir) = test_deps(vec![user_session, other_session]);
+        let (deps, _state, _dir) = test_deps(vec![user_session, other_session]);
         let ctx = ctx_with(&["session.prompt"]);
 
         for (session, expected_kind, expected_code) in [
@@ -1065,7 +1058,7 @@ mod tests {
         inst.view = crate::session::View::Structured;
         inst.status = crate::session::Status::Idle;
         inst.created_by_plugin = Some("cron".to_string());
-        let (deps, _dir) = test_deps(vec![inst]);
+        let (deps, _state, _dir) = test_deps(vec![inst]);
         let cmds = deps
             .session_service
             .acp_supervisor
@@ -1120,7 +1113,7 @@ mod tests {
         foreign.view = crate::session::View::Structured;
         foreign.agent_name = Some("claude".to_string());
         foreign.created_by_plugin = Some("other-plugin".to_string());
-        let (deps, state, _dir) = test_deps_with_state(vec![foreign]);
+        let (deps, state, _dir) = test_deps(vec![foreign]);
         // A live worker: without one every dispatch parks on `WorkerDown`,
         // which this path forwards rather than refusing, so the leak the test
         // is about would never be reachable.
@@ -1231,7 +1224,7 @@ mod tests {
             parked.agent_name = Some("aoe-no-such-agent-3686".to_string());
             parked.created_by_plugin = Some("cron".to_string());
             park(&mut parked);
-            let (deps, state, _dir) = test_deps_with_state(vec![parked]);
+            let (deps, state, _dir) = test_deps(vec![parked]);
             let ctx = ctx_with(&["session.prompt"]);
 
             let result = dispatch(
@@ -1264,7 +1257,7 @@ mod tests {
     /// registry grows without bound within the caller's turn quota.
     #[tokio::test]
     async fn turn_send_does_not_grow_the_lock_registry_for_nonexistent_sessions() {
-        let (deps, _dir) = test_deps(Vec::new());
+        let (deps, _state, _dir) = test_deps(Vec::new());
         let ctx = ctx_with(&["session.prompt"]);
 
         for i in 0..5 {

@@ -414,6 +414,11 @@ fn test_new_session_enters_live_mode_when_configured() {
 
     let mut h = TuiTestHarness::new("attach_live_send");
     write_config_new_session_mode_live_send(&h);
+    // The daemon starts the agent while creating, so the pane must outlive the
+    // attach this test is about: a stub agent that exits immediately would make
+    // the live-send preparation fail for a reason unrelated to the mode.
+    let bin = h.install_path_command("claude");
+    std::fs::write(bin.join("claude"), "#!/bin/sh\nexec sleep 120\n").unwrap();
     let project = h.project_path();
     h.spawn_tui();
 

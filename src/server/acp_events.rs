@@ -10,25 +10,18 @@ use tokio::sync::{broadcast, RwLock};
 use super::state::{instance_lock_in, AppState};
 use crate::server::{acp_ws, api};
 
-/// One task instead of two halves the broadcast clone count and locks
-/// `state.instances` once per event instead of twice for the events
-/// (e.g. `AcpSessionAssigned`) that both consumers care about.
+/// Applies live status, unread and session-id observations.
 pub(super) async fn acp_event_listener(state: Arc<AppState>) {
     let mut rx = state.acp_events_tx.subscribe();
     loop {
-        let frame = match rx.recv().await {
+        let received = tokio::select! {
+            biased;
+            _ = state.shutdown.cancelled() => return,
+            frame = rx.recv() => frame,
+        };
+        let frame = match received {
             Ok(f) => f,
-            // Lagged: a missed event can desync the sidebar dot or
-            // skip persisting an `AcpSessionAssigned`. Status will
-            // reconcile on the next event; a missed acp_session_id
-            // means at most one restart loses context. Far better to
-            // continue than to exit the listener entirely.
-            //
-            // The unread mark does NOT self-heal like status does: it is
-            // edge-triggered on `Running -> Idle`, so a dropped `Stopped` would
-            // lose it for good and no later event would reproduce it. The
-            // events are durable, recorded before broadcast, so replay the
-            // structured rows from the event log before continuing.
+            // Unread is edge-triggered; replay missed durable turn ends.
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                 tracing::warn!(
                     target: "acp.event_listener",
@@ -54,7 +47,6 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                 }
                 continue;
             }
-            // Closed: AppState dropped (shutdown). Exit cleanly.
             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                 tracing::debug!(
                     target: "acp.event_listener",
@@ -96,15 +88,18 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                         "wake-fire detected; dispatching push notification"
                     );
                     let state_for_push = state.clone();
-                    tokio::spawn(async move {
-                        crate::server::push::fire_wake_fired_push(
-                            state_for_push,
-                            &session_id,
-                            &session_title,
-                            reason.as_deref(),
-                        )
-                        .await;
-                    });
+                    state
+                        .runtime
+                        .work
+                        .spawn("server.acp_event_effect", async move {
+                            crate::server::push::fire_wake_fired_push(
+                                state_for_push,
+                                &session_id,
+                                &session_title,
+                                reason.as_deref(),
+                            )
+                            .await;
+                        });
                 }
                 None => {
                     tracing::trace!(
@@ -117,63 +112,59 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             }
         }
 
-        // Approval push: when the worker emits an `ApprovalRequested`
-        // event, trigger a Web Push so the user sees a "needs approval"
-        // alert even when the dashboard is backgrounded. Unlike the
-        // status-change pushes in `push.rs`, approvals do NOT honour
-        // the TUI/web active-session suppression; the service worker
-        // still routes focused clients to an in-app toast via the
-        // existing `aoe-push` postMessage path. See #1038.
+        // Approval pushes bypass active-session suppression.
         if let crate::acp::state::Event::ApprovalRequested { approval } = frame.event.as_ref() {
             let state_for_push = state.clone();
             let session_id = frame.session_id.clone();
             let approval_title = approval.tool_call.name.clone();
             let destructive = approval.destructive;
             let seq = frame.seq;
-            tokio::spawn(async move {
-                acp_ws::trigger_approval_push(
-                    &state_for_push,
-                    &session_id,
-                    &approval_title,
-                    destructive,
-                    seq,
-                )
-                .await;
-            });
+            state
+                .runtime
+                .work
+                .spawn("server.acp_event_effect", async move {
+                    acp_ws::trigger_approval_push(
+                        &state_for_push,
+                        &session_id,
+                        &approval_title,
+                        destructive,
+                        seq,
+                    )
+                    .await;
+                });
         }
 
-        // Clear push: when the approval is handled (on any device), retract
-        // the "needs approval" notification that the request push raised, so
-        // a backgrounded phone or second computer does not keep showing a
-        // stale alert for an already-resolved request. See #2491.
+        // Retract resolved approvals on every device.
         if let crate::acp::state::Event::ApprovalResolved { decision, .. } = frame.event.as_ref() {
             record_approval_decision(&state, *decision);
             let state_for_push = state.clone();
             let session_id = frame.session_id.clone();
             let seq = frame.seq;
-            tokio::spawn(async move {
-                acp_ws::trigger_approval_clear_push(&state_for_push, &session_id, seq).await;
-            });
+            state
+                .runtime
+                .work
+                .spawn("server.acp_event_effect", async move {
+                    acp_ws::trigger_approval_clear_push(&state_for_push, &session_id, seq).await;
+                });
         }
 
-        // Question push: an `AskUserQuestion` (ElicitationRequested) blocks
-        // the turn on the user just like an approval, so it gets the same
-        // dedicated, suppression-bypassing push instead of only the generic
-        // Waiting one. Same live-event-only path as the approval push above.
-        // See #2146.
+        // Questions use the same push policy as approvals.
         if let crate::acp::state::Event::ElicitationRequested { elicitation } = frame.event.as_ref()
         {
             let state_for_push = state.clone();
             let session_id = frame.session_id.clone();
             let question = elicitation.message.clone();
             let seq = frame.seq;
-            tokio::spawn(async move {
-                acp_ws::trigger_question_push(&state_for_push, &session_id, &question, seq).await;
-            });
+            state
+                .runtime
+                .work
+                .spawn("server.acp_event_effect", async move {
+                    acp_ws::trigger_question_push(&state_for_push, &session_id, &question, seq)
+                        .await;
+                });
         }
 
-        // Clear push for an answered question, mirroring the approval clear
-        // above. See #2491.
+        // Retract answered questions.
         if matches!(
             frame.event.as_ref(),
             crate::acp::state::Event::ElicitationResolved { .. }
@@ -181,15 +172,15 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             let state_for_push = state.clone();
             let session_id = frame.session_id.clone();
             let seq = frame.seq;
-            tokio::spawn(async move {
-                acp_ws::trigger_question_clear_push(&state_for_push, &session_id, seq).await;
-            });
+            state
+                .runtime
+                .work
+                .spawn("server.acp_event_effect", async move {
+                    acp_ws::trigger_question_clear_push(&state_for_push, &session_id, seq).await;
+                });
         }
 
-        // Recall cache: record the agent's advertised config options so the
-        // per-agent defaults settings page can populate its dropdowns without a
-        // live session. `record` debounces unchanged snapshots and writes off
-        // the async runtime. See #2631.
+        // Retain advertised options for settings without a live session.
         if let crate::acp::state::Event::ConfigOptionsUpdated { options } = frame.event.as_ref() {
             if !options.is_empty() {
                 let agent = state
@@ -208,7 +199,7 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                 if let Some(agent) = agent {
                     let options = options.clone();
                     let now = chrono::Utc::now().to_rfc3339();
-                    tokio::task::spawn_blocking(move || {
+                    let recorded = tokio::task::spawn_blocking(move || {
                         if let Err(e) = crate::acp::option_catalog::record(&agent, &options, now) {
                             tracing::warn!(
                                 target: "acp.event_listener",
@@ -217,7 +208,11 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                                 "failed to record acp option catalog"
                             );
                         }
-                    });
+                    })
+                    .await;
+                    if let Err(error) = recorded {
+                        tracing::warn!(target: "acp.event_listener", %error, "option catalog task failed");
+                    }
                 }
             }
         }
@@ -262,28 +257,25 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                     &first_user_prompt,
                     &agent_prose,
                 );
-                tokio::spawn(async move {
-                    crate::session::smart_rename::try_smart_rename(
-                        state_for_rename,
-                        session_id,
-                        crate::session::smart_rename::SmartRenameInput {
-                            first_user_prompt,
-                            context,
-                        },
-                        // Automatic turn-end trigger: honor the smart_rename
-                        // setting. Only the manual action forces past it (#3039).
-                        false,
-                    )
-                    .await;
-                });
+                state
+                    .runtime
+                    .work
+                    .spawn("server.acp_event_effect", async move {
+                        crate::session::smart_rename::try_smart_rename(
+                            state_for_rename,
+                            session_id,
+                            crate::session::smart_rename::SmartRenameInput {
+                                first_user_prompt,
+                                context,
+                            },
+                            // Automatic turn-end trigger: honor the smart_rename
+                            // setting. Only the manual action forces past it (#3039).
+                            false,
+                        )
+                        .await;
+                    });
             } else {
-                // A `prompt_complete` Stopped without any persisted UserPromptSent
-                // is unexpected: `publish_user_prompt_with_attachments` runs
-                // strictly before `send_prompt` in the ACP handler, so by the
-                // time the turn ends the first prompt should be durable in the
-                // event store. A silent skip would hide a plumbing bug (attachment
-                // rollback, pruning of an old session, race with SessionCleared);
-                // surface it at debug so operators can trace it.
+                // The first prompt must be durable before its turn completes.
                 tracing::debug!(
                     target: "smart_rename",
                     session = %frame.session_id,
@@ -314,14 +306,17 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
         if should_summarize {
             let state_for_summary = state.clone();
             let session_id = frame.session_id.clone();
-            tokio::spawn(async move {
-                crate::session::conversation_summary::try_conversation_summary(
-                    state_for_summary,
-                    session_id,
-                    crate::session::conversation_summary::SummaryTrigger::Auto,
-                )
-                .await;
-            });
+            state
+                .runtime
+                .work
+                .spawn("server.acp_event_effect", async move {
+                    crate::session::conversation_summary::try_conversation_summary(
+                        state_for_summary,
+                        session_id,
+                        crate::session::conversation_summary::SummaryTrigger::Auto,
+                    )
+                    .await;
+                });
         }
 
         // Gated on `reads_activity_flags`: a cold cache (nothing has
@@ -676,30 +671,8 @@ pub(super) fn should_mark_acp_unread(
         && !inst.unread
 }
 
-/// Write the automatic unread mark for `id` to its profile store, then mirror it
-/// into daemon memory. Returns whether the mark actually landed.
-///
-/// Takes primitives rather than [`AppState`] so it is reachable from tests
-/// (`AppState` has no test constructor).
-///
-/// Ordering rules, both of which cost correctness if dropped:
-///
-/// 1. **Under `instance_lock`.** The same mutex `PATCH /api/sessions/:id/unread`
-///    takes, held across both the write and the mirror. Without it a clear can
-///    land between them and leave disk read while memory says unread, and the
-///    user's explicit mark-read loses to a mark it happened after. Holding it
-///    makes the two orderings the only ones possible, and both are correct: a
-///    clear before this marks (the turn genuinely finished afterwards), a clear
-///    after this wins (the user read it afterwards).
-/// 2. **Only mirror a committed mutation.** `persist_session_update` reports
-///    `Ok` for a write whose closure matched no row, so `profile` going stale
-///    (a concurrent profile move) would otherwise mark memory off a successful
-///    no-op on the *old* profile, and the next reload would drop the
-///    notification. The flag reports whether the owning row was really mutated.
-///
-/// A stale-profile write is not retried. The row is left read rather than
-/// half-marked, the turn's mark is simply lost, and the move is rare enough that
-/// a re-resolve loop is not worth the added failure surface here.
+/// Serialize the durable unread mark and its mirror with explicit unread edits.
+/// A missing disk row must never produce a live mark.
 pub(super) async fn persist_and_mirror_unread(
     instances: &RwLock<Vec<Instance>>,
     instance_lock: &tokio::sync::Mutex<()>,
@@ -708,8 +681,6 @@ pub(super) async fn persist_and_mirror_unread(
     profile: String,
 ) -> bool {
     let _guard = instance_lock.lock().await;
-    let marked = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let marked_in_closure = marked.clone();
     let persist_id = id.to_string();
     let persisted = api::persist_session_update(
         profile.clone(),
@@ -718,15 +689,17 @@ pub(super) async fn persist_and_mirror_unread(
         move |instances| {
             if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
                 inst.mark_unread();
-                marked_in_closure.store(true, std::sync::atomic::Ordering::SeqCst);
+                true
+            } else {
+                false
             }
         },
     )
     .await;
-    if persisted.is_err() {
+    let Ok((marked, _, _)) = persisted else {
         return false;
-    }
-    if !marked.load(std::sync::atomic::Ordering::SeqCst) {
+    };
+    if !marked {
         tracing::debug!(
             target: "acp.event_listener",
             session = %id,

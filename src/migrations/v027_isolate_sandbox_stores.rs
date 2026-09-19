@@ -76,10 +76,13 @@ impl CopyState {
 /// `announce` lets the fallback probe say once, per pass, that the runtime
 /// could not be asked; the per-startup reconcile passes `false` so a machine
 /// whose runtime is down is not told the same thing on every command.
-pub(crate) fn batched_running_probe(announce: bool) -> impl Fn(&str) -> Result<bool> {
+pub(crate) fn batched_running_probe(
+    runtime: &crate::containers::ContainerRuntime,
+    announce: bool,
+) -> impl Fn(&str) -> Result<bool> + '_ {
     batched_running_probe_with(
-        crate::containers::batch_container_states,
-        probe_container_running,
+        move || runtime.batch_container_states(crate::containers::SANDBOX_NAME_PREFIX),
+        move |id| probe_container_running(id, runtime),
         announce,
     )
 }
@@ -174,8 +177,11 @@ pub(crate) fn batched_probe_with(
 /// legacy source while a container AoE cannot see may still be writing to it
 /// is the one outcome this migration must never produce, so an unknown answer
 /// takes the arm that copies nothing.
-fn probe_container_running(id: &str) -> Result<(bool, bool)> {
-    match crate::containers::DockerContainer::from_session_id(id).is_running() {
+fn probe_container_running(
+    id: &str,
+    runtime: &crate::containers::ContainerRuntime,
+) -> Result<(bool, bool)> {
+    match runtime.is_container_running(&crate::containers::DockerContainer::generate_name(id)) {
         Ok(running) => Ok((running, false)),
         Err(error) if runtime_cannot_answer(&error) => {
             tracing::warn!("v027 treating {id} as live: container runtime unavailable ({error})");
@@ -223,11 +229,14 @@ pub(crate) fn runtime_cannot_answer(error: &crate::containers::error::DockerErro
 /// pending for a later pass. A `remove` that fails for any other reason still
 /// aborts: `force=false` is what makes a container that became live after the
 /// probe fail the transition rather than be stopped underneath its agent.
-fn reap_migrated_container(id: &str) -> Result<bool> {
-    let container = crate::containers::DockerContainer::from_session_id(id);
-    match container.exists() {
+fn reap_migrated_container(
+    id: &str,
+    runtime: &crate::containers::ContainerRuntime,
+) -> Result<bool> {
+    let name = crate::containers::DockerContainer::generate_name(id);
+    match runtime.does_container_exist(&name) {
         Ok(true) => {
-            container.remove(false)?;
+            runtime.remove(&name, false)?;
             Ok(true)
         }
         Ok(false) => Ok(true),
@@ -274,17 +283,229 @@ struct Registry {
     value: Value,
 }
 
+#[derive(Clone, Copy)]
+struct MigrationScope<'a> {
+    only: Option<&'a str>,
+    store: Option<&'a dyn crate::session::SessionStore>,
+}
+
+impl MigrationScope<'_> {
+    fn publish(self, checkpoint: LockedSandboxCheckpoint<'_>) -> Result<()> {
+        match self.store {
+            Some(store) => store.commit_sandbox_checkpoint(checkpoint),
+            None => checkpoint.commit_local(),
+        }
+    }
+
+    fn check_available(self) -> Result<()> {
+        if let Some(store) = self.store {
+            store.check_available()?;
+        }
+        Ok(())
+    }
+
+    fn configuration(self, profile: &str) -> Result<crate::session::config::Config> {
+        let profile = (!profile.is_empty()).then_some(profile);
+        if let Some(store) = self.store {
+            return store.configuration(profile);
+        }
+        let mut config = match profile {
+            Some(profile) => crate::session::resolve_config_or_warn(profile),
+            None => crate::session::config::Config::load_or_warn(),
+        };
+        crate::session::config::profile_config::apply_cityhall_overrides(&mut config);
+        Ok(config)
+    }
+}
+
+struct RegistryLocks {
+    directories: Vec<PathBuf>,
+    flocks: Vec<crate::session::StorageFlock>,
+}
+
+pub(crate) struct LockedSandboxCheckpoint<'a> {
+    app_dir: &'a Path,
+    registries: &'a [Registry],
+    transition: &'a crate::session::StorageTransition,
+    locks: &'a RegistryLocks,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("sandbox registry checkpoint failed")]
+pub(crate) struct SandboxCheckpointFailure {
+    pub profile: Option<String>,
+    #[source]
+    pub source: anyhow::Error,
+}
+
+pub(crate) struct SandboxProfileCommit {
+    pub storage: crate::session::Storage,
+    pub rows: Vec<crate::session::Instance>,
+    pub groups: Vec<crate::session::Group>,
+}
+
+enum PreparedRegistry {
+    Profile {
+        commit: SandboxProfileCommit,
+        bytes: Vec<u8>,
+    },
+    Legacy {
+        path: PathBuf,
+        file: crate::session::ResolvedDataFile,
+        bytes: Vec<u8>,
+    },
+}
+
+pub(crate) struct PreparedSandboxCheckpoint<'a> {
+    registries: Vec<PreparedRegistry>,
+    transition: &'a crate::session::StorageTransition,
+    _locks: &'a RegistryLocks,
+}
+
+impl<'a> LockedSandboxCheckpoint<'a> {
+    pub(crate) fn commit_local(self) -> Result<()> {
+        for registry in self.registries {
+            let bytes = serde_json::to_vec_pretty(&registry.value)?;
+            crate::session::atomic_write(&registry.path, &bytes)?;
+            sync_parent(&registry.path)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn prepare(
+        self,
+        file_watch: &std::sync::Arc<crate::file_watch::FileWatchService>,
+    ) -> Result<PreparedSandboxCheckpoint<'a>> {
+        let mut prepared = Vec::with_capacity(self.registries.len());
+        for registry in self.registries {
+            let profile = profile_for_registry(self.app_dir, &registry.path);
+            let next = (|| -> Result<PreparedRegistry> {
+                let bytes = serde_json::to_vec_pretty(&registry.value)?;
+                if registry.path == self.app_dir.join("sessions.json") {
+                    return Ok(PreparedRegistry::Legacy {
+                        path: registry.path.clone(),
+                        file: crate::session::ResolvedDataFile::open(&registry.path)?,
+                        bytes,
+                    });
+                }
+                anyhow::ensure!(!profile.is_empty(), "sandbox registry has no named profile");
+                let storage = crate::session::Storage::open(&profile, file_watch.clone())?;
+                anyhow::ensure!(
+                    storage.sessions_path() == registry.path,
+                    "sandbox registry belongs to another namespace"
+                );
+                let directory =
+                    fs::canonicalize(registry.path.parent().context("registry needs a parent")?)?;
+                let index = self
+                    .locks
+                    .directories
+                    .binary_search(&directory)
+                    .map_err(|_| anyhow::anyhow!("sandbox registry is not locked"))?;
+                let (rows, groups) = storage.read_sandbox_checkpoint(
+                    &registry.value,
+                    &self.locks.flocks[index],
+                    self.transition,
+                )?;
+                Ok(PreparedRegistry::Profile {
+                    commit: SandboxProfileCommit {
+                        storage,
+                        rows,
+                        groups,
+                    },
+                    bytes,
+                })
+            })()
+            .map_err(|source| SandboxCheckpointFailure {
+                profile: (!profile.is_empty()).then_some(profile),
+                source,
+            })?;
+            prepared.push(next);
+        }
+        Ok(PreparedSandboxCheckpoint {
+            registries: prepared,
+            transition: self.transition,
+            _locks: self.locks,
+        })
+    }
+}
+
+impl PreparedSandboxCheckpoint<'_> {
+    pub(crate) fn profiles(&self) -> impl Iterator<Item = &crate::session::Storage> {
+        self.registries
+            .iter()
+            .filter_map(|registry| match registry {
+                PreparedRegistry::Profile { commit, .. } => Some(&commit.storage),
+                PreparedRegistry::Legacy { .. } => None,
+            })
+    }
+
+    pub(crate) fn commit(self) -> Result<Vec<SandboxProfileCommit>> {
+        for registry in &self.registries {
+            let profile = match registry {
+                PreparedRegistry::Profile { commit, .. } => Some(commit.storage.profile()),
+                PreparedRegistry::Legacy { .. } => None,
+            };
+            (|| -> Result<()> {
+                match registry {
+                    PreparedRegistry::Profile { commit, bytes } => {
+                        commit
+                            .storage
+                            .write_sandbox_checkpoint(bytes, self.transition)?;
+                    }
+                    PreparedRegistry::Legacy { path, file, bytes } => {
+                        anyhow::ensure!(
+                            file.same_target(&crate::session::ResolvedDataFile::open(path)?)?,
+                            "legacy registry binding changed"
+                        );
+                        file.replace_preserving_permissions(bytes)?;
+                        anyhow::ensure!(
+                            file.same_target(&crate::session::ResolvedDataFile::open(path)?)?,
+                            "legacy registry binding changed"
+                        );
+                    }
+                }
+                Ok(())
+            })()
+            .map_err(|source| SandboxCheckpointFailure {
+                profile: profile.map(str::to_owned),
+                source,
+            })?;
+        }
+        for storage in self.profiles() {
+            storage
+                .verify_bound_profile()
+                .map_err(|source| SandboxCheckpointFailure {
+                    profile: Some(storage.profile().to_owned()),
+                    source,
+                })?;
+        }
+        Ok(self
+            .registries
+            .into_iter()
+            .filter_map(|registry| match registry {
+                PreparedRegistry::Profile { commit, .. } => Some(commit),
+                PreparedRegistry::Legacy { .. } => None,
+            })
+            .collect())
+    }
+}
+
 pub fn run() -> Result<()> {
     let app_dir = crate::session::get_app_dir()?;
     let home = dirs::home_dir().context("home directory unavailable for sandbox migration")?;
+    let runtime = crate::containers::get_container_runtime();
+    let running = batched_running_probe(&runtime, true);
     run_in(
         &app_dir,
         &home,
-        &batched_running_probe(true),
-        &reap_migrated_container,
+        &running,
+        &|id| reap_migrated_container(id, &runtime),
         defer_requested(),
         true,
-        None,
+        MigrationScope {
+            only: None,
+            store: None,
+        },
     )
 }
 
@@ -292,11 +513,16 @@ pub fn run() -> Result<()> {
 /// every startup until no pre-v2 row remains, then becomes a cheap read.
 /// `announce` narrates pending rows.
 pub(crate) fn reconcile_pending(announce: bool) -> Result<()> {
+    let runtime = crate::containers::get_container_runtime();
+    let running = batched_running_probe(&runtime, announce);
     reconcile_scoped(
         announce,
-        None,
-        &batched_running_probe(announce),
-        &reap_migrated_container,
+        MigrationScope {
+            only: None,
+            store: None,
+        },
+        &running,
+        &|id| reap_migrated_container(id, &runtime),
     )
 }
 
@@ -305,12 +531,19 @@ pub(crate) fn reconcile_pending(announce: bool) -> Result<()> {
 /// the unit the liveness gate reasons about; every other cohort is left alone,
 /// so a machine with many parked or idle sessions does not pay for all of them
 /// on one launch.
-pub(crate) fn migrate_instance(id: &str) -> Result<()> {
+pub(crate) fn migrate_instance(
+    id: &str,
+    store: &dyn crate::session::SessionStore,
+    runtime: &crate::containers::ContainerRuntime,
+) -> Result<()> {
     reconcile_scoped(
         false,
-        Some(id),
-        &batched_running_probe(false),
-        &reap_migrated_container,
+        MigrationScope {
+            only: Some(id),
+            store: Some(store),
+        },
+        &batched_running_probe(runtime, false),
+        &|id| reap_migrated_container(id, runtime),
     )
 }
 
@@ -321,8 +554,17 @@ pub(crate) fn migrate_instance_with(
     id: &str,
     is_running: &RunningProbe<'_>,
     reap: &ReapProbe<'_>,
+    store: Option<&dyn crate::session::SessionStore>,
 ) -> Result<()> {
-    reconcile_scoped(false, Some(id), is_running, reap)
+    reconcile_scoped(
+        false,
+        MigrationScope {
+            only: Some(id),
+            store,
+        },
+        is_running,
+        reap,
+    )
 }
 
 /// `only` scopes the move to a single instance; `announce` both narrates and
@@ -330,12 +572,13 @@ pub(crate) fn migrate_instance_with(
 /// without copying while `aoe migrate` moves everything eligible.
 fn reconcile_scoped(
     announce: bool,
-    only: Option<&str>,
+    scope: MigrationScope<'_>,
     is_running: &RunningProbe<'_>,
     reap: &ReapProbe<'_>,
 ) -> Result<()> {
+    scope.check_available()?;
     let app_dir = crate::session::get_app_dir()?;
-    if !transition_may_be_pending(&app_dir, !announce && only.is_none())? {
+    if !transition_may_be_pending(&app_dir, !announce && scope.only.is_none())? {
         return Ok(());
     }
     let home = dirs::home_dir().context("home directory unavailable for sandbox migration")?;
@@ -351,9 +594,9 @@ fn reconcile_scoped(
         &home,
         is_running,
         reap,
-        defer_requested() || (!announce && only.is_none()),
+        defer_requested() || (!announce && scope.only.is_none()),
         announce,
-        only,
+        scope,
     )?;
     progress::report(progress::Event::Finished {
         version: 27,
@@ -470,7 +713,7 @@ fn run_in(
     reap: &ReapProbe<'_>,
     defer_stores: bool,
     announce: bool,
-    only: Option<&str>,
+    scope: MigrationScope<'_>,
 ) -> Result<()> {
     progress::step("reading session registries");
     fs::create_dir_all(app_dir)?;
@@ -484,7 +727,7 @@ fn run_in(
             reap,
             defer_stores,
             announce,
-            only,
+            scope,
         )? {
             PassOutcome::Done => return Ok(()),
             PassOutcome::WaitFor(root) => {
@@ -499,7 +742,7 @@ fn run_in(
     }
     tracing::warn!(
         "v027 giving up on {} after {SCOPED_RETRIES} waits; it stays on its shared store for now",
-        only.unwrap_or("this pass")
+        scope.only.unwrap_or("this pass")
     );
     Ok(())
 }
@@ -578,13 +821,22 @@ fn run_pass(
     reap: &ReapProbe<'_>,
     defer_stores: bool,
     announce: bool,
-    only: Option<&str>,
+    scope: MigrationScope<'_>,
 ) -> Result<PassOutcome> {
-    let mut transition_lock = Some(crate::session::acquire_storage_flock(app_dir, LOCK)?);
+    scope.check_available()?;
+    let only = scope.only;
+    let mut transition_lock = Some(
+        crate::session::StorageTransition::acquire_exclusive(app_dir).map_err(|source| {
+            SandboxCheckpointFailure {
+                profile: None,
+                source,
+            }
+        })?,
+    );
     let planned_paths = registry_paths(app_dir)?;
     let registry_dirs = registry_dirs_of(&planned_paths);
-    let mut registry_locks = Some(lock_registry_dirs(&registry_dirs)?);
-    let mut registries = load_registry_paths(planned_paths)?;
+    let mut registry_locks = Some(lock_registry_dirs(registry_dirs.clone())?);
+    let mut registries = load_registry_paths(app_dir, planned_paths)?;
     let journal = app_dir.join(JOURNAL);
     match fs::read(&journal) {
         Ok(bytes) => {
@@ -602,7 +854,7 @@ fn run_pass(
     let mut cleanup_roots = BTreeSet::new();
     let mut needs_registry_write = false;
     let mut defer_source_retirement = false;
-    let row_ids_by_root = collect_row_ids_by_root(&registries, app_dir, home)?;
+    let row_ids_by_root = collect_row_ids_by_root(&registries, app_dir, home, scope)?;
 
     for (registry_index, registry) in registries.iter_mut().enumerate() {
         let profile = profile_for_registry(app_dir, &registry.path);
@@ -646,7 +898,7 @@ fn run_pass(
                 defer_source_retirement = true;
                 continue;
             };
-            let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
+            let config = scope.configuration(&profile)?;
             let detect_as = row
                 .get("detect_as")
                 .and_then(Value::as_str)
@@ -848,11 +1100,14 @@ fn run_pass(
         return Ok(PassOutcome::Done);
     }
     if needs_registry_write {
-        for registry in &registries {
-            let bytes = serde_json::to_vec_pretty(&registry.value)?;
-            crate::session::atomic_write(&registry.path, &bytes)?;
-            sync_parent(&registry.path)?;
-        }
+        scope.publish(LockedSandboxCheckpoint {
+            app_dir,
+            registries: &registries,
+            transition: transition_lock
+                .as_ref()
+                .context("missing transition lock")?,
+            locks: registry_locks.as_ref().context("missing registry locks")?,
+        })?;
     }
     if !known_sources.is_empty() {
         let paths: Vec<String> = known_sources
@@ -1013,6 +1268,7 @@ fn run_pass(
             if gated_roots.insert(root.clone()) {
                 copy_gate(root);
             }
+            scope.check_available()?;
             // Reaped before the move, not after: a rename leaves no source
             // behind for a container that came up since the probe, and
             // nothing later can put one back. Removing without force fails on
@@ -1101,6 +1357,7 @@ fn run_pass(
             if gated_roots.insert(target.cleanup_root.clone()) {
                 copy_gate(&target.cleanup_root);
             }
+            scope.check_available()?;
             publish_store(
                 shared,
                 &target.private,
@@ -1121,8 +1378,16 @@ fn run_pass(
     // have changed meanwhile, so re-read them and publish only rows that still
     // carry the plan, into the documents as they are now; and ask about
     // liveness again, since a container may have come up during the copy.
+    scope.check_available()?;
     if transition_lock.is_none() {
-        transition_lock = Some(crate::session::acquire_storage_flock(app_dir, LOCK)?);
+        transition_lock = Some(
+            crate::session::StorageTransition::acquire_exclusive(app_dir).map_err(|source| {
+                SandboxCheckpointFailure {
+                    profile: None,
+                    source,
+                }
+            })?,
+        );
         // A profile created during the copy is locked too, since every
         // registry read below is written back.
         let fresh_paths = registry_paths(app_dir)?;
@@ -1130,12 +1395,12 @@ fn run_pass(
         dirs.extend(registry_dirs.iter().cloned());
         dirs.sort();
         dirs.dedup();
-        registry_locks = Some(lock_registry_dirs(&dirs)?);
+        registry_locks = Some(lock_registry_dirs(dirs)?);
     }
-    let _held = (transition_lock, registry_locks, cohort_locks);
+    let _cohort_locks = cohort_locks;
     refresh_liveness();
     let mut fresh = load_registries(app_dir)?;
-    let fresh_ids_by_root = collect_row_ids_by_root(&fresh, app_dir, home)?;
+    let fresh_ids_by_root = collect_row_ids_by_root(&fresh, app_dir, home, scope)?;
     for root in &cleanup_roots {
         let planned = row_ids_by_root.get(root);
         let arrived = fresh_ids_by_root
@@ -1221,6 +1486,7 @@ fn run_pass(
         ));
     }
     for (id, keys) in &ready_ids {
+        scope.check_available()?;
         if !reap(id)? {
             deferred_rows.extend(keys.iter().copied());
         }
@@ -1242,22 +1508,14 @@ fn run_pass(
             .flatten()
             .filter(|target| &target.cleanup_root == root)
             .collect();
-        // Every member under this root must have published, held members
-        // included: a held row still reads this source, so retiring it would
-        // leave that session with no store to open.
-        //
-        // The `Move` clause is the mechanism, not a restatement. It is what
-        // keeps a root alive for a held member, per root. The pass-wide
-        // `defer_source_retirement` below stays for the rows that never
-        // produce a target at all (no id, no tool, no agent), whose root
-        // cannot be known; routing an ordinary parked row through it instead
-        // would block every unrelated root on the machine.
+        // Held rows still own their source; unknown-row roots defer retirement globally.
         let all_ready = !related.is_empty()
             && related.iter().all(|target| {
                 target.disposition == Disposition::Move
                     && ready_rows.contains(&(target.registry, target.row))
             });
         if !defer_source_retirement && !blocked_roots.contains(root) && all_ready {
+            scope.check_available()?;
             progress::step(format!("retiring shared agent store {}", root.display()));
             if private_roots.contains(root) {
                 let replicated = excluded_by_root
@@ -1306,11 +1564,14 @@ fn run_pass(
             }
         }
     }
-    for registry in &fresh {
-        let bytes = serde_json::to_vec_pretty(&registry.value)?;
-        crate::session::atomic_write(&registry.path, &bytes)?;
-        sync_parent(&registry.path)?;
-    }
+    scope.publish(LockedSandboxCheckpoint {
+        app_dir,
+        registries: &fresh,
+        transition: transition_lock
+            .as_ref()
+            .context("missing transition lock")?,
+        locks: registry_locks.as_ref().context("missing registry locks")?,
+    })?;
 
     let done = ready_rows.len();
     // A held-only backlog is announced too: without it `aoe migrate` reports
@@ -1363,12 +1624,21 @@ fn registry_dirs_of(paths: &[PathBuf]) -> Vec<PathBuf> {
     dirs
 }
 
-fn lock_registry_dirs(dirs: &[PathBuf]) -> Result<Vec<crate::session::StorageFlock>> {
-    dirs.iter()
+fn lock_registry_dirs(directories: Vec<PathBuf>) -> Result<RegistryLocks> {
+    let flocks = directories
+        .iter()
         .map(|dir| {
             crate::session::acquire_storage_flock(dir, crate::session::STORAGE_LOCK_FILENAME)
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()
+        .map_err(|source| SandboxCheckpointFailure {
+            profile: None,
+            source,
+        })?;
+    Ok(RegistryLocks {
+        directories,
+        flocks,
+    })
 }
 
 /// Every legacy source each sandboxed row reads, by canonical root. The plan
@@ -1378,6 +1648,7 @@ fn collect_row_ids_by_root(
     registries: &[Registry],
     app_dir: &Path,
     home: &Path,
+    scope: MigrationScope<'_>,
 ) -> Result<BTreeMap<PathBuf, BTreeSet<std::ffi::OsString>>> {
     let mut row_ids_by_root: BTreeMap<PathBuf, BTreeSet<std::ffi::OsString>> = BTreeMap::new();
     for registry in registries {
@@ -1385,7 +1656,7 @@ fn collect_row_ids_by_root(
         let Some(rows) = registry.value.as_array() else {
             continue;
         };
-        let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
+        let config = scope.configuration(&profile)?;
         for row in rows {
             if !row
                 .pointer("/sandbox_info/enabled")
@@ -1567,41 +1838,73 @@ fn set_generation(row: &mut Value, generation: u8) {
 }
 
 fn registry_paths(app_dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut paths = Vec::new();
-    let profiles = app_dir.join("profiles");
-    match fs::read_dir(&profiles) {
-        Ok(entries) => {
-            for entry in entries {
-                let path = entry?.path().join("sessions.json");
-                if path.is_file() {
-                    paths.push(path);
+    let enumerate = || -> Result<Vec<PathBuf>> {
+        let mut paths = Vec::new();
+        match fs::read_dir(app_dir.join("profiles")) {
+            Ok(entries) => {
+                for entry in entries {
+                    let path = entry?.path().join("sessions.json");
+                    if registry_file_exists(&path)? {
+                        paths.push(path);
+                    }
                 }
             }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).with_context(|| format!("reading {}", profiles.display())),
-    }
-    let default = app_dir.join("sessions.json");
-    if default.is_file() {
-        paths.push(default);
-    }
-    paths.sort();
-    Ok(paths)
+        let legacy = app_dir.join("sessions.json");
+        if registry_file_exists(&legacy)? {
+            paths.push(legacy);
+        }
+        paths.sort();
+        Ok(paths)
+    };
+    enumerate().map_err(|source| {
+        SandboxCheckpointFailure {
+            profile: None,
+            source,
+        }
+        .into()
+    })
 }
 
-fn load_registry_paths(paths: Vec<PathBuf>) -> Result<Vec<Registry>> {
+fn registry_file_exists(path: &Path) -> Result<bool> {
+    match fs::metadata(path) {
+        Ok(metadata) => {
+            anyhow::ensure!(metadata.is_file(), "session registry is not a regular file");
+            Ok(true)
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn load_registry_paths(app_dir: &Path, paths: Vec<PathBuf>) -> Result<Vec<Registry>> {
     paths
         .into_iter()
         .map(|path| {
-            let value = serde_json::from_slice(&fs::read(&path)?)
-                .with_context(|| format!("parsing {}", path.display()))?;
+            let value = (|| -> Result<Value> { Ok(serde_json::from_slice(&fs::read(&path)?)?) })()
+                .map_err(|source| {
+                    let profile = profile_for_registry(app_dir, &path);
+                    SandboxCheckpointFailure {
+                        profile: (!profile.is_empty()).then_some(profile),
+                        source,
+                    }
+                })?;
             Ok(Registry { path, value })
         })
         .collect()
 }
 
 fn load_registries(app_dir: &Path) -> Result<Vec<Registry>> {
-    load_registry_paths(registry_paths(app_dir)?)
+    load_registry_paths(app_dir, registry_paths(app_dir)?)
 }
 
 pub(crate) fn profile_for_registry(app_dir: &Path, path: &Path) -> String {
@@ -2282,7 +2585,18 @@ mod tests {
     /// the glob import keeps these tests hermetic: they assert the migration's
     /// own logic and must not depend on a container runtime being installed.
     fn run_in(app_dir: &Path, home: &Path, is_running: &RunningProbe<'_>) -> Result<()> {
-        super::run_in(app_dir, home, is_running, &|_| Ok(true), false, true, None)
+        super::run_in(
+            app_dir,
+            home,
+            is_running,
+            &|_| Ok(true),
+            false,
+            true,
+            MigrationScope {
+                only: None,
+                store: None,
+            },
+        )
     }
 
     fn run_in_only(
@@ -2298,7 +2612,10 @@ mod tests {
             &|_| Ok(true),
             false,
             true,
-            Some(only),
+            MigrationScope {
+                only: Some(only),
+                store: None,
+            },
         )
     }
 
@@ -2467,7 +2784,10 @@ mod tests {
             &|_| Ok(false),
             false,
             true,
-            None,
+            MigrationScope {
+                only: None,
+                store: None,
+            },
         )
         .unwrap();
         let deferred: Value =
@@ -2489,7 +2809,10 @@ mod tests {
             &|_| Ok(true),
             false,
             true,
-            None,
+            MigrationScope {
+                only: None,
+                store: None,
+            },
         )
         .unwrap();
         let committed: Value =
@@ -2535,7 +2858,10 @@ mod tests {
             &|_| panic!("a deferred pass must not reap containers"),
             true,
             true,
-            None,
+            MigrationScope {
+                only: None,
+                store: None,
+            },
         )
         .unwrap();
         drop(guard);
@@ -2666,7 +2992,10 @@ mod tests {
                 &|_| panic!("a bare start must not reap containers"),
                 true,
                 false,
-                None,
+                MigrationScope {
+                    only: None,
+                    store: None,
+                },
             )
             .unwrap();
             drop(guard);
@@ -4055,7 +4384,10 @@ gemini = "{}"
                 &|_| Ok(true),
                 false,
                 true,
-                None,
+                MigrationScope {
+                    only: None,
+                    store: None,
+                },
             )
         });
         PausedPass {
@@ -4262,7 +4594,6 @@ gemini = "{}"
                 .paused
                 .recv_timeout(std::time::Duration::from_secs(10))
                 .expect("the holder reached its copy");
-
             let copies = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let (contended_tx, contended_rx) = std::sync::mpsc::channel();
             let counting_pass = |only: Option<&'static str>| {
@@ -4283,7 +4614,7 @@ gemini = "{}"
                         &|_| Ok(true),
                         false,
                         true,
-                        only,
+                        MigrationScope { only, store: None },
                     )
                 })
             };

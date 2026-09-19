@@ -1,6 +1,7 @@
 //! Installing and running agent status hooks around a launch.
 
 use super::*;
+use crate::session::SessionStore;
 use anyhow::bail;
 
 pub(super) fn status_hook_env_prefix(
@@ -77,41 +78,69 @@ pub(crate) fn sidecar_host_config_path_for(
 }
 
 impl Instance {
-    pub(super) fn run_pre_launch_hooks(
+    /// Run the pre-launch hooks. `progress` selects live streamed output for a
+    /// caller that displays it (the daemon create path); without one the hooks
+    /// keep their terminal attached and their output captured, so a CLI user
+    /// can still answer an interactive prompt.
+    pub(crate) fn run_pre_launch_hooks(
         &mut self,
         skip_on_launch: bool,
-        profile: &str,
+        store: &dyn SessionStore,
+        progress: Option<&dyn Fn(crate::session::config::repo_config::HookProgress)>,
     ) -> Result<()> {
-        self.mint_host_session_env()?;
-        self.run_launch_hooks(skip_on_launch, profile)
+        let config = store.configuration(Some(store.storage().profile()))?;
+        self.mint_host_session_env(&config)?;
+        self.run_launch_hooks(skip_on_launch, store, progress)
     }
 
-    fn run_launch_hooks(&mut self, skip_on_launch: bool, profile: &str) -> Result<()> {
+    fn run_launch_hooks(
+        &mut self,
+        skip_on_launch: bool,
+        store: &dyn SessionStore,
+        progress: Option<&dyn Fn(crate::session::config::repo_config::HookProgress)>,
+    ) -> Result<()> {
         if self.tool == "omp" && !self.has_command_override() {
             reject_omp_secret_args(&crate::session::config::quote_model_value_in_args(
                 &self.extra_args,
             ))?;
         }
+        let on_launch_hooks = if skip_on_launch {
+            None
+        } else {
+            let config = store.configuration(Some(store.storage().profile()))?;
+            self.resolve_on_launch_hooks(config.hooks.on_launch)
+        };
         let agent = self.resolved_agent();
         self.ensure_disclosed_host_hook_path(agent)?;
         self.install_agent_status_hooks(agent);
         self.ensure_host_folder_trust(agent);
         self.propagate_managed_skills();
 
-        let on_launch_hooks = self.resolve_on_launch_hooks(skip_on_launch, profile);
         if self.is_sandboxed() {
-            self.get_container_for_instance()?;
+            self.ensure_container_in(store)?;
             if let (Some(hook_cmds), Some(sandbox)) =
                 (on_launch_hooks.as_ref(), self.sandbox_info.as_ref())
             {
                 let hook_env = crate::session::config::repo_config::lifecycle_env_vars(self);
                 let workdir = self.container_workdir();
-                if let Err(error) = crate::session::config::repo_config::execute_hooks_in_container(
-                    hook_cmds,
-                    &sandbox.container_name,
-                    &workdir,
-                    &hook_env,
-                ) {
+                let result = match progress {
+                    Some(progress) => {
+                        crate::session::config::repo_config::execute_hooks_in_container_streamed(
+                            hook_cmds,
+                            &sandbox.container_name,
+                            &workdir,
+                            Some(progress),
+                            &hook_env,
+                        )
+                    }
+                    None => crate::session::config::repo_config::execute_hooks_in_container(
+                        hook_cmds,
+                        &sandbox.container_name,
+                        &workdir,
+                        &hook_env,
+                    ),
+                };
+                if let Err(error) = result {
                     if error.chain().any(|cause| {
                         cause
                             .downcast_ref::<crate::session::config::repo_config::HookTimeout>()
@@ -128,11 +157,21 @@ impl Instance {
             }
         } else if let Some(hook_cmds) = on_launch_hooks.as_ref() {
             let hook_env = crate::session::config::repo_config::lifecycle_env_vars(self);
-            if let Err(error) = crate::session::config::repo_config::execute_hooks(
-                hook_cmds,
-                Path::new(&self.project_path),
-                &hook_env,
-            ) {
+            let project_path = Path::new(&self.project_path);
+            let result = match progress {
+                Some(progress) => crate::session::config::repo_config::execute_hooks_streamed(
+                    hook_cmds,
+                    project_path,
+                    Some(progress),
+                    &hook_env,
+                ),
+                None => crate::session::config::repo_config::execute_hooks(
+                    hook_cmds,
+                    project_path,
+                    &hook_env,
+                ),
+            };
+            if let Err(error) = result {
                 if error.chain().any(|cause| {
                     cause
                         .downcast_ref::<crate::session::config::repo_config::HookTimeout>()
@@ -146,27 +185,11 @@ impl Instance {
         Ok(())
     }
 
-    /// Resolve on_launch hooks from the full config chain (global > profile > repo).
-    ///
-    /// Repo hooks go through trust verification; global/profile hooks are
-    /// implicitly trusted. Returns `None` when skipped or no hooks are configured.
+    /// Trusted repository hooks can replace the selected global/profile hooks.
     pub(crate) fn resolve_on_launch_hooks(
         &self,
-        skip_on_launch: bool,
-        profile: &str,
+        mut resolved_on_launch: Vec<String>,
     ) -> Option<Vec<String>> {
-        if skip_on_launch {
-            return None;
-        }
-
-        // Start with global+profile hooks as the base
-        let mut resolved_on_launch =
-            crate::session::config::profile_config::resolve_config_or_warn(profile)
-                .hooks
-                .on_launch;
-
-        // Check if repo has trusted hooks that override. Only the hooks surface
-        // matters here; untrusted project MCP must not suppress trusted hooks.
         if let Ok(trust) =
             crate::session::config::repo_config::check_repo_trust(Path::new(&self.project_path))
         {

@@ -185,16 +185,33 @@ fn structured_fork_mints_distinct_child_id_and_preserves_parent() {
     let parent_acp_id = wait_for_acp_id(&h, "ForkParent", Duration::from_secs(45));
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let parent_context_resume = rt.block_on(async {
-        reqwest::get(format!("http://127.0.0.1:{port}/api/sessions"))
-            .await
-            .expect("GET /api/sessions")
-            .json::<serde_json::Value>()
-            .await
-            .expect("decode sessions response")["sessions"]
-            .as_array()
-            .and_then(|rows| rows.iter().find(|row| row["title"] == "ForkParent"))
-            .map(|row| row["context_resume"].clone())
-            .expect("ForkParent context_resume")
+        let client = reqwest::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let response = client
+                .get(format!("http://127.0.0.1:{port}/api/sessions"))
+                .send()
+                .await
+                .expect("GET /api/sessions")
+                .error_for_status()
+                .expect("successful sessions response")
+                .json::<serde_json::Value>()
+                .await
+                .expect("decode sessions response");
+            let parent = response["sessions"]
+                .as_array()
+                .and_then(|rows| rows.iter().find(|row| row["title"] == "ForkParent"))
+                .expect("ForkParent API row");
+            // Disk persistence does not fence the runtime snapshot publisher.
+            if parent["acp_session_id"].as_str() == Some(parent_acp_id.as_str()) {
+                break parent["context_resume"].clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "API never published the captured parent identity: {parent}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     });
     assert_eq!(
         parent_context_resume,

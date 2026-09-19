@@ -168,31 +168,25 @@ impl Instance {
         } else {
             false
         };
-        self.acquire_lifecycle_reservation(
+        let generation = self.acquire_lifecycle_reservation(
             &storage,
             LifecycleOperation::Launch,
             Some(Status::Starting),
         )?;
 
-        // The durable reservation excludes peer launches while user hooks run.
-        // Both flocks must be absent because a hook may invoke aoe for this
-        // same session. Reacquire in the global order afterward and reload the
-        // authoritative title (via `reconcile_from_disk`) before deriving the
-        // tmux launch name: `spawn_prepared_launch`'s `tmux_session()` reads
-        // `self.title`, so the reload guarantees the name comes from the
-        // committed title a concurrent rename may have written during hooks,
-        // never the pre-hook value.
+        // Hooks may invoke aoe; retain the token, not the flocks, across them.
         drop(lifecycle_lock);
         drop(title_lock);
-        let hook_result = self.run_pre_launch_hooks(skip_on_launch, &profile);
+        let hook_result = self.run_pre_launch_hooks(skip_on_launch, &storage, None);
         let (_title_lock, _lifecycle_lock) =
-            self.reacquire_launch_locks_after_hooks(&storage, hook_result)?;
-        self.apply_fresh_launch_intent();
-
-        let prepared = match self.prepare_launch_command() {
+            self.reacquire_launch_locks_after_hooks(&storage, generation, hook_result)?;
+        let prepared = match self
+            .apply_fresh_launch_intent(&storage)
+            .and_then(|()| self.prepare_launch_command(&storage))
+        {
             Ok(prepared) => prepared,
             Err(error) => {
-                self.fail_reserved_launch(&storage, &error, false);
+                self.fail_reserved_launch(&storage, generation, &error, false);
                 return Err(error);
             }
         };
@@ -200,30 +194,34 @@ impl Instance {
             if corpse_pane {
                 self.kill_clean_locked()?;
             }
-            let outcome = self.spawn_prepared_launch(size, &profile, prepared)?;
-            self.commit_lifecycle_launch(&storage, false)?;
+            let outcome = self.spawn_prepared_launch(size, &storage, prepared)?;
+            self.commit_lifecycle_launch(&storage, generation, false)?;
             Ok(outcome)
         })();
         if let Err(error) = result {
-            self.fail_reserved_launch(&storage, &error, true);
+            self.fail_reserved_launch(&storage, generation, &error, true);
             return Err(error);
         }
         result
     }
 
-    pub(super) fn apply_fresh_launch_intent(&mut self) {
+    pub(super) fn apply_fresh_launch_intent(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+    ) -> Result<()> {
         if std::mem::take(&mut self.force_fresh_next_launch) {
             self.resume_intent = ResumeIntent::Cleared;
         }
-        self.reconcile_sidecar_into_disk();
+        self.reconcile_sidecar_into_disk(storage)
     }
 
     pub(super) fn spawn_prepared_launch(
         &mut self,
         size: Option<(u16, u16)>,
-        profile: &str,
+        storage: &dyn crate::session::SessionStore,
         mut prepared: PreparedLaunch,
     ) -> Result<LaunchSidOutcome> {
+        let profile = storage.storage().profile();
         let session = self.tmux_session()?;
         if session.exists() {
             anyhow::bail!(
@@ -280,10 +278,10 @@ impl Instance {
             None
         };
         let omp_generation_published = self.publish_omp_launch_generation(
-            profile,
+            storage,
             omp_capture_metadata.as_ref(),
             prepared.expected_prior_omp_generation.as_deref(),
-        );
+        )?;
         if let Some(metadata) = omp_capture_metadata.as_ref() {
             // The launch preamble (`wrap_omp_launch`) rewrites OMP's breadcrumb
             // and writes the capture marker only if the store's terminal-sessions
@@ -330,11 +328,11 @@ impl Instance {
 
         self.finalize_launch(
             session.name(),
-            profile,
+            storage,
             prepared.expected_prior_sid.as_deref(),
             prepared.expected_prior_intent,
             omp_capture_metadata,
-        );
+        )?;
 
         #[cfg(test)]
         test_support::observe(self, test_support::FinalizePhase::After);
@@ -349,11 +347,12 @@ impl Instance {
     pub(super) fn finalize_launch(
         &mut self,
         session_name: &str,
-        profile: &str,
+        storage: &dyn crate::session::SessionStore,
         expected_prior_sid: Option<&str>,
         expected_prior_intent: ResumeIntent,
         mut omp_capture_metadata: Option<OmpCaptureMetadata>,
-    ) {
+    ) -> Result<()> {
+        let profile = storage.storage().profile();
         if let Some(metadata) = omp_capture_metadata.as_ref() {
             let published = serde_json::to_string(metadata).ok().and_then(|encoded| {
                 crate::tmux::env::set_hidden_env(
@@ -375,7 +374,8 @@ impl Instance {
             }
         }
 
-        let outcome = self.persist_session_id(profile, expected_prior_sid, expected_prior_intent);
+        let outcome =
+            self.persist_session_id_with_store(storage, expected_prior_sid, expected_prior_intent)?;
 
         // Skip outcomes leave AOE_CAPTURED_SESSION_ID untouched: this path
         // runs before any poller publish, so env is empty for fresh sessions.
@@ -415,43 +415,21 @@ impl Instance {
             }
         }
 
-        self.maybe_start_poller_since(omp_capture_metadata);
+        self.maybe_start_poller_since(omp_capture_metadata, CaptureStorage::Scoped(storage))?;
 
         self.status = Status::Starting;
         self.last_start_time = Some(std::time::Instant::now());
 
-        // Apply status bar options in a background thread to avoid blocking
-        // the TUI on the multiple tmux subprocess calls they require.
-        let session_name = session_name.to_string();
-        let instance_id_for_log = self.id.clone();
-        let title = self.title.clone();
-        let branch = self.worktree_info.as_ref().map(|w| w.branch.clone());
-        let sandbox = self.sandbox_display();
-        let options_profile = profile.to_string();
-        match std::thread::Builder::new()
-            .name(format!("finalize-tmux-{}", instance_id_for_log))
-            .spawn(move || {
-                if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    crate::tmux::status_bar::apply_all_tmux_options(
-                        &session_name,
-                        &title,
-                        branch.as_deref(),
-                        sandbox.as_ref(),
-                        &options_profile,
-                    );
-                })) {
-                    tracing::error!(target: "session.store", "finalize-tmux thread panicked: {:?}", panic);
-                }
-            }) {
-            Ok(_handle) => {}
-            Err(e) => {
-                tracing::error!(target: "session.store",
-                    session = %instance_id_for_log,
-                    error = %e,
-                    "Failed to spawn finalize-tmux thread"
-                );
-            }
-        }
+        crate::tmux::status_bar::apply_all_tmux_options(
+            session_name,
+            &self.title,
+            self.worktree_info
+                .as_ref()
+                .map(|worktree| worktree.branch.as_str()),
+            self.sandbox_display().as_ref(),
+            profile,
+        );
+        Ok(())
     }
 }
 

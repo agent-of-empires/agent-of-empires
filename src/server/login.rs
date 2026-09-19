@@ -926,11 +926,18 @@ pub struct LoginRequest {
 /// POST /api/login
 pub async fn login_handler(
     State(state): State<Arc<AppState>>,
-    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    peer: super::peer::ConnectionPeer,
     headers: axum::http::HeaderMap,
     login_body: Result<Json<LoginRequest>, axum::extract::rejection::JsonRejection>,
 ) -> axum::response::Response {
-    let client_ip = resolve_client_ip(addr, &headers);
+    let super::peer::ConnectionPeer::Tcp(addr) = peer else {
+        return (
+            StatusCode::CONFLICT,
+            "Local owner authentication does not use browser login",
+        )
+            .into_response();
+    };
+    let client_ip = resolve_client_ip(addr, &headers, state.behind_tunnel);
 
     if !state.login_manager.is_enabled() {
         return (
@@ -1072,10 +1079,17 @@ pub struct ElevateRequest {
 /// of those). See #1131.
 pub async fn elevate_handler(
     State(state): State<Arc<AppState>>,
-    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    peer: super::peer::ConnectionPeer,
     request: axum::extract::Request,
 ) -> axum::response::Response {
-    let client_ip = resolve_client_ip(addr, request.headers());
+    let super::peer::ConnectionPeer::Tcp(addr) = peer else {
+        return (
+            StatusCode::CONFLICT,
+            "Local owner authentication does not use browser elevation",
+        )
+            .into_response();
+    };
+    let client_ip = resolve_client_ip(addr, request.headers(), state.behind_tunnel);
 
     if !state.login_manager.is_enabled() {
         return (
@@ -1310,6 +1324,17 @@ pub async fn login_status_handler(
     State(state): State<Arc<AppState>>,
     request: axum::extract::Request,
 ) -> Json<serde_json::Value> {
+    if matches!(
+        request
+            .extensions()
+            .get::<super::auth::LocalAuthorization>(),
+        Some(super::auth::LocalAuthorization::UnixOwner(_))
+    ) {
+        return Json(serde_json::json!({
+            "required": false, "authenticated": true, "elevated": true,
+            "elevated_until_secs": null, "principal": "local_owner"
+        }));
+    }
     let required = state.login_manager.is_enabled();
 
     if !required {

@@ -13,76 +13,277 @@ use super::structured_repair::{
     LiveStructuredWorkerRecord,
 };
 
-/// Load sessions from all profiles, matching the TUI's "all profiles" view.
-pub(super) fn load_all_instances(
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CanonicalMetadata {
+    pub default_profile: String,
+    pub profiles: Vec<crate::daemon::ProfileSnapshot>,
+    pub workspace_ordering: Vec<String>,
+    pub global_projects: Vec<crate::daemon::ProjectResponse>,
+    pub status_hooks: std::collections::HashMap<String, crate::status_hooks::StatusHookConfig>,
+    pub auxiliary_tools: std::collections::HashMap<String, Vec<String>>,
+}
+
+pub(crate) struct LoadedProfiles {
+    pub instances: Vec<Instance>,
+    pub metadata: CanonicalMetadata,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("canonical profile load failed")]
+pub(crate) struct ReloadFailure {
+    pub health: crate::daemon::RuntimeHealth,
+    #[source]
+    pub(super) source: anyhow::Error,
+}
+
+pub(super) fn load_all_profiles(
     file_watch: &Arc<FileWatchService>,
-) -> anyhow::Result<Vec<Instance>> {
-    let profiles = match crate::session::list_profiles() {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(
-                target: "server.file_watch",
-                error = %e,
-                "list_profiles failed; load_all_instances returning empty set"
+) -> Result<LoadedProfiles, ReloadFailure> {
+    use crate::daemon::{ProfileSnapshot, ProjectResponse, ReloadFailureCode, RuntimeHealth};
+    let profiles = crate::session::list_profiles().map_err(|source| ReloadFailure {
+        health: RuntimeHealth::Degraded {
+            code: ReloadFailureCode::ProfileEnumeration,
+            profiles: Vec::new(),
+        },
+        source,
+    })?;
+    let (default_profile, workspace_ordering, global_projects) = (|| {
+        let mut default_profile = crate::session::config::Config::load()?.default_profile;
+        anyhow::ensure!(!profiles.is_empty(), "Profile catalogue is empty");
+        if default_profile.is_empty() {
+            profiles[0].clone_into(&mut default_profile);
+        } else {
+            anyhow::ensure!(
+                profiles.contains(&default_profile),
+                "Configured default profile is unavailable"
             );
-            return Ok(Vec::new());
         }
-    };
+        let ordering = crate::session::load_workspace_ordering()?.order;
+        let projects = crate::session::projects::load_global()?
+            .into_iter()
+            .map(ProjectResponse::from)
+            .collect();
+        Ok::<_, anyhow::Error>((default_profile, ordering, projects))
+    })()
+    .map_err(|source| ReloadFailure {
+        health: RuntimeHealth::Degraded {
+            code: ReloadFailureCode::Metadata,
+            profiles: Vec::new(),
+        },
+        source,
+    })?;
     let mut all = Vec::new();
-    for profile in &profiles {
-        match Storage::new(profile, file_watch.clone()).and_then(|s| s.load()) {
-            Ok(mut instances) => {
-                for inst in &mut instances {
-                    inst.source_profile = profile.clone();
-                }
-                all.extend(instances);
+    let mut profile_metadata = Vec::with_capacity(profiles.len());
+    let mut status_hooks = std::collections::HashMap::new();
+    let mut auxiliary_tools = std::collections::HashMap::new();
+    for profile in profiles {
+        let (mut instances, groups, details) = (|| {
+            let (instances, groups) =
+                Storage::open(&profile, file_watch.clone())?.load_complete_with_groups()?;
+            let details = load_profile_details(&profile)?;
+            Ok::<_, anyhow::Error>((instances, groups, details))
+        })()
+        .map_err(|source| ReloadFailure {
+            health: RuntimeHealth::Degraded {
+                code: ReloadFailureCode::ProfileData,
+                profiles: vec![profile.clone()],
+            },
+            source,
+        })?;
+        for inst in &mut instances {
+            inst.source_profile = profile.clone();
+        }
+        all.extend(instances);
+        status_hooks.insert(profile.clone(), details.status_hooks);
+        auxiliary_tools.insert(profile.clone(), details.auxiliary_tools);
+        profile_metadata.push(ProfileSnapshot {
+            name: profile,
+            description: details.description,
+            groups,
+            projects: details.projects,
+        });
+    }
+    Ok(LoadedProfiles {
+        instances: all,
+        metadata: CanonicalMetadata {
+            default_profile,
+            profiles: profile_metadata,
+            workspace_ordering,
+            global_projects,
+            status_hooks,
+            auxiliary_tools,
+        },
+    })
+}
+
+pub(super) struct ProfileDetails {
+    pub description: Option<String>,
+    pub projects: Vec<crate::daemon::ProjectResponse>,
+    pub status_hooks: crate::status_hooks::StatusHookConfig,
+    pub auxiliary_tools: Vec<String>,
+}
+
+pub(super) fn load_profile_details(profile: &str) -> anyhow::Result<ProfileDetails> {
+    let description = crate::session::load_profile_config(profile)?.description;
+    let projects = crate::session::projects::load_profile(profile)?
+        .into_iter()
+        .map(crate::daemon::ProjectResponse::from)
+        .collect();
+    let config = crate::session::resolve_config(profile)?;
+    let mut auxiliary_tools: Vec<_> = config
+        .tools
+        .into_iter()
+        .filter(|(_, tool)| !tool.background && !tool.command.is_empty())
+        .map(|(name, _)| name)
+        .collect();
+    auxiliary_tools.sort_unstable();
+    Ok(ProfileDetails {
+        description,
+        projects,
+        status_hooks: config.status_hooks,
+        auxiliary_tools,
+    })
+}
+
+pub(super) enum StatusCommit {
+    Passive,
+    Lifecycle,
+}
+
+pub(super) fn replace_committed_profiles<const N: usize>(
+    current: &mut Vec<Instance>,
+    metadata: &mut CanonicalMetadata,
+    mut committed: [(&str, Vec<Instance>, Vec<crate::session::Group>); N],
+    committed_status: impl Fn(&str) -> Option<StatusCommit>,
+) -> Result<(), ReloadFailure> {
+    let invalid_profile = |profile: &str, message: &'static str| ReloadFailure {
+        health: crate::daemon::RuntimeHealth::Degraded {
+            code: crate::daemon::ReloadFailureCode::Metadata,
+            profiles: vec![profile.to_owned()],
+        },
+        source: anyhow::anyhow!(message),
+    };
+    let mut profile_indices = [0; N];
+    for (index, (profile, _, _)) in committed.iter().enumerate() {
+        let profile_index = metadata
+            .profiles
+            .iter()
+            .position(|item| item.name == *profile)
+            .ok_or_else(|| {
+                invalid_profile(
+                    profile,
+                    "committed profile is missing from canonical metadata",
+                )
+            })?;
+        if profile_indices[..index].contains(&profile_index) {
+            return Err(invalid_profile(
+                profile,
+                "profile occurs more than once in a commit",
+            ));
+        }
+        profile_indices[index] = profile_index;
+    }
+    let prior: std::collections::HashMap<_, _> = current
+        .iter()
+        .filter(|row| {
+            committed
+                .iter()
+                .any(|(profile, _, _)| row.source_profile == *profile)
+        })
+        .map(|row| (row.id.as_str(), row))
+        .collect();
+    for (profile, rows, _) in &mut committed {
+        for row in rows {
+            if row.source_profile != *profile {
+                (*profile).clone_into(&mut row.source_profile);
             }
-            Err(e) => {
-                tracing::warn!(
-                    target: "server.file_watch",
-                    profile = %profile,
-                    error = %e,
-                    "load_all_instances skipped profile; sessions for this profile will be \
-                     absent from state until next successful reload"
-                );
+            if let Some(previous) = prior.get(row.id.as_str()) {
+                let status = row.status;
+                let idle_entered_at = row.idle_entered_at;
+                let committed_error = row.last_error.take();
+                if previous.source_profile == *profile {
+                    row.merge_runtime_from_reload(previous);
+                } else {
+                    row.merge_runtime_for_profile_move(previous);
+                }
+                if let Some(commit) = committed_status(&row.id) {
+                    row.status = status;
+                    row.idle_entered_at = idle_entered_at;
+                    if matches!(commit, StatusCommit::Lifecycle) {
+                        row.last_error = committed_error;
+                    }
+                }
+                row.last_accessed_at = row.last_accessed_at.max(previous.last_accessed_at);
+            }
+            if row.is_archived() {
+                row.settle_archived_status();
             }
         }
     }
-    Ok(all)
-}
-
-/// Carry over the in-memory-only fields from the prior `state.instances`
-/// entry into the freshly-loaded one. These fields are `#[serde(skip)]`
-/// on `Instance` and would otherwise be reset to default every 2 s when
-/// `status_poll_loop` reloads from disk. Adding a new `#[serde(skip)]`
-/// field on `Instance` requires extending this function or the field is
-/// silently wiped on every poll tick.
-pub(super) fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Instance {
-    fresh.last_error_check = prior.last_error_check;
-    fresh.last_start_time = prior.last_start_time;
-    // Only preserve `last_error` while the session is still in Error. A healthy
-    // `fresh` clears it in `update_status_with_metadata_inner`; carrying the
-    // prior string over unconditionally would re-stick a stale error on a now-green
-    // session every poll tick when a healthy transition happened through a path that
-    // did not explicitly null `last_error` in-memory (issue #1271).
-    if fresh.status == Status::Error {
-        fresh.last_error = prior.last_error;
+    let capacity = current.len() - prior.len()
+        + committed
+            .iter()
+            .map(|(_, rows, _)| rows.len())
+            .sum::<usize>();
+    drop(prior);
+    let mut retained = Vec::with_capacity(capacity);
+    let mut insertion: [_; N] = std::array::from_fn(|index| (usize::MAX, usize::MAX, index));
+    for (position, row) in current.drain(..).enumerate() {
+        if let Some(index) = committed
+            .iter()
+            .position(|(profile, _, _)| row.source_profile == *profile)
+        {
+            if insertion[index].0 == usize::MAX {
+                insertion[index] = (retained.len(), position, index);
+            }
+        } else {
+            retained.push(row);
+        }
     }
-    fresh.session_id_poller = prior.session_id_poller;
-    fresh.poller_repair = prior.poller_repair;
-    fresh.session_id_poller_retry_after = prior.session_id_poller_retry_after;
-    fresh.retroactive_capture_excludes = prior.retroactive_capture_excludes;
-    fresh.acp_load_session_capable = prior.acp_load_session_capable;
-    fresh
+    insertion.sort_unstable();
+    for (offset, _, index) in insertion.into_iter().rev() {
+        let offset = offset.min(retained.len());
+        retained.splice(offset..offset, committed[index].1.drain(..));
+    }
+    *current = retained;
+    for ((_, _, groups), profile_index) in committed.into_iter().zip(profile_indices) {
+        metadata.profiles[profile_index].groups = groups;
+    }
+    Ok(())
 }
 
-/// The prior tick's `#[serde(skip)]` status bookkeeping for one row, the
-/// input to [`seed_tick_tracking`].
-#[derive(Debug, Clone, Copy, Default)]
+/// Adopt exact storage commits under one snapshot exclusion.
+pub(crate) async fn adopt_committed_profiles<const N: usize>(
+    state: &Arc<AppState>,
+    committed: [(&str, Vec<Instance>, Vec<crate::session::Group>); N],
+    committed_status: impl Fn(&str) -> bool,
+    _publication: &tokio::sync::RwLockWriteGuard<'_, ()>,
+) -> Result<(), ReloadFailure> {
+    let mut metadata = state.canonical_metadata.write().await;
+    let mut current = state.instances.write().await;
+    replace_committed_profiles(&mut current, &mut metadata, committed, |id| {
+        committed_status(id).then_some(StatusCommit::Lifecycle)
+    })?;
+    state
+        .mutation_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    state.runtime.request_publish();
+    Ok(())
+}
+
+/// Keep process state without replacing the committed lifecycle or identity.
+pub(super) fn merge_runtime_fields(prior: Instance, fresh: &mut Instance) {
+    fresh.last_error_check = prior.last_error_check;
+    fresh.inherit_runtime(prior, fresh.status == Status::Error);
+}
+
+/// Observations erased by storage loading and carried into the next sample.
+#[derive(Debug, Clone, Default)]
 pub(super) struct PriorTickTracking {
     ever_confirmed_present: bool,
     unknown_since: Option<std::time::Instant>,
     detection: crate::session::DetectionState,
+    auxiliary_targets: Vec<crate::session::AuxiliaryTarget>,
 }
 
 impl PriorTickTracking {
@@ -91,39 +292,42 @@ impl PriorTickTracking {
             ever_confirmed_present: inst.ever_confirmed_present,
             unknown_since: inst.unknown_since,
             detection: inst.detection,
+            auxiliary_targets: inst
+                .auxiliary
+                .iter()
+                .map(|observation| observation.target.clone())
+                .collect(),
         }
     }
 }
 
-/// Carry the previous tick's status bookkeeping onto a freshly disk-loaded
-/// instance, keyed by id. `load_all_instances` unconditionally resets these
-/// `#[serde(skip)]` fields to their defaults on every call, so
-/// `status_poll_loop` must call this BEFORE running
-/// `update_status_with_metadata` on the fresh instance. Each field breaks
-/// differently without it:
-///
-/// - `unknown_since` restarts at `Instant::now()` every 2s tick, so the
-///   bounded Unknown->Error escalation window in
-///   `update_status_with_metadata_inner` can never elapse (#2865).
-/// - `detection` restarts empty, so a `Running -> Idle` the rules did not
-///   read off live chrome proposes itself every tick and never meets the
-///   confirming poll that would publish it: a hookless manifest agent stays
-///   Running for the life of the session (#3642).
-///
-/// The counterpart carry for the opposite direction, after the status
-/// decision has run, lives in `reload_state_instances_from_disk`'s
-/// per-`StatusSource` handling.
+/// Restore the escalation clock, confirmations and known auxiliary targets before sampling.
 pub(super) fn seed_tick_tracking(
     instances: &mut [Instance],
-    prev: &std::collections::HashMap<String, PriorTickTracking>,
+    mut prev: std::collections::HashMap<String, PriorTickTracking>,
 ) {
     for inst in instances {
-        if let Some(prior) = prev.get(&inst.id) {
+        if let Some(prior) = prev.remove(&inst.id) {
             inst.ever_confirmed_present = prior.ever_confirmed_present;
             inst.unknown_since = prior.unknown_since;
             inst.detection = prior.detection;
+            inst.auxiliary = prior
+                .auxiliary_targets
+                .into_iter()
+                .map(|target| crate::session::AuxiliaryObservation {
+                    target,
+                    pane: Default::default(),
+                })
+                .collect();
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct SandboxHealth {
+    pub generation: u64,
+    pub container_name: String,
+    pub running: bool,
 }
 
 /// One tick's per-instance status decision: seed each freshly disk-loaded row's
@@ -139,6 +343,7 @@ pub(super) fn apply_tick_status_decisions(
     prev: &std::collections::HashMap<String, crate::session::Status>,
     suppressed_ids: &std::collections::HashSet<String>,
     pane_metadata: Option<&std::collections::HashMap<String, crate::tmux::PaneMetadata>>,
+    sandbox_health: &std::collections::HashMap<String, SandboxHealth>,
 ) {
     for inst in instances.iter_mut() {
         if suppressed_ids.contains(&inst.id) {
@@ -157,6 +362,26 @@ pub(super) fn apply_tick_status_decisions(
             continue;
         }
         if skip_tmux_decision_for_structured(inst) {
+            continue;
+        }
+        if inst.is_sandboxed()
+            && !matches!(
+                inst.status,
+                Status::Stopped | Status::Starting | Status::Creating | Status::Deleting
+            )
+            && inst.sandbox_info.as_ref().is_some_and(|sandbox| {
+                sandbox_health.get(&inst.id).is_some_and(|health| {
+                    health.generation == inst.lifecycle_generation
+                        && health.container_name == sandbox.container_name
+                        && !health.running
+                })
+            })
+        {
+            inst.status = Status::Error;
+            inst.last_error = Some("Container is not running".into());
+            inst.idle_entered_at = None;
+            inst.pane_dead_observed = false;
+            inst.live_status_baseline = Some(Status::Error);
             continue;
         }
         let Some(pane_metadata) = pane_metadata else {
@@ -244,64 +469,16 @@ pub(super) fn skip_tmux_decision_for_structured(inst: &mut Instance) -> bool {
     true
 }
 
-// INVARIANTS for `reload_state_instances_from_disk` (do not break without
-// revisiting `tests/serve_disk_reload_helper_equivalence.rs`):
-// 1. Both call sites (`status_poll_loop` and `disk_watcher_consumer`) must
-//    invoke this helper. They differ in cadence, in what they do BEFORE
-//    calling it (tmux scrape lives only in `status_poll_loop`), and in
-//    the StatusSource they pass.
-// 2. `merge_runtime_fields` is mandatory per-id. Skipping it wipes the
-//    #[serde(skip)] runtime fields (`last_error_check`,
-//    `last_start_time`, `last_error`, `session_id_poller`,
-//    `retroactive_capture_excludes`) that disk reload zeroes by design.
-// 3. `merge_runtime_fields` does NOT carry `status`, `last_accessed_at`,
-//    `idle_entered_at`, or the `PriorTickTracking` fields
-//    (`ever_confirmed_present`, `unknown_since`, `detection`).
-//    Those are handled per StatusSource: DiskOnly takes prior.status,
-//    `prior.idle_entered_at.or(fresh.idle_entered_at)`, and prior's
-//    tracking verbatim (its `fresh` never went through
-//    `update_status_with_metadata`, so those fields are still at their
-//    zeroed defaults). TmuxApplied takes fresh's status and tracking:
-//    the caller (`status_poll_loop`) already seeded `fresh` from the
-//    prior tick's tracking before running the tmux scrape and status
-//    decision, so `fresh` already holds this tick's authoritative values;
-//    restoring the pre-decision prior snapshot here would erase that
-//    decision every tick, re-freezing the Unknown->Error escalation window
-//    at zero elapsed time (#2865) and dropping a detection awaiting its
-//    confirming poll (#3642). `last_accessed_at` is monotonic-max
-//    regardless.
-// 4. The acp overlay filter is `inst.is_structured()`, never the lazy
-//    ACP session id. The latter is set lazily by the ACP handshake
-//    and is None for newly-spawned acp sessions; using it as the
-//    filter would silently drop overlay coverage for pre-handshake
-//    rows.
-// 5. `prior_by_id` is built with `.drain(..)` once, then read with
-//    `.get()` rather than `.remove()` in the merge loop, so the same map is
-//    still populated when `apply_acp_overlay_inplace` runs.
-// 6. Polling is canonical. The watcher path
-//    adds latency reduction; correctness still holds when it fails.
-// 7. `status_poll_loop` and `disk_watcher_consumer` may interleave
-//    per-tick; both serialise on `state.instances.write().await`. A
-//    DiskOnly merge between a TmuxApplied write and a subsequent tmux
-//    scrape can briefly carry the prior status; it self-corrects on
-//    the next 2s tick. Polling is canonical (invariant 6) so this is
-//    acceptable.
-// 8. Every caller must read `state.mutation_epoch` BEFORE its disk read and
-//    pass that value as `read_epoch`. `fresh` is a snapshot of
-//    `sessions.json`, so a committed membership or view transition that lands
-//    between that read and this call makes the snapshot unsafe. A wholesale
-//    replace could resurrect or drop a row, while a per-id merge could restore
-//    the previous execution backend and make a subsequent enable or disable
-//    take the wrong idempotent path. The comparison and every epoch bump happen
-//    under the `state.instances` write lock, after the durable mutation lands.
-//    This closes the check-then-act race while preserving externally created
-//    rows when the epoch still matches.
+// Both polling and disk notifications use this merge; polling remains authoritative.
+// Preserve runtime-only fields per ID. DiskOnly also preserves live status and
+// detection tracking; TmuxApplied keeps the newly sampled decision and tracking.
+// Access timestamps are monotonic. ACP overlay eligibility follows is_structured(),
+// not the lazily assigned ACP session ID. Keep prior_by_id intact for that overlay.
+// Callers hold namespace and reload-lane guards and capture mutation_epoch before
+// reading disk. Publication exclusion rejects stale reads and spans repair/passive
+// commits through adoption. Failure retains the last complete canonical state.
+// Status effects are dispatched only after successful adoption and publication.
 
-/// Reload `state.instances` by merging caller-supplied `fresh` against the
-/// prior in-memory snapshot per id, then reapplying the acp overlay.
-/// The caller is responsible for the disk read and, on the
-/// `TmuxApplied` path only, for emitting `state.status_tx`
-/// diffs BEFORE invoking the helper.
 /// Snapshot of the prior in-memory `state.instances` keyed by id, used
 /// for per-id merging in `reload_state_instances_from_disk` and the
 /// acp-overlay pass. Intentionally exposes only `drain_from` and `get`;
@@ -326,14 +503,15 @@ impl PriorById {
     }
 }
 
-#[doc(hidden)]
-pub(crate) async fn reload_state_instances_from_disk(
+pub(super) async fn reload_state_instances_from_disk(
     state: &Arc<AppState>,
-    fresh: Vec<Instance>,
+    mut fresh: Vec<Instance>,
     live_worker_records: Vec<LiveStructuredWorkerRecord>,
     status_source: StatusSource,
     read_epoch: u64,
-) {
+    mut metadata: CanonicalMetadata,
+    passive: std::collections::HashMap<String, super::status_poll::PassiveTransitionWrites>,
+) -> Vec<super::push::StatusChange> {
     // Snapshot suppression here so a worker that unmarks between the
     // caller's input build and the per-id decision cannot combine a
     // cleared mark with a stale row to re-emit the phantom Error
@@ -342,10 +520,8 @@ pub(crate) async fn reload_state_instances_from_disk(
     // inside `spawn_blocking`.
     let suppressed_ids =
         crate::session::recovery::snapshot_recently_restarted(&state.recently_restarted);
-    // Repair is a view transition too. Reserve its session before taking the
-    // instances lock, and keep that reservation through its deferred disk write.
-    // A busy enable/disable owns the desired view; skip it rather than repairing
-    // the temporary terminal-row/live-runner state during teardown.
+    // Keep view-transition ownership through the durable repair and publication.
+    // A busy enable/disable owns the desired view and must not be repaired.
     let terminal_ids: std::collections::HashSet<&str> = if live_worker_records.is_empty() {
         std::collections::HashSet::new()
     } else {
@@ -389,14 +565,35 @@ pub(crate) async fn reload_state_instances_from_disk(
         repair_guards.push(guard);
     }
 
+    let transition = if repair_records.is_empty() && passive.is_empty() {
+        None
+    } else {
+        match tokio::task::spawn_blocking(crate::session::StorageTransition::acquire)
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|result| result)
+        {
+            Ok(transition) => Some(Arc::new(transition)),
+            Err(error) => {
+                tracing::warn!(target: "server.file_watch", %error, "store transition unavailable");
+                state
+                    .mark_reload_failure(crate::daemon::RuntimeHealth::Degraded {
+                        code: crate::daemon::ReloadFailureCode::ProfileData,
+                        profiles: metadata
+                            .profiles
+                            .iter()
+                            .map(|profile| profile.name.clone())
+                            .collect(),
+                    })
+                    .await;
+                return Vec::new();
+            }
+        }
+    };
+    let _publication = state.publication.write().await;
     let mut current = state.instances.write().await;
 
-    // Invariant 8: `fresh` predates a committed membership or view transition.
-    // Applying it could restore the wrong row set or execution backend, so drop
-    // the whole reload. The next tick re-reads disk and converges.
-    //
-    // Compare under the `instances` write lock. Guarded mutations bump under
-    // that same lock after persistence, closing the check-then-act race.
+    // Reject reads predating a committed membership or view change.
     let current_epoch = state
         .mutation_epoch
         .load(std::sync::atomic::Ordering::SeqCst);
@@ -407,39 +604,74 @@ pub(crate) async fn reload_state_instances_from_disk(
             current_epoch,
             "dropping a disk reload whose snapshot predates a session lifecycle mutation"
         );
-        return;
+        return Vec::new();
+    }
+    if let Some(transition) = transition.as_ref() {
+        let repairs = repair_structured_rows_from_live_workers(&mut fresh, repair_records);
+        if let Err(error) = persist_structured_row_repairs(
+            state,
+            repairs,
+            &mut fresh,
+            &mut metadata,
+            transition,
+            &_publication,
+        )
+        .await
+        {
+            tracing::warn!(target: "server.file_watch", error = ?error, "retaining last complete state after repair failure");
+            *state.canonical_health.write().await = error.health;
+            state.runtime.request_publish();
+            return Vec::new();
+        }
+        if let Err(error) = super::status_poll::flush_passive_transition_writes(
+            state.file_watch.clone(),
+            &mut fresh,
+            &mut metadata,
+            passive,
+            transition,
+            &_publication,
+        )
+        .await
+        {
+            *state.canonical_health.write().await = error.health;
+            state.runtime.request_publish();
+            return Vec::new();
+        }
     }
 
-    let prior_by_id = PriorById::drain_from(&mut current);
+    let changes = merge_loaded_rows(&mut current, fresh, status_source, &suppressed_ids);
+    drop(current);
+    *state.canonical_metadata.write().await = metadata;
+    *state.canonical_health.write().await = crate::daemon::RuntimeHealth::Healthy;
+    state.runtime.request_publish();
+    changes
+}
 
-    let mut merged: Vec<Instance> = Vec::with_capacity(fresh.len());
+pub(super) fn merge_loaded_rows(
+    current: &mut Vec<Instance>,
+    fresh: Vec<Instance>,
+    status_source: StatusSource,
+    suppressed_ids: &std::collections::HashSet<String>,
+) -> Vec<super::push::StatusChange> {
+    let prior_by_id = PriorById::drain_from(current);
+    let mut merged = Vec::with_capacity(fresh.len());
     for mut row in fresh {
-        if let Some(prior) = prior_by_id.get(&row.id).cloned() {
+        if let Some(mut prior) = prior_by_id.get(&row.id).cloned() {
             let prior_status = prior.status;
             let prior_last_accessed = prior.last_accessed_at;
             let prior_idle_entered = prior.idle_entered_at;
-            let prior_tracking = PriorTickTracking::of(&prior);
-            row = merge_runtime_fields(prior, row);
-            match status_source {
-                StatusSource::DiskOnly => {
-                    row.status = prior_status;
-                    row.idle_entered_at = prior_idle_entered.or(row.idle_entered_at);
-                    // `row` here is a raw disk load (no tmux scrape ran), so
-                    // the `#[serde(skip)]` tracking fields are still at their
-                    // zeroed defaults; restore the prior tick's.
-                    row.ever_confirmed_present = prior_tracking.ever_confirmed_present;
-                    row.unknown_since = prior_tracking.unknown_since;
-                    row.detection = prior_tracking.detection;
+            if matches!(status_source, StatusSource::TmuxApplied) && !row.is_structured() {
+                row.inherit_process_runtime(prior);
+            } else {
+                if matches!(status_source, StatusSource::TmuxApplied) {
+                    prior.agent_pane = std::mem::take(&mut row.agent_pane);
+                    prior.auxiliary = std::mem::take(&mut row.auxiliary);
                 }
-                StatusSource::TmuxApplied => {
-                    // Caller already applied tmux scrape to fresh.status;
-                    // that is the authoritative value. idle_entered_at is
-                    // recomputed by upstream status-transition logic;
-                    // trust fresh. Likewise the tracking fields: the caller
-                    // seeded them from the prior tick before running the
-                    // status decision, so `row` already carries this tick's
-                    // advanced values. See #2865 and #3642.
-                }
+                merge_runtime_fields(prior, &mut row);
+            }
+            if matches!(status_source, StatusSource::DiskOnly) {
+                row.status = prior_status;
+                row.idle_entered_at = prior_idle_entered.or(row.idle_entered_at);
             }
             row.last_accessed_at = prior_last_accessed.max(row.last_accessed_at);
         }
@@ -448,15 +680,30 @@ pub(crate) async fn reload_state_instances_from_disk(
         }
         merged.push(row);
     }
-
-    let repairs = repair_structured_rows_from_live_workers(&mut merged, repair_records);
-
     apply_acp_overlay_inplace(&prior_by_id, &mut merged);
-
+    let mut changes = Vec::new();
+    let now = chrono::Utc::now();
+    for row in &mut merged {
+        if row.is_archived() {
+            row.settle_archived_status();
+        }
+        if matches!(status_source, StatusSource::TmuxApplied) && !row.is_structured() {
+            if let Some(prior) = prior_by_id
+                .get(&row.id)
+                .filter(|prior| prior.status != row.status)
+            {
+                changes.push(super::push::StatusChange {
+                    instance_id: row.id.clone(),
+                    instance_title: row.title.clone(),
+                    old: prior.status,
+                    new: row.status,
+                    at: now,
+                });
+            }
+        }
+    }
     *current = merged;
-    drop(current);
-
-    persist_structured_row_repairs(state, repairs, repair_guards);
+    changes
 }
 
 /// Apply the acp status / timestamps overlay to `merged`, sourcing
@@ -498,6 +745,155 @@ mod tests {
     use super::*;
     use chrono::Utc;
 
+    #[test]
+    fn committed_profile_batch_preserves_moved_runtime_and_rejects_partial_metadata() {
+        for missing in [None, Some("source"), Some("target")] {
+            let mut moving = Instance::new("moving", "/tmp/moving");
+            moving.source_profile = "source".into();
+            moving.status = Status::Running;
+            let mut source_peer = Instance::new("source peer", "/tmp/source-peer");
+            source_peer.source_profile = "source".into();
+            let mut target_peer = Instance::new("target peer", "/tmp/target-peer");
+            target_peer.source_profile = "target".into();
+            target_peer.status = Status::Running;
+            let mut unrelated = Instance::new("unrelated", "/tmp/unrelated");
+            unrelated.source_profile = "other".into();
+            let mut current = vec![
+                moving.clone(),
+                unrelated.clone(),
+                target_peer.clone(),
+                source_peer.clone(),
+            ];
+            let mut metadata = CanonicalMetadata {
+                default_profile: "source".into(),
+                profiles: ["source", "target", "other"]
+                    .into_iter()
+                    .filter(|name| Some(*name) != missing)
+                    .map(|name| crate::daemon::ProfileSnapshot {
+                        name: name.into(),
+                        description: Some(format!("{name} description")),
+                        groups: vec![crate::session::Group::new("old", "old")],
+                        projects: Vec::new(),
+                    })
+                    .collect(),
+                workspace_ordering: vec!["unrelated ordering".into()],
+                global_projects: Vec::new(),
+                status_hooks: Default::default(),
+                auxiliary_tools: Default::default(),
+            };
+            let original_rows = serde_json::to_value(&current).unwrap();
+            let original_metadata = metadata.clone();
+            let mut moved = moving.clone();
+            moved.title = "renamed".into();
+            moved.group_path = "destination".into();
+            moved.status = Status::Idle;
+            let mut source_after = source_peer.clone();
+            source_after.title = "source peer committed".into();
+            let mut target_after = target_peer.clone();
+            target_after.title = "target peer committed".into();
+            target_after.status = Status::Stopped;
+            let source_groups = vec![crate::session::Group::new("empty", "empty")];
+            let mut destination = crate::session::Group::new("destination", "destination");
+            destination.collapsed = true;
+            let target_groups = vec![destination];
+            let committed = [
+                ("target", vec![target_after, moved], target_groups.clone()),
+                ("source", vec![source_after], source_groups.clone()),
+            ];
+            let result = replace_committed_profiles(&mut current, &mut metadata, committed, |id| {
+                (id == target_peer.id).then_some(StatusCommit::Lifecycle)
+            });
+            if missing.is_some() {
+                assert!(result.is_err());
+                assert_eq!(serde_json::to_value(&current).unwrap(), original_rows);
+                assert_eq!(metadata, original_metadata);
+                continue;
+            }
+            result.unwrap();
+            assert_eq!(
+                current
+                    .iter()
+                    .map(|row| row.id.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    source_peer.id.as_str(),
+                    unrelated.id.as_str(),
+                    target_peer.id.as_str(),
+                    moving.id.as_str()
+                ]
+            );
+            assert_eq!(current[0].title, "source peer committed");
+            assert_eq!(current[2].title, "target peer committed");
+            assert_eq!(current[2].status, Status::Stopped);
+            assert_eq!(current[3].title, "renamed");
+            assert_eq!(current[3].group_path, "destination");
+            assert_eq!(current[3].source_profile, "target");
+            assert_eq!(current[3].status, Status::Running);
+            assert_eq!(metadata.profiles[0].groups, source_groups);
+            assert_eq!(metadata.profiles[1].groups, target_groups);
+            assert_eq!(metadata.profiles[2], original_metadata.profiles[2]);
+            assert_eq!(
+                metadata.workspace_ordering,
+                original_metadata.workspace_ordering
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn global_reload_rejects_partial_profile_data_and_recovers() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let first = Storage::new_unwatched("first").unwrap();
+        let second = Storage::new_unwatched("second").unwrap();
+        for storage in [&first, &second] {
+            storage
+                .update(|rows, _| {
+                    rows.push(Instance::new(storage.profile(), "/tmp/repo"));
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let intact = std::fs::read(second.sessions_path()).unwrap();
+        let mut partial: Vec<serde_json::Value> = serde_json::from_slice(&intact).unwrap();
+        partial.push(serde_json::json!({"id": 5}));
+        for damaged in [b"{".to_vec(), serde_json::to_vec(&partial).unwrap()] {
+            std::fs::write(second.sessions_path(), &damaged).unwrap();
+            assert!(load_all_profiles(&FileWatchService::noop()).is_err());
+            assert_eq!(std::fs::read(second.sessions_path()).unwrap(), damaged);
+            assert!(!second
+                .sessions_path()
+                .with_file_name("sessions.corrupt.jsonl")
+                .exists());
+        }
+        std::fs::write(second.sessions_path(), intact).unwrap();
+        let groups = second.sessions_path().with_file_name("groups.json");
+        std::fs::write(&groups, br#"[{"path":5}]"#).unwrap();
+        assert!(load_all_profiles(&FileWatchService::noop()).is_err());
+        assert!(!groups.with_file_name("groups.corrupt.jsonl").exists());
+        std::fs::remove_file(groups).unwrap();
+        let config = crate::session::get_app_dir().unwrap().join("config.toml");
+        std::fs::write(&config, "[invalid").unwrap();
+        let error = load_all_profiles(&FileWatchService::noop())
+            .err()
+            .expect("invalid global config must keep the runtime degraded");
+        assert_eq!(
+            error.health,
+            crate::daemon::RuntimeHealth::Degraded {
+                code: crate::daemon::ReloadFailureCode::Metadata,
+                profiles: Vec::new(),
+            }
+        );
+        std::fs::remove_file(config).unwrap();
+        let rows = load_all_profiles(&FileWatchService::noop()).unwrap();
+        let mut profiles: Vec<_> = rows
+            .instances
+            .iter()
+            .map(|row| row.source_profile.as_str())
+            .collect();
+        profiles.sort_unstable();
+        assert_eq!(profiles, ["first", "second"]);
+    }
+
     fn live_repair_fixture() -> (Arc<AppState>, Instance, LiveStructuredWorkerRecord, Storage) {
         let mut row = Instance::new("repair-transition", "/tmp/repo");
         row.source_profile = "repair-transition".into();
@@ -525,6 +921,8 @@ mod tests {
         );
         crate::process::worker_registry::save(&record).unwrap();
         let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        *state.canonical_metadata.try_write().unwrap() =
+            load_all_profiles(&state.file_watch).unwrap().metadata;
         (state, row, (record, "agent-session".into()), storage)
     }
 
@@ -545,6 +943,11 @@ mod tests {
             vec![record],
             StatusSource::DiskOnly,
             1,
+            {
+                let metadata = state.canonical_metadata.read().await.clone();
+                metadata
+            },
+            Default::default(),
         )
         .await;
         assert!(!state.instances.read().await[0].is_structured());
@@ -565,6 +968,11 @@ mod tests {
             vec![record],
             StatusSource::DiskOnly,
             0,
+            {
+                let metadata = state.canonical_metadata.read().await.clone();
+                metadata
+            },
+            Default::default(),
         )
         .await;
         assert!(!state.instances.read().await[0].is_structured());
@@ -583,6 +991,11 @@ mod tests {
             vec![record],
             StatusSource::DiskOnly,
             0,
+            {
+                let metadata = state.canonical_metadata.read().await.clone();
+                metadata
+            },
+            Default::default(),
         )
         .await;
         assert!(state.instances.read().await[0].is_structured());
@@ -591,6 +1004,135 @@ mod tests {
         let _transition = tokio::time::timeout(std::time::Duration::from_secs(2), lock.lock())
             .await
             .expect("repair persistence must finish");
+        assert!(storage.load().unwrap()[0].is_structured());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn repair_publishes_peer_rows_and_groups_from_its_storage_commit() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let (state, row, record, storage) = live_repair_fixture();
+        let mut frozen = Instance::new("peer-archived", "/tmp/frozen");
+        frozen.status = Status::Waiting;
+        let frozen_id = frozen.id.clone();
+        storage
+            .update(|rows, _| {
+                rows.push(frozen);
+                Ok(())
+            })
+            .unwrap();
+        let sampled = load_all_profiles(&state.file_watch).unwrap();
+        let peer = Instance::new("peer-created", "/tmp/peer");
+        let peer_id = peer.id.clone();
+        storage
+            .update(|rows, groups| {
+                rows[0].title = "peer-renamed".into();
+                rows.push(peer);
+                rows.iter_mut()
+                    .find(|item| item.id == frozen_id)
+                    .unwrap()
+                    .archive();
+                let mut group = crate::session::Group::new("group", "peer/group");
+                group.collapsed = true;
+                groups.push(group);
+                Ok(())
+            })
+            .unwrap();
+        reload_state_instances_from_disk(
+            &state,
+            sampled.instances,
+            vec![record],
+            StatusSource::TmuxApplied,
+            0,
+            sampled.metadata,
+            Default::default(),
+        )
+        .await;
+        let snapshot = state.runtime.publish(&state).await.unwrap();
+        let rows = &snapshot.value.contents.sessions;
+        assert_eq!(
+            rows.iter().find(|item| item.id == row.id).unwrap().title,
+            "peer-renamed"
+        );
+        assert_eq!(
+            rows.iter().find(|item| item.id == peer_id).unwrap().title,
+            "peer-created"
+        );
+        let frozen = rows.iter().find(|item| item.id == frozen_id).unwrap();
+        assert!(frozen.archived_at.is_some());
+        assert_eq!(frozen.status, "Idle");
+        let profile = snapshot
+            .value
+            .contents
+            .profiles
+            .iter()
+            .find(|profile| profile.name == row.source_profile)
+            .unwrap();
+        assert!(profile
+            .groups
+            .iter()
+            .any(|group| group.path == "peer/group" && group.collapsed));
+        assert!(storage
+            .load()
+            .unwrap()
+            .iter()
+            .find(|item| item.id == row.id)
+            .unwrap()
+            .is_structured());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_repair_retains_bundle_until_complete_recovery() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let (state, row, record, storage) = live_repair_fixture();
+        let metadata = load_all_profiles(&state.file_watch).unwrap().metadata;
+        *state.canonical_metadata.write().await = metadata.clone();
+        let intact = std::fs::read(storage.sessions_path()).unwrap();
+        std::fs::write(storage.sessions_path(), b"{").unwrap();
+        let mut stale_sample = row.clone();
+        stale_sample.title = "uncommitted title".into();
+        reload_state_instances_from_disk(
+            &state,
+            vec![stale_sample],
+            vec![record.clone()],
+            StatusSource::DiskOnly,
+            0,
+            metadata.clone(),
+            Default::default(),
+        )
+        .await;
+        assert_eq!(
+            *state.canonical_health.read().await,
+            crate::daemon::RuntimeHealth::Degraded {
+                code: crate::daemon::ReloadFailureCode::ProfileData,
+                profiles: vec![row.source_profile.clone()],
+            }
+        );
+        {
+            let retained = state.instances.read().await;
+            assert_eq!(retained[0].title, row.title);
+            assert_eq!(retained[0].agent_name, row.agent_name);
+            assert!(!retained[0].is_structured());
+        }
+        assert_eq!(*state.canonical_metadata.read().await, metadata);
+        std::fs::write(storage.sessions_path(), intact).unwrap();
+        let loaded = load_all_profiles(&state.file_watch).unwrap();
+        reload_state_instances_from_disk(
+            &state,
+            loaded.instances,
+            vec![record],
+            StatusSource::DiskOnly,
+            0,
+            loaded.metadata,
+            Default::default(),
+        )
+        .await;
+        assert_eq!(
+            *state.canonical_health.read().await,
+            crate::daemon::RuntimeHealth::Healthy
+        );
+        assert!(state.instances.read().await[0].is_structured());
         assert!(storage.load().unwrap()[0].is_structured());
     }
 
@@ -653,6 +1195,7 @@ mod tests {
             &prev,
             &std::collections::HashSet::new(),
             Some(&std::collections::HashMap::new()),
+            &Default::default(),
         );
 
         assert_eq!(
@@ -683,6 +1226,7 @@ mod tests {
             &prev,
             &std::collections::HashSet::new(),
             Some(&std::collections::HashMap::new()),
+            &Default::default(),
         );
 
         assert_eq!(instances[0].status, Status::Idle, "disk status stands");
@@ -709,6 +1253,7 @@ mod tests {
             &prev,
             &std::collections::HashSet::from([id]),
             Some(&std::collections::HashMap::new()),
+            &Default::default(),
         );
 
         assert_eq!(instances[0].status, Status::Starting);
@@ -736,10 +1281,110 @@ mod tests {
                 &prev,
                 &std::collections::HashSet::new(),
                 None,
+                &Default::default(),
             );
 
             assert_eq!(instances[0].status, live, "disk status was {disk:?}");
             assert_eq!(observed_transitions(&instances, &prev), vec![]);
+        }
+    }
+
+    #[test]
+    fn sandbox_health_requires_a_current_terminal_observation() {
+        for (view, status, observed_generation, known, expected) in [
+            (
+                crate::session::View::Terminal,
+                Status::Idle,
+                4,
+                true,
+                Status::Error,
+            ),
+            (
+                crate::session::View::Structured,
+                Status::Idle,
+                4,
+                true,
+                Status::Idle,
+            ),
+            (
+                crate::session::View::Terminal,
+                Status::Starting,
+                4,
+                true,
+                Status::Starting,
+            ),
+            (
+                crate::session::View::Terminal,
+                Status::Stopped,
+                4,
+                true,
+                Status::Stopped,
+            ),
+            (
+                crate::session::View::Terminal,
+                Status::Idle,
+                3,
+                true,
+                Status::Idle,
+            ),
+            (
+                crate::session::View::Terminal,
+                Status::Idle,
+                4,
+                false,
+                Status::Idle,
+            ),
+        ] {
+            let mut row = Instance::new("sandbox", "/tmp/sandbox");
+            row.view = view;
+            row.status = status;
+            row.lifecycle_generation = 4;
+            row.idle_entered_at = Some(chrono::Utc::now());
+            row.sandbox_info = Some(crate::session::SandboxInfo {
+                enabled: true,
+                container_id: None,
+                image: "unused".into(),
+                container_name: "owned-container".into(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                container_workdir: None,
+            });
+            let prev = std::collections::HashMap::from([(row.id.clone(), status)]);
+            let mut health = std::collections::HashMap::new();
+            if known {
+                health.insert(
+                    row.id.clone(),
+                    SandboxHealth {
+                        generation: observed_generation,
+                        container_name: "owned-container".into(),
+                        running: false,
+                    },
+                );
+            }
+            let mut canonical = vec![row.clone()];
+            apply_tick_status_decisions(
+                std::slice::from_mut(&mut row),
+                &prev,
+                &Default::default(),
+                None,
+                &health,
+            );
+            merge_loaded_rows(
+                &mut canonical,
+                vec![row],
+                StatusSource::TmuxApplied,
+                &Default::default(),
+            );
+            let row = &canonical[0];
+            assert_eq!(
+                row.status, expected,
+                "{view:?}, {status:?}, generation {observed_generation}, known {known}"
+            );
+            if expected == Status::Error {
+                assert!(row.last_error.is_some());
+                assert!(row.idle_entered_at.is_none());
+            }
         }
     }
 
@@ -793,69 +1438,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn seed_tick_tracking_carries_prior_tick_fields_onto_fresh_instance() {
-        // `load_all_instances` always resets these `#[serde(skip)]` fields to
-        // their defaults, mimicking status_poll_loop's fresh disk load.
-        let mut fresh = vec![Instance::new("sess-1", "/tmp/seed")];
-        assert!(!fresh[0].ever_confirmed_present);
-        assert_eq!(fresh[0].unknown_since, None);
-        assert_eq!(
-            fresh[0].detection,
-            crate::session::DetectionState::default()
-        );
-
-        let confirmed_at = std::time::Instant::now() - std::time::Duration::from_secs(3);
-        let mut prev = std::collections::HashMap::new();
-        prev.insert(
-            fresh[0].id.clone(),
-            PriorTickTracking {
-                ever_confirmed_present: true,
-                unknown_since: Some(confirmed_at),
-                detection: crate::session::DetectionState {
-                    pending: Some(Status::Idle),
-                    ..Default::default()
-                },
-            },
-        );
-
-        seed_tick_tracking(&mut fresh, &prev);
-
-        assert!(
-            fresh[0].ever_confirmed_present,
-            "prior tick's ever_confirmed_present must seed the fresh instance \
-             before update_status_with_metadata runs on it"
-        );
-        assert_eq!(
-            fresh[0].unknown_since,
-            Some(confirmed_at),
-            "prior tick's unknown_since must seed the fresh instance so the \
-             Unknown->Error escalation window can actually accumulate elapsed \
-             time across ticks (#2865)"
-        );
-        assert_eq!(
-            fresh[0].detection.pending,
-            Some(Status::Idle),
-            "prior tick's proposal must seed the fresh instance so the poll \
-             that agrees with it can publish it (#3642)"
-        );
-    }
-
-    #[test]
-    fn seed_tick_tracking_leaves_unknown_ids_untouched() {
-        let mut fresh = vec![Instance::new("sess-unseen", "/tmp/seed")];
-        let prev = std::collections::HashMap::new();
-
-        seed_tick_tracking(&mut fresh, &prev);
-
-        assert!(!fresh[0].ever_confirmed_present);
-        assert_eq!(fresh[0].unknown_since, None);
-        assert_eq!(
-            fresh[0].detection,
-            crate::session::DetectionState::default()
-        );
-    }
-
     fn tmux_available() -> bool {
         crate::tmux::tmux_command()
             .arg("-V")
@@ -864,17 +1446,7 @@ mod tests {
             .unwrap_or(false)
     }
 
-    /// #3642: the daemon rebuilds every row from disk each tick, so a
-    /// detection awaiting its confirming poll only survives through
-    /// `seed_tick_tracking`. Without that carry a hookless manifest agent
-    /// re-proposes the same Idle every tick, never meets its own proposal,
-    /// and the dashboard shows Running for the life of the session.
-    ///
-    /// Four ticks over a live pane parked on a screen no Claude rule matches,
-    /// each one starting from a fresh disk load as production does. The last
-    /// two also cover the capture-skip gate (#3600), which only reaches
-    /// production once this carry exists: on a skipped tick the status the
-    /// row came off disk with has to be the one that stands.
+    /// A proposal must survive disk reload, confirm, and remain stable on skipped captures.
     #[test]
     #[serial_test::serial]
     fn a_proposal_survives_the_tick_that_reloads_its_row_from_disk() {
@@ -888,10 +1460,7 @@ mod tests {
         // `load_all_instances` leaves it.
         let mut on_disk = Instance::new("aoe_test_3642_tick", "/tmp");
         on_disk.status = Status::Running;
-        assert_eq!(
-            on_disk.tool, "claude",
-            "fixture invariant: this test needs an agent with a manifest"
-        );
+        on_disk.tool = "claude".to_owned();
 
         let session_name = crate::tmux::Session::generate_name(&on_disk.id, &on_disk.title);
         let _kill = crate::tmux::test_helpers::TmuxTestSession::from_name(session_name.clone());
@@ -914,6 +1483,22 @@ mod tests {
             "tmux new-session failed: {}",
             String::from_utf8_lossy(&created.stderr)
         );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let pane = crate::tmux::tmux_query_command()
+                .args(["capture-pane", "-p", "-t", &session_name])
+                .output()
+                .expect("capture fixture pane");
+            assert!(pane.status.success(), "fixture pane capture failed");
+            if String::from_utf8_lossy(&pane.stdout).contains("turn over") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture pane did not initialize"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         let cache = crate::tmux::SessionCacheGuard::capture();
         cache.force_present(&[session_name.as_str()]);
 
@@ -928,6 +1513,7 @@ mod tests {
             let metadata = std::collections::HashMap::from([(
                 session_name.clone(),
                 crate::tmux::PaneMetadata {
+                    tool_owner: crate::tmux::ToolPaneOwner::Unmarked,
                     pane_dead: false,
                     pane_current_command: Some("claude".to_string()),
                     pane_start_command_is_protected: false,
@@ -938,12 +1524,13 @@ mod tests {
                 },
             )]);
             let mut instances = vec![on_disk.clone()];
-            seed_tick_tracking(&mut instances, &tracking);
+            seed_tick_tracking(&mut instances, std::mem::take(&mut tracking));
             apply_tick_status_decisions(
                 &mut instances,
                 &prev,
                 &std::collections::HashSet::new(),
                 Some(&metadata),
+                &Default::default(),
             );
             tracking = instances
                 .iter()
@@ -983,61 +1570,20 @@ mod tests {
     }
 
     #[test]
-    fn merge_runtime_fields_preserves_last_error_while_still_in_error() {
-        // Cascade-Err preservation: prior held the error string, fresh re-derived
-        // Error from a still-dead pane without re-attaching the message. Carry it.
-        let mut prior = Instance::new("seed", "/tmp/seed");
-        prior.status = Status::Error;
-        prior.last_error = Some("recovery cascade: foo".to_string());
-
-        let mut fresh = Instance::new("seed", "/tmp/seed");
-        fresh.status = Status::Error;
-        fresh.last_error = None;
-
-        let merged = merge_runtime_fields(prior, fresh);
-        assert_eq!(merged.last_error.as_deref(), Some("recovery cascade: foo"));
-    }
-
-    #[test]
-    fn merge_runtime_fields_drops_stale_last_error_on_healthy_transition() {
-        // Issue #1271: prior errored in-memory, the session recovered to Idle
-        // through a path that never nulled `last_error`. The fresh poll must not
-        // re-stick the stale string on a now-green session.
-        let mut prior = Instance::new("seed", "/tmp/seed");
-        prior.status = Status::Error;
-        prior.last_error = Some("recovery cascade: foo".to_string());
-
-        let mut fresh = Instance::new("seed", "/tmp/seed");
-        fresh.status = Status::Idle;
-        fresh.last_error = None;
-
-        let merged = merge_runtime_fields(prior, fresh);
-        assert_eq!(merged.last_error, None);
-    }
-
-    #[test]
-    fn merge_runtime_fields_drops_stale_last_error_idle_to_idle() {
-        // Both ends healthy but prior still carried a stale string: don't propagate.
-        let mut prior = Instance::new("seed", "/tmp/seed");
-        prior.status = Status::Idle;
-        prior.last_error = Some("stale".to_string());
-
-        let mut fresh = Instance::new("seed", "/tmp/seed");
-        fresh.status = Status::Idle;
-        fresh.last_error = None;
-
-        let merged = merge_runtime_fields(prior, fresh);
-        assert_eq!(merged.last_error, None);
-    }
-
-    #[test]
-    fn merge_runtime_fields_preserves_acp_load_session_capability() {
-        let mut prior = Instance::new("seed", "/tmp/seed");
-        prior.acp_load_session_capable = Some(true);
-
-        let fresh = Instance::new("seed", "/tmp/seed");
-        let merged = merge_runtime_fields(prior, fresh);
-
-        assert_eq!(merged.acp_load_session_capable, Some(true));
+    fn runtime_errors_follow_the_committed_status_transition() {
+        for (previous_status, committed_status, expected_error) in [
+            (Status::Error, Status::Error, Some("launch failed")),
+            (Status::Error, Status::Idle, None),
+            (Status::Idle, Status::Idle, None),
+        ] {
+            let mut prior = Instance::new("seed", "/tmp/seed");
+            prior.status = previous_status;
+            prior.last_error = Some("launch failed".into());
+            let mut fresh = Instance::new("seed", "/tmp/seed");
+            fresh.status = committed_status;
+            merge_runtime_fields(prior, &mut fresh);
+            assert_eq!(fresh.last_error.as_deref(), expected_error);
+            assert_eq!(fresh.status, committed_status);
+        }
     }
 }

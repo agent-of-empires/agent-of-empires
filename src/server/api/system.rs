@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use super::validate_profile_name;
 use super::AppState;
 use crate::server::auth::AuthenticatedTokenHash;
-use crate::server::auth::{handler_elevated, AuthenticatedSession, LoopbackTrusted};
+use crate::server::auth::{handler_elevated, AuthenticatedSession, LocalAuthorization};
 use crate::session::config::settings_schema::{
     clear_path, rewrite_plugin_sections, runtime_schema, strip_local_only, validate_patch,
     validate_patch_with, PatchRejection, Scope,
@@ -36,10 +36,13 @@ pub struct DashboardPresenceBody {
 /// their authenticated token owner.
 pub async fn post_dashboard_presence(
     State(state): State<Arc<AppState>>,
-    Extension(owner): Extension<AuthenticatedTokenHash>,
+    owner: Option<Extension<AuthenticatedTokenHash>>,
     headers: HeaderMap,
     Json(body): Json<DashboardPresenceBody>,
 ) -> StatusCode {
+    let Some(Extension(owner)) = owner else {
+        return StatusCode::NO_CONTENT;
+    };
     let client = headers
         .get("x-aoe-device-binding")
         .and_then(|value| value.to_str().ok())
@@ -172,7 +175,12 @@ fn build_custom_agent_infos(
 }
 
 pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentInfo>> {
-    let profile = state.profile.clone();
+    let profile = state
+        .canonical_metadata
+        .read()
+        .await
+        .default_profile
+        .clone();
     let result = tokio::task::spawn_blocking(move || {
         let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
         let custom_agents = config.session.custom_agents;
@@ -287,13 +295,7 @@ pub async fn update_settings(
         return resp;
     }
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let Json(mut body) = match body {
         Ok(b) => b,
@@ -489,13 +491,7 @@ pub async fn update_theme(
     body: Result<Json<ThemePatch>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let Json(mut patch) = match body {
         Ok(b) => b,
@@ -584,13 +580,7 @@ pub async fn update_theme(
 /// `config.toml`, so a corrupt global config can never block this flag.
 pub async fn mark_web_tour_seen(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return super::read_only_response();
     }
 
     let result = tokio::task::spawn_blocking(|| {
@@ -707,13 +697,7 @@ pub async fn mark_tip_seen(
     body: Result<Json<MarkTipSeenBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let Json(MarkTipSeenBody { id }) = match body {
         Ok(b) => b,
@@ -774,13 +758,7 @@ pub async fn set_show_tips(
     body: Result<Json<SetShowTipsBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let Json(SetShowTipsBody { enabled }) = match body {
         Ok(b) => b,
@@ -835,13 +813,7 @@ pub async fn dismiss_update(
     body: Result<Json<DismissUpdateBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let Json(body) = match body {
         Ok(b) => b,
@@ -915,13 +887,7 @@ pub async fn patch_web_ui_state(
     >,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let Json(patch) = match body {
         Ok(b) => b,
@@ -996,13 +962,7 @@ pub async fn mark_volume_ignores_globs_acknowledged(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return super::read_only_response();
     }
 
     let result = tokio::task::spawn_blocking(|| {
@@ -1093,7 +1053,12 @@ pub async fn get_resolved_theme(
 pub async fn get_current_theme(
     State(state): State<Arc<AppState>>,
 ) -> Json<crate::tui::styles::ResolvedTheme> {
-    let profile = state.profile.clone();
+    let profile = state
+        .canonical_metadata
+        .read()
+        .await
+        .default_profile
+        .clone();
     tracing::debug!(profile = %profile, "GET /api/theme/current");
     let resolved = tokio::task::spawn_blocking(move || {
         let name = crate::session::config::resolve_theme_name();
@@ -1110,55 +1075,37 @@ pub async fn get_current_theme(
 // --- Wizard support ---
 
 #[derive(Serialize)]
-pub struct ProfileInfo {
-    pub name: String,
+pub struct ProfileInfo<'a> {
+    pub name: &'a str,
     pub is_default: bool,
-    /// Optional short description, surfaced as helper text in the wizard
-    /// profile picker. `None` (and therefore omitted from JSON) when the
-    /// profile has no description configured. See #949.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
+    pub description: Option<&'a str>,
 }
 
-pub async fn list_profiles(State(state): State<Arc<AppState>>) -> Json<Vec<ProfileInfo>> {
-    // Profile enumeration plus per-profile description lookups all hit disk;
-    // do that off the async runtime so a slow filesystem (network home, fuse,
-    // etc.) cannot stall Tokio workers for every API client. See CodeRabbit
-    // feedback on #1274.
-    let active_profile = state.profile.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        // Resolve the active profile *before* enumerating. A server launched
-        // without --profile carries an empty profile; resolution then picks
-        // the first profile, bootstrapping `main` on a genuine first run.
-        // That bootstrap creates the profile directory as a side effect, so
-        // it must run before `list_profiles()` or the freshly bootstrapped
-        // profile would be absent from the returned list.
-        let active: String = if active_profile.is_empty() {
-            crate::session::config::resolve_default_profile()
-        } else {
-            active_profile
-        };
-        // Picker order (`default` last); `active` came from the plain
-        // enumeration.
-        let profiles = crate::session::list_profiles_for_display().unwrap_or_default();
-        profiles
-            .into_iter()
-            .map(|name| {
-                let is_default = name == active;
-                let description = crate::session::load_profile_config(&name)
-                    .ok()
-                    .and_then(|c| c.description);
-                ProfileInfo {
-                    name,
-                    is_default,
-                    description,
-                }
-            })
-            .collect::<Vec<ProfileInfo>>()
-    })
-    .await
-    .unwrap_or_default();
-    Json(result)
+impl AsRef<str> for ProfileInfo<'_> {
+    fn as_ref(&self) -> &str {
+        self.name
+    }
+}
+
+pub async fn list_profiles(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let snapshot = match state.runtime.snapshot(&state).await {
+        Ok(snapshot) => snapshot,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let mut profiles: Vec<_> = snapshot
+        .value
+        .contents
+        .profiles
+        .iter()
+        .map(|profile| ProfileInfo {
+            name: &profile.name,
+            is_default: profile.name == snapshot.value.contents.default_profile,
+            description: profile.description.as_deref(),
+        })
+        .collect();
+    crate::session::sort_profiles_for_display(&mut profiles);
+    Json(profiles).into_response()
 }
 
 #[derive(Deserialize)]
@@ -1557,8 +1504,13 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
     let passphrase_enabled = state.login_manager.is_enabled();
     let auth_mode =
         crate::server::resolve_auth_mode(&state.token_manager, &state.login_manager).await;
-    let acp_cfg =
-        crate::session::config::profile_config::resolve_config_or_warn(&state.profile).acp;
+    let profile = state
+        .canonical_metadata
+        .read()
+        .await
+        .default_profile
+        .clone();
+    let acp_cfg = crate::session::config::profile_config::resolve_config_or_warn(&profile).acp;
     let acp_show_tool_durations = acp_cfg.show_tool_durations;
     let acp_replay_events = acp_cfg.replay_events;
     let acp_compaction_reminder = acp_cfg.compaction_reminder;
@@ -1579,7 +1531,7 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
         read_only: state.read_only,
         behind_tunnel: state.behind_tunnel,
         cityhall_mode: state.cityhall_mode,
-        profile: state.profile.clone(),
+        profile,
         acp_show_tool_durations,
         acp_replay_events,
         acp_compaction_reminder,
@@ -1620,7 +1572,13 @@ pub struct UpdateStatusResponse {
 }
 
 pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<UpdateStatusResponse> {
-    let cfg = crate::session::config::profile_config::resolve_config_or_warn(&state.profile);
+    let profile = state
+        .canonical_metadata
+        .read()
+        .await
+        .default_profile
+        .clone();
+    let cfg = crate::session::config::profile_config::resolve_config_or_warn(&profile);
     let current = env!("CARGO_PKG_VERSION").to_string();
     let mode = cfg.updates.update_check_mode;
 
@@ -1671,223 +1629,258 @@ pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<Updat
 
 // --- Profile management ---
 
-#[derive(Deserialize)]
-pub struct CreateProfileBody {
-    pub name: String,
+async fn commit_profile(
+    state: Arc<AppState>,
+    mutation: crate::daemon::ProfileMutation,
+) -> axum::response::Response {
+    use crate::daemon::{ProfileMutation, ReloadFailureCode, RuntimeHealth};
+    use crate::server::reload::{load_all_profiles, merge_loaded_rows};
+
+    let names = match &mutation {
+        ProfileMutation::Create(body) => [Some(body.name.as_str()), None],
+        ProfileMutation::Rename { name, body } => {
+            [Some(name.as_str()), Some(body.new_name.as_str())]
+        }
+        ProfileMutation::Delete { name, query } => {
+            [Some(name.as_str()), query.replacement_default.as_deref()]
+        }
+        ProfileMutation::SetDefault(body) => [Some(body.name.as_str()), None],
+    };
+    for name in names.into_iter().flatten() {
+        if let Err(error) = validate_profile_name(name) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "validation_failed", "message": error,
+                })),
+            )
+                .into_response();
+        }
+    }
+    let transaction = tokio::select! {
+        _ = state.shutdown.cancelled() => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        transaction = crate::daemon::lifecycle::Transaction::acquire() => match transaction {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                tracing::warn!(%error, "profile catalogue ownership unavailable");
+                return (StatusCode::CONFLICT, crate::daemon::ApiErrorCode::LifecycleLocked.header(),
+                    Json(serde_json::json!({"error": "lifecycle_busy", "message": "Daemon lifecycle is busy"}))).into_response();
+            }
+        },
+    };
+    let namespace = tokio::select! {
+        _ = state.shutdown.cancelled() => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        namespace = state.profile_namespace.write() => namespace,
+    };
+    if *state.canonical_health.read().await != RuntimeHealth::Healthy {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let creation_active = match &mutation {
+        ProfileMutation::Rename { name, .. } | ProfileMutation::Delete { name, .. } => {
+            state.session_service.has_profile_creation(name)
+        }
+        _ => false,
+    };
+    if creation_active {
+        return (
+            StatusCode::CONFLICT,
+            crate::daemon::ApiErrorCode::LifecycleLocked.header(),
+            Json(serde_json::json!({"error": "lifecycle_busy", "message": "Profile has an active creation"})),
+        ).into_response();
+    }
+    let file_watch = state.file_watch.clone();
+    let prepared = tokio::task::spawn_blocking(move || {
+        let catalogue = crate::session::ProfileCatalogueTransaction::with_transaction(transaction)?;
+        let loaded = load_all_profiles(&file_watch).map(|_| ());
+        Ok::<_, anyhow::Error>((catalogue, loaded))
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|result| result);
+    let (catalogue, preflight) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            tracing::warn!(%error, "profile catalogue preparation failed");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    if let Err(error) = preflight {
+        state.mark_reload_failure(error.health).await;
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let publication = state.publication.write().await;
+    if *state.canonical_health.read().await != RuntimeHealth::Healthy {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let file_watch = state.file_watch.clone();
+    let committed = tokio::task::spawn_blocking(move || {
+        let result = match &mutation {
+            ProfileMutation::Create(body) => catalogue.create(&body.name),
+            ProfileMutation::Rename { name, body } => catalogue.rename(name, &body.new_name),
+            ProfileMutation::Delete { name, query } => catalogue
+                .delete(name, query.replacement_default.as_deref())
+                .map(|_| ()),
+            ProfileMutation::SetDefault(body) => catalogue.set_default(&body.name),
+        };
+        let loaded = load_all_profiles(&file_watch);
+        (catalogue, mutation, result, loaded)
+    })
+    .await;
+    let (catalogue, mutation, result, loaded) = match committed {
+        Ok(committed) => committed,
+        Err(error) => {
+            tracing::warn!(%error, "profile catalogue commit task failed");
+            *state.canonical_health.write().await = RuntimeHealth::Degraded {
+                code: ReloadFailureCode::Metadata,
+                profiles: Vec::new(),
+            };
+            state.runtime.request_publish();
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    let loaded = match loaded {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            *state.canonical_health.write().await = error.health;
+            state.runtime.request_publish();
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    let suppressed =
+        crate::session::recovery::snapshot_recently_restarted(&state.recently_restarted);
+    merge_loaded_rows(
+        &mut *state.instances.write().await,
+        loaded.instances,
+        crate::server::state::StatusSource::DiskOnly,
+        &suppressed,
+    );
+    *state.canonical_metadata.write().await = loaded.metadata;
+    *state.canonical_health.write().await = RuntimeHealth::Healthy;
+    state
+        .mutation_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    state.runtime.request_publish();
+    drop(publication);
+
+    if result.is_ok() {
+        match &mutation {
+            ProfileMutation::Create(body) => {
+                crate::server::add_profile_disk_watch(&state, &body.name).await
+            }
+            ProfileMutation::Rename { name, body } => {
+                crate::server::rename_profile_disk_watch(&state, name, &body.new_name).await
+            }
+            ProfileMutation::Delete { name, .. } => {
+                crate::server::remove_profile_disk_watch(&state, name).await
+            }
+            ProfileMutation::SetDefault(_) => {}
+        }
+    }
+    drop(namespace);
+    drop(catalogue);
+    let snapshot = match state.runtime.publish(&state).await {
+        Ok(snapshot) => snapshot,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    if let Err(error) = result {
+        let code = match mutation {
+            ProfileMutation::Create(_) => "create_failed",
+            ProfileMutation::Rename { .. } => "rename_failed",
+            ProfileMutation::Delete { .. } => "delete_failed",
+            ProfileMutation::SetDefault(_) => "update_failed",
+        };
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": code, "message": error.to_string()})),
+        )
+            .into_response();
+    }
+    let status = if matches!(mutation, ProfileMutation::Create(_)) {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    crate::server::runtime::mutation_response(
+        &snapshot.value.cursor,
+        (status, Json(serde_json::json!({"ok": true}))),
+    )
 }
 
 pub async fn create_profile(
     State(state): State<Arc<AppState>>,
-    body: Result<Json<CreateProfileBody>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<crate::daemon::CreateProfileBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return super::read_only_response();
     }
-    // Profiles are hidden entirely in CityHall (no picker, no CRUD UI).
-    if let Some(resp) = super::cityhall_block(&state) {
-        return resp;
+    if let Some(response) = super::cityhall_block(&state) {
+        return response;
     }
     let Json(body) = match body {
-        Ok(b) => b,
-        Err(rej) => return rej.into_response(),
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
     };
-    if let Err(e) = validate_profile_name(&body.name) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "validation_failed", "message": e})),
-        )
-            .into_response();
-    }
-    let name_for_create = body.name.clone();
-    match tokio::task::spawn_blocking(move || crate::session::create_profile(&name_for_create))
-        .await
-    {
-        Ok(Ok(())) => {
-            crate::server::add_profile_disk_watch(&state, &body.name).await;
-            (StatusCode::CREATED, Json(serde_json::json!({"ok": true}))).into_response()
-        }
-        Ok(Err(e)) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "create_failed", "message": e.to_string()})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "internal", "message": e.to_string()})),
-        )
-            .into_response(),
-    }
+    commit_profile(state, crate::daemon::ProfileMutation::Create(body)).await
 }
 
 pub async fn delete_profile(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(name): axum::extract::Path<String>,
+    query: Result<
+        axum::extract::Query<crate::daemon::DeleteProfileQuery>,
+        axum::extract::rejection::QueryRejection,
+    >,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return super::read_only_response();
     }
-    // Profiles are hidden entirely in CityHall (no picker, no CRUD UI).
-    if let Some(resp) = super::cityhall_block(&state) {
-        return resp;
+    if let Some(response) = super::cityhall_block(&state) {
+        return response;
     }
-    if let Err(e) = validate_profile_name(&name) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "validation_failed", "message": e})),
-        )
-            .into_response();
-    }
-    if name == state.profile {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "active_profile", "message": "Cannot delete the active profile"})),
-        )
-            .into_response();
-    }
-    let name_for_delete = name.clone();
-    match tokio::task::spawn_blocking(move || crate::session::delete_profile(&name_for_delete))
-        .await
-    {
-        Ok(Ok(())) => {
-            crate::server::remove_profile_disk_watch(&state, &name).await;
-            (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
-        }
-        Ok(Err(e)) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "delete_failed", "message": e.to_string()})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "internal", "message": e.to_string()})),
-        )
-            .into_response(),
-    }
-}
-
-#[derive(Deserialize)]
-pub struct RenameProfileBody {
-    pub new_name: String,
+    let axum::extract::Query(query) = match query {
+        Ok(query) => query,
+        Err(error) => return error.into_response(),
+    };
+    commit_profile(
+        state,
+        crate::daemon::ProfileMutation::Delete { name, query },
+    )
+    .await
 }
 
 pub async fn rename_profile(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(name): axum::extract::Path<String>,
-    body: Result<Json<RenameProfileBody>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<crate::daemon::RenameProfileBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return super::read_only_response();
     }
-    // Profiles are hidden entirely in CityHall (no picker, no CRUD UI).
-    if let Some(resp) = super::cityhall_block(&state) {
-        return resp;
+    if let Some(response) = super::cityhall_block(&state) {
+        return response;
     }
     let Json(body) = match body {
-        Ok(b) => b,
-        Err(rej) => return rej.into_response(),
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
     };
-    if let Err(e) = validate_profile_name(&name) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "validation_failed", "message": e})),
-        )
-            .into_response();
-    }
-    if let Err(e) = validate_profile_name(&body.new_name) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "validation_failed", "message": e})),
-        )
-            .into_response();
-    }
-    let old = name;
-    let new = body.new_name;
-    let old_for_rewire = old.clone();
-    let new_for_rewire = new.clone();
-    match tokio::task::spawn_blocking(move || crate::session::rename_profile(&old, &new)).await {
-        Ok(Ok(())) => {
-            crate::server::rename_profile_disk_watch(&state, &old_for_rewire, &new_for_rewire)
-                .await;
-            (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
-        }
-        Ok(Err(e)) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "rename_failed", "message": e.to_string()})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "internal", "message": e.to_string()})),
-        )
-            .into_response(),
-    }
-}
-
-#[derive(Deserialize)]
-pub struct DefaultProfileBody {
-    pub name: String,
+    commit_profile(state, crate::daemon::ProfileMutation::Rename { name, body }).await
 }
 
 pub async fn default_profile(
     State(state): State<Arc<AppState>>,
-    body: Result<Json<DefaultProfileBody>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<crate::daemon::DefaultProfileBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return super::read_only_response();
     }
-    // Profiles are hidden entirely in CityHall (no picker, no CRUD UI).
-    if let Some(resp) = super::cityhall_block(&state) {
-        return resp;
+    if let Some(response) = super::cityhall_block(&state) {
+        return response;
     }
     let Json(body) = match body {
-        Ok(b) => b,
-        Err(rej) => return rej.into_response(),
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
     };
-    if let Err(e) = validate_profile_name(&body.name) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "validation_failed", "message": e})),
-        )
-            .into_response();
-    }
-    let name = body.name;
-    match tokio::task::spawn_blocking(move || crate::session::set_default_profile(&name)).await {
-        Ok(Ok(())) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
-        Ok(Err(e)) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "update_failed", "message": e.to_string()})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "internal", "message": e.to_string()})),
-        )
-            .into_response(),
-    }
+    commit_profile(state, crate::daemon::ProfileMutation::SetDefault(body)).await
 }
 
 pub async fn get_profile_settings(
@@ -1980,17 +1973,11 @@ pub async fn update_profile_settings(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(name): axum::extract::Path<String>,
     session: Option<axum::Extension<AuthenticatedSession>>,
-    loopback: Option<axum::Extension<LoopbackTrusted>>,
+    loopback: Option<axum::Extension<LocalAuthorization>>,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let Json(mut body) = match body {
         Ok(b) => b,
@@ -2014,6 +2001,7 @@ pub async fn update_profile_settings(
         if let Some(bad) = first_non_cityhall_profile_leaf(&body) {
             return (
                 StatusCode::FORBIDDEN,
+                crate::daemon::ApiErrorCode::CityhallMode.header(),
                 Json(serde_json::json!({
                     "error": "cityhall_mode",
                     "message": format!("Field '{bad}' is not writable in CityHall mode"),
@@ -2022,11 +2010,7 @@ pub async fn update_profile_settings(
                 .into_response();
         }
     }
-    // Resolve elevation up front via the shared resolver: login disabled
-    // means always elevated, a loopback-trusted caller is elevated per the
-    // #1168 carve-out (#2610), otherwise only an elevated session may write
-    // a requires-elevation field.
-    let elevated = handler_elevated(&state, session.as_deref(), loopback.is_some()).await;
+    let elevated = handler_elevated(&state, session.as_deref(), loopback.as_deref()).await;
 
     // Validate every remaining leaf against the schema (single source of
     // truth, #1692): unknown section/field -> 400, requires-elevation without
@@ -2208,6 +2192,181 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use std::collections::HashMap;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn profile_catalogue_mutations_publish_before_receipt() -> anyhow::Result<()> {
+        use axum::{
+            body::Body,
+            http::Request,
+            routing::{delete, get, patch},
+            Router,
+        };
+        use tower::ServiceExt;
+
+        let temp = tempfile::tempdir()?;
+        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        crate::session::Storage::new("alpha", state.file_watch.clone())?;
+        crate::session::save_profile_config(
+            "alpha",
+            &crate::session::ProfileConfig {
+                description: Some("retained catalogue description".into()),
+                ..Default::default()
+            },
+        )?;
+        crate::session::set_default_profile("alpha")?;
+
+        *state.canonical_metadata.write().await =
+            crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+        let mut revision = state.runtime.publish(&state).await?.value.cursor.revision;
+        let router = Router::new()
+            .route("/api/profiles", get(list_profiles).post(create_profile))
+            .route("/api/profiles/{name}", delete(delete_profile))
+            .route("/api/profiles/{name}/rename", patch(rename_profile))
+            .route("/api/default-profile", patch(default_profile))
+            .with_state(state.clone());
+
+        for (method, uri, body, status, expected_default, expected_names) in [
+            (
+                "POST",
+                "/api/profiles",
+                r#"{"name":"beta"}"#,
+                StatusCode::CREATED,
+                "alpha",
+                &["alpha", "beta"][..],
+            ),
+            (
+                "PATCH",
+                "/api/default-profile",
+                r#"{"name":"beta"}"#,
+                StatusCode::OK,
+                "beta",
+                &["alpha", "beta"][..],
+            ),
+            (
+                "PATCH",
+                "/api/profiles/beta/rename",
+                r#"{"new_name":"gamma"}"#,
+                StatusCode::OK,
+                "gamma",
+                &["alpha", "gamma"][..],
+            ),
+            (
+                "DELETE",
+                "/api/profiles/gamma?replacement_default=alpha",
+                "",
+                StatusCode::OK,
+                "alpha",
+                &["alpha"][..],
+            ),
+        ] {
+            if method == "DELETE" {
+                for replacement in ["gamma", "missing"] {
+                    let response = router
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .method("DELETE")
+                                .uri(format!(
+                                    "/api/profiles/gamma?replacement_default={replacement}"
+                                ))
+                                .body(Body::empty())?,
+                        )
+                        .await?;
+                    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                    assert!(crate::session::get_profile_dir_path("gamma")?.is_dir());
+                    assert_eq!(crate::session::Config::load()?.default_profile, "gamma");
+                }
+            }
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))?,
+                )
+                .await?;
+            assert_eq!(response.status(), status);
+            let receipt = response
+                .headers()
+                .get(crate::daemon::RUNTIME_REVISION_HEADER)
+                .expect("a successful profile mutation must acknowledge its published snapshot")
+                .to_str()?
+                .parse::<u64>()?;
+            assert!(receipt > revision);
+            revision = receipt;
+            let snapshot = state.runtime.snapshot(&state).await?;
+            assert_eq!(snapshot.value.cursor.revision, receipt);
+            assert_eq!(snapshot.value.contents.default_profile, expected_default);
+            assert_eq!(
+                snapshot
+                    .value
+                    .contents
+                    .profiles
+                    .iter()
+                    .map(|profile| profile.name.as_str())
+                    .collect::<Vec<_>>(),
+                expected_names
+            );
+
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/profiles")
+                        .body(Body::empty())?,
+                )
+                .await?;
+            assert_eq!(response.status(), StatusCode::OK);
+            let profiles: Vec<serde_json::Value> =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await?)?;
+            assert_eq!(
+                profiles
+                    .iter()
+                    .filter(|profile| profile["is_default"] == true)
+                    .map(|profile| profile["name"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                [expected_default]
+            );
+        }
+        std::fs::write(
+            crate::session::get_profile_dir_path("alpha")?.join("config.toml"),
+            "description = [",
+        )?;
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/profiles")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"not-committed"}"#))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!crate::session::get_profile_dir_path("not-committed")?.exists());
+        let snapshot = state.runtime.publish(&state).await?;
+        assert!(
+            matches!(&snapshot.value.contents.health, crate::daemon::RuntimeHealth::Degraded {
+            code: crate::daemon::ReloadFailureCode::ProfileData, profiles
+        } if profiles == &["alpha"])
+        );
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/profiles")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let profiles: Vec<serde_json::Value> =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await?)?;
+        assert_eq!(profiles[0]["description"], "retained catalogue description");
+        Ok(())
+    }
 
     #[test]
     fn derive_sleep_inhibit_status_gates_held_on_backend() {

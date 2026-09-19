@@ -169,7 +169,7 @@ impl Instance {
     /// - Real agents (e.g. claude, opencode): also wait for the pane to no
     ///   longer be running a shell, so a keystroke doesn't land in the boot
     ///   prompt that runs before the agent binary takes over.
-    fn wait_for_pane_ready(&self, session: &tmux::Session) {
+    pub(crate) fn wait_for_pane_ready(&self, session: &tmux::Session) {
         let shell_check_unreliable = self.expects_shell()
             || self.has_command_override()
             || crate::hooks::read_hook_status(&self.id).is_some();

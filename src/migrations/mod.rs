@@ -38,12 +38,17 @@ mod v025_reenable_confirm_delete;
 mod v026_repoint_acp_default_agent;
 pub(crate) mod v027_isolate_sandbox_stores;
 mod v028_clear_archived_live_status;
+mod v029_core_daemon_launch;
+mod v030_serve_passphrase_policy;
+mod v031_pending_purge_owners;
+mod v032_capture_purge_runners;
+mod v033_canonical_sidebar;
 
 use anyhow::Result;
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 28;
+const CURRENT_VERSION: u32 = 33;
 const VERSION_FILE: &str = ".schema_version";
 
 struct Migration {
@@ -193,6 +198,31 @@ const MIGRATIONS: &[Migration] = &[
         name: "clear_archived_live_status",
         run: v028_clear_archived_live_status::run,
     },
+    Migration {
+        version: 29,
+        name: "core_daemon_launch",
+        run: v029_core_daemon_launch::run,
+    },
+    Migration {
+        version: 30,
+        name: "serve_passphrase_policy",
+        run: v030_serve_passphrase_policy::run,
+    },
+    Migration {
+        version: 31,
+        name: "pending_purge_owners",
+        run: v031_pending_purge_owners::run,
+    },
+    Migration {
+        version: 32,
+        name: "capture_purge_runners",
+        run: v032_capture_purge_runners::run,
+    },
+    Migration {
+        version: 33,
+        name: "canonical_sidebar",
+        run: v033_canonical_sidebar::run,
+    },
 ];
 
 /// The data-schema version this build targets, i.e. the version every install
@@ -208,26 +238,18 @@ pub fn has_pending_migrations() -> bool {
     get_current_version() < CURRENT_VERSION
 }
 
-/// Move this session's sandbox store into the private layout, if it is still
-/// on the shared one. Called from the container path so the copy is paid by
-/// the session that needs it rather than by every pending row on any `aoe`
-/// start.
-///
-/// `reporter` is how a caller with a screen narrates the copy: the TUI
-/// forwards it to its status line from a worker thread. Callers without one
-/// pass [`progress::tracing_reporter`], which leaves a trail in the log.
-///
-/// A failure here is reported by the caller and does not block the launch:
-/// a row that did not move stays on its shared store and is retried.
-pub fn migrate_sandbox_store_for_with(
+/// Move this session's shared sandbox store, reporting copy progress to the caller.
+pub(crate) fn migrate_sandbox_store_for_with(
     id: &str,
     reporter: Option<progress::Reporter>,
+    store: &dyn crate::session::SessionStore,
+    runtime: &crate::containers::ContainerRuntime,
 ) -> Result<()> {
     if get_current_version() < 27 {
         return Ok(());
     }
     let _installed = progress::install(reporter);
-    v027_isolate_sandbox_stores::migrate_instance(id)
+    v027_isolate_sandbox_stores::migrate_instance(id, store, runtime)
 }
 
 /// [`migrate_sandbox_store_for_with`] with the container probes injected, for
@@ -240,7 +262,7 @@ pub(crate) fn migrate_sandbox_store_for_test(
     reap: &dyn Fn(&str) -> Result<bool>,
 ) -> Result<()> {
     let _installed = progress::install(reporter);
-    v027_isolate_sandbox_stores::migrate_instance_with(id, is_running, reap)
+    v027_isolate_sandbox_stores::migrate_instance_with(id, is_running, reap, None)
 }
 
 pub fn run_migrations() -> Result<()> {

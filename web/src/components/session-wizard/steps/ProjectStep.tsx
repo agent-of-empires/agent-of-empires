@@ -58,6 +58,7 @@ function Toggle({
 type Tab = "recent" | "browse" | "clone" | "import";
 
 interface Props {
+  profile: string | undefined;
   data: WizardData;
   onChange: (field: string, value: unknown) => void;
   initialTab?: Tab;
@@ -66,16 +67,11 @@ interface Props {
   agents?: AgentInfo[];
 }
 
-export function ProjectStep({ data, onChange, initialTab, agents = [] }: Props) {
-  // `manualTab` is null until the user (or a select-and-jump action like
-  // Browse/Clone) picks a tab explicitly. Until then the active tab is
-  // derived: Recent while loading or when there is something to pick, Browse
-  // once loading settles with nothing saved or recent and no path is set (a
-  // remembered path with no picks stays on Recent so its selection shows).
-  // This avoids an effect just to flip to Browse once the picker data arrives.
+export function ProjectStep({ data, profile, onChange, initialTab, agents = [] }: Props) {
+  // Keep the user's tab choice while profile-scoped suggestions load.
   const [manualTab, setManualTab] = useState<Tab | null>(initialTab ?? null);
-  const { loading, query, setQuery, filteredSaved, filteredRecent, hasPicks } = useProjectPicker();
-  const activeTab: Tab = manualTab ?? (!loading && !hasPicks && !data.path ? "browse" : "recent");
+  const { loading, query, setQuery, filteredSaved, filteredRecent, hasPicks } = useProjectPicker(profile);
+  const activeTab: Tab = manualTab ?? (!loading && !hasPicks ? "browse" : "recent");
   const setActiveTab = setManualTab;
 
   // Clone state
@@ -415,6 +411,7 @@ export function ProjectStep({ data, onChange, initialTab, agents = [] }: Props) 
           {data.path && activeTab !== "browse" && (
             <div className="mt-5 pt-4 border-t border-surface-700/30">
               <ExtraReposPicker
+                profile={profile}
                 primaryPath={data.path}
                 selectedPaths={data.extraRepoPaths}
                 onChange={(paths) => onChange("extraRepoPaths", paths)}

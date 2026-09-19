@@ -13,6 +13,9 @@ impl HomeView {
     /// Switch the active profile filter in-place without destroying the view.
     /// Pass `None` for all-profiles mode, or `Some(name)` to filter to one profile.
     pub fn switch_profile(&mut self, new_profile: Option<String>) -> anyhow::Result<()> {
+        if self.active_profile != new_profile {
+            self.cancel_native_attachment();
+        }
         self.active_profile = new_profile;
         if let Some(profile) = self.active_profile.clone() {
             if !self.storages.contains_key(&profile) {
@@ -24,12 +27,6 @@ impl HomeView {
             self.storages.retain(|name, _| name == &profile);
             self.rewire_disk_subscriptions(std::slice::from_ref(&profile));
         }
-        // Reconcile config-watch subscriptions explicitly so this contract
-        // is local to switch_profile rather than implicit through
-        // reload_storage_only's transitive call. Idempotent set-diff: the
-        // global subscription is install-once and per-profile entries
-        // converge to the on-disk profile set; redundant invocations are
-        // no-ops.
         let config_targets = match crate::session::list_profiles() {
             Ok(profiles) => profiles,
             Err(e) => {

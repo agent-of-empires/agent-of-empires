@@ -14,6 +14,12 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
     use axum::routing::{delete, get, patch, post, put};
 
     let app = Router::new()
+        .route("/api/runtime", get(super::runtime::get_runtime_info))
+        .route(
+            "/api/runtime/snapshot",
+            get(super::runtime::get_runtime_snapshot),
+        )
+        .route("/api/runtime/ws", get(super::runtime::runtime_ws))
         // Explicit browser visibility heartbeat. Ordinary API requests do not
         // imply the dashboard is foregrounded, so they must not suppress push.
         .route("/api/presence", post(api::post_dashboard_presence))
@@ -21,6 +27,14 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/sessions",
             get(api::list_sessions).post(api::create_session),
+        )
+        .route(
+            "/api/sessions/creation-trust",
+            post(api::review_creation_trust),
+        )
+        .route(
+            "/api/sessions/{id}/creation/cancel",
+            post(api::cancel_creation),
         )
         // Static segment; registered before /api/sessions/{id} so the
         // literal "search" never resolves as a session id. See #2515.
@@ -97,6 +111,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             post(api::attach_session_project),
         )
         .route("/api/sessions/{id}/pin", patch(api::update_session_pin))
+        .route(
+            "/api/sessions/{id}/favorite",
+            patch(api::update_session_favorite),
+        )
         .route("/api/sessions/{id}/color", patch(api::update_session_color))
         .route(
             "/api/sessions/{id}/archive",
@@ -108,6 +126,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/sessions/{id}/trash", post(api::trash_session))
         .route("/api/sessions/{id}/restore", post(api::restore_session))
+        .route("/api/sessions/{id}/purge/abandon", post(api::abandon_purge))
         .route(
             "/api/sessions/{id}/unread",
             patch(api::update_session_unread),
@@ -119,6 +138,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/sessions/{id}/summarize", post(api::summarize_session))
         .route("/api/sessions/{id}/start", post(api::start_session))
+        .route("/api/sessions/{id}/restart", post(api::restart_session))
         .route(
             "/api/sessions/{id}/terminal",
             post(api::ensure_terminal).delete(api::kill_terminal),
@@ -126,6 +146,11 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/sessions/{id}/container-terminal",
             post(api::ensure_container_terminal),
+        )
+        .route("/api/sessions/{id}/tools/ensure", post(api::ensure_tool))
+        .route(
+            "/api/sessions/{id}/auxiliary/stop",
+            post(api::stop_auxiliary),
         )
         // Agents
         .route("/api/agents", get(api::list_agents))
@@ -146,7 +171,14 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/git/branches", get(api::list_branches))
         .route("/api/git/is-repo", get(api::is_git_repo))
         .route("/api/git/clone", post(api::clone_repo))
-        .route("/api/groups", get(api::list_groups))
+        .route(
+            "/api/groups",
+            get(api::list_groups)
+                .post(api::create_group)
+                .patch(api::move_group)
+                .delete(api::delete_group),
+        )
+        .route("/api/groups/collapse", patch(api::collapse_group))
         .route(
             "/api/projects",
             get(api::list_projects).post(api::create_project),
@@ -372,15 +404,26 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
     // Dashboard bundle (Vite build output) plus the SPA fallback. Without
     // `web` the daemon still answers `/api/*`; browser paths 404.
     #[cfg(feature = "web")]
-    let app = app
-        .route("/assets/{*path}", get(serve_asset))
-        .route("/manifest.json", get(serve_public_file))
-        .route("/sw.js", get(serve_public_file))
-        .route("/icon-192.png", get(serve_public_file))
-        .route("/icon-512.png", get(serve_public_file))
-        .fallback(get(serve_index));
+    let app = if state.core_only {
+        app
+    } else {
+        app.route("/assets/{*path}", get(serve_asset))
+            .route("/manifest.json", get(serve_public_file))
+            .route("/sw.js", get(serve_public_file))
+            .route("/icon-192.png", get(serve_public_file))
+            .route("/icon-512.png", get(serve_public_file))
+            .fallback(get(serve_index))
+    };
 
     app.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        super::runtime::mutation_scope,
+    ))
+    .layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        super::runtime::epoch_gate,
+    ))
+    .layer(axum::middleware::from_fn_with_state(
         state.clone(),
         cityhall_gate,
     ))

@@ -89,17 +89,18 @@ fn read_root(content: &str) -> Result<Map<String, Value>> {
 /// race against a concurrent surface write).
 fn mutate_servers<T>(mutate: impl FnOnce(&mut Map<String, Value>) -> T) -> Result<T> {
     let path = global_mcp_path()?;
-    crate::session::storage::locked_update(
-        &path,
-        read_root,
-        |root| Ok(serde_json::to_string_pretty(root)?),
-        |root| -> Result<T> {
-            let mut servers = take_servers(root)?;
-            let out = mutate(&mut servers);
-            root.insert("mcpServers".into(), Value::Object(servers));
-            Ok(out)
-        },
-    )?
+    crate::session::storage::LockedDataFile::open(&path)?
+        .update(
+            read_root,
+            |root| Ok(serde_json::to_string_pretty(root)?),
+            |root| -> Result<T> {
+                let mut servers = take_servers(root)?;
+                let out = mutate(&mut servers);
+                root.insert("mcpServers".into(), Value::Object(servers));
+                Ok(out)
+            },
+        )?
+        .map(|(result, _)| result)
 }
 
 /// Take the `mcpServers` object out of the parsed root, defaulting a missing key
@@ -112,10 +113,7 @@ fn take_servers(root: &mut Map<String, Value>) -> Result<Map<String, Value>> {
     }
 }
 
-/// Reason a conditional mutation did not persist, carried through
-/// `locked_update`'s error channel (it writes only on `Ok`). `Unchanged` means
-/// the operation was a no-op, so the file is left byte-for-byte untouched (no
-/// create, no rewrite); `Corrupt` propagates a malformed-file error.
+/// A rejected mutation preserves the file; corrupt data is never overwritten.
 enum SkipWrite {
     Unchanged,
     Corrupt(anyhow::Error),
@@ -128,8 +126,7 @@ enum SkipWrite {
 /// touch nothing on disk.
 fn try_mutate_servers(mutate: impl FnOnce(&mut Map<String, Value>) -> bool) -> Result<bool> {
     let path = global_mcp_path()?;
-    let outcome = crate::session::storage::locked_update(
-        &path,
+    let outcome = crate::session::storage::LockedDataFile::open(&path)?.update(
         read_root,
         |root| Ok(serde_json::to_string_pretty(root)?),
         |root| -> std::result::Result<(), SkipWrite> {
@@ -142,7 +139,7 @@ fn try_mutate_servers(mutate: impl FnOnce(&mut Map<String, Value>) -> bool) -> R
         },
     )?;
     match outcome {
-        Ok(()) => Ok(true),
+        Ok(((), _)) => Ok(true),
         Err(SkipWrite::Unchanged) => Ok(false),
         Err(SkipWrite::Corrupt(e)) => Err(e),
     }

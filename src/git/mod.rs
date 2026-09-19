@@ -27,6 +27,7 @@ pub use remote::{
     clone_bare_repo, clone_repo, get_remote_owner, get_remote_owner_with_key, get_remote_slug,
     get_remote_url,
 };
+pub(crate) use worktree::WorktreeCreation;
 pub use worktree::{GitWorktree, WorktreeEntry};
 
 /// Open a git repository at the given path without searching parent directories.

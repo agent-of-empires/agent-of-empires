@@ -1,12 +1,6 @@
 //! Background trash handler for TUI responsiveness.
 //!
-//! Trashing a sandboxed session stops its Docker container (`docker stop`,
-//! which blocks for the container's grace period, ~10s) and then relocates its
-//! worktree into the holding area. Running that on the UI event loop froze the
-//! TUI (issue #2924 added the container stop inline; this moves it off-thread,
-//! the same fix `StopPoller` applied for the stop path in #1496). Requests go
-//! to a worker thread, results come back over a channel the main loop polls
-//! each frame.
+//! Keep container teardown and worktree relocation off the render thread.
 
 use std::collections::HashSet;
 use std::sync::mpsc::TryRecvError;

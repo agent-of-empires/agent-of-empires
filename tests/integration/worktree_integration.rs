@@ -576,7 +576,7 @@ fn reconcile_heals_a_worktree_moved_outside_aoe() {
 
     let mut stale = instance.clone();
     assert_eq!(
-        reconcile_and_persist(&storage, &mut stale, &mut Default::default()).unwrap(),
+        reconcile_and_persist(&storage, &mut stale).unwrap(),
         WorktreePathResolution::Moved(relocated.canonicalize().unwrap())
     );
     assert_eq!(
@@ -610,12 +610,19 @@ fn reconcile_heals_a_worktree_moved_outside_aoe() {
     );
     assert!(outcome.new_path.exists());
 
-    // Reconciling again is a no-op: the recorded path is present, so git is
-    // never consulted.
+    // A current local copy must not hide the stale durable path.
     let mut settled = stale.clone();
     settled.project_path = outcome.new_path.to_string_lossy().into_owned();
     assert_eq!(
-        reconcile_and_persist(&storage, &mut settled, &mut Default::default()).unwrap(),
+        reconcile_and_persist(&storage, &mut settled).unwrap(),
+        WorktreePathResolution::Moved(outcome.new_path.canonicalize().unwrap())
+    );
+    assert_eq!(
+        std::path::Path::new(&storage.load().unwrap()[0].project_path),
+        outcome.new_path.canonicalize().unwrap()
+    );
+    assert_eq!(
+        reconcile_and_persist(&storage, &mut settled).unwrap(),
         WorktreePathResolution::Current
     );
 }
@@ -743,7 +750,7 @@ fn reconcile_refuses_a_checkout_another_session_records() {
 
     let mut reconciled = stale.clone();
     assert_eq!(
-        reconcile_and_persist(&storage, &mut reconciled, &mut Default::default()).unwrap(),
+        reconcile_and_persist(&storage, &mut reconciled).unwrap(),
         WorktreePathResolution::Current
     );
     assert_eq!(reconciled.project_path, stale.project_path);

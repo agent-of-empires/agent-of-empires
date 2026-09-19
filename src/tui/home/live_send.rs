@@ -1104,22 +1104,15 @@ impl Drop for LiveCaptureWorker {
 /// introducing one.
 const PANE_COUNT_PROBE_MS: u64 = 1_000;
 
-/// How many panes the worker's target window has, for deciding whether the
-/// preview needs the composite path. Returns 1 on any failure, which keeps the
-/// caller on the cheap single-pane transport.
-///
-/// A zoomed pane (`C-b z`) also reports 1: tmux keeps `window_panes` at its real
-/// count while reporting every pane at the window's full rectangle, so the panes
-/// overlap and the compositor's tiling assumption does not hold. Compositing
-/// there hides the zoomed pane behind border fill, so the single-pane transport
-/// is both cheaper and more correct.
+/// Use the composite preview only for an unzoomed split window.
+/// Missing or malformed observations retain the single-pane transport.
 fn probe_pane_count(name: &str, deadline: &crate::tmux::TmuxCommandDeadline) -> u16 {
     let mut command = crate::tmux::tmux_command();
     command.args([
         "display-message",
         "-p",
         "-t",
-        &format!("{name}:^"),
+        &format!("={name}:^"),
         "-F",
         "#{window_panes} #{window_zoomed_flag}",
     ]);
@@ -1219,6 +1212,11 @@ fn capture_composited_over_grid(
     let Some((_, layout)) = state.layout.as_ref() else {
         return capture_composited(name, lines, forward_empty, deadline);
     };
+    if layout.first_pane_id() != Some(channel.pane_id()) {
+        *state.layout = None;
+        *state.last_pane_probe = None;
+        return capture_composited(name, lines, forward_empty, deadline);
+    }
     let Some(first) = layout.first_pane() else {
         return capture_composited(name, lines, forward_empty, deadline);
     };
@@ -1246,7 +1244,7 @@ fn capture_composited_over_grid(
     cursor.history_size = 0;
     cursor.composite_pane0 = Some(first);
     (
-        Some(layout.composite_with_first_pane_rows(&rows)),
+        Some(layout.composite_with_first_pane_rows(channel.pane_id(), &rows)),
         Some(cursor),
     )
 }
@@ -2322,7 +2320,8 @@ fn dispatch_via_fork(
         }
     }
 
-    let target = format!("{}:^.0", tmux_name);
+    let target = crate::tmux::Session::from_name(tmux_name)
+        .live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())?;
     let mut cmd = crate::tmux::tmux_command();
     cmd.stderr(Stdio::null());
     match action {
@@ -4167,7 +4166,7 @@ mod tests {
                 "display-message",
                 "-p",
                 "-t",
-                &format!("{name}:^.0"),
+                &format!("{name}:^"),
                 "-F",
                 "#{pane_width}",
             ])

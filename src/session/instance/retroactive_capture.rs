@@ -4,27 +4,44 @@ use super::*;
 
 impl Instance {
     /// Full set of session IDs capture must skip for this instance.
-    pub(super) fn retroactive_capture_exclusion_set(&self) -> HashSet<String> {
-        crate::session::capture::compose_exclusion_with_persisted_peers(
-            &self.id,
-            &self.project_path,
-            &self.effective_profile(),
-            &self.retroactive_capture_excludes,
-        )
+    pub(super) fn retroactive_capture_exclusion_set(
+        &self,
+        stores: CaptureStorage<'_>,
+    ) -> Result<HashSet<String>> {
+        stores.with_store(&self.effective_profile(), |storage| {
+            let peers = storage.load()?;
+            Ok(
+                crate::session::capture::compose_exclusion_with_persisted_peers(
+                    &self.id,
+                    &self.project_path,
+                    &peers,
+                    &self.retroactive_capture_excludes,
+                ),
+            )
+        })
     }
 
-    pub(crate) fn try_retroactive_capture(&self) -> Option<String> {
-        let (capture, context) = self.resolved_session_support()?;
+    pub(crate) fn try_retroactive_capture(
+        &self,
+        stores: CaptureStorage<'_>,
+    ) -> Result<Option<String>> {
+        let Some((capture, context)) = self.resolved_session_support() else {
+            return Ok(None);
+        };
         let backend = capture.backend;
         if matches!(
             context,
             crate::agents::SessionCaptureContext::Preassigned
                 | crate::agents::SessionCaptureContext::ManagedExclusiveStore
         ) {
-            return None;
+            return Ok(None);
         }
-        let exclusion = self.retroactive_capture_exclusion_set();
-        let result = match backend {
+        let exclusion = if backend == crate::agents::SessionCaptureBackend::Omp {
+            self.retroactive_capture_exclusion_set(stores)?
+        } else {
+            HashSet::new()
+        };
+        let result = (|| match backend {
             crate::agents::SessionCaptureBackend::Claude
             | crate::agents::SessionCaptureBackend::HookSidecar => {
                 crate::hooks::read_hook_session_id_any_age(&self.id)
@@ -58,8 +75,8 @@ impl Instance {
             | crate::agents::SessionCaptureBackend::Kimi
             | crate::agents::SessionCaptureBackend::PrimeAgent
             | crate::agents::SessionCaptureBackend::OpenCode => None,
-        };
-        result.and_then(validated_session_id)
+        })();
+        Ok(result.and_then(validated_session_id))
     }
 
     /// Canonical `(tool, project_path)` keys shared by two or more id-less
@@ -115,7 +132,7 @@ impl Instance {
     pub(super) fn contended_capture_key(&self) -> (String, String) {
         (
             self.capture_agent_name().unwrap_or(&self.tool).to_string(),
-            crate::session::capture::canonicalize_or_raw(&self.project_path)
+            crate::session::path_identity::canonicalize_or_raw(&self.project_path)
                 .to_string_lossy()
                 .into_owned(),
         )
@@ -159,10 +176,22 @@ mod tests {
 
         let mut inst = Instance::new("pi-retro", "/tmp/pi-retro");
         inst.tool = "pi".to_string();
-        assert_eq!(inst.try_retroactive_capture(), None);
+        assert_eq!(
+            inst.try_retroactive_capture(CaptureStorage::Profiles(
+                &crate::file_watch::FileWatchService::noop()
+            ))
+            .unwrap(),
+            None
+        );
 
         inst.agent_session_id = Some("aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa".to_string());
-        assert_eq!(inst.try_retroactive_capture(), None);
+        assert_eq!(
+            inst.try_retroactive_capture(CaptureStorage::Profiles(
+                &crate::file_watch::FileWatchService::noop()
+            ))
+            .unwrap(),
+            None
+        );
 
         inst.sandbox_info = Some(crate::session::SandboxInfo {
             enabled: true,
@@ -179,7 +208,13 @@ mod tests {
             "/workspace",
             "the stub's conversation must match the workdir the scan would query"
         );
-        assert_eq!(inst.try_retroactive_capture(), None);
+        assert_eq!(
+            inst.try_retroactive_capture(CaptureStorage::Profiles(
+                &crate::file_watch::FileWatchService::noop()
+            ))
+            .unwrap(),
+            None
+        );
     }
 
     use super::*;
@@ -194,7 +229,7 @@ mod tests {
         );
         let cwd = std::env::current_dir().unwrap();
         let project = cwd.to_str().unwrap();
-        let canonical = crate::session::capture::canonicalize_or_raw(project)
+        let canonical = crate::session::path_identity::canonicalize_or_raw(project)
             .to_string_lossy()
             .into_owned();
         let mut base = Instance::new("base", project);
@@ -230,7 +265,7 @@ mod tests {
         );
         let cwd = std::env::current_dir().unwrap();
         let project = cwd.to_str().unwrap();
-        let canonical = crate::session::capture::canonicalize_or_raw(project)
+        let canonical = crate::session::path_identity::canonicalize_or_raw(project)
             .to_string_lossy()
             .into_owned();
         let mut base = Instance::new("base", project);
@@ -261,7 +296,7 @@ mod tests {
     fn contended_capture_cwds_flags_only_live_colocated_idless_same_tool() {
         let cwd = std::env::current_dir().unwrap();
         let p = cwd.to_str().unwrap();
-        let canon = crate::session::capture::canonicalize_or_raw(p)
+        let canon = crate::session::path_identity::canonicalize_or_raw(p)
             .to_string_lossy()
             .into_owned();
         let mk = |title: &str, tool: &str, sid: Option<&str>| {

@@ -274,7 +274,9 @@ fn group_header_count_tracks_trash_and_restore() {
     );
 
     env.view.select_session_by_id(&target);
-    env.view.toggle_archive_at_cursor().unwrap();
+    with_canonical_archive(&mut env, |env| {
+        env.view.toggle_archive_at_cursor().unwrap();
+    });
     assert_eq!(work_count(&env), 3, "restored session returns to the count");
 }
 

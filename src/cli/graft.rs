@@ -39,16 +39,9 @@ pub fn plugin_commands() -> Vec<PluginCommand> {
     out
 }
 
-/// The clap command augmented with active plugins' commands. A plugin command
-/// whose name collides with a core subcommand (or an already-grafted plugin
-/// command) is skipped, so core always wins. When the `aoe.web` plugin is
-/// disabled, `serve` is hidden from `--help` (it is rejected as unrecognized at
-/// invocation, see `serve_start_blocked`); this path already loads the registry,
-/// so no extra cost is added to the fast parse path.
+/// Add active plugin commands; core commands remain available independently.
 pub fn augmented_command() -> Command {
-    let cmd = graft_onto(Cli::command(), plugin_commands());
-
-    hide_disabled_serve(cmd, web_disabled())
+    graft_onto(Cli::command(), plugin_commands())
 }
 
 /// True when the builtin `aoe.web` plugin is present and disabled.
@@ -56,17 +49,6 @@ pub fn web_disabled() -> bool {
     crate::plugin::registry()
         .get("aoe.web")
         .is_some_and(|p| !p.enabled)
-}
-
-/// Hide `serve` from `--help` when the dashboard plugin is off. It stays
-/// parseable, since the lifecycle verbs must keep working; a fresh start is
-/// rejected as unrecognized in `main` (see `serve_start_blocked`).
-fn hide_disabled_serve(cmd: Command, web_disabled: bool) -> Command {
-    if web_disabled {
-        cmd.mut_subcommand("serve", |c| c.hide(true))
-    } else {
-        cmd
-    }
 }
 
 /// Whether a fresh `aoe serve` start must be rejected as an unrecognized
@@ -77,7 +59,7 @@ pub fn serve_start_blocked(cli: &Cli, web_disabled: bool) -> bool {
     let Some(super::definition::Commands::Serve(args)) = &cli.command else {
         return false;
     };
-    if args.stop || args.status || args.restart {
+    if args.core_only || args.stop || args.status || args.restart {
         return false;
     }
     web_disabled
@@ -194,7 +176,7 @@ mod tests {
         assert!(serve_start_blocked(&start, true));
         assert!(!serve_start_blocked(&start, false));
         // Lifecycle verbs always reach the daemon, even with the plugin off.
-        for verb in ["--stop", "--status", "--restart"] {
+        for verb in ["--core-only", "--stop", "--status", "--restart"] {
             let c = parse(&["aoe", "serve", verb]);
             assert!(
                 !serve_start_blocked(&c, true),
@@ -203,19 +185,5 @@ mod tests {
         }
         // A command other than `serve` is never blocked.
         assert!(!serve_start_blocked(&parse(&["aoe", "agents"]), true));
-    }
-
-    #[test]
-    fn hide_disabled_serve_hides_only_when_disabled() {
-        let shown = hide_disabled_serve(Cli::command(), false);
-        assert!(!shown
-            .find_subcommand("serve")
-            .expect("serve present")
-            .is_hide_set());
-        let hidden = hide_disabled_serve(Cli::command(), true);
-        assert!(hidden
-            .find_subcommand("serve")
-            .expect("serve present")
-            .is_hide_set());
     }
 }

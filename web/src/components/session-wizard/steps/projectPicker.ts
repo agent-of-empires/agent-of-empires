@@ -99,36 +99,42 @@ export function splitSavedAndRecent(
   return { saved, recent: recent.filter((r) => !savedPaths.has(normalizePath(r.path))) };
 }
 
-/** Fetches and filters the saved + recent project lists shared by the main
- *  Project step and the extra-repos picker (#3743), so both offer the same
- *  search-over-saved-and-recent experience instead of two divergent UIs. */
-export function useProjectPicker(excludePaths: string[] = []) {
+/** Saved paths are always read for the workflow's resolved profile. */
+export function useProjectPicker(profile: string | undefined, excludePaths: string[] = []) {
   const [recent, setRecent] = useState<RecentProject[]>([]);
   const [saved, setSaved] = useState<ProjectInfo[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [loadedProfile, setLoadedProfile] = useState<string>();
+  const loading = !profile || loadedProfile !== profile;
   const [query, setQuery] = useState("");
 
   useEffect(() => {
+    if (!profile) return;
     let cancelled = false;
-    Promise.all([fetchSessions(), fetchRecentProjects(), fetchProjects()]).then(
+    Promise.all([fetchSessions(), fetchRecentProjects(), fetchProjects({ profile })]).then(
       ([envelope, recentEnvelope, savedProjects]) => {
-        if (cancelled) return;
+        if (cancelled || savedProjects === null) return;
         const sessionDerived = envelope ? collectRecentProjects(envelope.sessions) : [];
         const merged = mergeRecentProjects(sessionDerived, recentEnvelope?.projects ?? []);
         const split = splitSavedAndRecent(savedProjects, merged);
         setSaved(split.saved);
         setRecent(split.recent);
-        setLoading(false);
+        setLoadedProfile(profile);
       },
     );
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [profile]);
 
   const excluded = useMemo(() => new Set(excludePaths.map(normalizePath)), [excludePaths]);
-  const visibleSaved = useMemo(() => saved.filter((s) => !excluded.has(normalizePath(s.path))), [saved, excluded]);
-  const visibleRecent = useMemo(() => recent.filter((r) => !excluded.has(normalizePath(r.path))), [recent, excluded]);
+  const visibleSaved = useMemo(
+    () => (loading ? [] : saved.filter((s) => !excluded.has(normalizePath(s.path)))),
+    [saved, excluded, loading],
+  );
+  const visibleRecent = useMemo(
+    () => (loading ? [] : recent.filter((r) => !excluded.has(normalizePath(r.path)))),
+    [recent, excluded, loading],
+  );
 
   // #3461: with no query, recents stay capped so the list reads as a short
   // "jump back in" list. A query searches the whole visible list instead, so
@@ -154,9 +160,6 @@ export function useProjectPicker(excludePaths: string[] = []) {
     filteredSaved,
     filteredRecent,
     hasPicks: visibleSaved.length > 0 || visibleRecent.length > 0,
-    // Unfiltered, so a caller can tell "nothing registered at all" apart from
-    // "everything registered got excluded" (e.g. the only saved project is
-    // the primary repo in ExtraReposPicker).
-    hasAnyProjects: saved.length > 0 || recent.length > 0,
+    hasAnyProjects: !loading && (saved.length > 0 || recent.length > 0),
   };
 }

@@ -189,7 +189,7 @@ impl HomeView {
                 inst.title.clone(),
                 taken
                     .iter()
-                    .map(|p| crate::session::projects::canonical_key(p))
+                    .map(crate::session::projects::canonical_key)
                     .collect::<Vec<_>>(),
                 // The session's own profile, not the view's filter: a session
                 // belongs to one profile and its registry is that profile's.

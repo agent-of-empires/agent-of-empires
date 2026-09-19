@@ -88,7 +88,7 @@ pub(crate) enum StatusSource {
 
 /// Shared application state accessible by all request handlers.
 pub struct AppState {
-    pub profile: String,
+    pub core_only: bool,
     pub read_only: bool,
     /// CityHall client mode, resolved once at launch from `AOE_CITYHALL_MODE`.
     /// When set, the web dashboard is locked down to an end-user client
@@ -97,11 +97,13 @@ pub struct AppState {
     /// server-side, not only in the UI, mirroring `read_only`. See #7.
     pub cityhall_mode: bool,
     pub instances: Arc<RwLock<Vec<Instance>>>,
-    /// Session-domain service handle sharing `instances`, `instance_locks`,
-    /// `file_watch`, the telemetry create counter, and the ACP supervisor
-    /// with the fields on this struct, so a non-HTTP caller (the plugin
-    /// host, #2897) can drive session create/turn without holding
-    /// `AppState`.
+    pub(crate) profile_namespace: Arc<RwLock<()>>,
+    pub(crate) publication: Arc<RwLock<()>>,
+    pub(crate) reload_lane: tokio::sync::Mutex<()>,
+    pub(crate) canonical_metadata: RwLock<super::reload::CanonicalMetadata>,
+    pub(crate) canonical_health: RwLock<crate::daemon::RuntimeHealth>,
+    pub(crate) runtime: super::runtime::NativeRuntime,
+    /// Shared session-domain service for HTTP and plugin entry points.
     pub session_service: Arc<session_service::SessionService>,
     pub token_manager: Arc<TokenManager>,
     pub login_manager: Arc<login::LoginManager>,
@@ -342,6 +344,12 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub(crate) async fn mark_reload_failure(&self, health: crate::daemon::RuntimeHealth) {
+        let _publication = self.publication.write().await;
+        *self.canonical_health.write().await = health;
+        self.runtime.request_publish();
+    }
+
     /// Read-through cache over `compute_changed_files`. Returns a fresh scan
     /// when the cached entry is missing or older than `CHANGED_FILES_TTL`;
     /// errors are never cached. Safe to call from `spawn_blocking` (the lock is

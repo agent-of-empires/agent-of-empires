@@ -46,23 +46,28 @@ pub fn spawn_supervised<F>(name: &'static str, policy: PanicPolicy, fut: F) -> J
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    tokio::spawn(async move {
-        match AssertUnwindSafe(fut).catch_unwind().await {
-            Ok(()) => {}
-            Err(payload) => {
-                let msg = panic_payload_string(&*payload);
-                tracing::error!(
-                    target: "task.panic",
-                    task = name,
-                    message = %msg,
-                    "background task panicked",
-                );
-                if matches!(policy, PanicPolicy::Surface) {
-                    std::panic::resume_unwind(payload);
-                }
+    tokio::spawn(supervise(name, policy, fut))
+}
+
+pub(crate) async fn supervise<F>(name: &'static str, policy: PanicPolicy, fut: F)
+where
+    F: Future<Output = ()> + Send,
+{
+    match AssertUnwindSafe(fut).catch_unwind().await {
+        Ok(()) => {}
+        Err(payload) => {
+            let msg = panic_payload_string(&*payload);
+            tracing::error!(
+                target: "task.panic",
+                task = name,
+                message = %msg,
+                "background task panicked",
+            );
+            if matches!(policy, PanicPolicy::Surface) {
+                std::panic::resume_unwind(payload);
             }
         }
-    })
+    }
 }
 
 fn panic_payload_string(payload: &(dyn std::any::Any + Send)) -> String {

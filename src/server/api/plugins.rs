@@ -19,7 +19,7 @@ use serde_json::json;
 use super::AppState;
 use crate::plugin;
 use crate::plugin::install::OperationLog;
-use crate::server::auth::{handler_elevated, AuthenticatedSession, LoopbackTrusted};
+use crate::server::auth::{handler_elevated, AuthenticatedSession, LocalAuthorization};
 
 const CAP_COMPOSER_READ: &str = "composer.read";
 
@@ -27,31 +27,20 @@ fn error_response(status: StatusCode, code: &str, message: String) -> Response {
     (status, Json(json!({ "error": code, "message": message }))).into_response()
 }
 
-/// Resolve the read-only and elevation gates shared by every mutation.
-/// Elevation goes through `handler_elevated`, so a loopback-trusted
-/// caller passes without a session (#2610): the loopback bypass paths
-/// never insert `AuthenticatedSession`, and treating that as
-/// not-elevated made these mutations unreachable from localhost.
+/// Apply mutation restrictions before resolving the authenticated principal.
 async fn mutation_gate(
     state: &AppState,
     session: Option<&AuthenticatedSession>,
-    loopback_trusted: bool,
+    local: Option<&LocalAuthorization>,
 ) -> Result<(), Response> {
     if state.read_only {
-        return Err(error_response(
-            StatusCode::FORBIDDEN,
-            "read_only",
-            "Server is in read-only mode".into(),
-        ));
+        return Err(super::read_only_response());
     }
-    // CityHall renders the Plugins tab read-only: install / uninstall / enable /
-    // update all mutate host-side state (an install runs arbitrary code from a
-    // client-supplied source), and elevation is no barrier for a locked-down
-    // user who holds the passphrase or runs with `--auth=none`. See #7.
+    // Host-side plugin changes remain forbidden in CityHall mode.
     if let Some(resp) = super::cityhall_block(state) {
         return Err(resp);
     }
-    if !handler_elevated(state, session, loopback_trusted).await {
+    if !handler_elevated(state, session, local).await {
         return Err(error_response(
             StatusCode::FORBIDDEN,
             "elevation_required",
@@ -284,11 +273,7 @@ pub async fn invoke_plugin_action(
     Json(body): Json<PluginActionBody>,
 ) -> Response {
     if state.read_only {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "read_only",
-            "Server is in read-only mode".into(),
-        );
+        return super::read_only_response();
     }
     // Plugin panes are hidden in CityHall (plugins are display only).
     if let Some(resp) = super::cityhall_block(&state) {
@@ -366,11 +351,7 @@ pub async fn invoke_plugin_command(
     Json(body): Json<InvokeCommandBody>,
 ) -> Response {
     if state.read_only {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "read_only",
-            "Server is in read-only mode".into(),
-        );
+        return super::read_only_response();
     }
     // Plugin commands are not surfaced in CityHall (plugins are display only).
     if let Some(resp) = super::cityhall_block(&state) {
@@ -468,11 +449,7 @@ pub async fn plugin_update_preview(
     Path(id): Path<String>,
 ) -> Response {
     if state.read_only {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "read_only",
-            "Server is in read-only mode".into(),
-        );
+        return super::read_only_response();
     }
     match plugin::install::preview_update(&id).await {
         Ok(preview) => Json(preview).into_response(),
@@ -499,11 +476,11 @@ pub struct ApplyUpdateBody {
 pub async fn apply_plugin_update(
     State(state): State<std::sync::Arc<AppState>>,
     session: Option<axum::Extension<AuthenticatedSession>>,
-    loopback: Option<axum::Extension<LoopbackTrusted>>,
+    loopback: Option<axum::Extension<LocalAuthorization>>,
     Path(id): Path<String>,
     Json(body): Json<ApplyUpdateBody>,
 ) -> Response {
-    if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.is_some()).await {
+    if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.as_deref()).await {
         return resp;
     }
     let plugin_id = id.clone();
@@ -516,6 +493,7 @@ pub async fn apply_plugin_update(
         }
         Ok(())
     })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -531,11 +509,11 @@ pub struct DismissUpdateBody {
 pub async fn dismiss_plugin_update(
     State(state): State<std::sync::Arc<AppState>>,
     session: Option<axum::Extension<AuthenticatedSession>>,
-    loopback: Option<axum::Extension<LoopbackTrusted>>,
+    loopback: Option<axum::Extension<LocalAuthorization>>,
     Path(id): Path<String>,
     Json(body): Json<DismissUpdateBody>,
 ) -> Response {
-    if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.is_some()).await {
+    if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.as_deref()).await {
         return resp;
     }
     let result = tokio::task::spawn_blocking(move || {
@@ -558,11 +536,11 @@ pub struct SetEnabledBody {
 pub async fn set_plugin_enabled(
     State(state): State<std::sync::Arc<AppState>>,
     session: Option<axum::Extension<AuthenticatedSession>>,
-    loopback: Option<axum::Extension<LoopbackTrusted>>,
+    loopback: Option<axum::Extension<LocalAuthorization>>,
     Path(id): Path<String>,
     Json(body): Json<SetEnabledBody>,
 ) -> Response {
-    if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.is_some()).await {
+    if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.as_deref()).await {
         return resp;
     }
     let result =
@@ -590,10 +568,10 @@ pub async fn set_plugin_enabled(
 pub async fn restart_plugin_worker(
     State(state): State<std::sync::Arc<AppState>>,
     session: Option<axum::Extension<AuthenticatedSession>>,
-    loopback: Option<axum::Extension<LoopbackTrusted>>,
+    loopback: Option<axum::Extension<LocalAuthorization>>,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.is_some()).await {
+    if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.as_deref()).await {
         return resp;
     }
     let registry = match tokio::task::spawn_blocking(plugin::reload_registry).await {
@@ -745,15 +723,8 @@ impl PluginJobRegistry {
     }
 }
 
-/// Begin a lifecycle job, spawn its work, and return `202 { job_id }`. Returns
-/// `409` when another lifecycle mutation is already running. The work runs in a
-/// detached task; its build output and host-side progress lines land in the job
-/// log file, which the dashboard tails via `plugin_job_status`.
-// ponytail: install/update run their (synchronous) build inside this async
-// task, parking one runtime worker for the build's duration. The single-active
-// guard caps that at one parked worker; switch to a dedicated blocking thread
-// only if that ever matters.
-fn start_job<F, Fut>(
+/// Admit one lifecycle job; return its id while its work remains tracked.
+async fn start_job<F, Fut>(
     state: std::sync::Arc<AppState>,
     kind: PluginJobKind,
     target: String,
@@ -772,7 +743,7 @@ where
     };
     let jobs = state.plugin_jobs.clone();
     let id = job_id.clone();
-    tokio::spawn(async move {
+    state.runtime.work.spawn("server.plugin_job", async move {
         let result = match OperationLog::file(&log_path) {
             Ok(log) => run(log).await,
             Err(e) => Err(e),
@@ -796,11 +767,7 @@ pub async fn preview_plugin_install(
     Json(body): Json<InstallPreviewBody>,
 ) -> Response {
     if state.read_only {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "read_only",
-            "Server is in read-only mode".into(),
-        );
+        return super::read_only_response();
     }
     // The marketplace / install flow is hidden and closed in CityHall.
     if let Some(resp) = super::cityhall_block(&state) {
@@ -826,10 +793,10 @@ pub struct StartInstallBody {
 pub async fn start_plugin_install(
     State(state): State<std::sync::Arc<AppState>>,
     session: Option<axum::Extension<AuthenticatedSession>>,
-    loopback: Option<axum::Extension<LoopbackTrusted>>,
+    loopback: Option<axum::Extension<LocalAuthorization>>,
     Json(body): Json<StartInstallBody>,
 ) -> Response {
-    if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.is_some()).await {
+    if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.as_deref()).await {
         return resp;
     }
     let source = body.source.clone();
@@ -844,6 +811,7 @@ pub async fn start_plugin_install(
                 .map(|_| ())
         },
     )
+    .await
 }
 
 /// `POST /api/plugins/{id}/uninstall`: start a host-side uninstall job. Removes
@@ -852,10 +820,10 @@ pub async fn start_plugin_install(
 pub async fn start_plugin_uninstall(
     State(state): State<std::sync::Arc<AppState>>,
     session: Option<axum::Extension<AuthenticatedSession>>,
-    loopback: Option<axum::Extension<LoopbackTrusted>>,
+    loopback: Option<axum::Extension<LocalAuthorization>>,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.is_some()).await {
+    if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.as_deref()).await {
         return resp;
     }
     let plugin_id = id.clone();
@@ -871,6 +839,7 @@ pub async fn start_plugin_uninstall(
             Err(e) => Err(anyhow::anyhow!("uninstall task failed: {e}")),
         }
     })
+    .await
 }
 
 #[derive(Deserialize)]

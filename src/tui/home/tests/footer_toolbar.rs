@@ -120,7 +120,7 @@ fn overlay_blocks_footer_and_sidebar_clicks() {
 fn strict_mode_buttons_carry_shifted_chords() {
     let mut env = create_test_env_with_sessions(3);
     env.view.strict_hotkeys = true;
-    render_at(&mut env, 120, 12);
+    render_at(&mut env, 160, 12);
 
     let diff = button_key(&env, KeyCode::Char('d')).expect("Diff button (strict ^D)");
     assert_eq!(

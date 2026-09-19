@@ -600,12 +600,18 @@ pub async fn live_terminal_ws(
 
     let read_only = state.read_only;
     let shutdown = state.shutdown.clone();
+    let work = state.runtime.work.clone();
 
     match tmux_name {
         Some(tmux_name) => ws
             .protocols(["aoe-auth"])
-            .on_upgrade(move |socket| {
-                handle_live_ws(socket, tmux_name, read_only, shutdown, LiveTransport::Grid)
+            .on_upgrade(move |socket| async move {
+                let _ = work
+                    .run(
+                        "server.live_terminal",
+                        handle_live_ws(socket, tmux_name, read_only, shutdown, LiveTransport::Grid),
+                    )
+                    .await;
             })
             .into_response(),
         None => {
@@ -707,9 +713,24 @@ async fn live_shell_ws(
         return (axum::http::StatusCode::NOT_FOUND, "Session not found").into_response();
     };
 
-    let tmux_name = match respawn(&state, &id, &inst, index).await {
-        Ok(name) => name,
-        Err(e) => {
+    let revive_state = state.clone();
+    let revive_id = id.clone();
+    let revived = state
+        .runtime
+        .work
+        .run("server.revive_shell", async move {
+            respawn(&revive_state, &revive_id, &inst, index).await
+        })
+        .await;
+    let tmux_name = match revived {
+        Ok(Ok(name)) => name,
+        Ok(Err(e)) => {
+            if let Some(response) = super::api::lifecycle_rejection(&state, &e) {
+                return response;
+            }
+            if e.is::<crate::session::NativeStoreUnavailable>() {
+                return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
             warn!(target: "terminal.ws", session = %id, kind = %kind, "failed to revive shell: {}", e);
             return (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -717,19 +738,31 @@ async fn live_shell_ws(
             )
                 .into_response();
         }
+        Err(super::runtime::RuntimeWorkError::ShuttingDown) => {
+            return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        Err(super::runtime::RuntimeWorkError::Interrupted) => {
+            return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
     };
 
     let read_only = state.read_only;
     let shutdown = state.shutdown.clone();
+    let work = state.runtime.work.clone();
     ws.protocols(["aoe-auth"])
-        .on_upgrade(move |socket| {
-            handle_live_ws(
-                socket,
-                tmux_name,
-                read_only,
-                shutdown,
-                LiveTransport::Snapshot,
-            )
+        .on_upgrade(move |socket| async move {
+            let _ = work
+                .run(
+                    "server.live_shell",
+                    handle_live_ws(
+                        socket,
+                        tmux_name,
+                        read_only,
+                        shutdown,
+                        LiveTransport::Snapshot,
+                    ),
+                )
+                .await;
         })
         .into_response()
 }
@@ -850,6 +883,8 @@ async fn handle_live_ws_inner(
     let capture_osc52 = osc52;
     #[cfg(unix)]
     let capture_vt = vt.clone();
+    let capture_stop = shutdown.child_token();
+    let capture_cancelled = capture_stop.clone();
     let capture_task = tokio::spawn(async move {
         #[cfg(unix)]
         let mut osc52_seen = capture_osc52
@@ -892,6 +927,9 @@ async fn handle_live_ws_inner(
         let mut last_heartbeat = std::time::Instant::now() - SIZE_OWNER_HEARTBEAT;
         let mut last_reclaim = std::time::Instant::now() - SIZE_OWNER_HEARTBEAT;
         loop {
+            if capture_cancelled.is_cancelled() {
+                break;
+            }
             // The grid serves single-pane windows within its scrollback depth;
             // a split window is composited from capture-pane.
             #[cfg(unix)]
@@ -1419,16 +1457,19 @@ async fn handle_live_ws_inner(
                 }
             }
 
-            wait_for_next(
-                &capture_settings,
-                &capture_nudge,
-                #[cfg(unix)]
-                vt_rx.as_mut(),
-                sample_started,
-                #[cfg(unix)]
-                grid_frame,
-            )
-            .await;
+            tokio::select! {
+                biased;
+                _ = capture_cancelled.cancelled() => break,
+                _ = wait_for_next(
+                    &capture_settings,
+                    &capture_nudge,
+                    #[cfg(unix)]
+                    vt_rx.as_mut(),
+                    sample_started,
+                    #[cfg(unix)]
+                    grid_frame,
+                ) => {}
+            }
         }
         debug!(
             target: "terminal.ws",
@@ -1446,38 +1487,53 @@ async fn handle_live_ws_inner(
     });
 
     // Sender task: sole socket writer; also emits keepalive pings.
+    let send_stop = capture_stop.clone();
+    let send_shutdown = shutdown.clone();
     let send_task = tokio::spawn(async move {
-        let mut ping = tokio::time::interval(PING_INTERVAL);
-        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        ping.tick().await; // arm: first tick fires immediately otherwise
-        loop {
-            tokio::select! {
-                msg = out_rx.recv() => {
-                    match msg {
-                        Some(Message::Close(frame)) => {
-                            let _ = ws_sender.send(Message::Close(frame)).await;
-                            break;
-                        }
-                        Some(msg) => {
-                            if ws_sender.send(msg).await.is_err() {
-                                break;
-                            }
-                        }
-                        None => break,
-                    }
-                }
-                _ = ping.tick() => {
-                    if ws_sender.send(Message::Ping(vec![].into())).await.is_err() {
+        let interrupted = tokio::select! {
+            biased;
+            _ = send_stop.cancelled() => true,
+            _ = async {
+                let mut ping = tokio::time::interval(PING_INTERVAL);
+                ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    let message = tokio::select! {
+                        message = out_rx.recv() => match message {
+                            Some(message) => message,
+                            None => break,
+                        },
+                        _ = ping.tick() => Message::Ping(vec![].into()),
+                    };
+                    let closing = matches!(message, Message::Close(_));
+                    if ws_sender.send(message).await.is_err() || closing {
                         break;
                     }
                 }
-            }
+            } => false,
+        };
+        if interrupted {
+            let frame = axum::extract::ws::CloseFrame {
+                code: if send_shutdown.is_cancelled() {
+                    CLOSE_CODE_GOING_AWAY
+                } else {
+                    1000
+                },
+                reason: "connection closed".into(),
+            };
+            let _ = tokio::time::timeout(
+                Duration::from_millis(200),
+                ws_sender.send(Message::Close(Some(frame))),
+            )
+            .await;
         }
+        send_stop.cancel();
     });
 
     // Recv loop: input bytes + control messages, until close/shutdown.
     loop {
         tokio::select! {
+            biased;
+            _ = capture_stop.cancelled() => break,
             msg = ws_receiver.next() => {
                 match msg {
                     Some(Ok(Message::Binary(data))) => {
@@ -1665,27 +1721,16 @@ async fn handle_live_ws_inner(
                     }
                 }
             }
-            _ = shutdown.cancelled() => {
-                let _ = out_tx
-                    .send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                        code: CLOSE_CODE_GOING_AWAY,
-                        reason: "server shutdown".into(),
-                    })))
-                    .await;
-                break;
-            }
         }
     }
 
-    capture_task.abort();
+    capture_stop.cancel();
+    let _ = capture_task.await;
     drop(out_tx);
     let _ = send_task.await;
 
-    // Release the size-owner lock if we held it. `release_size_owner` is a
-    // no-op for a non-owner, and restores `window-size latest` once the lock
-    // is vacant so a later full-size attach isn't pinned at phone dimensions.
-    // With another live viewer still connected, the lock stays held by
-    // whoever owns it; this disconnect doesn't disturb the survivor.
+    // Release only this viewer's size lease. The last owner restores
+    // window-size latest; another viewer's lease remains untouched.
     {
         let name = tmux_name.clone();
         let who = owner_id.clone();
@@ -1718,7 +1763,7 @@ struct LiveStats {
 /// not answer.
 #[cfg(unix)]
 fn window_pane_count(tmux_name: &str) -> Option<u16> {
-    let target = format!("{tmux_name}:^");
+    let target = format!("={tmux_name}:^");
     let mut command = crate::tmux::tmux_command();
     command.args([
         "display-message",

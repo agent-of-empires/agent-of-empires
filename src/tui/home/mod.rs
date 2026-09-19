@@ -14,7 +14,7 @@ mod live_send;
 mod live_send_prep;
 mod operations;
 mod overlays;
-mod panes;
+pub(in crate::tui) mod panes;
 mod persistence;
 mod pollers;
 mod preview;
@@ -44,11 +44,10 @@ use crate::session::{
     append_archived_section, append_archived_section_by_project, append_trash_section,
     config::{load_config, update_app_state, update_config, GroupByMode, SortOrder},
     flatten_sessions_by_attention, flatten_tree, flatten_tree_all_profiles, resolve_config_or_warn,
-    DefaultTerminalMode, EnsureReadyOutcome, Group, GroupTree, Instance, Item, Storage,
+    DefaultTerminalMode, Group, GroupTree, Instance, Item, Storage,
 };
 use crate::tmux::AvailableTools;
 
-use super::creation_poller::{CreatedWorktreeInfo, CreationPoller, CreationRequest};
 use super::deletion_poller::DeletionPoller;
 use super::dialogs::ServeView;
 use super::dialogs::{
@@ -60,10 +59,7 @@ use super::dialogs::{
     WorktreeNameDialog,
 };
 use super::diff::DiffView;
-use super::restart_poller::RestartPoller;
 use super::settings::SettingsView;
-use super::status_poller::{StatusPoller, StatusUpdate};
-use super::stop_poller::StopPoller;
 
 use self::creation::SessionMutationGuards;
 use self::icons::{
@@ -138,6 +134,28 @@ pub(super) struct CreatingHookProgress {
     pub(super) current_hook: Option<String>,
 }
 
+/// Cursor placement owed to the snapshot that reflects an archive toggle: the
+/// view submits the change, and only the canonical stamp moves the row.
+pub(super) struct PendingArchiveCursor {
+    pub(super) id: String,
+    pub(super) archived: bool,
+    /// Where the cursor lands when the row sinks (non-Attention sorts).
+    pub(super) successor: Option<String>,
+}
+
+/// A creation this view submitted to the daemon and still displays. The row is
+/// a local placeholder: the daemon owns provisioning, the hooks, and the
+/// committed session, so nothing here may be persisted or mutated.
+pub(super) struct PendingCreation {
+    /// The daemon's session id, known once a reservation or progress entry
+    /// names this creation.
+    pub(super) daemon_id: Option<String>,
+    pub(super) title: String,
+    pub(super) profile: String,
+    /// A cancellation was requested; it is sent as soon as the id is known.
+    pub(super) cancel_requested: bool,
+}
+
 /// One applied passive resize: the preview geometry the dedup keys on, the
 /// window geometry tmux actually applied (preview rows plus status-bar
 /// chrome), and when render adopted it. Only a pane snapshot taken after
@@ -160,6 +178,14 @@ struct RecoveryUpdate {
     /// freshly-set `last_start_time` (which is `#[serde(skip)]`).
     instance: Box<crate::session::Instance>,
     result: Result<crate::session::StartOutcome, String>,
+}
+
+pub(in crate::tui) struct ReadyNativeAttachment {
+    pub id: String,
+    pub tmux_name: String,
+    pub lease: crate::tui::session_feed::NativeLease,
+    /// What the caller asked to do with this pane once it was ready.
+    pub intent: crate::tui::home::panes::PaneIntent,
 }
 
 pub struct HomeView {
@@ -340,6 +366,7 @@ pub struct HomeView {
     /// later live-send call. Defaults to Agent for the historical
     /// path (Tab in Structured view).
     pub(super) pending_live_send_target: live_send::LiveSendTarget,
+    pending_native_attachment: Option<panes::PendingNativeAttachment>,
     /// Live-send mode: when `Some`, every key event in the home view is
     /// translated to a tmux send-keys call against this session's pane
     /// until the user presses the exit chord (Ctrl+q). Set by `Tab` (in
@@ -468,15 +495,8 @@ pub struct HomeView {
     pub(super) pending_attach_after_warning: Option<String>,
     /// Session to stop after the confirmation dialog is accepted
     pub(super) pending_stop_session: Option<String>,
-    /// Paired terminal to kill after the Terminal-view "kill terminal" confirm
-    /// dialog is accepted. Carries the session id and which terminal (host vs
-    /// container) the row was showing, so the accept path kills exactly the
-    /// terminal the user was looking at without touching the agent session.
-    pub(super) pending_stop_terminal: Option<(String, TerminalMode)>,
-    /// Tool session to kill after the Tool-view "kill tool" confirm dialog is
-    /// accepted: session id plus the tool name the view was previewing. Same
-    /// contract as `pending_stop_terminal`, the agent session is untouched.
-    pub(super) pending_stop_tool: Option<(String, String)>,
+    /// Target captured when the auxiliary stop confirmation opens.
+    pub(super) pending_stop_auxiliary: Option<(String, crate::session::AuxiliaryTarget)>,
     /// Sandbox image to pull after the "image update available" confirm dialog
     /// is accepted. Carries the image through the generic `ConfirmDialog`,
     /// which only knows its action string.
@@ -522,10 +542,6 @@ pub struct HomeView {
     // Tool availability
     pub(super) available_tools: AvailableTools,
 
-    // Performance: background status polling
-    pub(super) status_poller: StatusPoller,
-    pub(super) pending_status_refresh: bool,
-
     // Compact system-health strip controlled by `session.show_diagnostics_pane`.
     // The poller samples host resources and agent counts off the UI thread;
     // `metrics` holds the latest sample for the strip and detail view.
@@ -541,12 +557,8 @@ pub struct HomeView {
     pub(super) system_health_tip_earned: bool,
     pub(super) system_health_discovered: bool,
 
-    // The sidebar's subscription to the daemon's session list. Structured
-    // (ACP) rows take their status from it; see `session_feed`.
+    // Canonical subscription and native command lane.
     pub(super) session_feed: super::session_feed::SessionFeed,
-    pub(super) pending_session_feed: bool,
-    /// `session.daemon_sidebar`: whether the feed runs at all.
-    pub(super) daemon_sidebar: bool,
     pub(super) sidebar_source: super::session_feed::SidebarSource,
     // Structured (ACP) rows also surface their pending approval nonces from
     // the daemon; the home permission dialog resolves them. See
@@ -557,11 +569,7 @@ pub struct HomeView {
     // Performance: background deletion
     pub(super) deletion_poller: DeletionPoller,
 
-    // Performance: background stop (docker stop can block up to ~10s)
-    pub(super) stop_poller: StopPoller,
-
-    // Performance: background trash prep (stops the sandbox container, so the
-    // same ~10s docker stop block as `stop_poller`, plus the worktree move)
+    // Container teardown and worktree moves run off the render thread.
     pub(super) trash_poller: crate::tui::trash_poller::TrashPoller,
     /// Load-time healing (trashed-worktree relocation, worktree paths moved
     /// outside aoe) kicked once from `HomeView::new` so it never delays the
@@ -583,18 +591,10 @@ pub struct HomeView {
     /// `RECONCILE_RELOAD_RETRY_INTERVAL`.
     pub(super) reconcile_reload_retry_at: Option<std::time::Instant>,
 
-    // Performance: background restart (the start cascade shells out to docker
-    // and runs the before_start host hook, which can block for seconds)
-    pub(super) restart_poller: RestartPoller,
-    /// Sessions whose restart cascade is in flight on the restart poller.
-    /// Suppresses the StatusPoller's missing-tmux Error transition until the
-    /// worker reports back via `apply_restart_results`.
+    // Daemon start reservations: the daemon runs the start and its canonical
+    // snapshot drives the row; see `apply_restart_results`.
+    /// Sessions awaiting a daemon start snapshot (see `apply_restart_results`).
     pub(super) restart_in_flight: std::collections::HashSet<String>,
-    /// Sessions to attach once their in-flight restart launches the agent.
-    pub(super) attach_after_restart: std::collections::HashSet<String>,
-    /// Restarted sessions ready for the event loop to attach; see
-    /// `take_restarted_attaches`.
-    pub(super) restarted_attaches: Vec<String>,
 
     // Performance: background sandbox store move. A session still on the
     // shared store copies it before its first launch, which can take
@@ -615,20 +615,17 @@ pub struct HomeView {
     pub(super) attach_project_in_flight: std::collections::HashSet<String>,
 
     // Performance: background session creation (for sandbox)
-    pub(super) creation_poller: CreationPoller,
-    /// Set to true if user cancelled while creation was pending
-    pub(super) creation_cancelled: bool,
-    /// Sessions whose on_launch hooks already ran in the creation poller
-    pub(super) on_launch_hooks_ran: HashSet<String>,
+    /// The creation this view submitted to the daemon and still displays. The
+    /// daemon owns provisioning, hooks, and the committed row.
+    pub(super) pending_creation: Option<PendingCreation>,
 
     /// Hook progress for sessions in Creating state, keyed by stub instance ID
     pub(super) creating_hook_progress: HashMap<String, CreatingHookProgress>,
     /// The stub instance ID for the current background creation
     pub(super) creating_stub_id: Option<String>,
-    /// Group paths introduced only to display the current Creating stub.
-    /// Finalization removes these from persisted metadata before replacing the
-    /// stub, while preserving groups that were already present when requested.
-    creating_provisional_group_paths: HashSet<String>,
+
+    /// Cursor placement owed to the applied snapshot after an archive toggle.
+    pub(super) pending_archive_cursor: Option<PendingArchiveCursor>,
 
     // Performance: preview caching
     pub(super) preview_cache: PreviewCache,
@@ -752,8 +749,6 @@ pub struct HomeView {
 
     // Sound config for state transition sounds
     pub(super) sound_config: crate::sound::SoundConfig,
-    pub(super) status_hook_config: crate::status_hooks::StatusHookConfig,
-    pub(super) status_hook_configs: HashMap<String, crate::status_hooks::StatusHookConfig>,
 
     /// Resolved decay window from `Config.theme.idle_decay_minutes`. Read
     /// at startup and re-resolved on settings reload. Used by render to
@@ -885,12 +880,7 @@ pub struct HomeView {
     /// reported back.
     recovery_lock: Option<crate::session::recovery::RecoveryLock>,
 
-    /// Ids whose startup-recovery cascade is still in flight. Filtered
-    /// out of `request_status_refresh` so the 500ms poller does not
-    /// observe missing tmux state and broadcast `Status::Error` while a
-    /// worker is mid-cascade. Drained per-id by `apply_recovery_updates`
-    /// (success, error, or panic). Mirrors the `on_launch_hooks_ran`
-    /// HashSet pattern: TUI-local, event-driven, no TTL needed.
+    /// Sessions awaiting startup-recovery worker results.
     recovery_in_flight: std::collections::HashSet<String>,
 
     /// Spam-debounce for the `e` / `E` / `F5` restart keybind: maps

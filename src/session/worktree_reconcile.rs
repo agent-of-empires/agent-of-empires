@@ -1,36 +1,6 @@
-//! Reconcile a managed worktree session's recorded `project_path` against
-//! git's own worktree listing when the directory moved outside aoe (#2002).
-//!
-//! A worktree session records the directory it was created in and nothing
-//! syncs that string afterwards, so a `git worktree move` from another shell
-//! leaves `project_path` naming a directory that no longer exists. git already
-//! knows where the checkout went, keyed by branch, so the repair is a lookup
-//! rather than new bookkeeping.
-//!
-//! Design notes:
-//!   - **Triggered by absence.** The recorded path existing is treated as
-//!     proof it is still the right one, so a healthy row costs one `stat` and
-//!     never shells out. This does not catch a recorded path that survived as
-//!     an unrelated directory; that is not the reported failure and paying a
-//!     git listing per session per load to detect it is not worth it.
-//!   - **Never guesses.** git normally forbids two worktrees on one branch, but
-//!     a `--force`d or hand-edited repo can produce it. Two live candidates
-//!     leave the row alone rather than picking one. A lone candidate that
-//!     another session already records is refused for the same reason: git
-//!     only forbids the second worktree while the first registration is live,
-//!     so a pruned session's branch can legally be taken by a later checkout.
-//!   - **Rewrites a pointer, nothing else.** Unlike the trash relocation in
-//!     [`crate::session::trash`], which moves a directory and therefore needs a
-//!     lifecycle reservation, this only corrects a string to match where git
-//!     already says the checkout is. A plain `Storage::update` is enough.
-//!   - **Reconcile before the caller's pre-flight, never inside the
-//!     operation.** The rename path derives its duplicate-identity check and
-//!     its sandbox-container release from `project_path` before calling
-//!     `edit_worktree_workdir`. Healing inside that call would leave those
-//!     gates computed from the stale path: a stale leaf that happens to equal
-//!     the requested leaf makes `worktree_move_required` false, the container
-//!     is never released, and the `git worktree move` then runs against a live
-//!     bind mount.
+//! Repair missing managed worktree paths from Git before rename or attach preflight.
+//! Existing paths remain authoritative; ambiguous or already-owned candidates are rejected.
+//! Reference writes and their listing cache share the app-wide identity exclusion.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -152,72 +122,77 @@ pub fn resolve_worktree_path(
     select_live_worktree(entries, &info.branch, Path::new(&info.main_repo_path))
 }
 
-/// Reconcile one session: on [`WorktreePathResolution::Moved`], rewrite
-/// `inst.project_path` and persist it, so every later path-derived decision
-/// (the rename pre-flight gates, attach, status, diff) sees the live location.
-///
-/// Best-effort by design. Every non-`Moved` outcome, including a git failure,
-/// leaves the row exactly as it was and logs why, mirroring
-/// [`crate::session::trash::reconcile_trashed_location`]. Takes the `Storage`
-/// rather than deriving one from `inst.source_profile`: `Storage::load` does
-/// not set that field, so on the CLI it is empty, and an empty profile resolves
-/// to the *default* profile rather than failing.
+/// Reconcile the current durable row under app-wide reference exclusion.
+/// The supplied store, not `source_profile`, determines the profile.
 pub fn reconcile_and_persist(
     storage: &Storage,
     inst: &mut Instance,
-    cache: &mut ReconcileCache,
 ) -> anyhow::Result<WorktreePathResolution> {
-    let Some(info) = inst.worktree_info.clone() else {
+    let _identity = crate::session::acquire_session_identity_lock()?;
+    let Some(mut fresh) = storage.load()?.into_iter().find(|row| row.id == inst.id) else {
         return Ok(WorktreePathResolution::Current);
     };
-    // A trashed session's directory belongs to [`crate::session::trash`], which
-    // relocates the checkout into a holding dir and back and keeps its own
-    // pre-trash marker alongside `project_path`. Both surfaces that run this
-    // pass run the trash reconcile first, and repointing a row it owns (or one
-    // whose relocation it just failed to complete) would fight it.
+    let resolution = reconcile_and_persist_locked(storage, &mut fresh, &mut Default::default())?;
+    fresh.source_profile = std::mem::take(&mut inst.source_profile);
+    *inst = fresh;
+    Ok(resolution)
+}
+
+/// Caller retains identity exclusion from the row/cache reads through commit.
+pub(crate) fn reconcile_and_persist_locked(
+    storage: &dyn crate::session::SessionStore,
+    inst: &mut Instance,
+    cache: &mut ReconcileCache,
+) -> anyhow::Result<WorktreePathResolution> {
+    let structured = inst.is_structured();
+    let Some(info) = inst.worktree_info.as_ref() else {
+        return Ok(WorktreePathResolution::Current);
+    };
+    // Trash owns relocation and its recovery markers.
     if inst.is_trashed() {
         return Ok(WorktreePathResolution::Current);
     }
-    let recorded = PathBuf::from(&inst.project_path);
-    if !info.managed_by_aoe || recorded.exists() {
+    if !info.managed_by_aoe || Path::new(&inst.project_path).exists() {
         return Ok(WorktreePathResolution::Current);
     }
+    let recorded = PathBuf::from(&inst.project_path);
 
-    let resolution = resolve_worktree_path(cache.entries(&info.main_repo_path)?, &recorded, &info);
+    let resolution = resolve_worktree_path(cache.entries(&info.main_repo_path)?, &recorded, info);
     match &resolution {
         WorktreePathResolution::Moved(found) => {
             let id = inst.id.clone();
             let stale = inst.project_path.clone();
             let new_path = found.to_string_lossy().into_owned();
-            // Both guards below need the storage lock the git lookup ran
-            // without, so they live inside the update rather than beside it.
+            // Revalidate the target and competing claims in the same commit.
             let mut claimed_by: Option<String> = None;
             let applied = storage.update(|instances, _groups| {
-                // Never adopt a checkout another session already records. git
-                // forbids a second worktree on a branch only while the first
-                // registration is live, so once this session's entry is pruned
-                // a fresh checkout of the branch is legal and the branch-keyed
-                // lookup lands this row on it. Two rows naming one directory
-                // means trashing or deleting the stale one takes the live
-                // one's checkout with it, so leave the stale path alone.
-                if let Some(owner) = instances.iter().find(|c| {
-                    c.id != id
-                        && Path::new(&c.project_path).canonicalize().ok().as_deref()
+                let Some(index) = instances.iter().position(|row| row.id == id) else {
+                    return Ok(false);
+                };
+                let stored = &instances[index];
+                anyhow::ensure!(
+                    stored.is_structured() == structured,
+                    "session execution mode changed during worktree reconciliation"
+                );
+                if stored.project_path != stale
+                    || stored.is_trashed()
+                    || !stored.worktree_info.as_ref().is_some_and(|current| {
+                        current.managed_by_aoe
+                            && current.branch == info.branch
+                            && current.main_repo_path == info.main_repo_path
+                    })
+                {
+                    return Ok(false);
+                }
+                if let Some(owner) = instances.iter().find(|row| {
+                    row.id != id
+                        && Path::new(&row.project_path).canonicalize().ok().as_deref()
                             == Some(found.as_path())
                 }) {
                     claimed_by = Some(owner.id.clone());
                     return Ok(false);
                 }
-                // Compare and set: a peer process could have renamed or
-                // trashed this session while the lookup ran, and its path is
-                // fresher than a location we resolved from the old one.
-                let Some(stored) = instances.iter_mut().find(|c| c.id == id) else {
-                    return Ok(false);
-                };
-                if stored.project_path != stale {
-                    return Ok(false);
-                }
-                stored.project_path = new_path.clone();
+                instances[index].project_path = new_path.clone();
                 Ok(true)
             })?;
             if let Some(owner) = claimed_by {
@@ -235,7 +210,7 @@ pub fn reconcile_and_persist(
                 tracing::info!(
                     target: "session.worktree",
                     session = %inst.id,
-                    "worktree path changed under the reconcile; keeping the newer record"
+                    "session changed during worktree reconciliation; keeping the current record"
                 );
                 return Ok(WorktreePathResolution::Current);
             }
@@ -281,6 +256,13 @@ pub fn reconcile_and_persist(
 /// BLOCKING: opens repos and stats every recorded worktree. Never call it on an
 /// event loop or the async runtime.
 pub fn reconcile_profile(profile: &str) -> bool {
+    let _identity = match crate::session::acquire_session_identity_lock() {
+        Ok(guard) => guard,
+        Err(error) => {
+            tracing::warn!(target: "session.worktree", profile, "worktree path reconciliation skipped: {error}");
+            return false;
+        }
+    };
     let storage = match Storage::open_unwatched(profile) {
         Ok(storage) => storage,
         Err(error) => {
@@ -298,7 +280,7 @@ pub fn reconcile_profile(profile: &str) -> bool {
     let mut cache = ReconcileCache::default();
     let mut changed = false;
     for instance in &mut instances {
-        match reconcile_and_persist(&storage, instance, &mut cache) {
+        match reconcile_and_persist_locked(&storage, instance, &mut cache) {
             Ok(WorktreePathResolution::Moved(_)) => changed = true,
             Ok(_) => {}
             Err(error) => tracing::warn!(
@@ -321,6 +303,76 @@ mod tests {
             branch: branch.map(str::to_string),
             is_detached: false,
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reconciliation_waits_for_resource_identity_exclusion() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let root = tempfile::tempdir().unwrap();
+        let main = root.path().join("main");
+        let live = root.path().join("live");
+        let repo = git2::Repository::init(&main).unwrap();
+        let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+        let tree = repo
+            .find_tree(repo.index().unwrap().write_tree().unwrap())
+            .unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, "init", &tree, &[])
+            .unwrap();
+        GitWorktree::new(main.clone())
+            .unwrap()
+            .create_worktree("work", &live, true, None)
+            .unwrap();
+        let profile = "reconcile-exclusion";
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let mut instance = Instance::new("moved", root.path().join("gone").to_str().unwrap());
+        instance.worktree_info = Some(WorktreeInfo {
+            branch: "work".into(),
+            main_repo_path: main.to_str().unwrap().into(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        });
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let identity = crate::session::acquire_session_identity_lock().unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let storage = Storage::open_unwatched(profile).unwrap();
+            ready_tx.send(()).unwrap();
+            done_tx
+                .send(reconcile_and_persist(&storage, &mut instance))
+                .unwrap();
+        });
+        ready_rx.recv().unwrap();
+        let early = done_rx.recv_timeout(std::time::Duration::from_millis(300));
+        let completed_before_release = early.is_ok();
+        drop(identity);
+        let result = match early {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => done_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap(),
+            Err(error) => panic!("reconcile worker disconnected: {error}"),
+        };
+        worker.join().unwrap();
+        assert!(
+            !completed_before_release,
+            "reconciliation introduced a resource reference while identity exclusion was held"
+        );
+        assert_eq!(
+            result.unwrap(),
+            WorktreePathResolution::Moved(live.canonicalize().unwrap())
+        );
+        assert_eq!(
+            Path::new(&storage.load().unwrap()[0].project_path),
+            live.canonicalize().unwrap()
+        );
     }
 
     #[test]

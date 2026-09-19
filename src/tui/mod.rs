@@ -3,11 +3,9 @@
 mod app;
 mod approval_poller;
 mod attach_project_poller;
-mod attached_status_hooks;
 mod boot_spinner;
 pub(crate) mod clipboard;
 mod components;
-mod creation_poller;
 mod deletion_poller;
 pub mod dialogs;
 pub mod diff;
@@ -22,11 +20,8 @@ pub(crate) mod plugin_ui;
 mod reconcile_poller;
 pub(crate) mod remote_home;
 pub(crate) mod responsive;
-mod restart_poller;
 mod session_feed;
 pub mod settings;
-mod status_poller;
-mod stop_poller;
 mod store_move_poller;
 pub(crate) mod structured_view;
 pub(crate) mod styles;
@@ -378,9 +373,12 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
     }
 
     // Opt-in clean-only plugin auto-update sweep (off by default). Spawned
-    // non-blocking so a slow remote or git never delays the TUI. No notifier: the
-    // TUI has no plugin host, so the sweep asks a running daemon to reload.
-    crate::plugin::auto_update::spawn_if_enabled(&crate::session::Config::load_or_warn(), None);
+    // non-blocking so a slow remote or git never delays the TUI; applied updates
+    // take effect on the next launch.
+    tokio::spawn(async {
+        crate::plugin::auto_update::run_if_enabled(&crate::session::Config::load_or_warn(), None)
+            .await;
+    });
 
     // Bail early if stdin is not a terminal. Running without a tty would
     // cause the event loop to busy-loop after the parent terminal dies.

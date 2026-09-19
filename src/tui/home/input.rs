@@ -534,10 +534,10 @@ impl HomeView {
             if toggle_current
                 && matches!(&self.view_mode, ViewMode::Tool(current) if current == &tool_name)
             {
-                self.view_mode = ViewMode::Structured;
+                self.set_preview_view_mode(ViewMode::Structured);
                 return None;
             } else {
-                self.view_mode = ViewMode::Tool(tool_name);
+                self.set_preview_view_mode(ViewMode::Tool(tool_name));
                 self.preview_scroll_offset = 0;
                 self.tool_preview_cache = super::PreviewCache::default();
             }
@@ -1147,18 +1147,13 @@ impl HomeView {
                 None
             }
             "stop_session" => self.pending_stop_session.take().map(Action::StopSession),
-            "stop_terminal" => {
-                if let Some((session_id, mode)) = self.pending_stop_terminal.take() {
-                    if let Err(e) = self.kill_terminal_for(&session_id, mode) {
-                        tracing::error!(target: "tui.input", "Failed to kill terminal: {}", e);
-                    }
-                }
-                None
-            }
-            "stop_tool" => {
-                if let Some((session_id, tool_name)) = self.pending_stop_tool.take() {
-                    if let Err(e) = self.kill_tool_for(&session_id, &tool_name) {
-                        tracing::error!(target: "tui.input", "Failed to kill tool session: {}", e);
+            "stop_terminal" | "stop_tool" => {
+                if let Some((session_id, target)) = self.pending_stop_auxiliary.take() {
+                    if let Err(error) = self.session_feed.submit(
+                        session_id,
+                        crate::daemon::SessionMutation::StopAuxiliary(target),
+                    ) {
+                        self.info_dialog = Some(InfoDialog::new("Stop failed", &error.to_string()));
                     }
                 }
                 None
@@ -1390,8 +1385,7 @@ impl HomeView {
                     DialogResult::Cancel => {
                         self.confirm_dialog = None;
                         self.pending_stop_session = None;
-                        self.pending_stop_terminal = None;
-                        self.pending_stop_tool = None;
+                        self.pending_stop_auxiliary = None;
                         self.pending_force_remove_session = None;
                         self.pending_trash_session = None;
                         self.pending_image_pull = None;
@@ -1494,7 +1488,8 @@ impl HomeView {
                 let sid = self.pending_snooze_session.take();
                 if let Some(id) = sid {
                     if let Err(e) = self.snooze_session_for(&id, minutes) {
-                        tracing::error!("snooze_session_for failed: {}", e);
+                        self.info_dialog =
+                            Some(InfoDialog::new("Snooze not changed", &e.to_string()));
                     }
                 }
             }
@@ -1711,7 +1706,7 @@ impl HomeView {
                                     hooks_hash,
                                     mcp_hash,
                                     project_path,
-                                    hooks,
+                                    ..
                                 } => {
                                     // If persisting trust fails, abort creation:
                                     // launching anyway leaves a split state where
@@ -1724,13 +1719,16 @@ impl HomeView {
                                         mcp_hash.as_deref(),
                                     ) {
                                         tracing::error!(target: "tui.input", "Failed to persist repo trust; aborting session creation: {}", e);
-                                        None
                                     } else {
-                                        self.create_session_with_hooks(data, hooks)
+                                        // The daemon persists the approval
+                                        // itself before provisioning.
+                                        self.request_creation(data, Some(true));
                                     }
+                                    None
                                 }
-                                RepoTrustAction::Skip { hooks } => {
-                                    self.create_session_with_hooks(data, hooks)
+                                RepoTrustAction::Skip { .. } => {
+                                    self.request_creation(data, Some(false));
+                                    None
                                 }
                             };
                             self.pending_dialog_click_action = emit;
@@ -1751,13 +1749,10 @@ impl HomeView {
         key: KeyEvent,
         update_info: Option<&crate::update::UpdateInfo>,
     ) -> Option<Action> {
-        // Any keystroke drops a finalized preview-pane selection. The
-        // highlight pins to cell coords, so as soon as the user starts
-        // doing anything else (navigating the list, opening a dialog,
-        // typing through live-send, etc.) the cells underneath can
-        // change and the highlight would point at unrelated content.
-        // Doing the clear here covers both the live-send branch below
-        // and the regular home-view path.
+        self.reconcile_native_attachment();
+        if key.code == KeyCode::Esc {
+            self.cancel_native_attachment();
+        }
         self.clear_preview_selection();
 
         // Live-send capture normally wins over every other key handler:
@@ -2036,7 +2031,8 @@ impl HomeView {
                     let sid = self.pending_snooze_session.take();
                     if let Some(id) = sid {
                         if let Err(e) = self.snooze_session_for(&id, minutes) {
-                            tracing::error!("snooze_session_for failed: {}", e);
+                            self.info_dialog =
+                                Some(InfoDialog::new("Snooze not changed", &e.to_string()));
                         }
                     }
                 }
@@ -2136,7 +2132,7 @@ impl HomeView {
                                 hooks_hash,
                                 mcp_hash,
                                 project_path,
-                                hooks,
+                                ..
                             } => {
                                 // Abort creation if trust cannot be persisted, to
                                 // avoid a split state (hooks approved but project
@@ -2149,10 +2145,12 @@ impl HomeView {
                                     tracing::error!(target: "tui.input", "Failed to persist repo trust; aborting session creation: {}", e);
                                     return None;
                                 }
-                                return self.create_session_with_hooks(data, hooks);
+                                self.request_creation(data, Some(true));
+                                return None;
                             }
-                            RepoTrustAction::Skip { hooks } => {
-                                return self.create_session_with_hooks(data, hooks);
+                            RepoTrustAction::Skip { .. } => {
+                                self.request_creation(data, Some(false));
+                                return None;
                             }
                         }
                     }
@@ -2231,8 +2229,7 @@ impl HomeView {
                 DialogResult::Cancel => {
                     self.confirm_dialog = None;
                     self.pending_stop_session = None;
-                    self.pending_stop_terminal = None;
-                    self.pending_stop_tool = None;
+                    self.pending_stop_auxiliary = None;
                     self.pending_force_remove_session = None;
                     self.pending_trash_session = None;
                     self.pending_image_pull = None;
@@ -2687,7 +2684,7 @@ impl HomeView {
                 return None;
             }
             KeyCode::Esc if matches!(self.view_mode, ViewMode::Tool(_)) => {
-                self.view_mode = ViewMode::Structured;
+                self.set_preview_view_mode(ViewMode::Structured);
                 return None;
             }
             _ => {}
@@ -2826,6 +2823,10 @@ impl HomeView {
         id: ActionId,
         update_info: Option<&crate::update::UpdateInfo>,
     ) -> Option<Action> {
+        if id.needs_canonical_session() && self.is_creating_stub_selected() {
+            self.flash_status("Still creating this session; it has no runtime yet");
+            return None;
+        }
         match id {
             ActionId::Quit => return Some(Action::Quit),
             ActionId::Help => {
@@ -2834,7 +2835,7 @@ impl HomeView {
             }
             ActionId::ToolPicker => {
                 if matches!(self.view_mode, ViewMode::Tool(_)) {
-                    self.view_mode = ViewMode::Structured;
+                    self.set_preview_view_mode(ViewMode::Structured);
                 } else if !self.tool_configs.is_empty() {
                     self.open_tool_picker();
                 }
@@ -2861,10 +2862,10 @@ impl HomeView {
             ActionId::NewFromProject => self.open_project_session_picker(),
             ActionId::AttachTerminal => return self.attach_terminal_for_selected(),
             ActionId::ToggleView => {
-                self.view_mode = match self.view_mode {
+                self.set_preview_view_mode(match self.view_mode {
                     ViewMode::Structured => ViewMode::Terminal,
                     ViewMode::Terminal | ViewMode::Tool(_) => ViewMode::Structured,
-                };
+                });
                 if matches!(self.view_mode, ViewMode::Terminal) {
                     if let Some(action) = self.maybe_auto_start_live_send() {
                         return Some(action);
@@ -2921,17 +2922,18 @@ impl HomeView {
             }
             ActionId::ToggleFavorite => {
                 if let Err(e) = self.toggle_favorite_at_cursor() {
-                    tracing::error!("toggle_favorite_at_cursor failed: {}", e);
+                    self.info_dialog =
+                        Some(InfoDialog::new("Favorite not changed", &e.to_string()));
                 }
             }
             ActionId::ToggleSnooze => {
                 if let Err(e) = self.toggle_snooze_at_cursor() {
-                    tracing::error!("toggle_snooze_at_cursor failed: {}", e);
+                    self.info_dialog = Some(InfoDialog::new("Snooze not changed", &e.to_string()));
                 }
             }
             ActionId::ToggleUnread => {
                 if let Err(e) = self.toggle_unread_at_cursor() {
-                    tracing::error!("toggle_unread_at_cursor failed: {}", e);
+                    self.info_dialog = Some(InfoDialog::new("Unread not changed", &e.to_string()));
                 }
             }
             ActionId::ToggleContainer => self.toggle_container_for_selected(),
@@ -3431,48 +3433,26 @@ impl HomeView {
         } else {
             TerminalMode::Host
         };
-        let terminal_running = match mode {
-            TerminalMode::Container => inst
-                .container_terminal_tmux_session()
-                .map(|s| s.exists())
-                .unwrap_or(false),
-            TerminalMode::Host => inst
-                .terminal_tmux_session()
-                .map(|s| s.exists())
-                .unwrap_or(false),
+        let target = match mode {
+            TerminalMode::Host => crate::session::AuxiliaryTarget::Host { index: 0 },
+            TerminalMode::Container => crate::session::AuxiliaryTarget::Container { index: 0 },
         };
-        if !terminal_running {
+        if !matches!(
+            inst.auxiliary_presence(&target),
+            crate::session::PanePresence::Alive | crate::session::PanePresence::Dead
+        ) {
             return;
         }
         let message = format!(
             "Are you sure you want to kill the terminal for '{}'?",
             inst.title
         );
-        self.pending_stop_terminal = Some((session_id, mode));
+        self.pending_stop_auxiliary = Some((session_id, target));
         self.confirm_dialog = Some(ConfirmDialog::new(
             "Kill Terminal",
             &message,
             "stop_terminal",
         ));
-    }
-
-    /// Kill the paired terminal for `session_id` (host or container per `mode`),
-    /// then refresh so the Terminal-view row drops back to its idle glyph. The
-    /// agent session is left untouched.
-    pub(super) fn kill_terminal_for(
-        &mut self,
-        session_id: &str,
-        mode: TerminalMode,
-    ) -> anyhow::Result<()> {
-        if let Some(inst) = self.get_instance(session_id) {
-            match mode {
-                TerminalMode::Container => inst.kill_container_terminal()?,
-                TerminalMode::Host => inst.kill_terminal()?,
-            }
-        }
-        crate::tmux::refresh_session_cache();
-        self.reload()?;
-        Ok(())
     }
 
     /// Tool-view Stop: confirm, then kill the tool session (lazygit, yazi,
@@ -3485,34 +3465,20 @@ impl HomeView {
         let Some(inst) = self.get_instance(&session_id) else {
             return;
         };
-        let tool_session = crate::tmux::ToolSession::new(&inst.id, &inst.title, tool_name);
-        if !tool_session.exists() || tool_session.is_pane_dead() {
+        if inst.tool_presence(tool_name) != crate::session::PanePresence::Alive {
             return;
         }
         let message = format!(
             "Are you sure you want to kill {} for '{}'?",
             tool_name, inst.title
         );
-        self.pending_stop_tool = Some((session_id, tool_name.to_string()));
+        self.pending_stop_auxiliary = Some((
+            session_id,
+            crate::session::AuxiliaryTarget::Tool {
+                tool_name: tool_name.to_owned(),
+            },
+        ));
         self.confirm_dialog = Some(ConfirmDialog::new("Kill Tool", &message, "stop_tool"));
-    }
-
-    /// Kill the tool session for `session_id`, then refresh so the Tool-view
-    /// row drops back to its idle glyph. The agent session is left untouched.
-    pub(super) fn kill_tool_for(
-        &mut self,
-        session_id: &str,
-        tool_name: &str,
-    ) -> anyhow::Result<()> {
-        if let Some(inst) = self.get_instance(session_id) {
-            let tool_session = crate::tmux::ToolSession::new(&inst.id, &inst.title, tool_name);
-            if tool_session.exists() {
-                tool_session.kill()?;
-            }
-        }
-        crate::tmux::refresh_session_cache();
-        self.reload()?;
-        Ok(())
     }
 
     fn open_diff_for_selected(&mut self) {
@@ -3948,6 +3914,7 @@ impl HomeView {
         if self.selected_session != previous {
             self.preview_scroll_offset = 0;
             self.manual_unread_hold = None;
+            self.unread_dwell = None;
         }
     }
 
@@ -4213,6 +4180,13 @@ impl HomeView {
         }
     }
 
+    fn set_preview_view_mode(&mut self, mode: ViewMode) {
+        if self.view_mode != mode {
+            self.cancel_native_attachment();
+            self.view_mode = mode;
+        }
+    }
+
     pub(super) fn update_selected(&mut self) {
         if let Some(item) = self.flat_items.get(self.cursor) {
             let prev_session = self.selected_session.clone();
@@ -4245,22 +4219,12 @@ impl HomeView {
                 }
             }
             if self.selected_session != prev_session {
+                self.cancel_native_attachment();
                 self.system_health_open = false;
                 self.preview_scroll_offset = 0;
-                // A finalized preview selection pins to the previous pane's
-                // cells; carried into a different session it would paint a
-                // stale highlight and, because the preview holds its snapshot
-                // while a selection is live, stop the new session's preview
-                // from following output. Keystroke and click navigation already
-                // drop it upstream; clearing here also covers programmatic
-                // reselects (e.g. a poller) that never ran those paths.
                 self.clear_preview_selection();
-                // Moving off a hand-flagged row ends its manual-unread hold, so
-                // returning to it later dwell-clears like any other unread. Done
-                // here at the cursor->selection sync (every navigation path runs
-                // through it) so the release doesn't hinge on a dwell tick
-                // happening to fire during a quick hop to another row.
                 self.manual_unread_hold = None;
+                self.unread_dwell = None;
             }
         }
     }
@@ -4286,6 +4250,7 @@ impl HomeView {
             }
         }
         if self.flat_items.is_empty() {
+            self.cancel_native_attachment();
             self.cursor = 0;
             self.selected_session = None;
             self.selected_group = None;
@@ -4808,6 +4773,13 @@ impl HomeView {
                 self.cursor = idx;
                 self.update_selected();
             }
+            // The creating stub has no actions yet, so opening a menu whose
+            // every entry would refuse it is worse than saying why. See
+            // `ActionId::needs_canonical_session`.
+            if self.is_creating_stub_selected() {
+                self.flash_status("Still creating this session; it has no runtime yet");
+                return true;
+            }
             // Mirror the row-aware menu copy from the web sidebar so a group
             // row reads as "Rename Group / Delete Group" instead of bare
             // "Rename / Delete".
@@ -4942,6 +4914,12 @@ impl HomeView {
     /// new menu action needs to be wired here once, not at each call
     /// site.
     pub(super) fn dispatch_context_menu_action(&mut self, action: ContextMenuAction) {
+        // Every menu action targets the selected session, so the creating stub
+        // refuses the whole menu: see `ActionId::needs_canonical_session`.
+        if self.is_creating_stub_selected() {
+            self.flash_status("Still creating this session; it has no runtime yet");
+            return;
+        }
         match action {
             ContextMenuAction::Rename => self.open_rename_for_selected(),
             ContextMenuAction::Delete => self.open_delete_for_selected(),
@@ -4953,17 +4931,14 @@ impl HomeView {
                 }
             }
             ContextMenuAction::ToggleSnooze => {
-                // Same cursor-on-the-clicked-row guarantee as ToggleArchive:
-                // snoozing an active row opens the duration picker, unsnoozing
-                // wakes it immediately.
                 if let Err(e) = self.toggle_snooze_at_cursor() {
-                    tracing::error!("toggle_snooze_at_cursor (context menu) failed: {}", e);
+                    self.info_dialog = Some(InfoDialog::new("Snooze not changed", &e.to_string()));
                 }
             }
             ContextMenuAction::ToggleUnread => {
                 // Same cursor-on-the-clicked-row guarantee as ToggleArchive.
                 if let Err(e) = self.toggle_unread_at_cursor() {
-                    tracing::error!("toggle_unread_at_cursor (context menu) failed: {}", e);
+                    self.info_dialog = Some(InfoDialog::new("Unread not changed", &e.to_string()));
                 }
             }
             ContextMenuAction::NewSession => self.open_new_session_dialog(),
@@ -6344,13 +6319,8 @@ impl HomeView {
         self.teardown_live_send();
     }
 
-    /// Shared live-send teardown; touches no tmux sizing. Normal exits
-    /// call it via `exit_live_send_and_restore_sizing`; the lost-lock exit
-    /// (`poll_live_send_takeover`) calls it directly, because the surface
-    /// that took over has already sized the window to its own grid and
-    /// re-asserting `window-size latest` would stomp it (the exact flap
-    /// the size-owner lock exists to kill).
-    fn teardown_live_send(&mut self) {
+    /// Drop live-send without resizing a pane whose ownership may have changed.
+    pub(super) fn teardown_live_send(&mut self) {
         let live_session_id = self.live_send.take().map(|state| state.session_id);
         self.live_send_worker = None;
         // Leave the capture worker running: the same pane is still
@@ -6382,25 +6352,8 @@ impl HomeView {
         self.clear_preview_selection();
     }
 
-    /// Returns `Some(reason)` if the live-send target has drifted out
-    /// from under us between entry and now. Three drift modes:
-    /// - Instance row deleted (peer / web structured view / another aoe killed
-    ///   it).
-    /// - Title renamed AND the tmux session renamed with it, so the worker is
-    ///   now targeting a stale name. A retitle whose tmux rename did not land
-    ///   is not drift: `Session::resolve_name` still resolves onto the pane the
-    ///   worker holds, which is the session's pane.
-    /// - tmux session itself is gone (`tmux kill-session`, server
-    ///   restart) even though our instance row says otherwise. We use
-    ///   the existing `session_exists_from_cache` lookup so this costs
-    ///   a hashmap probe per keystroke (the status poller refreshes
-    ///   the cache every 500ms anyway). If the cache has no entry
-    ///   (`None`, e.g. before first refresh) we don't claim drift; the
-    ///   instance + name checks above are still the load-bearing
-    ///   safety net.
-    ///
-    /// The caller uses the message verbatim in the info dialog, so
-    /// phrase it as a user-facing sentence.
+    /// Detect deletion, a changed transport name, or confirmed pane disappearance.
+    /// Unknown auxiliary observations do not establish disappearance.
     fn live_send_drift_reason(&self, state: &live_send::LiveSendState) -> Option<&'static str> {
         let Some(inst) = self.get_instance(&state.session_id) else {
             return Some("Session was deleted while live mode was active.");
@@ -6424,7 +6377,31 @@ impl HomeView {
         if current_name != state.tmux_name {
             return Some("Session was renamed while live mode was active.");
         }
-        if crate::tmux::session_exists_from_cache(&state.tmux_name) == Some(false) {
+        use crate::session::{AuxiliaryTarget, PanePresence};
+        let gone = match &state.target {
+            live_send::LiveSendTarget::Agent => {
+                // The daemon may have created the pane after this process's
+                // last scan, so a cached miss is not evidence of death (the
+                // asymmetry documented on `session_exists`). Confirm with a
+                // live probe before ending live mode; Unknown stays put.
+                !crate::tmux::session_exists(&state.tmux_name)
+                    && crate::tmux::probe_session_existence(&state.tmux_name)
+                        == crate::tmux::SessionExistence::Absent
+            }
+            live_send::LiveSendTarget::Terminal => matches!(
+                inst.auxiliary_presence(&AuxiliaryTarget::Host { index: 0 }),
+                PanePresence::Absent | PanePresence::Dead
+            ),
+            live_send::LiveSendTarget::ContainerTerminal => matches!(
+                inst.auxiliary_presence(&AuxiliaryTarget::Container { index: 0 }),
+                PanePresence::Absent | PanePresence::Dead
+            ),
+            live_send::LiveSendTarget::Tool(name) => matches!(
+                inst.tool_presence(name),
+                PanePresence::Absent | PanePresence::Dead
+            ),
+        };
+        if gone {
             return Some("tmux pane went away while live mode was active.");
         }
         None
@@ -6894,8 +6871,10 @@ impl HomeView {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!(target: "tui.input", "Failed to check repo trust: {}", e);
-                let fallback = repo_config::resolve_global_profile_hooks(&data.profile);
-                return self.create_session_with_hooks(data, fallback);
+                // The read failed, so nothing here can approve repository
+                // hooks: skip them and let the daemon keep the global set.
+                self.request_creation(data, Some(false));
+                return None;
             }
         };
 
@@ -6933,7 +6912,14 @@ impl HomeView {
         };
 
         if !trust.needs_prompt() {
-            return self.create_session_with_hooks(data, hooks_on_trust);
+            // Already-trusted repository hooks are approved explicitly so the
+            // daemon runs them; an absent repository surface approves nothing.
+            let decision = match &trust.hooks {
+                TrustSurface::Trusted(_) => Some(true),
+                TrustSurface::NeedsTrust { .. } | TrustSurface::Absent => None,
+            };
+            self.request_creation(data, decision);
+            return None;
         }
 
         use crate::tui::dialogs::RepoTrustDialog;
@@ -6953,40 +6939,6 @@ impl HomeView {
         ));
         self.pending_repo_trust_data = Some(data);
         None
-    }
-
-    /// Create a session with optional hooks. Delegates to the background
-    /// `CreationPoller` when hooks are present, when the session is sandboxed,
-    /// or when a worktree branch is requested (to avoid freezing the TUI on
-    /// slow git hooks like `post-checkout`).
-    pub(super) fn create_session_with_hooks(
-        &mut self,
-        data: NewSessionData,
-        hooks: Option<crate::session::HooksConfig>,
-    ) -> Option<Action> {
-        let has_hooks = hooks
-            .as_ref()
-            .is_some_and(|h| !h.on_create.is_empty() || !h.on_launch.is_empty());
-        let has_worktree = data.worktree_enabled;
-
-        if data.sandbox || has_hooks || has_worktree {
-            self.request_creation(data, hooks);
-            return None;
-        }
-
-        match self.create_session(data) {
-            Ok(session_id) => {
-                self.new_dialog = None;
-                Some(Action::AttachAfterCreate(session_id))
-            }
-            Err(e) => {
-                tracing::error!(target: "tui.input", "Failed to create session: {}", e);
-                if let Some(dialog) = &mut self.new_dialog {
-                    dialog.set_error(e.to_string());
-                }
-                None
-            }
-        }
     }
 }
 

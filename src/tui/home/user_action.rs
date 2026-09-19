@@ -67,37 +67,28 @@ impl HomeView {
         }
     }
 
-    /// Clear the unread marker because the user engaged with the session
-    /// (Tab into live-send, Enter to attach, or dwell on it in the list).
-    /// Runs regardless of the feature flag so a stale marker can't survive a
-    /// disable/re-enable and reappear later; only writes when the session is
-    /// actually unread, so an already-read session doesn't churn the storage
-    /// flock.
-    pub(crate) fn clear_unread_on_view(&mut self, id: &str) {
-        // Engaging with the row ends its manual-flag visit, so drop any hold;
-        // otherwise a stale hold could later suppress an auto mark on this row.
+    /// Queue a read intent after engagement. Canonical feedback clears the row.
+    pub(crate) fn clear_unread_on_view(&mut self, id: &str) -> bool {
         if self.manual_unread_hold.as_deref() == Some(id) {
             self.manual_unread_hold = None;
         }
-        let is_unread = self.get_instance(id).is_some_and(|i| i.is_unread());
-        if is_unread {
-            let _ = self.apply_user_action(id, |i| i.mark_read());
+        if self.get_instance(id).is_some_and(|i| i.is_unread()) && self.session_feed.can_submit(id)
+        {
+            return self
+                .session_feed
+                .submit(
+                    id.to_owned(),
+                    crate::daemon::SessionMutation::Unread(crate::daemon::UpdateUnreadBody {
+                        unread: false,
+                    }),
+                )
+                .is_ok();
         }
+        false
     }
 
-    /// Dwell-to-read: clear the selected session's unread marker once it has
-    /// stayed selected, with the list in the foreground, for `UNREAD_DWELL`.
-    /// This is what separates "scrolled past it" from "stopped to read it."
-    /// Driven from the app tick loop; returns true when it cleared a marker
-    /// (so the caller can request a redraw).
-    ///
-    /// The clock is suspended (and reset) whenever the feature is off, a
-    /// dialog or live-send is up (the list isn't being read then), or nothing
-    /// is selected, and it restarts whenever the selection moves to a
-    /// different row. A row the user just flagged unread by hand is held until
-    /// the cursor leaves it (`manual_unread_hold`), so flagging it and sitting
-    /// there doesn't instantly undo the mark; once you leave and come back, it
-    /// clears on dwell like any other unread row.
+    /// Queue a read after a foreground dwell, except for a manually marked visit.
+    /// Returns whether a request was admitted, not whether the row changed.
     pub fn tick_unread_dwell(&mut self, now: std::time::Instant) -> bool {
         if !crate::session::unread_enabled() || self.has_dialog() {
             self.unread_dwell = None;
@@ -107,9 +98,6 @@ impl HomeView {
             self.unread_dwell = None;
             return false;
         };
-        // The manual hold only protects the row while it stays selected; the
-        // moment the cursor moves elsewhere, release it so a later return reads
-        // normally.
         if self
             .manual_unread_hold
             .as_deref()
@@ -119,7 +107,6 @@ impl HomeView {
         }
         let started = match &self.unread_dwell {
             Some((prev, started)) if *prev == id => *started,
-            // First tick on this row (or selection moved): start the clock.
             _ => {
                 self.unread_dwell = Some((id, now));
                 return false;
@@ -128,17 +115,10 @@ impl HomeView {
         if now.duration_since(started) < UNREAD_DWELL {
             return false;
         }
-        // A row the user just flagged by hand is held for this visit, so the
-        // dwell doesn't undo the mark while they sit on it. The clock stays
-        // parked on this row either way so we don't re-evaluate every tick.
         if self.manual_unread_hold.as_deref() == Some(id.as_str()) {
             return false;
         }
-        if self.get_instance(&id).is_some_and(|i| i.is_unread()) {
-            self.clear_unread_on_view(&id);
-            return true;
-        }
-        false
+        self.clear_unread_on_view(&id)
     }
 
     /// Bulk `apply_user_action`: one `Storage::update` per affected
@@ -207,50 +187,5 @@ impl HomeView {
             self.drop_peer_deleted_rows(&peer_deleted);
         }
         Ok(())
-    }
-
-    /// Like `mutate_instance`, but for fallible operations. Clones the entry,
-    /// applies `f` to the clone, and writes back only on success; the stored
-    /// entry is left untouched on `Err`.
-    pub(in crate::tui) fn try_mutate_instance<T>(
-        &mut self,
-        id: &str,
-        f: impl FnOnce(&mut Instance) -> anyhow::Result<T>,
-    ) -> anyhow::Result<Option<T>> {
-        if let Some(inst) = self.instances.get_mut(id) {
-            let mut updated = inst.clone();
-            let out = f(&mut updated)?;
-            *inst = updated;
-            return Ok(Some(out));
-        }
-        Ok(None)
-    }
-
-    /// Like `try_mutate_instance`, but writes the mutated clone back even
-    /// when `f` returns `Err`.
-    ///
-    /// Required for callers of `Instance::restart_with_size_opts` /
-    /// `ensure_pane_ready`, because the resume path can mutate
-    /// `agent_session_id`, `resume_probe_failed_sid`, and
-    /// `retroactive_capture_excludes` before returning `Err`. The default
-    /// `try_mutate_instance` drops the mutated clone on `Err`, leaving live
-    /// state inconsistent with disk until a later reload. This helper keeps
-    /// the live state consistent with the attempted restart.
-    pub(in crate::tui) fn try_mutate_instance_writeback_on_err<T>(
-        &mut self,
-        id: &str,
-        f: impl FnOnce(&mut Instance) -> anyhow::Result<T>,
-    ) -> anyhow::Result<Option<T>> {
-        if let Some(inst) = self.instances.get_mut(id) {
-            let mut updated = inst.clone();
-            let result = f(&mut updated);
-            *inst = updated;
-            return result.map(Some);
-        }
-        Ok(None)
-    }
-
-    pub fn set_instance_error(&mut self, id: &str, error: Option<String>) {
-        self.mutate_instance(id, |inst| inst.last_error = error);
     }
 }

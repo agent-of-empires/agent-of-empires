@@ -1409,6 +1409,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
     /// spawns tmux behind the test.
     fn agent_pane_metadata(command: &str, window_activity: Option<i64>) -> tmux::PaneMetadata {
         tmux::PaneMetadata {
+            tool_owner: crate::tmux::ToolPaneOwner::Unmarked,
             pane_dead: false,
             pane_current_command: Some(command.to_string()),
             pane_start_command_is_protected: false,

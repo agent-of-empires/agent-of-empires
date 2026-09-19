@@ -35,6 +35,8 @@ pub enum AcpError {
     RateLimited(Box<crate::acp::state::RateLimitInfo>),
     #[error("transport error: {0}")]
     Transport(String),
+    #[error("runner attach handshake timed out")]
+    AttachTimedOut,
     #[error("protocol violation: {0}")]
     Protocol(String),
     #[error("agent process exited unexpectedly")]

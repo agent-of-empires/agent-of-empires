@@ -1,38 +1,5 @@
-// Theme persistence under `--auth=passphrase` (#1510).
-//
-// Story 2: a passphrase user picks a theme. The dashboard repaints,
-// the new theme survives a page reload AND an `aoe serve` restart,
-// and NO passphrase re-prompt fires. Locks the body-shape elevation
-// gate in `update_profile_settings`: theme is on the safe list, so
-// the handler must not return 403 elevation_required and the client
-// must not pop ElevationPrompt.
-//
-// Story 3: a REMOTE passphrase user PATCHes a sandbox image. The
-// daemon DOES still return 403 elevation_required and the client
-// DOES pop the inline passphrase prompt; confirming it elevates the
-// session and the retry succeeds. Locks the threat-model half of the
-// fix: tamper-surface fields stay gated for remote callers. Remote is
-// simulated with an X-Forwarded-For header: the test socket is
-// loopback, and `resolve_client_ip` trusts forwarding headers from a
-// loopback peer, which is exactly the path a proxied real remote
-// request takes. A loopback caller (no XFF) is trusted per the #1168
-// carve-out and saves the same field with no prompt (#2610).
-//
-// Both tests boot a fresh `aoe serve --auth=passphrase` via
-// `spawnAoeServe({ preloginViaHarness: true })` and inject the
-// resulting session cookie + device binding so the browser starts
-// authenticated but NOT elevated. Elevation is the second factor
-// the issue is about.
-//
-// Direct `page.goto(/settings/...)` is avoided in passphrase mode:
-// the path is not in `is_login_session_exempt`, so a hard browser
-// navigation that carries only the cookie (no device-binding header
-// from the SPA's fetch wrapper) would redirect to `/login`. We
-// always land on `/` first (exempt; serves the SPA shell), let the
-// fetch interceptor authenticate subsequent API calls with cookie +
-// binding, then change the route client-side via history.pushState
-// + popstate so react-router renders the new view without a
-// re-navigation that would 401.
+// Theme persistence and settings elevation under passphrase authentication.
+// Local callers are trusted; proxy ingress requires browser-session elevation.
 
 import { test as base, expect, type Page } from "@playwright/test";
 import { spawnAoeServe, type ServeHandle } from "../helpers/aoeServe";
@@ -40,13 +7,25 @@ import { seedAuth } from "../helpers/liveTest";
 
 const SWITCH_TO = "dracula";
 
-const test = base.extend<{ servePreauthed: ServeHandle }>({
+const test = base.extend<{ servePreauthed: ServeHandle; serveIngress: ServeHandle }>({
   servePreauthed: async ({}, use, testInfo) => {
     const handle = await spawnAoeServe({
       authMode: "passphrase",
       workerIndex: testInfo.workerIndex,
       parallelIndex: testInfo.parallelIndex,
       preloginViaHarness: true,
+    });
+    await use(handle);
+    await handle.stop();
+  },
+  // Forwarded identity is trusted only on configured ingress.
+  serveIngress: async ({}, use, testInfo) => {
+    const handle = await spawnAoeServe({
+      authMode: "passphrase",
+      workerIndex: testInfo.workerIndex,
+      parallelIndex: testInfo.parallelIndex,
+      preloginViaHarness: true,
+      extraArgs: ["--behind-proxy", "--allowed-host", "aoe.test"],
     });
     await use(handle);
     await handle.stop();
@@ -210,7 +189,7 @@ test("theme picker persists across reload + restart without passphrase prompt", 
 // routable, so the simulation cannot collide with a real interface.
 const REMOTE_XFF = "203.0.113.10";
 
-test("sandbox image change requires elevation for remote callers, not loopback", async ({ servePreauthed, page }) => {
+test("sandbox image change needs no elevation on local loopback", async ({ servePreauthed, page }) => {
   const defaultProfile = await resolveDefaultProfile(servePreauthed);
 
   await bootDashboardAndNavigate(page, servePreauthed, "/");
@@ -230,6 +209,11 @@ test("sandbox image change requires elevation for remote callers, not loopback",
   }, defaultProfile);
   expect(loopbackStatus).toBe(200);
   await expect(page.locator('[role="dialog"]').filter({ hasText: /Confirm passphrase/i })).toHaveCount(0);
+});
+
+test("sandbox image change requires elevation through proxy ingress", async ({ serveIngress, page }) => {
+  const defaultProfile = await resolveDefaultProfile(serveIngress);
+  await bootDashboardAndNavigate(page, serveIngress, "/");
 
   // Remote caller (XFF from a loopback socket resolves to the forwarded
   // IP): the elevation gate holds. Fire the PATCH from the page so the
@@ -262,15 +246,15 @@ test("sandbox image change requires elevation for remote callers, not loopback",
   await expect(dialog).toBeVisible({ timeout: 5_000 });
 
   // The tampered write did not land.
-  const after = await fetch(`${servePreauthed.baseUrl}/api/profiles/${encodeURIComponent(defaultProfile)}/settings`, {
-    headers: authHeaders(servePreauthed),
+  const after = await fetch(`${serveIngress.baseUrl}/api/profiles/${encodeURIComponent(defaultProfile)}/settings`, {
+    headers: authHeaders(serveIngress),
   }).then((r) => r.json());
   expect(after?.sandbox?.default_image ?? "").not.toBe("ghcr.io/example/img:tampered");
 
   // Confirming the prompt elevates the session (elevation is a session
   // property, not per-IP) and the remote retry goes through: the
   // elevate-then-retry flow the loop bug broke.
-  await dialog.locator('input[type="password"]').fill(servePreauthed.passphrase!);
+  await dialog.locator('input[type="password"]').fill(serveIngress.passphrase!);
   await dialog.getByRole("button", { name: /Confirm/i }).click();
   await expect(dialog).toHaveCount(0, { timeout: 5_000 });
 
@@ -289,8 +273,8 @@ test("sandbox image change requires elevation for remote callers, not loopback",
   );
   expect(retryStatus).toBe(200);
 
-  const final = await fetch(`${servePreauthed.baseUrl}/api/profiles/${encodeURIComponent(defaultProfile)}/settings`, {
-    headers: authHeaders(servePreauthed),
+  const final = await fetch(`${serveIngress.baseUrl}/api/profiles/${encodeURIComponent(defaultProfile)}/settings`, {
+    headers: authHeaders(serveIngress),
   }).then((r) => r.json());
   expect(final?.sandbox?.default_image).toBe("ghcr.io/example/img:elevated");
 });

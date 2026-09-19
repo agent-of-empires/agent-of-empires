@@ -267,36 +267,22 @@ pub(crate) fn shell_escape_script_word(value: &str) -> String {
 /// escapes a `$`, and a bare `KEY` passes through from the host env. Unset host
 /// references and bare keys are skipped. Deduplicates by key (first wins).
 pub(crate) fn session_host_env_pairs(
-    profile: &str,
-    project_path: &std::path::Path,
+    trusted: &[String],
+    repo_aware: &[String],
     sandbox_info: &SandboxInfo,
 ) -> Vec<(String, String)> {
-    let resolved_profile = super::config::effective_profile(profile);
-    let trusted = super::config::profile_config::resolve_config_or_warn(&resolved_profile)
-        .sandbox
-        .environment;
-    let entries = match sandbox_info.extra_env.as_deref() {
-        None => trusted,
-        Some(extra) => {
-            let repo_aware = super::config::repo_config::resolve_config_with_repo_or_warn(
-                &resolved_profile,
-                project_path,
-            )
-            .sandbox
-            .environment;
-            host_hook_entries(extra, &trusted, &repo_aware)
-        }
-    };
-    resolve_hook_env_pairs(&entries)
+    match sandbox_info.extra_env.as_deref() {
+        None => resolve_hook_env_pairs(trusted),
+        Some(extra) => resolve_hook_env_pairs(host_hook_entries(extra, trusted, repo_aware)),
+    }
 }
 
-/// Filter a session's `extra_env` down to the entries safe to expose to a host
-/// hook: everything except entries the repo contributed (present in the
-/// repo-aware config but not in the profile/global `trusted` baseline). Repo
-/// entries are dropped, never added, so an untrusted repo cannot reach host
-/// execution even when the user submits a per-session override seeded from the
-/// repo-aware dialog. Pure, so it is unit-tested without touching disk.
-fn host_hook_entries(extra: &[String], trusted: &[String], repo_aware: &[String]) -> Vec<String> {
+/// Exclude repository-only entries from the host hook environment.
+fn host_hook_entries<'a>(
+    extra: &'a [String],
+    trusted: &'a [String],
+    repo_aware: &'a [String],
+) -> impl Iterator<Item = &'a String> {
     let trusted: std::collections::HashSet<&str> = trusted.iter().map(String::as_str).collect();
     let repo_contributed: std::collections::HashSet<&str> = repo_aware
         .iter()
@@ -305,35 +291,33 @@ fn host_hook_entries(extra: &[String], trusted: &[String], repo_aware: &[String]
         .collect();
     extra
         .iter()
-        .filter(|e| !repo_contributed.contains(e.as_str()))
-        .cloned()
-        .collect()
+        .filter(move |entry| !repo_contributed.contains(entry.as_str()))
 }
 
-/// Resolve `sandbox.environment` entries to concrete host `(KEY, VALUE)` pairs
-/// for a `before_start` host hook (the pure core of [`session_host_env_pairs`],
-/// split out so it can be tested without touching config on disk).
+/// Resolve sandbox entries into concrete host hook values.
 ///
 /// Duplicate keys resolve FIRST-wins here. The agent-side sibling,
 /// `resolve_host_environment_pairs`, is deliberately LAST-wins to match the
 /// host pane's sourced export order; keep the two distinct.
-fn resolve_hook_env_pairs(entries: &[String]) -> Vec<(String, String)> {
+fn resolve_hook_env_pairs<'a>(
+    entries: impl IntoIterator<Item = &'a String>,
+) -> Vec<(String, String)> {
     let mut seen = std::collections::HashSet::new();
     let mut pairs = Vec::new();
     for entry in entries {
         let (key, value) = match entry.split_once('=') {
-            Some((k, v)) => (k.to_string(), resolve_env_value(v)),
-            None => (entry.clone(), std::env::var(entry).ok()),
+            Some((k, v)) => (k, resolve_env_value(v)),
+            None => (entry.as_str(), std::env::var(entry).ok()),
         };
         // A malformed key would fail at `Command::envs` when the hook spawns;
         // skip it here (with a warning) rather than aborting the launch.
-        if !is_valid_env_key(&key) {
+        if !is_valid_env_key(key) {
             tracing::warn!(target: "session.create", "invalid env key '{}' for host hook; skipping", key);
             continue;
         }
         if let Some(v) = value {
-            if seen.insert(key.clone()) {
-                pairs.push((key, v));
+            if seen.insert(key) {
+                pairs.push((key.to_owned(), v));
             }
         }
     }
@@ -746,27 +730,24 @@ pub(crate) fn build_docker_env_args(
     sandbox: &SandboxInfo,
     project_path: &std::path::Path,
 ) -> DockerExecEnv {
-    build_docker_env_args_with_managed_codex_home(profile, sandbox, project_path, None)
+    let config = resolved_sandbox_config(profile, project_path);
+    build_docker_env_args_with_managed_codex_home(&config, sandbox, None)
 }
 
 /// Build docker exec environment flags and add AoE's managed Codex home when
 /// the session does not explicitly configure `CODEX_HOME`.
 pub(crate) fn build_docker_env_args_with_managed_codex_home(
-    profile: &str,
+    sandbox_config: &SandboxConfig,
     sandbox: &SandboxInfo,
-    project_path: &std::path::Path,
     managed_codex_home: Option<&str>,
 ) -> DockerExecEnv {
-    let sandbox_config = resolved_sandbox_config(profile, project_path);
-
     tracing::debug!(target: "session.create",
-        "build_docker_env_args: profile={:?}, configured_entries={}, extra_entries={}",
-        profile,
+        "build_docker_env_args: configured_entries={}, extra_entries={}",
         sandbox_config.environment.len(),
         sandbox.extra_env.as_ref().map_or(0, Vec::len)
     );
 
-    let mut env_entries = collect_environment(&sandbox_config, sandbox);
+    let mut env_entries = collect_environment(sandbox_config, sandbox);
     if let Some(codex_home) = managed_codex_home {
         if !env_entries.iter().any(|entry| entry.key() == "CODEX_HOME") {
             env_entries.push(EnvEntry::Literal {
@@ -785,8 +766,10 @@ pub(crate) fn build_docker_env_args_with_managed_codex_home(
     }
 
     let env = env_entries
-        .iter()
-        .map(|entry| (entry.key().to_string(), entry.value().to_string()))
+        .into_iter()
+        .map(|entry| match entry {
+            EnvEntry::Inherit { key, value } | EnvEntry::Literal { key, value } => (key, value),
+        })
         .collect::<Vec<_>>();
     let docker_args = if env.is_empty() {
         String::new()
@@ -1394,17 +1377,16 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
         let trusted = vec!["SHARED=keep".to_string()];
         let repo_aware = vec!["NODE_ENV=test".to_string(), "SHARED=keep".to_string()];
         assert_eq!(
-            host_hook_entries(&extra, &trusted, &repo_aware),
-            vec!["TEST_VAR=foo".to_string(), "SHARED=keep".to_string()],
+            host_hook_entries(&extra, &trusted, &repo_aware)
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["TEST_VAR=foo", "SHARED=keep"],
         );
     }
 
     #[test]
     fn test_session_host_env_pairs_uses_extra_env() {
-        let _app_guard = crate::session::test_support::isolate_app_dir();
-        // With a per-session extra_env and no repo config at the path, every
-        // entry survives the repo filter and is resolved to a host pair.
-        let tmp = tempfile::tempdir().unwrap();
+        // With no repository contribution, per-session entries reach the hook.
         let info = SandboxInfo {
             enabled: true,
             container_id: None,
@@ -1415,7 +1397,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
             before_start_env: Vec::new(),
             container_workdir: None,
         };
-        let pairs = session_host_env_pairs("any-profile", tmp.path(), &info);
+        let pairs = session_host_env_pairs(&[], &[], &info);
         assert_eq!(
             pairs,
             vec![
@@ -1954,9 +1936,8 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
                 container_workdir: None,
             };
             let result = build_docker_env_args_with_managed_codex_home(
-                "",
+                &resolved_sandbox_config("", project_path),
                 &sandbox,
-                project_path,
                 Some(managed_home),
             );
             let codex_home = result

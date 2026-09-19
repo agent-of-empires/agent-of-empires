@@ -16,21 +16,11 @@ impl HomeView {
     /// Tick dialog animations/timers and drain hook progress.
     /// Returns true when a redraw is needed.
     pub fn tick_dialog(&mut self) -> bool {
-        use crate::session::config::repo_config::HookProgress;
-
         let mut changed = false;
 
         if let Some(dialog) = &mut self.new_dialog {
             if dialog.tick() {
                 changed = true;
-            }
-
-            if dialog.is_loading() {
-                // Drain all pending hook progress messages
-                while let Some(progress) = self.creation_poller.try_recv_progress() {
-                    dialog.push_hook_progress(progress);
-                    changed = true;
-                }
             }
         }
 
@@ -55,28 +45,9 @@ impl HomeView {
             }
         }
 
-        // Drain hook progress into the creating buffer when no dialog is open
+        // Mirror the daemon's creation progress into the placeholder's buffer.
         if self.new_dialog.is_none() {
-            if let Some(ref stub_id) = self.creating_stub_id {
-                let stub_id = stub_id.clone();
-                if let Some(progress_buf) = self.creating_hook_progress.get_mut(&stub_id) {
-                    while let Some(progress) = self.creation_poller.try_recv_progress() {
-                        match progress {
-                            HookProgress::Started(cmd) => {
-                                progress_buf.current_hook = Some(cmd);
-                            }
-                            HookProgress::Output(line) => {
-                                progress_buf.hook_output.push(line);
-                                // Cap buffer to prevent unbounded memory growth
-                                if progress_buf.hook_output.len() > 1000 {
-                                    progress_buf.hook_output.drain(..500);
-                                }
-                            }
-                        }
-                        changed = true;
-                    }
-                }
-            }
+            changed |= self.apply_creation_progress();
         }
 
         changed

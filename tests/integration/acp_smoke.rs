@@ -606,7 +606,14 @@ async fn shim_agent_round_trips_terminal() {
         }
     }
 
-    let _ = client.shutdown().await;
+    let inbound = client
+        .take_inbound()
+        .expect("event stream remains attached");
+    client.shutdown().await.expect("shutdown");
+    assert!(
+        inbound.is_closed(),
+        "shutdown returned before the connection finished"
+    );
 
     let saw_terminal = events.iter().any(|e| match e {
         Event::AgentMessageChunk { text } => {

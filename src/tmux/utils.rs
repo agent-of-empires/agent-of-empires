@@ -100,8 +100,10 @@ pub fn append_remain_on_exit_args(args: &mut Vec<String>, target: &str) {
 
 /// Append `; set-option -t <target> pane-base-index 0` to an in-flight tmux
 /// argument list so that pane indices always start at 0 regardless of the
-/// user's global config.  This lets status checks use `.0` to reliably target
-/// the agent's pane.  See #488.
+/// user's global config. Pane targets address the first pane as `:^`, which
+/// resolves regardless of that base; the pin keeps the chained `^.0..^.{n}`
+/// captures addressing every pane without a prior `list-panes` round trip.
+/// See #488.
 pub fn append_pane_base_index_args(args: &mut Vec<String>, target: &str) {
     args.extend([
         ";".to_string(),
@@ -262,24 +264,29 @@ pub(crate) enum PaneProbe {
     Unknown,
 }
 
+/// Probe the first pane without treating lookup failures as disappearance.
 pub(crate) fn probe_pane(session_name: &str) -> PaneProbe {
-    // An empty name would make the target `:^.0`, which tmux resolves against
-    // whatever session is current: an unrelated live pane would then answer
-    // `Alive` and a poller seeded with no name would never terminate. Nothing
-    // resolved, so `Missing`.
     if session_name.is_empty() {
         return PaneProbe::Missing;
     }
-    // Use `^.0` to target the first window's first pane regardless of
-    // base-index or which pane is active, so the check always hits the
-    // agent's pane even when the user has created additional tmux windows
-    // or split panes.  See #435, #488.
-    let target = format!("{session_name}:^.0");
+    // The first pane by id order, never the active one: `^` follows focus,
+    // and `.0` is base-index sensitive. `list-panes` order is index order.
+    let first = match first_window_pane_ids_classified(
+        session_name,
+        &crate::tmux::TmuxCommandDeadline::new(),
+    ) {
+        PaneListLookup::Panes(ids) => ids,
+        PaneListLookup::Missing => return PaneProbe::Missing,
+        PaneListLookup::Unknown => return PaneProbe::Unknown,
+    };
+    let Some(first) = first.into_iter().next() else {
+        return PaneProbe::Missing;
+    };
     // `tmux_query_command`, not `tmux_command`: `classify_pane_probe` matches
     // the ENOENT marker in tmux's `error connecting to <socket> (<strerror>)`,
     // and glibc localizes `strerror` by `LC_MESSAGES`.
     let Some(output) = crate::tmux::tmux_query_command()
-        .args(["display-message", "-t", &target, "-p", "#{pane_dead}"])
+        .args(["display-message", "-t", &first, "-p", "#{pane_dead}"])
         .output()
         .ok()
     else {
@@ -287,6 +294,94 @@ pub(crate) fn probe_pane(session_name: &str) -> PaneProbe {
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
     classify_pane_probe(output.status.success(), stdout.trim(), &output.stderr)
+}
+
+pub fn first_pane_id(session_name: &str) -> Option<String> {
+    first_pane_id_with_deadline(session_name, &crate::tmux::TmuxCommandDeadline::new())
+}
+
+pub(crate) fn first_pane_id_with_deadline(
+    session_name: &str,
+    deadline: &crate::tmux::TmuxCommandDeadline,
+) -> Option<String> {
+    first_window_pane_ids_with_deadline(session_name, deadline)?
+        .into_iter()
+        .next()
+}
+
+enum PaneListLookup {
+    Panes(Vec<String>),
+    Missing,
+    Unknown,
+}
+
+fn first_window_pane_ids_classified(
+    session_name: &str,
+    deadline: &crate::tmux::TmuxCommandDeadline,
+) -> PaneListLookup {
+    let target = format!("={session_name}:");
+    let mut command = crate::tmux::tmux_query_command();
+    command.args([
+        "list-panes",
+        "-s",
+        "-t",
+        &target,
+        "-F",
+        "#{window_index} #{pane_index} #{pane_id}",
+    ]);
+    let Ok(output) = deadline.run(&mut command) else {
+        return PaneListLookup::Unknown;
+    };
+    if !output.status.success() {
+        return if tmux_no_server_running(&output.stderr)
+            || String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .any(|line| line.trim().starts_with("can't find session:"))
+        {
+            PaneListLookup::Missing
+        } else {
+            PaneListLookup::Unknown
+        };
+    }
+    let Ok(stdout) = String::from_utf8(output.stdout) else {
+        return PaneListLookup::Unknown;
+    };
+    let mut indexed: Vec<_> = stdout
+        .lines()
+        .filter_map(|line| {
+            let (window, rest) = line.split_once(' ')?;
+            let (index, id) = rest.split_once(' ')?;
+            let window: u32 = window.parse().ok()?;
+            let index: u32 = index.parse().ok()?;
+            (id.starts_with('%')).then_some((window, index, id.to_string()))
+        })
+        .collect();
+    indexed.sort_by_key(|(window, index, _)| (*window, *index));
+    let Some((first_window, _, _)) = indexed.first() else {
+        return if stdout.trim().is_empty() {
+            PaneListLookup::Missing
+        } else {
+            PaneListLookup::Unknown
+        };
+    };
+    let first_window = *first_window;
+    PaneListLookup::Panes(
+        indexed
+            .into_iter()
+            .take_while(|(window, _, _)| *window == first_window)
+            .map(|(_, _, id)| id)
+            .collect(),
+    )
+}
+
+pub(crate) fn first_window_pane_ids_with_deadline(
+    session_name: &str,
+    deadline: &crate::tmux::TmuxCommandDeadline,
+) -> Option<Vec<String>> {
+    match first_window_pane_ids_classified(session_name, deadline) {
+        PaneListLookup::Panes(ids) => Some(ids),
+        PaneListLookup::Missing | PaneListLookup::Unknown => None,
+    }
 }
 
 /// Pure classification of one `#{pane_dead}` probe, split out from the real
@@ -318,14 +413,12 @@ pub fn is_pane_dead(session_name: &str) -> bool {
 }
 
 pub(crate) fn pane_current_command(session_name: &str) -> Option<String> {
-    // Use `^.0` to target the first window's first pane regardless of
-    // base-index or which pane is active.  See #435, #488.
-    let target = format!("{session_name}:^.0");
+    let first = first_pane_id(session_name)?;
     crate::tmux::tmux_command()
         .args([
             "display-message",
             "-t",
-            &target,
+            &first,
             "-p",
             "#{pane_current_command}",
         ])
@@ -344,7 +437,7 @@ pub(crate) fn pane_current_command(session_name: &str) -> Option<String> {
 /// matched by `^`-anchored rules, so trimming here would let the same pane
 /// read one way through the poller and another through `aoe session capture`.
 pub(crate) fn pane_title(session_name: &str) -> Option<String> {
-    let target = format!("{session_name}:^.0");
+    let target = format!("={session_name}:^");
     crate::tmux::tmux_command()
         .args(["display-message", "-t", &target, "-p", "#{pane_title}"])
         .output()
@@ -363,7 +456,10 @@ fn strip_display_delimiter(raw: &str) -> &str {
 }
 
 fn pane_start_command_is_protected(session_name: &str) -> bool {
-    let target = format!("{session_name}:^.0");
+    let Some(first) = first_pane_id(session_name) else {
+        return false;
+    };
+    let target = first;
     crate::tmux::tmux_command()
         .args([
             "display-message",
@@ -463,32 +559,64 @@ pub fn tmux_prefix_display() -> &'static str {
     })
 }
 
-/// Run `tmux kill-session -t <name>`. A missing session is treated as
-/// success, since the goal is "this session is not present": `can't find
-/// session` (the session is gone, e.g. callers commonly kill the pane's
-/// process tree first, which can tear the session down before this lands)
-/// and `no server running` (no tmux server at all, so no session exists)
-/// are both swallowed in the C locale. Any other tmux failure returns
-/// `Err`. Caller is responsible for `refresh_session_cache` after a
-/// successful kill.
+/// Kill a session, accepting only confirmed session or server absence.
+/// Callers refresh the session cache after success.
 pub(crate) fn kill_session_if_present(name: &str) -> Result<()> {
     let output = crate::tmux::tmux_query_command()
-        .args(["kill-session", "-t", name])
+        .args(["kill-session", "-t"])
+        .arg(format!("={name}"))
         .output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // Deliberately broader than `tmux_no_server_running`: for a kill, ANY
-        // connect failure (`error connecting`, any errno) means there is no
-        // server and thus no session to remove, so it is success. The status
-        // pollers need the narrower ENOENT-only test to keep transient glitches
-        // on the error path; here a false "absent" cannot act on a live pane.
-        let absent = stderr.contains("can't find session")
-            || stderr.contains("no server running")
-            || stderr.contains("error connecting");
+        let absent = crate::tmux::tmux_no_server_running(&output.stderr)
+            || stderr
+                .lines()
+                .any(|line| line.trim().starts_with("can't find session:"));
         if !absent {
             bail!("Failed to kill tmux session '{}': {}", name, stderr);
         }
     }
+    Ok(())
+}
+
+/// Kill indexed terminals and tool sessions, including names left behind by retitles.
+pub(crate) fn kill_ancillary_sessions_for_id(id: &str) -> Result<()> {
+    use crate::tmux::{CONTAINER_TERMINAL_PREFIX, TERMINAL_PREFIX, TOOL_PREFIX};
+    let output = crate::tmux::tmux_query_command()
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output()?;
+    if !output.status.success() {
+        if crate::tmux::tmux_no_server_running(&output.stderr) {
+            crate::tmux::refresh_session_cache();
+            return Ok(());
+        }
+        bail!(
+            "Failed to enumerate ancillary tmux sessions: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let suffix = super::id_suffix(id);
+    for name in std::str::from_utf8(&output.stdout)?.lines() {
+        let matches = if name.starts_with(TOOL_PREFIX) {
+            name.ends_with(&suffix)
+        } else if name.starts_with(TERMINAL_PREFIX) || name.starts_with(CONTAINER_TERMINAL_PREFIX) {
+            name.rsplit_once(&suffix).is_some_and(|(_, tail)| {
+                tail.is_empty()
+                    || tail.strip_prefix("_t").is_some_and(|index| {
+                        !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+            })
+        } else {
+            false
+        };
+        if matches {
+            if let Some(pid) = crate::process::get_pane_pid(name) {
+                crate::process::kill_process_tree(pid);
+            }
+            kill_session_if_present(name)?;
+        }
+    }
+    crate::tmux::refresh_session_cache();
     Ok(())
 }
 
@@ -1052,6 +1180,223 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn kill_session_if_present_rejects_invalid_socket_paths() {
+        if std::env::var_os("AOE_TEST_TMUX_KILL_CHILD").is_some() {
+            assert_eq!(probe_pane("proof-target"), PaneProbe::Unknown);
+            assert!(
+                kill_session_if_present("proof-target").is_err(),
+                "a connection error must not claim the session was removed"
+            );
+            let _home = crate::session::test_support::isolate_app_dir();
+            let instance = crate::session::Instance::new("proof", "/tmp");
+            let results = [
+                ("agent", instance.kill_locked()),
+                (
+                    "ancillary enumeration",
+                    kill_ancillary_sessions_for_id(&instance.id),
+                ),
+                (
+                    "host",
+                    crate::tmux::TerminalSession::new(&instance.id, "proof")
+                        .unwrap()
+                        .kill(),
+                ),
+                (
+                    "container",
+                    crate::tmux::ContainerTerminalSession::new(&instance.id, "proof")
+                        .unwrap()
+                        .kill(),
+                ),
+                (
+                    "tool",
+                    crate::tmux::ToolSession::new(&instance.id, "proof", "tool").kill(),
+                ),
+            ];
+            for (kind, result) in results {
+                assert!(
+                    result.is_err(),
+                    "{kind} kill concealed an inaccessible server"
+                );
+            }
+            crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
+            for structured in [false, true] {
+                use crate::session::deletion::{
+                    DeletionRequest, PurgeReservation, PurgeTransaction,
+                };
+                let mut row = crate::session::Instance::new("purge proof", "");
+                row.source_profile = "socket-proof".into();
+                row.status = crate::session::Status::Stopped;
+                row.scratch = true;
+                if structured {
+                    row.view = crate::session::View::Structured;
+                }
+                let path = crate::session::scratch::provision_scratch_dir(&row.id).unwrap();
+                row.project_path = path.to_string_lossy().into_owned();
+                std::fs::write(path.join("payload"), b"retain while runtime is unknown").unwrap();
+                let store = crate::session::Storage::new_unwatched("socket-proof").unwrap();
+                store
+                    .update(|rows, _| {
+                        rows.push(row.clone());
+                        Ok(())
+                    })
+                    .unwrap();
+                let request = DeletionRequest {
+                    session_id: row.id.clone(),
+                    instance: row,
+                    delete_worktree: false,
+                    delete_branch: false,
+                    delete_sandbox: false,
+                    force_delete: false,
+                    detach_hooks: true,
+                    keep_scratch: false,
+                };
+                let PurgeReservation::Reserved(transaction) =
+                    PurgeTransaction::reserve(store, request, None).unwrap()
+                else {
+                    panic!("purge must be admitted");
+                };
+                let transaction = transaction.run_hooks().unwrap();
+                let result = if structured {
+                    transaction.begin_irreversible().unwrap().finish()
+                } else {
+                    transaction.complete()
+                };
+                assert!(
+                    !result.success,
+                    "purge claimed success without a reachable tmux server"
+                );
+                assert_eq!(
+                    std::fs::read(path.join("payload")).unwrap(),
+                    b"retain while runtime is unknown"
+                );
+            }
+
+            return;
+        }
+        if !tmux_available() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let not_directory = root.path().join("not-a-directory");
+        std::fs::write(&not_directory, b"not a socket directory").unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tmux::utils::tests::kill_session_if_present_rejects_invalid_socket_paths",
+                "--nocapture",
+            ])
+            .env("AOE_TEST_TMUX_KILL_CHILD", "1")
+            .env("AOE_TMUX_SOCKET", not_directory.join("socket"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn ancillary_teardown_preserves_other_sessions_and_exact_name_peers() {
+        if std::env::var_os("AOE_TEST_ANCILLARY_KILL_CHILD").is_some() {
+            use crate::tmux::test_helpers::TmuxTestSession;
+            use crate::tmux::{ContainerTerminalSession, Session, TerminalSession, ToolSession};
+            let _home = crate::session::test_support::isolate_app_dir();
+            let id = "abc12345-owned";
+            let owned = [
+                TerminalSession::generate_name(id, "old title"),
+                TerminalSession::generate_name_indexed(id, "another title", 12),
+                ContainerTerminalSession::generate_name_indexed(id, "container", 3),
+                ToolSession::generate_name(id, "removed config", "old-tool"),
+            ];
+            let missing = ToolSession::generate_name(id, "absent", "prefix");
+            let peers = [
+                Session::generate_name(id, "agent"),
+                TerminalSession::generate_name("xyz98765-peer", "peer"),
+                format!("{}_topic", owned[0]),
+                format!("{missing}_peer"),
+            ];
+            let sessions: Vec<_> = owned
+                .iter()
+                .chain(&peers)
+                .map(|name| TmuxTestSession::from_name(name.clone()))
+                .collect();
+            for session in &sessions {
+                let output = crate::tmux::tmux_command()
+                    .args([
+                        "-f",
+                        "/dev/null",
+                        "new-session",
+                        "-d",
+                        "-s",
+                        session.name(),
+                        "sleep 120",
+                    ])
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            assert_eq!(
+                crate::process::get_pane_pid(&missing),
+                None,
+                "an absent session must not resolve a peer process"
+            );
+            kill_session_if_present(&missing).unwrap();
+            kill_ancillary_sessions_for_id(id).unwrap();
+            let output = crate::tmux::tmux_query_command()
+                .args(["list-sessions", "-F", "#{session_name}"])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let names: std::collections::HashSet<_> = std::str::from_utf8(&output.stdout)
+                .unwrap()
+                .lines()
+                .collect();
+            for name in &owned {
+                assert!(
+                    !names.contains(name.as_str()),
+                    "owned session survived: {name}"
+                );
+            }
+            for name in &peers {
+                assert!(
+                    names.contains(name.as_str()),
+                    "unselected session was killed: {name}"
+                );
+            }
+            return;
+        }
+        if !tmux_available() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tmux::utils::tests::ancillary_teardown_preserves_other_sessions_and_exact_name_peers", "--nocapture"])
+            .env("AOE_TEST_ANCILLARY_KILL_CHILD", "1")
+            .env("AOE_TMUX_SOCKET", root.path().join("tmux.sock"))
+            .env("HOME", root.path())
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Capture must read the title published on the agent pane.
+    #[test]
+    #[serial_test::serial]
     fn pane_title_reads_the_panes_published_title() {
         if !tmux_available() {
             return;
@@ -1148,7 +1493,7 @@ mod pane_probe_tests {
         assert!(from_utf8(enoent).is_ok());
     }
 
-    /// An empty name never reaches tmux: `:^.0` resolves against whatever
+    /// An empty name never reaches tmux: `:^` resolves against whatever
     /// session is current, so an unrelated live pane would answer `Alive` and
     /// a poller seeded with no name would hold its budget slot forever.
     #[test]

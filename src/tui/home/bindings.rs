@@ -94,6 +94,40 @@ pub enum ActionId {
     AutoName,
 }
 
+impl ActionId {
+    /// Whether acting on this variant needs a canonical session behind the
+    /// cursor. The creating stub is a sidebar placeholder the daemon owns end
+    /// to end: it has neither a runtime nor a published row, so these actions
+    /// must refuse it instead of sending a mutation for an unknown id. Actions
+    /// listing their own status gate (`AttachTerminal` and live-send already
+    /// refuse `Status::Creating`) still belong here: the fence is per action,
+    /// not per status check.
+    pub const fn needs_canonical_session(self) -> bool {
+        matches!(
+            self,
+            Self::AttachTerminal
+                | Self::ToggleView
+                | Self::SendMessage
+                | Self::RespondToPermission
+                | Self::Stop
+                | Self::Delete
+                | Self::Rename
+                | Self::SetWorktreeName
+                | Self::AddProject
+                | Self::Diff
+                | Self::Restart
+                | Self::ToggleArchive
+                | Self::ToggleFavorite
+                | Self::ToggleSnooze
+                | Self::ToggleUnread
+                | Self::ToggleContainer
+                | Self::Fork
+                | Self::AutoName
+                | Self::NewFromSelection
+        )
+    }
+}
+
 /// A single chord. `ctrl` requires the Control modifier; Shift is implicit in
 /// the uppercase letter `code` (terminals deliver `Shift+d` as `Char('D')`,
 /// and iOS Mosh delivers a bare uppercase keycode with no Shift modifier, so

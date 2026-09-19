@@ -78,6 +78,7 @@ function renderStep() {
   const onChange = vi.fn();
   const utils = render(
     <ProjectStep
+      profile="default"
       data={{
         ...initialData,
         path: "",

@@ -4,8 +4,12 @@ use std::collections::HashMap;
 use std::process::Command;
 
 pub(super) use super::unix::{
-    configure_process_group, kill_process_group, terminate_process_group,
+    configure_process_group, kill_process_group, terminate_process_group, try_wait_status_hook,
 };
+
+pub(crate) fn unix_peer_uid(stream: &tokio::net::UnixStream) -> std::io::Result<u32> {
+    Ok(stream.peer_cred()?.uid())
+}
 
 /// Collect `pid` and every descendant by parsing `ps -A` once and walking the map.
 pub(super) fn collect_pid_tree(pid: u32) -> Vec<u32> {

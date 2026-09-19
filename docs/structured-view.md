@@ -112,13 +112,15 @@ It exits 1 if Node is missing, 2 if some agents are unreachable, else 0. Pass `-
 
 Non-ACP tools always run in the terminal view, with no toggle.
 
+The local TUI ensures a native core daemon at startup without opening a web listener. It reuses an existing daemon and leaves it running on exit. Structured sidebar statuses arrive through the runtime WebSocket; disconnecting retains their last displayed values and does not automatically restart the daemon.
+
 ### Launch command and session naming
 
 `--cmd <tool>` resolves through `session.agent_command_override` the same as terminal sessions, so an override like `opencode = "opencode-plannotator"` makes `--cmd opencode` launch `opencode-plannotator acp` (the required ACP args are preserved). Adapter-backed agents such as Claude use `session.agent_acp_cmd` for a full command swap instead. The wizard shows the resolved launch command read-only.
 
 `aoe add` does not prompt for a name by default: it uses `--title`, else the worktree branch name, else a generated name. Pass `-i`/`--interactive` for the same name prompt the TUI and wizard show. Set per-agent defaults for web-created sessions under `[acp.acp_defaults.<agent>]`:
 
-When a structured view session keeps its generated civilization name (no `--title`, no branch name), AoE auto-renames it from its first turn using the session's own agent in one-shot mode (`claude -p`, `codex exec`, `opencode run`, `gemini -p`, `omp -p`). This is on by default and controlled by `session.smart_rename`. It renames the title only, never the worktree directory (the running agent holds it), and never touches a session you named yourself. Sandboxed sessions, agents with no one-shot mode, and command-overridden agents keep the generated name. See [Configuration: Session](guides/configuration.md#session).
+When a structured view session keeps its generated civilization name, AoE can name it from its first completed turn. This changes only the title, not the worktree directory, and never overwrites a manually chosen name. See the [smart-rename settings](guides/configuration.md#session) for agent selection, sandbox eligibility, and model overrides.
 
 The rename waits for the first turn to finish and titles from the whole transcript, your prompt and the agent's response, so the title reflects what the turn did (and the one-shot never races the live agent for the provider API).
 

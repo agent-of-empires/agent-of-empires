@@ -118,6 +118,7 @@ pub(crate) fn finalize_restore_commit(
     stored.project_path = project_path.to_string();
     stored.pre_trash_project_path = pre_trash_project_path.clone();
     stored.untrash();
+    stored.status = super::Status::Stopped;
     stored.release_lifecycle_reservation_if_owned(LifecycleOperation::Restore, generation);
     RestoreCommit::Committed
 }
@@ -264,6 +265,7 @@ mod tests {
     fn restore_commit_requires_exact_generation() {
         let now = Utc::now();
         let mut row = trashed("session");
+        row.status = super::super::Status::Running;
         let generation = row
             .try_acquire_lifecycle_reservation(
                 LifecycleOperation::Restore,
@@ -284,6 +286,7 @@ mod tests {
             RestoreCommit::Superseded,
         );
         assert!(instances[0].is_trashed());
+        assert_eq!(instances[0].status, super::super::Status::Running);
         assert_eq!(
             finalize_restore_commit(
                 &mut instances,
@@ -295,6 +298,7 @@ mod tests {
             RestoreCommit::Committed,
         );
         assert!(!instances[0].is_trashed());
+        assert_eq!(instances[0].status, super::super::Status::Stopped);
         assert_eq!(instances[0].project_path, "/tmp/restored");
         assert_eq!(instances[0].lifecycle_reservation, None);
     }

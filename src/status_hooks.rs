@@ -3,14 +3,16 @@
 use std::collections::HashMap;
 #[cfg(not(test))]
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aoe_settings_derive::SettingsSection;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::session::{Instance, Status};
+#[cfg(test)]
+use crate::session::Instance;
+use crate::session::Status;
 
 /// Milliseconds a status must remain stable before hook commands run, so
 /// rapid flickers (Running -> Waiting -> Running) don't fire spurious hooks.
@@ -38,10 +40,10 @@ fn effective_debounce_ms() -> u64 {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, SettingsSection)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, SettingsSection)]
 #[setting_section(name = "status_hooks", category = "Status Hooks")]
 pub struct StatusHookConfig {
-    /// Run local commands when TUI sessions change status.
+    /// Run local commands when the core observes session status changes.
     #[serde(default)]
     #[setting(label = "Enabled", widget = "toggle")]
     pub enabled: bool,
@@ -116,6 +118,7 @@ pub struct StatusHookContext {
 }
 
 impl StatusHookContext {
+    #[cfg(test)]
     pub fn from_instance(
         instance: &Instance,
         old_status: Status,
@@ -173,192 +176,162 @@ pub fn commands_for_transition(old: Status, new: Status, config: &StatusHookConf
     commands
 }
 
-pub fn has_configured_commands(config: &StatusHookConfig) -> bool {
-    config.enabled
-        && [
-            config.on_starting.as_deref(),
-            config.on_running.as_deref(),
-            config.on_waiting.as_deref(),
-            config.on_idle.as_deref(),
-            config.on_error.as_deref(),
-            config.on_change.as_deref(),
-        ]
-        .into_iter()
-        .any(|cmd| non_empty_command(cmd).is_some())
+#[derive(Default)]
+pub(crate) struct StatusHooks {
+    state: Arc<Mutex<DebounceState>>,
 }
 
-pub fn run_for_transition(
-    instance: &Instance,
-    old: Status,
-    new: Status,
-    config: &StatusHookConfig,
-) {
-    if !config.enabled || old == new {
-        return;
+#[derive(Default)]
+struct DebounceState {
+    entries: HashMap<String, DebounceEntry>,
+    configs: HashMap<String, StatusHookConfig>,
+    generation: u64,
+}
+
+impl StatusHooks {
+    pub(crate) fn reconcile(
+        &self,
+        rows: &[crate::daemon::SessionResponse],
+        configs: &HashMap<String, StatusHookConfig>,
+    ) {
+        let mut state = self.state.lock().unwrap();
+        if !state.entries.is_empty() {
+            let profiles: HashMap<_, _> = rows
+                .iter()
+                .map(|row| (row.id.as_str(), row.profile.as_str()))
+                .collect();
+            let DebounceState {
+                entries,
+                configs: previous,
+                ..
+            } = &mut *state;
+            entries.retain(|id, entry| {
+                let Some(&profile) = profiles.get(id.as_str()) else {
+                    return false;
+                };
+                profile == entry.profile
+                    && configs.get(profile).is_some_and(|config| {
+                        config.enabled && previous.get(profile) == Some(config)
+                    })
+            });
+        }
+        if state.configs != *configs {
+            state.configs.clone_from(configs);
+        }
     }
 
-    let changed_at = Utc::now();
-    let commands = commands_for_transition(old, new, config);
-    let debounce_ms = effective_debounce_ms();
-    if debounce_ms > 0 {
-        run_debounced_transition(instance, old, new, changed_at, commands, debounce_ms);
-        return;
+    pub(crate) fn prepare_transition(
+        &self,
+        mut context: StatusHookContext,
+        config: &StatusHookConfig,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> Option<impl std::future::Future<Output = ()> + Send + 'static> {
+        let old = context.old_status;
+        let new = context.new_status;
+        if !config.enabled || old == new || shutdown.is_cancelled() {
+            return None;
+        }
+        let commands = commands_for_transition(old, new, config);
+        let debounce_ms = effective_debounce_ms();
+        let generation = if debounce_ms > 0 {
+            let mut state = self.state.lock().unwrap();
+            state.generation = state
+                .generation
+                .checked_add(1)
+                .expect("status hook generation exhausted");
+            let generation = state.generation;
+            let entry = state
+                .entries
+                .entry(context.session_id.clone())
+                .or_insert(DebounceEntry {
+                    profile: context.profile.clone(),
+                    stable_status: old,
+                    generation: 0,
+                    pending_status: None,
+                });
+            entry.generation = generation;
+            if new == entry.stable_status {
+                entry.pending_status = None;
+                return None;
+            }
+            if commands.is_empty() {
+                entry.stable_status = new;
+                entry.pending_status = None;
+                return None;
+            }
+            context.old_status = entry.stable_status;
+            entry.pending_status = Some(new);
+            Some(entry.generation)
+        } else {
+            if commands.is_empty() {
+                return None;
+            }
+            None
+        };
+        let state = self.state.clone();
+        Some(async move {
+            if let Some(generation) = generation {
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = tokio::time::sleep(Duration::from_millis(debounce_ms)) => {}
+                }
+                let mut state = state.lock().unwrap();
+                match state.entries.get_mut(&context.session_id) {
+                    Some(entry)
+                        if entry.generation == generation && entry.pending_status == Some(new) =>
+                    {
+                        entry.stable_status = new;
+                        entry.pending_status = None;
+                    }
+                    _ => return,
+                }
+            }
+            if shutdown.is_cancelled() {
+                return;
+            }
+            #[cfg(not(test))]
+        if let Err(error) = tokio::task::spawn_blocking(move || {
+            let project_path = PathBuf::from(&context.project_path);
+            for command in commands {
+                if shutdown.is_cancelled() {
+                    break;
+                }
+                if let Err(error) = run_hook_command_blocking(&command, &context, &project_path, &shutdown) {
+                    if !shutdown.is_cancelled() {
+                        tracing::warn!(target: "hooks.status_hooks", session_id = %context.session_id, %error, "status hook failed");
+                    }
+                }
+            }
+        }).await {
+            tracing::error!(target: "hooks.status_hooks", %error, "status hook worker failed");
+        }
+            #[cfg(test)]
+            {
+                let mut launches = recorded_launches().lock().unwrap();
+                for command in commands {
+                    launches.push(RecordedLaunch {
+                        command,
+                        context: context.clone(),
+                    });
+                }
+            }
+        })
     }
-
-    if commands.is_empty() {
-        return;
-    }
-    spawn_transition_commands(instance, old, new, changed_at, commands);
 }
 
 fn non_empty_command(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|s| !s.is_empty())
 }
 
-fn spawn_transition_commands(
-    instance: &Instance,
-    old: Status,
-    new: Status,
-    changed_at: DateTime<Utc>,
-    commands: Vec<String>,
-) {
-    let context = StatusHookContext::from_instance(instance, old, new, changed_at);
-    // Keep one transition's commands in one worker so `on_change` cannot race
-    // ahead of the status-specific hook.
-    spawn_hook_commands(commands, context);
-}
-
 #[derive(Debug, Clone)]
 struct DebounceEntry {
+    profile: String,
     stable_status: Status,
     generation: u64,
     pending_status: Option<Status>,
 }
 
-fn debounce_state() -> &'static Mutex<HashMap<String, DebounceEntry>> {
-    static STATE: OnceLock<Mutex<HashMap<String, DebounceEntry>>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn run_debounced_transition(
-    instance: &Instance,
-    old: Status,
-    new: Status,
-    changed_at: DateTime<Utc>,
-    commands: Vec<String>,
-    debounce_ms: u64,
-) {
-    let session_id = instance.id.clone();
-    let mut state = debounce_state().lock().unwrap();
-    let entry = state.entry(session_id.clone()).or_insert(DebounceEntry {
-        stable_status: old,
-        generation: 0,
-        pending_status: None,
-    });
-    entry.generation = entry.generation.wrapping_add(1);
-    let generation = entry.generation;
-    let stable_status = entry.stable_status;
-
-    if new == stable_status {
-        entry.pending_status = None;
-        return;
-    }
-
-    if commands.is_empty() {
-        entry.stable_status = new;
-        entry.pending_status = None;
-        return;
-    }
-
-    entry.pending_status = Some(new);
-    drop(state);
-
-    let instance = instance.clone();
-    // Tests release the real worker explicitly instead of racing its deadline.
-    #[cfg(test)]
-    let gate = DEBOUNCE_WORKERS.with(|workers| {
-        workers
-            .borrow()
-            .as_ref()
-            .map(|_| std::sync::mpsc::channel::<()>())
-    });
-    #[cfg(test)]
-    let (release, wait) = gate.map_or((None, None), |(tx, rx)| (Some(tx), Some(rx)));
-    let worker = std::thread::spawn(move || {
-        #[cfg(test)]
-        if let Some(wait) = wait {
-            let _ = wait.recv();
-        } else {
-            std::thread::sleep(Duration::from_millis(debounce_ms));
-        }
-        #[cfg(not(test))]
-        std::thread::sleep(Duration::from_millis(debounce_ms));
-        let mut state = debounce_state().lock().unwrap();
-        let should_run = match state.get_mut(&session_id) {
-            Some(entry) if entry.generation == generation && entry.pending_status == Some(new) => {
-                entry.stable_status = new;
-                entry.pending_status = None;
-                true
-            }
-            _ => false,
-        };
-        drop(state);
-
-        if should_run {
-            spawn_transition_commands(&instance, stable_status, new, changed_at, commands);
-        }
-    });
-    #[cfg(test)]
-    if let Some(release) = release {
-        DEBOUNCE_WORKERS.with(|workers| {
-            workers
-                .borrow_mut()
-                .as_mut()
-                .unwrap()
-                .push((release, worker));
-        });
-    }
-    #[cfg(not(test))]
-    drop(worker);
-}
-
-#[cfg(not(test))]
-fn spawn_hook_commands(commands: Vec<String>, context: StatusHookContext) {
-    std::thread::spawn(move || {
-        let project_path = PathBuf::from(&context.project_path);
-        for command in commands {
-            let result = run_hook_command_blocking(&command, &context, &project_path);
-            if let Err(e) = result {
-                tracing::warn!(
-                    target: "hooks.status_hooks",
-                    session_id = %context.session_id,
-                    new_status = %context.new_status.as_str(),
-                    "status hook failed: {}",
-                    e
-                );
-            }
-        }
-    });
-}
-
-#[cfg(test)]
-fn spawn_hook_commands(commands: Vec<String>, context: StatusHookContext) {
-    let mut launches = recorded_launches().lock().unwrap();
-    for command in commands {
-        launches.push(RecordedLaunch {
-            command,
-            context: context.clone(),
-        });
-    }
-}
-
-/// Upper bound on how long a single status hook may block its worker
-/// thread. A misconfigured hook (e.g. one that opens a foreground GUI
-/// app, hangs on stdin, or `tail -f`s a log) would otherwise leak the
-/// std::thread spawned in `spawn_hook_commands` for the life of the
-/// TUI. 30s is generous for sound players and notifier CLIs, short
-/// enough that a steady stream of long-stuck hooks doesn't accumulate
-/// indefinitely.
+/// Upper bound for one status-hook command.
 #[cfg(not(test))]
 const HOOK_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -367,36 +340,22 @@ fn run_hook_command_blocking(
     command: &str,
     context: &StatusHookContext,
     project_path: &Path,
+    shutdown: &tokio_util::sync::CancellationToken,
 ) -> std::io::Result<()> {
-    let mut child = build_command(command, context, project_path).spawn()?;
-    let deadline = std::time::Instant::now() + HOOK_COMMAND_TIMEOUT;
-    loop {
-        match child.try_wait()? {
-            Some(status) => {
-                return if status.success() {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::other(format!(
-                        "command exited with status {:?}",
-                        status.code()
-                    )))
-                };
-            }
-            None => {
-                if std::time::Instant::now() >= deadline {
-                    // Best-effort kill; if the child has already exited
-                    // between the try_wait above and here, kill is a
-                    // no-op error we don't care about.
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(std::io::Error::other(format!(
-                        "command timed out after {}s",
-                        HOOK_COMMAND_TIMEOUT.as_secs()
-                    )));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-        }
+    match crate::process::run_status_with_timeout_process_group(
+        &mut build_command(command, context, project_path),
+        HOOK_COMMAND_TIMEOUT,
+        || shutdown.is_cancelled(),
+    )? {
+        Some(status) if status.success() => Ok(()),
+        Some(status) => Err(std::io::Error::other(format!(
+            "command exited with status {:?}",
+            status.code()
+        ))),
+        None => Err(std::io::Error::other(format!(
+            "command timed out after {}s",
+            HOOK_COMMAND_TIMEOUT.as_secs()
+        ))),
     }
 }
 
@@ -420,18 +379,6 @@ fn build_command(
     for (key, value) in context.env_vars() {
         child.env(key, value);
     }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        unsafe {
-            child.pre_exec(|| {
-                nix::unistd::setsid().map_err(std::io::Error::other)?;
-                Ok(())
-            });
-        }
-    }
-
     child
 }
 
@@ -455,94 +402,155 @@ pub fn take_recorded_launches() -> Vec<RecordedLaunch> {
 }
 
 #[cfg(test)]
-pub fn reset_debounce_state() {
-    debounce_state().lock().unwrap().clear();
-}
-
-#[cfg(test)]
-type DebounceWorker = (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>);
-
-#[cfg(test)]
-thread_local! {
-    static DEBOUNCE_WORKERS: std::cell::RefCell<Option<Vec<DebounceWorker>>> = const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use serial_test::serial;
-    struct DebounceOverride(u64);
+    /// RAII guard restoring the test debounce override to 0 (the synchronous
+    /// path other tests rely on) even when an assertion panics.
+    struct DebounceOverride;
 
     impl DebounceOverride {
         fn set(ms: u64) -> Self {
-            let previous = TEST_DEBOUNCE_MS.swap(ms, std::sync::atomic::Ordering::SeqCst);
-            DEBOUNCE_WORKERS.with(|workers| *workers.borrow_mut() = Some(Vec::new()));
-            Self(previous)
-        }
-
-        fn finish(&self) {
-            let workers = DEBOUNCE_WORKERS
-                .with(|workers| std::mem::take(workers.borrow_mut().as_mut().unwrap()));
-            let handles: Vec<_> = workers
-                .into_iter()
-                .map(|(release, worker)| {
-                    release.send(()).unwrap();
-                    worker
-                })
-                .collect();
-            for worker in handles {
-                worker.join().expect("debounce worker panicked");
-            }
+            set_test_debounce_ms(ms);
+            Self
         }
     }
 
     impl Drop for DebounceOverride {
         fn drop(&mut self) {
-            let workers = DEBOUNCE_WORKERS.with(|workers| workers.borrow_mut().take().unwrap());
-            for (release, worker) in workers {
-                drop(release);
-                let _ = worker.join();
-            }
-            set_test_debounce_ms(self.0);
+            set_test_debounce_ms(0);
         }
     }
 
-    #[test]
-    fn default_config_is_disabled() {
-        let config = StatusHookConfig::default();
-        assert!(!config.enabled);
-        assert!(commands_for_transition(Status::Running, Status::Waiting, &config).is_empty());
+    #[tokio::test]
+    #[serial]
+    async fn reenabling_hooks_observes_transitions_after_disabled_interval() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let _debounce = DebounceOverride::set(10);
+        take_recorded_launches();
+        let mut row = Instance::new("hook reactivation", "/repo");
+        row.source_profile = "test".into();
+        row.status = Status::Idle;
+        let state = crate::server::test_support::build_test_app_state(vec![row]);
+        state.canonical_metadata.write().await.status_hooks.insert(
+            "test".into(),
+            StatusHookConfig {
+                enabled: true,
+                on_running: Some("running-notification".into()),
+                ..Default::default()
+            },
+        );
+        state.runtime.publish(&state).await.unwrap();
+        state.instances.write().await[0].status = Status::Running;
+        state.runtime.publish(&state).await.unwrap();
+        state.runtime.work.drain().await;
+        assert_eq!(take_recorded_launches().len(), 1);
+        state
+            .canonical_metadata
+            .write()
+            .await
+            .status_hooks
+            .get_mut("test")
+            .unwrap()
+            .enabled = false;
+        state.runtime.publish(&state).await.unwrap();
+        state.instances.write().await[0].status = Status::Idle;
+        state.runtime.publish(&state).await.unwrap();
+        state
+            .canonical_metadata
+            .write()
+            .await
+            .status_hooks
+            .get_mut("test")
+            .unwrap()
+            .enabled = true;
+        state.runtime.publish(&state).await.unwrap();
+        state.instances.write().await[0].status = Status::Running;
+        state.runtime.publish(&state).await.unwrap();
+        state.runtime.work.drain().await;
+        let launches = take_recorded_launches();
+        assert_eq!(
+            launches.len(),
+            1,
+            "reactivation lost a real Idle-to-Running transition"
+        );
+        assert_eq!(launches[0].context.old_status, Status::Idle);
+        assert_eq!(launches[0].context.new_status, Status::Running);
     }
 
-    #[test]
-    fn deserializes_toml_config() {
-        let config: StatusHookConfig = toml::from_str(
-            r#"
-            enabled = true
-            on_waiting = "notify-send waiting"
-            on_change = "~/bin/aoe-hook"
-            "#,
-        )
-        .unwrap();
-        assert!(config.enabled);
-        assert_eq!(config.on_waiting.as_deref(), Some("notify-send waiting"));
-        assert_eq!(config.on_change.as_deref(), Some("~/bin/aoe-hook"));
-    }
-
-    /// Regression: the schema used to expose `debounce_ms`. It is gone now
-    /// (the debounce is a fixed internal constant); configs read between
-    /// upgrade and migration must still deserialize cleanly.
-    #[test]
-    fn legacy_debounce_ms_is_ignored() {
-        let config: StatusHookConfig = toml::from_str(
-            r#"
-            enabled = true
-            debounce_ms = 500
-            on_waiting = "notify-send waiting"
-            "#,
-        )
-        .expect("legacy debounce_ms should not error");
-        assert!(config.enabled);
+    #[tokio::test]
+    #[serial]
+    async fn pending_hooks_follow_profile_ownership_without_reusing_tickets() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let _debounce = DebounceOverride::set(10);
+        take_recorded_launches();
+        let mut instance = Instance::new("pending hook", "/repo");
+        instance.source_profile = "test".into();
+        let state = crate::server::test_support::build_test_app_state(vec![instance.clone()]);
+        let snapshot = state.runtime.publish(&state).await.unwrap();
+        let original = &snapshot.value.contents.sessions;
+        let config = StatusHookConfig {
+            enabled: true,
+            on_running: Some("notify-running".into()),
+            ..Default::default()
+        };
+        let configs = HashMap::from([
+            ("test".into(), config.clone()),
+            ("other".into(), config.clone()),
+        ]);
+        for change in ["disabled", "removed", "moved", "reconfigured", "recreated"] {
+            let hooks = StatusHooks::default();
+            hooks.reconcile(original, &configs);
+            let context = StatusHookContext::from_instance(
+                &instance,
+                Status::Idle,
+                Status::Running,
+                Utc::now(),
+            );
+            let pending = hooks
+                .prepare_transition(context.clone(), &config, Default::default())
+                .unwrap();
+            let mut rows = original.clone();
+            let mut changed = configs.clone();
+            match change {
+                "disabled" => changed.get_mut("test").unwrap().enabled = false,
+                "removed" | "recreated" => rows.clear(),
+                "moved" => rows[0].profile = "other".into(),
+                "reconfigured" => {
+                    changed.get_mut("test").unwrap().on_running = Some("new-command".into())
+                }
+                _ => unreachable!(),
+            }
+            hooks.reconcile(&rows, &changed);
+            if change == "recreated" {
+                hooks.reconcile(original, &configs);
+                let replacement = hooks
+                    .prepare_transition(context, &config, Default::default())
+                    .unwrap();
+                tokio::join!(pending, replacement);
+                assert_eq!(
+                    take_recorded_launches().len(),
+                    1,
+                    "an obsolete ticket matched a recreated row"
+                );
+            } else {
+                pending.await;
+                assert!(
+                    take_recorded_launches().is_empty(),
+                    "pending hook survived {change}"
+                );
+                hooks.reconcile(original, &configs);
+                hooks
+                    .prepare_transition(context, &config, Default::default())
+                    .unwrap()
+                    .await;
+                assert_eq!(
+                    take_recorded_launches().len(),
+                    1,
+                    "restored ownership lost a transition after {change}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -574,10 +582,10 @@ mod tests {
         );
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn debounces_stable_transition() {
-        reset_debounce_state();
+    async fn debounces_stable_transition() {
+        let hooks = StatusHooks::default();
         take_recorded_launches();
         let _debounce = DebounceOverride::set(10);
 
@@ -590,11 +598,22 @@ mod tests {
         };
 
         let observed_before = Utc::now();
-        run_for_transition(&instance, Status::Running, Status::Waiting, &config);
+        let task = hooks
+            .prepare_transition(
+                StatusHookContext::from_instance(
+                    &instance,
+                    Status::Running,
+                    Status::Waiting,
+                    observed_before,
+                ),
+                &config,
+                Default::default(),
+            )
+            .unwrap();
         let observed_after = Utc::now();
         assert!(take_recorded_launches().is_empty());
 
-        _debounce.finish();
+        task.await;
         let launches = take_recorded_launches();
         assert_eq!(launches.len(), 1);
         assert_eq!(launches[0].command, "notify-waiting");
@@ -604,10 +623,10 @@ mod tests {
         assert!(launches[0].context.changed_at <= observed_after);
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn debounce_cancels_flicker_back_to_stable_status() {
-        reset_debounce_state();
+    async fn debounce_cancels_flicker_back_to_stable_status() {
+        let hooks = StatusHooks::default();
         take_recorded_launches();
         let _debounce = DebounceOverride::set(10);
 
@@ -619,17 +638,38 @@ mod tests {
             ..Default::default()
         };
 
-        run_for_transition(&instance, Status::Running, Status::Waiting, &config);
-        run_for_transition(&instance, Status::Waiting, Status::Running, &config);
-
-        _debounce.finish();
+        let pending = hooks
+            .prepare_transition(
+                StatusHookContext::from_instance(
+                    &instance,
+                    Status::Running,
+                    Status::Waiting,
+                    Utc::now(),
+                ),
+                &config,
+                Default::default(),
+            )
+            .unwrap();
+        assert!(hooks
+            .prepare_transition(
+                StatusHookContext::from_instance(
+                    &instance,
+                    Status::Waiting,
+                    Status::Running,
+                    Utc::now()
+                ),
+                &config,
+                Default::default()
+            )
+            .is_none());
+        pending.await;
         assert!(take_recorded_launches().is_empty());
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn debounce_coalesces_to_latest_pending_status() {
-        reset_debounce_state();
+    async fn debounce_coalesces_to_latest_pending_status() {
+        let hooks = StatusHooks::default();
         take_recorded_launches();
         let _debounce = DebounceOverride::set(10);
 
@@ -642,10 +682,31 @@ mod tests {
             ..Default::default()
         };
 
-        run_for_transition(&instance, Status::Running, Status::Waiting, &config);
-        run_for_transition(&instance, Status::Waiting, Status::Idle, &config);
-
-        _debounce.finish();
+        let first = hooks
+            .prepare_transition(
+                StatusHookContext::from_instance(
+                    &instance,
+                    Status::Running,
+                    Status::Waiting,
+                    Utc::now(),
+                ),
+                &config,
+                Default::default(),
+            )
+            .unwrap();
+        let last = hooks
+            .prepare_transition(
+                StatusHookContext::from_instance(
+                    &instance,
+                    Status::Waiting,
+                    Status::Idle,
+                    Utc::now(),
+                ),
+                &config,
+                Default::default(),
+            )
+            .unwrap();
+        tokio::join!(first, last);
         let launches = take_recorded_launches();
         assert_eq!(launches.len(), 1);
         assert_eq!(launches[0].command, "notify-idle");

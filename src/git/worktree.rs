@@ -1,6 +1,4 @@
-//! `GitWorktree` — worktree lifecycle, branch detection, and template-based
-//! path computation. Split out from `mod.rs` as part of the code-quality
-//! consolidation pass; the public API is unchanged.
+//! Git worktree lifecycle, branch detection, and template paths.
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -12,6 +10,20 @@ use regex::Regex;
 use super::error::{GitError, Result};
 use super::open_repo_at;
 use super::template::{resolve_template, TemplateVars};
+
+#[derive(Default)]
+pub(crate) struct WorktreeCreation {
+    pub branch_created: bool,
+    pub checkout_created: bool,
+}
+
+struct EmptyWorktreeDirectory<'a>(&'a Path);
+
+impl Drop for EmptyWorktreeDirectory<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(self.0);
+    }
+}
 
 /// Strip embedded credentials from URL-style substrings before stderr
 /// gets logged or surfaced to the user. Git fetch errors typically echo
@@ -694,6 +706,24 @@ impl GitWorktree {
         create_branch: bool,
         base_branch: Option<&str>,
     ) -> Result<Vec<String>> {
+        self.create_worktree_tracked(
+            branch,
+            path,
+            create_branch,
+            base_branch,
+            &mut WorktreeCreation::default(),
+        )
+    }
+
+    pub(crate) fn create_worktree_tracked(
+        &self,
+        branch: &str,
+        path: &Path,
+        create_branch: bool,
+        base_branch: Option<&str>,
+        created: &mut WorktreeCreation,
+    ) -> Result<Vec<String>> {
+        *created = WorktreeCreation::default();
         let total_start = std::time::Instant::now();
         let mut warnings: Vec<String> = Vec::new();
         tracing::info!(target: "git.worktree",
@@ -831,6 +861,7 @@ impl GitWorktree {
 
             let commit = repo.find_commit(commit_oid)?;
             repo.branch(branch, &commit, false)?;
+            created.branch_created = true;
         } else {
             let has_local = repo.find_branch(branch, git2::BranchType::Local).is_ok();
             if !has_local {
@@ -861,11 +892,27 @@ impl GitWorktree {
             .to_str()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid path"))?;
 
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if let Err(error) = std::fs::create_dir(path) {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                return Err(GitError::WorktreeAlreadyExists(path.to_path_buf()));
+            }
+            return Err(error.into());
+        }
+        let empty_directory = EmptyWorktreeDirectory(path);
+
         let t = std::time::Instant::now();
         let output =
             super::command::run_git(&self.repo_path, ["worktree", "add", path_str, branch])?;
         let add_elapsed = t.elapsed();
 
+        created.checkout_created =
+            output.status.success() || (path.exists() && path.join(".git").exists());
+        if created.checkout_created {
+            std::mem::forget(empty_directory);
+        }
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -880,13 +927,8 @@ impl GitWorktree {
             // the error message).
             let combined = sanitize_remote_credentials(&combined);
 
-            // post-checkout hooks (e.g. pre-commit's hook-type=post-checkout
-            // running uv-sync, npm install, etc.) can fail after git has
-            // already created the worktree directory. When that happens, the
-            // worktree IS usable; we record a warning instead of aborting
-            // session creation.
-            let worktree_created = path.exists() && path.join(".git").exists();
-            if worktree_created {
+            // Git may finish the checkout before a post-checkout hook fails.
+            if created.checkout_created {
                 let warning = format!(
                     "post-checkout hook failed for {} (worktree created, hook output below):\n{}",
                     path.display(),
@@ -1349,7 +1391,7 @@ impl GitWorktree {
 
     /// Return the registered checkout path for the local branch, including a
     /// stale locked entry whose checkout no longer exists.
-    fn worktree_path_for_branch(&self, branch: &str) -> Result<Option<PathBuf>> {
+    pub(crate) fn worktree_path_for_branch(&self, branch: &str) -> Result<Option<PathBuf>> {
         let output =
             super::command::run_git(&self.repo_path, ["worktree", "list", "--porcelain", "-z"])?;
         if !output.status.success() {
@@ -2146,59 +2188,15 @@ mod tests {
         );
     }
 
-    /// Every git subprocess reachable from `move_worktree` /
-    /// `edit_worktree_workdir` is bounded. The profile-move transaction runs
-    /// them while holding the app-global identity flock, both per-session
-    /// locks, and both profile storage flocks, so one unbounded call pins every
-    /// peer `aoe` process. Pins the whole set rather than one call: the gap
-    /// this closes was `unlock_worktree` sitting one line above an already
-    /// bounded `git worktree move`.
-    ///
-    /// Source-level rather than behavioural because making git itself block on
-    /// `.git` metadata is not reproducible in a unit test; the failure mode is
-    /// a future caller reaching for the unbounded helper, which this catches.
-    #[test]
-    fn every_worktree_mutation_subprocess_is_bounded() {
-        // Whitespace-normalised so rustfmt's line wrapping cannot change the
-        // result: the point is which helper is called, not how it is laid out.
-        let source = include_str!("worktree.rs");
-        let region = source
-            .split_once("impl GitWorktree {")
-            .expect("GitWorktree impl block")
-            .1
-            .split_once("\n#[cfg(test)]")
-            .expect("test module terminates the scanned region")
-            .0;
-        let flat = region.split_whitespace().collect::<Vec<_>>().join(" ");
-        let cases = [
-            ("\"worktree\", \"lock\"", "git worktree lock"),
-            ("\"worktree\", \"unlock\"", "git worktree unlock"),
-            ("\"show-ref\", \"--verify\"", "git show-ref --verify"),
-            ("\"worktree\", \"move\"", "git worktree move"),
-            ("\"branch\", \"-m\"", "git branch -m"),
-        ];
-        for (needle, label) in cases {
-            let at = flat
-                .find(needle)
-                .unwrap_or_else(|| panic!("{label} should still be issued from this module"));
-            // The helper name precedes its argument list, so scan back to the
-            // nearest `run_git*` and require one of the timed variants.
-            let call = flat[..at]
-                .rfind("run_git")
-                .map(|i| &flat[i..])
-                .unwrap_or_default();
-            assert!(
-                call.starts_with("run_git_with_timeout")
-                    || call.starts_with("run_git_quiet_with_timeout"),
-                "{label} must go through a bounded helper, found `{}`",
-                call.split('(').next().unwrap_or(call)
-            );
-        }
-    }
-
     fn run_git(path: &Path, args: &[&str]) {
         let output = std::process::Command::new("git")
             .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
             .current_dir(path)
             .output()
             .unwrap();

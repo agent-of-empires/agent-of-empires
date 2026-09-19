@@ -65,6 +65,7 @@ function renderStep(importAcpSessionId = "", agents: AgentInfo[] = [CLAUDE_INSTA
   const onChange = vi.fn();
   const utils = render(
     <ProjectStep
+      profile="default"
       data={{ ...initialData, path: "", extraRepoPaths: [], scratch: false, importAcpSessionId }}
       onChange={onChange}
       initialTab="import"

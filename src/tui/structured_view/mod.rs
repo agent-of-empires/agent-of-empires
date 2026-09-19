@@ -34,11 +34,11 @@ use self::state::{
 };
 use crate::acp::client::{
     require_daemon, ws_connect_with, DaemonEndpoint, HttpClient, HttpError, ManagerError,
-    PluginCommandView, WsError, WsMessage, REPLAY_PAGE_SIZE,
+    PluginCommandView, WsMessage, REPLAY_PAGE_SIZE,
 };
 use crate::acp::elicitations::ElicitationResolution;
 use crate::acp::protocol::ApprovalDecisionWire;
-use crate::daemon::QueuedPromptEntry;
+use crate::daemon::{QueuedPromptEntry, WsError};
 use crate::plugin::ui_state::{Tone, UiSnapshot};
 use crate::session::config::{resolve_theme_name, resolve_theme_palette_mode};
 use crate::tui::styles::Theme;

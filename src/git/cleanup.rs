@@ -3,10 +3,18 @@
 use std::path::{Path, PathBuf};
 
 use crate::containers::DockerContainer;
+use crate::session::path_identity::{canonicalize_or_raw, CleanupProtection};
 use crate::session::Instance;
 
 use super::open_repo_at;
 use super::GitWorktree;
+
+#[derive(Clone, Copy)]
+pub(crate) struct WorktreeCleanupOptions {
+    pub force: bool,
+    pub allow_container_removal: bool,
+    pub allow_root_cleanup: bool,
+}
 
 /// Cap on the number of dirty file entries we list inline in error messages so
 /// the TUI output pane does not get blown out on a worktree with thousands of
@@ -37,10 +45,12 @@ const MAX_PARENT_PRUNE_HOPS: usize = 4;
 /// Best-effort: failures are logged and swallowed. The caller's worktree
 /// removal already succeeded; an orphaned wrapper is a cosmetic leak, not a
 /// reason to fail the deletion.
-fn prune_empty_parent_dirs(worktree_path: &Path, main_repo: &Path) {
-    let main_canonical = main_repo
-        .canonicalize()
-        .unwrap_or_else(|_| main_repo.to_path_buf());
+fn prune_empty_parent_dirs(
+    worktree_path: &Path,
+    main_repo: &Path,
+    protection: &[&CleanupProtection],
+) {
+    let main_canonical = canonicalize_or_raw(main_repo);
     let home = dirs::home_dir();
 
     let mut current = worktree_path.parent().map(|p| p.to_path_buf());
@@ -56,9 +66,13 @@ fn prune_empty_parent_dirs(worktree_path: &Path, main_repo: &Path) {
             break;
         }
 
-        let parent_canonical = parent
-            .canonicalize()
-            .unwrap_or_else(|_| parent.to_path_buf());
+        let parent_canonical = canonicalize_or_raw(&parent);
+        if protection
+            .iter()
+            .any(|owner| owner.references_path(&parent))
+        {
+            break;
+        }
 
         // Refuse to touch the main repo or any of its ancestors.
         if main_canonical.starts_with(&parent_canonical) {
@@ -428,21 +442,28 @@ pub fn cleanup_sandbox_worktree(instance: &Instance) -> bool {
             return false;
         }
     }
-    let needs_start = match container.probe_running() {
-        crate::containers::Probe::Running => false,
-        crate::containers::Probe::NotRunning => true,
+    // Cleanup never starts the container it is tearing down: a purge that
+    // boots the managed entrypoint executes the very workload it was asked to
+    // discard. A stopped container keeps its worktree until the host removes it.
+    match container.probe_running() {
+        crate::containers::Probe::Running => {}
+        crate::containers::Probe::NotRunning => {
+            tracing::debug!(
+                target: "containers.runtime",
+                session = %instance.id,
+                "container is not running; skipping the in-container worktree cleanup"
+            );
+            return false;
+        }
         crate::containers::Probe::Unknown(e) => {
             tracing::warn!(
                 target: "containers.runtime",
                 session = %instance.id,
                 error = %e,
-                "container running-state probe failed during worktree cleanup; attempting container start (safe if already running)"
+                "container running-state probe failed during worktree cleanup; skipping best-effort cleanup"
             );
-            true
+            return false;
         }
-    };
-    if needs_start && container.start().is_err() {
-        return false;
     }
     match container.exec(&["find", ".", "-mindepth", "1", "-delete"]) {
         Ok(output) => output.status.success(),
@@ -450,33 +471,21 @@ pub fn cleanup_sandbox_worktree(instance: &Instance) -> bool {
     }
 }
 
-/// Perform full worktree cleanup with automatic sandbox fallback.
-///
-/// Handles both cases:
-/// - `.git` file missing: removes directory and prunes stale references
-/// - `.git` file present: uses `git worktree remove`, falls back to
-///   container cleanup for sandboxed sessions with permission errors
-///
-/// `allow_container_removal` controls whether the sandbox fallback is
-/// permitted to force-remove the container as part of its recovery.
-/// Set to `true` when the caller has already requested container
-/// deletion (or is about to), and `false` when the caller wants to
-/// preserve the container (e.g. `aoe remove --keep-container` or
-/// `delete_worktree=true, delete_sandbox=false`). When `false` and
-/// the fallback is the only way to make progress, the worktree
-/// removal fails with the original permission error instead of
-/// quietly tearing down the container behind the user's back.
-///
-/// Returns `Ok(())` if the worktree was successfully removed, or
-/// `Err(errors)` with error messages on failure.
-pub fn remove_managed_worktree(
+/// Remove a managed checkout without exceeding the caller's sandbox permissions.
+/// Whole-root cleanup and container removal are independent permissions.
+pub(crate) fn remove_managed_worktree(
     git_wt: &GitWorktree,
     worktree_path: &Path,
     main_repo: &Path,
     instance: &Instance,
-    force: bool,
-    allow_container_removal: bool,
+    options: WorktreeCleanupOptions,
+    protection: &[&CleanupProtection],
 ) -> Result<(), Vec<String>> {
+    let WorktreeCleanupOptions {
+        force,
+        allow_container_removal,
+        allow_root_cleanup,
+    } = options;
     let mut errors = Vec::new();
     let has_dot_git = worktree_path.join(".git").exists();
 
@@ -492,33 +501,12 @@ pub fn remove_managed_worktree(
     let mut worktree_removed = false;
 
     if !has_dot_git {
-        // .git is missing (manual deletion or other issue).
-        // Remove the dir ourselves and prune stale references.
-        //
-        // For sandboxed sessions, missing `.git` almost always means the
-        // in-container preclean (`find . -delete`) wiped the worktree
-        // along with `.git` itself. The only remaining content on the
-        // host is mount-point cruft from anonymous volumes (empty
-        // `target/`, `node_modules/`, `.venv/` dirs created by Docker
-        // as anchors for `-v /workspace/<repo>/target` style mounts).
-        // Strict `remove_dir` then fails with ENOTEMPTY ("Directory not
-        // empty (os error 66)" on macOS); escalate to `remove_dir_all`
-        // so the leftover empty mount-point dirs are cleaned up. The
-        // host-side dirty check in `perform_deletion` guarantees we
-        // only reach this code path when the user opted in to losing
-        // any uncommitted changes (via `force_delete=true`) or the
-        // worktree was clean.
-        //
-        // For non-sandboxed sessions, missing `.git` typically means
-        // the user did something manual; keep strict behavior gated on
-        // the explicit `force` flag.
-        // This branch removes the directory by hand and reaps the admin entry
-        // with `prune`, which skips locked worktrees. Unlock first (best-effort;
-        // resolves from the admin side even though `.git` is already gone) so
-        // the aoe lock does not strand the entry.
+        // Preclean can leave mount-point debris after removing .git.
+        // Without permission to preclean, recursive removal still requires force.
+        // Unlock orphaned admin entries before pruning.
         git_wt.unlock_worktree(worktree_path);
 
-        let effective_force = force || instance.is_sandboxed();
+        let effective_force = force || (instance.is_sandboxed() && allow_root_cleanup);
         match remove_worktree_dir(worktree_path, main_repo, effective_force) {
             Ok(()) => {
                 worktree_removed = true;
@@ -531,6 +519,7 @@ pub fn remove_managed_worktree(
                         main_repo,
                         instance,
                         allow_container_removal,
+                        allow_root_cleanup,
                     )
                 {
                     worktree_removed = true;
@@ -576,7 +565,7 @@ pub fn remove_managed_worktree(
                         path = %worktree_path.display(),
                         "git has no worktree entry for this path; removing the leftover directory by hand"
                     );
-                    let effective_force = force || instance.is_sandboxed();
+                    let effective_force = force || (instance.is_sandboxed() && allow_root_cleanup);
                     match remove_worktree_dir(worktree_path, main_repo, effective_force) {
                         Ok(()) => worktree_removed = true,
                         Err(e2) if is_permission_error(&e2.to_string()) => {
@@ -585,6 +574,7 @@ pub fn remove_managed_worktree(
                                 main_repo,
                                 instance,
                                 allow_container_removal,
+                                allow_root_cleanup,
                             ) {
                                 worktree_removed = true;
                             } else {
@@ -608,6 +598,7 @@ pub fn remove_managed_worktree(
                         main_repo,
                         instance,
                         allow_container_removal,
+                        allow_root_cleanup,
                     )
                 {
                     worktree_removed = true;
@@ -642,12 +633,8 @@ pub fn remove_managed_worktree(
         }
     }
 
-    // Clean up empty wrapper directories created by nested path templates
-    // (e.g., `../{repo-name}-worktrees/{branch}/{repo-name}` leaves an empty
-    // `{branch}/` behind once the leaf is gone). Best-effort, never fails
-    // deletion.
     if worktree_removed {
-        prune_empty_parent_dirs(worktree_path, main_repo);
+        prune_empty_parent_dirs(worktree_path, main_repo, protection);
     }
 
     if errors.is_empty() {
@@ -657,30 +644,19 @@ pub fn remove_managed_worktree(
     }
 }
 
-/// Try to clean up a worktree directory using the sandbox container.
-///
-/// When worktree files are root-owned (from container execution), the host
-/// can't delete them directly. This function:
-/// 1. Runs `find . -mindepth 1 -delete` inside the container
-/// 2. Force-removes the container to release the bind mount
-/// 3. Retries directory removal (with VirtioFS delay handling)
-///
-/// Step 2 is gated on `allow_container_removal`: when the caller
-/// opted out of container deletion, we refuse to nuke the container
-/// just to free a permission-bound worktree. In that case the caller
-/// sees the original Worktree permission error and can decide what
-/// to do.
+/// Recover a permission failure only when whole-root cleanup and container removal are allowed.
 fn try_sandbox_dir_cleanup(
     worktree_path: &Path,
     main_repo: &Path,
     instance: &Instance,
     allow_container_removal: bool,
+    allow_root_cleanup: bool,
 ) -> bool {
     if !instance.is_sandboxed() {
         return false;
     }
-    if !allow_container_removal {
-        tracing::debug!(target: "git.worktree", "sandbox fallback skipped: caller forbade container removal");
+    if !allow_container_removal || !allow_root_cleanup {
+        tracing::debug!(target: "git.worktree", "sandbox fallback exceeds caller cleanup permissions");
         return false;
     }
 
@@ -691,9 +667,10 @@ fn try_sandbox_dir_cleanup(
     }
 
     let container = DockerContainer::from_session_id(&instance.id);
-    let rm_result = container.remove(true);
-    tracing::debug!(target: "git.worktree", ?rm_result, "container force-removed");
-    container.remove_named_ignore_volumes(&instance.id);
+    if let crate::containers::Teardown::Failed(error) = container.teardown(&instance.id) {
+        tracing::debug!(target: "git.worktree", %error, "container removal failed; cleanup retained");
+        return false;
+    }
 
     match remove_worktree_dir(worktree_path, main_repo, true) {
         Ok(()) => true,
@@ -733,127 +710,83 @@ mod tests {
         assert!(!wt.exists());
     }
 
-    /// `try_sandbox_dir_cleanup` must respect `allow_container_removal=false`
-    /// by returning early without touching the container, even when the
-    /// instance is sandboxed and the worktree would otherwise be a
-    /// fallback candidate. We can't easily test the docker-side branch
-    /// without a real container runtime, but we CAN guarantee the
-    /// early-return: a non-sandboxed instance should also return false,
-    /// and a sandboxed instance with `allow_container_removal=false`
-    /// should not even attempt to invoke `cleanup_sandbox_worktree`.
-    /// This regression test is checked via a side effect: we point the
-    /// instance at a non-existent worktree path, so the only way the
-    /// function could reach the post-cleanup `remove_worktree_dir` call
-    /// is if it bypassed the early-return. If the flag is honored,
-    /// the function returns false immediately.
+    // Missing `.git` permits recursive sandbox cleanup only for an unshared root.
     #[test]
-    fn test_try_sandbox_dir_cleanup_respects_allow_container_removal_false() {
-        use crate::session::{Instance, SandboxInfo};
-        let mut instance = Instance::new("Test", "/tmp/aoe-cleanup-test-nonexistent");
-        instance.sandbox_info = Some(SandboxInfo {
-            enabled: true,
-            container_id: None,
-            image: "alpine".to_string(),
-            container_name: "aoe-sandbox-doesnotexist".to_string(),
-            extra_env: None,
-            custom_instruction: None,
-            before_start_env: Vec::new(),
-            container_workdir: None,
-        });
-
-        let worktree = std::path::PathBuf::from("/tmp/aoe-cleanup-test-nonexistent");
-        let main_repo = std::path::PathBuf::from("/tmp/aoe-cleanup-test-main-nonexistent");
-
-        // With allow_container_removal=false, must return false without
-        // touching anything.
-        let result = try_sandbox_dir_cleanup(&worktree, &main_repo, &instance, false);
-        assert!(
-            !result,
-            "sandbox fallback must bail when allow_container_removal=false"
-        );
-    }
-
-    /// Anonymous-volume mount-point cruft: when a sandboxed session's
-    /// in-container preclean (`find . -delete`) runs, the bind mount on
-    /// the host loses its real contents (including `.git`) but Docker
-    /// leaves the anonymous-volume mount-point directories behind as
-    /// empty `target/`, `node_modules/`, `.venv/` dirs. Strict
-    /// `remove_dir` then fails with ENOTEMPTY ("Directory not empty
-    /// (os error 66)" on macOS) even though the user opted into
-    /// destroying the worktree. `remove_managed_worktree` must escalate
-    /// to `remove_dir_all` for sandboxed instances in this case.
-    #[test]
-    fn test_remove_managed_worktree_sandboxed_clears_mount_point_cruft() {
+    fn test_remove_managed_worktree_sandboxed_clears_only_unshared_root_cruft() {
         use crate::session::{Instance, SandboxInfo};
 
-        let tmp = tempfile::TempDir::new().unwrap();
-        let main_repo = tmp.path().join("main");
-        let worktree_path = tmp.path().join("worktree");
-        std::fs::create_dir(&main_repo).unwrap();
+        for allow_root_cleanup in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let main_repo = tmp.path().join("main");
+            let worktree_path = tmp.path().join("worktree");
+            std::fs::create_dir(&main_repo).unwrap();
 
-        let repo = git2::Repository::init(&main_repo).unwrap();
-        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
-        let tree_id = repo.index().unwrap().write_tree().unwrap();
-        let tree = repo.find_tree(tree_id).unwrap();
-        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
-            .unwrap();
+            let repo = git2::Repository::init(&main_repo).unwrap();
+            let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+            let tree_id = repo.index().unwrap().write_tree().unwrap();
+            let tree = repo.find_tree(tree_id).unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+                .unwrap();
 
-        let status = std::process::Command::new("git")
-            .args([
-                "worktree",
-                "add",
-                "-b",
-                "feature/cruft",
-                worktree_path.to_str().unwrap(),
-            ])
-            .current_dir(&main_repo)
-            .output()
-            .unwrap();
-        assert!(
-            status.status.success(),
-            "git worktree add failed: {}",
-            String::from_utf8_lossy(&status.stderr)
-        );
+            let status = std::process::Command::new("git")
+                .args([
+                    "worktree",
+                    "add",
+                    "-b",
+                    "feature/cruft",
+                    worktree_path.to_str().unwrap(),
+                ])
+                .current_dir(&main_repo)
+                .output()
+                .unwrap();
+            assert!(
+                status.status.success(),
+                "git worktree add failed: {}",
+                String::from_utf8_lossy(&status.stderr)
+            );
 
-        // Simulate post-preclean state: `.git` was wiped along with
-        // everything else, only the anonymous-volume mount-point dirs
-        // remain on the host as empty directories.
-        std::fs::remove_file(worktree_path.join(".git")).unwrap();
-        std::fs::create_dir(worktree_path.join("target")).unwrap();
-        std::fs::create_dir(worktree_path.join("node_modules")).unwrap();
-        std::fs::create_dir(worktree_path.join(".venv")).unwrap();
+            // Model mount-point leftovers after the in-container preclean.
+            std::fs::remove_file(worktree_path.join(".git")).unwrap();
+            std::fs::create_dir(worktree_path.join("target")).unwrap();
+            std::fs::create_dir(worktree_path.join("node_modules")).unwrap();
+            std::fs::create_dir(worktree_path.join(".venv")).unwrap();
 
-        let mut instance = Instance::new("Test", worktree_path.to_str().unwrap());
-        instance.sandbox_info = Some(SandboxInfo {
-            enabled: true,
-            container_id: None,
-            image: "alpine".to_string(),
-            container_name: "aoe-cruft-doesnotexist".to_string(),
-            extra_env: None,
-            custom_instruction: None,
-            before_start_env: Vec::new(),
-            container_workdir: None,
-        });
+            let mut instance = Instance::new("Test", worktree_path.to_str().unwrap());
+            instance.sandbox_info = Some(SandboxInfo {
+                enabled: true,
+                container_id: None,
+                image: "alpine".to_string(),
+                container_name: "aoe-cruft-doesnotexist".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                container_workdir: None,
+            });
 
-        let git_wt = GitWorktree::new(main_repo.clone()).unwrap();
-        let result = remove_managed_worktree(
-            &git_wt,
-            &worktree_path,
-            &main_repo,
-            &instance,
-            false, // force = false; sandboxed escalation must kick in
-            true,  // allow_container_removal (not exercised here)
-        );
+            let git_wt = GitWorktree::new(main_repo.clone()).unwrap();
+            let result = remove_managed_worktree(
+                &git_wt,
+                &worktree_path,
+                &main_repo,
+                &instance,
+                WorktreeCleanupOptions {
+                    force: false,
+                    allow_container_removal: true,
+                    allow_root_cleanup,
+                },
+                &[&CleanupProtection::default()],
+            );
 
-        assert!(
-            result.is_ok(),
-            "sandboxed removal must clear mount-point cruft: {:?}",
-            result
-        );
-        assert!(
-            !worktree_path.exists(),
-            "worktree dir should be gone after sandboxed cleanup"
-        );
+            if allow_root_cleanup {
+                assert!(result.is_ok(), "sandbox cleanup failed: {result:?}");
+                assert!(!worktree_path.exists());
+            } else {
+                assert!(result.is_err());
+                assert!(worktree_path.join("target").is_dir());
+                assert!(worktree_path.join("node_modules").is_dir());
+                assert!(worktree_path.join(".venv").is_dir());
+            }
+        }
     }
 
     /// Counterpart: non-sandboxed sessions with a missing `.git` get
@@ -896,8 +829,18 @@ mod tests {
         let instance = Instance::new("Test", worktree_path.to_str().unwrap());
 
         let git_wt = GitWorktree::new(main_repo.clone()).unwrap();
-        let result =
-            remove_managed_worktree(&git_wt, &worktree_path, &main_repo, &instance, false, false);
+        let result = remove_managed_worktree(
+            &git_wt,
+            &worktree_path,
+            &main_repo,
+            &instance,
+            WorktreeCleanupOptions {
+                force: false,
+                allow_container_removal: false,
+                allow_root_cleanup: true,
+            },
+            &[&CleanupProtection::default()],
+        );
 
         assert!(
             result.is_err(),
@@ -907,20 +850,6 @@ mod tests {
             worktree_path.exists(),
             "worktree dir should still exist after strict failure"
         );
-    }
-
-    #[test]
-    fn test_try_sandbox_dir_cleanup_returns_false_for_non_sandboxed() {
-        use crate::session::Instance;
-        let instance = Instance::new("Test", "/tmp/aoe-cleanup-test-nonexistent");
-        // No sandbox_info set.
-        let worktree = std::path::PathBuf::from("/tmp/aoe-cleanup-test-nonexistent");
-        let main_repo = std::path::PathBuf::from("/tmp/aoe-cleanup-test-main-nonexistent");
-
-        // Even with allow_container_removal=true, a non-sandboxed
-        // instance must early-return.
-        let result = try_sandbox_dir_cleanup(&worktree, &main_repo, &instance, true);
-        assert!(!result);
     }
 
     #[test]
@@ -1093,8 +1022,18 @@ mod tests {
 
         // force=true mirrors the auto-purge, which forces removal so a dirty
         // tree can't pin an expired session in the trash forever.
-        let result =
-            remove_managed_worktree(&git_wt, &worktree_path, &main_repo, &instance, true, false);
+        let result = remove_managed_worktree(
+            &git_wt,
+            &worktree_path,
+            &main_repo,
+            &instance,
+            WorktreeCleanupOptions {
+                force: true,
+                allow_container_removal: false,
+                allow_root_cleanup: true,
+            },
+            &[&CleanupProtection::default()],
+        );
 
         assert!(
             result.is_ok(),
@@ -1107,8 +1046,18 @@ mod tests {
         );
 
         // Idempotent: the purge may re-run before its registry entry drains.
-        let again =
-            remove_managed_worktree(&git_wt, &worktree_path, &main_repo, &instance, true, false);
+        let again = remove_managed_worktree(
+            &git_wt,
+            &worktree_path,
+            &main_repo,
+            &instance,
+            WorktreeCleanupOptions {
+                force: true,
+                allow_container_removal: false,
+                allow_root_cleanup: true,
+            },
+            &[&CleanupProtection::default()],
+        );
         assert!(again.is_ok(), "second removal must be a no-op: {:?}", again);
     }
 
@@ -1255,7 +1204,7 @@ mod tests {
         std::fs::remove_dir(&worktree).unwrap();
         assert!(branch_dir.exists());
 
-        prune_empty_parent_dirs(&worktree, &main_repo);
+        prune_empty_parent_dirs(&worktree, &main_repo, &[&CleanupProtection::default()]);
 
         assert!(!branch_dir.exists(), "branch wrapper dir should be gone");
         assert!(!base.exists(), "worktrees base dir should be gone");
@@ -1280,7 +1229,7 @@ mod tests {
 
         std::fs::remove_dir_all(&worktree).unwrap();
 
-        prune_empty_parent_dirs(&worktree, &main_repo);
+        prune_empty_parent_dirs(&worktree, &main_repo, &[&CleanupProtection::default()]);
 
         assert!(
             branch_dir.exists(),
@@ -1305,10 +1254,30 @@ mod tests {
 
         std::fs::remove_dir(&deleted_wt).unwrap();
 
-        prune_empty_parent_dirs(&deleted_wt, &main_repo);
+        prune_empty_parent_dirs(&deleted_wt, &main_repo, &[&CleanupProtection::default()]);
 
         assert!(base.exists(), "shared base must survive other worktrees");
         assert!(other_wt.exists(), "other worktree must be untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_pruning_preserves_the_survivors_symlink_traversal() {
+        let root = tempfile::tempdir().unwrap();
+        let main_repo = root.path().join("main");
+        let real = root.path().join("real");
+        let alias = root.path().join("alias");
+        for path in [&main_repo, &real.join("empty"), &real.join("peer")] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let owner = Instance::new("peer", alias.join("empty/../peer").to_str().unwrap());
+        let protection = CleanupProtection::new([&owner]).unwrap();
+        prune_empty_parent_dirs(&alias.join("empty/deleted"), &main_repo, &[&protection]);
+        assert!(
+            std::path::Path::new(&owner.project_path).is_dir(),
+            "pruning broke the surviving session cwd"
+        );
     }
 
     /// Bare-repo template `./{branch}` puts the worktree inside the main repo.
@@ -1322,7 +1291,7 @@ mod tests {
 
         std::fs::remove_dir(&worktree).unwrap();
 
-        prune_empty_parent_dirs(&worktree, &main_repo);
+        prune_empty_parent_dirs(&worktree, &main_repo, &[&CleanupProtection::default()]);
 
         assert!(main_repo.exists(), "main repo must be untouched");
     }
@@ -1343,7 +1312,7 @@ mod tests {
 
         std::fs::remove_dir(&worktree).unwrap();
 
-        prune_empty_parent_dirs(&worktree, &main_repo);
+        prune_empty_parent_dirs(&worktree, &main_repo, &[&CleanupProtection::default()]);
 
         assert!(wrapper.exists(), "wrapper with stray file must survive");
         assert!(stray.exists(), "stray file must not be touched");

@@ -138,7 +138,13 @@ On the delete side, aoe runs `git submodule deinit -f --all` before `git worktre
 
 ### Trashing relocates the worktree
 
-Moving a worktree session to the trash (rather than purging it) relocates its worktree out of the active worktree dir into a sibling `.aoe-trash/<session-id>` holding directory via `git worktree move`, so trashed sessions stop cluttering the active checkouts. The worktree stays a live checkout, so previewing a trashed session still works. Restoring the session moves the worktree back to its original path; if that path is now occupied, the restore is refused so nothing is overwritten. Purging a trashed session removes the worktree from the holding dir. Sessions trashed before this behavior existed are relocated the next time the daemon starts or the TUI loads.
+Trashing a managed worktree session moves its checkout into a sibling `.aoe-trash/<session-id>` holding directory via `git worktree move`. If relocation fails, the session remains in the trash and its recorded path is unchanged. The default branch checkout is protected as described below.
+
+Restore moves the worktree back to its original path. If that path is occupied, the session stays in the trash and nothing is overwritten; clear the conflict and retry. Restoring leaves the agent stopped. Start it explicitly when ready to resume. Purging a trashed session removes the worktree from the holding directory. Interrupted relocations are reconciled when the daemon starts or the TUI loads.
+
+Without Force, purge preserves a dirty worktree and retains its session for retry. A workspace purge also stops when a sibling was restored, preserving the owner and its shared worktree.
+
+Native daemon clients can abandon a stuck purge using its current reservation generation. Abandon removes the session record and schedules runtime cleanup; it does not cancel a hook or cleanup already underway, and does not start another worktree or branch removal.
 
 ### The default branch's checkout is never removed
 

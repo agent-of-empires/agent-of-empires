@@ -31,7 +31,18 @@ mod platform {
     pub(super) fn kill_process_group(_: &std::process::Child) {}
 
     pub(super) fn terminate_process_group(_: &std::process::Child) {}
+
+    pub(super) fn try_wait_status_hook(
+        child: &mut std::process::Child,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        child.try_wait()
+    }
 }
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use platform::unix_peer_uid;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use unix::detach_daemon_stdin;
 
 /// System memory + agent-count sampling for the TUI diagnostics strip.
 pub(crate) mod metrics;
@@ -65,7 +76,7 @@ pub fn wait_with_timeout(
     child: &mut Child,
     timeout: Duration,
 ) -> std::io::Result<Option<ExitStatus>> {
-    wait_with_timeout_inner(child, timeout, false)
+    wait_with_timeout_inner(child, timeout, false, false, || false)
 }
 
 /// When `kill_process_group` is true, the caller MUST have configured `child`
@@ -75,18 +86,29 @@ fn wait_with_timeout_inner(
     child: &mut Child,
     timeout: Duration,
     kill_process_group: bool,
+    cleanup_on_exit: bool,
+    cancelled: impl Fn() -> bool,
 ) -> std::io::Result<Option<ExitStatus>> {
-    let deadline = Instant::now() + timeout;
+    let mut deadline = Instant::now() + timeout;
     let termination_grace = (timeout / 4).min(PROCESS_GROUP_TERMINATION_GRACE);
-    let terminate_at = deadline.checked_sub(termination_grace).unwrap_or(deadline);
+    let mut terminate_at = deadline.checked_sub(termination_grace).unwrap_or(deadline);
     let mut termination_requested = false;
     loop {
-        if let Some(status) = child.try_wait()? {
-            if !termination_requested {
+        if !termination_requested {
+            let status = if cleanup_on_exit {
+                platform::try_wait_status_hook(child)?
+            } else {
+                child.try_wait()?
+            };
+            if let Some(status) = status {
                 return Ok(Some(status));
             }
         }
         let now = Instant::now();
+        if !termination_requested && cancelled() {
+            deadline = deadline.min(now + termination_grace);
+            terminate_at = now;
+        }
         if kill_process_group && !termination_requested && now >= terminate_at {
             platform::terminate_process_group(child);
             termination_requested = true;
@@ -132,6 +154,28 @@ pub fn run_with_timeout_process_group(
     )
 }
 
+/// Run a command without capturing output; cancellation terminates and reaps
+/// its process group with the same bounded grace as a timeout.
+/// Remaining process-group members are killed before reaping an exited leader.
+pub(crate) fn run_status_with_timeout_process_group(
+    cmd: &mut Command,
+    timeout: Duration,
+    cancelled: impl Fn() -> bool,
+) -> std::io::Result<Option<ExitStatus>> {
+    if cancelled() {
+        return Ok(None);
+    }
+    platform::configure_process_group(cmd);
+    let mut child = cmd.spawn()?;
+    wait_with_timeout_inner(
+        &mut child,
+        timeout,
+        cfg!(any(target_os = "linux", target_os = "macos")),
+        true,
+        cancelled,
+    )
+}
+
 fn run_with_timeout_inner(
     cmd: &mut Command,
     timeout: Duration,
@@ -143,7 +187,9 @@ fn run_with_timeout_inner(
     cmd.stderr(Stdio::from(stderr_file.reopen()?));
     let mut child = cmd.spawn()?;
 
-    let Some(status) = wait_with_timeout_inner(&mut child, timeout, kill_process_group)? else {
+    let Some(status) =
+        wait_with_timeout_inner(&mut child, timeout, kill_process_group, false, || false)?
+    else {
         return Ok(None);
     };
     // Regular files, rather than pipes drained by background threads, keep
@@ -222,15 +268,19 @@ fn collect_descendants_from_map(
     }
 }
 
-/// Get the PID of the shell process running in a tmux pane
+/// The live shell PID in the exact session’s first pane, the agent pane.
 pub fn get_pane_pid(session_name: &str) -> Option<u32> {
-    // Use `^.0` to target the first window's first pane regardless of
-    // base-index or which pane is active, so we always query the agent's
-    // pane even when the user has created additional tmux windows or split
-    // panes.  See #435, #488.
-    let target = format!("{session_name}:^.0");
+    let pane = crate::tmux::first_pane_id(session_name)?;
+    // The pane id must travel alone: `session:%id` reads as a window
+    // spec and falls back to the window's active pane (tmux 3.7c).
     let output = crate::tmux::tmux_command()
-        .args(["display-message", "-t", &target, "-p", "#{pane_pid}"])
+        .args([
+            "display-message",
+            "-t",
+            &pane,
+            "-p",
+            "#{pane_dead}\t#{pane_pid}",
+        ])
         .output()
         .ok()?;
 
@@ -248,7 +298,11 @@ pub fn get_pane_pid(session_name: &str) -> Option<u32> {
         return None;
     }
 
-    let pid = String::from_utf8_lossy(&output.stdout).trim().parse().ok();
+    let pid = std::str::from_utf8(&output.stdout)
+        .ok()
+        .and_then(|value| value.trim().strip_prefix("0\t"))
+        .and_then(|pid| pid.parse::<u32>().ok())
+        .filter(|pid| *pid > 0 && i32::try_from(*pid).is_ok());
     if tracing::enabled!(target: "process.ppid", tracing::Level::TRACE) {
         tracing::trace!(
             target: "process.ppid",
@@ -1110,12 +1164,13 @@ mod tests {
 
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn run_with_timeout_process_group_kills_descendants() {
-        let tmp = tempfile::tempdir().unwrap();
-        let pid_path = tmp.path().join("descendant.pid");
-        let term_path = tmp.path().join("terminated");
-        let mut cmd = Command::new("sh");
-        cmd.args([
+    fn timeout_and_cancellation_terminate_process_group_descendants() {
+        for cancel in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let pid_path = tmp.path().join("descendant.pid");
+            let term_path = tmp.path().join("terminated");
+            let mut cmd = Command::new("sh");
+            cmd.args([
             "-c",
             "trap 'printf term > \"$2\"' TERM; sleep 10 & child=$!; printf %s \"$child\" > \"$1\"; wait",
             "sh",
@@ -1123,36 +1178,76 @@ mod tests {
         .arg(&pid_path)
         .arg(&term_path);
 
-        let result = run_with_timeout_process_group(&mut cmd, Duration::from_secs(2)).unwrap();
-        assert!(result.is_none(), "process group should time out");
-        assert_eq!(
-            std::fs::read_to_string(term_path).expect("SIGTERM trap should run"),
-            "term",
-            "the process-group leader must receive SIGTERM before escalation"
-        );
-
-        let pid: i32 = std::fs::read_to_string(pid_path)
-            .expect("shell should publish descendant pid")
-            .parse()
+            let result = if cancel {
+                run_status_with_timeout_process_group(&mut cmd, Duration::from_secs(30), || {
+                    pid_path.exists()
+                })
+            } else {
+                run_with_timeout_process_group(&mut cmd, Duration::from_secs(2))
+                    .map(|output| output.map(|output| output.status))
+            }
             .unwrap();
-        let process_is_running = |pid: i32| {
-            let output = Command::new("ps")
-                .args(["-o", "stat=", "-p", &pid.to_string()])
-                .output()
-                .expect("ps should inspect descendant state");
-            let state = String::from_utf8_lossy(&output.stdout);
-            output.status.success()
-                && !state.trim().is_empty()
-                && !state.trim_start().starts_with('Z')
-        };
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while process_is_running(pid) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
+            assert!(result.is_none(), "process group must be interrupted");
+            assert_eq!(
+                std::fs::read_to_string(term_path).expect("SIGTERM trap should run"),
+                "term",
+                "the process-group leader must receive SIGTERM before escalation"
+            );
+
+            let pid: i32 = std::fs::read_to_string(pid_path)
+                .expect("shell should publish descendant pid")
+                .parse()
+                .unwrap();
+            let process_is_running = |pid: i32| {
+                let output = Command::new("ps")
+                    .args(["-o", "stat=", "-p", &pid.to_string()])
+                    .output()
+                    .expect("ps should inspect descendant state");
+                let state = String::from_utf8_lossy(&output.stdout);
+                output.status.success()
+                    && !state.trim().is_empty()
+                    && !state.trim_start().starts_with('Z')
+            };
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while process_is_running(pid) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                !process_is_running(pid),
+                "descendant must be exited or a terminated zombie after interruption"
+            );
         }
-        assert!(
-            !process_is_running(pid),
-            "descendant must be exited or a terminated zombie after the timeout"
-        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn completed_status_hook_does_not_abandon_background_children() {
+        let root = tempfile::tempdir().unwrap();
+        let pid_path = root.path().join("child.pid");
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", r#"sleep 30 & printf %s $! > "$1""#, "sh"])
+            .arg(&pid_path);
+        let result =
+            run_status_with_timeout_process_group(&mut command, Duration::from_secs(2), || false)
+                .unwrap();
+        assert!(result.unwrap().success());
+        let pid: i32 = std::fs::read_to_string(pid_path).unwrap().parse().unwrap();
+        let output = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&output.stdout);
+        let running = output.status.success()
+            && !state.trim().is_empty()
+            && !state.trim_start().starts_with('Z');
+        if running {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        assert!(!running, "completed hook left its background child running");
     }
 
     #[test]

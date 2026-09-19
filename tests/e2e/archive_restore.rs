@@ -114,6 +114,9 @@ fn test_archive_then_unarchive_cycle() {
     );
 
     h.spawn_tui();
+    // The native pane preparation refuses an unhealthy runtime, so wait for the
+    // subscription to report readiness before driving panes.
+    h.wait_for("Runtime ready");
     h.wait_for_ready();
     h.wait_for("Archivo");
     h.wait_for("Neighbor");
@@ -150,8 +153,23 @@ fn test_archive_then_unarchive_cycle() {
     );
 
     // Unarchive it; the row returns to the active list, still selected.
+    // The archive command can still be in flight here, and the native lane
+    // refuses a second change for the same row until the first resolves (a local
+    // toggle had no such window). Press, and press once more if the row is still
+    // parked, instead of racing that window.
     h.send_keys("z");
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    while h.capture_screen().contains("is parked") && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    if h.capture_screen().contains("is parked") {
+        h.send_keys("z");
+    }
     h.wait_for_absent("is parked", Duration::from_secs(5));
+    // The unarchive is a daemon mutation now, so the row rises when the applied
+    // snapshot carries the cleared stamp: wait for the empty section to go with
+    // it before asserting on a single frame.
+    h.wait_for_absent("Archived (", Duration::from_secs(5));
     // The unarchive triggers a full clear+redraw. `wait_for_absent` above can
     // satisfy on the transient blank frame mid-redraw, so a bare capture here
     // races the repaint and sometimes catches an empty screen (the same blank
@@ -171,8 +189,15 @@ fn test_archive_then_unarchive_cycle() {
     // The unarchived row is Stopped (archive killed its pane). Once the poller
     // stamps the gone-error, the preview must show the calm Stopped placeholder,
     // not the red "tmux session is gone" crash error.
-    h.wait_for("isn't running");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !h.capture_screen().contains("isn't running") && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(150));
+    }
     let stopped = h.capture_screen();
+    assert!(
+        stopped.contains("isn't running"),
+        "the unarchived row should show the calm stopped preview\n{stopped}"
+    );
     assert!(
         !stopped.contains("tmux session is gone"),
         "stopped preview must not show the red corpse error\n{stopped}"
@@ -444,6 +469,9 @@ fn test_tui_bulk_archive_group_tears_down_all_tmux_off_thread() {
     }
 
     h.spawn_tui();
+    // The native pane preparation refuses an unhealthy runtime, so wait for the
+    // subscription to report readiness before driving panes.
+    h.wait_for("Runtime ready");
     h.wait_for_ready();
     // The group header renders as "name (count)"; its presence proves the group
     // loaded with all three members.

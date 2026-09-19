@@ -4,6 +4,7 @@ import { ProjectSearchList } from "./ProjectSearchList";
 import { useProjectPicker } from "./projectPicker";
 
 interface Props {
+  profile: string | undefined;
   primaryPath: string;
   selectedPaths: string[];
   onChange: (paths: string[]) => void;
@@ -89,6 +90,7 @@ function RepoBaseInput({
 }
 
 export function ExtraReposPicker({
+  profile,
   primaryPath,
   selectedPaths,
   onChange,
@@ -100,9 +102,10 @@ export function ExtraReposPicker({
 
   // Hide the primary repo from the picker so users can't accidentally
   // duplicate it (the builder rejects duplicate repo names).
-  const { loading, saved, recent, query, setQuery, filteredSaved, filteredRecent, hasAnyProjects } = useProjectPicker([
-    primaryPath,
-  ]);
+  const { loading, saved, recent, query, setQuery, filteredSaved, filteredRecent, hasAnyProjects } = useProjectPicker(
+    profile,
+    [primaryPath],
+  );
 
   const setRepoBase = (path: string, base: string) => {
     const next = { ...repoBases };

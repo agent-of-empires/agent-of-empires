@@ -22,6 +22,10 @@ export function wizard(page: Page): Locator {
 
 /** Open the wizard with the `n` keyboard shortcut and wait for it to mount. */
 export async function openWizard(page: Page) {
+  // Navigation/body actionability can precede AppContent mounting past the
+  // login-status gate. Match the scratch-shortcut readiness guard before
+  // sending a one-shot key event that would otherwise be lost during startup.
+  await expect(page.getByRole("button", { name: /New session/ }).first()).toBeVisible();
   await page.locator("body").click();
   await page.keyboard.press("n");
   await expect(page.getByTestId("session-wizard")).toBeVisible();

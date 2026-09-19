@@ -11,13 +11,12 @@ use std::{
 use anyhow::{bail, Result};
 use chrono::Utc;
 
+use super::path_identity::CleanupProtection;
 use crate::containers;
 use crate::git::error::GitError;
 use crate::git::GitWorktree;
 
-use super::{
-    civilizations, Config, Instance, SandboxInfo, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
-};
+use super::{civilizations, Instance, SandboxInfo, WorkspaceInfo, WorkspaceRepo, WorktreeInfo};
 
 /// Parameters for creating a new session instance.
 #[derive(Debug, Clone)]
@@ -65,7 +64,7 @@ pub struct InstanceParams {
 /// Result of building an instance, tracking what was created for cleanup purposes.
 pub struct BuildResult {
     pub instance: Instance,
-    /// Path to worktree if one was created and managed by aoe
+    /// Owned checkout or branch from single-worktree provisioning.
     pub created_worktree: Option<CreatedWorktree>,
     /// Workspace worktrees created during build (for cleanup)
     pub created_workspace_worktrees: Vec<CreatedWorktree>,
@@ -74,10 +73,95 @@ pub struct BuildResult {
     pub warnings: Vec<String>,
 }
 
-/// A worktree provisioned during instance building and owned by this build.
+pub(crate) struct InstancePlan {
+    pub result: BuildResult,
+    provisioning: Provisioning,
+}
+
+enum Provisioning {
+    None,
+    Scratch,
+    Worktree {
+        create_new_branch: bool,
+        init_submodules: bool,
+    },
+    Workspace(WorkspacePlan),
+}
+
+impl InstancePlan {
+    pub fn provision(mut self) -> std::result::Result<BuildResult, Box<BuildFailure>> {
+        let outcome = (|| -> Result<()> {
+            match self.provisioning {
+                Provisioning::None => {}
+                Provisioning::Scratch => {
+                    super::scratch::provision_scratch_dir(&self.result.instance.id)?;
+                }
+                Provisioning::Worktree {
+                    create_new_branch,
+                    init_submodules,
+                } => {
+                    let instance = &mut self.result.instance;
+                    let info = instance
+                        .worktree_info
+                        .as_mut()
+                        .expect("worktree plan metadata");
+                    let path = PathBuf::from(&instance.project_path);
+                    let main_repo_path = PathBuf::from(&info.main_repo_path);
+                    let git = GitWorktree::new(main_repo_path.clone())?
+                        .with_init_submodules(init_submodules);
+                    let mut created = crate::git::WorktreeCreation::default();
+                    let outcome = git.create_worktree_tracked(
+                        &info.branch,
+                        &path,
+                        create_new_branch,
+                        info.base_branch.as_deref(),
+                        &mut created,
+                    );
+                    if created.checkout_created || created.branch_created {
+                        info.managed_by_aoe = true;
+                        self.result.created_worktree = Some(CreatedWorktree {
+                            path,
+                            main_repo_path,
+                            checkout_created: created.checkout_created,
+                            owned_branch: created.branch_created.then(|| info.branch.clone()),
+                        });
+                    }
+                    self.result.warnings.extend(outcome?);
+                }
+                Provisioning::Workspace(workspace) => {
+                    workspace.provision(
+                        self.result
+                            .instance
+                            .workspace_info
+                            .as_mut()
+                            .expect("workspace plan metadata"),
+                        &mut self.result.created_workspace_worktrees,
+                        &mut self.result.warnings,
+                    )?;
+                }
+            }
+            Ok(())
+        })();
+        match outcome {
+            Ok(()) => Ok(self.result),
+            Err(error) => Err(Box::new(BuildFailure {
+                result: self.result,
+                error,
+            })),
+        }
+    }
+}
+
+pub(crate) struct BuildFailure {
+    pub result: BuildResult,
+    pub error: anyhow::Error,
+}
+
+/// Owned artifacts from one worktree creation attempt.
 pub struct CreatedWorktree {
     pub path: PathBuf,
     pub main_repo_path: PathBuf,
+    pub checkout_created: bool,
     /// Branch created by this build. `None` when attaching an existing branch.
     pub owned_branch: Option<String>,
 }
@@ -125,7 +209,7 @@ fn resolve_repo_base_branch(
 ) -> Option<String> {
     let main_repo =
         GitWorktree::find_main_repo(repo_path).unwrap_or_else(|_| repo_path.to_path_buf());
-    let key = crate::session::projects::canonical_key(&main_repo.to_string_lossy());
+    let key = crate::session::projects::canonical_key(main_repo.to_string_lossy());
     let project = project_bases.get(&key).map(String::as_str);
     resolve_base_branch(session, project, global)
 }
@@ -224,6 +308,23 @@ pub struct WorkspaceRepoSpec {
     pub base_branch: Option<String>,
 }
 
+struct WorkspaceRepoPlan {
+    repo_path: PathBuf,
+    repo_name: String,
+    main_repo_path: PathBuf,
+    worktree_subdir: PathBuf,
+    base_branch: Option<String>,
+    created: crate::git::WorktreeCreation,
+}
+
+struct WorkspacePlan {
+    workspace_path: PathBuf,
+    branch: String,
+    create_new_branch: bool,
+    init_submodules: bool,
+    repos: Vec<WorkspaceRepoPlan>,
+}
+
 /// Create a multi-repo workspace with worktrees for each repository.
 ///
 /// Validates repo paths, detects name collisions, creates worktrees inside
@@ -236,6 +337,43 @@ pub fn create_workspace(
     workspace_template: &str,
     init_submodules: bool,
 ) -> Result<WorkspaceResult> {
+    let plan = plan_workspace(
+        primary,
+        extra_repos,
+        branch,
+        create_new_branch,
+        workspace_template,
+        init_submodules,
+    )?;
+    let mut result = WorkspaceResult {
+        workspace_info: plan.info(),
+        workspace_path: plan.workspace_path.clone(),
+        created_worktrees: Vec::new(),
+        warnings: Vec::new(),
+    };
+    if let Err(error) = plan.provision(
+        &mut result.workspace_info,
+        &mut result.created_worktrees,
+        &mut result.warnings,
+    ) {
+        cleanup_workspace(
+            &result.workspace_info,
+            &result.created_worktrees,
+            &CleanupProtection::default(),
+        );
+        return Err(error);
+    }
+    Ok(result)
+}
+
+fn plan_workspace(
+    primary: &WorkspaceRepoSpec,
+    extra_repos: &[WorkspaceRepoSpec],
+    branch: &str,
+    create_new_branch: bool,
+    workspace_template: &str,
+    init_submodules: bool,
+) -> Result<WorkspacePlan> {
     let primary_main_repo = GitWorktree::find_main_repo(&primary.path)?;
     let primary_git_wt = GitWorktree::new(primary_main_repo)?;
 
@@ -244,8 +382,6 @@ pub fn create_workspace(
 
     let workspace_path =
         primary_git_wt.compute_path(branch, workspace_template, session_id_short)?;
-    let workspace_dir = workspace_path.to_string_lossy().to_string();
-    std::fs::create_dir_all(&workspace_path)?;
 
     // (canonicalized path, resolved base branch) for the primary repo followed
     // by every extra repo. The primary path is left as the caller passed it;
@@ -268,7 +404,6 @@ pub fn create_workspace(
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "repo".to_string());
         if !seen_names.insert(name.clone()) {
-            let _ = std::fs::remove_dir_all(&workspace_path);
             bail!(
                 "Duplicate repository name '{}' in workspace\n\
                  Tip: Rename one of the directories to avoid the collision",
@@ -277,27 +412,9 @@ pub fn create_workspace(
         }
     }
 
-    let cleanup = |created: &[CreatedWorktree], ws_path: &std::path::Path| {
-        let protection = CleanupProtection::default();
-        for worktree in created {
-            cleanup_created_worktree(worktree, "workspace worktree", &protection);
-        }
-        let _ = std::fs::remove_dir_all(ws_path);
-    };
-
-    // Pre-validate every repo and resolve metadata sequentially. This is cheap
-    // (no network) and lets us fail fast before kicking off any worktree work.
-    struct RepoPlan {
-        repo_path: PathBuf,
-        repo_name: String,
-        main_repo_path: PathBuf,
-        worktree_subdir: PathBuf,
-        base_branch: Option<String>,
-    }
-    let mut plans: Vec<RepoPlan> = Vec::with_capacity(all_repos.len());
+    let mut plans = Vec::with_capacity(all_repos.len());
     for (repo_path, base_branch) in &all_repos {
         if !GitWorktree::is_git_repo(repo_path) {
-            cleanup(&[], &workspace_path);
             bail!(
                 "Path is not in a git repository: {}\n\
                  Tip: All --repo paths must be git repositories",
@@ -317,134 +434,128 @@ pub fn create_workspace(
 
         let worktree_subdir = workspace_path.join(&repo_name);
 
-        plans.push(RepoPlan {
+        plans.push(WorkspaceRepoPlan {
             repo_path: repo_path.clone(),
             repo_name,
             main_repo_path,
             worktree_subdir,
             base_branch: base_branch.clone(),
+            created: crate::git::WorktreeCreation::default(),
         });
     }
 
-    // Run create_worktree for every repo concurrently. Each worktree lives in
-    // a different directory and uses a different main repo, so the operations
-    // are independent. Network IO (git fetch + git submodule update) dominates
-    // each step, so fanning out cuts wall time roughly to that of the slowest
-    // repo.
-    let create_start = std::time::Instant::now();
-    let parallel_results: Vec<std::result::Result<Vec<String>, String>> =
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = plans
+    Ok(WorkspacePlan {
+        workspace_path,
+        branch: branch.to_string(),
+        create_new_branch,
+        init_submodules,
+        repos: plans,
+    })
+}
+
+impl WorkspacePlan {
+    fn info(&self) -> WorkspaceInfo {
+        WorkspaceInfo {
+            branch: self.branch.clone(),
+            workspace_dir: self.workspace_path.to_string_lossy().to_string(),
+            repos: self
+                .repos
                 .iter()
-                .map(|plan| {
-                    let branch = branch.to_string();
-                    let base = plan.base_branch.clone();
-                    let main_repo_path = plan.main_repo_path.clone();
-                    let worktree_subdir = plan.worktree_subdir.clone();
-                    let repo_name = plan.repo_name.clone();
-                    scope.spawn(move || -> std::result::Result<Vec<String>, String> {
-                        let repo_start = std::time::Instant::now();
-                        let result = (|| -> std::result::Result<Vec<String>, String> {
-                            let git_wt = GitWorktree::new(main_repo_path)
-                                .map_err(|e| format!("{}: {}", repo_name, e))?
+                .map(|repo| WorkspaceRepo {
+                    name: repo.repo_name.clone(),
+                    source_path: repo.repo_path.to_string_lossy().to_string(),
+                    branch: self.branch.clone(),
+                    worktree_path: repo.worktree_subdir.to_string_lossy().to_string(),
+                    main_repo_path: repo.main_repo_path.to_string_lossy().to_string(),
+                    managed_by_aoe: false,
+                    branch_preexisting: true,
+                    base_branch: self
+                        .create_new_branch
+                        .then(|| repo.base_branch.clone())
+                        .flatten(),
+                    base_branch_override: None,
+                })
+                .collect(),
+            created_at: Utc::now(),
+            cleanup_on_delete: false,
+        }
+    }
+    fn provision(
+        self,
+        info: &mut WorkspaceInfo,
+        created_worktrees: &mut Vec<CreatedWorktree>,
+        warnings: &mut Vec<String>,
+    ) -> Result<()> {
+        let Self {
+            workspace_path,
+            branch,
+            create_new_branch,
+            init_submodules,
+            repos: mut plans,
+        } = self;
+        if let Some(parent) = workspace_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::create_dir(&workspace_path)?;
+        info.cleanup_on_delete = true;
+        let branch = branch.as_str();
+        let parallel_results: Vec<std::result::Result<Vec<String>, String>> =
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = plans
+                    .iter_mut()
+                    .map(|plan| {
+                        scope.spawn(move || {
+                            let git = GitWorktree::new(plan.main_repo_path.clone())
+                                .map_err(|error| format!("{}: {error}", plan.repo_name))?
                                 .with_init_submodules(init_submodules);
-                            git_wt
-                                .create_worktree(
-                                    &branch,
-                                    &worktree_subdir,
-                                    create_new_branch,
-                                    base.as_deref(),
-                                )
-                                .map_err(|e| format!("{}: {}", repo_name, e))
-                        })();
-                        tracing::info!(target: "session.create",
-                            "workspace create: repo={} elapsed={:?} ok={}",
-                            repo_name,
-                            repo_start.elapsed(),
-                            result.is_ok()
-                        );
-                        result
+                            git.create_worktree_tracked(
+                                branch,
+                                &plan.worktree_subdir,
+                                create_new_branch,
+                                plan.base_branch.as_deref(),
+                                &mut plan.created,
+                            )
+                            .map_err(|error| format!("{}: {error}", plan.repo_name))
+                        })
                     })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| match h.join() {
-                    Ok(r) => r,
-                    Err(_) => Err("worktree thread panicked".to_string()),
-                })
-                .collect()
-        });
-    tracing::info!(target: "session.create",
-        "workspace create: {} repos completed in {:?}",
-        plans.len(),
-        create_start.elapsed()
-    );
-
-    let mut warnings: Vec<String> = Vec::new();
-    let mut errors: Vec<String> = Vec::new();
-    let mut created_worktrees: Vec<CreatedWorktree> = Vec::new();
-    let mut repos: Vec<WorkspaceRepo> = Vec::with_capacity(plans.len());
-
-    for (plan, result) in plans.iter().zip(parallel_results) {
-        match result {
-            Ok(w) => {
-                warnings.extend(w);
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| match handle.join() {
+                        Ok(result) => result,
+                        Err(_) => Err("worktree thread panicked".to_string()),
+                    })
+                    .collect()
+            });
+        let mut errors = Vec::new();
+        for ((plan, result), repo) in plans.iter().zip(parallel_results).zip(&mut info.repos) {
+            repo.managed_by_aoe = plan.created.checkout_created;
+            repo.branch_preexisting = !plan.created.branch_created;
+            if plan.created.checkout_created || plan.created.branch_created {
                 created_worktrees.push(CreatedWorktree {
                     path: plan.worktree_subdir.clone(),
                     main_repo_path: plan.main_repo_path.clone(),
-                    owned_branch: create_new_branch.then(|| branch.to_string()),
-                });
-                repos.push(WorkspaceRepo {
-                    name: plan.repo_name.clone(),
-                    source_path: plan.repo_path.to_string_lossy().to_string(),
-                    branch: branch.to_string(),
-                    worktree_path: plan.worktree_subdir.to_string_lossy().to_string(),
-                    main_repo_path: plan.main_repo_path.to_string_lossy().to_string(),
-                    managed_by_aoe: true,
-                    // The builder always creates the branch it names, so branch
-                    // and worktree ownership coincide for a repo present at
-                    // creation. Only `attach_project` can set this.
-                    branch_preexisting: false,
-                    // The ref this repo's branch was forked from, so the diff
-                    // view can default to it per repo (#3329). Recorded only
-                    // when the branch was created here; `create_worktree`
-                    // ignores the base when checking out an existing branch.
-                    base_branch: create_new_branch
-                        .then(|| plan.base_branch.clone())
-                        .flatten(),
-                    base_branch_override: None,
+                    checkout_created: plan.created.checkout_created,
+                    owned_branch: plan.created.branch_created.then(|| branch.to_string()),
                 });
             }
-            Err(msg) => errors.push(msg),
+            match result {
+                Ok(output) => warnings.extend(output),
+                Err(error) => errors.push(error),
+            }
         }
-    }
-
-    if !errors.is_empty() {
-        cleanup(&created_worktrees, &workspace_path);
         if errors.len() == 1 {
             bail!("Failed to create worktree for {}", errors.remove(0));
-        } else {
+        }
+        if !errors.is_empty() {
             bail!(
                 "Failed to create worktrees ({} repos):\n  - {}",
                 errors.len(),
                 errors.join("\n  - ")
             );
         }
+        Ok(())
     }
-
-    Ok(WorkspaceResult {
-        workspace_info: WorkspaceInfo {
-            branch: branch.to_string(),
-            workspace_dir,
-            repos,
-            created_at: Utc::now(),
-            cleanup_on_delete: true,
-        },
-        created_worktrees,
-        workspace_path,
-        warnings,
-    })
 }
 
 /// Build an instance with all setup (worktree resolution, sandbox config).
@@ -458,6 +569,30 @@ pub fn build_instance(
     existing_branches: &[&str],
     profile: &str,
 ) -> Result<BuildResult> {
+    plan_instance(params, existing_titles, existing_branches, profile)?
+        .provision()
+        .map_err(|failure| {
+            let protection = CleanupProtection::default();
+            if let Some(worktree) = &failure.result.created_worktree {
+                cleanup_created_worktree(worktree, "worktree", &protection);
+            }
+            if let Some(workspace) = &failure.result.instance.workspace_info {
+                cleanup_workspace(
+                    workspace,
+                    &failure.result.created_workspace_worktrees,
+                    &protection,
+                );
+            }
+            failure.error
+        })
+}
+
+pub(crate) fn plan_instance(
+    params: InstanceParams,
+    existing_titles: &[&str],
+    existing_branches: &[&str],
+    profile: &str,
+) -> Result<InstancePlan> {
     // Host-only agents (e.g. settl) cannot run in a sandbox or use worktrees.
     let is_host_only = crate::agents::get_agent(&params.tool).is_some_and(|a| a.host_only);
     if is_host_only && params.sandbox {
@@ -489,25 +624,16 @@ pub fn build_instance(
         }
     }
 
-    // Scratch sessions have no project repo, so config resolution falls
-    // back to global+profile defaults (`Path::new("")` makes
-    // `resolve_config_with_repo` skip the repo-config layer cleanly).
+    // Scratch sessions use only global and profile settings.
     let config_path = if params.scratch {
         std::path::PathBuf::new()
     } else {
         std::path::PathBuf::from(&params.path)
     };
-    let config =
-        super::config::repo_config::resolve_config_with_repo(profile, &config_path).unwrap_or_else(|e| {
-            tracing::warn!(target: "session.create", "Failed to load config, using defaults: {}", e);
-            Config::default()
-        });
+    let config = super::config::repo_config::resolve_config_with_repo(profile, &config_path)?;
 
     let mut final_path = if params.scratch {
-        // Provisioning happens after `Instance::new` so we can key the
-        // directory on the generated instance id. Leave `final_path` empty
-        // for now; the worktree/workspace and path-existence blocks below
-        // are gated on the same flag.
+        // Scratch paths depend on the instance ID.
         String::new()
     } else {
         PathBuf::from(&params.path)
@@ -517,9 +643,8 @@ pub fn build_instance(
     };
 
     let mut worktree_info = None;
-    let mut created_worktree = None;
+    let mut provisioning = Provisioning::None;
     let mut workspace_info = None;
-    let mut created_workspace_worktrees: Vec<CreatedWorktree> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let taken_branches = collect_taken_branches_for_derived_dedupe(
         existing_branches,
@@ -597,7 +722,7 @@ pub fn build_instance(
                 })
                 .collect();
 
-            let ws_result = create_workspace(
+            let workspace = plan_workspace(
                 &primary,
                 &extra_repos,
                 branch,
@@ -606,12 +731,10 @@ pub fn build_instance(
                 config.worktree.init_submodules,
             )?;
 
-            final_path = ws_result.workspace_path.to_string_lossy().to_string();
-            workspace_info = Some(ws_result.workspace_info);
-            created_workspace_worktrees = ws_result.created_worktrees;
-            warnings.extend(ws_result.warnings);
+            final_path = workspace.workspace_path.to_string_lossy().to_string();
+            workspace_info = Some(workspace.info());
+            provisioning = Provisioning::Workspace(workspace);
         } else {
-            // Single worktree mode (existing logic)
             let path = PathBuf::from(&params.path);
             if !GitWorktree::is_git_repo(&path) {
                 // Typed error (not a bare `bail!` string) so the web handler's
@@ -659,19 +782,16 @@ pub fn build_instance(
                     let session_id = uuid::Uuid::new_v4().to_string();
                     let worktree_path = git_wt.compute_path(branch, template, &session_id[..8])?;
 
-                    let w = git_wt.create_worktree(branch, &worktree_path, false, None)?;
-                    warnings.extend(w);
+                    provisioning = Provisioning::Worktree {
+                        create_new_branch: false,
+                        init_submodules: config.worktree.init_submodules,
+                    };
 
                     final_path = worktree_path.to_string_lossy().to_string();
-                    created_worktree = Some(CreatedWorktree {
-                        path: worktree_path,
-                        main_repo_path: main_repo_path.clone(),
-                        owned_branch: None,
-                    });
                     worktree_info = Some(WorktreeInfo {
                         branch: branch.clone(),
                         main_repo_path: main_repo_path.to_string_lossy().to_string(),
-                        managed_by_aoe: true,
+                        managed_by_aoe: false,
                         created_at: Utc::now(),
                         base_branch: None,
                     });
@@ -705,19 +825,16 @@ pub fn build_instance(
                     )
                 });
 
-                let w = git_wt.create_worktree(branch, &worktree_path, true, base.as_deref())?;
-                warnings.extend(w);
+                provisioning = Provisioning::Worktree {
+                    create_new_branch: true,
+                    init_submodules: config.worktree.init_submodules,
+                };
 
                 final_path = worktree_path.to_string_lossy().to_string();
-                created_worktree = Some(CreatedWorktree {
-                    path: worktree_path,
-                    main_repo_path: main_repo_path.clone(),
-                    owned_branch: Some(branch.clone()),
-                });
                 worktree_info = Some(WorktreeInfo {
                     branch: branch.clone(),
                     main_repo_path: main_repo_path.to_string_lossy().to_string(),
-                    managed_by_aoe: true,
+                    managed_by_aoe: false,
                     created_at: Utc::now(),
                     base_branch: base,
                 });
@@ -725,12 +842,8 @@ pub fn build_instance(
         }
     }
 
-    // For scratch sessions, `final_path` is intentionally empty here; the
-    // scratch directory is provisioned below after `Instance::new` runs (we
-    // need the instance id to name the directory). For all other sessions,
-    // catch the typed-a-bad-path case before tmux silently falls back to
-    // the home directory.
-    if !params.scratch {
+    // Only borrowed paths must already exist during preparation.
+    if !params.scratch && matches!(provisioning, Provisioning::None) {
         let final_path_buf = PathBuf::from(&final_path);
         if !final_path_buf.exists() {
             bail!("Project path does not exist: {}", final_path);
@@ -742,7 +855,8 @@ pub fn build_instance(
 
     let mut instance = Instance::new(&final_title, &final_path);
     if params.scratch {
-        let dir = super::scratch::provision_scratch_dir(&instance.id)?;
+        let dir = super::scratch::scratch_path(&instance.id)?;
+        provisioning = Provisioning::Scratch;
         instance.project_path = dir.to_string_lossy().to_string();
         instance.scratch = true;
     }
@@ -847,71 +961,17 @@ pub fn build_instance(
         }
     }
 
-    Ok(BuildResult {
-        instance,
-        created_worktree,
-        created_workspace_worktrees,
-        warnings,
+    CleanupProtection::new([&instance])?;
+
+    Ok(InstancePlan {
+        result: BuildResult {
+            instance,
+            created_worktree: None,
+            created_workspace_worktrees: Vec::new(),
+            warnings,
+        },
+        provisioning,
     })
-}
-
-#[derive(Default)]
-struct CleanupProtection<'a> {
-    owner: Option<&'a Instance>,
-}
-
-impl CleanupProtection<'_> {
-    fn paths_equal(left: &Path, right: &Path) -> bool {
-        left == right
-            || left
-                .canonicalize()
-                .ok()
-                .zip(right.canonicalize().ok())
-                .is_some_and(|(left, right)| left == right)
-    }
-
-    /// Exact matches protect a winner-owned worktree; containment protects a
-    /// winner path nested under a workspace root from recursive root cleanup.
-    fn path_references_target(reference: &Path, target: &Path) -> bool {
-        if reference == target || reference.starts_with(target) {
-            return true;
-        }
-        reference
-            .canonicalize()
-            .ok()
-            .zip(target.canonicalize().ok())
-            .is_some_and(|(reference, target)| reference == target || reference.starts_with(target))
-    }
-
-    fn references_path(&self, target: &Path) -> bool {
-        let Some(owner) = self.owner else {
-            return false;
-        };
-        if Self::path_references_target(Path::new(&owner.project_path), target) {
-            return true;
-        }
-        owner.workspace_info.as_ref().is_some_and(|workspace| {
-            Self::path_references_target(Path::new(&workspace.workspace_dir), target)
-                || workspace.repos.iter().any(|repo| {
-                    Self::path_references_target(Path::new(&repo.worktree_path), target)
-                })
-        })
-    }
-
-    fn references_branch(&self, main_repo_path: &Path, branch: &str) -> bool {
-        let Some(owner) = self.owner else {
-            return false;
-        };
-        owner.worktree_info.as_ref().is_some_and(|worktree| {
-            Self::paths_equal(Path::new(&worktree.main_repo_path), main_repo_path)
-                && worktree.branch == branch
-        }) || owner.workspace_info.as_ref().is_some_and(|workspace| {
-            workspace.repos.iter().any(|repo| {
-                Self::paths_equal(Path::new(&repo.main_repo_path), main_repo_path)
-                    && repo.branch == branch
-            })
-        })
-    }
 }
 
 /// Remove a worktree and then its build-owned branch. The branch stays intact
@@ -919,8 +979,14 @@ impl CleanupProtection<'_> {
 fn cleanup_created_worktree(
     created: &CreatedWorktree,
     label: &str,
-    protection: &CleanupProtection<'_>,
+    protection: &CleanupProtection,
 ) {
+    if !created.checkout_created {
+        if let Err(error) = cleanup_unchecked_out_branch(created, std::iter::once(protection)) {
+            tracing::warn!(target: "session.create", "Failed to clean up {label} branch: {error}");
+        }
+        return;
+    }
     if protection.references_path(&created.path) {
         tracing::debug!(
             target: "session.create",
@@ -947,50 +1013,76 @@ fn cleanup_created_worktree(
     }
 }
 
+pub(crate) fn cleanup_unchecked_out_branch<'a>(
+    created: &CreatedWorktree,
+    mut protection: impl Iterator<Item = &'a CleanupProtection>,
+) -> Result<()> {
+    let Some(branch) = created.owned_branch.as_deref() else {
+        return Ok(());
+    };
+    if protection.any(|owner| owner.references_branch(&created.main_repo_path, branch)) {
+        return Ok(());
+    }
+    let git = GitWorktree::new(created.main_repo_path.clone())?;
+    if git.protected_default_branch_names()?.contains(branch) {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        git.worktree_path_for_branch(branch)?.is_none(),
+        "Creation branch cleanup refused a registered checkout"
+    );
+    git.delete_branch(branch)?;
+    Ok(())
+}
+
+fn cleanup_workspace(
+    info: &WorkspaceInfo,
+    created: &[CreatedWorktree],
+    protection: &CleanupProtection,
+) {
+    for worktree in created {
+        cleanup_created_worktree(worktree, "workspace worktree", protection);
+    }
+    if info.cleanup_on_delete && !protection.references_path(Path::new(&info.workspace_dir)) {
+        // Retain anything that worktree cleanup could not safely remove.
+        let _ = std::fs::remove_dir(&info.workspace_dir);
+    }
+}
+
 /// Clean up resources created during a failed or cancelled instance build.
 ///
-/// Runtime resources always belong to the losing build and are stopped first,
-/// so a sandbox bind mount cannot block worktree removal. `protected_owner`
-/// is the persisted row that won a final uniqueness race; filesystem and Git
-/// resources referenced by that row are retained.
+/// Stop the losing build before cleanup; retain resources referenced by `protected_owner`.
 pub fn cleanup_instance(
     instance: &Instance,
     created_worktree: Option<&CreatedWorktree>,
     created_workspace_worktrees: &[CreatedWorktree],
     protected_owner: Option<&Instance>,
 ) {
-    // The loser may never have reached storage, so lifecycle-coordinated stop
-    // cannot reserve its row. Tear down only tmux resources named by its id.
-    // There is no per-build poller/monitor thread to stop here: the build
-    // path's only extra threads are the scoped worktree-creation threads that
-    // join before `build_instance` returns, and the async creation poller's
-    // build thread has already finished delivering its result before a rollback
-    // reaches this helper. So the tmux (below) and container (further down)
-    // teardown reclaim every runtime resource with no thread left running.
-    instance.kill_all_tmux_sessions_without_lifecycle_row();
+    let protection = CleanupProtection::new(protected_owner);
+    if let Err(error) = instance.kill_all_tmux_sessions_without_lifecycle_row() {
+        tracing::warn!(target: "session.create", session_id = %instance.id, %error, "Runtime teardown failed; build resources retained");
+        return;
+    }
 
     if let Some(sandbox) = &instance.sandbox_info {
         if sandbox.enabled {
-            // Direct idempotent teardown, never gated on a separate existence
-            // probe. This must precede filesystem cleanup because the
-            // container bind-mounts the worktree.
+            // Release the bind mount before filesystem cleanup.
             let container = containers::DockerContainer::from_session_id(&instance.id);
             if let containers::Teardown::Failed(e) = container.teardown(&instance.id) {
                 tracing::warn!(target: "session.create", "Failed to clean up container: {}", e);
+                return;
             }
         }
     }
-
-    let protection = CleanupProtection {
-        owner: protected_owner,
+    let protection = match protection {
+        Ok(protection) => protection,
+        Err(error) => {
+            tracing::warn!(target: "session.create", session_id = %instance.id, %error, "Resource ownership unavailable; build resources retained");
+            return;
+        }
     };
 
-    // Scratch dirs are provisioned eagerly inside `build_instance`
-    // (well before this helper's other cleanup targets exist), so an
-    // abort between provisioning and the caller finishing the session
-    // would otherwise leak the directory on disk. Guard the removal
-    // through `is_scratch_path` so a tampered `project_path` cannot
-    // wipe unrelated app data.
+    // Recursive scratch cleanup is restricted to the app namespace.
     if instance.scratch {
         let scratch_path = PathBuf::from(&instance.project_path);
         if !protection.references_path(&scratch_path)
@@ -1010,14 +1102,8 @@ pub fn cleanup_instance(
         cleanup_created_worktree(worktree, "worktree", &protection);
     }
 
-    for worktree in created_workspace_worktrees {
-        cleanup_created_worktree(worktree, "workspace worktree", &protection);
-    }
     if let Some(workspace) = &instance.workspace_info {
-        let workspace_dir = Path::new(&workspace.workspace_dir);
-        if !protection.references_path(workspace_dir) {
-            let _ = std::fs::remove_dir_all(workspace_dir);
-        }
+        cleanup_workspace(workspace, created_workspace_worktrees, &protection);
     }
 }
 
@@ -1697,6 +1783,52 @@ mod tests {
     }
 
     #[test]
+    fn workspace_creation_does_not_adopt_existing_directories() {
+        let repo_parent = init_repo_with_commit("primary");
+        let primary = WorkspaceRepoSpec {
+            path: repo_parent.path().join("primary"),
+            base_branch: None,
+        };
+        for invalid_extra in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let workspace = root.path().join("existing-workspace");
+            std::fs::create_dir(&workspace).unwrap();
+            let marker = workspace.join("owned-by-someone-else");
+            std::fs::write(&marker, "preserve this directory").unwrap();
+            let extra_path = root.path().join("not-a-repository");
+            std::fs::create_dir(&extra_path).unwrap();
+            let extras = if invalid_extra {
+                vec![WorkspaceRepoSpec {
+                    path: extra_path,
+                    base_branch: None,
+                }]
+            } else {
+                Vec::new()
+            };
+            let result = create_workspace(
+                &primary,
+                &extras,
+                "new-branch",
+                true,
+                workspace.to_str().unwrap(),
+                false,
+            );
+            assert_eq!(
+                std::fs::read_to_string(&marker).unwrap(),
+                "preserve this directory"
+            );
+            assert!(
+                result.is_err(),
+                "an existing directory must not become build-owned"
+            );
+            assert!(git2::Repository::open(&primary.path)
+                .unwrap()
+                .find_branch("new-branch", git2::BranchType::Local)
+                .is_err());
+        }
+    }
+
+    #[test]
     fn test_create_workspace_reports_all_concurrent_failures() {
         // Two repos that each only have a "main"/"master" branch. Asking for
         // a non-existent branch with create_new_branch=false makes both
@@ -1733,11 +1865,7 @@ mod tests {
             Err(e) => e,
         };
         let msg = format!("{err}");
-        assert!(
-            msg.contains("Failed to create worktrees"),
-            "multi-error bail! prefix missing: {msg}"
-        );
-        assert!(msg.contains("(2 repos)"), "should report repo count: {msg}");
+        assert!(!workspaces_root.path().join("nonexistent-branch").exists());
         assert!(
             msg.contains("repo-a-fail"),
             "first repo name missing from message: {msg}"
@@ -1746,47 +1874,6 @@ mod tests {
             msg.contains("repo-b-fail"),
             "second repo name missing from message: {msg}"
         );
-    }
-
-    #[test]
-    fn test_create_workspace_single_failure_keeps_simple_message() {
-        // One bad repo; the message should NOT use the multi-error format
-        // (no "(N repos):" prefix) and SHOULD use the singular phrasing.
-        let parent_a = init_repo_with_commit("repo-solo-fail");
-        let repo_a = parent_a.path().join("repo-solo-fail");
-        let workspaces_root = tempfile::TempDir::new().unwrap();
-        let template = workspaces_root
-            .path()
-            .join("{branch}")
-            .to_string_lossy()
-            .into_owned();
-
-        let result = create_workspace(
-            &WorkspaceRepoSpec {
-                path: repo_a,
-                base_branch: None,
-            },
-            &[],
-            "nonexistent-branch",
-            false,
-            &template,
-            true,
-        );
-
-        let err = match result {
-            Ok(_) => panic!("single-repo failure should still surface"),
-            Err(e) => e,
-        };
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("Failed to create worktree for"),
-            "singular phrasing missing: {msg}"
-        );
-        assert!(
-            !msg.contains("repos):"),
-            "single-failure path should not use multi-error wording: {msg}"
-        );
-        assert!(msg.contains("repo-solo-fail"), "repo name missing: {msg}");
     }
 
     #[test]
@@ -1820,7 +1907,7 @@ mod tests {
     fn resolve_repo_base_branch_keys_launch_repo_by_root() {
         let (parent, _tip) = init_repo_with_branch("proj", "release");
         let root = parent.path().join("proj");
-        let key = crate::session::projects::canonical_key(&root.to_string_lossy());
+        let key = crate::session::projects::canonical_key(root.to_string_lossy());
         let mut bases = std::collections::HashMap::new();
         bases.insert(key, "develop".to_string());
 
@@ -1858,7 +1945,7 @@ mod tests {
             .create_worktree("wt-branch", &wt_path, true, None)
             .unwrap();
 
-        let key = crate::session::projects::canonical_key(&root.to_string_lossy());
+        let key = crate::session::projects::canonical_key(root.to_string_lossy());
         let mut bases = std::collections::HashMap::new();
         bases.insert(key, "develop".to_string());
 
@@ -2033,6 +2120,7 @@ mod tests {
         let created = CreatedWorktree {
             path: worktree_path.clone(),
             main_repo_path: main_repo_path.clone(),
+            checkout_created: true,
             owned_branch: Some("rollback-branch".to_string()),
         };
         cleanup_created_worktree(&created, "test worktree", &CleanupProtection::default());
@@ -2169,6 +2257,34 @@ mod tests {
             scratch: false,
             fork_seed: None,
         }
+    }
+    #[test]
+    #[serial_test::serial]
+    fn build_instance_rejects_invalid_config_before_creating_worktree() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
+        let parent = init_repo_with_commit("invalid-config");
+        let project = parent.path().join("invalid-config");
+        std::fs::create_dir(project.join(".agent-of-empires")).unwrap();
+        std::fs::write(project.join(".agent-of-empires/config.toml"), "[worktree").unwrap();
+        let mut params = custom_agent_params(&project, "claude");
+        params.worktree_enabled = true;
+        params.worktree_branch = Some("config-must-not-create".into());
+        params.create_new_branch = true;
+
+        let result = build_instance(params, &[], &[], "default");
+        assert!(
+            result.is_err(),
+            "invalid configuration must reject creation"
+        );
+        let repo = git2::Repository::open(&project).unwrap();
+        assert_eq!(
+            repo.find_branch("config-must-not-create", git2::BranchType::Local)
+                .err()
+                .expect("branch must not be created")
+                .code(),
+            git2::ErrorCode::NotFound,
+        );
     }
 
     #[test]

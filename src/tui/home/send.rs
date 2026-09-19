@@ -19,15 +19,7 @@ pub(super) fn permission_response_tokens(
 
 impl HomeView {
     pub fn set_instance_status(&mut self, id: &str, status: crate::session::Status) {
-        let old_status = self.get_instance(id).map(|inst| inst.status);
         self.mutate_instance(id, |inst| inst.status = status);
-        if let Some(old) = old_status {
-            if old != status {
-                if let Some(inst) = self.get_instance(id).cloned() {
-                    self.handle_status_transition(&inst, old, status, false, true);
-                }
-            }
-        }
     }
 
     /// Stamp `last_accessed_at` on a session (user-initiated interaction).
@@ -60,105 +52,32 @@ impl HomeView {
         }
     }
 
-    /// Run the send-message work after the dialog has been dismissed: call
-    /// `ensure_pane_ready` (which may auto-start or respawn), then deliver
-    /// the keystrokes. Errors are surfaced via `info_dialog` so the caller
-    /// (`execute_action`) only has to clear its transient status.
-    ///
-    pub fn execute_send_message(&mut self, session_id: &str, message: &str) {
-        let target = std::mem::replace(
+    /// Take the target the next message should be delivered to.
+    pub(in crate::tui) fn take_send_target(&mut self) -> live_send::LiveSendTarget {
+        std::mem::replace(
             &mut self.pending_send_target,
             live_send::LiveSendTarget::Agent,
-        );
-        // Same pane-readiness cascades as live-send: agent runs the
-        // full `ensure_pane_ready` (Docker, splash, resume); terminals
-        // just need their tmux session to exist with a live pane. Every cold
-        // target starts at the visible preview size, avoiding an immediate
-        // full-terminal-to-preview resize and its SIGWINCH repaint.
-        let boot_size = self.live_send_boot_size();
-        match &target {
-            live_send::LiveSendTarget::Agent => {
-                let outcome = self.try_mutate_instance_writeback_on_err(session_id, |inst| {
-                    inst.ensure_pane_ready_with_size(boot_size)
-                        .map_err(Into::into)
-                });
-                match outcome {
-                    Ok(Some(EnsureReadyOutcome::ResumeFailed { sid })) => {
-                        self.info_dialog = Some(InfoDialog::new(
-                            "Send Failed",
-                            &format!("Resume failed for sid {sid}; preserved for explicit retry"),
-                        ));
-                        return;
-                    }
-                    Ok(_) => {}
-                    Err(err) => {
-                        self.info_dialog = Some(InfoDialog::new(
-                            "Send Failed",
-                            &format!("Cannot prepare session: {}", err),
-                        ));
-                        return;
-                    }
-                }
-            }
-            live_send::LiveSendTarget::Terminal => {
-                if let Err(e) = self.ensure_terminal_pane_ready(session_id, boot_size) {
-                    self.info_dialog = Some(InfoDialog::new(
-                        "Send Failed",
-                        &format!("Cannot prepare terminal: {}", e),
-                    ));
-                    return;
-                }
-            }
-            live_send::LiveSendTarget::ContainerTerminal => {
-                if let Err(e) = self.ensure_container_terminal_pane_ready(session_id, boot_size) {
-                    self.info_dialog = Some(InfoDialog::new(
-                        "Send Failed",
-                        &format!("Cannot prepare container terminal: {}", e),
-                    ));
-                    return;
-                }
-            }
-            live_send::LiveSendTarget::Tool(name) => {
-                let name = name.clone();
-                if let Err(e) = self.ensure_tool_pane_ready(session_id, &name, boot_size) {
-                    self.info_dialog = Some(InfoDialog::new(
-                        "Send Failed",
-                        &format!("Cannot prepare tool '{}': {}", name, e),
-                    ));
-                    return;
-                }
-            }
-        };
-        let Some(inst) = self.get_instance(session_id) else {
+        )
+    }
+
+    /// Deliver a queued message to a pane the daemon has confirmed ready.
+    pub(in crate::tui) fn finish_send(
+        &mut self,
+        session_id: &str,
+        tmux_name: &str,
+        target: live_send::LiveSendTarget,
+        message: &str,
+    ) {
+        let Some(inst) = self.get_instance(session_id).cloned() else {
             self.info_dialog = Some(InfoDialog::new(
                 "Send Failed",
                 "Session disappeared before the message could be sent.",
             ));
             return;
         };
-        let tmux_session = match &target {
-            live_send::LiveSendTarget::Agent => {
-                match crate::tmux::Session::new(&inst.id, &inst.title) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        self.info_dialog = Some(InfoDialog::new(
-                            "Send Failed",
-                            &format!("Failed to resolve session: {}", e),
-                        ));
-                        return;
-                    }
-                }
-            }
-            live_send::LiveSendTarget::Terminal => crate::tmux::Session::from_name(
-                &crate::tmux::TerminalSession::resolve_name(&inst.id, &inst.title),
-            ),
-            live_send::LiveSendTarget::ContainerTerminal => crate::tmux::Session::from_name(
-                &crate::tmux::ContainerTerminalSession::resolve_name(&inst.id, &inst.title),
-            ),
-            live_send::LiveSendTarget::Tool(name) => crate::tmux::Session::from_name(
-                crate::tmux::ToolSession::new(&inst.id, &inst.title, name).session_name(),
-            ),
-        };
+        // The receipt named the pane the daemon confirmed, so nothing is
+        // resolved locally and a stale name cannot be sent to.
+        let tmux_session = crate::tmux::Session::from_name(tmux_name);
         // Agent gets a tool-specific Enter delay so paste-burst-aware
         // agents (e.g. Codex) don't swallow the final Enter. Shells in
         // the paired terminal panes don't need the delay.

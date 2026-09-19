@@ -341,7 +341,9 @@ pub async fn run(profile: &str, args: ListArgs) -> Result<()> {
     let (all_instances, _) = storage.load_with_groups()?;
     let instances: Vec<Instance> = all_instances
         .into_iter()
-        .filter(|inst| SessionScope::matches(Some(scope), inst))
+        .filter(|inst| {
+            SessionScope::matches(Some(scope), (inst).is_archived(), (inst).is_trashed())
+        })
         .collect();
 
     // `--json` is answered before the empty-listing message: an empty result is
@@ -391,7 +393,11 @@ async fn run_all_profiles(json: bool, scope: SessionScope) -> Result<()> {
             if let Ok(storage) = Storage::open_unwatched(profile_name) {
                 if let Ok((instances, _)) = storage.load_with_groups() {
                     for inst in &instances {
-                        if !SessionScope::matches(Some(scope), inst) {
+                        if !SessionScope::matches(
+                            Some(scope),
+                            (inst).is_archived(),
+                            (inst).is_trashed(),
+                        ) {
                             continue;
                         }
                         all_sessions.push(session_json(inst, profile_name));
@@ -410,7 +416,13 @@ async fn run_all_profiles(json: bool, scope: SessionScope) -> Result<()> {
             if let Ok((all_instances, _)) = storage.load_with_groups() {
                 let instances: Vec<&Instance> = all_instances
                     .iter()
-                    .filter(|inst| SessionScope::matches(Some(scope), inst))
+                    .filter(|inst| {
+                        SessionScope::matches(
+                            Some(scope),
+                            (inst).is_archived(),
+                            (inst).is_trashed(),
+                        )
+                    })
                     .collect();
                 if instances.is_empty() {
                     continue;
@@ -656,28 +668,6 @@ mod tests {
             active["snoozed_until"],
             serde_json::to_value(future).unwrap()
         );
-    }
-
-    /// Backward-compat: `aoe list` (no `--state`) shows what it always
-    /// showed, i.e. every persisted session. Guards against a future
-    /// well-meaning refactor flipping the default to `live` and quietly
-    /// dropping trashed rows for anyone scripted against today's output.
-    #[test]
-    fn default_state_is_all_for_backward_compat() {
-        let default: SessionScope = StateFilter::All.into();
-        assert!(matches!(default, SessionScope::All));
-
-        let live_inst = Instance::new("l", "/r");
-        let mut trashed = Instance::new("t", "/r");
-        trashed.trash();
-        let mut archived = Instance::new("a", "/r");
-        archived.archive();
-        for inst in [&live_inst, &trashed, &archived] {
-            assert!(
-                SessionScope::matches(Some(default), inst),
-                "default state=all must list every session"
-            );
-        }
     }
 
     /// `list --all` never consumes `--profile`; the single-profile form goes

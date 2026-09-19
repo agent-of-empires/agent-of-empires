@@ -30,6 +30,7 @@ test.describe("Sidebar", () => {
     // sidebar, alongside an add-project button. Stub /api/sessions so the app
     // reports online, otherwise the add button stays hidden.
     await page.route("**/api/sessions", (r) => r.fulfill({ json: { sessions: [], workspace_ordering: [] } }));
+    await page.route("**/api/profiles", (r) => r.fulfill({ json: [{ name: "default", is_default: true }] }));
     await page.route("**/api/projects*", (r) =>
       r.fulfill({ json: [{ name: "saved-repo", path: "/work/saved-repo", scope: "global", pinned: false }] }),
     );
@@ -64,6 +65,8 @@ test.describe("Create session from home screen", () => {
   });
 
   test("'Clone URL' pane opens wizard on Clone tab", async ({ page }) => {
+    await page.route("**/api/profiles", (r) => r.fulfill({ json: [{ name: "default", is_default: true }] }));
+    await page.route("**/api/projects*", (r) => r.fulfill({ json: [] }));
     await page.goto("/");
     await page.getByText("Clone URL").click();
     await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();

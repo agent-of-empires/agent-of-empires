@@ -12,9 +12,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
-use super::attached_status_hooks::AttachedStatusHookWatcher;
 use super::home::{HomeView, TerminalMode};
-use super::status_poller::StatusUpdate;
 use super::styles::Theme;
 use crate::containers::image_update::ImageUpdate;
 use crate::session::{get_update_settings, update_app_state, Config};
@@ -80,21 +78,11 @@ fn clear_reported_session_creates(reported: u32, outcome: crate::telemetry::Send
     });
 }
 
-/// Count one TUI session create for the opt-in telemetry trend counter. Bounded
-/// accumulator, read-and-decremented by the snapshot paths; a no-op for
-/// opted-out installs (the snapshot is never built / sent). Called from
-/// `HomeView::add_instance`, the single funnel every TUI create passes through.
+/// Count one TUI session create for the opt-in telemetry trend counter.
+/// Bounded accumulator, read-and-decremented by the snapshot paths; a no-op
+/// for opted-out installs. Called when a daemon-confirmed creation lands.
 pub(super) fn record_session_create() {
     TUI_SESSION_CREATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Test-only read of the process-local create counter, so the `home` module's
-/// `add_instance` gating test can assert real creates count and `Creating`
-/// stubs do not. Tests sharing the counter use the `telemetry_creates` serial
-/// group to avoid racing on this global.
-#[cfg(test)]
-pub(crate) fn session_create_count_for_test() -> u32 {
-    reported_session_creates()
 }
 
 struct UpdateStatus {
@@ -732,26 +720,6 @@ impl App {
         Ok(result)
     }
 
-    fn with_attached_status_hooks<F, R>(
-        &mut self,
-        terminal: &mut Terminal<TuiBackend>,
-        f: F,
-    ) -> Result<(R, Vec<StatusUpdate>)>
-    where
-        F: FnOnce() -> R,
-    {
-        let watcher = AttachedStatusHookWatcher::start(self.home.attached_status_hook_sessions());
-        let result = self.with_raw_mode_disabled(terminal, f);
-        let mut attached_status_updates = Vec::new();
-
-        if let Some(watcher) = watcher {
-            attached_status_updates = watcher.stop();
-        }
-        self.home.reset_status_refresh();
-
-        result.map(|result| (result, attached_status_updates))
-    }
-
     pub fn show_startup_warning(&mut self, message: &str) {
         // Warnings preempt onboarding dialogs so the user sees the problem
         // before the intro walkthrough.
@@ -791,6 +759,7 @@ impl App {
     }
 
     pub async fn run(&mut self, terminal: &mut Terminal<TuiBackend>) -> Result<()> {
+        self.home.connect_runtime();
         // Keep the display snapshots (sessions, pane metadata) fresh off the
         // paint thread: every _for_display helper and the passive preview
         // resize executor answers from these snapshots and never forks in render.
@@ -888,26 +857,22 @@ impl App {
         // the second frame starts overwriting them.
         let mut last_refresh_at: Option<std::time::Instant> = None;
         const REFRESH_COOLDOWN: Duration = Duration::from_millis(15);
-        let mut last_status_refresh = std::time::Instant::now();
+        let mut last_poller_repair = std::time::Instant::now();
         let mut last_metrics_sample = std::time::Instant::now();
-        let mut last_session_feed_refresh = std::time::Instant::now();
         let mut last_disk_refresh = std::time::Instant::now();
         let mut full_heartbeat_deferred = false;
         let mut last_spinner_redraw = std::time::Instant::now();
         let mut last_heartbeat = std::time::Instant::now();
         let mut last_presence_refresh = std::time::Instant::now();
-        let mut last_session_idle_reap = std::time::Instant::now();
         // Throttle for how often the periodic block re-reads settings;
         // without this, the inner guards would re-fire on every loop
         // iteration once any time has passed, hitting the config file at
         // the 20Hz loop rate.
         let mut last_update_eval = std::time::Instant::now();
-        const STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
-        // Structured rows read their status over HTTP from the daemon rather
-        // than from a local tmux scrape, and `/api/sessions` costs the daemon
-        // a few SQLite lookups per structured row. Half the tmux cadence
-        // keeps a status dot feeling live while halving that request rate.
-        const SESSION_FEED_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+        // I5: session-id poller repair cadence only. It MUST NOT refresh
+        // terminal-row status: status/display fields are daemon-authoritative
+        // and arrive via `apply_session_feed` -> `apply_daemon_status_update`.
+        const SESSION_ID_POLLER_REPAIR_INTERVAL: Duration = Duration::from_millis(500);
         const DISK_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
         // Diagnostics-strip sampling. 1s keeps the sparkline responsive to a
         // fast memory climb; request_metrics_refresh is a no-op unless the strip
@@ -921,11 +886,6 @@ impl App {
         // "another instance appeared/left" signal responsive without disk I/O
         // on the hot render path.
         const PRESENCE_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
-        // How often the standalone TUI evaluates plain tmux sessions for idle
-        // auto-stop (`session.auto_stop_idle_secs`, #1690). Matches the serve
-        // daemon's cadence; both reapers claim under the storage lock so they
-        // never double-stop a session when run side by side.
-        const SESSION_IDLE_REAP_INTERVAL: Duration = Duration::from_secs(60);
         // A presence file counts as live while its mtime is within this window.
         // Larger than the liveness heartbeat so a couple of missed beats (busy loop,
         // brief stall) don't drop an instance; matches the push consumer.
@@ -981,6 +941,34 @@ impl App {
             // defect 1), and that EOF from a dead tty is detected (defect 2).
             tokio::select! {
                 event = self.event_stream.as_mut().expect("event_stream missing").next() => {
+                    self.home.apply_session_feed();
+                    if self.home.sidebar_source != crate::tui::session_feed::SidebarSource::Daemon {
+                        match event {
+                            Some(Ok(Event::Key(key)))
+                                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                                #[cfg(feature = "e2e-tests")]
+                                if key.code == KeyCode::F(12) && std::env::var_os("AOE_E2E_INPUT_BARRIER").is_some() {
+                                    self.draw(terminal)?;
+                                    e2e_render_ack(false)?;
+                                    continue;
+                                }
+                                match (key.code, key.modifiers) {
+                                    (KeyCode::Char('q'), KeyModifiers::NONE)
+                                    | (KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
+                                    (KeyCode::Char('r'), KeyModifiers::NONE)
+                                        if self.home.sidebar_source == crate::tui::session_feed::SidebarSource::Disconnected => {
+                                        self.home.connect_runtime();
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            Some(Ok(Event::Resize(_, _))) => {}
+                            None => break,
+                            _ => continue,
+                        }
+                        self.draw(terminal)?;
+                        continue;
+                    }
                     match event {
                         Some(Ok(Event::Key(key))) => {
                             // Only act on key-down / auto-repeat. Terminals that
@@ -1877,15 +1865,11 @@ impl App {
                 needs_full_refresh = true;
             }
 
-            if last_status_refresh.elapsed() >= STATUS_REFRESH_INTERVAL {
-                self.home.request_status_refresh();
+            // I5: session-id repair only, not a status refresh. Terminal-row
+            // status comes from the daemon feed (`apply_session_feed`).
+            if last_poller_repair.elapsed() >= SESSION_ID_POLLER_REPAIR_INTERVAL {
                 self.home.repair_session_id_pollers();
-                last_status_refresh = std::time::Instant::now();
-            }
-
-            if self.home.apply_status_updates() {
-                refresh_needed = true;
-                needs_full_refresh = true;
+                last_poller_repair = std::time::Instant::now();
             }
 
             if last_metrics_sample.elapsed() >= METRICS_SAMPLE_INTERVAL {
@@ -1899,11 +1883,37 @@ impl App {
                 refresh_needed = true;
             }
 
-            if last_session_feed_refresh.elapsed() >= SESSION_FEED_REFRESH_INTERVAL {
-                self.home.request_session_feed_refresh();
-                last_session_feed_refresh = std::time::Instant::now();
-            }
             if self.home.apply_session_feed() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+            let had_native_error = self.home.info_dialog.is_some();
+            if let Some(ready) = self.home.take_native_attachment() {
+                use crate::tui::home::panes::PaneIntent;
+                match ready.intent {
+                    PaneIntent::Attach => self.attach_native_target(ready, terminal)?,
+                    PaneIntent::LiveSend(target) => {
+                        // The toast that covered the revive settles with the
+                        // receipt, exactly as the blocking path used to.
+                        self.update_status = None;
+                        match self
+                            .home
+                            .enter_live_send_with(&ready.id, &ready.tmux_name, target)
+                        {
+                            Ok(()) => self.draw(terminal)?,
+                            Err(()) => self.draw(terminal)?,
+                        }
+                    }
+                    PaneIntent::Send { message, target } => {
+                        self.update_status = None;
+                        self.home
+                            .finish_send(&ready.id, &ready.tmux_name, target, &message);
+                    }
+                }
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+            if !had_native_error && self.home.info_dialog.is_some() {
                 refresh_needed = true;
                 needs_full_refresh = true;
             }
@@ -1913,11 +1923,6 @@ impl App {
             }
 
             if self.home.apply_deletion_results() {
-                refresh_needed = true;
-                needs_full_refresh = true;
-            }
-
-            if self.home.apply_stop_results() {
                 refresh_needed = true;
                 needs_full_refresh = true;
             }
@@ -1932,14 +1937,6 @@ impl App {
                 needs_full_refresh = true;
             }
 
-            if last_session_idle_reap.elapsed() >= SESSION_IDLE_REAP_INTERVAL {
-                last_session_idle_reap = std::time::Instant::now();
-                if self.reap_idle_sessions() {
-                    refresh_needed = true;
-                    needs_full_refresh = true;
-                }
-            }
-
             if self.home.apply_session_id_updates() {
                 refresh_needed = true;
                 needs_full_refresh = true;
@@ -1951,11 +1948,6 @@ impl App {
             }
 
             if self.home.apply_restart_results() {
-                refresh_needed = true;
-                needs_full_refresh = true;
-            }
-            for session_id in self.home.take_restarted_attaches() {
-                self.attach_live_session(&session_id, terminal)?;
                 refresh_needed = true;
                 needs_full_refresh = true;
             }
@@ -3401,6 +3393,11 @@ impl App {
     /// "press Enter" placeholder). An active (entered) view is never
     /// disturbed. Returns true if the mount set changed (needs redraw).
     async fn reconcile_structured_preview(&mut self) -> bool {
+        if self.home.sidebar_source != crate::tui::session_feed::SidebarSource::Daemon {
+            self.preview_mount_pending = None;
+            self.home.structured_preview_pending = false;
+            return self.home.structured_preview.take().is_some();
+        }
         // An entered view owns the selection and keyboard; leave it be,
         // but only while its session is still a live structured row AND
         // still the selected one. A peer (web, another aoe) can delete
@@ -3492,81 +3489,6 @@ impl App {
         true
     }
 
-    /// Auto-stop plain tmux sessions idle past `session.auto_stop_idle_secs`
-    /// (#1690). Runs on a 60s gate from the main loop. Each candidate is
-    /// claimed under the per-profile storage lock (so a co-running `aoe serve`
-    /// cannot double-stop it), marked `Stopped` in memory, then handed to the
-    /// background `StopPoller`; the result is reconciled by `apply_stop_results`
-    /// like a manual stop. Returns true if any session was reaped.
-    fn reap_idle_sessions(&mut self) -> bool {
-        // Live attach state; on a tmux query failure skip this pass rather
-        // than risk reaping a session the user is attached to.
-        let Ok(attached) = crate::tmux::attached_session_names() else {
-            return false;
-        };
-        let now = chrono::Utc::now();
-        // Boundary snapshot: `idle_reap_candidates` takes `&[Instance]`
-        // (shared API with the daemon caller in `src/server/idle_reap.rs`).
-        let instances: Vec<crate::session::Instance> = self.home.instances().cloned().collect();
-        let candidates = crate::session::idle_reap::idle_reap_candidates(
-            &instances,
-            now,
-            &attached,
-            |profile| {
-                crate::session::config::profile_config::resolve_config_or_warn(profile)
-                    .session
-                    .auto_stop_idle_secs
-            },
-        );
-        let mut reaped = false;
-        for cand in candidates {
-            match crate::session::idle_reap::claim_idle_stop(
-                &cand.profile,
-                self.home.file_watch.clone(),
-                &cand.session_id,
-                now,
-                cand.threshold_secs,
-            ) {
-                Ok(Some(instance)) => {
-                    // Mirror Action::StopSession: the claim already persisted
-                    // `Stopped`; reassert it in memory and run the kill off the
-                    // UI thread so a sandbox `docker stop` cannot freeze the TUI.
-                    self.home
-                        .set_instance_status(&cand.session_id, crate::session::Status::Stopped);
-                    self.home
-                        .stop_poller
-                        .request_stop(crate::tui::stop_poller::StopRequest {
-                            session_id: cand.session_id.clone(),
-                            instance,
-                        });
-                    tracing::info!(
-                        target: "tui.idle_reap",
-                        session = %cand.session_id,
-                        profile = %cand.profile,
-                        threshold_secs = cand.threshold_secs,
-                        "auto-stopped idle tmux session",
-                    );
-                    reaped = true;
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        target: "tui.idle_reap",
-                        session = %cand.session_id,
-                        error = %e,
-                        "idle auto-stop claim failed",
-                    );
-                }
-            }
-        }
-        if reaped {
-            if let Err(e) = self.home.save() {
-                tracing::error!(target: "tui.idle_reap", "failed to save after idle reap: {e}");
-            }
-        }
-        reaped
-    }
-
     fn execute_action(
         &mut self,
         action: Action,
@@ -3577,32 +3499,21 @@ impl App {
             Action::AttachSession(id) => {
                 self.attach_session(&id, terminal)?;
             }
-            Action::AttachAfterCreate(id) => {
-                self.dispatch_new_session_attach(&id, terminal)?;
-            }
             Action::AttachTerminal(id, mode) => {
-                self.attach_terminal(&id, mode, terminal)?;
+                self.attach_terminal(&id, mode);
             }
             Action::EditFile(path) => {
                 self.edit_file(&path, terminal)?;
             }
             Action::StopSession(id) => {
-                if let Some(inst) = self.home.get_instance(&id) {
-                    // Run the stop on a background thread: `inst.stop()` calls
-                    // `docker stop` for sandboxed sessions, which can block for
-                    // the container's grace period (~10s) and would otherwise
-                    // freeze the TUI (issue #1496). Set Stopped immediately so
-                    // the status poller won't override to Error while the stop
-                    // is in flight; the result is applied in the main loop via
-                    // `apply_stop_results`.
-                    let request = crate::tui::stop_poller::StopRequest {
-                        session_id: id.clone(),
-                        instance: inst.clone(),
-                    };
-                    self.home
-                        .set_instance_status(&id, crate::session::Status::Stopped);
-                    self.home.save()?;
-                    self.home.stop_poller.request_stop(request);
+                if self.home.get_instance(&id).is_none() {
+                    return Ok(());
+                }
+                if let Err(error) = self.home.submit_daemon_stop_via_ui(&id) {
+                    self.home.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                        "Stop failed",
+                        &error.to_string(),
+                    ));
                 }
             }
             Action::SetTheme(name) => {
@@ -3649,9 +3560,19 @@ impl App {
                         Some(UpdateStatus::transient("Reviving session...".into()));
                     self.draw(terminal)?;
                 }
-                self.home.execute_send_message(&id, &message);
-                if !warm {
+                let target = self.home.take_send_target();
+                // Boot the pane at the size it will be shown at, so entering
+                // live send does not immediately reflow it.
+                let boot_size = self.home.live_send_boot_size();
+                if let Err(error) = self
+                    .home
+                    .prepare_send_target(&id, target, message, boot_size)
+                {
                     self.update_status = None;
+                    self.home.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                        "Send Failed",
+                        &error.to_string(),
+                    ));
                 }
             }
             Action::EnterLiveSend(id) => {
@@ -3675,25 +3596,21 @@ impl App {
                         Some(UpdateStatus::transient("Reviving session...".into()));
                     self.draw(terminal)?;
                 }
-                let outcome = self.home.prepare_live_send(&id);
-                // Settle the toast before redraw so HomeView computes the
-                // geometry the user will actually see. That draw queues the
-                // resize through LiveSendWorker; the action thread never
-                // performs or waits for a tmux resize.
-                if !warm {
-                    self.update_status = match &outcome {
-                        // On clean ready, drop the toast entirely. On Err the
-                        // info_dialog already carries the failure detail, so the
-                        // transient toast just gets in the way.
-                        Ok(()) | Err(()) => None,
-                    };
-                }
-                if outcome.is_ok() {
-                    self.draw(terminal)?;
+                let target = self.home.take_live_send_target();
+                let boot_size = self.home.live_send_boot_size();
+                if let Err(error) = self.home.prepare_live_send_target(&id, target, boot_size) {
+                    // The receipt carries the geometry the user will see, so the
+                    // entry itself happens there; a refusal here only needs to
+                    // drop the toast and explain.
+                    self.update_status = None;
+                    self.home.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                        "Live send failed",
+                        &error.to_string(),
+                    ));
                 }
             }
             Action::AttachToolSession(id, tool_name) => {
-                self.attach_tool_session(&id, &tool_name, terminal)?;
+                self.attach_tool_session(&id, &tool_name);
             }
             Action::RunBackgroundToolSession(id, tool_name) => {
                 self.run_background_tool_session(&id, &tool_name);
@@ -3725,9 +3642,8 @@ impl App {
 
     /// Route a freshly-created session through the configured new-session
     /// mode. Shared by both creation paths (synchronous
-    /// `Action::AttachAfterCreate` and the async branch in the main loop's
-    /// `apply_creation_results` handler) so the mode applies regardless of
-    /// which one fired.
+    /// `apply_creation_results` handler) so the configured mode applies to
+    /// every daemon-created session.
     ///
     /// A structured session skips the tmux modes entirely and opens its
     /// structured view (#2926): the wizard's Structured toggle is an
@@ -3871,10 +3787,12 @@ impl App {
                 return Ok(());
             }
 
-            // Skip on_launch hooks if they already ran in the background creation poller
-            let skip_on_launch = self.home.take_on_launch_hooks_ran(session_id);
-            // The attach follows from the tick loop; failures surface as the
-            // restart worker's dialogs.
+            // The terminal size is read inside `restart_then_attach`, which
+            // sizes the tmux session at creation instead of 80x24 default.
+
+            // The daemon runs on_launch on every start, matching the CLI, so a
+            // TUI start never suppresses them.
+            let skip_on_launch = false;
             self.home
                 .restart_then_attach(session_id, crate::terminal::get_size(), skip_on_launch);
             return Ok(());
@@ -3901,18 +3819,12 @@ impl App {
         // top clipped.
         tmux_session.reset_size_to_latest_client();
         self.home.clear_preview_pane_sync(session_id);
-        let (attach_result, attached_status_updates) =
-            self.with_attached_status_hooks(terminal, || tmux_session.attach())?;
+        let attach_result = self.with_raw_mode_disabled(terminal, || tmux_session.attach())?;
 
         self.needs_redraw = true;
         crate::tmux::refresh_session_cache();
         self.home.reload()?;
-        self.home
-            .apply_status_updates_without_hooks(attached_status_updates);
-        // The user just viewed this session (and any turn that finished
-        // during the attach was applied above without the live-send
-        // exemption). Clear its unread marker on return so the round-trip
-        // nets to read.
+        self.home.apply_session_feed();
         self.home.clear_unread_on_view(session_id);
         self.home.stamp_last_accessed(session_id);
         // Persist so the attach-return bump survives aoe restart. Same
@@ -3955,170 +3867,70 @@ impl App {
         true
     }
 
-    fn attach_terminal(
-        &mut self,
-        session_id: &str,
-        mode: TerminalMode,
-        terminal: &mut Terminal<TuiBackend>,
-    ) -> Result<()> {
-        let instance = match self.home.get_instance(session_id) {
-            Some(inst) => inst.clone(),
-            None => return Ok(()),
-        };
-
-        // Get terminal size to pass to tmux session creation
-        let size = crate::terminal::get_size();
-
-        // Prepare the tmux session before leaving TUI mode
-        let attach_fn: Box<dyn FnOnce() -> Result<()>> = match mode {
-            TerminalMode::Container if instance.is_sandboxed() => {
-                let container_session = instance.container_terminal_tmux_session()?;
-                if !container_session.exists() || container_session.is_pane_dead() {
-                    if self.defer_to_store_move(
-                        session_id,
-                        Action::AttachTerminal(session_id.to_string(), mode),
-                    ) {
-                        return Ok(());
-                    }
-                    if container_session.exists() {
-                        let _ = container_session.kill();
-                    }
-                    if let Err(e) = self
-                        .home
-                        .start_container_terminal_for_instance_with_size(session_id, size)
-                    {
-                        self.home
-                            .set_instance_error(session_id, Some(e.to_string()));
-                        return Ok(());
-                    }
-                }
-                Box::new(move || container_session.attach())
-            }
-            _ => {
-                let terminal_session = instance.terminal_tmux_session()?;
-                if !terminal_session.exists() || terminal_session.is_pane_dead() {
-                    if terminal_session.exists() {
-                        let _ = terminal_session.kill();
-                    }
-                    if let Err(e) = self
-                        .home
-                        .start_terminal_for_instance_with_size(session_id, size)
-                    {
-                        self.home
-                            .set_instance_error(session_id, Some(e.to_string()));
-                        return Ok(());
-                    }
-                }
-                Box::new(move || terminal_session.attach())
-            }
-        };
-
-        let (attach_result, attached_status_updates) =
-            self.with_attached_status_hooks(terminal, attach_fn)?;
-
-        self.needs_redraw = true;
-        crate::tmux::refresh_session_cache();
-        self.home.reload()?;
-        self.home
-            .apply_status_updates_without_hooks(attached_status_updates);
-        if self.home.sort_order() == crate::session::config::SortOrder::Attention {
-            self.home.select_top_attention(Some(session_id));
+    fn attach_terminal(&mut self, session_id: &str, mode: TerminalMode) {
+        let sandboxed = self
+            .home
+            .get_instance(session_id)
+            .is_some_and(|row| row.is_sandboxed());
+        let target = if mode == TerminalMode::Container && sandboxed {
+            crate::session::AuxiliaryTarget::Container { index: 0 }
         } else {
-            self.home.select_session_by_id(session_id);
-        }
-
-        if let Err(e) = attach_result {
-            tracing::warn!(target: "tui.input", "tmux terminal attach returned error: {}", e);
-        }
-
-        Ok(())
+            crate::session::AuxiliaryTarget::Host { index: 0 }
+        };
+        self.prepare_native_attachment(session_id, target);
     }
 
-    fn attach_tool_session(
+    fn attach_tool_session(&mut self, session_id: &str, tool_name: &str) {
+        self.prepare_native_attachment(
+            session_id,
+            crate::session::AuxiliaryTarget::Tool {
+                tool_name: tool_name.into(),
+            },
+        );
+    }
+
+    fn prepare_native_attachment(&mut self, id: &str, target: crate::session::AuxiliaryTarget) {
+        use crate::tui::home::panes::{NativePane, PaneIntent};
+        if let Err(error) = self.home.prepare_native_attachment(
+            id,
+            NativePane::Auxiliary(target),
+            crate::terminal::get_size(),
+            PaneIntent::Attach,
+        ) {
+            self.home.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                "Attachment failed",
+                &error.to_string(),
+            ));
+        }
+    }
+
+    fn attach_native_target(
         &mut self,
-        session_id: &str,
-        tool_name: &str,
+        ready: crate::tui::home::ReadyNativeAttachment,
         terminal: &mut Terminal<TuiBackend>,
     ) -> Result<()> {
-        let instance = match self.home.get_instance(session_id) {
-            Some(inst) => inst.clone(),
-            None => return Ok(()),
-        };
-
-        let tool_config = match self.home.tool_configs.get(tool_name) {
-            Some(tc) => tc.clone(),
-            None => return Ok(()),
-        };
-
-        if tool_config.command.is_empty() {
-            self.home.set_instance_error(
-                session_id,
-                Some(format!("Tool '{}' has no command configured", tool_name)),
-            );
+        if !ready.lease.is_valid() {
             return Ok(());
         }
-
-        let size = crate::terminal::get_size();
-        let tool_session = crate::tmux::ToolSession::new(&instance.id, &instance.title, tool_name);
-
-        if !tool_session.exists() || tool_session.is_pane_dead() {
-            if tool_session.exists() {
-                let _ = tool_session.kill();
-            }
-            if let Err(e) = tool_session.create_with_size(
-                &instance.project_path,
-                &tool_config.command,
-                size,
-                &instance.effective_profile(),
-            ) {
-                self.home
-                    .set_instance_error(session_id, Some(e.to_string()));
-                return Ok(());
-            }
-            // A misconfigured tool command (bad flag, missing binary) can
-            // exit near-instantly, leaving a `remain-on-exit`-held dead
-            // pane. Catch that here instead of handing a dead pane to
-            // `attach()`: without the SIGINT guard around the attach, the
-            // user's only way out (Ctrl+C) would kill aoe itself.
-            if let Err(e) = tool_session.wait_until_ready() {
-                self.home
-                    .set_instance_error(session_id, Some(e.to_string()));
-                return Ok(());
-            }
-        }
-
-        let branch = instance
-            .worktree_info
-            .as_ref()
-            .map(|w| w.branch.as_str())
-            .or_else(|| instance.workspace_info.as_ref().map(|w| w.branch.as_str()));
-        crate::tmux::status_bar::apply_all_tmux_options(
-            tool_session.session_name(),
-            &format!("{} ({})", instance.title, tool_name),
-            branch,
-            None,
-            &instance.effective_profile(),
-        );
-
-        let attach_fn: Box<dyn FnOnce() -> Result<()>> = Box::new(move || tool_session.attach());
-        let (attach_result, attached_status_updates) =
-            self.with_attached_status_hooks(terminal, attach_fn)?;
-
+        let target = crate::tmux::Session::from_name(&ready.tmux_name);
+        let lease = ready.lease;
+        let attach_result = self.with_raw_mode_disabled(
+            terminal,
+            Box::new(move || {
+                anyhow::ensure!(lease.is_valid(), "Native interaction permission revoked");
+                target.attach()
+            }),
+        )?;
         self.needs_redraw = true;
-        crate::tmux::refresh_session_cache();
-        self.home.reload()?;
-        self.home
-            .apply_status_updates_without_hooks(attached_status_updates);
-        self.home.select_session_by_id(session_id);
-
-        if let Err(e) = attach_result {
-            tracing::warn!(
-                "tmux tool session '{}' attach returned error: {}",
-                tool_name,
-                e
-            );
+        self.home.apply_session_feed();
+        if self.home.sort_order() == crate::session::config::SortOrder::Attention {
+            self.home.select_top_attention(Some(&ready.id));
+        } else {
+            self.home.select_session_by_id(&ready.id);
         }
-
+        if let Err(error) = attach_result {
+            tracing::warn!(target: "tui.input", %error, "Native tmux attach failed");
+        }
         Ok(())
     }
 
@@ -4337,7 +4149,6 @@ pub enum Action {
     /// (no sandbox, hooks, or worktree). This action routes through the
     /// new-session mode, like the async path in `apply_creation_results`.
     /// `AttachSession` is already resolved for an existing session row.
-    AttachAfterCreate(String),
     /// Attach to a tool session (lazygit, yazi, etc.) for the given agent
     /// session. The tool_name indexes into Config.tools.
     AttachToolSession(String, String),

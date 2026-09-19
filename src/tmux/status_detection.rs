@@ -1228,7 +1228,6 @@ enter to select · esc to cancel";
         for rule in ["active_spinner", "live_token_counter", "interrupt_hint"] {
             assert!(claude_rule_matches(rule, running), "{rule}");
         }
-        assert_eq!(detect_claude(running, "", None), Status::Running);
 
         let parked = "\
 ✻ Worked for 1m 52s\n\

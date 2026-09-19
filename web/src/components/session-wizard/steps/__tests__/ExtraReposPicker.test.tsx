@@ -39,6 +39,7 @@ function setup(overrides?: { selectedPaths?: string[]; primaryPath?: string; bas
   const onRepoBasesChange = vi.fn();
   const utils = render(
     <ExtraReposPicker
+      profile="default"
       primaryPath={overrides?.primaryPath ?? "/repos/primary"}
       selectedPaths={overrides?.selectedPaths ?? []}
       onChange={onChange}

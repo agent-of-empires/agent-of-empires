@@ -88,7 +88,7 @@ base.describe("pin a project from the web sidebar (#2047, #2208)", () => {
       await expect(page.locator("[data-testid='sidebar-group-header']").filter({ hasText: "projectB" })).toHaveCount(0);
 
       // ...but it IS a saved project: the registry still lists it.
-      const savedList = await (await page.request.get(`${serve.baseUrl}/api/projects`)).json();
+      const savedList = await (await page.request.get(`${serve.baseUrl}/api/projects?scope=global`)).json();
       expect(savedList.some((p: { name: string }) => p.name === "projectB")).toBe(true);
 
       // ---- Pin projectA from its header menu (POST with pinned:true) ----
@@ -127,7 +127,7 @@ base.describe("pin a project from the web sidebar (#2047, #2208)", () => {
 
       // The #2208 regression: unpin must NOT delete the saved project. The
       // registry still lists projectA (it would be in the Projects view / wizard).
-      const afterUnpin = await (await page.request.get(`${serve.baseUrl}/api/projects`)).json();
+      const afterUnpin = await (await page.request.get(`${serve.baseUrl}/api/projects?scope=global`)).json();
       expect(afterUnpin.some((p: { path: string }) => p.path === repoA)).toBe(true);
     } finally {
       await serve.stop();

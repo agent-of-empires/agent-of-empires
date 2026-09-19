@@ -1088,7 +1088,7 @@ Add a project to the registry
 
   Possible values: `global`, `profile`
 
-* `--allow-override` — Allow registering this path even if it already exists in the other scope. Without this flag the command errors when the same canonical path is already registered globally (when adding to profile) or in any profile (when adding globally). When override is allowed and both scopes hold the same path, the profile entry shadows the global one
+* `--allow-override` — Allow the same canonical path in the global and selected profile scopes. The profile entry shadows the global entry in merged views
 * `--base-branch <BASE_BRANCH>` — Default base branch for new worktree branches created against this project, whether it is the launch repo or an extra repo in a multi-repo workspace. An explicit session base wins; when omitted, falls back to the global/profile `worktree.default_base_branch`, then the repo's detected default branch
 
 
@@ -1564,6 +1564,7 @@ Start the aoe daemon: REST/WebSocket API, plus the web dashboard in builds that 
 
 ###### **Options:**
 
+* `--core-only` — Serve the private local API without opening TCP or a dashboard
 * `--port <PORT>` — Port to listen on (default: 8080; debug builds default to 8081 so a `cargo run` instance does not collide with an installed release `aoe`)
 * `--host <HOST>` — Host/IP to bind to (use 0.0.0.0 for LAN/VPN access)
 
@@ -1589,7 +1590,8 @@ Start the aoe daemon: REST/WebSocket API, plus the web dashboard in builds that 
    `--status` is read-only and incompatible with every flag that would change daemon state (`--stop`, `--daemon`, `--remote`) or the bind config of a fresh daemon (`--no-auth`, `--auth`, `--behind-proxy`, `--read-only`, `--passphrase`, `--port`, `--tunnel-name`, `--no-tailscale`, `--tunnel-url`, `--open`, `--allowed-host`, `--allowed-origin`). Clap reports the misuse instead of silently ignoring the extras.
 * `--passphrase <PASSPHRASE>` — Require a passphrase for login (second-factor auth). Can also be set via AOE_SERVE_PASSPHRASE environment variable
 * `--open` — Open the dashboard URL in the default browser once the server is ready. Ignored in a build with no dashboard bundle, under --daemon or --remote, and whenever no browser the user could see is reachable (see `tui::open_url`): over SSH without a forwarded display, or on Linux/BSD with no display server. `BROWSER` overrides the check on platforms whose launcher reads it, which excludes macOS
-* `--restart` — Restart a running `aoe serve` daemon, replaying the host, port, mode, and auth it was launched with (read from `serve.launch`). The passphrase is recalled from `serve.passphrase` or `AOE_SERVE_PASSPHRASE` before the old daemon is stopped, so a passphrase-protected daemon is never left down. Incompatible with the flags that would change the daemon's bind config: that config comes from the persisted launch state
+* `--restart` — Restart the running managed daemon with its recorded policy. Missing credentials are rejected before stopping it
+* `--rollback` — Restore the retained daemon policy after a failed replacement
 
 
 

@@ -266,20 +266,20 @@ fn is_fire_worthy(status: Status) -> bool {
     matches!(status, Status::Idle | Status::Waiting | Status::Error)
 }
 
-/// Spawn the consumer task. Subscribes to `state.status_tx` and dispatches a
-/// debounced HTTP POST to any instance's `callback_url` on a fire-worthy
-/// transition. Runs for the lifetime of the server, mirroring
-/// `push::spawn_consumer`.
-pub fn spawn_consumer(state: Arc<AppState>) {
-    tokio::spawn(async move {
+/// Dispatch debounced callbacks for fire-worthy status transitions.
+pub async fn spawn_consumer(state: Arc<AppState>) {
+    let work = state.runtime.work.clone();
+    work.spawn("server.callback_consumer", async move {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(DISPATCH_CONCURRENCY));
         let mut rx = state.status_tx.subscribe();
         loop {
             tokio::select! {
+                biased;
+                _ = state.shutdown.cancelled() => return,
                 recv = rx.recv() => {
                     match recv {
                         Ok(change) => {
-                            handle_status_change(state.clone(), semaphore.clone(), change);
+                            handle_status_change(state.clone(), semaphore.clone(), change).await;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             tracing::warn!(target: "http.middleware", lagged = n, "callback: consumer lagged, skipped events");
@@ -290,16 +290,12 @@ pub fn spawn_consumer(state: Arc<AppState>) {
                         }
                     }
                 }
-                _ = state.shutdown.cancelled() => {
-                    tracing::info!(target: "http.middleware", "callback: shutdown signaled, consumer exiting");
-                    return;
-                }
             }
         }
     });
 }
 
-fn handle_status_change(
+async fn handle_status_change(
     state: Arc<AppState>,
     semaphore: Arc<tokio::sync::Semaphore>,
     change: StatusChange,
@@ -310,8 +306,13 @@ fn handle_status_change(
     let session_id = change.instance_id.clone();
     let generation = bump_debounce(&session_id);
 
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(DEBOUNCE_MS)).await;
+    let work = state.runtime.work.clone();
+    work.spawn("server.callback_send", async move {
+        tokio::select! {
+            biased;
+            _ = state.shutdown.cancelled() => return,
+            _ = tokio::time::sleep(Duration::from_millis(DEBOUNCE_MS)) => {}
+        }
         // Superseded by a later transition within the debounce window? That
         // later transition owns firing (or dropping).
         if !claim_debounce(&session_id, generation) {

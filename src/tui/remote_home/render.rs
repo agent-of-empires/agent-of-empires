@@ -128,25 +128,18 @@ pub fn render(frame: &mut Frame, area: Rect, theme: &Theme, state: &RemoteHomeSt
             Constraint::Length(2),
         ])
         .split(area);
-    render_header(frame, chunks[0], theme, state);
+    render_header(frame, chunks[0], theme);
     render_list(frame, chunks[1], theme, state);
     render_footer(frame, chunks[2], theme, state);
 }
 
-fn render_header(frame: &mut Frame, area: Rect, theme: &Theme, state: &RemoteHomeState) {
-    let spans = vec![
-        Span::styled(
-            " Remote sessions · ",
-            Style::default()
-                .fg(theme.title)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            state.endpoint.base_url.clone(),
-            Style::default().fg(theme.text),
-        ),
-        Span::raw(" "),
-    ];
+fn render_header(frame: &mut Frame, area: Rect, theme: &Theme) {
+    let spans = vec![Span::styled(
+        " Remote sessions ",
+        Style::default()
+            .fg(theme.title)
+            .add_modifier(Modifier::BOLD),
+    )];
     let block = Block::default().borders(Borders::BOTTOM);
     let para = Paragraph::new(Line::from(spans)).block(block);
     frame.render_widget(para, area);
@@ -155,8 +148,8 @@ fn render_header(frame: &mut Frame, area: Rect, theme: &Theme, state: &RemoteHom
 fn render_list(frame: &mut Frame, area: Rect, theme: &Theme, state: &RemoteHomeState) {
     if let Some(err) = &state.last_error {
         let para = Paragraph::new(format!(
-            "Could not reach daemon at {}:\n\n{}\n\nPress r to retry, q to quit.",
-            state.endpoint.base_url, err
+            "Could not reach daemon:\n\n{}\n\nPress r to retry, q to quit.",
+            err
         ))
         .style(Style::default().fg(theme.error));
         frame.render_widget(para, area);

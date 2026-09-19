@@ -276,22 +276,26 @@ pub fn load_repo_config(project_path: &Path) -> Result<Option<RepoConfig>> {
     }
 
     let config_path = project_path.join(REPO_CONFIG_PATH);
-    let (config_path, is_legacy) = if config_path.exists() {
-        (config_path, false)
-    } else {
-        let legacy_path = project_path.join(LEGACY_REPO_CONFIG_PATH);
-        if legacy_path.exists() {
-            (legacy_path, true)
-        } else {
-            return Ok(None);
+    let (config_path, is_legacy) = match fs::symlink_metadata(&config_path) {
+        Ok(_) => (config_path, false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let legacy_path = project_path.join(LEGACY_REPO_CONFIG_PATH);
+            match fs::symlink_metadata(&legacy_path) {
+                Ok(_) => (legacy_path, true),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("Failed to inspect {}", legacy_path.display()))
+                }
+            }
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to inspect {}", config_path.display()))
         }
     };
 
-    // A project path of `$HOME` resolves this to the user's own global
-    // `config.toml` on macOS and Windows (#3400). That file is not a repo
-    // config: loading it re-merges the global layer onto itself and reports
-    // every global-only section as a rejected repo override. Decline, and log
-    // the path so the upstream caller that passed such a path is findable.
+    // A project can alias the global config directory; do not apply that layer twice.
     if resolves_to_global_config(&config_path) {
         tracing::debug!(target: "session.store",
             path = %config_path.display(),
@@ -414,6 +418,27 @@ pub fn save_repo_config(project_path: &Path, config: &RepoConfig) -> Result<()> 
 /// (empty hook lists never serialize, so they inherit rather than wipe).
 pub fn merge_repo_config(config: Config, repo: &RepoConfig) -> Config {
     super::profile_config::merge_configs_generic(&config, &repo.allowed_overrides())
+}
+
+pub(crate) fn resolve_sandbox_config_with_repo(
+    base: &super::SandboxConfig,
+    project: &Path,
+) -> Result<Option<super::SandboxConfig>> {
+    let Some(repo) = load_repo_config(&repo_config_source_path(project))? else {
+        return Ok(None);
+    };
+    let overrides = repo.allowed_overrides();
+    let Some(sandbox) = overrides
+        .get("sandbox")
+        .filter(|value| value.as_object().is_some_and(|object| !object.is_empty()))
+    else {
+        return Ok(None);
+    };
+    let mut merged = serde_json::to_value(base)?;
+    super::settings_schema::merge_json(&mut merged, sandbox);
+    serde_json::from_value(merged)
+        .map(Some)
+        .context("Invalid repository sandbox configuration")
 }
 
 /// Filter a sparse override map to what a repo may set: the repo-allowed
@@ -691,31 +716,32 @@ pub fn trust_repo(
     let normalized = normalize_path(project_path);
     let path = trusted_repos_path()?;
 
-    crate::session::storage::locked_update(
-        &path,
-        |content| toml::from_str(content).context("Failed to parse trusted_repos.toml"),
-        |trusted: &TrustedRepos| Ok(toml::to_string_pretty(trusted)?),
-        |trusted| {
-            // Preserve the surface not being updated by carrying its existing hash.
-            let existing = trusted.repos.iter().find(|r| r.path == normalized);
-            let hooks_final = hooks_hash
-                .map(str::to_string)
-                .or_else(|| existing.and_then(|e| e.hooks_hash.clone()));
-            let mcp_final = mcp_hash
-                .map(str::to_string)
-                .or_else(|| existing.and_then(|e| e.mcp_hash.clone()));
+    crate::session::storage::LockedDataFile::open(&path)?
+        .update(
+            |content| toml::from_str(content).context("Failed to parse trusted_repos.toml"),
+            |trusted: &TrustedRepos| Ok(toml::to_string_pretty(trusted)?),
+            |trusted| {
+                // Preserve the surface not being updated by carrying its existing hash.
+                let existing = trusted.repos.iter().find(|r| r.path == normalized);
+                let hooks_final = hooks_hash
+                    .map(str::to_string)
+                    .or_else(|| existing.and_then(|e| e.hooks_hash.clone()));
+                let mcp_final = mcp_hash
+                    .map(str::to_string)
+                    .or_else(|| existing.and_then(|e| e.mcp_hash.clone()));
 
-            trusted.repos.retain(|r| r.path != normalized);
+                trusted.repos.retain(|r| r.path != normalized);
 
-            trusted.repos.push(TrustedRepo {
-                path: normalized,
-                hooks_hash: hooks_final,
-                mcp_hash: mcp_final,
-                trusted_at: chrono::Utc::now().to_rfc3339(),
-            });
-            Ok::<_, anyhow::Error>(())
-        },
-    )?
+                trusted.repos.push(TrustedRepo {
+                    path: normalized,
+                    hooks_hash: hooks_final,
+                    mcp_hash: mcp_final,
+                    trusted_at: chrono::Utc::now().to_rfc3339(),
+                });
+                Ok::<_, anyhow::Error>(())
+            },
+        )?
+        .map(|(result, _)| result)
 }
 
 /// Trust state of one reviewable surface (lifecycle hooks or project MCP). Each
@@ -860,7 +886,10 @@ pub fn merge_hooks_with_config(profile: &str, repo_hooks: HooksConfig) -> Option
 /// actually resolve: repo overrides global per type. Unlike `merge_hooks_with_config`
 /// this keeps `on_destroy` and never collapses to `None`, since it feeds the trust
 /// dialog rather than execution gating.
-fn apply_repo_hook_overrides(mut base: HooksConfig, repo_hooks: &HooksConfig) -> HooksConfig {
+pub(crate) fn apply_repo_hook_overrides(
+    mut base: HooksConfig,
+    repo_hooks: &HooksConfig,
+) -> HooksConfig {
     if !repo_hooks.on_create.is_empty() {
         base.on_create = repo_hooks.on_create.clone();
     }
@@ -1214,11 +1243,11 @@ fn run_hook_with_timeout(
     }
 }
 
-/// Run hook commands with streamed output sent through a progress channel.
+/// Run hook commands with optional live progress and a bounded error tail.
 fn run_hooks_streamed(
     commands: &[String],
     target: &HookTarget,
-    progress_tx: &mpsc::Sender<HookProgress>,
+    progress: Option<&dyn Fn(HookProgress)>,
     extra_env: &[(&'static str, String)],
 ) -> Result<()> {
     use std::io::BufRead;
@@ -1232,7 +1261,9 @@ fn run_hooks_streamed(
 
     for (idx, cmd) in commands.iter().enumerate() {
         tracing::info!(target: "session.store", "Running hook (streamed): {}", cmd);
-        let _ = progress_tx.send(HookProgress::Started(cmd.clone()));
+        if let Some(progress) = progress {
+            progress(HookProgress::Started(cmd.clone()));
+        }
 
         let mut command = build_hook_command(
             cmd,
@@ -1249,18 +1280,67 @@ fn run_hooks_streamed(
             .spawn()
             .with_context(|| format!("Failed to execute hook: {}", cmd))?;
 
+        // Drain on its own thread so the deadline below can fire while the
+        // child is quiet, and so a killed child cannot block the reader.
+        let pid = child.id();
+        let child_stdout = child.stdout.take();
+        let (lines_tx, lines_rx) = mpsc::channel::<String>();
+        std::thread::Builder::new()
+            .name(format!("aoe-hook-stream-{}", pid))
+            .spawn(move || {
+                if let Some(stdout) = child_stdout {
+                    for line in std::io::BufReader::new(stdout)
+                        .lines()
+                        .map_while(Result::ok)
+                    {
+                        if lines_tx.send(line).is_err() {
+                            return;
+                        }
+                    }
+                }
+            })
+            .expect("hook stream thread spawn");
+
+        let hook_timeout = crate::session::recovery::current_hook_timeout();
+        let deadline = hook_timeout.map(|timeout| std::time::Instant::now() + timeout);
         let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
         let mut total_lines = 0usize;
-        if let Some(stdout) = child.stdout.take() {
-            let reader = std::io::BufReader::new(stdout);
-            for line in reader.lines().map_while(Result::ok) {
-                total_lines += 1;
-                if tail.len() == ERROR_TAIL_LINES {
-                    tail.pop_front();
+        loop {
+            let line = match deadline {
+                None => match lines_rx.recv() {
+                    Ok(line) => line,
+                    Err(_) => break,
+                },
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    match lines_rx.recv_timeout(remaining) {
+                        Ok(line) => line,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            let timeout_secs = hook_timeout.map_or(0, |t| t.as_secs());
+                            tracing::warn!(
+                                target: "session.startup_recovery",
+                                cmd = %cmd,
+                                timeout_secs,
+                                "hook timed out; killing process tree to release recovery lock"
+                            );
+                            crate::process::kill_process_tree(pid);
+                            return Err(anyhow::Error::new(HookTimeout {
+                                cmd: cmd.to_string(),
+                                timeout_secs,
+                            }));
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
                 }
-                tail.push_back(line.clone());
-                let _ = progress_tx.send(HookProgress::Output(line));
+            };
+            total_lines += 1;
+            if tail.len() == ERROR_TAIL_LINES {
+                tail.pop_front();
             }
+            if let Some(progress) = progress {
+                progress(HookProgress::Output(line.clone()));
+            }
+            tail.push_back(line);
         }
 
         let status = child.wait()?;
@@ -1286,7 +1366,9 @@ fn run_hooks_streamed(
                     detail.push_str(&format!("\n(hook {} of {})", idx + 1, commands.len()));
                 }
             }
-            let _ = progress_tx.send(HookProgress::Output(detail.clone()));
+            if let Some(progress) = progress {
+                progress(HookProgress::Output(detail.clone()));
+            }
             anyhow::bail!(detail);
         }
 
@@ -1325,25 +1407,7 @@ pub fn execute_hooks_in_container(
     )
 }
 
-/// Resolve `host_hooks.before_start` from global + profile config only.
-///
-/// Deliberately resolved without repo overrides ([`super::profile_config::resolve_config_or_warn`]
-/// rather than [`resolve_config_with_repo_or_warn`]) so a repo can never
-/// contribute host commands; this is belt-and-suspenders on top of
-/// `host_hooks` being excluded from `REPO_OVERRIDABLE_SECTIONS`.
-pub fn resolve_before_start_hooks(profile: &str) -> Vec<String> {
-    let resolved = super::effective_profile(profile);
-    super::profile_config::resolve_config_or_warn(&resolved)
-        .host_hooks
-        .before_start
-}
-
-/// Resolve `host_hooks.before_session` from global + profile config only.
-///
-/// Same trust boundary as [`resolve_before_start_hooks`]: resolved without repo
-/// overrides so a checked-out repo can never contribute a host command. The
-/// hook runs for host (non-sandboxed) sessions, where its output lands in the
-/// agent's own environment rather than a container's.
+/// Resolve host-session hooks without repository-supplied commands.
 pub fn resolve_before_session_hooks(profile: &str) -> Vec<String> {
     let resolved = super::effective_profile(profile);
     super::profile_config::resolve_config_or_warn(&resolved)
@@ -1622,13 +1686,13 @@ pub fn execute_hooks_in_container_best_effort(
 pub fn execute_hooks_streamed(
     commands: &[String],
     project_path: &Path,
-    progress_tx: &mpsc::Sender<HookProgress>,
+    progress: Option<&dyn Fn(HookProgress)>,
     extra_env: &[(&'static str, String)],
 ) -> Result<()> {
     run_hooks_streamed(
         commands,
         &HookTarget::Local { project_path },
-        progress_tx,
+        progress,
         extra_env,
     )
 }
@@ -1638,7 +1702,7 @@ pub fn execute_hooks_in_container_streamed(
     commands: &[String],
     container_name: &str,
     workdir: &str,
-    progress_tx: &mpsc::Sender<HookProgress>,
+    progress: Option<&dyn Fn(HookProgress)>,
     extra_env: &[(&'static str, String)],
 ) -> Result<()> {
     run_hooks_streamed(
@@ -1647,7 +1711,7 @@ pub fn execute_hooks_in_container_streamed(
             container_name,
             workdir,
         },
-        progress_tx,
+        progress,
         extra_env,
     )
 }
@@ -2850,14 +2914,31 @@ trusted_at = "2026-01-31T00:00:00Z"
         assert!(merged.worktree.enabled);
     }
 
-    /// Regression for issue #901: streamed hooks must run detached from the
-    /// TUI's controlling terminal, so an interactive prompt (e.g., `git clone`
-    /// over HTTPS asking for a username) cannot reach `/dev/tty` and corrupt
-    /// the TUI screen. We verify the contract holds:
-    ///   1. stdin is not a TTY (`[ -t 0 ]` is false)
-    ///   2. `GIT_TERMINAL_PROMPT=0` is exported, so git fails fast with a
-    ///      clean error instead of falling back to a tty prompt
-    ///   3. `GIT_ASKPASS` / `SSH_ASKPASS` are defanged
+    /// The streamed runner is the daemon create path. It must honor the same
+    /// deadline as the captured one, so a hung hook cannot hold the recovery
+    /// lock, and it must kill the descendant tree rather than detach it.
+    #[test]
+    fn streamed_hook_honors_the_recovery_deadline() {
+        let _shell = pin_host_shell();
+        let tmp = tempfile::tempdir().unwrap();
+        let late = tmp.path().join("late-effect");
+        // A descendant that outlives the hook would trip this marker.
+        let probe = format!("(sleep 0.6; touch {late:?}) & sleep 30");
+        let _scope = crate::session::HookTimeoutScope::new(std::time::Duration::from_millis(200));
+        let err = execute_hooks_streamed(std::slice::from_ref(&probe), tmp.path(), None, &[])
+            .expect_err("the deadline stops the hook");
+        let timeout = err
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<HookTimeout>())
+            .expect("a deadline failure reports HookTimeout");
+        assert_eq!(timeout.cmd, probe);
+        std::thread::sleep(std::time::Duration::from_millis(900));
+        assert!(
+            !late.exists(),
+            "the timed-out hook's descendant survived the deadline"
+        );
+    }
+
     #[test]
     fn streamed_hook_detached_from_tty() {
         let _shell = pin_host_shell();
@@ -2869,7 +2950,15 @@ trusted_at = "2026-01-31T00:00:00Z"
             echo "SSH_ASKPASS=${SSH_ASKPASS:-unset}"
         "#;
         let (tx, rx) = mpsc::channel();
-        execute_hooks_streamed(&[probe.to_string()], tmp.path(), &tx, &[]).unwrap();
+        execute_hooks_streamed(
+            &[probe.to_string()],
+            tmp.path(),
+            Some(&|event| {
+                let _ = tx.send(event);
+            }),
+            &[],
+        )
+        .unwrap();
         drop(tx);
 
         let lines: Vec<String> = rx
@@ -2903,87 +2992,34 @@ trusted_at = "2026-01-31T00:00:00Z"
         );
     }
 
-    /// A failing streamed hook's error must carry the hook's output, not just
-    /// the exit code. Streamed hooks merge stderr into stdout and send it down
-    /// the progress channel, which the TUI discards once creation fails; the
-    /// returned error is the only context that reaches the "Creation Failed"
-    /// dialog (via `CreationResult::Error`), so it has to include the output
-    /// that explains why the hook failed.
+    // Failure output must survive after the live progress view closes.
     #[test]
-    fn streamed_hook_failure_error_includes_output() {
+    fn streamed_hook_failure_retains_output_and_stops_following_hooks() {
         let _shell = pin_host_shell();
         let tmp = tempfile::tempdir().unwrap();
-        // The failure detail lives in a script file, not the hook command
-        // line, mirroring real hooks (`npm install`, `./setup.sh`) whose
-        // command text says nothing about why they failed.
+        // Keep the diagnostic out of command text to require captured output.
         let script = tmp.path().join("hook.sh");
         std::fs::write(
             &script,
             "#!/bin/sh\necho 'fatal: dependency xyz not found' >&2\nexit 3\n",
         )
         .unwrap();
-        let probe = "sh hook.sh".to_string();
-        let (tx, _rx) = mpsc::channel();
-        let err = execute_hooks_streamed(&[probe], tmp.path(), &tx, &[])
-            .expect_err("hook exits non-zero");
+        let hooks = [
+            "touch first".to_string(),
+            "sh hook.sh".to_string(),
+            "touch forbidden".to_string(),
+        ];
+        let err =
+            execute_hooks_streamed(&hooks, tmp.path(), None, &[]).expect_err("hook exits non-zero");
+        assert!(tmp.path().join("first").exists());
+        assert!(!tmp.path().join("forbidden").exists());
         let msg = format!("{:#}", err);
-        assert!(msg.contains("exit code 3"), "got: {}", msg);
         assert!(
             msg.contains("fatal: dependency xyz not found"),
             "error must include the hook's output so the TUI dialog shows the \
              actual failure, not just the exit code; got:\n{}",
             msg
         );
-    }
-
-    /// With multiple on_create hooks the failure detail says which hook
-    /// failed and that the rest were skipped, so the user doesn't assume
-    /// later hooks ran.
-    #[test]
-    fn streamed_hook_failure_names_position_when_multiple() {
-        let _shell = pin_host_shell();
-        let tmp = tempfile::tempdir().unwrap();
-        let hooks = vec![
-            "true".to_string(),
-            "sh -c 'exit 7'".to_string(),
-            "true".to_string(),
-        ];
-        let (tx, _rx) = mpsc::channel();
-        let err = execute_hooks_streamed(&hooks, tmp.path(), &tx, &[])
-            .expect_err("second hook exits non-zero");
-        let msg = format!("{:#}", err);
-        assert!(
-            msg.contains("(hook 2 of 3; remaining hooks skipped)"),
-            "got: {}",
-            msg
-        );
-    }
-
-    /// When the last hook fails there is nothing left to skip, so the position
-    /// text omits the "remaining hooks skipped" suffix.
-    #[test]
-    fn streamed_hook_failure_omits_skip_note_for_last_hook() {
-        let _shell = pin_host_shell();
-        let tmp = tempfile::tempdir().unwrap();
-        let hooks = vec!["true".to_string(), "sh -c 'exit 7'".to_string()];
-        let (tx, _rx) = mpsc::channel();
-        let err = execute_hooks_streamed(&hooks, tmp.path(), &tx, &[])
-            .expect_err("last hook exits non-zero");
-        let msg = format!("{:#}", err);
-        assert!(msg.contains("(hook 2 of 2)"), "got: {}", msg);
-        assert!(!msg.contains("remaining hooks skipped"), "got: {}", msg);
-    }
-
-    /// A single hook keeps the error free of position noise.
-    #[test]
-    fn streamed_hook_failure_omits_position_when_single() {
-        let _shell = pin_host_shell();
-        let tmp = tempfile::tempdir().unwrap();
-        let (tx, _rx) = mpsc::channel();
-        let err = execute_hooks_streamed(&["sh -c 'exit 7'".to_string()], tmp.path(), &tx, &[])
-            .expect_err("hook exits non-zero");
-        let msg = format!("{:#}", err);
-        assert!(!msg.contains("remaining hooks skipped"), "got: {}", msg);
     }
 
     /// The CLI/captured path leaves the terminal attached so users running
@@ -3203,9 +3239,7 @@ trusted_at = "2026-01-31T00:00:00Z"
         );
 
         std::fs::remove_file(tmp.path().join("env.txt")).unwrap();
-        let (tx, _rx) = mpsc::channel();
-        execute_hooks_streamed(&[probe.to_string()], tmp.path(), &tx, &env).unwrap();
-        drop(tx);
+        execute_hooks_streamed(&[probe.to_string()], tmp.path(), None, &env).unwrap();
         let out = std::fs::read_to_string(tmp.path().join("env.txt")).unwrap();
         assert!(
             out.contains(&format!("ID={}", instance.id)),

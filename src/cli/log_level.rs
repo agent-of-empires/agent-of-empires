@@ -42,14 +42,14 @@ pub async fn run(args: LogLevelArgs) -> Result<()> {
         .unwrap_or(&primary.url)
         .trim_end_matches('/');
     let endpoint = format!("{base}/api/log-level");
-    let token = extract_token(&primary.url);
-
-    let client = reqwest::Client::new();
+    let token = crate::daemon::authorization_header(extract_token(&primary.url))?;
+    let endpoint = crate::daemon::native_url(&endpoint)?;
+    let client = crate::daemon::native_http_client(&endpoint, token.is_some())?;
 
     if args.get || (args.level.is_none() && args.filter.is_none()) {
-        let mut req = client.get(&endpoint);
+        let mut req = client.get(endpoint);
         if let Some(t) = token {
-            req = req.bearer_auth(t);
+            req = req.header(reqwest::header::AUTHORIZATION, t);
         }
         let resp = req.send().await.context("GET /api/log-level")?;
         let status = resp.status();
@@ -77,9 +77,9 @@ pub async fn run(args: LogLevelArgs) -> Result<()> {
         (None, None) => unreachable!("guarded above"),
     };
 
-    let mut req = client.patch(&endpoint).json(&body);
+    let mut req = client.patch(endpoint).json(&body);
     if let Some(t) = token {
-        req = req.bearer_auth(t);
+        req = req.header(reqwest::header::AUTHORIZATION, t);
     }
     let resp = req.send().await.context("PATCH /api/log-level")?;
     let status = resp.status();

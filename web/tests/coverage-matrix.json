@@ -2682,7 +2682,7 @@
     {
       "id": "projects-form-modal",
       "kind": "vitest",
-      "risk": "low",
+      "risk": "medium",
       "specs": ["src/components/__tests__/ProjectFormModal.test.tsx"],
       "components": ["web/src/components/ProjectFormModal.tsx"]
     },
@@ -3356,9 +3356,14 @@
     {
       "id": "story.wizard-saved-projects",
       "kind": "mocked-playwright",
-      "risk": "low",
+      "risk": "high",
       "specs": ["tests/wizard-project-step.spec.ts"],
-      "components": ["web/src/components/session-wizard/steps/ProjectStep.tsx"]
+      "components": [
+        "web/src/components/session-wizard/steps/ProjectStep.tsx",
+        "web/src/components/session-wizard/steps/projectPicker.ts",
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/lib/api.ts"
+      ]
     },
     {
       "id": "story.wizard-browse-disk",
@@ -3417,7 +3422,9 @@
       "components": [
         "web/src/components/session-wizard/steps/ExtraReposPicker.tsx",
         "web/src/components/session-wizard/steps/projectPicker.ts",
-        "web/src/components/session-wizard/steps/ProjectSearchList.tsx"
+        "web/src/components/session-wizard/steps/ProjectSearchList.tsx",
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/lib/api.ts"
       ]
     },
     {
@@ -3476,7 +3483,7 @@
       "kind": "mocked-playwright",
       "risk": "high",
       "specs": ["tests/sidebar-project-pin.spec.ts"],
-      "components": ["web/src/App.tsx", "web/src/lib/api.ts"]
+      "components": ["web/src/App.tsx", "web/src/lib/api.ts", "web/src/hooks/useProjects.ts"]
     },
     {
       "id": "triage.archive-toggle",

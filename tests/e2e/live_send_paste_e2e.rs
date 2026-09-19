@@ -98,6 +98,9 @@ fn test_live_send_paste_into_non_bracketed_pane_has_no_marker_debris() {
     );
 
     h.spawn_tui();
+    // The native pane preparation refuses an unhealthy runtime, so wait for the
+    // subscription to report readiness before driving panes.
+    h.wait_for("Runtime ready");
     h.wait_for("Pasty");
     h.send_keys("Enter");
     h.wait_for_timeout("LIVE", Duration::from_secs(10));
