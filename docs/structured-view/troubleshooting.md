@@ -222,6 +222,11 @@ and later want to return to the original agent.
   also a valid target even though neither surface lists it, so switching to one
   means naming it here.
 
+- **Terminal/tmux sessions:** right-click a terminal session in the web sidebar
+  and pick "Switch terminal agent", or run `aoe session switch-agent <session> <target>`.
+  The project, worktree, and AoE session stay the same; the new CLI starts
+  without the old tool's resume id.
+
 The transcript divider reads `Switched structured view agent from <from> to <to>
 (manual)`, distinct from the `(rate_limited)` divider the recovery flow emits.
 

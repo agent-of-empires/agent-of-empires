@@ -14,6 +14,7 @@ import {
   fetchAcpAgents,
   installAcpAgent,
   switchAcpAgent,
+  switchTerminalAgent,
   type SwitchAgentResponse,
 } from "./api";
 
@@ -129,6 +130,27 @@ describe("switchAcpAgent", () => {
     (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(new Response("conflict", { status: 409 }));
     const result = await switchAcpAgent("s-1", "codex");
     expect(result).toBeNull();
+  });
+});
+
+describe("switchTerminalAgent", () => {
+  it("POSTs the target to the session-level switch endpoint", async () => {
+    const response = { session_id: "s-1", tool: "codex", status: "running" };
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(ok(response));
+    await expect(switchTerminalAgent("s-1", "codex")).resolves.toEqual(response);
+    const fetchMock = vi.mocked(globalThis.fetch);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(String(url)).toContain("/api/sessions/s-1/switch-agent");
+    expect((init as RequestInit).method).toBe("POST");
+    expect(JSON.parse((init as RequestInit).body as string)).toEqual({ target: "codex" });
+  });
+
+  it("encodes the session id and returns null on failure", async () => {
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(new Response("conflict", { status: 409 }));
+    await expect(switchTerminalAgent("weird/id", "codex")).resolves.toBeNull();
+    const fetchMock = vi.mocked(globalThis.fetch);
+    const url = fetchMock.mock.calls[0]?.[0];
+    expect(String(url)).toContain("weird%2Fid");
   });
 });
 

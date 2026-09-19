@@ -355,6 +355,21 @@ pub struct SwitchAgentResponse {
     pub status: String,
 }
 
+/// `POST /api/sessions/{id}/switch-agent` body for terminal/tmux sessions.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SwitchTerminalAgentRequest {
+    /// Installed built-in agent or configured custom terminal tool name.
+    pub target: String,
+}
+
+/// `POST /api/sessions/{id}/switch-agent` response.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SwitchTerminalAgentResponse {
+    pub session_id: String,
+    pub tool: String,
+    pub status: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

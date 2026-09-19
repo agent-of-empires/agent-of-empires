@@ -16,7 +16,8 @@ use super::discovery::DaemonEndpoint;
 use crate::acp::elicitations::ElicitationResolution;
 use crate::acp::protocol::{
     ApprovalDecisionWire, FilesResponse, PromptRequest, ReplayResponse, ResolveApprovalRequest,
-    SwitchAgentRequest, SwitchAgentResponse,
+    SwitchAgentRequest, SwitchAgentResponse, SwitchTerminalAgentRequest,
+    SwitchTerminalAgentResponse,
 };
 use crate::plugin::ui_state::UiSnapshot;
 
@@ -535,6 +536,25 @@ impl HttpClient {
         let res = self.auth(self.http.post(&url)).json(&body).send().await?;
         let res = check_status(res, session_id).await?;
         Ok(res.json::<SwitchAgentResponse>().await?)
+    }
+
+    /// `POST /api/sessions/{id}/switch-agent`. Switches a terminal/tmux
+    /// session's tool while preserving its AoE session and worktree identity.
+    pub async fn switch_terminal_agent(
+        &self,
+        session_id: &str,
+        target: &str,
+    ) -> Result<SwitchTerminalAgentResponse, HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/switch-agent",
+            self.endpoint.base_url, session_id
+        );
+        let body = SwitchTerminalAgentRequest {
+            target: target.to_string(),
+        };
+        let res = self.auth(self.http.post(&url)).json(&body).send().await?;
+        let res = check_status(res, session_id).await?;
+        Ok(res.json::<SwitchTerminalAgentResponse>().await?)
     }
 
     /// `POST /api/sessions/{id}/acp/approvals/{nonce}`. `option_id` names

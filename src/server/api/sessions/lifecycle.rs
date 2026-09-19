@@ -982,6 +982,229 @@ pub async fn summarize_session(
     StatusCode::ACCEPTED.into_response()
 }
 
+/// `POST /api/sessions/{id}/switch-agent` switches a terminal/tmux session
+/// to another installed tool without changing its AoE identity or worktree.
+/// The old tool's session ids are parked by `Instance::swap_tool`, so the new
+/// CLI never receives a foreign resume id.
+pub async fn switch_terminal_agent(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<
+        Json<crate::acp::protocol::SwitchTerminalAgentRequest>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> impl IntoResponse {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
+    if state.read_only {
+        return crate::server::api::read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let target = body.target.trim().to_string();
+    if target.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "validation_failed",
+                "message": "target is required",
+            })),
+        )
+            .into_response();
+    }
+
+    let Some(_submission) = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await
+    else {
+        return crate::server::api::session_not_found();
+    };
+    let lock = state.instance_lock(&id).await;
+    let _guard = lock.lock().await;
+
+    let (profile, mut working) = {
+        let instances = state.instances.read().await;
+        let Some(instance) = instances.iter().find(|instance| instance.id == id) else {
+            return crate::server::api::session_not_found();
+        };
+        if instance.is_structured() {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "structured_session",
+                    "message": "use the ACP switch-agent endpoint for structured sessions",
+                })),
+            )
+                .into_response();
+        }
+        if matches!(
+            instance.status,
+            Status::Creating | Status::Deleting | Status::Starting
+        ) {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "session_busy",
+                    "message": "session is already changing state",
+                })),
+            )
+                .into_response();
+        }
+        if instance.tool == target {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "same_tool",
+                    "message": format!("session is already using {target}"),
+                })),
+            )
+                .into_response();
+        }
+        (instance.source_profile.clone(), instance.clone())
+    };
+
+    let config = crate::session::resolve_config_or_warn(&profile);
+    let available = crate::tmux::AvailableTools::detect();
+    let target_available = available
+        .available_list()
+        .iter()
+        .any(|tool| tool == &target)
+        || config.session.custom_agents.contains_key(&target);
+    if !target_available {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "unknown_tool",
+                "message": format!("agent tool is not installed or configured: {target}"),
+            })),
+        )
+            .into_response();
+    }
+
+    let target_command = config.session.resolve_tool_command(&target);
+    let target_extra_args = config
+        .session
+        .agent_extra_args
+        .get(&target)
+        .cloned()
+        .unwrap_or_default();
+    working.source_profile = profile.clone();
+    working.swap_tool(&target);
+    working.command = target_command.clone();
+    working.extra_args = target_extra_args.clone();
+
+    let storage = match Storage::new_unwatched(&profile) {
+        Ok(storage) => storage,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "storage_failed",
+                    "message": error.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+    let persist_id = id.clone();
+    let persist_profile = profile.clone();
+    if let Err(error) = storage.update(|instances, _groups| {
+        let Some(instance) = instances
+            .iter_mut()
+            .find(|instance| instance.id == persist_id)
+        else {
+            anyhow::bail!("session disappeared before terminal agent switch");
+        };
+        instance.source_profile = persist_profile.clone();
+        instance.swap_tool(&target);
+        instance.command = target_command.clone();
+        instance.extra_args = target_extra_args.clone();
+        Ok(())
+    }) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "persist_failed",
+                "message": error.to_string(),
+            })),
+        )
+            .into_response();
+    }
+
+    {
+        let mut instances = state.instances.write().await;
+        if let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) {
+            instance.swap_tool(&target);
+            instance.command = target_command;
+            instance.extra_args = target_extra_args;
+        }
+    }
+
+    let sync_base = working.clone();
+    let restart_result = tokio::task::spawn_blocking(move || {
+        match working.restart_with_resume_policy(
+            None,
+            false,
+            crate::session::ResumeAttemptPolicy::Allow,
+        ) {
+            Ok(outcome) => Ok((working, sync_base, outcome)),
+            Err(error) => Err((working, sync_base, error)),
+        }
+    })
+    .await;
+    match restart_result {
+        Ok(Ok((started, sync_base, _outcome))) => {
+            let mut instances = state.instances.write().await;
+            let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) else {
+                return crate::server::api::session_gone_after_persist();
+            };
+            apply_post_restart_sync(instance, &sync_base, &started);
+            let response = SessionResponse::from_instance(
+                instance,
+                crate::claude_settings::read_tui_fullscreen(),
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "session_id": id,
+                    "tool": response.tool,
+                    "status": "running",
+                })),
+            )
+                .into_response()
+        }
+        Ok(Err((started, sync_base, error))) => {
+            let message = error.to_string();
+            let mut instances = state.instances.write().await;
+            if let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) {
+                apply_post_restart_sync(instance, &sync_base, &started);
+                instance.status = Status::Error;
+                instance.last_error = Some(message.clone());
+            }
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "restart_failed",
+                    "message": message,
+                })),
+            )
+                .into_response()
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "internal",
+                "message": format!("terminal agent switch panicked: {error}"),
+            })),
+        )
+            .into_response(),
+    }
+}
+
 /// Stop a session, matching the TUI's `x` keybind: kill the tmux pane and
 /// stop (but do not remove) the Docker container for plain sessions; shut down
 /// the worker for structured-view sessions. The session record is preserved

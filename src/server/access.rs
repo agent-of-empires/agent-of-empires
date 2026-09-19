@@ -340,6 +340,7 @@ pub(super) const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
     ("POST", "/api/sessions/{id}/restore"),
     ("POST", "/api/sessions/{id}/start"),
     ("POST", "/api/sessions/{id}/stop"),
+    ("POST", "/api/sessions/{id}/switch-agent"),
     ("POST", "/api/sessions/{id}/summarize"),
     ("POST", "/api/sessions/{id}/smart-rename"),
     ("POST", "/api/sessions/{id}/trash"),
