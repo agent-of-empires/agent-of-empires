@@ -118,6 +118,68 @@ pub(crate) fn iter_hook_targets() -> Vec<HookTarget> {
                         }
                     }
                 }
+
+                // A status-aliased wrapper installs host hooks into the
+                // config root it declares but records no execution binding,
+                // so uninstall must enumerate that root from the profile
+                // config itself.
+                let config =
+                    crate::session::config::profile_config::resolve_config_or_warn(&profile);
+                let Some(home) = dirs::home_dir() else {
+                    continue;
+                };
+                for tool in config.session.agent_config_dir.keys() {
+                    let detect_as = config
+                        .session
+                        .agent_detect_as
+                        .get(tool)
+                        .map(String::as_str)
+                        .unwrap_or("");
+                    let Some(agent) = crate::session::resolved_agent_for(&profile, tool, detect_as)
+                    else {
+                        continue;
+                    };
+                    let Some(root) = config.session.agent_config_dir_for(tool, &home) else {
+                        continue;
+                    };
+                    if let Some(hook_cfg) = agent.hook_config.as_ref() {
+                        if let Some(file) = Path::new(hook_cfg.settings_rel_path).file_name() {
+                            let path = root.join(file);
+                            if !targets.iter().any(|target| {
+                                matches!(target.kind, HookTargetKind::JsonSettings)
+                                    && target.path == path
+                            }) {
+                                let events = crate::agents::resolved_hook_events(agent, &config)
+                                    .unwrap_or_default();
+                                targets.push(HookTarget {
+                                    agent_name: agent.name,
+                                    kind: HookTargetKind::JsonSettings,
+                                    path,
+                                    events,
+                                });
+                            }
+                        }
+                    } else if let Some(sidecar) = agent.sidecar_hooks.as_ref() {
+                        let relative: std::path::PathBuf = Path::new(sidecar.host_config_subpath)
+                            .components()
+                            .skip(1)
+                            .collect();
+                        let path = root.join(relative);
+                        if !targets.iter().any(|target| {
+                            matches!(target.kind, HookTargetKind::Sidecar(_)) && target.path == path
+                        }) {
+                            let events =
+                                crate::agents::resolved_sidecar_hook_events(agent, &config)
+                                    .unwrap_or_default();
+                            targets.push(HookTarget {
+                                agent_name: agent.name,
+                                kind: HookTargetKind::Sidecar(sidecar),
+                                path,
+                                events,
+                            });
+                        }
+                    }
+                }
             }
         }
         Err(error) => {

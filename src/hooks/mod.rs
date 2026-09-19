@@ -3143,6 +3143,37 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn test_iter_hook_targets_includes_declared_status_alias_config_dir() {
+        let tmp = TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
+
+        // A status-aliased wrapper installs host hooks into its declared
+        // config root but records no execution binding, so uninstall must
+        // still reach the file through the profile's declared namespace.
+        let profile_dir = crate::session::get_profile_dir("alias-profile").unwrap();
+        std::fs::write(
+            profile_dir.join("config.toml"),
+            format!(
+                "[session.custom_agents]\nremote-claude = \"ssh -t host claude\"\n\n[session.agent_detect_as]\nremote-claude = \"claude\"\n\n[session.agent_config_dir]\nremote-claude = \"{}\"\n",
+                tmp.path().join(".remote-claude").display()
+            ),
+        )
+        .unwrap();
+
+        let paths: Vec<_> = iter_hook_targets()
+            .into_iter()
+            .filter(|t| matches!(t.kind, HookTargetKind::JsonSettings))
+            .map(|t| t.path)
+            .collect();
+
+        assert!(
+            paths.contains(&tmp.path().join(".remote-claude").join("settings.json")),
+            "declared status-alias config root must be enumerable for uninstall: {paths:?}"
+        );
+    }
+
+    #[test]
     fn test_install_codex_hooks_preserves_disabled_flag_and_skips_install() {
         let tmp = TempDir::new().unwrap();
         let codex_dir = tmp.path().join(".codex");
