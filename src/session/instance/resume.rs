@@ -653,6 +653,121 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn account_restart_consumes_persisted_selected_store() {
+        const SID: &str = "11111111-2222-3333-4444-555555555555";
+        let temp = tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _env = isolate_resume_environment(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("config.toml"),
+            "[session.agent_detect_as]\na = \"claude\"\nb = \"claude\"\n[session.agent_config_dir]\na = \"~/source\"\nb = \"~/destination\"\n").unwrap();
+        let profile = crate::session::config::effective_profile("");
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(&profile);
+        crate::session::config::profile_config::resolve_config_or_warn(&profile);
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let relative = std::path::Path::new("projects")
+            .join(crate::session::capture::encode_claude_project_path(
+                &project.to_string_lossy(),
+            ))
+            .join(format!("{SID}.jsonl"));
+        for (root, content, seconds) in [
+            ("source", "unselected\n", 200),
+            ("destination", "selected\n", 100),
+        ] {
+            let path = temp.path().join(root).join(&relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, content).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new().set_modified(
+                        std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds),
+                    ),
+                )
+                .unwrap();
+        }
+        let record = temp.path().join("launched");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$@\" > {}\nexec sleep 60\n",
+            shell_escape(&record.to_string_lossy()),
+        );
+        let _claude = install_fake_claude(temp.path(), &script);
+        let destination = temp.path().join("destination");
+        let mut instance = Instance::new("carry-runtime", project.to_str().unwrap());
+        instance.source_profile = profile.clone();
+        instance.tool = "a".into();
+        instance.command = "claude".into();
+        instance.detect_as = "claude".into();
+        let binding = instance
+            .asserted_resume_binding(SID, Some(&destination))
+            .unwrap();
+        instance.set_agent_conversation(Some(SID.into()), Some(binding), None);
+        let storage = crate::session::storage::Storage::new_unwatched(&profile).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let name = crate::tmux::Session::generate_name(&instance.id, &instance.title);
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(name);
+        instance
+            .start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow)
+            .unwrap();
+        assert!(std::fs::read_to_string(&record)
+            .unwrap()
+            .starts_with(destination.to_str().unwrap()));
+        std::fs::remove_file(&record).unwrap();
+        let crate::session::conversation_carry::ToolSwap::KeepConversation(Some(carry)) =
+            crate::session::conversation_carry::classify(&instance, &profile, "b")
+        else {
+            panic!("expected account carry");
+        };
+        storage
+            .update(|rows, _| {
+                rows.iter_mut()
+                    .find(|row| row.id == instance.id)
+                    .unwrap()
+                    .swap_account("b");
+                Ok(())
+            })
+            .unwrap();
+        let outcome = instance.restart_discarding_sandbox_container(None, true, false, Some(carry));
+        instance.stop_and_flush_poller();
+        let observed = std::fs::read_to_string(&record).unwrap();
+        instance.kill_clean().unwrap();
+        assert!(outcome.is_ok(), "{outcome:?}");
+        let args: Vec<_> = observed.lines().collect();
+        assert_eq!(args[0], destination.to_str().unwrap());
+        assert!(
+            args.windows(2).any(|pair| pair == ["--resume", SID]),
+            "{args:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(destination.join(relative)).unwrap(),
+            "selected\n"
+        );
+        let rows = storage.load().unwrap();
+        let row = rows.iter().find(|row| row.id == instance.id).unwrap();
+        assert_eq!(row.tool, "b");
+        assert_eq!(
+            row.agent_session_binding
+                .as_ref()
+                .unwrap()
+                .execution
+                .as_ref()
+                .unwrap()
+                .stores,
+            vec![destination]
+        );
+    }
+
+    #[test]
     fn resume_and_capture_capabilities_control_each_path() {
         let sid = "11111111-1111-1111-1111-111111111111";
         let cases = [
