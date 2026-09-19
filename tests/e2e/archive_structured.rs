@@ -179,7 +179,10 @@ fn create_tool_session(sock: &std::path::Path, session_id: &str, title: &str) ->
 fn archive_via_api(port: u16, session_id: &str, kill_pane: bool) {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("reqwest client");
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let resp = client
