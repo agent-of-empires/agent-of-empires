@@ -2437,10 +2437,13 @@ pub async fn acp_disable(
     let Some(slot) = instances.iter_mut().find(|row| row.id == id) else {
         return (StatusCode::NOT_FOUND, "session not found").into_response();
     };
-    if slot.view != memory_expected.0
-        || slot.acp_session_id != memory_expected.1
-        || (keep_context && !memory_expected.2.matches(slot))
-    {
+    let adopted_matches = slot.view == disk_expected.0
+        && slot.acp_session_id == disk_expected.1
+        && (!keep_context || disk_expected.2.matches(slot));
+    let original_matches = slot.view == memory_expected.0
+        && slot.acp_session_id == memory_expected.1
+        && (!keep_context || memory_expected.2.matches(slot));
+    if !(original_matches || adopted_matches) {
         return (
             StatusCode::CONFLICT,
             "ACP identity changed during terminal handoff; retry",
@@ -4299,6 +4302,99 @@ mod tests {
                 crate::session::View::Structured
             );
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn terminal_handoff_cas_follows_the_adopted_durable_row_through_a_reload() {
+        use std::{future::Future, task::Poll, time::Duration};
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+            .block_on(async {
+                for (reload, expected_status) in [
+                    (None, StatusCode::OK),
+                    (Some(false), StatusCode::CONFLICT),
+                    (Some(true), StatusCode::OK),
+                ] {
+                    let profile = "handoff-reload";
+                    let mut cached = crate::session::Instance::new(
+                        "handoff",
+                        temp.path().join("missing").to_str().unwrap(),
+                    );
+                    cached.tool = "shell".into();
+                    cached.source_profile = profile.into();
+                    let id = cached.id.clone();
+                    let mut durable = cached.clone();
+                    durable.view = crate::session::View::Structured;
+                    durable.acp_session_id = Some("11111111-1111-4111-8111-111111111111".into());
+                    let storage = crate::session::Storage::new_unwatched(profile).unwrap();
+                    storage
+                        .update(|all, _| {
+                            *all = vec![durable.clone()];
+                            Ok(())
+                        })
+                        .unwrap();
+                    let state = crate::server::test_support::build_test_app_state(vec![cached]);
+                    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+                    let (release_tx, release_rx) = std::sync::mpsc::channel();
+                    let holder = tokio::task::spawn_blocking(move || {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    });
+                    entered_rx.await.unwrap();
+                    let lock = state.instance_lock(&id).await;
+                    let mut handler = Box::pin(acp_disable(State(state.clone()), Path(id.clone())));
+                    std::future::poll_fn(|cx| {
+                        assert!(handler.as_mut().poll(cx).is_pending());
+                        Poll::Ready(())
+                    })
+                    .await;
+                    assert!(lock.try_lock().is_err());
+                    if let Some(same_identity) = reload {
+                        let mut fresh = durable;
+                        if !same_identity {
+                            fresh.acp_session_id =
+                                Some("22222222-2222-4222-8222-222222222222".into());
+                        }
+                        crate::server::reload::reload_state_instances_from_disk(
+                            &state,
+                            vec![fresh],
+                            Vec::new(),
+                            crate::server::state::StatusSource::DiskOnly,
+                            state
+                                .mutation_epoch
+                                .load(std::sync::atomic::Ordering::SeqCst),
+                        )
+                        .await;
+                    }
+                    release_tx.send(()).unwrap();
+                    holder.await.unwrap();
+                    let response = tokio::time::timeout(Duration::from_secs(10), handler)
+                        .await
+                        .unwrap()
+                        .into_response();
+                    assert_eq!(response.status(), expected_status, "reload={reload:?}");
+                    let expected_view = if expected_status == StatusCode::OK {
+                        crate::session::View::Terminal
+                    } else {
+                        crate::session::View::Structured
+                    };
+                    assert_eq!(state.instances.read().await[0].view, expected_view);
+                    let durable_rows = storage.load().unwrap();
+                    assert_eq!(durable_rows[0].view, expected_view);
+                    let expected_sid = if expected_status == StatusCode::OK {
+                        None
+                    } else {
+                        Some("11111111-1111-4111-8111-111111111111".to_string())
+                    };
+                    assert_eq!(durable_rows[0].acp_session_id, expected_sid);
+                }
+            });
     }
 
     #[tokio::test]
