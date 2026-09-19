@@ -60,7 +60,8 @@ pub struct Cli {
 
     /// Attach to a remote agent daemon instead of using the local
     /// session list. Equivalent to setting `AOE_DAEMON_URL`; pair with
-    /// `AOE_DAEMON_TOKEN` for the bearer token. Only meaningful at the
+    /// `AOE_DAEMON_TOKEN` for the bearer token, or `AOE_DAEMON_PASSPHRASE`
+    /// against a `--auth=passphrase` daemon. Only meaningful at the
     /// no-subcommand `aoe` invocation (the TUI dashboard); ignored
     /// otherwise.
     #[arg(long, global = true, env = "AOE_DAEMON_URL")]

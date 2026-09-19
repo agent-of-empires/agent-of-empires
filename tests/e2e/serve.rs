@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use serial_test::parallel;
 
-use crate::harness::{pick_free_port, require_tmux, wait_for_port, TuiTestHarness};
+use crate::harness::{pick_free_port, require_node, require_tmux, wait_for_port, TuiTestHarness};
 
 /// Resolve the daemon's PID file inside the harness's isolated home.
 /// Mirrors `crate::session::get_app_dir`'s platform split.
@@ -736,4 +736,147 @@ fn cli_serve_startup_bail_reaches_debug_log() {
         contents.contains("--behind-proxy requires --allowed-host"),
         "fatal startup reason must be routed through the tracing sink; debug.log was:\n{contents}"
     );
+}
+
+fn parse_session_id(add_stdout: &str) -> String {
+    add_stdout
+        .lines()
+        .find_map(|l| {
+            let id = l.trim().strip_prefix("ID:")?.trim();
+            (!id.is_empty()).then(|| id.to_string())
+        })
+        .unwrap_or_else(|| panic!("could not find session ID in `aoe add` output:\n{add_stdout}"))
+}
+
+#[test]
+fn parse_session_id_extracts_the_trimmed_value() {
+    assert_eq!(
+        parse_session_id("  Title:    demo\n  ID:      abc-123\n"),
+        "abc-123"
+    );
+}
+
+#[test]
+#[should_panic(expected = "could not find session ID")]
+fn parse_session_id_panics_when_id_line_is_missing() {
+    parse_session_id("  Title:    demo\n");
+}
+
+#[test]
+#[should_panic(expected = "could not find session ID")]
+fn parse_session_id_panics_when_id_value_is_empty() {
+    // A blank `ID:` line (broken `aoe add` output) must fail fast rather
+    // than hand `prompt_until_accepted` an empty id to retry for 30s.
+    parse_session_id("  Title:    demo\n  ID:      \n");
+}
+
+/// `aoe acp prompt` 404s until the worker is live and handshaked, so a
+/// successful call is the readiness oracle.
+fn prompt_until_accepted(h: &TuiTestHarness, session_id: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let out = h.run_cli(&["acp", "prompt", session_id, "hello"]);
+        if out.status.success() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "worker never accepted a prompt within {timeout:?}.\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Regression test: before this fix, every `aoe acp <verb>` CLI subcommand
+/// (built on the same `HttpClient`, see `src/acp/client/http.rs`) could not
+/// authenticate against a `--behind-proxy --auth=passphrase` daemon at all.
+/// The client only ever sent `Authorization: Bearer <token>`, and a
+/// passphrase daemon never mints one; the loopback auth bypass
+/// (`cli_serve_auth_passphrase_loopback_bypass`) is also withdrawn under
+/// `--behind-proxy` (`cli_serve_auth_passphrase_behind_proxy_gates_unforwarded_requests`),
+/// so even a same-host, same-user `aoe acp prompt` hit a flat 401. The fix
+/// teaches the client to log in via `POST /api/login` using the daemon's own
+/// `serve.passphrase` file (the same file `aoe serve --restart` already
+/// reads) and cache the resulting `aoe_session` cookie, mirroring how it
+/// already reuses `serve.token` for `--auth=token`.
+#[test]
+#[parallel]
+fn cli_acp_prompt_authenticates_against_behind_proxy_passphrase_daemon() {
+    require_tmux!();
+    require_node!();
+
+    let mut h = TuiTestHarness::new_in_tmp("acp_prompt_passphrase_behind_proxy");
+    let script_path = h.home_path().join("passphrase-prompt-script.json");
+    std::fs::write(&script_path, "{}").expect("write fake-acp script");
+    h.install_acp_shim(&script_path);
+    h.stop_daemon_on_drop();
+
+    // A structured view session needs a git repo as its workspace.
+    let project = h.project_path();
+    for args in [
+        vec!["init", "-q"],
+        vec!["commit", "--allow-empty", "-q", "-m", "init"],
+    ] {
+        let out = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&project)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("run git");
+        assert!(out.status.success(), "git {args:?} failed");
+    }
+
+    let port = pick_free_port();
+    let port_s = port.to_string();
+    let start = h.run_cli(&[
+        "serve",
+        "--daemon",
+        "--port",
+        &port_s,
+        "--auth",
+        "passphrase",
+        "--passphrase",
+        "e2e-pass",
+        "--behind-proxy",
+        "--allowed-host",
+        "aoe.example.test",
+    ]);
+    assert!(
+        start.status.success(),
+        "aoe serve --daemon --auth=passphrase --behind-proxy failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&start.stdout),
+        String::from_utf8_lossy(&start.stderr),
+    );
+    assert!(
+        wait_for_port(port, Duration::from_secs(10)),
+        "daemon never bound port {port}"
+    );
+
+    let add = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "-t",
+        "passphrase-prompt",
+        "-c",
+        "claude",
+        "--structured-view",
+    ]);
+    assert!(
+        add.status.success(),
+        "aoe add --structured-view failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&add.stdout),
+        String::from_utf8_lossy(&add.stderr),
+    );
+    let session_id = parse_session_id(&String::from_utf8_lossy(&add.stdout));
+
+    // Pre-fix this looped until timeout: every attempt got a flat 401
+    // (`daemon rejected the request (401)`), never the 404-while-spawning
+    // this retry is actually meant to ride out.
+    prompt_until_accepted(&h, &session_id, Duration::from_secs(30));
 }
