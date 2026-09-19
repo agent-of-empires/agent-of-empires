@@ -1304,11 +1304,18 @@ export const SessionRow = memo(function SessionRow({
   // Re-run smart rename ("Auto-name now") for a structured session whose
   // automatic rename never landed. Best-effort and async: a success just means
   // the one-shot was re-triggered; the title updates over the live session
-  // stream when it completes. Only offered while the session is still
-  // default-named (see the menu gate), so it never overwrites a chosen title.
+  // stream when it completes. Always offered, like the TUI action; the
+  // already-named check below reuses `default_name` (computed server-side by
+  // the same `is_default_civ_name` predicate that gates the TUI and backend)
+  // so both surfaces refuse to overwrite a chosen title for the same reason,
+  // worded the same way (`SkipReason::NameNotDefault`).
   const handleAutoNameNow = async () => {
     setContextMenu(null);
     if (!acpSession) return;
+    if (!acpSession.default_name) {
+      reportError("Session already has a custom name");
+      return;
+    }
     const result = await smartRenameSession(acpSession.id);
     if (!result.ok) {
       reportError(result.message ?? "Could not start auto-name. Please try again.");
@@ -1893,7 +1900,7 @@ export const SessionRow = memo(function SessionRow({
                     Fork session
                   </button>
                 )}
-                {!readOnly && acpSession?.default_name && (
+                {!readOnly && acpSession && (
                   <button
                     onClick={() => void handleAutoNameNow()}
                     data-testid="sidebar-context-menu-auto-name"
