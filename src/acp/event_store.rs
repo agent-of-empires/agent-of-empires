@@ -149,6 +149,14 @@ pub struct RateLimitPark {
     pub last_resume_attempt_ms: Option<i64>,
 }
 
+/// One unresolved `BackgroundAgentLaunched` row. See
+/// `EventStore::unresolved_background_agent_launches`.
+#[derive(Debug, Clone)]
+pub struct UnresolvedBackgroundAgentLaunch {
+    pub agent_id: String,
+    pub output_file: String,
+}
+
 /// SQLite-backed structured view event log. One row per (session_id, seq).
 ///
 /// The generic storage mechanics (schema, append, retention prune, keyset
@@ -1635,6 +1643,57 @@ impl EventStore {
             Ok(r) => r,
             Err(e) => {
                 warn!(target: "acp.event_store", "query unresolved_background_agent_ids for {session_id}: {e}");
+                return Vec::new();
+            }
+        };
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
+    /// `agent_id` and `output_file` for `BackgroundAgentLaunched` events
+    /// with no matching `BackgroundAgentCompleted`, the same set as
+    /// [`Self::unresolved_background_agent_ids`] but carrying the
+    /// transcript path a resumed tailer needs. Used by `Supervisor::attach`
+    /// to resume tracking a sub-agent that survived the restart instead of
+    /// eagerly detaching it.
+    pub fn unresolved_background_agent_launches(
+        &self,
+        session_id: &str,
+    ) -> Vec<UnresolvedBackgroundAgentLaunch> {
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let mut stmt = match conn.prepare(
+            "SELECT json_extract(event_json, '$.BackgroundAgentLaunched.agent_id'),
+                    json_extract(event_json, '$.BackgroundAgentLaunched.output_file')
+             FROM acp_events
+             WHERE session_id = ?1
+               AND discriminant = 'BackgroundAgentLaunched'
+               AND json_extract(event_json, '$.BackgroundAgentLaunched.agent_id') IS NOT NULL
+               AND json_extract(event_json, '$.BackgroundAgentLaunched.agent_id') NOT IN (
+                   SELECT json_extract(event_json, '$.BackgroundAgentCompleted.agent_id')
+                   FROM acp_events
+                   WHERE session_id = ?1
+                     AND discriminant = 'BackgroundAgentCompleted'
+                     AND json_extract(event_json, '$.BackgroundAgentCompleted.agent_id') IS NOT NULL
+               )
+             ORDER BY seq ASC",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(target: "acp.event_store", "prepare unresolved_background_agent_launches for {session_id}: {e}");
+                return Vec::new();
+            }
+        };
+        let rows = match stmt.query_map(params![session_id], |row| {
+            Ok(UnresolvedBackgroundAgentLaunch {
+                agent_id: row.get(0)?,
+                output_file: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            })
+        }) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(target: "acp.event_store", "query unresolved_background_agent_launches for {session_id}: {e}");
                 return Vec::new();
             }
         };

@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use crate::containers::{self, DockerContainer};
 use crate::session::config::container_config;
+use crate::session::conversation_carry::ConversationCarry;
 use crate::session::environment::{
     build_docker_env_args_with_managed_codex_home, resolved_sandbox_environment, shell_escape,
     shell_escape_script_word,
@@ -65,6 +66,7 @@ pub(crate) mod test_helpers;
 mod tmux_session;
 mod types;
 
+pub(crate) use accessors::resolved_agent_for;
 pub use flags::{is_valid_session_color, SessionBucket, SESSION_COLORS};
 pub(crate) use lifecycle::NEWER_GENERATION_BUSY_REASON;
 pub use lifecycle::{LifecycleOperation, LifecycleReservation, LifecycleReservationError};
@@ -76,6 +78,8 @@ pub(crate) use sid_persist::{persist_session_to_storage, SidPersistOutcome, SidW
 pub use start::{LaunchSidOutcome, StartOutcome};
 pub(crate) use status::PassiveStatusPatch;
 pub use status::{Status, TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR};
+#[cfg(test)]
+pub(crate) use test_helpers::install_aliases;
 pub(crate) use tmux_session::{
     duplicate_session_error, find_duplicate_session, is_duplicate_session, AgentSeed,
 };

@@ -406,7 +406,7 @@ fn test_move_to_profile_commits_without_pending_bookkeeping() {
 
     let mut requested = view.get_instance(&id).unwrap().clone();
     requested.group_path = "moved/group".to_string();
-    view.move_to_profile(&id, "target", requested, None)
+    view.move_to_profile(&id, "target", requested, None, false)
         .unwrap();
     view.reload_preserving_profile_move_runtime(std::slice::from_ref(&id))
         .unwrap();
@@ -449,7 +449,7 @@ fn test_move_to_profile_save_roundtrip_persists_under_target() {
 
     let mut requested = view.get_instance(&id).unwrap().clone();
     requested.group_path.clear();
-    view.move_to_profile(&id, "target", requested, None)
+    view.move_to_profile(&id, "target", requested, None, false)
         .unwrap();
     view.save().expect("save must succeed across profiles");
 
@@ -592,7 +592,7 @@ fn profile_only_move_seeds_target_from_authoritative_title_and_lifecycle() {
     assert_eq!(authoritative.status, Status::Running);
 
     let requested = authoritative.clone();
-    view.move_to_profile(&id, "target", requested, None)
+    view.move_to_profile(&id, "target", requested, None, false)
         .unwrap();
     view.save().unwrap();
 
@@ -641,7 +641,7 @@ fn profile_move_blocks_fresh_but_allows_stale_lifecycle_reservation() {
     let _guards = view.lock_session_mutation_and_reload(&id).unwrap();
     let requested = view.get_instance(&id).cloned().unwrap();
     let error = view
-        .move_to_profile(&id, "target", requested, None)
+        .move_to_profile(&id, "target", requested, None, false)
         .expect_err("reserved session must not move profiles");
 
     assert!(error
@@ -680,7 +680,7 @@ fn profile_move_blocks_fresh_but_allows_stale_lifecycle_reservation() {
 
     let requested = view.get_instance(&id).unwrap().clone();
     let baseline = requested.clone();
-    view.move_to_profile(&id, "target", requested, Some(&baseline))
+    view.move_to_profile(&id, "target", requested, Some(&baseline), false)
         .expect("stale reservation must not block profile move");
     assert!(source.load().unwrap().is_empty());
     assert!(Storage::new_unwatched("target")
@@ -755,7 +755,8 @@ fn test_move_to_profile_same_profile_only_updates_group_path() {
 
     let mut requested = view.get_instance(&id).unwrap().clone();
     requested.group_path = "newgrp".to_string();
-    view.move_to_profile(&id, "test", requested, None).unwrap();
+    view.move_to_profile(&id, "test", requested, None, false)
+        .unwrap();
 
     assert!(
         !view.pending_deletions.contains_key("test")
@@ -904,6 +905,75 @@ fn restart_profile_move_commits_staged_launch_edit() {
             .agent_session_id
             .as_deref(),
         Some("fresh-claude-session")
+    );
+}
+
+/// A restart that moves profiles AND swaps to another account of the same agent
+/// must land the moved row with its conversation intact, from the locked source
+/// row rather than the TUI snapshot. Parking it there would orphan the
+/// transcript the carry copied into the incoming account (#4030).
+#[test]
+#[serial]
+fn restart_profile_move_account_swap_keeps_the_conversation() {
+    let (_temp, _guard, mut view, id) =
+        boot_view_with_one_session("victim", "/tmp/profile-account");
+    let app_dir = crate::session::get_app_dir().expect("app dir");
+    std::fs::create_dir_all(&app_dir).expect("app dir");
+    std::fs::write(
+        app_dir.join("config.toml"),
+        "[session.agent_detect_as]\n\
+         claude-1 = \"claude\"\n\
+         claude-2 = \"claude\"\n",
+    )
+    .expect("config");
+    let _registry_test = crate::tmux::status_rules::ProfileRegistryGuard::take("test");
+    let _registry_target = crate::tmux::status_rules::ProfileRegistryGuard::take("target");
+    crate::session::config::profile_config::resolve_config_or_warn("test");
+    crate::session::config::profile_config::resolve_config_or_warn("target");
+
+    fn seed(instance: &mut Instance) {
+        instance.tool = "claude-1".to_string();
+        instance.detect_as = "claude".to_string();
+        instance.agent_session_id = Some("snapshot-sid".to_string());
+    }
+    view.mutate_instance(&id, seed);
+    view.storages["test"]
+        .update(|instances, _groups| {
+            seed(instances.iter_mut().find(|row| row.id == id).unwrap());
+            Ok(())
+        })
+        .unwrap();
+    // A poller lands a fresher conversation on disk than the TUI mirror holds.
+    view.storages["test"]
+        .update(|instances, _groups| {
+            instances
+                .iter_mut()
+                .find(|row| row.id == id)
+                .unwrap()
+                .agent_session_id = Some("durable-sid".to_string());
+            Ok(())
+        })
+        .unwrap();
+    view.storages.insert(
+        "target".to_string(),
+        Storage::new_unwatched("target").unwrap(),
+    );
+    view.selected_session = Some(id.clone());
+
+    view.restart_selected_session(Some("target"), Some("claude-2"), None, None)
+        .unwrap();
+
+    let target_rows = Storage::new_unwatched("target").unwrap().load().unwrap();
+    let moved = target_rows.iter().find(|row| row.id == id).unwrap();
+    assert_eq!(moved.tool, "claude-2");
+    assert_eq!(
+        moved.agent_session_id.as_deref(),
+        Some("durable-sid"),
+        "the moved row must resume the locked source row's conversation"
+    );
+    assert!(
+        !moved.prior_tool_session_ids.contains_key("claude-1"),
+        "an account swap carries the conversation rather than parking it"
     );
 }
 

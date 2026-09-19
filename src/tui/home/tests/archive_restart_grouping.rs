@@ -542,6 +542,78 @@ fn restart_selected_session_tool_swap_discards_sandbox_container() {
     }
 }
 
+/// Swapping between two tool names that run the same agent on different
+/// accounts keeps the conversation instead of parking it, so the session
+/// resumes where it left off on the new account (#4030). A swap to a different
+/// agent still parks it.
+#[test]
+#[serial]
+fn restart_selected_session_account_swap_keeps_the_conversation() {
+    const SID: &str = "11111111-2222-3333-4444-555555555555";
+    // (tool swapped to, sid still on the row, sid parked under the old tool)
+    let cases = [("claude-2", Some(SID), None), ("codex", None, Some(SID))];
+    for (new_tool, expected_live, expected_parked) in cases {
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("test");
+        let mut env = create_test_env_with_sessions(1);
+        let id = env.view.instance_at(0).id.clone();
+        env.view.selected_session = Some(id.clone());
+
+        // A real profile config, not a bare registry install: the restart path
+        // resolves the profile several times, and each resolve reinstalls that
+        // profile's whole alias registry from what it read.
+        let profile_dir = crate::session::get_profile_dir_path("test").expect("profile dir");
+        std::fs::create_dir_all(&profile_dir).expect("profile dir");
+        std::fs::write(
+            profile_dir.join("config.toml"),
+            "[session.agent_detect_as]\n\
+             claude-1 = \"claude\"\n\
+             claude-2 = \"claude\"\n",
+        )
+        .expect("profile config");
+        crate::session::config::profile_config::resolve_config_or_warn("test");
+
+        let seed = |inst: &mut Instance| {
+            inst.tool = "claude-1".to_string();
+            inst.detect_as = "claude".to_string();
+            inst.agent_session_id = Some(SID.to_string());
+        };
+        env.view.mutate_instance(&id, seed);
+        env.view
+            .storages
+            .get("test")
+            .unwrap()
+            .update(|instances, _groups| {
+                seed(instances.iter_mut().find(|i| i.id == id).unwrap());
+                Ok(())
+            })
+            .unwrap();
+
+        env.view
+            .restart_selected_session(None, Some(new_tool), None, None)
+            .unwrap();
+
+        let disk = Storage::new_unwatched("test").unwrap().load().unwrap();
+        let row = disk.iter().find(|i| i.id == id).unwrap();
+        assert_eq!(row.tool, new_tool);
+        assert_eq!(
+            row.agent_session_id.as_deref(),
+            expected_live,
+            "{new_tool}: the disk row is what the next launch resumes from"
+        );
+        assert_eq!(
+            row.prior_tool_session_ids
+                .get("claude-1")
+                .and_then(|parked| parked.agent_session_id.as_deref()),
+            expected_parked,
+            "{new_tool}"
+        );
+        assert_eq!(
+            env.view.instance_at(0).agent_session_id.as_deref(),
+            expected_live
+        );
+    }
+}
+
 /// The disk row a tool swap writes must resolve `agent_detect_as` against the
 /// session's own profile. `source_profile` is `skip_serializing`, so a
 /// storage-loaded row comes back blank and would key the default profile's
@@ -2500,7 +2572,7 @@ fn profile_move_group_metadata_survives_reload() {
             .entry("beta".to_string())
             .or_insert_with(|| GroupTree::new_with_groups(&[], &[]));
         let requested = view.instances["moved"].clone();
-        view.move_to_profile("moved", "beta", requested, None)
+        view.move_to_profile("moved", "beta", requested, None, false)
             .unwrap();
     }
 

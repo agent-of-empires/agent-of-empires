@@ -722,6 +722,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         recently_restarted: crate::session::recovery::new_recently_restarted(),
         mutation_epoch: Arc::clone(&mutation_epoch),
         recovery_pending: crate::session::recovery::new_recovery_pending(),
+        metrics_sampler: tokio::sync::Mutex::new(Default::default()),
         cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
             // Seed with an already-stale timestamp so the first request
             // forces a fresh resolve instead of handing out an empty map.

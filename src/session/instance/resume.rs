@@ -62,17 +62,20 @@ impl Instance {
         skip_on_launch: bool,
         resume_policy: ResumeAttemptPolicy,
     ) -> Result<StartOutcome> {
-        self.orchestrate_resume_launch(size, skip_on_launch, resume_policy, true, false)
+        self.orchestrate_resume_launch(size, skip_on_launch, resume_policy, true, false, None)
     }
 
     /// Restart, first removing the sandbox container when `discard_sandbox_container`
-    /// is set so the launch recreates it with the current tool's mounts (#3959).
+    /// is set so the launch recreates it with the current tool's mounts (#3959),
+    /// and carrying the conversation into the incoming account's config root
+    /// when the swap changed only the account (#4030).
     /// Removal happens only once this restart owns the Launch reservation.
     pub fn restart_discarding_sandbox_container(
         &mut self,
         size: Option<(u16, u16)>,
         skip_on_launch: bool,
         discard_sandbox_container: bool,
+        conversation_carry: Option<ConversationCarry>,
     ) -> Result<StartOutcome> {
         self.orchestrate_resume_launch(
             size,
@@ -80,6 +83,7 @@ impl Instance {
             ResumeAttemptPolicy::HonorAutoResumeSetting,
             true,
             discard_sandbox_container,
+            conversation_carry,
         )
     }
 
@@ -185,7 +189,7 @@ impl Instance {
         skip_on_launch: bool,
         resume_policy: ResumeAttemptPolicy,
     ) -> Result<StartOutcome> {
-        self.orchestrate_resume_launch(size, skip_on_launch, resume_policy, false, false)
+        self.orchestrate_resume_launch(size, skip_on_launch, resume_policy, false, false, None)
     }
 
     fn orchestrate_resume_launch(
@@ -195,6 +199,7 @@ impl Instance {
         resume_policy: ResumeAttemptPolicy,
         restart: bool,
         discard_sandbox_container: bool,
+        conversation_carry: Option<ConversationCarry>,
     ) -> Result<StartOutcome> {
         crate::session::validate_instance_id(&self.id)
             .context("refusing to start: AOE_INSTANCE_ID failed validation")?;
@@ -252,18 +257,8 @@ impl Instance {
         let skipped_failed_resume_sid = self.apply_resume_policy(resume_policy);
         self.apply_fresh_launch_intent();
 
-        let mut prepared = match self.prepare_launch_command() {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                self.fail_reserved_launch(&storage, &error, false);
-                return Err(error);
-            }
-        };
         let result = (|| {
-            if restart {
-                self.kill_clean_locked()?;
-                prepared = self.refresh_prepared_prime_launch_after_pane_stop(prepared)?;
-            }
+            let prepared = self.stop_carry_and_prepare(restart, conversation_carry)?;
             let launch_outcome = self.spawn_prepared_launch(size, &profile, prepared)?;
             let outcome =
                 self.finish_resume_launch(launch_outcome, skipped_failed_resume_sid, &profile)?;
@@ -275,6 +270,36 @@ impl Instance {
             return Err(error);
         }
         result
+    }
+
+    /// Tear down the outgoing pane, carry the conversation, then build the
+    /// launch command, in that order.
+    ///
+    /// The order is load-bearing at both ends, which is why all three steps
+    /// live here rather than spread through the cascade. The outgoing agent
+    /// appends to its transcript for as long as it runs, so a carry before the
+    /// teardown copies a file that is still growing, and the incoming
+    /// account's copy is never repaired once published. And
+    /// `build_launch_command` chooses `--resume <sid>` or `--session-id <sid>`
+    /// from whether the incoming account's transcript exists, so a carry after
+    /// it pins an id the agent then rejects as already in use, killing the pane
+    /// (#3399).
+    fn stop_carry_and_prepare(
+        &mut self,
+        restart: bool,
+        conversation_carry: Option<ConversationCarry>,
+    ) -> Result<PreparedLaunch> {
+        if restart {
+            self.kill_clean_locked()?;
+        }
+        if let Some(carry) = conversation_carry {
+            carry.run();
+        }
+        let prepared = self.prepare_launch_command()?;
+        if restart {
+            return self.refresh_prepared_prime_launch_after_pane_stop(prepared);
+        }
+        Ok(prepared)
     }
 
     /// A failure fails the restart: relaunching into the old container would run
@@ -466,6 +491,78 @@ mod tests {
     use crate::session::instance::test_helpers::install_aliases;
     use serial_test::serial;
     use tempfile::tempdir;
+
+    /// Pins the order inside `stop_carry_and_prepare`: the launch command is
+    /// built from whether the incoming account's transcript exists, so the
+    /// carry has to have published it by then. Preparing first yields
+    /// `--session-id <sid>` on an id the agent rejects as already in use once
+    /// the carry creates the transcript (#3399, #4030).
+    #[test]
+    #[serial]
+    fn carry_runs_before_the_launch_command_picks_its_resume_flag() {
+        const SID: &str = "11111111-2222-3333-4444-555555555555";
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let home = dirs::home_dir().expect("home");
+        let app_dir = crate::session::get_app_dir().expect("app dir");
+        std::fs::create_dir_all(&app_dir).expect("app dir");
+        std::fs::write(
+            app_dir.join("config.toml"),
+            "[session.agent_detect_as]\n\
+             claude-1 = \"claude\"\n\
+             claude-2 = \"claude\"\n\
+             \n\
+             [session.agent_config_dir]\n\
+             claude-1 = \"~/dot-claude-1\"\n\
+             claude-2 = \"~/dot-claude-2\"\n",
+        )
+        .expect("config");
+        let profile = crate::session::config::effective_profile("");
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(&profile);
+        crate::session::config::profile_config::resolve_config_or_warn(&profile);
+
+        let project = home.join("project");
+        std::fs::create_dir_all(&project).expect("project");
+        let mut inst = Instance::new("t", project.to_str().unwrap());
+        inst.tool = "claude-1".to_string();
+        inst.detect_as = "claude".to_string();
+        // The renamed-wrapper shape these per-account tools take: a bare token
+        // the launch shell resolves, which keeps native resume available.
+        inst.command = "claude".to_string();
+        inst.agent_session_id = Some(SID.to_string());
+
+        // The outgoing account holds the conversation, the incoming one does not.
+        let encoded = crate::session::capture::encode_claude_project_path(
+            &crate::session::capture::canonicalize_or_raw(project.to_str().unwrap())
+                .to_string_lossy(),
+        );
+        let seeded = home.join("dot-claude-1").join("projects").join(&encoded);
+        std::fs::create_dir_all(&seeded).expect("seed dir");
+        std::fs::write(seeded.join(format!("{SID}.jsonl")), "conversation\n").expect("seed");
+
+        let carry = match crate::session::conversation_carry::classify(&inst, &profile, "claude-2")
+        {
+            crate::session::conversation_carry::ToolSwap::KeepConversation(Some(carry)) => carry,
+            other => panic!("expected a planned carry, got {other:?}"),
+        };
+        inst.swap_account("claude-2");
+
+        let prepared = inst
+            .stop_carry_and_prepare(false, Some(carry))
+            .expect("prepare");
+
+        assert!(
+            prepared.is_existing,
+            "the carried transcript must be visible when the flag is chosen"
+        );
+        assert!(
+            prepared
+                .command
+                .as_deref()
+                .is_some_and(|command| command.contains(&format!("--resume {SID}"))),
+            "expected --resume on the carried conversation, got: {:?}",
+            prepared.command
+        );
+    }
     type PostShellCallback = Box<dyn FnOnce(&crate::tmux::Session)>;
     thread_local! {
         static POST_SHELL_OBSERVER: std::cell::RefCell<Option<PostShellCallback>> = const { std::cell::RefCell::new(None) };

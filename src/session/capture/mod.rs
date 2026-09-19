@@ -34,10 +34,23 @@ fn resolve_agent_home(env_var: Option<&str>, default_subdir: &str) -> Result<Pat
 /// absent, and the project-dir scan can hand back a conversation belonging to
 /// another profile that happens to share the cwd. See #3399.
 ///
-/// Precedence mirrors [`crate::hooks::agent_settings_path_in`]: the session's
-/// host environment first, then AoE's own env (a var exported in the shell that
-/// launched `aoe` is inherited by the agent too), then `~/.claude`.
-fn claude_home_for_host_environment(host_env: &[String]) -> Result<PathBuf> {
+/// `declared` is the session's `session.agent_config_dir` entry and wins
+/// outright, matching [`crate::hooks::trust_host_project`]: that setting exists
+/// for wrappers that export the config-dir variable themselves, which they do
+/// after AoE has already handed the launch its environment, so the variable is
+/// absent from `host_env` in exactly the case the setting is for.
+///
+/// Without one, precedence mirrors [`crate::hooks::agent_settings_path_in`]:
+/// the session's host environment first, then AoE's own env (a var exported in
+/// the shell that launched `aoe` is inherited by the agent too), then
+/// `~/.claude`.
+pub(crate) fn claude_home_for_host_environment(
+    declared: Option<&Path>,
+    host_env: &[String],
+) -> Result<PathBuf> {
+    if let Some(dir) = declared {
+        return Ok(dir.to_path_buf());
+    }
     match claude_config_dir_override(host_env) {
         Some(dir) => Ok(PathBuf::from(dir)),
         None => resolve_agent_home(None, ".claude"),
@@ -111,12 +124,12 @@ pub(crate) fn encode_claude_project_path(project_path: &str) -> String {
 /// such an id as a fresh pinned session (`--session-id <uuid>`) instead of a
 /// guaranteed-to-fail `--resume`.
 ///
-/// `<config>` is resolved from the session's profile-scoped `host_env`, the
-/// same way the launch path resolves it (see
-/// [`claude_home_for_host_environment`]). Probing the default `~/.claude` for a
-/// profile pinned elsewhere would report every real conversation absent and
-/// downgrade it to `--session-id <uuid>`, which the agent rejects as already in
-/// use, killing the pane outright. See #3399.
+/// `<config>` is resolved from the session's declared `agent_config_dir` and
+/// its profile-scoped `host_env`, the same way the launch path resolves it
+/// (see [`claude_home_for_host_environment`]). Probing the default `~/.claude`
+/// for a profile pinned elsewhere would report every real conversation absent
+/// and downgrade it to `--session-id <uuid>`, which the agent rejects as
+/// already in use, killing the pane outright. See #3399.
 ///
 /// Returns `true` ONLY when the Claude home resolves and the transcript file is
 /// confirmed missing. Any uncertainty (home dir unresolved) returns `false` so
@@ -128,8 +141,9 @@ pub(crate) fn claude_host_transcript_confirmed_absent(
     project_path: &str,
     session_id: &str,
     host_env: &[String],
+    declared_config_dir: Option<&Path>,
 ) -> bool {
-    let Ok(claude_home) = claude_home_for_host_environment(host_env) else {
+    let Ok(claude_home) = claude_home_for_host_environment(declared_config_dir, host_env) else {
         return false;
     };
     let canonical = canonicalize_or_raw(project_path);
@@ -1727,19 +1741,53 @@ mod tests {
             crate::session::test_support::EnvGuard::set(&[("CLAUDE_CONFIG_DIR", tmp.path())]);
 
         assert!(
-            !claude_host_transcript_confirmed_absent("/tmp/myproject", present, &[]),
+            !claude_host_transcript_confirmed_absent("/tmp/myproject", present, &[], None),
             "a transcript on disk (even stale) must not be reported absent"
         );
         assert!(
-            claude_host_transcript_confirmed_absent("/tmp/myproject", missing, &[]),
+            claude_host_transcript_confirmed_absent("/tmp/myproject", missing, &[], None),
             "an unwritten sid must be reported confirmed-absent"
         );
         // A project dir that was never created is also confirmed-absent.
         assert!(claude_host_transcript_confirmed_absent(
             "/tmp/never-opened-project",
             present,
-            &[]
+            &[],
+            None
         ));
+    }
+
+    /// A session pinned with `session.agent_config_dir` reads its transcripts
+    /// from that directory, and nothing puts the equivalent variable in the
+    /// host environment: the wrappers the setting exists for export it
+    /// themselves, after AoE has handed the launch its environment. Probing
+    /// the environment's answer would report every real conversation absent
+    /// and downgrade a good `--resume` to a `--session-id` the agent rejects.
+    #[test]
+    fn declared_config_dir_wins_over_the_host_environment() {
+        let declared = tempfile::tempdir().unwrap();
+        let from_env = tempfile::tempdir().unwrap();
+        let sid = "11111111-2222-3333-4444-555555555555";
+        let project_dir = declared.path().join("projects").join("-tmp-myproject");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(project_dir.join(format!("{sid}.jsonl")), "data\n").unwrap();
+
+        let _env =
+            crate::session::test_support::EnvGuard::set(&[("CLAUDE_CONFIG_DIR", from_env.path())]);
+
+        assert!(
+            claude_host_transcript_confirmed_absent("/tmp/myproject", sid, &[], None),
+            "pre-condition: the environment's directory does not hold it"
+        );
+        assert!(
+            !claude_host_transcript_confirmed_absent(
+                "/tmp/myproject",
+                sid,
+                &[],
+                Some(declared.path())
+            ),
+            "the declared directory is the one the agent actually opens"
+        );
     }
 
     #[cfg(unix)]

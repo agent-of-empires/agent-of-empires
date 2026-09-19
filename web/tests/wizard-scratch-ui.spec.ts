@@ -149,6 +149,9 @@ test.describe("Wizard scratch sessions (#1324)", () => {
     // Scratch is pre-armed: the scratch callout shows and Launch is enabled.
     await expect(w.getByText(/Scratch session/).first()).toBeVisible();
     await expect(w.getByRole("switch", { name: "Skip project folder" })).toHaveAttribute("aria-checked", "true");
+    // Launch (and its shortcut) wait for the profile defaults to settle; the
+    // comment above promised enabled, so assert it before pressing.
+    await expect(w.getByRole("button", { name: /Launch session/ })).toBeEnabled();
 
     await page.keyboard.press("ControlOrMeta+Enter");
 

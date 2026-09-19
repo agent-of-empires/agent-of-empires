@@ -209,19 +209,7 @@ impl Instance {
             self.prior_tool_session_ids
                 .insert(self.tool.clone(), outgoing);
         }
-        self.tool = new_tool.to_string();
-        // The alias is resolved per-tool, so the outgoing tool's answer cannot
-        // survive: kept, it points `resolved_agent` at the wrong built-in
-        // outright (a `codex-personal` -> `claude-personal` swap would keep
-        // detecting as codex); cleared, the row lands in the same
-        // empty-`detect_as` state a session built before its tool joined
-        // `[session.agent_detect_as]` does. Re-resolve against the same
-        // process-global registry `effective_detect_as` reads, so this stays a
-        // lookup rather than a config load, and the row ends up exactly as if
-        // it had been built on the new tool.
-        self.detect_as =
-            tmux::status_rules::effective_detect_as(&self.source_profile, new_tool, "")
-                .into_owned();
+        self.adopt_tool(new_tool);
         // Consumed, not copied: the row owns exactly one live conversation per
         // agent, and leaving the entry behind would let a later swap restore an
         // id this session has since replaced.
@@ -256,6 +244,55 @@ impl Instance {
         // lets the spawn path pick the new tool's default agent instead of
         // silently keeping the old backend alive across the swap.
         self.agent_name = None;
+    }
+
+    /// Move this row to a different `tool` that runs the SAME agent on another
+    /// account, keeping the conversation rather than parking it.
+    ///
+    /// Everything [`Self::swap_tool`] clears is cleared because it names
+    /// something in the outgoing agent's namespace: a session id, a model, an
+    /// effort vocabulary, a structured-view agent. None of that changes when
+    /// only the account does, so all of it survives. What the incoming account
+    /// lacks is the transcript itself, which
+    /// [`crate::session::conversation_carry`] copies into its config root.
+    ///
+    /// The entry parked under `new_tool` by an earlier swap is dropped: the
+    /// row's live conversation for that tool is now the carried one, and
+    /// leaving the old id behind would let a later swap back restore a
+    /// conversation this session has moved on from.
+    ///
+    /// Persistence has the same contract as [`Self::swap_tool`]: the caller
+    /// writes the result to disk, or `reconcile_from_disk` reverts it.
+    pub(crate) fn swap_account(&mut self, new_tool: &str) {
+        if new_tool == self.tool {
+            return;
+        }
+        self.adopt_tool(new_tool);
+        self.prior_tool_session_ids.remove(new_tool);
+        // The transcript the carry copies is what the previous failure was
+        // missing, so the loop-breaker must not outlive the account it fired
+        // on; the resume-probe cascade still catches a second failure.
+        self.resume_probe_failed_sid = None;
+        self.acp_load_session_capable = None;
+    }
+
+    /// Take on `new_tool`'s identity: the name plus the `agent_detect_as`
+    /// alias resolved for it.
+    ///
+    /// The alias is resolved per-tool, so the outgoing tool's answer cannot
+    /// survive: kept, it points `resolved_agent` at the wrong built-in
+    /// outright (a `codex-personal` -> `claude-personal` swap would keep
+    /// detecting as codex); cleared, the row lands in the same
+    /// empty-`detect_as` state a session built before its tool joined
+    /// `[session.agent_detect_as]` does. Re-resolve against the same
+    /// process-global registry `effective_detect_as` reads, so this stays a
+    /// lookup rather than a config load, and the row ends up exactly as if it
+    /// had been built on the new tool.
+    fn adopt_tool(&mut self, new_tool: &str) {
+        self.tool = new_tool.to_string();
+        self.detect_as =
+            tmux::status_rules::effective_detect_as(&self.source_profile, new_tool, "")
+                .into_owned();
     }
 
     /// Apply a passively-detected status transition to a disk row. Touches
@@ -325,13 +362,22 @@ impl Instance {
     /// preserving unrelated fields refreshed by a peer after `pre` was read.
     /// A tool change is one atomic state transition: the tool name and every
     /// conversation field staged by `swap_tool` must travel together.
-    pub(crate) fn merge_profile_move_diff(&mut self, pre: &Self, post: &Self) {
+    /// `account_swap` says the tool change keeps the same agent and changes
+    /// only which account it runs as, so the conversation travels with the row
+    /// instead of being parked (#4030). The caller classifies it, rather than
+    /// this deciding for itself, so the row that lands matches the swap the
+    /// restart already planned its transcript copy for.
+    pub(crate) fn merge_profile_move_diff(&mut self, pre: &Self, post: &Self, account_swap: bool) {
         self.merge_user_action_diff(pre, post);
         if pre.tool != post.tool {
             // Apply the requested transition to the freshly locked disk row.
             // The TUI post snapshot can carry parked session ids captured
             // before a poller or peer refreshed the durable conversation state.
-            self.swap_tool(&post.tool);
+            if account_swap {
+                self.swap_account(&post.tool);
+            } else {
+                self.swap_tool(&post.tool);
+            }
         }
         if pre.command != post.command {
             self.command = post.command.clone();
@@ -1787,6 +1833,115 @@ mod tests {
     /// `swap_tool` re-resolves the alias for the incoming tool. The alias is
     /// per-tool, so carrying the outgoing tool's value forward aims every
     /// launch-time reader at the wrong built-in.
+    /// The cross-profile move re-applies the swap to the freshly locked disk
+    /// row, so it has to be told which swap the restart classified. Left to
+    /// park, an account swap lands the moved row with no session id and the
+    /// transcript the carry copied is orphaned (#4030).
+    #[test]
+    fn merge_profile_move_diff_carries_the_conversation_on_an_account_swap() {
+        const PROFILE: &str = "profile-move-account-swap-test";
+        let _registry = install_aliases(PROFILE, &[("claude-1", "claude"), ("claude-2", "claude")]);
+
+        // (account swap, sid on the moved row, sid parked under the old tool)
+        let cases = [
+            (true, Some("durable-sid"), None),
+            (false, None, Some("durable-sid")),
+        ];
+        for (account_swap, expected_live, expected_parked) in cases {
+            let mut locked = Instance::new("t", "/tmp/x");
+            locked.source_profile = PROFILE.to_string();
+            locked.tool = "claude-1".to_string();
+            locked.detect_as = "claude".to_string();
+            locked.agent_session_id = Some("durable-sid".to_string());
+
+            let mut pre = locked.clone();
+            pre.agent_session_id = Some("stale-snapshot-sid".to_string());
+            let mut post = pre.clone();
+            post.tool = "claude-2".to_string();
+
+            locked.merge_profile_move_diff(&pre, &post, account_swap);
+
+            assert_eq!(locked.tool, "claude-2", "account_swap={account_swap}");
+            assert_eq!(
+                locked.agent_session_id.as_deref(),
+                expected_live,
+                "account_swap={account_swap}: the locked row's own id is the durable one"
+            );
+            assert_eq!(
+                locked
+                    .prior_tool_session_ids
+                    .get("claude-1")
+                    .and_then(|parked| parked.agent_session_id.as_deref()),
+                expected_parked,
+                "account_swap={account_swap}"
+            );
+        }
+    }
+
+    #[test]
+    fn swap_account_keeps_the_conversation_and_drops_the_parked_one() {
+        const PROFILE: &str = "account-swap-test";
+        let _registry = install_aliases(PROFILE, &[("claude-1", "claude"), ("claude-2", "claude")]);
+
+        let mut inst = Instance::new("Test", "/home/user/project");
+        inst.source_profile = PROFILE.to_string();
+        inst.tool = "claude-1".to_string();
+        inst.detect_as = "claude".to_string();
+        inst.agent_session_id = Some("claude-session-123".to_string());
+        inst.acp_session_id = Some("acp-claude-1".to_string());
+        inst.resume_intent = ResumeIntent::Use("claude-session-123".to_string());
+        inst.resume_probe_failed_sid = Some("claude-session-123".to_string());
+        inst.agent_model = Some("claude-opus-4-7".to_string());
+        inst.acp_effort = Some("high".to_string());
+        inst.agent_name = Some("claude-code".to_string());
+        inst.prior_tool_session_ids.insert(
+            "claude-2".to_string(),
+            PriorToolSession {
+                agent_session_id: Some("stale-on-the-other-account".to_string()),
+                acp_session_id: None,
+            },
+        );
+
+        inst.swap_account("claude-2");
+
+        assert_eq!(inst.tool, "claude-2");
+        assert_eq!(inst.detect_as, "claude");
+        assert_eq!(inst.agent_session_id.as_deref(), Some("claude-session-123"));
+        assert_eq!(inst.acp_session_id.as_deref(), Some("acp-claude-1"));
+        assert_eq!(
+            inst.resume_intent,
+            ResumeIntent::Use("claude-session-123".to_string()),
+            "the pinned id names the same agent's namespace, so it survives"
+        );
+        assert_eq!(inst.agent_model.as_deref(), Some("claude-opus-4-7"));
+        assert_eq!(inst.acp_effort.as_deref(), Some("high"));
+        assert_eq!(inst.agent_name.as_deref(), Some("claude-code"));
+        assert_eq!(
+            inst.resume_probe_failed_sid, None,
+            "the carried transcript is what the failed probe was missing"
+        );
+        assert!(
+            !inst.prior_tool_session_ids.contains_key("claude-2"),
+            "the carried conversation is this tool's live one now"
+        );
+        assert!(
+            !inst.prior_tool_session_ids.contains_key("claude-1"),
+            "nothing is parked: the conversation moved rather than stayed behind"
+        );
+
+        // Same-tool call is a no-op: the caller applies the swap to the disk
+        // row and the in-memory row independently.
+        inst.prior_tool_session_ids.insert(
+            "claude-2".to_string(),
+            PriorToolSession {
+                agent_session_id: Some("keep-me".to_string()),
+                acp_session_id: None,
+            },
+        );
+        inst.swap_account("claude-2");
+        assert!(inst.prior_tool_session_ids.contains_key("claude-2"));
+    }
+
     #[test]
     fn swap_tool_reresolves_detect_as() {
         const PROFILE: &str = "detect-as-swap-test";
