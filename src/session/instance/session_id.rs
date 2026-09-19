@@ -1462,6 +1462,26 @@ mod tests {
     use serial_test::serial;
     use std::os::unix::fs::PermissionsExt;
 
+    /// Certifies the exact content roots `instance_roots` returns for a
+    /// hand-built sandboxed instance, mirroring the admission the sandboxed
+    /// launch path performs in `get_container_for_instance` before any store
+    /// read. The receipt-only seam is used rather than `admit_fresh_instance`
+    /// because that one returns a `StorageFlock` holding the storage
+    /// transition lock, which deadlocks a fixture that exercises (or repeats)
+    /// the same path.
+    fn admit_sandbox_fixture(inst: &Instance) {
+        let app = crate::session::get_app_dir().unwrap();
+        let roots = crate::migrations::v031_isolate_sandbox_content::instance_roots(inst).unwrap();
+        for root in roots {
+            std::fs::create_dir_all(&root.path).unwrap();
+            let roles: Vec<&str> = root.roles.iter().map(String::as_str).collect();
+            crate::migrations::v031_isolate_sandbox_content::certify_test_content(
+                &app, &inst.id, &root.path, &roles,
+            )
+            .unwrap();
+        }
+    }
+
     #[test]
     fn self_heal_eligibility_rejects_owned_and_inactive_rows() {
         let base = Instance::new("self-heal", "/tmp/self-heal");
@@ -1775,6 +1795,7 @@ mod tests {
         });
 
         assert_eq!(inst.try_retroactive_capture(), None);
+        admit_sandbox_fixture(&inst);
         std::fs::create_dir_all(inst.sandbox_capture_store_dir().unwrap()).unwrap();
         inst.capture_started_at = Some(std::time::SystemTime::now());
         inst.maybe_start_poller_since(None);
@@ -1801,6 +1822,7 @@ mod tests {
             before_start_env: Vec::new(),
             container_workdir: Some("/workspace/project".to_string()),
         });
+        admit_sandbox_fixture(&inst);
         let store = inst.sandbox_capture_store_dir().unwrap();
         std::fs::create_dir_all(&store).unwrap();
         let mut config = inst.build_container_config().unwrap();
@@ -2025,6 +2047,7 @@ mod tests {
             before_start_env: Vec::new(),
             container_workdir: Some("/workspace/project".to_string()),
         });
+        admit_sandbox_fixture(&inst);
         inst.build_launch_command().unwrap();
         let plan = inst
             .prime_agent_capture_plan(inst.prime_agent_capture_options().unwrap())
@@ -2171,6 +2194,7 @@ await publish({}, { sessionManager: {
             container_workdir: Some("/workspace/project".to_string()),
         });
 
+        admit_sandbox_fixture(&inst);
         inst.build_launch_command().unwrap();
         let store = inst.sandbox_capture_store_dir().unwrap();
         let sessions = store.join("custom-sessions");
@@ -2498,6 +2522,7 @@ process.stdout.write(JSON.stringify({ rootOnly, defaultMode }));
             container_workdir: None,
             before_start_env: Vec::new(),
         });
+        admit_sandbox_fixture(&inst);
         inst.mark_pi_extension_launched_for_test();
 
         // Round-trip the way a daemon or TUI reload does.
@@ -2558,6 +2583,7 @@ process.stdout.write(JSON.stringify({ rootOnly, defaultMode }));
             container_workdir: None,
             before_start_env: Vec::new(),
         });
+        admit_sandbox_fixture(&inst);
         let SessionSidecarSource::SandboxDir(dir) = inst.pi_sidecar_source().unwrap() else {
             panic!("sandboxed Pi must publish into its config bind");
         };
@@ -2626,6 +2652,7 @@ process.stdout.write(JSON.stringify({ rootOnly, defaultMode }));
         };
 
         let inst = sandboxed_pi("piownconfig01");
+        admit_sandbox_fixture(&inst);
         let SessionSidecarSource::SandboxDir(stale_sidecar) = inst.pi_sidecar_source().unwrap()
         else {
             panic!("sandboxed Pi must publish into its config bind");
@@ -2642,6 +2669,7 @@ pi = "~/.pi-personal"
         .unwrap();
 
         let mut declared = sandboxed_pi("piownconfig01");
+        admit_sandbox_fixture(&declared);
         let (_, env_prefix) = declared
             .identity_extension_launch()
             .expect("declared sandbox config supports the pane extension");
@@ -2665,6 +2693,7 @@ pi = "~/.pi-personal"
         // The container publishes `/root/.pi/...`; the file lives under the
         // sandbox dir on this side. Checking the container path verbatim would
         // reject every sandbox transcript.
+        let _app = crate::session::test_support::isolate_app_dir();
         let mut inst = Instance::new("pi-ns", "/tmp/pi-ns");
         inst.tool = "pi".to_string();
         inst.sandbox_info = Some(crate::session::SandboxInfo {
@@ -2677,6 +2706,7 @@ pi = "~/.pi-personal"
             container_workdir: None,
             before_start_env: Vec::new(),
         });
+        admit_sandbox_fixture(&inst);
 
         let published = "/root/.pi/sessions/--proj--/2026-01-01T00-00-00-000Z_x.jsonl";
         let host = inst
@@ -2725,9 +2755,11 @@ pi = "~/.pi-personal"
             before_start_env: Vec::new(),
         });
         inst.pi_session_path = Some(format!("/root/.pi/agent/sessions/--proj--/{leaf}"));
+        admit_sandbox_fixture(&inst);
 
-        // No store dir on the host side of the bind yet: unreadable, so the
-        // launch keeps whatever it would have done without this gate.
+        // The admitted store has no transcript subtree published into it, so
+        // the recorded path cannot be resolved: unreadable, and the launch
+        // keeps whatever it would have done without this gate.
         assert!(
             !inst.pi_recorded_transcript_missing(),
             "an uninspectable store is not evidence the conversation is gone"

@@ -19,6 +19,9 @@
 pub struct AgentProfile {
     /// Registry key. Matches `AgentRegistry` (`src/acp/agent_registry.rs`).
     pub key: &'static str,
+    /// Native configuration store used by this adapter. Independent ACP
+    /// engines and unknown adapters do not inherit a TUI tool's reset.
+    pub native_config_agent: Option<&'static str>,
     /// `_meta.<namespace>.parentToolUseId` lookup order for subagent
     /// linkage. Empty when the agent's parent-child linkage is unknown;
     /// indentation simply doesn't render rather than guessing a
@@ -131,6 +134,7 @@ impl AgentProfile {
 /// the adapter source at `~/.nvm/.../@agentclientprotocol/claude-agent-acp/dist/tools.js`.
 pub const CLAUDE: AgentProfile = AgentProfile {
     key: "claude",
+    native_config_agent: Some("claude"),
     parent_meta_namespaces: &["claudeCode"],
     clear_aliases: &["/clear"],
     // claude-agent-acp handles `/clear` locally ("Local-only commands"), so a
@@ -165,6 +169,7 @@ pub const CLAUDE_CODE: AgentProfile = AgentProfile {
 /// Skill, plan mode, or ScheduleWakeup in Codex's tool surface.
 pub const CODEX: AgentProfile = AgentProfile {
     key: "codex",
+    native_config_agent: Some("codex"),
     parent_meta_namespaces: &[],
     clear_aliases: &["/new"],
     // codex-acp advertises no `new`/`clear`/reset command; a forwarded
@@ -188,6 +193,7 @@ pub const CODEX: AgentProfile = AgentProfile {
 /// guessing a `_meta` namespace.
 pub const OPENCODE: AgentProfile = AgentProfile {
     key: "opencode",
+    native_config_agent: Some("opencode"),
     parent_meta_namespaces: &[],
     clear_aliases: &["/new"],
     // OpenCode also maps `/new`, but whether its adapter handles the
@@ -208,6 +214,7 @@ pub const OPENCODE: AgentProfile = AgentProfile {
 /// clear aliases empty rather than corrupting transcript segmentation.
 pub const GEMINI: AgentProfile = AgentProfile {
     key: "gemini",
+    native_config_agent: Some("gemini"),
     parent_meta_namespaces: &[],
     clear_aliases: &[],
     clear_requires_driven_reset: false,
@@ -222,6 +229,7 @@ pub const GEMINI: AgentProfile = AgentProfile {
 /// Mistral Vibe via bundled `vibe-acp`. Defaults until verified.
 pub const VIBE: AgentProfile = AgentProfile {
     key: "vibe",
+    native_config_agent: Some("vibe"),
     parent_meta_namespaces: &[],
     clear_aliases: &[],
     clear_requires_driven_reset: false,
@@ -234,6 +242,7 @@ pub const VIBE: AgentProfile = AgentProfile {
 /// Pi coding agent via `pi-acp`. Defaults until verified.
 pub const PI: AgentProfile = AgentProfile {
     key: "pi",
+    native_config_agent: Some("pi"),
     parent_meta_namespaces: &[],
     clear_aliases: &[],
     clear_requires_driven_reset: false,
@@ -248,6 +257,7 @@ pub const PI: AgentProfile = AgentProfile {
 /// YOLO mode id. Parent linkage metadata is unobserved and stays disabled.
 pub const OMP: AgentProfile = AgentProfile {
     key: "omp",
+    native_config_agent: Some("omp"),
     parent_meta_namespaces: &[],
     clear_aliases: &["/new"],
     clear_requires_driven_reset: false,
@@ -265,6 +275,7 @@ pub const OMP: AgentProfile = AgentProfile {
 /// starts a fresh conversation.
 pub const KIMI: AgentProfile = AgentProfile {
     key: "kimi",
+    native_config_agent: Some("kimi"),
     parent_meta_namespaces: &[],
     clear_aliases: &["/new"],
     clear_requires_driven_reset: false,
@@ -284,6 +295,7 @@ pub const KIMI: AgentProfile = AgentProfile {
 /// unobserved, so clear aliases stay empty until then.
 pub const PRIME_AGENT: AgentProfile = AgentProfile {
     key: "prime-agent",
+    native_config_agent: Some("prime-agent"),
     parent_meta_namespaces: &[],
     clear_aliases: &[],
     clear_requires_driven_reset: false,
@@ -303,6 +315,7 @@ pub const PRIME_AGENT: AgentProfile = AgentProfile {
 /// mode picker the adapter cannot honor. See #1904.
 pub const AOE_AGENT: AgentProfile = AgentProfile {
     key: "aoe-agent",
+    native_config_agent: None,
     // The adapter sets no `_meta` on its tool_call notifications at all, so
     // there is no namespace to look up and child tool calls cannot be linked
     // to a parent. Populate this only once the adapter emits linkage.
@@ -332,6 +345,7 @@ pub const AOE_AGENT: AgentProfile = AgentProfile {
 /// shows whatever the agent emits.
 pub const DEFAULT: AgentProfile = AgentProfile {
     key: "default",
+    native_config_agent: None,
     parent_meta_namespaces: &[],
     clear_aliases: &[],
     clear_requires_driven_reset: false,

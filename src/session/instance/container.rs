@@ -86,7 +86,8 @@ impl Instance {
     /// container launch first copies that store; see [`Self::move_sandbox_store`].
     pub fn sandbox_store_move_pending(&self) -> bool {
         self.is_sandboxed()
-            && self.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION
+            && !crate::migrations::v031_isolate_sandbox_content::instance_ready(self)
+                .unwrap_or(false)
     }
 
     /// Move this session's sandbox store into the private layout, narrating
@@ -123,30 +124,17 @@ impl Instance {
         // structured sessions and a bare container terminal all arrive here.
         // The TUI runs it ahead of time on a worker so this is a no-op there;
         // see `tui::store_move_poller`. It must stay above the shared flock
-        // below, which the move takes exclusively to plan and publish. A
-        // failure leaves the row on its shared store for a later attempt
-        // rather than blocking the launch.
+        // below. Failure is not permission to launch on unproven native state.
         if self.sandbox_store_move_pending() {
-            match self.move_sandbox_store(Some(crate::migrations::progress::tracing_reporter())) {
-                Ok(true) => self.reconcile_from_disk(),
-                Ok(false) => {}
-                Err(error) => tracing::warn!(
-                    session_id = %self.id,
-                    %error,
-                    "sandbox store move deferred; session continues on its shared store"
-                ),
+            if !self.move_sandbox_store(Some(crate::migrations::progress::tracing_reporter()))? {
+                anyhow::bail!(
+                    "sandbox {} must be stopped before native history can be isolated",
+                    self.id
+                );
             }
+            self.reconcile_from_disk();
         }
         self.warn_legacy_agent_config_mounts();
-        let _transition_lock =
-            if self.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION {
-                Some(crate::session::acquire_storage_shared_flock(
-                    &crate::session::get_app_dir()?,
-                    crate::migrations::v027_isolate_sandbox_stores::LOCK,
-                )?)
-            } else {
-                None
-            };
 
         // A container built for another agent mounts that agent's config.
         // Decide on the disk row and a resolved profile: a stale in-memory copy
@@ -176,6 +164,10 @@ impl Instance {
         }
         // After every reload above, which may have replaced the tool.
         let detect_as = self.effective_detect_as().into_owned();
+        // Admit the reconciled tool: reconciliation above may have replaced it,
+        // and the isolated store is seeded for the agent the launch will run.
+        let _transition_lock =
+            crate::migrations::v031_isolate_sandbox_content::admit_fresh_instance(self)?;
 
         // Direct is_running()? / exists()? here rather than probe_running():
         // this function already returns Result, so `?` correctly propagates
@@ -194,10 +186,6 @@ impl Instance {
             // Already up: not a come-up, so don't re-mint. Fill lazily only if a
             // fresh process attached to a running container with no values yet.
             self.ensure_before_start_env(false)?;
-            if self.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION {
-                self.backfill_container_workdir(&container);
-                return Ok(container);
-            }
             // Still rotating the copy in its store. The refresh below would
             // fold that copy into the shared file and log every sandbox on
             // it out at the copy's next rotation, so refuse first.
@@ -216,6 +204,7 @@ impl Instance {
                 &self.tool,
                 Some(detect_as.as_str()),
                 fold,
+                std::path::Path::new(&self.container_workdir()),
             );
             let config = self.build_container_config_with(fold)?;
             self.identity_publisher_launched = config.identity_publisher_installed
@@ -255,6 +244,7 @@ impl Instance {
                     &self.tool,
                     Some(detect_as.as_str()),
                     container_config::CredentialFold::Freshest,
+                    std::path::Path::new(&self.container_workdir()),
                 );
                 let config = self.build_container_config()?;
                 // Built before its agent shared a credential file, so it
@@ -812,6 +802,7 @@ claude-personal = "~/.claude-global"
              *agent-tool*) cat '{label}' ;;\n\
              *sandbox-store-generation*) echo 2 ;;\n\
              *State.Running*) echo false ;;\n\
+             *) echo '[{{\"Id\":\"c\",\"State\":{{\"Running\":false}},\"Mounts\":[]}}]' ;;\n\
              esac\n\
              exit 0\n\
              fi\n\
@@ -826,6 +817,10 @@ claude-personal = "~/.claude-global"
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let _path = crate::session::test_support::path_prepended(&bin);
+        // A project outside the isolated home, so its own mount never contains
+        // the recovery namespace under that home and admission is not refused.
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
         let profile = "agent-tool-label";
         let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(profile);
         let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
@@ -846,9 +841,10 @@ claude-personal = "~/.claude-global"
             /// A persisted row whose profile config cannot be parsed.
             RowBrokenProfile(&'static str, &'static str),
         }
-        // `store` is the agent config root the reuse path refreshed, if any.
+        // The isolated store admission seeds for the effective (reconciled)
+        // tool, or None when reconciliation fails before admission is reached.
         let cases = [
-            (("codex", ""), "claude", Disk::Absent, 1, None),
+            (("codex", ""), "claude", Disk::Absent, 1, Some(".codex")),
             (
                 ("codex", ""),
                 "claude",
@@ -860,7 +856,13 @@ claude-personal = "~/.claude-global"
             (("codex", ""), "", Disk::Absent, 0, Some(".codex")),
             (("codex", ""), "claude", Disk::Corrupt, 0, None),
             (("codex", ""), "codex", Disk::Corrupt, 0, Some(".codex")),
-            (("claude", ""), "claude", Disk::Row("codex", ""), 1, None),
+            (
+                ("claude", ""),
+                "claude",
+                Disk::Row("codex", ""),
+                1,
+                Some(".codex"),
+            ),
             (
                 ("alias-a", "claude"),
                 "alias-b:codex",
@@ -868,7 +870,13 @@ claude-personal = "~/.claude-global"
                 0,
                 Some(".codex"),
             ),
-            (("alias-a", "codex"), "alias-a", Disk::Absent, 1, None),
+            (
+                ("alias-a", "codex"),
+                "alias-a",
+                Disk::Absent,
+                1,
+                Some(".codex"),
+            ),
             (
                 ("alias-c", ""),
                 "alias-c:claude",
@@ -888,7 +896,7 @@ claude-personal = "~/.claude-global"
             let _ = std::fs::remove_file(&calls_path);
             let _ = std::fs::remove_file(&removed_path);
             std::fs::write(&label_path, built_for).unwrap();
-            let mut instance = Instance::new("tool label", temp.path().to_str().unwrap());
+            let mut instance = Instance::new("tool label", project.to_str().unwrap());
             instance.tool = tool.to_string();
             instance.detect_as = detect_as.to_string();
             instance.source_profile = profile.to_string();

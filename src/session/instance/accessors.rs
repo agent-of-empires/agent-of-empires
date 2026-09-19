@@ -51,6 +51,8 @@ impl Instance {
             sandbox_store_generation:
                 crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION,
             sandbox_store_transition_paths: Vec::new(),
+            sandbox_content_policy: 0,
+            sandbox_content_resets: Vec::new(),
             terminal_info: None,
             agent_session_id: None,
             omp_capture_generation: None,
@@ -457,7 +459,9 @@ impl Instance {
     }
 
     pub(super) fn sandbox_capture_store_dir(&self) -> Option<std::path::PathBuf> {
-        if !self.is_sandboxed() {
+        if !self.is_sandboxed()
+            || !crate::migrations::v031_isolate_sandbox_content::instance_ready(self).ok()?
+        {
             return None;
         }
         let home = dirs::home_dir()?;
@@ -466,16 +470,6 @@ impl Instance {
         );
         let declared = config.session.agent_config_dir_for(&self.tool, &home);
         let agent = self.resolved_agent()?;
-        if self.sandbox_store_generation
-            < crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION
-        {
-            return crate::session::config::container_config::legacy_sandbox_store_dir(
-                agent.name,
-                &home,
-                declared.as_deref(),
-                (self.sandbox_store_generation == 0).then_some(self.id.as_str()),
-            );
-        }
         crate::session::config::container_config::sandbox_store_dir(
             agent.name,
             &home,

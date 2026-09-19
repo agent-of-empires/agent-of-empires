@@ -20,6 +20,7 @@ pub(super) struct PreparedLaunch {
     pub(super) omp_capture_plan: Option<OmpCapturePlan>,
     pub(super) launch_env: LaunchEnvironment,
     pub(super) expected_prior_sid: Option<String>,
+    pub(super) sandbox_context_reset: Option<(String, Vec<String>)>,
     pub(super) expected_prior_intent: ResumeIntent,
     pub(super) expected_prior_omp_generation: Option<String>,
 }
@@ -366,6 +367,14 @@ impl Instance {
     }
 
     pub(super) fn prepare_launch_command(&mut self) -> Result<PreparedLaunch> {
+        let sandbox_context_reset = match self.resolved_agent() {
+            Some(agent) => {
+                crate::migrations::v031_isolate_sandbox_content::prepare_terminal_launch_context(
+                    self, agent.name,
+                )?
+            }
+            None => None,
+        };
         let expected_prior_sid = self.agent_session_id.clone();
         let expected_prior_intent = self.resume_intent.clone();
         let expected_prior_omp_generation = self.omp_capture_generation.clone();
@@ -378,6 +387,7 @@ impl Instance {
             expected_prior_sid,
             expected_prior_intent,
             expected_prior_omp_generation,
+            sandbox_context_reset,
         })
     }
 
@@ -703,6 +713,25 @@ impl Instance {
 #[cfg(test)]
 mod tests {
 
+    /// Mirror the launch path's content admission for a sandboxed fixture: a
+    /// real launch runs `admit_fresh_instance` before anything reads the
+    /// store, and an unadmitted sandboxed pane resolves no sidecar path (so no
+    /// launch line). That call also holds a launch transition lock, which a
+    /// fixture must not carry into the paths these tests exercise, so this
+    /// certifies exactly the roots `instance_roots` names — the same roots
+    /// admission proves.
+    fn admit_fixture_content(inst: &Instance) {
+        let app = crate::session::get_app_dir().unwrap();
+        for root in crate::migrations::v031_isolate_sandbox_content::instance_roots(inst).unwrap() {
+            std::fs::create_dir_all(&root.path).unwrap();
+            let roles: Vec<&str> = root.roles.iter().map(String::as_str).collect();
+            crate::migrations::v031_isolate_sandbox_content::certify_test_content(
+                &app, &inst.id, &root.path, &roles,
+            )
+            .unwrap();
+        }
+    }
+
     // The sidecar env var has to survive into the docker argv, not just be
     // computed: nothing in CI runs a container to catch it going missing.
     #[test]
@@ -726,6 +755,7 @@ mod tests {
             container_workdir: Some("/workspace".to_string()),
             before_start_env: Vec::new(),
         });
+        admit_fixture_content(&inst);
 
         let (cmd, _, _, _) = inst
             .build_launch_command()
@@ -774,6 +804,7 @@ mod tests {
             container_workdir: None,
             before_start_env: Vec::new(),
         });
+        admit_fixture_content(&inst);
 
         let (flag, env) = inst
             .identity_extension_launch()

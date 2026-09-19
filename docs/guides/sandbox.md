@@ -303,32 +303,51 @@ aoe add --sandbox-image my-sandbox:latest .
 
 ## Per-session agent stores
 
-Each sandboxed session gets its own agent store on the host: a copy of the
-agent's config and history under `sandbox-v2/<instance-id>` inside the agent's config directory
-(for example `~/.claude/sandbox-v2/<id>`). The container mounts that copy at
-the agent's usual config path, so credentials, hooks and conversation history
-belong to one session and `aoe` can resume the right conversation.
+Each sandboxed session gets its own agent store on the host, under
+`sandbox-v2/<instance-id>` inside the agent's config directory (for example
+`~/.claude/sandbox-v2/<id>`). AoE builds that store from the configuration it
+declares for the agent: its config files, credentials and authored resources.
+The host's native history is never imported, so a session's transcripts,
+caches and logs start empty and belong to it alone. A host file AoE does not
+declare for that agent, such as one you wrote yourself, stays on the host
+instead of being copied. The container mounts the
+store at the agent's usual config path, so credentials, hooks and conversation
+history belong to one session and `aoe` can resume the right conversation.
+
+A session keeps the store it was given for as long as AoE can still prove it
+wrote that store. When it cannot, each of its content roots is moved intact
+under `.aoe-sandbox-recovery/<transaction>/<index>/original` beside the agent's
+config directory and a fresh store is seeded in its place, with the session's
+original left alone. AoE copies back native resume state that was already
+sandbox-only (Claude `projects/` and OpenCode `opencode.db*`) and keeps those
+agents' session IDs. Native history that could have been imported from the host
+stays in recovery. When an agent's native resume is isolated, its next start
+shows a notice naming the retained originals; that isolated history is not
+replayed automatically.
 
 Sessions created before this layout shared one agent store per agent (for
-example `~/.claude/sandbox`). Each one moves when you start it: AoE copies the
-shared store into that session's private directory, removes its stopped
-container so the next launch mounts the copy, and deletes the shared store once
-every session that used it has moved (the private copies are the data from then
-on). For an agent whose sessions already had a private store of their own, the
-copy takes the shared store's top-level files, its credentials, config and
-state, and not its directories: caches, logs, plugin trees and conversation
-history belonging to no one session. Those stay where they are rather than
-being replicated into every session, so if any are left the shared store is
-kept rather than deleted and AoE names it when the move finishes; remove it
-yourself once you no longer want it. A store with nothing left in it is
-deleted as before. A large store takes a while, so the first start of a
+example `~/.claude/sandbox`). Each one moves when you start it: AoE gives the
+session its private directory, removes its stopped container so the next launch
+mounts that copy, and once every session that used the shared store has moved,
+the shared store itself is moved whole into
+`.aoe-sandbox-recovery/v027-<transaction>/original` rather than deleted, so
+nothing it held is lost. A session that already had a private store of its own
+takes only the shared store's top-level files (its credentials, config and
+state); the shared store's directories, which are caches, logs, plugin trees and
+conversation history belonging to no one session, are not replicated into every
+session. AoE names the retained original when the move finishes; that copy is
+the data from then on, and you remove it yourself once you no longer want it. A
+large store takes a while, so the first start of a
 session is slower than usual; the TUI shows the copy's progress on its status
 line and opens the session once it is done, and a plain `aoe` start says how
 many sessions still
 have the move ahead of them. A session whose container is still running is
 skipped and moved on a later start, after it stops. Trashed and archived sessions stay on the shared
 store. Starting one moves it; restoring or unarchiving alone does not, so run
-`aoe migrate` afterwards if you want it moved before its next start.
+`aoe migrate` afterwards if you want it moved before its next start. If a live
+sandbox can see the recovery directory, the move of the shared store is
+deferred until that mount is gone: the sessions still move, and `aoe migrate`
+finishes the job afterwards.
 
 To move every eligible session at once instead of paying for each at its next
 start:
@@ -388,7 +407,9 @@ file, so the revoked token stays there until the next login.
 ### Reclaiming stores
 
 Permanently deleting a sandboxed session removes its store along with its
-container. Stores stranded before that, by a delete that kept the container, or
+container, unless AoE cannot prove it wrote that store: an unproven original is
+preserved rather than deleted, so a delete cannot destroy content nothing could
+restore. Stores stranded before that, by a delete that kept the container, or
 by a delete that failed part-way and kept the session, are found by their
 instance id resolving in no profile:
 

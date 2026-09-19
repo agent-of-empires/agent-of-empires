@@ -387,20 +387,31 @@ impl AcpTranscript {
             .collect();
     }
 
-    /// Whether to show the context-loss notice until the next prompt.
-    /// A later prompt dismisses the notice; it does not automatically replay history.
-    /// Derived from the newest reset or prompt row, so the notice survives a
-    /// reconnect without any client-side reduction.
+    /// Derived from the rows, so it survives a reconnect with no client-side
+    /// latch: a reset with no prompt after it means the context is gone. A
+    /// session that was never prompted has nothing to re-prime, so a pre-prompt
+    /// reset (an isolated native history, a refused fork) is a message without
+    /// a badge, which is what the dashboard's own gate does.
     pub fn context_primer_pending(&self) -> bool {
-        self.server_rows
-            .iter()
-            .rev()
-            .find_map(|row| match row.kind {
-                TranscriptRowKind::ContextReset => Some(true),
-                TranscriptRowKind::UserPrompt | TranscriptRowKind::UserDiffComments => Some(false),
-                _ => None,
-            })
-            .unwrap_or(false)
+        let prompted = self.server_rows.iter().any(|row| {
+            matches!(
+                row.kind,
+                TranscriptRowKind::UserPrompt | TranscriptRowKind::UserDiffComments
+            )
+        });
+        prompted
+            && self
+                .server_rows
+                .iter()
+                .rev()
+                .find_map(|row| match row.kind {
+                    TranscriptRowKind::ContextReset => Some(true),
+                    TranscriptRowKind::UserPrompt | TranscriptRowKind::UserDiffComments => {
+                        Some(false)
+                    }
+                    _ => None,
+                })
+                .unwrap_or(false)
     }
 }
 
@@ -723,8 +734,13 @@ mod tests {
         let reset = || Event::SessionContextReset {
             reason: "worker restarted".into(),
         };
-        let cases: [(&str, Vec<Event>, bool); 4] = [
+        let cases: [(&str, Vec<Event>, bool); 5] = [
             ("empty", vec![], false),
+            (
+                "reset before any prompt has nothing to re-prime",
+                vec![reset()],
+                false,
+            ),
             ("reset with nothing after", vec![prompt(), reset()], true),
             (
                 "prompt dismisses the notice",

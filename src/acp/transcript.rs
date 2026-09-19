@@ -422,17 +422,22 @@ impl TranscriptModel {
                 ))]
             }
             Event::SessionContextReset { reason } => {
-                // Suppress the divider on a session that never saw a prompt:
-                // session/load failing on a 0-prompt session is expected, not an
-                // incident. Events arrive in seq order, so a scan captures every
-                // earlier prompt.
+                // Suppress the divider on a session that never saw a prompt for
+                // the two cases that are expected there: an empty reason, and
+                // the load-failure fallback the agent raises when a stored id
+                // no longer exists. Every other reason is a message for the
+                // user (an isolated native history, a refused fork) and is
+                // shown even before the first prompt. Events arrive in seq
+                // order, so a scan captures every earlier prompt.
                 let has_prior_prompt = self.rows.iter().any(|r| {
                     matches!(
                         r.kind,
                         TranscriptRowKind::UserPrompt | TranscriptRowKind::UserDiffComments
                     )
                 });
-                if !has_prior_prompt {
+                if !has_prior_prompt
+                    && (reason.is_empty() || reason.starts_with("session/load failed"))
+                {
                     return Vec::new();
                 }
                 let text = if reason.is_empty() {
@@ -1847,13 +1852,23 @@ mod tests {
     }
 
     #[test]
-    fn context_reset_divider_suppressed_without_a_prior_prompt() {
-        // A 0-prompt session's session/load failure is expected, not an
-        // incident; no divider. With a prior prompt, the reason is rendered.
-        let none = fold(vec![Event::SessionContextReset {
-            reason: "load failed".into(),
+    fn context_reset_divider_needs_a_reason_or_a_prior_prompt() {
+        // The two resets a 0-prompt session is expected to raise carry no
+        // divider: an empty reason, and the load-failure fallback.
+        let silent = fold(vec![Event::SessionContextReset { reason: "".into() }]);
+        assert!(silent.rows().is_empty());
+        let fallback = fold(vec![Event::SessionContextReset {
+            reason: "session/load failed: bad id".into(),
         }]);
-        assert!(none.rows().is_empty());
+        assert!(fallback.rows().is_empty());
+
+        // Any other reason is a message for the user and is shown.
+        let announced = fold(vec![Event::SessionContextReset {
+            reason: "Sandbox native history was isolated".into(),
+        }]);
+        let row = announced.rows().last().unwrap();
+        assert_eq!(row.kind, TranscriptRowKind::ContextReset);
+        assert!(row.text.contains("isolated"));
 
         let with_prompt = fold(vec![
             prompt("hi"),
@@ -1865,17 +1880,12 @@ mod tests {
         assert_eq!(row.kind, TranscriptRowKind::ContextReset);
         assert!(row.text.contains("session/load failed"));
 
-        // An empty reason falls back to the canned message.
-        let fallback = fold(vec![
+        // An empty reason falls back to the canned message once prompted.
+        let canned = fold(vec![
             prompt("hi"),
             Event::SessionContextReset { reason: "".into() },
         ]);
-        assert!(fallback
-            .rows()
-            .last()
-            .unwrap()
-            .text
-            .contains("context reset"));
+        assert!(canned.rows().last().unwrap().text.contains("context reset"));
     }
 
     #[test]

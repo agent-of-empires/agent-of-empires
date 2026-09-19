@@ -5,6 +5,17 @@ pub struct VolumeMount {
     pub read_only: bool,
 }
 
+/// Actual runtime state, never inferred from the desired create configuration.
+#[derive(Clone, Debug)]
+pub(crate) struct InspectedContainer {
+    pub(crate) id: String,
+    pub(crate) running: bool,
+    pub(crate) bind_mounts: Vec<VolumeMount>,
+    pub(crate) opaque_mounts: Vec<std::path::PathBuf>,
+    /// Apple runtime plugin name; absence on Docker/Podman is not a plugin guess.
+    pub(crate) runtime_handler: Option<String>,
+}
+
 /// A named Docker/Podman volume mounted at a specific container path.
 /// Used by `volume_ignores_strategy = "named"` to bypass VirtioFS shadowing on macOS.
 pub struct NamedVolumeMount {
