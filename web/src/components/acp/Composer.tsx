@@ -1246,10 +1246,10 @@ export function Composer({
                   pendingConfigOption={pendingConfigOption}
                   onSetConfigOption={setConfigOption}
                 />
+                <UsageHint usage={sessionUsage} />
               </div>
 
               <div data-testid="composer-actions" className="flex shrink-0 items-center gap-2">
-                <UsageHint usage={sessionUsage} />
                 <PluginComposerActions sessionId={sessionId} getSnapshot={getPluginComposerSnapshot} />
                 {turnActive ? (
                   <>
@@ -1649,19 +1649,27 @@ function UsageHint({ usage }: { usage: AcpState["sessionUsage"] }) {
     `Context window: ${usage.used.toLocaleString()} of ${usage.size.toLocaleString()} tokens used (${pct}%). ` +
     `Color warns as the window fills.` +
     (cost ? ` ${cost} is cumulative session spend since the last /clear or /compact.` : "");
+  // Last in the wrapping cluster, not the pinned actions: on a narrow footer
+  // it takes its own row instead of pushing Stop and Send off screen.
   return (
-    <Tooltip text={explanation} multiline>
-      <span
-        className={`hidden sm:inline-flex items-center gap-1 text-[11px] tabular-nums ${tone}`}
-        aria-label={explanation}
-      >
-        <span>
-          {usedLabel}/{sizeLabel}
+    <span className="ml-auto pl-2">
+      <Tooltip text={explanation} multiline>
+        <span
+          data-testid="composer-usage"
+          className={`inline-flex items-center gap-1 text-[11px] tabular-nums ${tone}`}
+          aria-label={explanation}
+        >
+          <span className="hidden sm:inline">
+            {usedLabel}/{sizeLabel}
+          </span>
+          <span className="opacity-70">
+            <span className="hidden sm:inline">(</span>
+            {pct}%<span className="hidden sm:inline">)</span>
+          </span>
+          {cost ? <span className="opacity-70">· {cost}</span> : null}
         </span>
-        <span className="opacity-70">({pct}%)</span>
-        {cost ? <span className="opacity-70">· {cost}</span> : null}
-      </span>
-    </Tooltip>
+      </Tooltip>
+    </span>
   );
 }
 

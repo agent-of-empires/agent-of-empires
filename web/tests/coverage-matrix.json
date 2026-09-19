@@ -3195,6 +3195,13 @@
       "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/Markdown.tsx"]
     },
     {
+      "id": "acp.story.composer-mobile-usage",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/acp-composer-usage-mobile.spec.ts"],
+      "components": ["web/src/components/acp/Composer.tsx"]
+    },
+    {
       "id": "acp.story.composer-mobile-footer-actions",
       "kind": "mocked-playwright",
       "risk": "high",
