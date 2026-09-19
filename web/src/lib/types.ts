@@ -146,8 +146,9 @@ export interface SessionResponse {
    *  the sidebar auto-name chip. See session::smart_rename. */
   smart_rename?: "inactive" | "pending" | "running";
   /** True when the session still carries its auto-generated civilization name.
-   *  Gates the sidebar "Auto-name now" action, which only re-runs smart rename
-   *  on a still-default session. More reliable than `smart_rename` for this: a
+   *  The sidebar "Auto-name now" action is always shown (like the TUI's) but
+   *  only re-runs smart rename when this is true, so it never overwrites a
+   *  chosen title. More reliable than `smart_rename` for this: a
    *  timed-out one-shot stays `pending` while an unusable-output one goes
    *  `inactive`, but both leave the name default and recoverable. Populated by
    *  the session list; absent on single-session responses. */
