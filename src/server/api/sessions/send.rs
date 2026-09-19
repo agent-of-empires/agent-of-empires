@@ -154,6 +154,11 @@ pub async fn send_message(
 
     match send_result {
         Ok(Ok((outcome, started))) => {
+            let mut body = serde_json::json!({"sent": true});
+            if let EnsureReadyOutcome::FreshAfterUnavailableResume { notice } = &outcome {
+                body["resume_outcome"] = serde_json::json!("fresh_after_unavailable_resume");
+                body["message"] = serde_json::Value::String(notice.warning_message());
+            }
             // ensure_pane_ready mutated `started` (status, agent_session_id,
             // last_start_time, last_error) on the clone. Sync those back to
             // the live entry so the next request sees a coherent view;
@@ -171,7 +176,7 @@ pub async fn send_message(
             } else {
                 // Session was deleted between the send and the stamp; nothing
                 // left to persist.
-                return (StatusCode::OK, Json(serde_json::json!({"sent": true}))).into_response();
+                return (StatusCode::OK, Json(body)).into_response();
             };
             drop(instances);
             let id_for_save = id.clone();
@@ -197,7 +202,7 @@ pub async fn send_message(
                     }
                 }
             });
-            (StatusCode::OK, Json(serde_json::json!({"sent": true}))).into_response()
+            (StatusCode::OK, Json(body)).into_response()
         }
         Ok(Err(boxed)) => {
             let (started, outcome, send_err) = *boxed;

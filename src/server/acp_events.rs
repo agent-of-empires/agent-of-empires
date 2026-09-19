@@ -10,9 +10,7 @@ use tokio::sync::{broadcast, RwLock};
 use super::state::{instance_lock_in, AppState};
 use crate::server::{acp_ws, api};
 
-/// One task instead of two halves the broadcast clone count and locks
-/// `state.instances` once per event instead of twice for the events
-/// (e.g. `AcpSessionAssigned`) that both consumers care about.
+/// Apply ACP events to durable identity and runtime session state.
 pub(super) async fn acp_event_listener(state: Arc<AppState>) {
     let mut rx = state.acp_events_tx.subscribe();
     loop {
@@ -364,9 +362,68 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             continue;
         }
 
-        // Acquire `instances` once for both branches. Releases before
-        // the (potentially blocking) sessions.json save.
-        let (profile_to_save, unread_profile) = {
+        if acp_change.is_some() {
+            let lock = state.instance_lock(&frame.session_id).await;
+            let _identity_guard = lock.lock().await;
+            let profile = {
+                let instances = state.instances.read().await;
+                let Some(inst) = instances
+                    .iter()
+                    .find(|inst| inst.id == frame.session_id && inst.is_structured())
+                else {
+                    continue;
+                };
+                inst.source_profile.clone()
+            };
+            let session_id = frame.session_id.clone();
+            let change = acp_change.clone();
+            let file_watch = state.file_watch.clone();
+            let saved = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                let storage = crate::session::Storage::new(&profile, file_watch)?;
+                storage.update(|all, _| {
+                    let Some(inst) = all
+                        .iter_mut()
+                        .find(|inst| inst.id == session_id && inst.is_structured())
+                    else {
+                        return Ok(None);
+                    };
+                    apply_acp_session_change(inst, &session_id, change.as_ref());
+                    Ok(Some((
+                        inst.acp_session_id.clone(),
+                        inst.idle_dormant_since,
+                        inst.import_pending,
+                        inst.fork_pending.clone(),
+                    )))
+                })
+            })
+            .await;
+            match saved {
+                Ok(Ok(Some((sid, dormant, import, fork)))) => {
+                    let mut instances = state.instances.write().await;
+                    if let Some(inst) = instances
+                        .iter_mut()
+                        .find(|inst| inst.id == frame.session_id && inst.is_structured())
+                    {
+                        inst.acp_session_id = sid;
+                        inst.idle_dormant_since = dormant;
+                        inst.import_pending = import;
+                        inst.fork_pending = fork;
+                        state
+                            .mutation_epoch
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(target: "acp.event_listener", session = %frame.session_id, "ACP identity was not saved: {error}")
+                }
+                Err(error) => {
+                    tracing::warn!(target: "acp.event_listener", session = %frame.session_id, "ACP identity save task failed: {error}")
+                }
+            }
+        }
+
+        let unread_profile = {
             let mut instances = state.instances.write().await;
             let Some(inst) = instances.iter_mut().find(|i| i.id == frame.session_id) else {
                 continue;
@@ -392,48 +449,13 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                 }
             }
 
-            // Snapshotting around the call is exactly "the transition
-            // `apply_status_intent` actually applied": it assigns `status` in
-            // one place and every rejected or no-op path (the trashed /
-            // Deleting / Creating guard, the Stopped guard, the ineligible
-            // HealError guard, `status == target`) leaves it untouched. We hold
-            // the write lock across both reads, so nothing else can move it in
-            // between. A future refactor that makes `apply_status_intent`
-            // assign `status` more than once has to revisit this.
             let old_status = inst.status;
             apply_status_intent(inst, status_intent, &state.status_tx);
-            let unread_profile =
-                should_mark_acp_unread(inst, old_status, crate::session::unread_enabled())
-                    .then(|| inst.source_profile.clone());
-
-            (
-                apply_acp_session_change(inst, &frame.session_id, acp_change.as_ref()),
-                unread_profile,
-            )
+            should_mark_acp_unread(inst, old_status, crate::session::unread_enabled())
+                .then(|| inst.source_profile.clone())
         };
 
-        // The turn just finished, so the row takes the automatic unread mark.
-        // This is the sole producer of it for a structured row. The tmux poll
-        // loop has no authority over a paneless one, which is why #3162 stopped
-        // it reporting phantom transitions for them and so left this gap; the
-        // TUI's passive path is gated off them to keep the boolean single-writer.
-        //
-        // The write has to be durable. `reload_state_instances_from_disk` rebases
-        // every row on the disk row on each 2s tick and `merge_runtime_fields`
-        // does not carry `unread`, so an in-memory-only mark is gone within two
-        // seconds. Memory is mirrored only after the write lands, the same
-        // ordering `flush_passive_transition_writes` uses (#2755) and for the
-        // same reason: a mark that exists only in daemon memory is served over
-        // `/api/sessions`, mirrored into the TUI, and then silently dropped by
-        // the next reload.
-        //
-        // Deliberately not folded into the `profile_to_save` save below:
-        // `derive_acp_session_change` yields nothing for `Event::Stopped`, so an
-        // identity change and a turn-end can never arrive on the same event and
-        // there is no atomicity to win.
-        //
-        // `persist_and_mirror_unread` owns the lock and commit-check ordering;
-        // see its docstring for why both are load-bearing.
+        // Release the identity guard before the unread helper takes the same lock.
         if let Some(profile) = unread_profile {
             let lock = state.instance_lock(&frame.session_id).await;
             persist_and_mirror_unread(
@@ -444,49 +466,6 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                 profile,
             )
             .await;
-        }
-
-        // Persist `acp_session_id` to disk if the field changed.
-        // Sync FS (file copy + JSON write) goes through spawn_blocking
-        // so the runtime stays responsive under large session lists.
-        if let Some(profile) = profile_to_save {
-            let session_id_for_log = frame.session_id.clone();
-            let session_id_for_save = frame.session_id.clone();
-            let profile_for_save = profile.clone();
-            let acp_change_for_save = acp_change.clone();
-            let file_watch = state.file_watch.clone();
-            let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                let storage = crate::session::Storage::new(&profile_for_save, file_watch)?;
-                storage.update(|all, _groups| {
-                    if let Some(inst) = all.iter_mut().find(|i| i.id == session_id_for_save) {
-                        apply_acp_session_change(
-                            inst,
-                            &session_id_for_save,
-                            acp_change_for_save.as_ref(),
-                        );
-                    }
-                    Ok(())
-                })?;
-                Ok(())
-            })
-            .await;
-            match save_result {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                        target: "acp.event_listener",
-                        session = %session_id_for_log,
-                        "save after acp_session_id update: {e}"
-                    );
-                }
-                Err(join_err) => {
-                    tracing::warn!(
-                        target: "acp.event_listener",
-                        session = %session_id_for_log,
-                        "spawn_blocking join error during acp_session_id save: {join_err}"
-                    );
-                }
-            }
         }
     }
 }
@@ -839,17 +818,12 @@ pub(super) fn apply_acp_session_change(
     session_id: &str,
     change: Option<&AcpSessionChange>,
 ) -> Option<String> {
+    if !inst.is_structured() {
+        return None;
+    }
     match change? {
         AcpSessionChange::Assigned(new_id) => {
-            // A worker just initialized (session/new or session/load), so the
-            // session is by definition no longer idle-dormant. Clear any
-            // marker now: a stale one left by a non-user respawn (e.g. the
-            // build-stale respawn #1754, which brings the worker back without
-            // a user wake) otherwise makes the reconciler's
-            // `!is_idle_dormant()` resume filter refuse to bring the session
-            // back after this worker later dies, deadlocking a queued prompt
-            // that the client parked waiting for a worker that never returns.
-            // See #2237.
+            // A live worker must not retain an idle-dormant marker.
             let cleared_stale_dormant = inst.idle_dormant_since.take().is_some();
             let same_acp_session = inst.acp_session_id.as_deref() == Some(new_id.as_str());
             // #2276: clear import_pending only when the assigned id matches the
@@ -1679,12 +1653,21 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn acp_event_listener_tracks_load_session_capability_updates() {
         let _app_dir = crate::session::test_support::isolate_app_dir();
         let mut inst = Instance::new("acp-session", "/tmp/acp");
+        inst.source_profile = "listener-capability".into();
         inst.view = crate::session::View::Structured;
         inst.acp_session_id = Some("same-acp-id".to_string());
         let id = inst.id.clone();
+        crate::session::Storage::new_unwatched(&inst.source_profile)
+            .unwrap()
+            .update(|rows, _| {
+                rows.push(inst.clone());
+                Ok(())
+            })
+            .unwrap();
         let state = test_support::build_test_app_state(vec![inst]);
         let first_generation = state.acp_supervisor.test_insert_worker(&id).await;
         let listener = tokio::spawn(acp_event_listener(state.clone()));
@@ -2191,14 +2174,27 @@ mod tests {
         );
     }
 
-    // #2237: a worker coming live (AcpSessionAssigned) must clear a stale
-    // idle-dormant marker, even when the acp_session_id is unchanged (a
-    // session/load reattach reuses it). Without this, a stale marker left by a
-    // non-user respawn keeps the reconciler's resume filter skipping the
-    // session forever once the worker dies, deadlocking a queued prompt.
+    #[test]
+    fn acp_session_changes_do_not_resurrect_terminal_state() {
+        let mut inst = Instance::new("terminal", "/tmp/terminal");
+        inst.view = crate::session::View::Terminal;
+        inst.resume_intent = crate::session::ResumeIntent::Use("native-id".into());
+        let expected = inst.conversation_state();
+        for change in [
+            AcpSessionChange::Assigned("late-id".into()),
+            AcpSessionChange::Reset("late reset".into()),
+            AcpSessionChange::Cleared,
+        ] {
+            assert!(apply_acp_session_change(&mut inst, "terminal", Some(&change)).is_none());
+            assert_eq!(inst.acp_session_id, None);
+            assert!(expected.matches(&inst));
+        }
+    }
+
     #[test]
     fn acp_session_assigned_clears_stale_dormant_marker_on_same_id() {
         let mut inst = Instance::new("seed", "/tmp/seed");
+        inst.view = crate::session::View::Structured;
         inst.acp_session_id = Some("sid-1".to_string());
         inst.idle_dormant_since = Some(chrono::Utc::now());
 
@@ -2260,6 +2256,7 @@ mod tests {
     #[test]
     fn non_fork_assignment_preserves_import_pending() {
         let mut inst = Instance::new("seed", "/tmp/seed");
+        inst.view = crate::session::View::Structured;
         inst.acp_session_id = None;
         inst.fork_pending = None;
         inst.import_pending = Some(true);
@@ -2320,6 +2317,7 @@ mod tests {
     #[test]
     fn reset_without_fork_pending_preserves_import_pending() {
         let mut inst = Instance::new("seed", "/tmp/seed");
+        inst.view = crate::session::View::Structured;
         inst.acp_session_id = Some("dead-id".into());
         inst.fork_pending = None;
         inst.import_pending = Some(true);
@@ -2342,6 +2340,7 @@ mod tests {
     #[test]
     fn acp_session_assigned_same_id_no_marker_is_noop() {
         let mut inst = Instance::new("seed", "/tmp/seed");
+        inst.view = crate::session::View::Structured;
         inst.acp_session_id = Some("sid-1".to_string());
         inst.idle_dormant_since = None;
         // Same id, nothing stale to clear: must stay a no-op (no rewrite).

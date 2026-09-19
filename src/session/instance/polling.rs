@@ -126,7 +126,8 @@ impl Instance {
     ///
     /// Pi polls its sidecar or nothing: the pane publishes its own
     /// conversation, and a store keyed by cwd cannot say which pane owns what.
-    /// Reads memory only: this runs per session on every TUI refresh.
+    /// Resolving the capture specification reads the profile configuration;
+    /// callers are launch and session-ID persistence, not the refresh path.
     pub(crate) fn launch_has_session_publisher(&self) -> bool {
         let Some((capture, context)) = self.resolved_session_support() else {
             return false;
@@ -141,7 +142,7 @@ impl Instance {
     }
 
     pub fn supports_session_poller(&self) -> bool {
-        let Some((capture, context)) = self.resolved_session_support() else {
+        let Some((capture, context)) = self.source_session_support() else {
             return false;
         };
         match capture.backend {
@@ -158,7 +159,7 @@ impl Instance {
         if !self.is_sandboxed() {
             return false;
         }
-        let Some(current_store) = self.sandbox_capture_store_dir() else {
+        let Some(current_store) = self.capture_store_dir() else {
             return false;
         };
         let Ok(current_store) = std::fs::canonicalize(current_store) else {
@@ -187,11 +188,28 @@ impl Instance {
                     || peer.archived_at.is_some()
                     || peer.trashed_at.is_some()
                     || matches!(peer.status, Status::Stopped | Status::Deleting)
-                    || peer.resolved_capture_backend() != Some(backend)
                 {
                     continue;
                 }
-                let Some(peer_store) = peer.sandbox_capture_store_dir() else {
+                let agent = match &peer.active_execution {
+                    Some(active) => crate::agents::get_agent(&active.binding.agent),
+                    None => peer.resolved_agent(),
+                };
+                let Some(agent) = agent else {
+                    return false;
+                };
+                let peer_backend = agent
+                    .session_support
+                    .as_ref()
+                    .and_then(|support| support.capture.as_ref())
+                    .map(|capture| capture.backend);
+                if peer_backend != Some(backend) {
+                    continue;
+                }
+                if peer.active_execution.is_none() {
+                    return false;
+                }
+                let Some(peer_store) = peer.capture_store_dir() else {
                     return false;
                 };
                 let Ok(peer_store) = std::fs::canonicalize(peer_store) else {
@@ -248,14 +266,16 @@ impl Instance {
             return PollerStart::Started;
         }
         self.session_id_poller = None;
-        let Some((capture, context)) = self.resolved_session_support() else {
+        let Some((capture, context)) = self.source_session_support() else {
             return PollerStart::NotApplicable;
         };
         let backend = capture.backend;
         if !self.supports_session_poller() {
             return PollerStart::NotApplicable;
         }
-        let prime_options = if backend == crate::agents::SessionCaptureBackend::PrimeAgent {
+        let prime_options = if self.active_execution.is_none()
+            && backend == crate::agents::SessionCaptureBackend::PrimeAgent
+        {
             self.prime_agent_capture_options()
         } else {
             None
@@ -265,11 +285,19 @@ impl Instance {
             crate::agents::SessionCaptureBackend::Codex
             | crate::agents::SessionCaptureBackend::Gemini
             | crate::agents::SessionCaptureBackend::Hermes
-            | crate::agents::SessionCaptureBackend::Kimi => {
-                self.sandbox_capture_store_dir().is_some()
+            | crate::agents::SessionCaptureBackend::Kimi => self.capture_store_dir().is_some(),
+            crate::agents::SessionCaptureBackend::PrimeAgent => self
+                .active_execution
+                .as_ref()
+                .map_or(prime_options.is_some(), |active| {
+                    matches!(active.capture, Some(CaptureContext::Prime { .. }))
+                }),
+            crate::agents::SessionCaptureBackend::Omp => {
+                self.active_execution.as_ref().map_or_else(
+                    || self.omp_capture_options().is_some(),
+                    |active| matches!(active.capture, Some(CaptureContext::Omp(_))),
+                )
             }
-            crate::agents::SessionCaptureBackend::PrimeAgent => prime_options.is_some(),
-            crate::agents::SessionCaptureBackend::Omp => self.omp_capture_options().is_some(),
             crate::agents::SessionCaptureBackend::Pi => self.pi_sidecar_source().is_some(),
             crate::agents::SessionCaptureBackend::Claude
             | crate::agents::SessionCaptureBackend::HookSidecar => true,
@@ -282,7 +310,12 @@ impl Instance {
         if !crate::session::poller::session_id_poller_budget_available() {
             return PollerStart::BudgetExhausted;
         }
-        let prime_plan = if let Some(options) = prime_options {
+        let prime_plan = if let Some(active) = &self.active_execution {
+            match &active.capture {
+                Some(CaptureContext::Prime { plan, .. }) => Some(plan.clone()),
+                _ => None,
+            }
+        } else if let Some(options) = prime_options {
             match self.prime_agent_capture_plan(options) {
                 Ok(plan) => Some(plan),
                 Err(error) => {
@@ -303,7 +336,7 @@ impl Instance {
             let Some(store) = prime_plan
                 .as_ref()
                 .map(|plan| plan.store.clone())
-                .or_else(|| self.sandbox_capture_store_dir())
+                .or_else(|| self.capture_store_dir())
             else {
                 return PollerStart::NotApplicable;
             };
@@ -357,36 +390,62 @@ impl Instance {
             return PollerStart::NotApplicable;
         };
         let omp_metadata = if backend == crate::agents::SessionCaptureBackend::Omp {
-            let Some(options) = self.omp_capture_options() else {
-                return PollerStart::NotApplicable;
-            };
-            omp_metadata.or_else(|| self.omp_capture_metadata(&tmux_session_name, &options, None))
+            if let Some(active) = &self.active_execution {
+                match &active.capture {
+                    Some(CaptureContext::Omp(metadata)) => Some(metadata.clone()),
+                    _ => None,
+                }
+            } else {
+                let Some(options) = self.omp_capture_options() else {
+                    return PollerStart::NotApplicable;
+                };
+                omp_metadata
+                    .or_else(|| self.omp_capture_metadata(&tmux_session_name, &options, None))
+            }
         } else {
             None
         };
 
         let mut poller = SessionPoller::new(tmux_session_name);
         let instance_id = self.id.clone();
-        let initial_known = self.agent_session_id.clone();
-        let extra_excludes = self.retroactive_capture_exclusion_set();
+        let initial_known = self.agent_session_id.clone().filter(|_| {
+            self.agent_session_binding
+                .as_ref()
+                .is_some_and(ConversationBinding::is_known)
+        });
+        let extra_excludes = self.retroactive_capture_excludes.clone();
 
         if backend == crate::agents::SessionCaptureBackend::Omp {
             let Some(metadata) = omp_metadata.as_ref() else {
                 return PollerStart::NotApplicable;
             };
-            let poll_fn: crate::session::poller::SessionIdPollFn = if self.is_sandboxed() {
-                let Some(sandbox) = self.sandbox_info.as_ref() else {
-                    return PollerStart::NotApplicable;
-                };
-                Box::new(omp_poll_fn_sandboxed(
-                    sandbox.container_name.clone(),
-                    self.id.clone(),
-                    Some(metadata.launch_marker.clone()),
-                    extra_excludes,
-                ))
-            } else {
-                Box::new(omp_poll_fn(self.id.clone(), extra_excludes))
+            let container_name = match &self.active_execution {
+                Some(active) => active
+                    .container
+                    .as_ref()
+                    .map(|container| container.id.clone()),
+                None => self
+                    .sandbox_info
+                    .as_ref()
+                    .filter(|sandbox| sandbox.enabled)
+                    .map(|sandbox| sandbox.container_name.clone()),
             };
+            let poll_fn: crate::session::poller::SessionIdPollFn =
+                if let Some(container_name) = container_name {
+                    Box::new(omp_poll_fn_sandboxed(
+                        container_name,
+                        self.id.clone(),
+                        Some(metadata.launch_marker.clone()),
+                        extra_excludes,
+                        self.active_execution.clone(),
+                    ))
+                } else {
+                    Box::new(omp_poll_fn(
+                        self.id.clone(),
+                        extra_excludes,
+                        self.active_execution.clone(),
+                    ))
+                };
             let log_id = self.id.clone();
             let on_change: Box<dyn Fn(&str) + Send + 'static> = Box::new(move |new_id| {
                 tracing::info!(target: "session.store", "Session ID observed for {}: {}", log_id, new_id);
@@ -400,8 +459,36 @@ impl Instance {
             let Some(source) = self.pi_sidecar_source() else {
                 return PollerStart::NotApplicable;
             };
-            let inner = crate::session::capture::pi_sidecar_poll_fn(self.id.clone(), source);
+            let inner = crate::session::capture::pi_sidecar_poll_fn(
+                self.id.clone(),
+                source,
+                self.active_execution.clone(),
+            );
             let poll_fn: crate::session::poller::SessionIdPollFn = Box::new(move |_| inner());
+            let log_id = self.id.clone();
+            let on_change: Box<dyn Fn(&str) + Send + 'static> = Box::new(move |new_id| {
+                tracing::info!(target: "session.store", "Session ID observed for {}: {}", log_id, new_id);
+            });
+            let initial =
+                initial_known.map(crate::session::poller::SessionIdObservation::instance_sidecar);
+            let spawn = poller.start_observations(instance_id, poll_fn, on_change, initial);
+            return self.install_poller(poller, spawn);
+        }
+
+        if matches!(
+            backend,
+            crate::agents::SessionCaptureBackend::Claude
+                | crate::agents::SessionCaptureBackend::HookSidecar
+        ) {
+            let sidecar_id = self.id.clone();
+            let active = self.active_execution.clone();
+            let poll_fn: crate::session::poller::SessionIdPollFn = Box::new(move |_| {
+                super::execution::hook_session_observation(
+                    &sidecar_id,
+                    active.as_ref(),
+                    Some(std::time::Duration::from_secs(300)),
+                )
+            });
             let log_id = self.id.clone();
             let on_change: Box<dyn Fn(&str) + Send + 'static> = Box::new(move |new_id| {
                 tracing::info!(target: "session.store", "Session ID observed for {}: {}", log_id, new_id);
@@ -419,58 +506,72 @@ impl Instance {
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .map(|duration| duration.as_secs_f64() * 1000.0)
             .unwrap_or(f64::MAX);
+        let store_cwd = self
+            .active_execution
+            .as_ref()
+            .and_then(|active| match &active.capture {
+                Some(CaptureContext::Store { cwd, .. }) => Some(cwd.clone()),
+                _ => None,
+            });
         let poll_fn: Box<dyn Fn() -> Option<String> + Send + 'static> = match backend {
-            crate::agents::SessionCaptureBackend::Claude
-            | crate::agents::SessionCaptureBackend::HookSidecar => {
-                let sidecar_id = self.id.clone();
-                Box::new(move || crate::hooks::read_hook_session_id(&sidecar_id))
-            }
             crate::agents::SessionCaptureBackend::Codex => {
-                let Some(store) = self.sandbox_capture_store_dir() else {
+                let Some(store) = self.capture_store_dir() else {
                     return PollerStart::NotApplicable;
                 };
                 Box::new(codex_poll_fn_sandboxed_store(
                     store,
-                    self.container_workdir(),
+                    store_cwd.unwrap_or_else(|| self.container_workdir()),
                     self.id.clone(),
                     capture_floor,
                     extra_excludes,
+                    self.active_execution
+                        .as_ref()
+                        .map(|active| active.binding.clone()),
                 ))
             }
             crate::agents::SessionCaptureBackend::Gemini => {
-                let Some(store) = self.sandbox_capture_store_dir() else {
+                let Some(store) = self.capture_store_dir() else {
                     return PollerStart::NotApplicable;
                 };
                 Box::new(gemini_poll_fn_sandboxed_store(
                     store,
-                    self.container_workdir(),
+                    store_cwd.unwrap_or_else(|| self.container_workdir()),
                     self.id.clone(),
                     capture_floor,
                     extra_excludes,
+                    self.active_execution
+                        .as_ref()
+                        .map(|active| active.binding.clone()),
                 ))
             }
             crate::agents::SessionCaptureBackend::Hermes => {
-                let Some(store) = self.sandbox_capture_store_dir() else {
+                let Some(store) = self.capture_store_dir() else {
                     return PollerStart::NotApplicable;
                 };
                 Box::new(hermes_poll_fn_sandboxed_store(
                     store,
-                    self.container_workdir(),
+                    store_cwd.unwrap_or_else(|| self.container_workdir()),
                     self.id.clone(),
                     capture_floor,
                     extra_excludes,
+                    self.active_execution
+                        .as_ref()
+                        .map(|active| active.binding.clone()),
                 ))
             }
             crate::agents::SessionCaptureBackend::Kimi => {
-                let Some(store) = self.sandbox_capture_store_dir() else {
+                let Some(store) = self.capture_store_dir() else {
                     return PollerStart::NotApplicable;
                 };
                 Box::new(kimi_poll_fn_sandboxed_store(
                     store,
-                    self.container_workdir(),
+                    store_cwd.unwrap_or_else(|| self.container_workdir()),
                     self.id.clone(),
                     capture_floor_ms,
                     extra_excludes,
+                    self.active_execution
+                        .as_ref()
+                        .map(|active| active.binding.clone()),
                 ))
             }
             crate::agents::SessionCaptureBackend::PrimeAgent => {
@@ -480,15 +581,18 @@ impl Instance {
                 let preferred_sidecar = self.prime_root_sidecar_poll_fn(plan.clone());
                 Box::new(prime_agent_poll_fn_sandboxed(
                     preferred_sidecar,
-                    plan.store,
-                    plan.session_dir,
-                    plan.container_cwd,
+                    plan,
                     self.id.clone(),
                     capture_floor_ms,
                     extra_excludes,
+                    self.active_execution
+                        .as_ref()
+                        .map(|active| active.binding.clone()),
                 ))
             }
-            crate::agents::SessionCaptureBackend::OpenCode
+            crate::agents::SessionCaptureBackend::Claude
+            | crate::agents::SessionCaptureBackend::HookSidecar
+            | crate::agents::SessionCaptureBackend::OpenCode
             | crate::agents::SessionCaptureBackend::Pi
             | crate::agents::SessionCaptureBackend::Omp => return PollerStart::NotApplicable,
         };
@@ -506,7 +610,24 @@ impl Instance {
         let on_change: Box<dyn Fn(&str) + Send + 'static> = Box::new(move |new_id| {
             tracing::info!(target: "session.store", "Session ID observed for {}: {}", log_id, new_id);
         });
-        let spawn = poller.start(instance_id, poll_fn, on_change, initial_known);
+        let active = self.active_execution.clone().filter(|active| {
+            matches!(
+                active.capture,
+                Some(CaptureContext::Store { .. } | CaptureContext::Prime { .. })
+            )
+        });
+        let poll_fn: crate::session::poller::SessionIdPollFn = Box::new(move |_| {
+            let mut observation =
+                crate::session::poller::SessionIdObservation::instance_sidecar(poll_fn()?);
+            if let Some(active) = &active {
+                observation.source = Some(active.binding.clone());
+                observation.execution = Some(active.clone());
+            }
+            Some(observation)
+        });
+        let initial =
+            initial_known.map(crate::session::poller::SessionIdObservation::instance_sidecar);
+        let spawn = poller.start_observations(instance_id, poll_fn, on_change, initial);
         self.install_poller(poller, spawn)
     }
 
@@ -520,9 +641,6 @@ impl Instance {
     }
 
     /// Replace a missing or finished poller once its tmux pane is live.
-    ///
-    /// OMP pollers reload pane metadata on every tick, so a replacement binds
-    /// to the durable generation that won any concurrent restart race.
     pub(crate) fn repair_session_id_poller_if_needed(
         &mut self,
         snapshot: &crate::tmux::LiveSessionSnapshot,
@@ -588,7 +706,7 @@ impl Instance {
         }
     }
 
-    pub(super) fn stop_poller(&self) {
+    pub(crate) fn stop_poller(&self) {
         if let Some(ref poller_arc) = self.session_id_poller {
             match poller_arc.lock() {
                 Ok(mut poller) => poller.stop(),
@@ -626,11 +744,8 @@ impl Instance {
     }
 
     pub(super) fn stop_and_flush_poller_lifecycle_locked(&mut self) {
-        // A Pi pane's last word is in its sidecar, which no poller may have
-        // read: a CLI-only pane has none, and a restart tears the pane down
-        // before the next one starts. Every teardown reaches here, so this is
-        // where the flush belongs rather than at one call site.
-        self.flush_pi_sidecar_if_published();
+        // A CLI-only pane may have a final publication but no poller to drain.
+        self.flush_published_if_present();
         // stop_poller() signals the thread but leaves the handle in place, so
         // this is_some() means "a poller existed and may have queued a final
         // observation": drain it before dropping the handle below.
@@ -860,7 +975,7 @@ mod tests {
             .unwrap();
 
         let published = "01a053b6-c470-78de-9d8f-bc00ef05332a";
-        crate::hooks::write_session_id_via_guard(&inst.id, published).unwrap();
+        super::super::test_helpers::publish_host_pi_transcript(&inst.id, published, home.path());
 
         inst.stop_and_flush_poller_lifecycle_locked();
 
@@ -923,11 +1038,30 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let published = "99999999-9999-4999-8999-999999999999";
         std::fs::write(dir.join("session_id"), format!("{published}\n")).unwrap();
+        let transcript = dir
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("agent/sessions")
+            .join(format!("time_{published}.jsonl"));
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(
+            &transcript,
+            format!("{{\"type\":\"session\",\"id\":\"{published}\"}}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("session_path"),
+            format!("/root/.pi/agent/sessions/time_{published}.jsonl"),
+        )
+        .unwrap();
         let poll = crate::session::capture::pi_sidecar_poll_fn(
             sandboxed.id.clone(),
             sandboxed
                 .pi_sidecar_source()
                 .expect("a resolvable sandbox source"),
+            None,
         );
         assert_eq!(poll().map(|o| o.sid).as_deref(), Some(published));
     }
@@ -1006,21 +1140,35 @@ mod tests {
         let app = tempfile::tempdir().unwrap();
         let _app_guard = crate::session::test_support::isolate_app_dir_at(app.path());
         let backend = crate::agents::SessionCaptureBackend::Gemini;
-        let current_profile = "capture-owner-a";
-        let peer_profile = "capture-owner-b";
-        let current_storage = crate::session::Storage::new_unwatched(current_profile).unwrap();
-        let peer_storage = crate::session::Storage::new_unwatched(peer_profile).unwrap();
-
+        let current_storage = crate::session::Storage::new_unwatched("capture-owner-a").unwrap();
+        let peer_storage = crate::session::Storage::new_unwatched("capture-owner-b").unwrap();
         let mut current = sandboxed_gemini("current", "/repos/current", "/workspace/current");
-        current.source_profile = current_profile.to_string();
-        current.sandbox_store_generation = 1;
+        current.source_profile = "capture-owner-a".into();
         let mut peer = sandboxed_gemini("peer", "/repos/peer", "/workspace/peer");
-        peer.source_profile = peer_profile.to_string();
-        peer.sandbox_store_generation = 1;
-        let shared_store = current.sandbox_capture_store_dir().unwrap();
-        assert_eq!(peer.sandbox_capture_store_dir().unwrap(), shared_store);
+        peer.source_profile = "capture-owner-b".into();
+        let shared_store = app.path().join("shared");
         std::fs::create_dir_all(&shared_store).unwrap();
-
+        std::fs::create_dir_all(peer.sandbox_capture_store_dir().unwrap()).unwrap();
+        let bind = |instance: &mut Instance, store: &std::path::Path| {
+            instance.active_execution = Some(super::ActiveExecution {
+                launch_id: uuid::Uuid::new_v4().to_string(),
+                binding: crate::session::ExecutionBinding {
+                    agent: "gemini".into(),
+                    stores: vec![store.to_path_buf()],
+                    configuration: Vec::new(),
+                    cwd: "/workspace".into(),
+                    cwd_filesystem: "host".into(),
+                    filesystem: "host".into(),
+                },
+                capture: Some(super::CaptureContext::Store {
+                    root: store.to_path_buf(),
+                    cwd: "/workspace".into(),
+                }),
+                container: None,
+            });
+        };
+        bind(&mut current, &shared_store);
+        bind(&mut peer, &shared_store);
         current_storage
             .update(|instances, _| {
                 *instances = vec![current.clone()];
@@ -1035,14 +1183,24 @@ mod tests {
             .unwrap();
         assert!(
             !current.managed_capture_store_is_exclusive(backend),
-            "different rows and workdirs sharing one store are not exclusive"
+            "inspected mounts override predicted private stores"
         );
 
-        peer.sandbox_store_generation =
-            crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION;
-        let peer_store = peer.sandbox_capture_store_dir().unwrap();
-        assert_ne!(peer_store, shared_store);
+        peer.tool = "claude".into();
+        peer_storage
+            .update(|instances, _| {
+                *instances = vec![peer.clone()];
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            !current.managed_capture_store_is_exclusive(backend),
+            "configuration changes do not change the running writer"
+        );
+
+        let peer_store = app.path().join("distinct");
         std::fs::create_dir_all(&peer_store).unwrap();
+        bind(&mut peer, &peer_store);
         peer_storage
             .update(|instances, _| {
                 *instances = vec![peer.clone()];
@@ -1052,6 +1210,29 @@ mod tests {
         assert!(
             current.managed_capture_store_is_exclusive(backend),
             "distinct physical stores do not conflict"
+        );
+
+        peer.active_execution = None;
+        peer_storage
+            .update(|instances, _| {
+                *instances = vec![peer.clone()];
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            current.managed_capture_store_is_exclusive(backend),
+            "an unlocated Claude peer must not block Gemini capture"
+        );
+        peer.tool = "gemini".into();
+        peer_storage
+            .update(|instances, _| {
+                *instances = vec![peer.clone()];
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            !current.managed_capture_store_is_exclusive(backend),
+            "an unlocated peer of the same backend cannot prove exclusivity"
         );
     }
 

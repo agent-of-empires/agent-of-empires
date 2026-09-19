@@ -368,6 +368,7 @@ struct WorkerHandle {
     /// revalidates it against the table so a stale actor cannot drop a
     /// replacement.
     lease: Lease,
+    native_session_id: Option<String>,
 }
 /// Per-session monotonically-increasing seq counter. Lives at the
 /// supervisor level (not on `WorkerHandle`) so it survives shutdown
@@ -581,6 +582,14 @@ pub struct SpawnRequest {
     /// avoiding a duplicate-key panic. The caller computes it from the
     /// session's `import_pending` flag. See #2276.
     pub seed_history_replay: bool,
+    /// Claude store pin for a host spawn, threaded from the conversation
+    /// binding the session selected (`resume_binding` / observed agent
+    /// binding). The supervisor applies it over `Config.environment` and
+    /// `before_session` hooks so the structured worker keeps reading the
+    /// conversation's own transcript store, and the transcript probe in
+    /// `acp_enable` resolves through the same pin. Not persisted: callers
+    /// rebuild it from the Instance on every request.
+    pub claude_store_pin: Option<PathBuf>,
 }
 
 /// True when `command` names the same executable as `binary`, comparing
@@ -1726,6 +1735,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             acp_mode_id,
             agent_command_override,
             seed_history_replay,
+            claude_store_pin,
         } = req;
 
         // Per-agent install gate. claude-agent-acp lazy-installs its
@@ -1913,6 +1923,24 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
         }
 
+        let claude_store_pin = claude_store_pin.filter(|_| {
+            sandbox_info.is_none() && matches!(agent.as_str(), "claude" | "claude-code")
+        });
+        // The selected conversation's own Claude store outranks both the
+        // profile `environment` list and a `before_session` hook on
+        // `CLAUDE_CONFIG_DIR`: the pin points at the transcript this session
+        // was pinned to, and a worker reading a different store would start a
+        // conversation that cannot continue it.
+        if sandbox_info.is_none() {
+            if let Some(store) = &claude_store_pin {
+                host_environment.retain(|(k, _)| k != "CLAUDE_CONFIG_DIR");
+                host_environment.push((
+                    "CLAUDE_CONFIG_DIR".into(),
+                    store.to_string_lossy().to_string(),
+                ));
+            }
+        }
+
         let mut env = provider_env;
         if let Some(model) = model {
             env.push(("AOE_AGENT_MODEL".into(), model));
@@ -1982,6 +2010,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             artifact_dir: crate::session::artifacts::session_artifact_dir(&session_id).ok(),
             wrapper_substitution,
             generation: lease.epoch(),
+            claude_store_pin: claude_store_pin.clone(),
         };
 
         debug!(
@@ -2062,6 +2091,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             session_id.clone(),
             WorkerHandle {
                 client,
+                native_session_id: None,
                 drain_task,
                 // Empty: the initial spawn doesn't count toward the
                 // restart budget.
@@ -2320,6 +2350,10 @@ impl<S: BroadcastSink> Supervisor<S> {
                                 established = true;
                                 let mut guard = workers.lock().await;
                                 if let Some(handle) = guard.get_mut(&session_id) {
+                                    if handle.lease.epoch() != lease.epoch() {
+                                        continue;
+                                    }
+                                    handle.native_session_id = Some(acp_session_id.clone());
                                     if let WorkerKind::Runner { spawn_config } = &mut handle.kind {
                                         info!(
                                             target: "acp.supervisor",
@@ -2336,6 +2370,10 @@ impl<S: BroadcastSink> Supervisor<S> {
                             Event::SessionContextReset { reason } => {
                                 let mut guard = workers.lock().await;
                                 if let Some(handle) = guard.get_mut(&session_id) {
+                                    if handle.lease.epoch() != lease.epoch() {
+                                        continue;
+                                    }
+                                    handle.native_session_id = None;
                                     if let WorkerKind::Runner { spawn_config } = &mut handle.kind {
                                         info!(
                                             target: "acp.supervisor",
@@ -2647,6 +2685,22 @@ impl<S: BroadcastSink> Supervisor<S> {
                         }
                     }
 
+                    // The conversation's pinned Claude store outranks a
+                    // re-minted hook or profile entry here too: the respawn
+                    // must keep reading the same transcript store the prior
+                    // launch used.
+                    if respawn_config.sandbox_info.is_none() {
+                        if let Some(store) = &respawn_config.claude_store_pin {
+                            respawn_config
+                                .host_environment
+                                .retain(|(k, _)| k != "CLAUDE_CONFIG_DIR");
+                            respawn_config.host_environment.push((
+                                "CLAUDE_CONFIG_DIR".into(),
+                                store.to_string_lossy().to_string(),
+                            ));
+                        }
+                    }
+
                     // MCP layers can change between crashes; re-resolve them, against
                     // the environment just re-minted, so the replacement sees the
                     // current set from the config dir it will launch with (#3734).
@@ -2810,6 +2864,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                                 Some(handle) => {
                                     handle.client = Arc::clone(&new_client);
                                     handle.lease = respawn_lease.clone();
+                                    handle.native_session_id = None;
                                     None
                                 }
                                 None => Some(InstallError::Stale),
@@ -3601,6 +3656,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             session_id.clone(),
             WorkerHandle {
                 client,
+                native_session_id: None,
                 drain_task,
                 restart_history: vec![],
                 // Attached: if the worker dies, the drain task sees EOF and
@@ -3679,6 +3735,22 @@ impl<S: BroadcastSink> Supervisor<S> {
         cancel_orphaned_elicitations_on(&*self.sink, &self.next_seqs, session_id);
     }
 
+    /// The native store the running worker launched with, for an ACP
+    /// to terminal handoff; None unless the live worker owns `acp_session_id`.
+    pub(crate) async fn native_handoff_store(
+        &self,
+        session_id: &str,
+        acp_session_id: &str,
+    ) -> Option<crate::session::ExecutionBinding> {
+        let workers = self.workers.lock().await;
+        let handle = workers.get(session_id)?;
+        if !lock_recover(&self.lifecycle).is_running(session_id)
+            || handle.native_session_id.as_deref() != Some(acp_session_id)
+        {
+            return None;
+        }
+        handle.client.native_store.clone()
+    }
     /// Detach background sub-agents that were left `Running`/`Stalled` by
     /// the previous daemon. See [`detach_orphaned_background_agents_on`].
     fn detach_orphaned_background_agents(&self, session_id: &str) {
@@ -3808,6 +3880,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             session_id.to_string(),
             WorkerHandle {
                 client: Arc::new(client),
+                native_session_id: None,
                 drain_task: tokio::spawn(async {}),
                 restart_history: vec![],
                 kind,
@@ -4632,6 +4705,7 @@ mod tests {
     fn respawn_refreshes_a_changed_pin_on_the_cached_config() {
         use crate::session::config::AcpAgentDefaults;
         let cached = SpawnConfig {
+            claude_store_pin: None,
             wrapper_substitution: None,
             agent_key: "claude".into(),
             tool: "claude".into(),
@@ -4764,6 +4838,7 @@ mod tests {
     fn respawn_keeps_an_explicit_effort_when_the_pin_changes() {
         use crate::session::config::AcpAgentDefaults;
         let cached = SpawnConfig {
+            claude_store_pin: None,
             wrapper_substitution: None,
             agent_key: "claude".into(),
             tool: "claude".into(),
@@ -5217,6 +5292,7 @@ mod tests {
 
         let result = sup
             .spawn(SpawnRequest {
+                claude_store_pin: None,
                 session_id: "s-wire".into(),
                 // Attach shape: the caller passes the wrapper key as both
                 // agent and tool, so resolve_agent_spec performs the
@@ -5457,6 +5533,7 @@ cursor-acp-bridge = "agent acp"
         let sup = Supervisor::new(sink);
         let result = sup
             .spawn(SpawnRequest {
+                claude_store_pin: None,
                 session_id: "s-1".into(),
                 agent: "no-such-agent".into(),
                 tool: "no-such-agent".into(),
@@ -5492,6 +5569,7 @@ cursor-acp-bridge = "agent acp"
 
         let result = sup
             .spawn(SpawnRequest {
+                claude_store_pin: None,
                 session_id: "s-1".into(),
                 agent: "claude-code".into(),
                 tool: "claude-code".into(),
@@ -5702,6 +5780,7 @@ cursor-acp-bridge = "agent acp"
         };
         let socket_path = tmp.path().join("budget.sock");
         let dummy_config = SpawnConfig {
+            claude_store_pin: None,
             wrapper_substitution: None,
             agent_key: "claude".into(),
             tool: "claude".into(),
@@ -5791,6 +5870,7 @@ cursor-acp-bridge = "agent acp"
             env_allowlist: None,
         };
         let dummy_config = SpawnConfig {
+            claude_store_pin: None,
             wrapper_substitution: None,
             agent_key: "claude".into(),
             tool: "claude".into(),
@@ -5896,6 +5976,7 @@ cursor-acp-bridge = "agent acp"
             env_allowlist: None,
         };
         let dummy_config = SpawnConfig {
+            claude_store_pin: None,
             wrapper_substitution: None,
             agent_key: "claude".into(),
             tool: "claude".into(),
@@ -5972,6 +6053,7 @@ cursor-acp-bridge = "agent acp"
             env_allowlist: None,
         };
         let dummy_config = SpawnConfig {
+            claude_store_pin: None,
             wrapper_substitution: None,
             agent_key: "claude".into(),
             tool: "claude".into(),
@@ -6118,6 +6200,7 @@ cursor-acp-bridge = "agent acp"
         };
         WorkerKind::Runner {
             spawn_config: Box::new(SpawnConfig {
+                claude_store_pin: None,
                 wrapper_substitution: None,
                 agent_key: "claude".into(),
                 tool: "claude".into(),
@@ -7389,6 +7472,7 @@ cursor-acp-bridge = "agent acp"
 
     fn spawn_request(session_id: &str) -> SpawnRequest {
         SpawnRequest {
+            claude_store_pin: None,
             session_id: session_id.into(),
             agent: "claude-code".into(),
             tool: "claude-code".into(),
@@ -7411,6 +7495,7 @@ cursor-acp-bridge = "agent acp"
 
     fn runner_config(socket_path: PathBuf) -> SpawnConfig {
         SpawnConfig {
+            claude_store_pin: None,
             wrapper_substitution: None,
             agent_key: "claude".into(),
             tool: "claude".into(),
@@ -8186,6 +8271,7 @@ cursor-acp-bridge = "agent acp"
 
         let result = sup
             .spawn(SpawnRequest {
+                claude_store_pin: None,
                 session_id: "s-2".into(),
                 agent: "claude-code".into(),
                 tool: "claude-code".into(),
@@ -8259,6 +8345,7 @@ cursor-acp-bridge = "agent acp"
 
         let result = sup
             .spawn(SpawnRequest {
+                claude_store_pin: None,
                 session_id: "fresh".into(),
                 agent: "claude-code".into(),
                 tool: "claude-code".into(),

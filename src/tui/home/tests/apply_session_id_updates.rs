@@ -159,7 +159,10 @@ fn apply_session_id_updates_skips_retroactive_excludes() {
     let inst = fresh_instance(profile, "aer");
     let mut view = build_view_with_inst(profile, &inst);
     if let Some(i) = view.instances.get_mut(&inst.id) {
-        i.retroactive_capture_excludes.insert(NEW_SID.to_string());
+        i.retroactive_capture_excludes
+            .insert(crate::session::ConversationBinding::unknown(
+                NEW_SID.to_string(),
+            ));
     }
 
     let tmux = TmuxSession::create(&inst.id, &inst.title);

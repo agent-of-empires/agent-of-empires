@@ -3034,14 +3034,7 @@ impl HomeView {
         }
     }
 
-    /// Whether the session `id` can be forked, so the context menu shows the
-    /// "Fork session" row only when the palette action would succeed. A
-    /// structured parent needs an agent advertising the ACP fork capability; a
-    /// terminal parent needs a forkable terminal agent (claude/codex/opencode).
-    /// The captured-conversation precondition is intentionally NOT checked here:
-    /// the row still shows for a not-yet-started session, and the palette action
-    /// explains "nothing to fork yet" if the user picks it, matching how other
-    /// rows stay visible and explain on use.
+    /// Terminal fork eligibility comes from the captured conversation, not status.
     pub(super) fn session_can_fork(&self, id: &str) -> bool {
         let Some(inst) = self.get_instance(id) else {
             return false;
@@ -3049,7 +3042,11 @@ impl HomeView {
         if inst.is_structured() {
             crate::session::fork::structured_fork_capable(&inst.tool, inst.agent_name.as_deref())
         } else {
-            crate::session::fork::terminal_agent_can_fork(&inst.tool)
+            inst.fork_parent_binding()
+                .and_then(|parent| parent.execution.as_ref())
+                .is_some_and(|execution| {
+                    crate::session::fork::terminal_agent_can_fork(&execution.agent)
+                })
         }
     }
 
@@ -3220,8 +3217,12 @@ impl HomeView {
             return;
         };
         let tool = parent.tool.clone();
-        let parent_agent_session_id = parent.agent_session_id.clone();
-        let repo_path = parent.repo_path().to_string();
+        let parent_binding = parent.fork_parent_binding().cloned();
+        let repo_path = if parent.is_structured() {
+            parent.repo_path().to_string()
+        } else {
+            parent.project_path.clone()
+        };
         let group_path = parent.group_path.clone();
         let title = parent.title.clone();
         let parent_is_structured = parent.is_structured();
@@ -3262,11 +3263,7 @@ impl HomeView {
             }
         } else {
             let child_id = crate::session::capture::generate_session_uuid();
-            match crate::session::fork::terminal_fork_seed(
-                &tool,
-                parent_agent_session_id.as_deref(),
-                child_id,
-            ) {
+            match crate::session::fork::terminal_fork_seed(parent_binding.as_ref(), child_id) {
                 Ok(s) => s,
                 Err(crate::session::ForkDenied::AgentCannotFork) => {
                     self.info_dialog = Some(InfoDialog::new(

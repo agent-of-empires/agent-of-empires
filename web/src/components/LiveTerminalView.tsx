@@ -61,6 +61,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
   // now that this view also renders on desktop.
   const coarse = useIsCoarsePointer();
   const [ensureState, setEnsureState] = useState<"pending" | "ready" | "error">("pending");
+  const [ensureWarning, setEnsureWarning] = useState<string | null>(null);
   const [ensureError, setEnsureError] = useState<string | null>(null);
   const clipboardArmRef = useRef<ArmedClipboardWrite | null>(null);
   const receiveAgentClipboard = useCallback((text: string) => {
@@ -99,6 +100,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
   if (session.id !== trackedSessionId) {
     setTrackedSessionId(session.id);
     setEnsureState("pending");
+    setEnsureWarning(null);
     setEnsureError(null);
   }
   const lastEnsuredSessionIdRef = useRef<string | null>(null);
@@ -131,6 +133,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
       if (controller.signal.aborted) return;
       if (res.ok) {
         lastEnsuredSessionIdRef.current = session.id;
+        setEnsureWarning(res.message ?? null);
         setEnsureState("ready");
       } else {
         setEnsureState("error");
@@ -174,6 +177,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
         if (controller.signal.aborted) return;
         if (res.ok) {
           lastEnsuredSessionIdRef.current = session.id;
+          setEnsureWarning(res.message ?? null);
           setEnsureState("ready");
         } else {
           setEnsureState("error");
@@ -249,6 +253,14 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
         maxRetries={live.maxRetries}
         onRetry={live.manualReconnect}
       />
+
+      {ensureWarning && (
+        <div className="absolute left-0 right-0 top-12 z-20 flex justify-center px-3 pointer-events-none">
+          <span className="text-xs text-status-warning bg-surface-900/90 border border-surface-700/60 rounded-full px-4 py-2 max-w-md break-words text-center">
+            {ensureWarning}
+          </span>
+        </div>
+      )}
 
       {live.state.connected && live.state.ownerKnown && !live.state.isOwner && (
         <div className="absolute left-0 right-0 top-3 flex justify-center z-20 px-3">

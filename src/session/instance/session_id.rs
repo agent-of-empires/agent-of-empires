@@ -77,11 +77,11 @@ fn parse_prime_agent_launch_options(words: &[String]) -> Option<PrimeAgentLaunch
     Some(options)
 }
 
-fn resolve_prime_agent_path(value: &str, cwd: &Path) -> PathBuf {
+fn resolve_prime_agent_path(value: &str, cwd: &Path, home: &Path) -> PathBuf {
     let expanded = if value == "~" {
-        PathBuf::from("/root")
+        home.to_path_buf()
     } else if let Some(relative) = value.strip_prefix("~/") {
-        Path::new("/root").join(relative)
+        home.join(relative)
     } else {
         PathBuf::from(value)
     };
@@ -93,7 +93,7 @@ fn resolve_prime_agent_path(value: &str, cwd: &Path) -> PathBuf {
     crate::git::template::lexical_normalize(&absolute)
 }
 
-fn read_prime_agent_settings(
+pub(super) fn read_session_settings(
     path: &Path,
 ) -> anyhow::Result<Option<serde_json::Map<String, serde_json::Value>>> {
     match std::fs::symlink_metadata(path) {
@@ -103,17 +103,15 @@ fn read_prime_agent_settings(
     }
     let parent = path
         .parent()
-        .ok_or_else(|| anyhow::anyhow!("Prime Agent settings path has no parent"))?;
+        .ok_or_else(|| anyhow::anyhow!("settings path has no parent"))?;
     let leaf = path
         .file_name()
-        .ok_or_else(|| anyhow::anyhow!("Prime Agent settings path has no file name"))?;
+        .ok_or_else(|| anyhow::anyhow!("settings path has no file name"))?;
     let root = crate::session::AnchoredDir::open(parent)?;
     let Some(bytes) = root.read_regular(Path::new(leaf), PRIME_AGENT_SETTINGS_MAX_BYTES)? else {
-        anyhow::bail!("Prime Agent settings are not a bounded regular file");
+        anyhow::bail!("settings are not a bounded regular file");
     };
-    Ok(serde_json::from_slice::<serde_json::Value>(&bytes)
-        .ok()
-        .and_then(|settings| settings.as_object().cloned()))
+    Ok(serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&bytes).ok())
 }
 
 fn read_sandbox_sidecar_file(
@@ -151,9 +149,9 @@ fn validated_prime_root_publication(
     let publication: Publication = serde_json::from_slice(&bytes).ok()?;
     let id = validated_session_id(publication.id)?;
     let path = &publication.path;
-    let expected_cwd = crate::session::capture::canonicalize_or_raw(&plan.container_cwd);
+    let expected_cwd = crate::git::template::lexical_normalize(Path::new(&plan.container_cwd));
     if publication.depth != 0
-        || crate::session::capture::canonicalize_or_raw(&publication.cwd) != expected_cwd
+        || crate::git::template::lexical_normalize(Path::new(&publication.cwd)) != expected_cwd
         || !path.is_absolute()
         || crate::git::template::lexical_normalize(path) != *path
         || path.parent()? != plan.container_session_dir
@@ -186,7 +184,9 @@ fn validated_prime_root_publication(
         && header
             .get("cwd")
             .and_then(|value| value.as_str())
-            .is_some_and(|cwd| crate::session::capture::canonicalize_or_raw(cwd) == expected_cwd);
+            .is_some_and(|cwd| {
+                crate::git::template::lexical_normalize(Path::new(cwd)) == expected_cwd
+            });
     valid.then_some(PrimeRootPublication::Ready(id))
 }
 
@@ -232,6 +232,10 @@ impl Instance {
         if !self.launch_invokes_resolved_agent_directly(agent) {
             return None;
         }
+        self.prime_agent_launch_options()
+    }
+
+    fn prime_agent_launch_options(&self) -> Option<PrimeAgentLaunchOptions> {
         let parsed = super::launch_command::parse_launch_command(self.get_tool_command())?;
         let mut words = parsed.words;
         words.extend(shell_words::split(&self.extra_args).ok()?);
@@ -272,21 +276,6 @@ impl Instance {
         store: PathBuf,
         options: PrimeAgentLaunchOptions,
     ) -> anyhow::Result<PrimeAgentCapturePlan> {
-        anyhow::ensure!(
-            config.uses_default_container_home(),
-            "Prime capture requires the default container HOME"
-        );
-
-        let launch_cwd = PathBuf::from(self.container_workdir());
-        let container_cwd = options.cwd.as_deref().map_or_else(
-            || launch_cwd.clone(),
-            |cwd| resolve_prime_agent_path(cwd, &launch_cwd),
-        );
-        anyhow::ensure!(
-            container_cwd.is_absolute(),
-            "Prime working directory is not absolute"
-        );
-
         let environment_value = |key: &str| {
             config
                 .environment
@@ -294,33 +283,117 @@ impl Instance {
                 .find(|entry| entry.key() == key)
                 .map(|entry| entry.value())
         };
-        let environment_session_dir = environment_value("PRIME_AGENT_SESSION_DIR")
-            .or_else(|| environment_value("PRIME_AGENT_CODING_AGENT_SESSION_DIR"))
-            .filter(|value| !value.is_empty());
+        anyhow::ensure!(
+            config.uses_default_container_home(),
+            "Prime capture requires the default container HOME"
+        );
+        Self::resolve_prime_agent_layout(
+            store,
+            options,
+            Path::new(&self.container_workdir()),
+            (Path::new("/root"), Path::new(PRIME_AGENT_DIR_IN_CONTAINER)),
+            environment_value("PRIME_AGENT_SESSION_DIR")
+                .or_else(|| environment_value("PRIME_AGENT_CODING_AGENT_SESSION_DIR")),
+            |path, writable| config.host_path_for_container_path(path, writable),
+        )
+    }
+
+    pub(super) fn prime_agent_launch_plan_from_inputs(
+        &self,
+        inputs: &super::execution::NativeLaunchInputs,
+        agent_dir: &Path,
+        home: &Path,
+    ) -> anyhow::Result<PrimeAgentCapturePlan> {
+        let root = inputs.canonical_path(agent_dir)?;
+        let store = if let Some(container) = &inputs.container {
+            anyhow::ensure!(
+                home == Path::new("/root"),
+                "Prime capture requires the default container HOME"
+            );
+            container
+                .host_path(&root, true)
+                .context("Prime store is not mounted from a writable local filesystem")?
+        } else {
+            root.clone()
+        };
+        let mut options = self
+            .prime_agent_launch_options()
+            .context("Prime launch options do not support a managed conversation")?;
+        if let Some(cwd) = options.cwd.as_deref() {
+            let cwd = resolve_prime_agent_path(cwd, &inputs.cwd, home);
+            options.cwd = Some(
+                inputs
+                    .canonical_path(&cwd)?
+                    .to_str()
+                    .context("Prime working directory is not UTF-8")?
+                    .to_owned(),
+            );
+        }
+        Self::resolve_prime_agent_layout(
+            store,
+            options,
+            &inputs.cwd,
+            (home, &root),
+            inputs
+                .environment
+                .get("PRIME_AGENT_SESSION_DIR")
+                .or_else(|| {
+                    inputs
+                        .environment
+                        .get("PRIME_AGENT_CODING_AGENT_SESSION_DIR")
+                })
+                .map(String::as_str),
+            |path, writable| {
+                let path = inputs.canonical_path(path).ok()?;
+                match &inputs.container {
+                    Some(container) => container.host_path(&path, writable),
+                    None => Some(path),
+                }
+            },
+        )
+    }
+
+    fn resolve_prime_agent_layout(
+        store: PathBuf,
+        options: PrimeAgentLaunchOptions,
+        launch_cwd: &Path,
+        (home, agent_dir): (&Path, &Path),
+        environment_session_dir: Option<&str>,
+        host_path_for: impl Fn(&Path, bool) -> Option<PathBuf>,
+    ) -> anyhow::Result<PrimeAgentCapturePlan> {
+        let container_cwd = options.cwd.as_deref().map_or_else(
+            || launch_cwd.to_path_buf(),
+            |cwd| resolve_prime_agent_path(cwd, launch_cwd, home),
+        );
+        anyhow::ensure!(
+            container_cwd.is_absolute(),
+            "Prime working directory is not absolute"
+        );
+
         let configured_session_dir = options
             .session_dir
             .filter(|value| !value.is_empty())
-            .or_else(|| environment_session_dir.map(str::to_string));
-
+            .or_else(|| {
+                environment_session_dir
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+            });
         let session_dir_value = if let Some(value) = configured_session_dir {
             value
         } else {
-            let global_container_path =
-                Path::new(PRIME_AGENT_DIR_IN_CONTAINER).join("settings.json");
+            let global_container_path = agent_dir.join("settings.json");
             let project_container_path = container_cwd.join(".prime/agent/settings.json");
-            let global_host_path = config
-                .host_path_for_container_path(&global_container_path, false)
+            let global_host_path = host_path_for(&global_container_path, false)
                 .context("global Prime settings are not mapped to a readable host path")?;
-            let project_host_path = config
-                .host_path_for_container_path(&project_container_path, false)
+            let project_host_path = host_path_for(&project_container_path, false)
                 .context("project Prime settings are not mapped to a readable host path")?;
-            let global = read_prime_agent_settings(&global_host_path).with_context(|| {
+            let global = read_session_settings(&global_host_path).with_context(|| {
                 format!(
                     "cannot safely read Prime settings {}",
                     global_host_path.display()
                 )
             })?;
-            let project = read_prime_agent_settings(&project_host_path).with_context(|| {
+            let project = read_session_settings(&project_host_path).with_context(|| {
                 format!(
                     "cannot safely read Prime settings {}",
                     project_host_path.display()
@@ -336,19 +409,22 @@ impl Instance {
                 }) {
                 Some(serde_json::Value::String(value)) => value.clone(),
                 Some(serde_json::Value::Null) | None => {
-                    format!("{PRIME_AGENT_DIR_IN_CONTAINER}/sessions")
+                    format!(
+                        "{}/sessions",
+                        agent_dir.to_str().context("Prime store is not UTF-8")?
+                    )
                 }
                 Some(_) => anyhow::bail!("Prime sessionDir setting is neither a string nor null"),
             }
         };
 
-        let container_session_dir = resolve_prime_agent_path(&session_dir_value, &container_cwd);
+        let container_session_dir =
+            resolve_prime_agent_path(&session_dir_value, &container_cwd, home);
         let session_dir = container_session_dir
-            .strip_prefix(Path::new(PRIME_AGENT_DIR_IN_CONTAINER))
+            .strip_prefix(agent_dir)
             .context("Prime session directory is outside the managed store")?
             .to_path_buf();
-        let mapped = config
-            .host_path_for_container_path(&container_session_dir, true)
+        let mapped = host_path_for(&container_session_dir, true)
             .context("Prime session directory is not mapped to a writable host path")?;
         anyhow::ensure!(
             mapped == store.join(&session_dir),
@@ -373,24 +449,80 @@ impl Instance {
     /// pane exists and only through the backend/context declared by the agent.
     /// A miss starts fresh; no shared store is searched without its launch
     /// floor and ownership contract.
-    pub fn acquire_session_id(&mut self) -> (Option<String>, bool) {
-        // Both pre-mint decisions are made here rather than inside
-        // acquire_session_id_with: it keeps the config read and the binary
-        // probe off every other launch, and keeps the inner fn a pure,
-        // testable seam.
-        let backend = self.resolved_capture_backend();
+    fn acquire_session_id(
+        &mut self,
+        execution: Option<&super::execution::NativeExecution>,
+    ) -> (Option<String>, bool) {
+        let backend = execution.map_or_else(
+            || self.resolved_capture_backend(),
+            |execution| {
+                execution
+                    .agent
+                    .session_support
+                    .as_ref()
+                    .and_then(|support| support.capture.as_ref())
+                    .map(|capture| capture.backend)
+            },
+        );
         let preassign = backend == Some(crate::agents::SessionCaptureBackend::OpenCode)
-            && self.opencode_preassign_enabled();
-        let pin_pi = self.pi_session_id_pinnable();
-        let preassign_environment = preassign.then(|| self.resolved_host_environment());
-        self.acquire_session_id_with(&|path| {
+            && execution.map_or_else(
+                || self.opencode_preassign_enabled(),
+                |execution| execution.opencode_preassign,
+            );
+        let pin_pi = execution.map_or_else(
+            || self.pi_session_id_pinnable(),
+            |execution| execution.pi_pinnable,
+        );
+        let environment =
+            (preassign && execution.is_none()).then(|| self.resolved_host_environment());
+        let native_created = std::cell::Cell::new(false);
+        let result = self.acquire_session_id_with(execution, &|path| {
             if pin_pi {
                 return Some(crate::session::capture::generate_session_uuid());
             }
-            preassign_environment.as_deref().and_then(|environment| {
-                crate::session::capture::preassign_opencode_session_id(path, environment)
-            })
-        })
+            if !preassign {
+                return None;
+            }
+            let mut command = std::process::Command::new(
+                execution.map_or(std::path::Path::new("opencode"), |execution| {
+                    execution.program.as_path()
+                }),
+            );
+            let cwd = if let Some(execution) = execution {
+                command.env_clear().envs(&execution.inputs.environment);
+                for (key, value) in &execution.routing {
+                    if let Some(value) = value {
+                        command.env(key, value);
+                    } else {
+                        command.env_remove(key);
+                    }
+                }
+                execution.inputs.cwd.to_str()?
+            } else {
+                command.envs(crate::session::environment::resolve_host_environment_pairs(
+                    environment.as_deref()?,
+                ));
+                path
+            };
+            let sid = crate::session::capture::preassign_opencode_session_id(cwd, command);
+            native_created.set(sid.is_some());
+            sid
+        });
+        if native_created.get() {
+            if let (Some(execution), Some(sid)) = (execution, result.0.as_ref()) {
+                self.set_agent_conversation(
+                    Some(sid.clone()),
+                    Some(ConversationBinding {
+                        session_id: sid.clone(),
+                        execution: Some(execution.binding.clone()),
+                        provenance: ConversationProvenance::Observed,
+                        transcript_path: None,
+                    }),
+                    None,
+                );
+            }
+        }
+        result
     }
 
     /// Session-id acquisition with the pre-mint step injected as a seam, so
@@ -399,24 +531,33 @@ impl Instance {
     /// helper and the Pi pin.
     fn acquire_session_id_with(
         &mut self,
+        execution: Option<&super::execution::NativeExecution>,
         mint_fresh_id: &dyn Fn(&str) -> Option<String>,
     ) -> (Option<String>, bool) {
+        let backend = execution.map_or_else(
+            || self.resolved_capture_backend(),
+            |execution| {
+                execution
+                    .agent
+                    .session_support
+                    .as_ref()
+                    .and_then(|support| support.capture.as_ref())
+                    .map(|capture| capture.backend)
+            },
+        );
         match self.resume_intent.clone() {
             ResumeIntent::Use(sid) => {
-                self.agent_session_id = Some(sid.clone());
+                let path = (self.agent_session_id.as_ref() == Some(&sid))
+                    .then(|| self.pi_session_path.clone())
+                    .flatten();
+                self.set_agent_conversation(Some(sid.clone()), self.resume_binding.clone(), path);
                 return (Some(sid), true);
             }
             ResumeIntent::Cleared => {
-                self.agent_session_id = None;
+                self.set_agent_conversation(None, None, None);
                 self.resume_probe_failed_sid = None;
-                // The transcript belonged to the conversation being dropped.
-                // `pi_resumable_transcript` would refuse it on the id check
-                // anyway; not carrying it is one less thing depending on that.
-                self.pi_session_path = None;
-                let session_id = self.fresh_launch_session_id(mint_fresh_id);
-                if let Some(ref id) = session_id {
-                    self.agent_session_id = Some(id.clone());
-                }
+                let session_id = self.fresh_launch_session_id(backend, mint_fresh_id);
+                self.set_agent_conversation(session_id.clone(), None, None);
                 return (session_id, false);
             }
             ResumeIntent::Fork { .. } => {
@@ -434,15 +575,24 @@ impl Instance {
 
         match self.prime_root_publication() {
             Some(PrimeRootPublication::Ready(id))
-                if !self.retroactive_capture_excludes.contains(&id) =>
+                if !self.is_capture_excluded(
+                    &id,
+                    self.active_execution.as_ref().map(|active| &active.binding),
+                ) =>
             {
-                self.agent_session_id = Some(id.clone());
+                let binding = self
+                    .prime_root_observation(id.clone())
+                    .conversation_binding();
+                self.set_agent_conversation(Some(id.clone()), binding, None);
                 return (Some(id), true);
             }
             Some(PrimeRootPublication::Pending(id))
-                if !self.retroactive_capture_excludes.contains(&id) =>
+                if !self.is_capture_excluded(
+                    &id,
+                    self.active_execution.as_ref().map(|active| &active.binding),
+                ) =>
             {
-                self.agent_session_id = None;
+                self.set_agent_conversation(None, None, None);
                 self.resume_probe_failed_sid = None;
                 return (None, false);
             }
@@ -450,47 +600,38 @@ impl Instance {
         }
 
         if let Some(stored) = self.agent_session_id.clone() {
-            // Rebinding rather than returning early runs the observation
-            // through the same empty-thread downgrade as the stored id below.
-            // The SessionStart hook fires before Claude writes any content, so
-            // the sidecar can legitimately name a thread with no transcript.
-            let stored = match self.capture_freshest_session_id() {
-                Some(fresh) => {
-                    tracing::info!(
-                        target: "session.store",
-                        stale = %stored,
-                        fresh = %fresh,
-                        tool = %self.tool,
-                        "Replacing stored session id with fresher live observation"
-                    );
-                    self.agent_session_id = Some(fresh.clone());
-                    fresh
+            let stored = match self.capture_freshest_conversation() {
+                Some(observation) => {
+                    tracing::info!(target: "session.store", stale = %stored, fresh = %observation.sid, tool = %self.tool,
+                        "Replacing stored conversation with fresher live observation");
+                    self.apply_conversation_observation(&observation);
+                    observation.sid
                 }
                 None => stored,
             };
-            // A stored Claude sid with no transcript on disk is not resumable:
-            // Claude minted the UUID at first launch but nothing was ever
-            // written (an empty thread killed before the first prompt), so
-            // `--resume <sid>` is a guaranteed launch failure that lands the
-            // session in the "resume failed for sid ...; preserved for explicit
-            // retry" state. Launch it as a fresh pinned session instead
-            // (`is_existing = false` -> `--session-id <sid>`), which succeeds
-            // and keeps the id stable so a later first prompt stays continuous.
-            // Pi is pre-minted too, but it needs no equivalent branch: its
-            // pin flag is also its create flag, so `apply_session_flags`
-            // relaunches an unwritten pin with `--session-id` and pi recreates
-            // the conversation under the same id (see
-            // `resume_flag_arm_is_existing`). Host-only: a sandboxed transcript
-            // lives inside the container, which may not be up at acquire time.
-            if self.resolved_capture_backend() == Some(crate::agents::SessionCaptureBackend::Claude)
-                && !self.is_sandboxed()
-                && crate::session::capture::claude_host_transcript_confirmed_absent(
-                    &self.project_path,
-                    &stored,
-                    &self.resolved_host_environment(),
-                    self.declared_agent_config_dir_for(&self.tool).as_deref(),
+            // An unwritten Claude pin can be created under the same ID. Uncertain reads preserve resume.
+            let absent = backend == Some(crate::agents::SessionCaptureBackend::Claude)
+                && execution.map_or_else(
+                    || !self.is_sandboxed(),
+                    |execution| execution.inputs.container.is_none(),
                 )
-            {
+                && match execution {
+                    Some(execution) => execution.binding.stores.first().is_some_and(|root| {
+                        crate::session::capture::claude_host_transcript_confirmed_absent(
+                            execution.inputs.cwd.to_str().unwrap_or(&self.project_path),
+                            &stored,
+                            &[],
+                            Some(root),
+                        )
+                    }),
+                    None => crate::session::capture::claude_host_transcript_confirmed_absent(
+                        &self.project_path,
+                        &stored,
+                        &self.resolved_host_environment(),
+                        self.declared_agent_config_dir_for(&self.tool).as_deref(),
+                    ),
+                };
+            if absent {
                 tracing::info!(
                     target: "session.store",
                     sid = %stored,
@@ -505,22 +646,22 @@ impl Instance {
 
         let tmux_exists = self.tmux_session().is_ok_and(|s| s.exists());
         if tmux_exists {
-            if let Some(id) = self.try_retroactive_capture() {
+            if let Some(observation) = self.try_retroactive_capture() {
                 tracing::info!(target: "session.store",
                     "Retroactive capture found session ID for {}: {}",
                     self.tool,
-                    id
+                    observation.sid
                 );
-                self.agent_session_id = Some(id);
+                self.apply_conversation_observation(&observation);
                 return (self.agent_session_id.clone(), true);
             }
         }
 
-        let session_id = self.fresh_launch_session_id(mint_fresh_id);
+        let session_id = self.fresh_launch_session_id(backend, mint_fresh_id);
 
         if let Some(ref id) = session_id {
             tracing::debug!(target: "session.store", "Session ID for {}: {}", self.tool, id);
-            self.agent_session_id = session_id.clone();
+            self.set_agent_conversation(session_id.clone(), None, None);
         }
 
         (session_id, false)
@@ -532,9 +673,10 @@ impl Instance {
     /// from the shared store. Other supported backends capture after launch.
     fn fresh_launch_session_id(
         &self,
+        backend: Option<crate::agents::SessionCaptureBackend>,
         mint_fresh_id: &dyn Fn(&str) -> Option<String>,
     ) -> Option<String> {
-        match self.resolved_capture_backend()? {
+        match backend? {
             crate::agents::SessionCaptureBackend::Claude => Some(generate_session_uuid()),
             crate::agents::SessionCaptureBackend::OpenCode
             | crate::agents::SessionCaptureBackend::Pi => mint_fresh_id(&self.project_path),
@@ -622,10 +764,11 @@ impl Instance {
         let Ok((storage, _lifecycle_lock, generation)) = ownership else {
             return;
         };
+        let expected = self.conversation_state();
         let captured = self.try_retroactive_capture();
         let applied = captured.as_ref().is_some_and(|captured| {
-            self.resume_probe_failed_sid.as_deref() != Some(captured.as_str())
-                && persist_session_to_storage(profile, &self.id, captured, None, &file_watch)
+            self.resume_probe_failed_sid.as_deref() != Some(captured.sid.as_str())
+                && persist_session_to_storage(profile, &self.id, captured, &expected, &file_watch)
                     == SidWrite::Applied
         });
         let released = storage.update(|instances, _groups| {
@@ -646,7 +789,9 @@ impl Instance {
         self.lifecycle_generation = generation;
         self.lifecycle_reservation = None;
         if applied {
-            self.agent_session_id = captured;
+            if let Some(observation) = captured {
+                self.apply_conversation_observation(&observation);
+            }
             self.resume_probe_failed_sid = None;
             tracing::info!(
                 target: "session.store",
@@ -664,37 +809,37 @@ impl Instance {
     /// sidecar. Managed store backends route through their exact store, cwd,
     /// launch-floor, exclusion, and lease checks. No backend falls through to a
     /// different identity source.
-    pub(crate) fn capture_freshest_session_id(&self) -> Option<String> {
-        let backend = self.resolved_capture_backend()?;
-        if backend == crate::agents::SessionCaptureBackend::Pi {
-            let authoritative = self.pi_published_session_id(false)?;
-            if self.retroactive_capture_excludes.contains(&authoritative) {
-                return None;
+    pub(crate) fn capture_freshest_conversation(
+        &self,
+    ) -> Option<crate::session::poller::SessionIdObservation> {
+        let observation = match self.source_capture_backend()? {
+            crate::agents::SessionCaptureBackend::Pi => self.pi_published_conversation(false)?,
+            crate::agents::SessionCaptureBackend::PrimeAgent => {
+                let PrimeRootPublication::Ready(sid) = self.prime_root_publication()? else {
+                    return None;
+                };
+                self.prime_root_observation(sid)
             }
-            return override_if_distinct(self.agent_session_id.as_deref(), authoritative);
-        }
-        if backend == crate::agents::SessionCaptureBackend::PrimeAgent {
-            let PrimeRootPublication::Ready(authoritative) = self.prime_root_publication()? else {
-                return None;
-            };
-            if self.retroactive_capture_excludes.contains(&authoritative) {
-                return None;
-            }
-            return override_if_distinct(self.agent_session_id.as_deref(), authoritative);
-        }
-        if matches!(
-            backend,
             crate::agents::SessionCaptureBackend::Claude
-                | crate::agents::SessionCaptureBackend::HookSidecar
-        ) {
-            let authoritative = crate::hooks::read_hook_session_id_any_age(&self.id)?;
-            if self.retroactive_capture_excludes.contains(&authoritative) {
-                return None;
+            | crate::agents::SessionCaptureBackend::HookSidecar => {
+                super::execution::hook_session_observation(
+                    &self.id,
+                    self.active_execution.as_ref(),
+                    None,
+                )?
             }
-            return override_if_distinct(self.agent_session_id.as_deref(), authoritative);
+            _ => self.try_retroactive_capture()?,
+        };
+        if self.is_capture_excluded(&observation.sid, observation.source.as_ref()) {
+            return None;
         }
-        let live = self.try_retroactive_capture()?;
-        override_if_distinct(self.agent_session_id.as_deref(), live)
+        if self.agent_session_id.as_ref() == Some(&observation.sid)
+            && self.agent_session_binding == observation.conversation_binding()
+            && self.pi_session_path == observation.pi_session_path
+        {
+            return None;
+        }
+        Some(observation)
     }
 
     #[cfg(test)]
@@ -787,62 +932,37 @@ impl Instance {
         ))
     }
 
-    /// Whether this Pi pane publishes its conversation through the AoE
-    /// extension, which is what makes its observations name a pane.
-    ///
-    /// Read from what the launch did, not from the binary probe: an upgrade
-    /// mid-session must not reclassify a pane that is already running.
-    /// The conversation this pane published, whichever side of the container
-    /// boundary it published on. `any_age` drops the freshness window, which a
-    /// final flush wants and a resume does not.
-    pub(crate) fn pi_published_session_id(&self, any_age: bool) -> Option<String> {
-        if self.resolved_capture_backend() != Some(crate::agents::SessionCaptureBackend::Pi) {
-            return None;
-        }
-        match self.extension_sidecar_source()? {
-            SessionSidecarSource::HostHooks => {
-                if any_age {
-                    crate::hooks::read_hook_session_id_any_age(&self.id)
-                } else {
-                    crate::hooks::read_hook_session_id(&self.id)
-                }
-            }
-            SessionSidecarSource::SandboxDir(_) => {
-                let raw = self.read_extension_sandbox_file("session_id")?;
-                let id = std::str::from_utf8(&raw).ok()?.trim();
-                uuid::Uuid::parse_str(id).ok().map(|_| id.to_string())
-            }
-        }
-    }
-
-    /// The transcript path this pane published, as the pane sees it. In a
-    /// container that is a /root/.pi/ path, which is what pi's argv needs;
-    /// pi_host_view_of maps it back for host-side checks.
-    pub(crate) fn pi_published_session_path(&self) -> Option<String> {
-        if self.resolved_capture_backend() != Some(crate::agents::SessionCaptureBackend::Pi) {
-            return None;
-        }
-        self.published_extension_session_path()
-    }
-
-    fn published_extension_session_path(&self) -> Option<String> {
-        match self.extension_sidecar_source()? {
-            SessionSidecarSource::HostHooks => crate::hooks::read_hook_session_path(&self.id),
-            SessionSidecarSource::SandboxDir(_) => {
-                let raw = self.read_extension_sandbox_file("session_path")?;
-                let path = std::str::from_utf8(&raw).ok()?.trim();
-                path.starts_with('/').then(|| path.to_string())
-            }
-        }
+    /// Read the ID and path from the publisher recorded for this launch.
+    pub(crate) fn pi_published_conversation(
+        &self,
+        any_age: bool,
+    ) -> Option<crate::session::poller::SessionIdObservation> {
+        crate::session::capture::read_pi_session_observation(
+            &self.id,
+            &self.extension_sidecar_source()?,
+            self.active_execution.as_ref(),
+            any_age,
+        )
     }
 
     /// Where this Pi pane publishes, or None when that cannot be established.
     pub(crate) fn pi_sidecar_source(&self) -> Option<SessionSidecarSource> {
-        (self.resolved_capture_backend() == Some(crate::agents::SessionCaptureBackend::Pi))
+        (self.source_capture_backend() == Some(crate::agents::SessionCaptureBackend::Pi))
             .then(|| self.extension_sidecar_source())?
     }
 
     fn extension_sidecar_source(&self) -> Option<SessionSidecarSource> {
+        if let Some(active) = &self.active_execution {
+            return match &active.capture {
+                Some(CaptureContext::Pi { source, .. }) => Some(source.clone()),
+                Some(CaptureContext::Prime { sidecar, .. }) => sidecar.clone(),
+                _ => None,
+            };
+        }
+        self.resolve_extension_sidecar_source()
+    }
+
+    pub(super) fn resolve_extension_sidecar_source(&self) -> Option<SessionSidecarSource> {
         self.resolved_capture_backend()?.identity_publisher()?;
         if self.is_sandboxed() {
             crate::session::validate_instance_id(&self.id).ok()?;
@@ -852,30 +972,35 @@ impl Instance {
                     .join(&self.id),
             ));
         }
-        Some(SessionSidecarSource::HostHooks)
+        Some(SessionSidecarSource::host_hooks(&self.id))
     }
 
     fn extension_config_bind_dir(&self) -> Option<std::path::PathBuf> {
         self.sandbox_capture_store_dir()
     }
-
-    fn read_extension_sandbox_file(&self, leaf: &str) -> Option<Vec<u8>> {
-        read_sandbox_sidecar_file(
-            &self.extension_config_bind_dir()?,
-            &self.id,
-            leaf,
-            SESSION_SIDECAR_MAX_BYTES,
-        )
-    }
-
-    fn extension_sandbox_regular_exists(&self, relative: &Path) -> bool {
-        self.extension_config_bind_dir()
-            .and_then(|root| crate::session::AnchoredDir::open(&root).ok())
-            .is_some_and(|root| root.regular_exists(relative))
+    fn extension_source_bind_dir(&self) -> Option<PathBuf> {
+        let SessionSidecarSource::SandboxDir(mut path) = self.extension_sidecar_source()? else {
+            return None;
+        };
+        if path.file_name()? != std::ffi::OsStr::new(&self.id) {
+            return None;
+        }
+        path.pop();
+        if path.file_name()? != "aoe-session" {
+            return None;
+        }
+        path.pop();
+        Some(path)
     }
 
     /// A published Pi path as the host filesystem sees it.
     fn pi_host_view_of(&self, published: &str) -> Option<std::path::PathBuf> {
+        if let Some(active) = &self.active_execution {
+            return match &active.container {
+                Some(container) => container.host_path(Path::new(published), true),
+                None => Some(PathBuf::from(published)),
+            };
+        }
         if !self.is_sandboxed() {
             return Some(std::path::PathBuf::from(published));
         }
@@ -891,6 +1016,18 @@ impl Instance {
     /// is deliberately distinct from `Absent`, because only `Absent` is
     /// evidence about the conversation rather than about our own view.
     fn pi_recorded_transcript_state(&self, path: &str) -> PiTranscriptState {
+        if let Some(active) = &self.active_execution {
+            let Some(CaptureContext::Pi { root, .. }) = &active.capture else {
+                return PiTranscriptState::Unreadable;
+            };
+            if !Path::new(path).starts_with(root) {
+                return PiTranscriptState::Unreadable;
+            }
+            return self
+                .pi_host_view_of(path)
+                .map(|path| host_transcript_state(&path))
+                .unwrap_or(PiTranscriptState::Unreadable);
+        }
         let relative = if self.is_sandboxed() {
             match path.strip_prefix("/root/.pi/") {
                 Some(relative) => Path::new(relative),
@@ -953,48 +1090,36 @@ impl Instance {
     }
 
     pub(crate) fn absorb_published_pi_session(&mut self) {
-        if self.resolved_capture_backend() != Some(crate::agents::SessionCaptureBackend::Pi) {
-            return;
-        }
-        let Some(path) = self.pi_published_session_path() else {
+        let Some(observation) = self.pi_published_conversation(true) else {
             return;
         };
-        if self.pi_session_path.as_deref() == Some(path.as_str()) {
-            return;
-        }
-        self.pi_session_path = Some(path.clone());
-        // The sidecar this came from lives in the host temp directory, which a
-        // reboot clears. Only the durable copy survives to tell the next launch
-        // which conversation the pane was on and whether it has a transcript.
-        if let Ok(storage) = crate::session::storage::Storage::new(
+        let expected = self.conversation_state();
+        match persist_session_to_storage(
             &self.effective_profile(),
-            self.resolve_file_watch(),
+            &self.id,
+            &observation,
+            &expected,
+            &self.resolve_file_watch(),
         ) {
-            self.store_pi_session_path(&storage, &path);
-        }
-    }
-
-    /// Record a published transcript path on this row's durable state.
-    pub(super) fn store_pi_session_path(
-        &self,
-        storage: &crate::session::storage::Storage,
-        path: &str,
-    ) {
-        if let Err(error) = storage.update(|instances, _| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == self.id) {
-                inst.pi_session_path = Some(path.to_string());
-            }
-            Ok(())
-        }) {
-            tracing::warn!(
-                target: "session.store",
-                instance = %self.id,
-                "could not persist the Pi transcript path the pane published: {error}",
-            );
+            SidWrite::Applied => self.apply_conversation_observation(&observation),
+            // A pinned-foreign publication is a deliberate non-write; like a
+            // divergence skip, it carries no update worth reconciling.
+            SidWrite::Skipped | SidWrite::PinnedForeign => self.reconcile_from_disk(),
+            SidWrite::Failed => {}
         }
     }
 
     fn prime_root_publication(&self) -> Option<PrimeRootPublication> {
+        if let Some(active) = &self.active_execution {
+            let Some(CaptureContext::Prime {
+                plan,
+                sidecar: Some(_),
+            }) = &active.capture
+            else {
+                return None;
+            };
+            return validated_prime_root_publication(plan, &self.id);
+        }
         let plan = self.prime_agent_capture_plan(self.prime_agent_capture_options()?)
             .inspect_err(|error| {
                 tracing::debug!(target: "session.capture", session = %self.id, reason = %format_args!("{error:#}"),
@@ -1004,27 +1129,63 @@ impl Instance {
         validated_prime_root_publication(&plan, &self.id)
     }
 
+    fn prime_root_observation(&self, sid: String) -> crate::session::poller::SessionIdObservation {
+        let mut observation = crate::session::poller::SessionIdObservation::instance_sidecar(sid);
+        if let Some(active) = self.active_execution.as_ref().filter(|active| {
+            matches!(
+                active.capture,
+                Some(CaptureContext::Prime {
+                    sidecar: Some(_),
+                    ..
+                })
+            )
+        }) {
+            observation.execution = Some(active.clone());
+            observation.source = Some(active.binding.clone());
+        }
+        observation
+    }
+
+    pub(super) fn prime_published_conversation(
+        &self,
+    ) -> Option<crate::session::poller::SessionIdObservation> {
+        let PrimeRootPublication::Ready(sid) = self.prime_root_publication()? else {
+            return None;
+        };
+        Some(self.prime_root_observation(sid))
+    }
+
     pub(super) fn absorb_published_prime_session(&mut self) -> bool {
         if !matches!(self.resume_intent, ResumeIntent::Default) {
             return false;
         }
         let target = match self.prime_root_publication() {
             Some(PrimeRootPublication::Ready(id))
-                if !self.retroactive_capture_excludes.contains(&id) =>
+                if !self.is_capture_excluded(
+                    &id,
+                    self.active_execution.as_ref().map(|active| &active.binding),
+                ) =>
             {
                 Some(id)
             }
             Some(PrimeRootPublication::Pending(id))
-                if !self.retroactive_capture_excludes.contains(&id) =>
+                if !self.is_capture_excluded(
+                    &id,
+                    self.active_execution.as_ref().map(|active| &active.binding),
+                ) =>
             {
                 None
             }
             _ => return false,
         };
-        if self.agent_session_id == target {
+        let binding = target.as_ref().and_then(|sid| {
+            self.prime_root_observation(sid.clone())
+                .conversation_binding()
+        });
+        if self.agent_session_id == target && self.agent_session_binding == binding {
             return false;
         }
-        self.agent_session_id = target;
+        self.set_agent_conversation(target, binding, None);
         true
     }
 
@@ -1037,26 +1198,32 @@ impl Instance {
     }
 
     pub(crate) fn uses_pi_session_sidecar(&self) -> bool {
-        self.resolved_capture_backend() == Some(crate::agents::SessionCaptureBackend::Pi)
+        self.source_capture_backend() == Some(crate::agents::SessionCaptureBackend::Pi)
             && self.pi_sidecar_source().is_some()
             && (self.pi_extension_launched || self.extension_sidecar_exists())
     }
 
     fn extension_sidecar_exists(&self) -> bool {
-        match self.extension_sidecar_source() {
-            Some(SessionSidecarSource::SandboxDir(_)) => {
-                let relative = Path::new("aoe-session").join(&self.id).join("session_id");
-                self.extension_sandbox_regular_exists(&relative)
-            }
-            Some(SessionSidecarSource::HostHooks) => {
-                crate::hooks::session_id_sidecar_exists(&self.id)
-            }
-            None => false,
-        }
+        let Some(source) = self.extension_sidecar_source() else {
+            return false;
+        };
+        let Ok(leaf) = crate::hooks::session_id_leaf(
+            self.active_execution
+                .as_ref()
+                .map(|active| active.launch_id.as_str()),
+        ) else {
+            return false;
+        };
+        source
+            .read_file(&self.id, &leaf, SESSION_SIDECAR_MAX_BYTES, None)
+            .is_some()
     }
 
     pub(super) fn clear_pane_identity_sidecar(&self) {
-        match self.resolved_capture_backend() {
+        if self.active_execution.is_some() {
+            return;
+        }
+        match self.source_capture_backend() {
             Some(
                 crate::agents::SessionCaptureBackend::Claude
                 | crate::agents::SessionCaptureBackend::HookSidecar,
@@ -1066,11 +1233,13 @@ impl Instance {
             // Prime's root_session survives failed launches and is replaced only by a root.
             Some(crate::agents::SessionCaptureBackend::Pi) => match self.extension_sidecar_source()
             {
-                Some(SessionSidecarSource::HostHooks) => {
-                    let _ = crate::hooks::unlink_session_id_via_guard(&self.id);
+                Some(source @ SessionSidecarSource::HostHooks(_)) => {
+                    if source.matches_host_hooks(&self.id) {
+                        let _ = crate::hooks::unlink_session_id_via_guard(&self.id);
+                    }
                 }
                 Some(SessionSidecarSource::SandboxDir(_)) => {
-                    if let Some(root_path) = self.extension_config_bind_dir() {
+                    if let Some(root_path) = self.extension_source_bind_dir() {
                         if let Ok(root) = crate::session::AnchoredDir::open(&root_path) {
                             let base = Path::new("aoe-session").join(&self.id);
                             let _ = root.remove_file(&base.join("session_id"));
@@ -1087,7 +1256,7 @@ impl Instance {
     /// Whether this session may pin its Pi conversation with `--session-id`.
     ///
     /// Requires a directly verified host Pi launch with an unmodified PATH.
-    fn pi_session_id_pinnable(&self) -> bool {
+    pub(super) fn pi_session_id_pinnable(&self) -> bool {
         self.resolved_capture_backend() == Some(crate::agents::SessionCaptureBackend::Pi)
             && !self.is_sandboxed()
             && !super::launch_command::environment_defines_path(&self.resolved_host_environment())
@@ -1102,6 +1271,7 @@ impl Instance {
     /// exits 1 on, and `--session-id` recreates it.
     fn resume_flag_arm_is_existing(
         &self,
+        execution: Option<&super::execution::NativeExecution>,
         is_existing: bool,
         pi_pinnable: bool,
         session_id: Option<&str>,
@@ -1111,9 +1281,10 @@ impl Instance {
         // conversation when it is absent, so it is for ids AoE minted. A value
         // the user pinned keeps `--session`, which resolves partials and
         // searches wider; its shape says nothing about its origin.
-        let takes_pinning_arm = self.resolved_capture_backend()
-            == Some(crate::agents::SessionCaptureBackend::Pi)
-            && pi_pinnable
+        let takes_pinning_arm = execution.map_or_else(
+            || self.resolved_capture_backend() == Some(crate::agents::SessionCaptureBackend::Pi),
+            |execution| execution.agent.name == "pi",
+        ) && pi_pinnable
             && !explicitly_pinned
             && session_id.is_some_and(|sid| uuid::Uuid::parse_str(sid).is_ok());
         is_existing && !takes_pinning_arm
@@ -1248,11 +1419,22 @@ impl Instance {
         }
     }
 
-    pub(super) fn apply_session_flags(&mut self, cmd: &mut String, context: &str) -> Result<bool> {
+    pub(super) fn apply_session_flags(
+        &mut self,
+        cmd: &mut String,
+        context: &str,
+        agent: Option<&'static crate::agents::AgentDef>,
+        execution: Option<&super::execution::NativeExecution>,
+    ) -> Result<bool> {
+        let agent = execution.map(|execution| execution.agent).or(agent);
         let Some(parsed_command) = parse_launch_command(cmd) else {
             return Ok(false);
         };
-        if let Some(selector) = self.existing_session_selector(&parsed_command.words) {
+        if let Some(selector) = execution
+            .is_none()
+            .then(|| self.existing_session_selector(&parsed_command.words))
+            .flatten()
+        {
             let aoe_has_state = self.agent_session_id.is_some()
                 || matches!(
                     self.resume_intent,
@@ -1267,45 +1449,66 @@ impl Instance {
                 "command supplies its own native session selector; skipping AoE session injection");
             return Ok(false);
         }
-        if !self.supports_native_resume() {
+        if execution.is_none() && !self.supports_native_resume() {
+            anyhow::ensure!(
+                !matches!(
+                    self.resume_intent,
+                    ResumeIntent::Use(_) | ResumeIntent::Fork { .. }
+                ),
+                "explicit conversation operation is unsupported by this launch"
+            );
             return Ok(false);
         }
-        if let ResumeIntent::Fork { from } = self.resume_intent.clone() {
-            let child = self.agent_session_id.clone();
-            if let Some(child_id) = child.as_deref() {
-                let resume_tool = self
-                    .resolved_agent()
-                    .map_or(self.tool.as_str(), |agent| agent.name);
-                let fork_part = build_fork_flags(resume_tool, &from, child_id);
-                if !fork_part.is_empty() {
-                    // Codex's fork is a subcommand and must sit right after the
-                    // binary (before other flags), like its resume subcommand.
-                    // Flag-shaped forks (claude, opencode) append.
-                    let is_subcommand = matches!(
-                        self.resolved_agent().map(|agent| &agent.fork_strategy),
-                        Some(crate::agents::ForkStrategy::CodexFork)
-                    );
-                    splice_subcommand_or_append(
-                        cmd,
-                        &fork_part,
-                        is_subcommand.then_some(parsed_command.executable_end),
-                    );
-                }
+        if let Some(execution) = execution {
+            if !execution.namespace_arguments.is_empty() {
+                cmd.push(' ');
+                cmd.push_str(&shell_words::join(&execution.namespace_arguments));
             }
-            // A fork is a fresh session, not an in-place resume.
+        }
+        if let ResumeIntent::Fork { from } = self.resume_intent.clone() {
+            let agent = agent.context("fork execution adapter is unavailable")?;
+            let child_id = self
+                .agent_session_id
+                .as_deref()
+                .context("fork child seed is missing")?;
+            let fork_part = build_fork_flags(agent.name, &from, child_id);
+            anyhow::ensure!(
+                !fork_part.is_empty(),
+                "native agent cannot execute this fork"
+            );
+            let is_subcommand =
+                matches!(agent.fork_strategy, crate::agents::ForkStrategy::CodexFork);
+            splice_subcommand_or_append(
+                cmd,
+                &fork_part,
+                is_subcommand.then_some(parsed_command.executable_end),
+            );
             return Ok(false);
         }
         // Read before acquisition: a Use intent marks an id the user pinned
         // rather than one AoE minted or captured.
         let explicitly_pinned = matches!(self.resume_intent, ResumeIntent::Use(_));
-        self.absorb_published_pi_session();
-        let (mut session_id, is_existing) = self.acquire_session_id();
+        let (mut session_id, is_existing) = self.acquire_session_id(execution);
+        if let Some(path) = execution.and_then(|execution| execution.pi_transcript_path.as_ref()) {
+            self.set_agent_conversation(
+                session_id.clone(),
+                self.agent_session_binding.clone(),
+                Some(path.clone()),
+            );
+            let flags = format!("--session {}", shell_escape(path));
+            splice_subcommand_or_append(cmd, &flags, None);
+            return Ok(true);
+        }
         // Which ResumeStrategy arm to emit. Pi diverges from `is_existing`
         // (see `resume_flag_arm_is_existing`), so the launch flag and the
         // "this was a resume" answer this fn returns are decided separately.
         let flag_arm_is_existing = self.resume_flag_arm_is_existing(
+            execution,
             is_existing,
-            self.pi_session_id_pinnable(),
+            execution.map_or_else(
+                || self.pi_session_id_pinnable(),
+                |execution| execution.pi_pinnable,
+            ),
             session_id.as_deref(),
             explicitly_pinned,
         );
@@ -1317,7 +1520,10 @@ impl Instance {
         // `Sandbox` covers copilot's stale host id, which must not cross into
         // the sandbox namespace. It already excludes an explicit pin, which
         // stays authoritative against this instance's own store.
-        let static_unavailable = self.terminal_resume_static_unavailable();
+        let static_unavailable = execution
+            .is_none()
+            .then(|| self.terminal_resume_static_unavailable())
+            .flatten();
         if matches!(static_unavailable, Some(ResumeStaticUnavailable::Command)) {
             tracing::warn!(target: "session.store",
                 tool = %self.tool,
@@ -1337,7 +1543,7 @@ impl Instance {
         // empty one under the same uuid after a worktree move.
         // Never over an explicit pin: the user named a conversation, and a
         // stored path is AoE's own bookkeeping.
-        if is_existing && !explicitly_pinned && session_id.is_some() {
+        if execution.is_none() && is_existing && !explicitly_pinned && session_id.is_some() {
             if let Some(path) = self.pi_resumable_transcript() {
                 let flags = format!("--session {}", shell_escape(&path));
                 splice_subcommand_or_append(cmd, &flags, None);
@@ -1359,8 +1565,14 @@ impl Instance {
         if flag_arm_is_existing
             && !explicitly_pinned
             && session_id.is_some()
-            && self.resolved_capture_backend() == Some(crate::agents::SessionCaptureBackend::Pi)
-            && self.pi_recorded_transcript_missing()
+            && execution.map_or_else(
+                || {
+                    self.resolved_capture_backend()
+                        == Some(crate::agents::SessionCaptureBackend::Pi)
+                        && self.pi_recorded_transcript_missing()
+                },
+                |execution| execution.agent.name == "pi" && execution.pi_transcript_path.is_none(),
+            )
         {
             tracing::info!(
                 target: "session.store",
@@ -1372,9 +1584,7 @@ impl Instance {
             );
             session_id = None;
         }
-        let resume_tool = self
-            .resolved_agent()
-            .map_or(self.tool.as_str(), |agent| agent.name);
+        let resume_tool = agent.map_or(self.tool.as_str(), |agent| agent.name);
         let emitted = append_resume_flags(
             resume_tool,
             session_id.as_deref(),
@@ -1382,6 +1592,10 @@ impl Instance {
             cmd,
             parsed_command.executable_end,
             context,
+        );
+        anyhow::ensure!(
+            !matches!(self.resume_intent, ResumeIntent::Use(_)) || emitted,
+            "explicit resume did not produce a native resume selector"
         );
         Ok(is_existing && emitted)
     }
@@ -1424,11 +1638,10 @@ impl Instance {
         });
 
         match outcome {
-            Ok(write @ (SidWrite::Applied | SidWrite::Skipped)) => {
+            Ok(write @ (SidWrite::Applied | SidWrite::Skipped | SidWrite::PinnedForeign)) => {
                 if let Ok(insts) = storage.load() {
                     if let Some(disk) = insts.into_iter().find(|i| i.id == self.id) {
-                        self.agent_session_id = disk.agent_session_id;
-                        self.resume_intent = disk.resume_intent;
+                        self.adopt_conversation_state(disk.conversation_state());
                         self.resume_probe_failed_sid = disk.resume_probe_failed_sid;
                     }
                 }
@@ -1543,7 +1756,7 @@ mod tests {
         inst.tool = "opencode".to_string();
         inst.agent_session_id = Some("oc-session-42".to_string());
 
-        let (session_id, is_existing) = inst.acquire_session_id();
+        let (session_id, is_existing) = inst.acquire_session_id(None);
 
         assert_eq!(session_id, Some("oc-session-42".to_string()));
         assert!(is_existing);
@@ -1577,7 +1790,7 @@ mod tests {
         let json = serde_json::to_string(&inst).unwrap();
         let mut reloaded: Instance = serde_json::from_str(&json).unwrap();
 
-        let (session_id, is_existing) = reloaded.acquire_session_id();
+        let (session_id, is_existing) = reloaded.acquire_session_id(None);
         assert_eq!(session_id.as_deref(), Some(native_id));
         assert!(is_existing);
         assert_eq!(
@@ -1601,7 +1814,7 @@ mod tests {
         // transcript-dependent for Claude and is covered hermetically in
         // `verify_on_resume`; asserting it here would read the developer's real
         // `~/.claude`.
-        let (session_id, _is_existing) = inst.acquire_session_id();
+        let (session_id, _is_existing) = inst.acquire_session_id(None);
         assert_eq!(session_id, Some("session-42".to_string()));
     }
 
@@ -1613,7 +1826,7 @@ mod tests {
         inst.tool = "codex".to_string();
         inst.agent_session_id = Some("sess-99".to_string());
 
-        let (session_id, is_existing) = inst.acquire_session_id();
+        let (session_id, is_existing) = inst.acquire_session_id(None);
 
         assert_eq!(session_id, Some("sess-99".to_string()));
         assert!(is_existing);
@@ -1636,7 +1849,7 @@ mod tests {
         // The method returns the persisted id as the owned session. The
         // is_existing flag is transcript-dependent for Claude (see
         // `verify_on_resume`) and would read the real `~/.claude` here.
-        let (session_id, _is_existing) = inst.acquire_session_id();
+        let (session_id, _is_existing) = inst.acquire_session_id(None);
         assert_eq!(session_id, Some("invalid-session-id".to_string()));
     }
 
@@ -1664,7 +1877,9 @@ mod tests {
             from: "parent-1111-2222-3333-444444444444".to_string(),
         };
         let mut cmd = "claude".to_string();
-        let is_existing = inst.apply_session_flags(&mut cmd, "test").unwrap();
+        let is_existing = inst
+            .apply_session_flags(&mut cmd, "test", inst.resolved_agent(), None)
+            .unwrap();
         assert_eq!(
             cmd,
             "claude --resume parent-1111-2222-3333-444444444444 --fork-session --session-id child-5555-6666-7777-888888888888"
@@ -1702,7 +1917,8 @@ mod tests {
             });
             let mut cmd = tool.to_string();
             assert_eq!(
-                inst.apply_session_flags(&mut cmd, "test").unwrap(),
+                inst.apply_session_flags(&mut cmd, "test", inst.resolved_agent(), None)
+                    .unwrap(),
                 resumed,
                 "{tool}"
             );
@@ -1725,7 +1941,12 @@ mod tests {
         });
         let mut automatic_cmd = "copilot".to_string();
         assert!(!automatic_copilot
-            .apply_session_flags(&mut automatic_cmd, "test")
+            .apply_session_flags(
+                &mut automatic_cmd,
+                "test",
+                automatic_copilot.resolved_agent(),
+                None
+            )
             .unwrap());
         assert_eq!(automatic_cmd, "copilot");
 
@@ -1734,7 +1955,9 @@ mod tests {
         host_prime.agent_session_id = Some(sid.to_string());
         host_prime.resume_intent = ResumeIntent::Use(sid.to_string());
         let mut cmd = "prime-agent".to_string();
-        assert!(host_prime.apply_session_flags(&mut cmd, "test").unwrap());
+        assert!(host_prime
+            .apply_session_flags(&mut cmd, "test", host_prime.resolved_agent(), None)
+            .unwrap());
         assert_eq!(cmd, format!("prime-agent --resume {sid}"));
     }
     #[test]
@@ -1746,7 +1969,7 @@ mod tests {
             let mut inst = Instance::new(tool, "/tmp/test");
             inst.tool = tool.to_string();
             inst.detect_as = tool.to_string();
-            crate::hooks::write_session_id_via_guard(&inst.id, "stale-sid").unwrap();
+            crate::hooks::write_session_id_via_guard(&inst.id, "stale-sid", None).unwrap();
             assert!(crate::hooks::session_id_sidecar_exists(&inst.id));
 
             inst.clear_pane_identity_sidecar();
@@ -2004,6 +2227,193 @@ mod tests {
     }
     #[test]
     #[serial_test::serial]
+    fn prime_explicit_resume_separates_namespace_from_capture() {
+        if which::which("node").is_err() {
+            return;
+        }
+        let mut failures = Vec::new();
+        for (command, args, suffix, sandboxed) in [
+            ("prime-agent", "--cwd /workspace/project/sub", "sub", true),
+            ("my-prime", "", "", true),
+            ("my-prime", "--cwd sub", "sub", false),
+            ("prime-agent", "--cwd sub", "sub", false),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
+            let project = tmp.path().join("project");
+            std::fs::create_dir_all(project.join("sub")).unwrap();
+            let profile = "prime-wrapper-resume";
+            declare_execution_aliases(profile, &[("prime-agent", "prime-agent")], tmp.path());
+            let mut inst = Instance::new("prime-wrapper", project.to_str().unwrap());
+            inst.source_profile = profile.into();
+            inst.tool = "prime-agent".into();
+            inst.command = command.into();
+            inst.extra_args = args.into();
+            inst.sandbox_info = Some(SandboxInfo {
+                enabled: true,
+                container_id: None,
+                image: "test-image".into(),
+                container_name: "prime-wrapper".into(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                container_workdir: Some("/workspace/project".into()),
+            });
+            let _transport = install_container_transport(
+                tmp.path(),
+                "prime-wrapper",
+                &inst.build_container_config().unwrap().volumes,
+            );
+            std::fs::copy(
+                tmp.path().join("native-bin/prime-agent"),
+                tmp.path().join("native-bin/my-prime"),
+            )
+            .unwrap();
+            if !sandboxed {
+                inst.sandbox_info = None;
+                inst.pending_host_env = vec![
+                    ("HOME".into(), tmp.path().to_str().unwrap().into()),
+                    (
+                        "PATH".into(),
+                        format!(
+                            "{}:{}",
+                            tmp.path().join("native-bin").display(),
+                            std::env::var("PATH").unwrap()
+                        ),
+                    ),
+                ];
+            }
+            let sid = "018f47a6-7b80-7cc3-98a2-37b5f486b2a1";
+            let binding = match inst.asserted_resume_binding(sid, None) {
+                Ok(binding) => binding,
+                Err(error) => {
+                    failures.push(format!("{command} {args}: {error:#}"));
+                    continue;
+                }
+            };
+            assert_eq!(
+                binding.execution.as_ref().unwrap().cwd,
+                project.join(suffix).canonicalize().unwrap()
+            );
+            inst.resume_intent = ResumeIntent::Use(sid.into());
+            inst.resume_binding = Some(binding);
+            let prepared = inst
+                .prepare_launch_command(inst.conversation_state())
+                .unwrap();
+            if !sandboxed || command == "my-prime" {
+                assert!(
+                    prepared.execution.as_ref().unwrap().capture.is_none(),
+                    "explicit resume must not grant this invocation automatic capture"
+                );
+            }
+            let command = prepared.command.unwrap();
+            assert!(command.contains(&format!("--resume {sid}")), "{command}");
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn fresh_prime_launch_does_not_recapture_abandoned_root() {
+        use crate::session::instance::start::test_support::{FinalizeObserver, FinalizePhase};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut inst = Instance::new("prime-abandoned", project.to_str().unwrap());
+        inst.tool = "prime-agent".into();
+        inst.sandbox_info = Some(SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test-image".into(),
+            container_name: "prime-abandoned".into(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: Some("/workspace/project".into()),
+        });
+        let _transport = install_container_transport(
+            tmp.path(),
+            "prime-abandoned",
+            &inst.build_container_config().unwrap().volumes,
+        );
+        inst.build_launch_command(None).unwrap();
+        let plan = inst
+            .prime_agent_capture_plan(inst.prime_agent_capture_options().unwrap())
+            .unwrap();
+        let old = "018f47a6-7b80-7cc3-98a2-37b5f486b2a1";
+        let abandoned = "018f47a6-7b80-7cc3-98a2-37b5f486b2a2";
+        let sessions = plan.store.join(&plan.session_dir);
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("abandoned.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "type": "session", "id": abandoned, "cwd": plan.container_cwd, "rlmDepth": 0
+                })
+            ),
+        )
+        .unwrap();
+        let sidecars = plan.store.join("aoe-session").join(&inst.id);
+        std::fs::create_dir_all(&sidecars).unwrap();
+        std::fs::write(
+            sidecars.join("root_session"),
+            serde_json::to_vec(&serde_json::json!({
+                "id": abandoned,
+                "path": plan.container_session_dir.join("abandoned.jsonl"),
+                "cwd": plan.container_cwd, "rlmDepth": 0
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        inst.set_agent_conversation(Some(old.into()), None, None);
+        let prepared = inst
+            .prepare_launch_command(inst.conversation_state())
+            .unwrap();
+        assert!(!prepared.is_existing);
+        assert!(matches!(prepared.fresh_notice,
+            Some(crate::session::instance::FreshLaunchNotice::UnqualifiedStoredConversation { ref sid })
+                if sid == abandoned));
+        let name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(name);
+        let observed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let observed_in_callback = observed.clone();
+        let _observer = FinalizeObserver::install(inst.id.clone(), move |instance, phase| {
+            if let FinalizePhase::Before = phase {
+                observed_in_callback.set(true);
+                let poll = crate::session::capture::prime_agent_poll_fn_sandboxed(
+                    instance.prime_root_sidecar_poll_fn(plan.clone()),
+                    plan.clone(),
+                    instance.id.clone(),
+                    f64::MAX,
+                    instance.retroactive_capture_excludes.clone(),
+                    instance
+                        .active_execution
+                        .as_ref()
+                        .map(|active| active.binding.clone()),
+                );
+                assert_eq!(
+                    poll(),
+                    None,
+                    "fresh launch must not recapture the abandoned root before republication"
+                );
+            }
+        });
+        let outcome = inst
+            .spawn_prepared_launch(None, "default", prepared)
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            crate::session::LaunchSidOutcome::Fresh { .. }
+        ));
+        inst.stop_poller();
+        assert!(observed.get());
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn prime_unmaterialized_root_never_resumes_previous_history() {
         if which::which("node").is_err() {
             eprintln!("skipping: node not found on PATH");
@@ -2025,7 +2435,12 @@ mod tests {
             before_start_env: Vec::new(),
             container_workdir: Some("/workspace/project".to_string()),
         });
-        inst.build_launch_command().unwrap();
+        let _transport = install_container_transport(
+            tmp.path(),
+            "prime-empty",
+            &inst.build_container_config().unwrap().volumes,
+        );
+        inst.build_launch_command(None).unwrap();
         let plan = inst
             .prime_agent_capture_plan(inst.prime_agent_capture_options().unwrap())
             .unwrap();
@@ -2042,8 +2457,20 @@ mod tests {
             )
         };
         std::fs::write(sessions.join("old.jsonl"), header(old)).unwrap();
-        inst.agent_session_id = Some(old.to_string());
-        let prepared = inst.prepare_launch_command().unwrap();
+        let execution = inst
+            .resolve_native_execution(inst.conversation_target())
+            .unwrap();
+        inst.active_execution = Some(ActiveExecution {
+            launch_id: execution.inputs.launch_id,
+            binding: execution.binding,
+            capture: execution.capture,
+            container: execution.inputs.container,
+        });
+        let binding = inst.asserted_resume_binding(old, None).unwrap();
+        inst.set_agent_conversation(Some(old.to_string()), Some(binding), None);
+        let prepared = inst
+            .prepare_launch_command(inst.conversation_state())
+            .unwrap();
         let persisted = serde_json::to_string(&inst).unwrap();
         let sidecar = plan
             .store
@@ -2077,12 +2504,13 @@ await publish({}, { sessionManager: {
         );
         let poll = crate::session::capture::prime_agent_poll_fn_sandboxed(
             inst.prime_root_sidecar_poll_fn(plan.clone()),
-            plan.store.clone(),
-            plan.session_dir.clone(),
-            plan.container_cwd.clone(),
+            plan.clone(),
             inst.id.clone(),
             0.0,
             HashSet::new(),
+            inst.active_execution
+                .as_ref()
+                .map(|active| active.binding.clone()),
         );
         assert_eq!(
             poll(),
@@ -2104,7 +2532,7 @@ await publish({}, { sessionManager: {
         ] {
             let mut explicit = inst.clone();
             explicit.resume_intent = intent;
-            assert_eq!(explicit.acquire_session_id_with(&|_| None), expected);
+            assert_eq!(explicit.acquire_session_id_with(None, &|_| None), expected);
         }
         let refreshed = inst
             .refresh_prepared_prime_launch_after_pane_stop(prepared)
@@ -2114,7 +2542,9 @@ await publish({}, { sessionManager: {
             inst.clear_pane_identity_sidecar();
             let mut restarted: Instance = serde_json::from_str(&persisted).unwrap();
             let mut command = "prime-agent".to_string();
-            assert!(!restarted.apply_session_flags(&mut command, "test").unwrap());
+            assert!(!restarted
+                .apply_session_flags(&mut command, "test", restarted.resolved_agent(), None)
+                .unwrap());
             assert_eq!(command, "prime-agent");
             assert_eq!(restarted.agent_session_id, None);
         }
@@ -2126,7 +2556,7 @@ await publish({}, { sessionManager: {
         );
         let mut uncertain: Instance = serde_json::from_str(&persisted).unwrap();
         assert_eq!(
-            uncertain.acquire_session_id_with(&|_| None),
+            uncertain.acquire_session_id_with(None, &|_| None),
             (Some(old.to_string()), true)
         );
         std::fs::remove_dir(sessions.join("new.jsonl")).unwrap();
@@ -2134,7 +2564,7 @@ await publish({}, { sessionManager: {
         std::fs::rename(&sessions, &unavailable).unwrap();
         let mut uncertain: Instance = serde_json::from_str(&persisted).unwrap();
         assert_eq!(
-            uncertain.acquire_session_id_with(&|_| None),
+            uncertain.acquire_session_id_with(None, &|_| None),
             (Some(old.to_string()), true)
         );
         std::fs::rename(&unavailable, &sessions).unwrap();
@@ -2142,7 +2572,9 @@ await publish({}, { sessionManager: {
         assert_eq!(poll().as_deref(), Some(new));
         let mut restarted: Instance = serde_json::from_str(&persisted).unwrap();
         let mut command = "prime-agent".to_string();
-        assert!(restarted.apply_session_flags(&mut command, "test").unwrap());
+        assert!(restarted
+            .apply_session_flags(&mut command, "test", restarted.resolved_agent(), None)
+            .unwrap());
         assert_eq!(command, format!("prime-agent --resume {new}"));
     }
 
@@ -2171,7 +2603,21 @@ await publish({}, { sessionManager: {
             container_workdir: Some("/workspace/project".to_string()),
         });
 
-        inst.build_launch_command().unwrap();
+        let _transport = install_container_transport(
+            tmp.path(),
+            "prime-root-only",
+            &inst.build_container_config().unwrap().volumes,
+        );
+        inst.build_launch_command(None).unwrap();
+        let execution = inst
+            .resolve_native_execution(inst.conversation_target())
+            .unwrap();
+        inst.active_execution = Some(ActiveExecution {
+            launch_id: execution.inputs.launch_id,
+            binding: execution.binding,
+            capture: execution.capture,
+            container: execution.inputs.container,
+        });
         let store = inst.sandbox_capture_store_dir().unwrap();
         let sessions = store.join("custom-sessions");
         std::fs::create_dir_all(sessions.join("children")).unwrap();
@@ -2313,7 +2759,9 @@ process.stdout.write(JSON.stringify({ rootOnly, defaultMode }));
         let mut restarted: Instance =
             serde_json::from_str(&serde_json::to_string(&inst).unwrap()).unwrap();
         let mut command = "prime-agent".to_string();
-        assert!(restarted.apply_session_flags(&mut command, "test").unwrap());
+        assert!(restarted
+            .apply_session_flags(&mut command, "test", restarted.resolved_agent(), None)
+            .unwrap());
         assert_eq!(command, format!("prime-agent --resume {parent_id}"));
 
         let profile = restarted.effective_profile();
@@ -2324,9 +2772,13 @@ process.stdout.write(JSON.stringify({ rootOnly, defaultMode }));
                 Ok(())
             })
             .unwrap();
-        let prepared = restarted.prepare_launch_command().unwrap();
+        let prepared = restarted
+            .prepare_launch_command(restarted.conversation_state())
+            .unwrap();
         assert!(prepared.command.as_deref().unwrap().contains(parent_id));
-        let excluded_prepared = restarted.prepare_launch_command().unwrap();
+        let excluded_prepared = restarted
+            .prepare_launch_command(restarted.conversation_state())
+            .unwrap();
         let newer_id = "018f47a6-7b80-7cc3-98a2-37b5f486b2a3";
         std::fs::write(
             sessions.join("newer.jsonl"),
@@ -2349,16 +2801,18 @@ process.stdout.write(JSON.stringify({ rootOnly, defaultMode }));
             excluded.agent_session_id = stored.clone();
             excluded
                 .retroactive_capture_excludes
-                .insert(newer_id.to_string());
+                .insert(ConversationBinding::unknown(newer_id.to_string()));
             let mut command = "prime-agent".to_string();
-            excluded.apply_session_flags(&mut command, "test").unwrap();
+            excluded
+                .apply_session_flags(&mut command, "test", excluded.resolved_agent(), None)
+                .unwrap();
             assert_eq!(excluded.agent_session_id, stored);
             assert!(!command.contains(newer_id), "{command}");
         }
         let mut excluded = restarted.clone();
         excluded
             .retroactive_capture_excludes
-            .insert(newer_id.to_string());
+            .insert(ConversationBinding::unknown(newer_id.to_string()));
         let excluded_launch = excluded
             .refresh_prepared_prime_launch_after_pane_stop(excluded_prepared)
             .unwrap();
@@ -2379,11 +2833,7 @@ process.stdout.write(JSON.stringify({ rootOnly, defaultMode }));
             .unwrap();
         assert_eq!(restarted.agent_session_id.as_deref(), Some(newer_id));
         assert!(prepared.command.as_deref().unwrap().contains(newer_id));
-        let _ = restarted.persist_session_id(
-            &profile,
-            prepared.expected_prior_sid.as_deref(),
-            prepared.expected_prior_intent.clone(),
-        );
+        let _ = restarted.persist_session_id(&profile, &prepared.expected_conversation);
         assert_eq!(
             storage.load().unwrap()[0].agent_session_id.as_deref(),
             Some(newer_id)
@@ -2391,20 +2841,20 @@ process.stdout.write(JSON.stringify({ rootOnly, defaultMode }));
         assert_eq!(restarted.agent_session_id.as_deref(), Some(newer_id));
         storage
             .update(|instances, _| {
-                instances[0].agent_session_id = Some(child_id.to_string());
+                instances[0].set_agent_conversation(Some(child_id.to_string()), None, None);
                 Ok(())
             })
             .unwrap();
-        let _ = restarted.persist_session_id(
-            &profile,
-            prepared.expected_prior_sid.as_deref(),
-            prepared.expected_prior_intent,
-        );
+        let _ = restarted.persist_session_id(&profile, &prepared.expected_conversation);
         assert_eq!(
             storage.load().unwrap()[0].agent_session_id.as_deref(),
             Some(child_id)
         );
         assert_eq!(restarted.agent_session_id.as_deref(), Some(child_id));
+        assert_eq!(
+            restarted.conversation_state(),
+            storage.load().unwrap()[0].conversation_state()
+        );
     }
     #[test]
     fn clearing_the_conversation_drops_its_transcript_path() {
@@ -2417,7 +2867,7 @@ process.stdout.write(JSON.stringify({ rootOnly, defaultMode }));
         );
         inst.resume_intent = ResumeIntent::Cleared;
 
-        let (sid, is_existing) = inst.acquire_session_id_with(&|_| None);
+        let (sid, is_existing) = inst.acquire_session_id_with(None, &|_| None);
 
         assert_eq!(sid, None, "no pin without a mint seam");
         assert!(!is_existing);
@@ -2468,15 +2918,14 @@ process.stdout.write(JSON.stringify({ rootOnly, defaultMode }));
             !inst.supports_session_poller(),
             "and must not poll, which would read the host sidecar"
         );
-        assert_eq!(inst.pi_published_session_id(true), None);
-        assert_eq!(inst.pi_published_session_path(), None);
+        assert!(inst.pi_published_conversation(true).is_none());
 
         // The host pane it must not be confused with does have a source.
         let mut host = Instance::new("pi-host-src", "/tmp/pi-unresolvable");
         host.tool = "pi".to_string();
         assert_eq!(
             host.pi_sidecar_source(),
-            Some(SessionSidecarSource::HostHooks)
+            Some(SessionSidecarSource::host_hooks(&host.id))
         );
     }
 
@@ -2521,7 +2970,25 @@ process.stdout.write(JSON.stringify({ rootOnly, defaultMode }));
             "01a053b6-c470-78de-9d8f-bc00ef05332a\n",
         )
         .unwrap();
-
+        let sid = "01a053b6-c470-78de-9d8f-bc00ef05332a";
+        let transcript = dir
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("agent/sessions")
+            .join(format!("time_{sid}.jsonl"));
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(
+            &transcript,
+            format!("{{\"type\":\"session\",\"id\":\"{sid}\"}}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("session_path"),
+            format!("/root/.pi/agent/sessions/time_{sid}.jsonl"),
+        )
+        .unwrap();
         assert!(
             reloaded.uses_pi_session_sidecar(),
             "the published file is what a reloaded session has to go on"
@@ -2531,7 +2998,10 @@ process.stdout.write(JSON.stringify({ rootOnly, defaultMode }));
             "poller repair must stay available after a reload"
         );
         assert_eq!(
-            reloaded.pi_published_session_id(true).as_deref(),
+            reloaded
+                .pi_published_conversation(true)
+                .map(|observation| observation.sid)
+                .as_deref(),
             Some("01a053b6-c470-78de-9d8f-bc00ef05332a"),
             "and the final flush must read it"
         );
@@ -2564,14 +3034,15 @@ process.stdout.write(JSON.stringify({ rootOnly, defaultMode }));
         std::fs::create_dir_all(&dir).unwrap();
         let sidecar = dir.join("session_id");
         std::fs::write(&sidecar, vec![b'x'; SESSION_SIDECAR_MAX_BYTES + 1]).unwrap();
-        assert_eq!(inst.pi_published_session_id(true), None);
+        assert!(inst.pi_published_conversation(true).is_none());
 
         std::fs::remove_file(&sidecar).unwrap();
         mkfifo(&sidecar, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
-        assert_eq!(inst.pi_published_session_id(true), None);
+        assert!(inst.pi_published_conversation(true).is_none());
         let poll = crate::session::capture::pi_sidecar_poll_fn(
             inst.id.clone(),
             SessionSidecarSource::SandboxDir(dir.clone()),
+            None,
         );
         assert!(poll().is_none());
 
@@ -2649,10 +3120,12 @@ pi = "~/.pi-personal"
         declared.mark_pi_extension_launched_for_test();
         assert!(declared.pi_sidecar_source().is_some());
         assert!(declared.uses_pi_session_sidecar());
-        assert_eq!(declared.pi_published_session_id(true), None);
+        assert!(declared.pi_published_conversation(true).is_none());
 
         let mut cmd = String::from("pi");
-        declared.apply_session_flags(&mut cmd, "test").unwrap();
+        declared
+            .apply_session_flags(&mut cmd, "test", declared.resolved_agent(), None)
+            .unwrap();
         assert!(
             !cmd.contains(STALE_ID) && !cmd.contains("--session"),
             "a sidecar from the unmounted default store must not reach the launch line: {cmd:?}"
@@ -2845,7 +3318,9 @@ pi = "~/.pi-personal"
         inst.pi_session_path = Some(transcript.to_string_lossy().into_owned());
 
         let mut cmd = "pi".to_string();
-        let resumed = inst.apply_session_flags(&mut cmd, "test").unwrap();
+        let resumed = inst
+            .apply_session_flags(&mut cmd, "test", inst.resolved_agent(), None)
+            .unwrap();
         assert_eq!(cmd, "pi", "no selector may be handed to a doomed resume");
         assert!(!resumed, "nothing was resumed");
         assert_eq!(
@@ -2857,7 +3332,9 @@ pi = "~/.pi-personal"
         // The same row resumes by path once the transcript is there.
         std::fs::write(&transcript, "{}\n").unwrap();
         let mut cmd = "pi".to_string();
-        assert!(inst.apply_session_flags(&mut cmd, "test").unwrap());
+        assert!(inst
+            .apply_session_flags(&mut cmd, "test", inst.resolved_agent(), None)
+            .unwrap());
         assert_eq!(cmd, format!("pi --session '{}'", transcript.display()));
     }
 
@@ -2940,7 +3417,7 @@ pi = "~/.pi-personal"
             ("no id", false, None, false, false),
         ] {
             assert_eq!(
-                inst.resume_flag_arm_is_existing(sid.is_some(), pinnable, sid, explicit),
+                inst.resume_flag_arm_is_existing(None, sid.is_some(), pinnable, sid, explicit),
                 expected,
                 "{label}"
             );
@@ -2951,7 +3428,7 @@ pi = "~/.pi-personal"
         // the tool so no other launch spawns `pi --help`.
         let mut claude = Instance::new("claude-pinned", "/tmp/pi-pinned");
         claude.tool = "claude".to_string();
-        assert!(claude.resume_flag_arm_is_existing(true, true, minted, false));
+        assert!(claude.resume_flag_arm_is_existing(None, true, true, minted, false));
         assert!(!claude.pi_session_id_pinnable());
     }
 
@@ -2960,8 +3437,8 @@ pi = "~/.pi-personal"
         let mut inst = Instance::new("Test", "/tmp/test");
         inst.tool = "claude".to_string();
 
-        let (first, first_existing) = inst.acquire_session_id();
-        let (second, second_existing) = inst.acquire_session_id();
+        let (first, first_existing) = inst.acquire_session_id(None);
+        let (second, second_existing) = inst.acquire_session_id(None);
 
         // Repeated acquire yields a STABLE id. The first mint reports fresh; a
         // second acquire with no transcript on disk stays fresh-pinned (an empty
@@ -2980,7 +3457,7 @@ pi = "~/.pi-personal"
         let mut inst = Instance::new("Test", "/tmp/test");
         inst.tool = "opencode".to_string();
         let (sid, is_existing) =
-            inst.acquire_session_id_with(&|_| Some("ses_preassigned".to_string()));
+            inst.acquire_session_id_with(None, &|_| Some("ses_preassigned".to_string()));
         assert_eq!(sid, Some("ses_preassigned".to_string()));
         assert!(!is_existing);
         assert_eq!(inst.agent_session_id, Some("ses_preassigned".to_string()));
@@ -2992,7 +3469,7 @@ pi = "~/.pi-personal"
         // the shared SQLite store.
         let mut inst = Instance::new("Test", "/tmp/test");
         inst.tool = "opencode".to_string();
-        let (sid, is_existing) = inst.acquire_session_id_with(&|_| None);
+        let (sid, is_existing) = inst.acquire_session_id_with(None, &|_| None);
         assert_eq!(sid, None);
         assert!(!is_existing);
         assert_eq!(inst.agent_session_id, None);
@@ -3005,13 +3482,13 @@ pi = "~/.pi-personal"
         let mut claude = Instance::new("Test", "/tmp/test");
         claude.tool = "claude".to_string();
         let (claude_sid, _) =
-            claude.acquire_session_id_with(&|_| panic!("preassign seam ran for claude"));
+            claude.acquire_session_id_with(None, &|_| panic!("preassign seam ran for claude"));
         assert!(claude_sid.is_some());
 
         let mut codex = Instance::new("Test", "/tmp/test");
         codex.tool = "codex".to_string();
         let (codex_sid, _) =
-            codex.acquire_session_id_with(&|_| panic!("preassign seam ran for codex"));
+            codex.acquire_session_id_with(None, &|_| panic!("preassign seam ran for codex"));
         assert_eq!(codex_sid, None);
     }
 
@@ -3022,7 +3499,8 @@ pi = "~/.pi-personal"
         let mut inst = Instance::new("Test", "/tmp/test");
         inst.tool = "opencode".to_string();
         inst.resume_intent = ResumeIntent::Cleared;
-        let (sid, is_existing) = inst.acquire_session_id_with(&|_| Some("ses_cleared".to_string()));
+        let (sid, is_existing) =
+            inst.acquire_session_id_with(None, &|_| Some("ses_cleared".to_string()));
         assert_eq!(sid, Some("ses_cleared".to_string()));
         assert!(!is_existing);
         assert_eq!(inst.agent_session_id, Some("ses_cleared".to_string()));
@@ -3068,14 +3546,18 @@ pi = "~/.pi-personal"
         }
     }
 
-    /// A resume subcommand must land right after the program the pane runs,
-    /// and the splice finds that spot by taking the first word. A multi-word
-    /// launcher puts something else there, so the flags are dropped rather
-    /// than spliced onto the wrong program (#3638).
     #[test]
+    #[serial_test::serial]
     fn codex_wrapper_command_never_takes_a_spliced_subcommand() {
+        let home = tempfile::tempdir().unwrap();
+        let _isolation = crate::session::test_support::isolate_app_dir_at(home.path());
         const PROFILE: &str = "codex-wrapper-splice-test";
         let _registry = install_aliases(PROFILE, &[("codex-remote", "codex")]);
+        crate::session::instance::test_helpers::declare_execution_aliases(
+            PROFILE,
+            &[("codex-remote", "codex")],
+            home.path(),
+        );
         let sid = "11111111-2222-3333-4444-555555555555";
 
         // The documented custom-agent shape: a multi-token launcher.
@@ -3090,7 +3572,9 @@ pi = "~/.pi-personal"
             TerminalContextResume::CommandUnsupported
         );
         let mut cmd = wrapped.command.clone();
-        assert!(!wrapped.apply_session_flags(&mut cmd, "test").unwrap());
+        assert!(wrapped
+            .apply_session_flags(&mut cmd, "test", wrapped.resolved_agent(), None)
+            .is_err());
         assert_eq!(
             cmd, "ssh -t lenovo codex",
             "the resume token must not be spliced onto the launcher"
@@ -3108,32 +3592,27 @@ pi = "~/.pi-personal"
             TerminalContextResume::Available
         );
         let mut direct_cmd = direct.command.clone();
-        assert!(direct.apply_session_flags(&mut direct_cmd, "test").unwrap());
+        assert!(direct
+            .apply_session_flags(&mut direct_cmd, "test", direct.resolved_agent(), None)
+            .unwrap());
         assert_eq!(direct_cmd, format!("codex resume {sid} --model o3"));
 
-        // A path-qualified script escapes the launch shell's `PATH`, which is
-        // the only thing tying a bare token to the agent AoE resolved.
         let mut qualified = Instance::new("qualified", "/tmp/codex-splice");
-        qualified.source_profile = PROFILE.to_string();
+        qualified.source_profile = "codex-wrapper-unproven".into();
         qualified.tool = "codex-remote".to_string();
         qualified.command = "/opt/bin/mycodex".to_string();
         qualified.agent_session_id = Some(sid.to_string());
         qualified.resume_intent = ResumeIntent::Use(sid.to_string());
         assert_eq!(
             qualified.terminal_context_resume_cached(),
-            TerminalContextResume::CommandUnsupported
+            TerminalContextResume::AgentUnsupported
         );
         let mut qualified_cmd = qualified.command.clone();
-        assert!(!qualified
-            .apply_session_flags(&mut qualified_cmd, "test")
-            .unwrap());
+        assert!(qualified
+            .apply_session_flags(&mut qualified_cmd, "test", qualified.resolved_agent(), None)
+            .is_err());
         assert_eq!(qualified_cmd, "/opt/bin/mycodex");
 
-        // A bare wrapper binary is the program itself, so the splice reaches
-        // the agent it execs. This is what `agent_command_override` documents
-        // and what a `custom_agents` script is, and dropping it would take
-        // resume away from a plain `codex` session that only renamed its
-        // binary.
         for command in ["mycodex", "codex-personal"] {
             let mut bare = Instance::new("bare", "/tmp/codex-splice");
             bare.source_profile = PROFILE.to_string();
@@ -3148,19 +3627,19 @@ pi = "~/.pi-personal"
             );
             let mut bare_cmd = bare.command.clone();
             assert!(
-                bare.apply_session_flags(&mut bare_cmd, "test").unwrap(),
+                bare.apply_session_flags(&mut bare_cmd, "test", bare.resolved_agent(), None)
+                    .unwrap(),
                 "{command}"
             );
             assert_eq!(bare_cmd, format!("{command} resume {sid}"));
         }
     }
 
-    /// A custom agent that wraps a supported one has no `AgentDef` of its
-    /// own, so every capture and resume path used to miss on `tool` raw: no
-    /// id was pinned at launch and no resume flag was emitted, and each
-    /// restart silently started a fresh conversation (#3638).
     #[test]
-    fn custom_agent_pins_and_resumes_through_its_detect_as_base() {
+    #[serial_test::serial]
+    fn declared_agent_pins_and_resumes_through_its_native_contract() {
+        let home = tempfile::tempdir().unwrap();
+        let _isolation = crate::session::test_support::isolate_app_dir_at(home.path());
         const PROFILE: &str = "custom-agent-resume-test";
         let _registry = install_aliases(
             PROFILE,
@@ -3170,14 +3649,24 @@ pi = "~/.pi-personal"
                 ("droid-personal", "droid"),
             ],
         );
-
+        crate::session::instance::test_helpers::declare_execution_aliases(
+            PROFILE,
+            &[
+                ("claude-personal", "claude"),
+                ("copilot-personal", "copilot"),
+                ("droid-personal", "droid"),
+            ],
+            home.path(),
+        );
         let mut inst = Instance::new("wrapper", "/tmp/custom-agent-resume");
         inst.source_profile = PROFILE.to_string();
         inst.tool = "claude-personal".to_string();
         inst.command = "claude-personal".to_string();
 
         let mut fresh = "claude-personal".to_string();
-        assert!(!inst.apply_session_flags(&mut fresh, "test").unwrap());
+        assert!(!inst
+            .apply_session_flags(&mut fresh, "test", inst.resolved_agent(), None)
+            .unwrap());
         let sid = inst
             .agent_session_id
             .clone()
@@ -3190,12 +3679,12 @@ pi = "~/.pi-personal"
             TerminalContextResume::Available
         );
         let mut restart = "claude-personal".to_string();
-        assert!(inst.apply_session_flags(&mut restart, "test").unwrap());
+        assert!(inst
+            .apply_session_flags(&mut restart, "test", inst.resolved_agent(), None)
+            .unwrap());
         assert_eq!(restart, format!("claude-personal --resume {sid}"));
         assert_eq!(inst.agent_session_id.as_deref(), Some(sid.as_str()));
 
-        // A wrapper whose base has no verified native resume contract stays
-        // silent, pinned id and all.
         let mut unsupported = Instance::new("wrapper", "/tmp/custom-agent-resume");
         unsupported.source_profile = PROFILE.to_string();
         unsupported.tool = "droid-personal".to_string();
@@ -3206,7 +3695,9 @@ pi = "~/.pi-personal"
             TerminalContextResume::AgentUnsupported
         );
         let mut droid = "droid-personal".to_string();
-        assert!(!unsupported.apply_session_flags(&mut droid, "test").unwrap());
+        assert!(unsupported
+            .apply_session_flags(&mut droid, "test", unsupported.resolved_agent(), None)
+            .is_err());
         assert_eq!(droid, "droid-personal");
 
         // Sandboxing applies the resolved base agent's session-store rule.
@@ -3231,7 +3722,9 @@ pi = "~/.pi-personal"
             TerminalContextResume::SandboxUnsupported
         );
         let mut copilot = "copilot-personal".to_string();
-        assert!(!sandboxed.apply_session_flags(&mut copilot, "test").unwrap());
+        assert!(!sandboxed
+            .apply_session_flags(&mut copilot, "test", sandboxed.resolved_agent(), None)
+            .unwrap());
         assert_eq!(copilot, "copilot-personal");
     }
     #[test]
@@ -3241,23 +3734,29 @@ pi = "~/.pi-personal"
         // Fresh mint (no prior transcript): acquire reports a new session
         // (`--session-id`), so apply_session_flags returns false.
         let mut cmd = String::from("claude");
-        assert!(!inst.apply_session_flags(&mut cmd, "test").unwrap());
+        assert!(!inst
+            .apply_session_flags(&mut cmd, "test", inst.resolved_agent(), None)
+            .unwrap());
         // A user-pinned resume intent reports an existing session
         // unconditionally, so apply_session_flags returns true.
         inst.resume_intent = ResumeIntent::Use("019342ab-1234-7def-8901-abcdef012345".to_string());
         let mut cmd2 = String::from("claude");
-        assert!(inst.apply_session_flags(&mut cmd2, "test").unwrap());
+        assert!(inst
+            .apply_session_flags(&mut cmd2, "test", inst.resolved_agent(), None)
+            .unwrap());
     }
     #[test]
     fn unsupported_context_without_identity_neither_resumes_nor_polls() {
         let mut inst = Instance::new("unsupported", "/tmp/test");
         inst.tool = "codex".to_string();
 
-        assert_eq!(inst.acquire_session_id_with(&|_| None), (None, false));
+        assert_eq!(inst.acquire_session_id_with(None, &|_| None), (None, false));
         assert_eq!(inst.agent_session_id, None);
 
         let mut cmd = String::from("codex");
-        assert!(!inst.apply_session_flags(&mut cmd, "test").unwrap());
+        assert!(!inst
+            .apply_session_flags(&mut cmd, "test", inst.resolved_agent(), None)
+            .unwrap());
         assert_eq!(cmd, "codex");
 
         inst.capture_started_at = Some(std::time::SystemTime::now());
@@ -3273,7 +3772,7 @@ pi = "~/.pi-personal"
         inst.agent_session_id = None;
         inst.resume_intent = ResumeIntent::Use("user-pinned".to_string());
 
-        let (sid, is_existing) = inst.acquire_session_id();
+        let (sid, is_existing) = inst.acquire_session_id(None);
         assert_eq!(sid.as_deref(), Some("user-pinned"));
         assert!(is_existing);
         assert_eq!(inst.agent_session_id.as_deref(), Some("user-pinned"));
@@ -3287,7 +3786,7 @@ pi = "~/.pi-personal"
         inst.agent_session_id = Some("observed".to_string());
         inst.resume_intent = ResumeIntent::Use("user-pinned".to_string());
 
-        let (sid, is_existing) = inst.acquire_session_id();
+        let (sid, is_existing) = inst.acquire_session_id(None);
         assert_eq!(sid.as_deref(), Some("user-pinned"));
         assert!(is_existing);
     }
@@ -3300,7 +3799,7 @@ pi = "~/.pi-personal"
         inst.agent_session_id = Some("observed".to_string());
         inst.resume_intent = ResumeIntent::Cleared;
 
-        let (sid, is_existing) = inst.acquire_session_id();
+        let (sid, is_existing) = inst.acquire_session_id(None);
         assert!(
             sid.is_some(),
             "Claude must always have a session id at launch"
@@ -3318,7 +3817,7 @@ pi = "~/.pi-personal"
         inst.agent_session_id = Some("observed".to_string());
         inst.resume_intent = ResumeIntent::Cleared;
 
-        let (sid, is_existing) = inst.acquire_session_id();
+        let (sid, is_existing) = inst.acquire_session_id(None);
         assert_eq!(sid, None);
         assert!(!is_existing);
         assert_eq!(inst.agent_session_id, None);
@@ -3351,7 +3850,7 @@ pi = "~/.pi-personal"
         // the isolated home holding no transcript for it, the empty thread
         // launches fresh-pinned (`is_existing = false`, `--session-id`)
         // rather than a certain-to-fail `--resume`.
-        let (sid, is_existing) = inst.acquire_session_id();
+        let (sid, is_existing) = inst.acquire_session_id(None);
         assert_eq!(sid.as_deref(), Some("observed"));
         assert!(!is_existing);
     }
@@ -3363,7 +3862,7 @@ pi = "~/.pi-personal"
         inst.agent_session_id = None;
         inst.resume_intent = ResumeIntent::Default;
 
-        let (sid, is_existing) = inst.acquire_session_id();
+        let (sid, is_existing) = inst.acquire_session_id(None);
         assert!(sid.is_some());
         assert!(!is_existing);
         assert_eq!(inst.agent_session_id, sid);
@@ -3419,9 +3918,9 @@ pi = "~/.pi-personal"
             inst.tool = "claude".to_string();
             inst.agent_session_id = Some(stale.to_string());
             inst.resume_intent = ResumeIntent::Default;
-            crate::hooks::write_session_id_via_guard(&inst.id, fresh).unwrap();
+            crate::hooks::write_session_id_via_guard(&inst.id, fresh, None).unwrap();
 
-            let (sid, is_existing) = inst.acquire_session_id();
+            let (sid, is_existing) = inst.acquire_session_id(None);
             assert_eq!(sid.as_deref(), Some(fresh));
             assert!(is_existing);
             assert_eq!(inst.agent_session_id.as_deref(), Some(fresh));
@@ -3455,7 +3954,7 @@ pi = "~/.pi-personal"
             inst.resume_intent = ResumeIntent::Default;
 
             let dir = super::write_sidecar(&inst.id, empty_thread);
-            let (sid, is_existing) = inst.acquire_session_id();
+            let (sid, is_existing) = inst.acquire_session_id(None);
             std::fs::remove_dir_all(&dir).ok();
 
             assert_eq!(sid.as_deref(), Some(empty_thread));
@@ -3486,7 +3985,7 @@ pi = "~/.pi-personal"
             inst.agent_session_id = Some(stored.to_string());
             inst.resume_intent = ResumeIntent::Default;
 
-            let (sid, is_existing) = inst.acquire_session_id();
+            let (sid, is_existing) = inst.acquire_session_id(None);
             assert_eq!(sid.as_deref(), Some(stored));
             assert!(
                 !is_existing,
@@ -3522,7 +4021,7 @@ pi = "~/.pi-personal"
             inst.agent_session_id = Some(stored.to_string());
             inst.resume_intent = ResumeIntent::Default;
 
-            let (sid, is_existing) = inst.acquire_session_id();
+            let (sid, is_existing) = inst.acquire_session_id(None);
             assert_eq!(sid.as_deref(), Some(stored));
             assert!(
                 is_existing,
@@ -3581,7 +4080,7 @@ pi = "~/.pi-personal"
                 inst.agent_session_id = Some(sid.to_string());
                 inst.resume_intent = ResumeIntent::Default;
 
-                let (acquired, is_existing) = inst.acquire_session_id();
+                let (acquired, is_existing) = inst.acquire_session_id(None);
                 assert_eq!(acquired.as_deref(), Some(sid));
                 assert!(
                     is_existing,
@@ -3609,7 +4108,7 @@ pi = "~/.pi-personal"
                     .into_owned(),
             )];
 
-            let (acquired, is_existing) = inst.acquire_session_id();
+            let (acquired, is_existing) = inst.acquire_session_id(None);
             assert_eq!(acquired.as_deref(), Some(other_sid));
             assert!(
                 is_existing,
@@ -3629,7 +4128,7 @@ pi = "~/.pi-personal"
             inst.agent_session_id = Some("stored-cursor-sid".to_string());
             inst.resume_intent = ResumeIntent::Default;
 
-            let (sid, is_existing) = inst.acquire_session_id();
+            let (sid, is_existing) = inst.acquire_session_id(None);
             assert_eq!(sid.as_deref(), Some("stored-cursor-sid"));
             assert!(is_existing);
             assert_eq!(inst.agent_session_id.as_deref(), Some("stored-cursor-sid"));
@@ -3677,7 +4176,7 @@ pi = "~/.pi-personal"
             inst.resume_intent = ResumeIntent::Default;
 
             let dir = super::write_sidecar(&inst.id, mine);
-            let (sid, is_existing) = inst.acquire_session_id();
+            let (sid, is_existing) = inst.acquire_session_id(None);
             std::fs::remove_dir_all(&dir).ok();
 
             // The authoritative sidecar overrides the stale stored sid;
@@ -3707,7 +4206,9 @@ pi = "~/.pi-personal"
                 .unwrap();
 
             assert_eq!(
-                inst.capture_freshest_session_id().as_deref(),
+                inst.capture_freshest_conversation()
+                    .map(|observation| observation.sid)
+                    .as_deref(),
                 Some("published-new")
             );
             std::fs::remove_dir_all(dir).ok();
@@ -3762,7 +4263,7 @@ pi = "~/.pi-personal"
             assert!(inst.is_sandboxed());
 
             let dir = super::write_sidecar(&inst.id, mine);
-            let (sid, is_existing) = inst.acquire_session_id();
+            let (sid, is_existing) = inst.acquire_session_id(None);
             std::fs::remove_dir_all(&dir).ok();
 
             // The host-readable sidecar names this sandbox pane's conversation;
@@ -3779,7 +4280,8 @@ pi = "~/.pi-personal"
 
             let mut inst = Instance::new("pi-fresh", "/tmp/pi-fresh");
             inst.tool = "pi".to_string();
-            let (sid, is_existing) = inst.acquire_session_id_with(&|_| Some(pinned.to_string()));
+            let (sid, is_existing) =
+                inst.acquire_session_id_with(None, &|_| Some(pinned.to_string()));
             assert_eq!(sid.as_deref(), Some(pinned));
             assert!(
                 !is_existing,
@@ -3797,7 +4299,10 @@ pi = "~/.pi-personal"
 
             let mut unpinnable = Instance::new("pi-unpinnable", "/tmp/pi-fresh");
             unpinnable.tool = "pi".to_string();
-            assert_eq!(unpinnable.acquire_session_id_with(&|_| None), (None, false));
+            assert_eq!(
+                unpinnable.acquire_session_id_with(None, &|_| None),
+                (None, false)
+            );
             assert_eq!(unpinnable.agent_session_id, None);
         }
     }
@@ -3819,7 +4324,9 @@ pi = "~/.pi-personal"
             let mut inst = Instance::new("claude", "/tmp/x");
             inst.tool = "claude".to_string();
             let mut actual = command.to_string();
-            assert!(!inst.apply_session_flags(&mut actual, "test").unwrap());
+            assert!(!inst
+                .apply_session_flags(&mut actual, "test", inst.resolved_agent(), None)
+                .unwrap());
             assert_eq!(actual, command);
             assert!(inst.agent_session_id.is_none());
         }
@@ -3843,7 +4350,12 @@ pi = "~/.pi-personal"
             inst.agent_session_id = stored;
             inst.resume_intent = intent;
             let error = inst
-                .apply_session_flags(&mut "claude --resume external".to_string(), "test")
+                .apply_session_flags(
+                    &mut "claude --resume external".to_string(),
+                    "test",
+                    inst.resolved_agent(),
+                    None,
+                )
                 .unwrap_err();
             assert!(error
                 .to_string()
@@ -3871,7 +4383,12 @@ pi = "~/.pi-personal"
             inst.tool = "claude".to_string();
             inst.agent_session_id = Some(sid.to_string());
             let error = inst
-                .apply_session_flags(&mut command.to_string(), "test")
+                .apply_session_flags(
+                    &mut command.to_string(),
+                    "test",
+                    inst.resolved_agent(),
+                    None,
+                )
                 .unwrap_err();
             assert!(
                 error
@@ -3887,7 +4404,9 @@ pi = "~/.pi-personal"
         let mut external = Instance::new("codex", "/tmp/x");
         external.tool = "codex".to_string();
         let mut command = "codex resume external".to_string();
-        assert!(!external.apply_session_flags(&mut command, "test").unwrap());
+        assert!(!external
+            .apply_session_flags(&mut command, "test", external.resolved_agent(), None)
+            .unwrap());
         assert_eq!(command, "codex resume external");
 
         let sid = "11111111-2222-3333-4444-555555555555";
@@ -3896,7 +4415,7 @@ pi = "~/.pi-personal"
         value_token.resume_intent = ResumeIntent::Use(sid.to_string());
         let mut command = "codex --model resume".to_string();
         assert!(value_token
-            .apply_session_flags(&mut command, "test")
+            .apply_session_flags(&mut command, "test", value_token.resolved_agent(), None)
             .unwrap());
         assert_eq!(command, format!("codex resume {sid} --model resume"));
 
@@ -3907,7 +4426,9 @@ pi = "~/.pi-personal"
         alias.tool = "work-claude".to_string();
         alias.command = "claude --resume external".to_string();
         let mut command = alias.command.clone();
-        assert!(!alias.apply_session_flags(&mut command, "test").unwrap());
+        assert!(!alias
+            .apply_session_flags(&mut command, "test", alias.resolved_agent(), None)
+            .unwrap());
         assert!(alias.agent_session_id.is_none());
     }
 
@@ -3960,7 +4481,9 @@ pi = "~/.pi-personal"
             TerminalContextResume::InvalidTarget
         );
         let mut command = "claude".to_string();
-        assert!(!inst.apply_session_flags(&mut command, "test").unwrap());
+        assert!(inst
+            .apply_session_flags(&mut command, "test", inst.resolved_agent(), None)
+            .is_err());
         assert_eq!(command, "claude");
         inst.resume_intent = ResumeIntent::Cleared;
         assert_eq!(
@@ -4012,7 +4535,9 @@ pi = "~/.pi-personal"
             "a pinned copilot conversation must still be attempted"
         );
         let mut pinned = "copilot".to_string();
-        assert!(inst.apply_session_flags(&mut pinned, "test").unwrap());
+        assert!(inst
+            .apply_session_flags(&mut pinned, "test", inst.resolved_agent(), None)
+            .unwrap());
         assert_eq!(pinned, format!("copilot --session-id {sid}"));
 
         // kimi and prime-agent resume from the per-instance sandbox store

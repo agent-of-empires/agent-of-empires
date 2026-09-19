@@ -94,6 +94,27 @@ test.describe("Sidebar Switch view (#2252)", () => {
     await expect(page.getByText("Failed to switch to terminal")).toBeVisible();
   });
 
+  test("a refused handoff displays the complete recovery guidance", async ({ page }) => {
+    await mockApis(page, [{ id: "sess-9", title: "Refused handoff", view: "structured", acp_capable: true }]);
+    const guidance =
+      "Native store is unknown. Run aoe session set-session-id sess-9 conversation-id --store /alternate/claude to restore context.";
+    await page.route("**/api/sessions/*/acp/disable", (r) =>
+      r.fulfill({ status: 409, contentType: "text/plain", body: guidance }),
+    );
+    await openSwitchMenu(page, "Refused handoff");
+    await page.locator("[data-testid='switch-view-confirm']").click();
+    await expect(page.getByRole("alert").filter({ hasText: guidance })).toBeVisible();
+    await expect(page.locator("[data-testid='switch-view-dialog']")).toBeHidden();
+  });
+
+  test("a network failure retains the generic switch error", async ({ page }) => {
+    await mockApis(page, [{ id: "sess-9", title: "Offline handoff", view: "structured", acp_capable: true }]);
+    await page.route("**/api/sessions/*/acp/disable", (r) => r.abort("failed"));
+    await openSwitchMenu(page, "Offline handoff");
+    await page.locator("[data-testid='switch-view-confirm']").click();
+    await expect(page.getByText("Failed to switch to terminal", { exact: true })).toBeVisible();
+  });
+
   test("terminal acp-capable session switches to structured after confirm", async ({ page }) => {
     await mockApis(page, [{ id: "sess-2", title: "Terminal claude", view: "terminal", acp_capable: true }]);
 

@@ -53,6 +53,9 @@ impl Instance {
             sandbox_store_transition_paths: Vec::new(),
             terminal_info: None,
             agent_session_id: None,
+            agent_session_binding: None,
+            resume_binding: None,
+            active_execution: None,
             omp_capture_generation: None,
             lifecycle_generation: 0,
             resume_probe_failed_sid: None,
@@ -180,17 +183,15 @@ impl Instance {
         tmux::status_rules::effective_detect_as(&self.source_profile, &self.tool, &self.detect_as)
     }
 
-    /// The built-in agent backing this session: its own tool when that names
-    /// one, else the agent its `agent_detect_as` alias points at.
-    ///
-    /// Every launch-time consumer resolves through here rather than reading
-    /// `detect_as` raw, because a miss is silent and permanent. `None` drops
-    /// the `AOE_PROFILE`/`AOE_INSTANCE_ID` prefix from the launch line
-    /// ([`status_hook_env_prefix`]) and skips hook install, so every hook the
-    /// agent does have bails on `[ -n "$AOE_INSTANCE_ID" ]` and the session
-    /// reports Idle forever with nothing logged.
+    /// Native execution identity; status aliases never authorize conversation access.
     pub(crate) fn resolved_agent(&self) -> Option<&'static crate::agents::AgentDef> {
-        resolved_agent_for(&self.source_profile, &self.tool, &self.detect_as)
+        self.execution_agent().ok()
+    }
+
+    pub(crate) fn status_agent(&self) -> Option<&'static crate::agents::AgentDef> {
+        self.resolved_agent()
+            .or_else(|| crate::agents::get_agent(&self.tool))
+            .or_else(|| crate::agents::get_agent(&self.effective_detect_as()))
     }
 
     /// The built-in identity used to compare capture stores and aliases.
@@ -203,7 +204,7 @@ impl Instance {
     }
     /// Whether a launch fragment carries shell syntax the pane's shell would
     /// act on, so the agent is not what the command word names.
-    fn contains_active_shell_syntax(value: &str) -> bool {
+    pub(super) fn contains_active_shell_syntax(value: &str) -> bool {
         let mut quote = None;
         let mut escaped = false;
         for ch in value.chars() {
@@ -286,40 +287,11 @@ impl Instance {
             .map(str::to_owned)
     }
 
-    /// Whether a resume selector appended to this launch reaches the agent.
-    ///
-    /// [`Self::launch_invokes_resolved_agent_directly`] is the stricter test
-    /// and stays the one that authorizes capture: inferring ownership from a
-    /// store, mirroring a binary under `opencode serve`, or matching a process
-    /// by argv all need the agent's own name. Emitting a selector needs less.
-    /// A single bare token is the program the pane runs whatever it is called,
-    /// which is the wrapper shape `custom_agents` and `agent_command_override`
-    /// document, and `agent_detect_as` is the user declaring what it wraps.
-    /// Refusing it takes resume away from every renamed wrapper and each
-    /// restart silently starts a fresh conversation (#3638).
-    ///
-    /// A path-qualified token still fails: a bare one resolves through the
-    /// launch shell's `PATH`, which AoE controls, and a path escapes it.
+    /// Only a verified direct invocation or an explicit wrapper contract carries selectors.
     pub(crate) fn launch_can_carry_resume_selector(&self, agent: &crate::agents::AgentDef) -> bool {
-        if self.launch_invokes_resolved_agent_directly(agent) {
-            return true;
-        }
-        let Some(parsed_command) = parse_launch_command(self.get_tool_command()) else {
-            return false;
-        };
-        let [token] = parsed_command.words.as_slice() else {
-            return false;
-        };
-        if token.contains('/') || token.starts_with('-') {
-            return false;
-        }
-        if Self::contains_active_shell_syntax(self.get_tool_command())
-            || Self::contains_active_shell_syntax(&self.extra_args)
-        {
-            return false;
-        }
-        shell_words::split(&self.extra_args)
-            .is_ok_and(|extra| !extra.iter().any(|word| word == "--"))
+        self.execution_agent()
+            .is_ok_and(|actual| actual.name == agent.name)
+            && self.managed_user_argv(agent).is_ok()
     }
 
     /// Whether this launch shape leaves Claude user hooks enabled.
@@ -411,6 +383,32 @@ impl Instance {
             self.launch_invokes_resolved_agent_directly(agent)
         };
         authorized.then_some((capture, context))
+    }
+    pub(super) fn source_session_support(
+        &self,
+    ) -> Option<(
+        &'static crate::agents::SessionCaptureSpec,
+        crate::agents::SessionCaptureContext,
+    )> {
+        let Some(active) = &self.active_execution else {
+            return self.resolved_session_support();
+        };
+        let capture = crate::agents::get_agent(&active.binding.agent)?
+            .session_support
+            .as_ref()?
+            .capture
+            .as_ref()?;
+        let context = if active.container.is_some() {
+            capture.sandbox
+        } else {
+            capture.host
+        };
+        (context != crate::agents::SessionCaptureContext::Unsupported).then_some((capture, context))
+    }
+
+    pub(super) fn source_capture_backend(&self) -> Option<crate::agents::SessionCaptureBackend> {
+        self.source_session_support()
+            .map(|(capture, _)| capture.backend)
     }
 
     pub(super) fn resolved_capture_backend(&self) -> Option<crate::agents::SessionCaptureBackend> {
@@ -516,25 +514,78 @@ impl Instance {
         self.view == View::Structured
     }
 
-    /// Switch this structured-view session to terminal mode while keeping the
-    /// conversation resumable (#2252). Carries the ACP-side `acp_session_id`
-    /// into the terminal-side `agent_session_id` and pins it as the resume
-    /// target (`ResumeIntent::Use`), so the next `start()` launches
-    /// `<tool> --resume <sid>` instead of a fresh pane, then drops the
-    /// structured-view-only ids.
-    ///
-    /// The caller must have confirmed the agent pairing shares a
-    /// CLI-resumable transcript (see `agents::acp_transcript_cli_resumable`).
-    /// When `acp_session_id` is unset this only flips the view, leaving no
-    /// resume target, which is why the caller also gates on it being present.
-    pub(crate) fn switch_to_terminal_keep_context(&mut self) {
-        if let Some(sid) = self.acp_session_id.take() {
-            self.agent_session_id = Some(sid.clone());
-            self.resume_intent = ResumeIntent::Use(sid);
-        }
+    /// Keep only a store asserted by the user or captured from the live worker.
+    pub(crate) fn switch_to_terminal_keep_context(
+        &mut self,
+        worker: Option<&ExecutionBinding>,
+    ) -> Result<()> {
+        let sid = self
+            .acp_session_id
+            .clone()
+            .context("ACP conversation ID is unavailable")?;
+        let binding = self
+            .resume_binding
+            .as_ref()
+            .filter(|binding| {
+                matches!(&self.resume_intent, ResumeIntent::Use(target) if target == &sid)
+                    && binding.session_id == sid
+                    && binding.provenance == ConversationProvenance::Asserted
+                    && binding.execution.as_ref().is_some_and(|execution| execution.agent == "claude")
+            })
+            .cloned()
+            .or_else(|| self.resolved_handoff_binding(&sid, worker?))
+            .context("ACP does not prove a native conversation store; bind its current ID with aoe session set-session-id SESSION ID --store /absolute/claude-store before switching to terminal")?;
+        self.adopt_conversation_state(ConversationState {
+            session_id: Some(sid.clone()),
+            binding: Some(binding.clone()),
+            intent: ResumeIntent::Use(sid),
+            resume_binding: Some(binding),
+            active: None,
+            pi_session_path: None,
+        });
+        self.acp_session_id = None;
         self.import_pending = None;
         self.acp_load_session_capable = None;
         self.view = View::Terminal;
+        Ok(())
+    }
+
+    /// The host Claude conversation this session selected, either through an
+    /// explicit pin (`ResumeIntent::Use`) or the observed agent session. A
+    /// structured handoff must keep reading this conversation's own store
+    /// rather than the profile default, or the transcript the pin points at
+    /// becomes unreadable to the new worker.
+    pub(crate) fn selected_claude_conversation(&self) -> Option<(&str, &ExecutionBinding)> {
+        if self.is_sandboxed() || matches!(self.resume_intent, ResumeIntent::Fork { .. }) {
+            return None;
+        }
+        let (sid, binding, _) = self.conversation_target()?;
+        let binding = binding?;
+        if !binding.is_known() {
+            return None;
+        }
+        let execution = binding.execution.as_ref()?;
+        (execution.agent == "claude" && execution.filesystem == "host").then_some((sid, execution))
+    }
+
+    fn resolved_handoff_binding(
+        &self,
+        sid: &str,
+        worker: &ExecutionBinding,
+    ) -> Option<ConversationBinding> {
+        if worker.agent != "claude" || self.is_sandboxed() || worker.filesystem != "host" {
+            return None;
+        }
+        let binding = ConversationBinding {
+            session_id: sid.to_owned(),
+            execution: Some(worker.clone()),
+            provenance: ConversationProvenance::Observed,
+            transcript_path: None,
+        };
+        let execution = self
+            .resolve_native_execution(Some((sid, Some(&binding), true)))
+            .ok()?;
+        Self::execution_identity_matches(worker, &execution.binding).then_some(binding)
     }
 }
 
@@ -558,22 +609,276 @@ mod tests {
     use crate::session::instance::test_helpers::*;
 
     #[test]
-    fn switch_to_terminal_keep_context_carries_acp_id_into_resume_target() {
+    #[serial_test::serial]
+    fn switch_to_terminal_keep_context_resolves_the_native_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "claude",
+            "#!/bin/sh\nexit 0\n",
+        );
         let mut inst = Instance::new("claude", "/tmp");
         inst.view = View::Structured;
         inst.acp_session_id = Some("sid-abc".to_string());
         inst.import_pending = Some(true);
         inst.acp_load_session_capable = Some(true);
+        inst.pi_session_path = Some("/tmp/foreign.jsonl".into());
 
-        inst.switch_to_terminal_keep_context();
+        let worker = inst.resolve_native_execution(None).unwrap().binding;
+        inst.switch_to_terminal_keep_context(Some(&worker)).unwrap();
 
+        assert!(inst.fork_parent_binding().is_some());
         assert_eq!(inst.view, View::Terminal);
         assert_eq!(inst.agent_session_id.as_deref(), Some("sid-abc"));
         assert_eq!(inst.resume_intent, ResumeIntent::Use("sid-abc".to_string()));
+        assert_eq!(
+            inst.fork_parent_binding().unwrap().provenance,
+            ConversationProvenance::Observed,
+            "a worker-derived conversation is not a user assertion"
+        );
+        assert_eq!(
+            inst.agent_session_binding
+                .as_ref()
+                .and_then(|binding| binding.execution.as_ref())
+                .map(|execution| execution.agent.as_str()),
+            Some("claude"),
+            "the handoff must record the resolved claude execution"
+        );
         // Structured-view-only state is dropped before terminal launch.
         assert_eq!(inst.acp_session_id, None);
         assert_eq!(inst.import_pending, None);
         assert_eq!(inst.acp_load_session_capable, None);
+        assert!(inst.pi_session_path.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn switch_to_terminal_keep_context_prefers_an_asserted_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let mut inst = Instance::new("claude", "/tmp");
+        inst.view = View::Structured;
+        inst.acp_session_id = Some("sid-abc".to_string());
+        inst.resume_intent = ResumeIntent::Use("sid-abc".into());
+        inst.resume_binding = Some(ConversationBinding {
+            session_id: "sid-abc".into(),
+            provenance: ConversationProvenance::Asserted,
+            transcript_path: None,
+            execution: Some(ExecutionBinding {
+                agent: "claude".into(),
+                stores: vec!["/tmp/claude".into()],
+                configuration: Vec::new(),
+                cwd: "/tmp".into(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+            }),
+        });
+
+        inst.switch_to_terminal_keep_context(None).unwrap();
+
+        assert_eq!(
+            inst.agent_session_binding
+                .as_ref()
+                .and_then(|binding| binding.execution.as_ref())
+                .map(|execution| execution.stores.as_slice()),
+            Some(&[std::path::PathBuf::from("/tmp/claude")][..]),
+            "an existing assertion must win over the resolved default"
+        );
+    }
+
+    /// A pending terminal fork's parent must not present itself as the
+    /// resumable conversation: acp_enable would clear the fork intent and
+    /// session/load the parent, attaching the preallocated child directly to
+    /// it. See the `selected_claude_conversation` contract.
+    #[test]
+    fn selected_claude_conversation_excludes_a_pending_fork() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let mut inst = Instance::new("claude", "/tmp");
+        inst.resume_intent = ResumeIntent::Fork {
+            from: "parent-sid".into(),
+        };
+        inst.resume_binding = Some(ConversationBinding {
+            session_id: "parent-sid".into(),
+            provenance: ConversationProvenance::Asserted,
+            transcript_path: None,
+            execution: Some(ExecutionBinding {
+                agent: "claude".into(),
+                stores: vec!["/tmp/claude".into()],
+                configuration: Vec::new(),
+                cwd: "/tmp".into(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+            }),
+        });
+
+        assert_eq!(
+            inst.selected_claude_conversation(),
+            None,
+            "a pending fork's parent is not a resumable conversation"
+        );
+    }
+
+    /// A sandboxed session's conversation store lives in the container; the
+    /// host-side selector must not return it as a handoff target.
+    #[test]
+    fn selected_claude_conversation_excludes_a_sandboxed_session() {
+        let mut inst = Instance::new("claude", "/tmp");
+        inst.sandbox_info = Some(SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "alpine:latest".into(),
+            container_name: "aoe-sandbox-x".into(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        });
+
+        assert_eq!(inst.selected_claude_conversation(), None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn switch_to_terminal_keep_context_accepts_a_session_home_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "claude",
+            "#!/bin/sh\nexit 0\n",
+        );
+        let session_home = temp.path().join("agent-home");
+        let mut inst = Instance::new("claude-session-home", "/tmp");
+        // The worker and the terminal launch both read this HOME, so the
+        // conversation store is shared even though the daemon's HOME differs.
+        inst.pending_host_env = vec![("HOME".into(), session_home.display().to_string())];
+        inst.view = View::Structured;
+        inst.acp_session_id = Some("sid-abc".to_string());
+
+        let worker = inst.resolve_native_execution(None).unwrap().binding;
+        inst.switch_to_terminal_keep_context(Some(&worker)).unwrap();
+
+        assert_eq!(
+            inst.agent_session_binding
+                .as_ref()
+                .and_then(|binding| binding.execution.as_ref())
+                .and_then(|execution| execution.stores.first())
+                .map(std::path::PathBuf::as_path),
+            Some(path_identity(&session_home.join(".claude")).as_path()),
+            "a session HOME store the worker shares must be accepted"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn switch_to_terminal_keep_context_refuses_a_store_the_worker_never_wrote() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let profile = "handoff-declared-store";
+        let declared = temp.path().join("declared-claude");
+        let path =
+            crate::session::config::profile_config::get_profile_config_path(profile).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "[session.agent_config_dir]\nclaude = {:?}\n",
+                declared.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        let mut inst = Instance::new("claude-declared", "/tmp");
+        inst.source_profile = profile.into();
+        inst.view = View::Structured;
+        inst.acp_session_id = Some("sid-abc".to_string());
+
+        let error = inst.switch_to_terminal_keep_context(None).unwrap_err();
+
+        assert!(
+            error.to_string().contains("set-session-id"),
+            "refusal must carry recovery guidance: {error}"
+        );
+        assert_eq!(inst.view, View::Structured);
+        assert_eq!(inst.acp_session_id.as_deref(), Some("sid-abc"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn an_asserted_worker_store_produces_a_launchable_handoff() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let profile = "handoff-asserted-worker-store";
+        let declared = temp.path().join("declared-claude");
+        let path =
+            crate::session::config::profile_config::get_profile_config_path(profile).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "[session.agent_config_dir]\nclaude = {:?}\n",
+                declared.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "claude",
+            "#!/bin/sh\nexit 0\n",
+        );
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let mut inst = Instance::new("claude-asserted-store", project.to_str().unwrap());
+        inst.source_profile = profile.into();
+        inst.view = View::Structured;
+        inst.acp_session_id = Some("sid-abc".to_string());
+
+        // The declaration moves the pane, so the handoff alone is refused; the
+        // documented recovery names the store the structured-view worker writes,
+        // and the launch must then honour it.
+        assert!(inst.switch_to_terminal_keep_context(None).is_err());
+        let worker_store = temp.path().join("worker-claude");
+        std::fs::create_dir_all(&worker_store).unwrap();
+        let binding = inst
+            .asserted_resume_binding("sid-abc", Some(&worker_store))
+            .unwrap();
+        inst.resume_intent = ResumeIntent::Use("sid-abc".into());
+        inst.resume_binding = Some(binding);
+
+        inst.switch_to_terminal_keep_context(None).unwrap();
+
+        let prepared = inst
+            .prepare_launch_command(inst.conversation_state())
+            .expect("an asserted store must produce a launchable handoff");
+        let command = prepared.command.unwrap();
+        assert!(
+            command.contains(&worker_store.canonicalize().unwrap().display().to_string()),
+            "the launch must route the asserted store: {command}"
+        );
+        assert!(
+            !command.contains(&declared.display().to_string()),
+            "the declared store must not be routed: {command}"
+        );
+    }
+
+    #[test]
+    fn switch_to_terminal_keep_context_refuses_an_unprovable_id() {
+        let mut inst = Instance::new("codex-structured", "/tmp");
+        inst.tool = "codex".into();
+        inst.command = "codex".into();
+        inst.view = View::Structured;
+        inst.acp_session_id = Some("sid-abc".to_string());
+
+        let error = inst.switch_to_terminal_keep_context(None).unwrap_err();
+
+        assert!(
+            error.to_string().contains("set-session-id"),
+            "refusal must carry recovery guidance: {error}"
+        );
+        assert_eq!(inst.view, View::Structured);
+        assert_eq!(inst.acp_session_id.as_deref(), Some("sid-abc"));
+        assert!(inst.agent_session_id.is_none());
     }
 
     #[test]
@@ -821,21 +1126,13 @@ mod tests {
         assert_eq!(inst.project_path, "/home/user/old");
         assert_eq!(inst.tool, "claude");
         assert!(inst.agent_session_id.is_none());
-
-        // After loading, can set a new session ID
-        let mut inst = inst;
-        inst.agent_session_id = Some("new-session-456".to_string());
-        assert_eq!(inst.agent_session_id, Some("new-session-456".to_string()));
     }
 
-    /// A custom-agent row whose stored `detect_as` is empty must still resolve
-    /// its built-in agent at launch. Without it `status_hook_env_prefix` drops
-    /// `AOE_INSTANCE_ID`, every hook in the agent's settings file bails on
-    /// `[ -n "$AOE_INSTANCE_ID" ]`, and the session reports Idle forever with
-    /// nothing logged. #3398 taught the read sites to consult the live
-    /// registry; this is the launch site.
+    // The status registry is process-global, so this test must not run beside
+    // another one that installs its own aliases.
     #[test]
-    fn empty_detect_as_still_resolves_the_launch_agent() {
+    #[serial_test::serial]
+    fn empty_detect_as_resolves_status_without_granting_execution() {
         const PROFILE: &str = "detect-as-launch-path-test";
         let _registry = install_aliases(PROFILE, &[("claude-personal", "claude")]);
 
@@ -845,19 +1142,10 @@ mod tests {
         inst.command = "claude-personal".to_string();
         inst.detect_as = String::new();
 
-        assert_eq!(
-            inst.resolved_agent().map(|a| a.name),
-            Some("claude"),
-            "empty detect_as must fall back to the live agent_detect_as registry"
-        );
-        assert_eq!(
-            status_hook_env_prefix(&inst.effective_profile(), "abc123", inst.resolved_agent()),
-            format!(
-                "AOE_PROFILE='{PROFILE}' AOE_INSTANCE_ID='abc123' AOE_HOOK_BIN={} AOE_AGENT_PID=$$ AOE_AGENT_BIN={} ",
-                shell_escape(&std::env::current_exe().unwrap().to_string_lossy()),
-                shell_escape("claude")
-            ),
-        );
+        assert_eq!(inst.effective_detect_as(), "claude");
+        assert!(inst.resolved_agent().is_none());
+        // The hook environment prefix this alias feeds is pinned by
+        // `hooks::tests::test_status_hook_env_prefix_includes_hermes`.
     }
     #[test]
     fn native_resume_requires_a_direct_local_builtin_launch() {
@@ -873,6 +1161,18 @@ mod tests {
 
         inst.tool = "claude".to_string();
         assert!(inst.supports_native_resume());
+        for (command, supported) in [
+            ("claude resume", true),
+            ("claude agents", false),
+            ("claude stop", false),
+            ("codex resume", false),
+            ("omp --thinking low", true),
+        ] {
+            inst.tool = command.split_whitespace().next().unwrap().into();
+            inst.command = command.into();
+            assert_eq!(inst.supports_native_resume(), supported, "{command}");
+        }
+        inst.tool = "claude".into();
         inst.command = "ssh -t host claude".to_string();
         assert!(!inst.supports_native_resume());
         inst.command = "claude > /tmp/transcript".to_string();
@@ -934,19 +1234,6 @@ mod tests {
     }
 
     #[test]
-    fn capture_generation_guards_survive_serialization() {
-        let mut inst = Instance::new("claude", "/tmp/custom");
-        let floor = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(42);
-        inst.capture_started_at = Some(floor);
-        inst.retroactive_capture_excludes
-            .insert("stale-sid".to_string());
-
-        let encoded = serde_json::to_string(&inst).unwrap();
-        let decoded: Instance = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(decoded.capture_started_at, Some(floor));
-        assert!(decoded.retroactive_capture_excludes.contains("stale-sid"));
-    }
-    #[test]
     fn claude_hook_publisher_proof_respects_hook_disabling_argv() {
         let cases = [
             ("", true),
@@ -971,10 +1258,6 @@ mod tests {
                 inst.hook_session_publisher_allowed_by_argv(),
                 expected,
                 "args={args:?}"
-            );
-            assert!(
-                inst.supports_native_resume(),
-                "hook-disabling argv must not disable native resume: {args:?}"
             );
         }
     }

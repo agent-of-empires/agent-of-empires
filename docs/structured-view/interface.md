@@ -26,11 +26,16 @@ stay in sync.
   draws them as text (see [Terminal view](../guides/web/terminal.md)).
 - **Switching views** (the per-session "Switch to terminal" / "Switch to
   structured view" action in the web sidebar or the TUI context menu)
-  keeps the git worktree, files on disk, and any commits. For a **claude**
-  session the conversation is kept in both directions: to the terminal via
-  `claude --resume`, and back to structured view by reloading the
-  transcript. Every other agent starts a fresh conversation under the new
-  view.
+  keeps the git worktree, files on disk, and commits. Claude can resume its
+  native transcript in terminal view: AoE binds the current ACP ID to the
+  native store it resolves for the session's agent, and an explicit
+  [native-store assertion](../guides/session-resume.md#pinning-or-resetting-a-conversation)
+  names a different store when needed. An ACP ID alone is not native-store
+  provenance; a handoff whose store cannot be resolved, or that the
+  structured-view worker does not share (a declared
+  `session.agent_config_dir` on a host session), is refused before worker
+  teardown. Switching back can reload the Claude transcript.
+  Other agent pairings start a fresh conversation under the new view.
 - **TUI status indicators**: a healthy structured view session shows as
   Idle/Active in the session list, observed via the ACP event stream
   rather than tmux pane probing.

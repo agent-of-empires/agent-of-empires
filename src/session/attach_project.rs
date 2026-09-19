@@ -290,6 +290,14 @@ impl Conversion {
     }
 }
 
+/// Whether the next launch resumes a known conversation that cannot move.
+fn conversation_cannot_follow(instance: &super::Instance) -> bool {
+    instance
+        .conversation_target()
+        .and_then(|(_, binding, _)| binding)
+        .is_some_and(crate::session::ConversationBinding::is_known)
+}
+
 /// Decide how to make room for the new repo, and where the workspace lands.
 ///
 /// The workspace directory comes from the same `workspace_path_template` and
@@ -519,6 +527,18 @@ pub fn plan(
     // checkout, workspace path taken, branch already checked out) happens with
     // nothing created.
     let conversion = plan_conversion(instance, profile, on_existing)?;
+    // A known resume target cannot follow a workspace conversion. Reject it
+    // before stopping the session or moving its checkout.
+    if !matches!(conversion, Conversion::Append { .. }) && conversation_cannot_follow(instance) {
+        bail!(
+            "'{}' carries a conversation bound to its current working directory; \
+             moving the session into '{}' would leave that conversation \
+             unresumable. Keep its current directory, or explicitly clear the \
+             resume target before attaching to start a new conversation.",
+            instance.title,
+            conversion.workspace_dir().display()
+        );
+    }
 
     let workspace_dir = conversion.workspace_dir().to_path_buf();
     let worktree_path = workspace_dir.join(&repo_name);
@@ -850,6 +870,20 @@ pub fn attach_planned(
     instance: &super::Instance,
     plan: AttachPlan,
 ) -> Result<AttachOutcome> {
+    // A publication that has not been drained yet would be flushed after the
+    // move with the stale cwd, re-qualifying the old directory after the
+    // commit. Flush it first so the durable recheck sees the row as it will
+    // stand at the commit.
+    if plan.moves_session {
+        match instance.flush_published_conversation(storage) {
+            Some(crate::session::SidWrite::Applied) | None => {}
+            Some(outcome) => anyhow::bail!(
+                "'{}' has an undrained conversation publication ({outcome:?}); drain it or \
+                 clear the resume target before converting",
+                instance.title
+            ),
+        }
+    }
     let prepared = execute(instance, plan)?;
 
     let id = session_id.to_string();
@@ -861,12 +895,15 @@ pub fn attach_planned(
             .iter_mut()
             .find(|i| i.id == id)
             .with_context(|| format!("session not found: {id}"))?;
+        // Planning may precede a concurrent publication or explicit pin.
+        anyhow::ensure!(
+            !converted || !conversation_cannot_follow(inst),
+            "'{}' now resumes a conversation bound to its current working directory; \
+             conversion cannot be committed",
+            inst.title
+        );
         inst.workspace_info = Some(workspace);
         if converted {
-            // The session now works in the workspace directory, and its old
-            // single-repo worktree record is superseded by the entry for that
-            // same repo inside `workspace_info.repos`. Leaving `worktree_info`
-            // set would have the delete path handle the primary worktree twice.
             inst.project_path = new_project_path;
             inst.worktree_info = None;
         }
@@ -1538,6 +1575,240 @@ mod tests {
             std::fs::read_to_string(session_wt.join("wip.txt")).unwrap(),
             "in progress"
         );
+    }
+
+    // Admission must follow the selected resume target, not a stale observation.
+    #[test]
+    #[serial_test::serial]
+    fn a_known_conversation_refuses_the_attach_before_anything_moves() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _guard = isolated_profile(temp.path(), "attach-conv");
+
+        let backend = temp.path().join("src/backend");
+        let frontend = temp.path().join("src/frontend");
+        init_repo(&backend);
+        init_repo(&frontend);
+        let session_wt = temp.path().join("src/backend-featx");
+        git_in(
+            &backend,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "featx",
+                session_wt.to_str().unwrap(),
+            ],
+        );
+
+        let mut inst = Instance::new("Worktree Session", session_wt.to_str().unwrap());
+        inst.worktree_info = Some(WorktreeInfo {
+            branch: "featx".to_string(),
+            main_repo_path: backend.to_string_lossy().to_string(),
+            managed_by_aoe: true,
+            created_at: Utc::now(),
+            base_branch: None,
+        });
+        inst.tool = "claude".into();
+        let sid = "22222222-2222-4222-8222-222222222222";
+        inst.agent_session_id = Some(sid.into());
+        inst.agent_session_binding = Some(crate::session::ConversationBinding {
+            session_id: sid.into(),
+            execution: Some(crate::session::ExecutionBinding {
+                agent: "claude".into(),
+                stores: vec![temp.path().join("claude-store")],
+                configuration: Vec::new(),
+                cwd: session_wt.clone(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+            }),
+            provenance: crate::session::ConversationProvenance::Observed,
+            transcript_path: None,
+        });
+
+        let Err(err) = plan(&inst, "attach-conv", &frontend, ExistingBranch::Refuse) else {
+            panic!("a known conversation cannot follow the workspace move");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("conversation"),
+            "the refusal has to name the conversation: {msg}"
+        );
+        assert!(
+            session_wt.join("README.md").exists(),
+            "a refusal must not touch the session's checkout"
+        );
+
+        inst.resume_binding = inst.agent_session_binding.take();
+        for intent in [
+            crate::session::ResumeIntent::Use(sid.into()),
+            crate::session::ResumeIntent::Fork { from: sid.into() },
+        ] {
+            inst.resume_intent = intent;
+            assert!(plan(&inst, "attach-conv", &frontend, ExistingBranch::Refuse).is_err());
+            assert!(session_wt.join("README.md").exists());
+        }
+        inst.agent_session_binding = inst.resume_binding.take();
+
+        inst.resume_intent = crate::session::ResumeIntent::Cleared;
+        let cleared = plan(&inst, "attach-conv", &frontend, ExistingBranch::Refuse)
+            .expect("an explicit fresh start must not resume the old conversation");
+        let prepared = execute(&inst, cleared).expect("the cleared session can move");
+        assert!(Path::new(prepared.project_path())
+            .join("backend/README.md")
+            .exists());
+        prepared.rollback();
+        assert!(session_wt.join("README.md").exists());
+
+        let storage = Storage::open_unwatched("attach-conv").unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(inst.clone());
+                Ok(())
+            })
+            .unwrap();
+        let stale_plan = plan(&inst, "attach-conv", &frontend, ExistingBranch::Refuse).unwrap();
+        let destination = stale_plan.workspace_dir().to_path_buf();
+        let pinned = inst.agent_session_binding.clone();
+        storage
+            .update(|rows, _| {
+                rows[0].resume_intent = crate::session::ResumeIntent::Use(sid.into());
+                rows[0].resume_binding = pinned.clone();
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            attach_planned(&storage, &inst.id, &inst, stale_plan).is_err(),
+            "a pin committed after planning must prevent the conversion commit"
+        );
+        let disk = storage.load().unwrap().remove(0);
+        assert_eq!(disk.project_path, inst.project_path);
+        assert!(disk.workspace_info.is_none());
+        assert_eq!(
+            disk.resume_intent,
+            crate::session::ResumeIntent::Use(sid.into())
+        );
+        assert!(session_wt.join("README.md").exists());
+        assert!(!destination.exists());
+
+        let mut pending = disk;
+        pending.resume_intent = crate::session::ResumeIntent::Default;
+        pending.resume_binding = None;
+        let binding = pending.agent_session_binding.as_mut().unwrap();
+        binding.provenance = crate::session::ConversationProvenance::Preallocated;
+        let launch_id = uuid::Uuid::new_v4().to_string();
+        let hook_dir = crate::hooks::ensure_instance_dir_path(&pending.id).unwrap();
+        pending.active_execution = Some(crate::session::instance::ActiveExecution {
+            launch_id: launch_id.clone(),
+            binding: binding.execution.clone().unwrap(),
+            capture: Some(crate::session::instance::CaptureContext::Hooks(
+                hook_dir.join(format!("session_id.{launch_id}")),
+            )),
+            container: None,
+        });
+        let rotated = "33333333-3333-4333-8333-333333333333";
+        std::fs::write(hook_dir.join(format!("session_id.{launch_id}")), rotated).unwrap();
+        storage
+            .update(|rows, _| {
+                rows[0] = pending.clone();
+                Ok(())
+            })
+            .unwrap();
+        let pending_plan =
+            plan(&pending, "attach-conv", &frontend, ExistingBranch::Refuse).unwrap();
+        assert!(
+            attach_planned(&storage, &pending.id, &pending, pending_plan).is_err(),
+            "an undrained qualified publication must prevent conversion"
+        );
+        let observed = storage.load().unwrap().remove(0);
+        assert_eq!(observed.project_path, inst.project_path);
+        assert!(observed.workspace_info.is_none());
+        assert_eq!(
+            observed.agent_session_id.as_deref(),
+            Some(rotated),
+            "the drain lands the rotated conversation at the old cwd before the recheck refuses"
+        );
+        assert!(observed.agent_session_binding.as_ref().unwrap().is_known());
+        assert!(session_wt.join("README.md").exists());
+
+        let mut prime = observed;
+        prime.tool = "prime-agent".into();
+        prime.agent_session_id = None;
+        prime.agent_session_binding = None;
+        let prime_store = temp.path().join("prime-store");
+        let sessions = prime_store.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let sidecars = prime_store.join("aoe-session").join(&prime.id);
+        std::fs::create_dir_all(&sidecars).unwrap();
+        let header = serde_json::json!({
+            "type": "session", "id": rotated, "cwd": "/workspace", "rlmDepth": 0
+        });
+        std::fs::write(sessions.join("root.jsonl"), format!("{header}\n")).unwrap();
+        std::fs::write(
+            sidecars.join("root_session"),
+            serde_json::to_vec(&serde_json::json!({
+                "id": rotated, "path": "/root/.prime/agent/sessions/root.jsonl",
+                "cwd": "/workspace", "rlmDepth": 0
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let active = prime.active_execution.as_mut().unwrap();
+        active.binding.agent = "prime-agent".into();
+        active.binding.stores = vec![prime_store.clone()];
+        active.capture = Some(crate::session::instance::CaptureContext::Prime {
+            plan: crate::session::instance::PrimeAgentCapturePlan {
+                store: prime_store,
+                session_dir: "sessions".into(),
+                container_session_dir: "/root/.prime/agent/sessions".into(),
+                container_cwd: "/workspace".into(),
+            },
+            sidecar: Some(crate::session::instance::SessionSidecarSource::SandboxDir(
+                sidecars,
+            )),
+        });
+        storage
+            .update(|rows, _| {
+                rows[0] = prime.clone();
+                Ok(())
+            })
+            .unwrap();
+        let prime_plan = plan(&prime, "attach-conv", &frontend, ExistingBranch::Refuse).unwrap();
+        assert!(
+            attach_planned(&storage, &prime.id, &prime, prime_plan).is_err(),
+            "a materialized Prime root must be drained before conversion commits"
+        );
+        let disk = storage.load().unwrap().remove(0);
+        assert_eq!(disk.project_path, inst.project_path);
+        assert!(disk.workspace_info.is_none());
+        assert_eq!(disk.agent_session_id.as_deref(), Some(rotated));
+        assert!(disk.agent_session_binding.as_ref().unwrap().is_known());
+        assert!(session_wt.join("README.md").exists());
+
+        storage
+            .update(|rows, _| {
+                rows[0].resume_intent = crate::session::ResumeIntent::Cleared;
+                rows[0].resume_binding = None;
+                Ok(())
+            })
+            .unwrap();
+        attach(
+            &storage,
+            "attach-conv",
+            &inst.id,
+            &frontend,
+            ExistingBranch::Refuse,
+        )
+        .unwrap();
+        let disk = storage.load().unwrap().remove(0);
+        let workspace = disk
+            .workspace_info
+            .expect("successful conversion must persist its workspace");
+        assert_eq!(disk.project_path, workspace.workspace_dir);
+        assert_eq!(workspace.repos.len(), 2);
+        for repo in workspace.repos {
+            assert!(Path::new(&repo.worktree_path).join("README.md").exists());
+        }
+        assert!(disk.worktree_info.is_none());
     }
 
     /// Converting a session into a workspace has to carry its diff base with it.

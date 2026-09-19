@@ -66,8 +66,15 @@ impl Instance {
     /// the profile list. That is the best available answer: the minted values
     /// are deliberately not persisted because they may be short-lived secrets.
     pub(crate) fn resolved_host_environment(&self) -> Vec<String> {
+        self.resolved_host_environment_from(self.profile_host_environment())
+    }
+
+    pub(super) fn resolved_host_environment_from(
+        &self,
+        profile_environment: Vec<String>,
+    ) -> Vec<String> {
         let mut environment = crate::session::environment::drop_shadowed_host_entries(
-            self.profile_host_environment(),
+            profile_environment,
             &self.pending_host_env,
         );
         environment.extend(self.pending_host_env.iter().map(|(key, value)| {
@@ -175,7 +182,7 @@ impl Instance {
             }
         }
         // After every reload above, which may have replaced the tool.
-        let detect_as = self.effective_detect_as().into_owned();
+        let command = self.get_tool_command().to_owned();
 
         // Direct is_running()? / exists()? here rather than probe_running():
         // this function already returns Result, so `?` correctly propagates
@@ -201,7 +208,7 @@ impl Instance {
             // Still rotating the copy in its store. The refresh below would
             // fold that copy into the shared file and log every sandbox on
             // it out at the copy's next rotation, so refuse first.
-            if self.predates_shared_credential(&container, &detect_as)? {
+            if self.predates_shared_credential(&container, &command)? {
                 anyhow::bail!(
                     "running sandbox {} predates the shared credential file; stop it, then relaunch to rebuild it",
                     self.id
@@ -214,7 +221,7 @@ impl Instance {
                 &self.effective_profile(),
                 &self.id,
                 &self.tool,
-                Some(detect_as.as_str()),
+                Some(command.as_str()),
                 fold,
             );
             let config = self.build_container_config_with(fold)?;
@@ -225,7 +232,7 @@ impl Instance {
             self.backfill_container_workdir(&container);
             container_config::ensure_folder_trust_config_for_active_agent(
                 &self.tool,
-                Some(detect_as.as_str()),
+                Some(command.as_str()),
                 &self.source_profile,
                 &self.id,
                 &self.container_workdir(),
@@ -253,7 +260,7 @@ impl Instance {
                     &self.effective_profile(),
                     &self.id,
                     &self.tool,
-                    Some(detect_as.as_str()),
+                    Some(command.as_str()),
                     container_config::CredentialFold::Freshest,
                 );
                 let config = self.build_container_config()?;
@@ -273,7 +280,7 @@ impl Instance {
                     self.backfill_container_workdir(&container);
                     container_config::ensure_folder_trust_config_for_active_agent(
                         &self.tool,
-                        Some(detect_as.as_str()),
+                        Some(command.as_str()),
                         &self.source_profile,
                         &self.id,
                         &self.container_workdir(),
@@ -324,7 +331,7 @@ impl Instance {
     fn container_agent_identity(&self) -> Result<String> {
         container_config::container_agent_identity(
             &self.tool,
-            Some(&self.effective_detect_as()),
+            Some(self.get_tool_command()),
             &self.source_profile,
         )
         .context("cannot resolve the session's agent to check its sandbox container")
@@ -337,12 +344,12 @@ impl Instance {
     pub(crate) fn predates_shared_credential(
         &self,
         container: &DockerContainer,
-        detect_as: &str,
+        command: &str,
     ) -> Result<bool> {
         if !container_config::agent_shares_credential_file(
             &self.effective_profile(),
             &self.tool,
-            Some(detect_as),
+            Some(command),
         ) {
             return Ok(false);
         }
@@ -453,7 +460,6 @@ impl Instance {
         fold: container_config::CredentialFold,
     ) -> Result<crate::containers::ContainerConfig> {
         self.ensure_container_hook_mount_source();
-        let detect_as = self.effective_detect_as();
         let sandbox = self
             .sandbox_info
             .as_ref()
@@ -468,10 +474,7 @@ impl Instance {
         .session
         .merge_hooks_into_selected_agent;
         let selected_agent = if merge_selected {
-            // Mirror the host path's agent resolution (a custom wrapper detected
-            // as kiro carries kiro's sidecar via detect_as), and the sandbox's
-            // own `resolve_active_agent`, which also falls back to detect_as.
-            self.resolved_agent()
+            self.status_agent()
                 .and_then(|a| a.sidecar_hooks.as_ref())
                 .and_then(|s| s.selected_agent_hooks.as_ref())
                 .and_then(|sel| {
@@ -483,9 +486,12 @@ impl Instance {
         container_config::build_container_config(
             &self.project_path,
             sandbox,
-            container_config::ContainerAgentSelection::new(&self.tool, Some(&detect_as))
-                .with_selected_agent(selected_agent.as_deref())
-                .with_credential_fold(fold),
+            container_config::ContainerAgentSelection::new(
+                &self.tool,
+                Some(self.get_tool_command()),
+            )
+            .with_selected_agent(selected_agent.as_deref())
+            .with_credential_fold(fold),
             self.is_yolo_mode(),
             &self.id,
             self.workspace_info.as_ref(),
@@ -861,14 +867,19 @@ claude-personal = "~/.claude-global"
             (("codex", ""), "claude", Disk::Corrupt, 0, None),
             (("codex", ""), "codex", Disk::Corrupt, 0, Some(".codex")),
             (("claude", ""), "claude", Disk::Row("codex", ""), 1, None),
+            // A status-only alias is not an execution identity, so this row's
+            // container label is its tool name and the reuse path refreshes no
+            // store. A wrapper or a built-in tool is what carries a store.
             (
                 ("alias-a", "claude"),
-                "alias-b:codex",
+                "alias-b",
                 Disk::Row("alias-b", "codex"),
                 0,
-                Some(".codex"),
+                None,
             ),
-            (("alias-a", "codex"), "alias-a", Disk::Absent, 1, None),
+            // Same contract: the alias-only row labels its container "alias-a"
+            // and therefore reuses it instead of rebuilding.
+            (("alias-a", "codex"), "alias-a", Disk::Absent, 0, None),
             (
                 ("alias-c", ""),
                 "alias-c:claude",

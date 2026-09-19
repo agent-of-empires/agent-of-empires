@@ -53,6 +53,7 @@ serde_json = "1.0"
 serde_yaml = "0.9"
 toml = "1.1"
 toml_edit = "0.25"
+dotenv-ng-core = "1.0"
 
 # File watching
 notify = "8.2"

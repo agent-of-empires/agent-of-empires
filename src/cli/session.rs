@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use crate::session::{
     acquire_session_identity_lock, duplicate_session_error, is_duplicate_session, GroupTree,
-    Instance, LifecycleOperation, ResumeIntent, StartOutcome, Storage,
+    Instance, LaunchSidOutcome, LifecycleOperation, ResumeIntent, StartOutcome, Storage,
 };
 
 #[derive(Subcommand)]
@@ -41,14 +41,15 @@ pub enum SessionCommands {
     /// Auto-detect current session
     Current(CurrentArgs),
 
-    /// Attach another repo to an existing session, so an agent that turns out
-    /// to need a second repo can keep working in the same conversation instead
-    /// of the session being recreated. Creates a worktree for the repo and
-    /// restarts the agent so it can see it; the conversation is kept. See #3103.
+    /// Attach another repo to an existing session, creating a worktree for it
+    /// and restarting the agent. Moving the session's working directory is
+    /// refused while its resume target is a known conversation bound to that
+    /// directory. Explicitly clear the resume target to start a new conversation
+    /// after attaching. An implicitly preallocated ID is re-linked. See #3103.
     AddProject(AddProjectArgs),
 
-    /// Set the resume target for a session; agents with resume disabled in AoE
-    /// store the ID but do not use it
+    /// Set the resume target for a session; an agent whose exact native resume
+    /// AoE cannot resolve is refused
     SetSessionId(SetSessionIdArgs),
 
     /// Set or clear the per-session diff base branch. The diff view
@@ -281,10 +282,14 @@ struct CaptureOutput {
 pub struct SetSessionIdArgs {
     /// Session ID or title
     identifier: String,
-    /// Resume target: for resume-enabled agents, a UUID/sid pins subsequent
-    /// launches to that conversation; agents with resume disabled in AoE store
-    /// but do not use it. An empty string forces a one-shot fresh start.
+    /// Conversation to resume. An empty string requests a one-shot fresh
+    /// start, which only a terminal session can take: a structured session
+    /// keeps its ACP conversation and needs the native ID plus an explicit
+    /// `--store` and a bound Claude conversation.
     session_id: String,
+    /// Assert the native store: a Claude store directory, or a Pi/OMP transcript file.
+    #[arg(long)]
+    store: Option<std::path::PathBuf>,
 }
 
 #[derive(Args)]
@@ -815,27 +820,11 @@ async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let mut working = inst.clone();
     working.source_profile = profile.to_string();
 
-    // Snapshot the sid for the same reason `restart_session` does: a persisted
-    // `ResumeIntent::Cleared` (from `aoe session set-session-id <id> ""`) makes
-    // `acquire_session_id` drop it on this launch, but the abandoned rollout
-    // lingers and stays newest-by-mtime, so the fresh poller's immediate first
-    // poll can re-observe it and the drain below would silently revert the
-    // user's clear.
-    let prior_sid = working.agent_session_id.clone();
-
     // Launch orchestration owns its lifecycle locks and deliberately releases
     // them while user hooks run.
-    let _ = working.start_with_size_opts(crate::terminal::get_size(), false)?;
-
-    // Cleared on this launch, so the sid we came in with is abandoned.
-    if working.agent_session_id.is_none() {
-        if let Some(sid) = prior_sid {
-            working.retroactive_capture_excludes.insert(sid);
-        }
-    }
+    let launch_sid = working.start_with_size_opts(crate::terminal::get_size(), false)?;
 
     // The CLI has no long-lived loop to drain the just-started session-id
-    // poller, so a capture-deferred agent would exit with agent_session_id unset
     // and silently lose resume. Wait briefly for the poller and persist via the
     // same drain the TUI/daemon use.
     let file_watch = crate::file_watch::FileWatchService::noop();
@@ -874,6 +863,13 @@ async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         );
     }
 
+    if let LaunchSidOutcome::Fresh {
+        fresh_notice: Some(notice),
+        ..
+    } = launch_sid
+    {
+        eprintln!("{}", notice.warning_message());
+    }
     println!("✓ Started session: {}", title);
     Ok(())
 }
@@ -963,6 +959,19 @@ fn apply_import_mode(
         inst.import_pending = Some(true);
     } else {
         inst.resume_intent = ResumeIntent::Use(s.session_id.clone());
+        inst.resume_binding = Some(crate::session::ConversationBinding {
+            session_id: s.session_id.clone(),
+            execution: Some(crate::session::ExecutionBinding {
+                agent: "claude".into(),
+                stores: vec![s.config_dir.clone()],
+                configuration: Vec::new(),
+                cwd: crate::session::capture::canonicalize_or_raw(&s.cwd),
+                filesystem: "host".into(),
+                cwd_filesystem: "host".into(),
+            }),
+            provenance: crate::session::ConversationProvenance::Imported,
+            transcript_path: None,
+        });
     }
 }
 
@@ -1104,17 +1113,9 @@ fn launch_imported(profile: &str, ids: &[String]) -> Result<()> {
         };
         let mut working = inst.clone();
         working.source_profile = profile.to_string();
-        // See `start_session`: a cleared sid whose rollout is still newest on
-        // disk would be re-adopted by the drain below.
-        let prior_sid = working.agent_session_id.clone();
         if let Err(e) = working.start_with_size(crate::terminal::get_size()) {
             eprintln!("Warning: failed to start {}: {e}", working.title);
             continue;
-        }
-        if working.agent_session_id.is_none() {
-            if let Some(sid) = prior_sid {
-                working.retroactive_capture_excludes.insert(sid);
-            }
         }
         // Persist the poller-observed id before exit (see start_session).
         crate::session::sync::capture_launched_session_id_blocking(
@@ -1246,21 +1247,12 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
                 .expect("semaphore not closed");
             let title = inst.title.clone();
             let res = tokio::task::spawn_blocking(move || {
-                let prior_sid = inst.agent_session_id.clone();
                 let result = inst.restart_with_size(size);
                 // Drain the fresh poller so a fresh-relaunched capture-deferred
                 // agent persists its new agent_session_id. No-op for Resumed /
                 // ResumeFailed. In spawn_blocking: off the runtime, parallel,
                 // bounded by the semaphore.
                 if result.is_ok() {
-                    if matches!(
-                        result,
-                        Ok(StartOutcome::Fresh) | Ok(StartOutcome::FreshAfterFailedResume { .. })
-                    ) {
-                        if let Some(sid) = prior_sid {
-                            inst.retroactive_capture_excludes.insert(sid);
-                        }
-                    }
                     let file_watch = crate::file_watch::FileWatchService::noop();
                     crate::session::sync::capture_launched_session_id_blocking(
                         &mut inst,
@@ -1300,6 +1292,10 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
             )),
             Ok(StartOutcome::FreshAfterFailedResume { sid }) => {
                 fresh_after_failed_resume.push((title.clone(), sid));
+                succeeded.push((id, title));
+            }
+            Ok(StartOutcome::FreshAfterUnavailableResume { notice, .. }) => {
+                eprintln!("{title}: {}", notice.warning_message());
                 succeeded.push((id, title));
             }
             Ok(StartOutcome::Resumed | StartOutcome::Fresh) => succeeded.push((id, title)),
@@ -1394,11 +1390,6 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let mut working = inst.clone();
     working.source_profile = profile.to_string();
 
-    // Snapshot the sid before `restart_with_size` clears it on a forced-fresh
-    // path: the abandoned rollout lingers and stays newest-by-mtime, so the
-    // fresh poller can re-observe it. Excluded below so the drain rejects it.
-    let prior_sid = working.agent_session_id.clone();
-
     // Restart orchestration owns its lifecycle locks and releases them while
     // user hooks run, so recursive same-id commands cannot deadlock.
     let outcome = working.restart_with_resume_policy(
@@ -1447,14 +1438,6 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     // relaunches fresh mints a new agent_session_id no CLI loop would drain.
     // Same drain as `session start`; no-op for Resumed (sid kept) and
     // ResumeFailed (poller cleared). After the wake wait, so it is usually ready.
-    if matches!(
-        outcome,
-        StartOutcome::Fresh | StartOutcome::FreshAfterFailedResume { .. }
-    ) {
-        if let Some(sid) = prior_sid {
-            working.retroactive_capture_excludes.insert(sid);
-        }
-    }
     let file_watch = crate::file_watch::FileWatchService::noop();
     crate::session::sync::capture_launched_session_id_blocking(
         &mut working,
@@ -1500,6 +1483,10 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
                 "✓ Restarted session: {} (started fresh; a prior resume attempt failed for sid {sid}, the old conversation is still reachable via the agent's own resume/history picker)",
                 title
             );
+        }
+        StartOutcome::FreshAfterUnavailableResume { notice, .. } => {
+            eprintln!("{}", notice.warning_message());
+            println!("Restarted session: {}", title);
         }
         StartOutcome::Resumed | StartOutcome::Fresh => {
             println!("✓ Restarted session: {}", title);
@@ -2882,17 +2869,23 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
     let lifecycle_lock = storage
         .acquire_instance_lifecycle_lock(&target_id)
         .context("failed to acquire instance resume-target lock")?;
-    let (title, tool) = storage.update(|instances, _groups| {
+    let title = storage.update(|instances, _groups| {
         super::patch_instance(instances, &target_id, |inst| {
+            inst.source_profile = storage.profile().to_string();
             if inst.is_structured() {
-                anyhow::bail!(
-                    "cannot set resume target on structured view-mode session '{}'; structured view manages its own conversation lifecycle via ACP",
-                    inst.title
-                );
+                anyhow::ensure!(args.store.is_some() && matches!((&new_intent, inst.acp_session_id.as_deref()), (crate::session::ResumeIntent::Use(sid), Some(acp_sid)) if sid == acp_sid),
+                    "ACP manages its own conversation; a native handoff assertion requires its current ID and an explicit --store");
             }
+            let binding = match &new_intent {
+                crate::session::ResumeIntent::Use(sid) => Some(inst.asserted_resume_binding(sid, args.store.as_deref())?),
+                _ => None,
+            };
+            anyhow::ensure!(!inst.is_structured() || binding.as_ref().and_then(|binding| binding.execution.as_ref()).is_some_and(|execution| execution.agent == "claude"),
+                "ACP terminal handoff is supported only for an explicitly bound Claude conversation");
+            inst.resume_binding = binding;
             inst.resume_intent = new_intent.clone();
             inst.resume_probe_failed_sid = None;
-            Ok((inst.title.clone(), inst.tool.clone()))
+            Ok(inst.title.clone())
         })
     })?;
     drop(lifecycle_lock);
@@ -2900,13 +2893,6 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
     match &new_intent {
         crate::session::ResumeIntent::Use(id) => {
             println!("✓ Set resume target for '{}': {}", title, id);
-            if let Some(agent) = crate::agents::get_agent(&tool) {
-                if agent.session_support.is_none() {
-                    eprintln!(
-                        "Warning: {tool} does not support exact native session resume; this ID will be stored but not used."
-                    );
-                }
-            }
         }
         crate::session::ResumeIntent::Cleared => {
             println!(
@@ -3193,7 +3179,7 @@ mod restart_args_tests {
                 live.session_id_poller_is_running(),
                 "capture must be supervised before the blocking attach call"
             );
-            crate::hooks::write_session_id_via_guard(&live.id, first).unwrap();
+            crate::session::publish_host_pi_transcript(&live.id, first, home.path());
             Ok(())
         })
         .unwrap();
@@ -3205,7 +3191,7 @@ mod restart_args_tests {
 
         let second = "01a053b6-c470-78de-9d8f-bc00ef05332b";
         let result = supervise_attach_capture(&mut inst, |live| {
-            crate::hooks::write_session_id_via_guard(&live.id, second).unwrap();
+            crate::session::publish_host_pi_transcript(&live.id, second, home.path());
             Err(anyhow::anyhow!("fake attach failure"))
         });
 
@@ -3469,10 +3455,21 @@ mod set_session_id_tests {
     #[serial]
     async fn set_session_id_clears_resume_probe_failed_marker() {
         let temp = tempdir().unwrap();
-        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
-
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _path = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "my-claude",
+            "#!/bin/sh\nexit 0\n",
+        );
+        Storage::new_unwatched("default").unwrap();
+        let config_path =
+            crate::session::config::profile_config::get_profile_config_path("set-sid-clear-marker")
+                .unwrap();
+        std::fs::write(config_path, format!("[session.agent_execution_as]\nmy-claude = 'claude'\n[session.agent_config_dir]\nmy-claude = {}\n", toml::Value::String(temp.path().join(".claude").to_str().unwrap().into()))).unwrap();
         let storage = Storage::new_unwatched("set-sid-clear-marker").unwrap();
-        let mut inst = Instance::new("marked_session", "/tmp/x");
+        let mut inst = Instance::new("marked_session", temp.path().to_str().unwrap());
+        inst.tool = "my-claude".into();
+        inst.command = "my-claude".into();
         inst.agent_session_id = Some("11111111-1111-1111-1111-111111111111".to_string());
         inst.resume_probe_failed_sid = Some("11111111-1111-1111-1111-111111111111".to_string());
         let id = inst.id.clone();
@@ -3492,6 +3489,7 @@ mod set_session_id_tests {
             SetSessionIdArgs {
                 identifier: id.clone(),
                 session_id: "22222222-2222-2222-2222-222222222222".to_string(),
+                store: None,
             },
         )
         .await
@@ -3504,6 +3502,20 @@ mod set_session_id_tests {
             ResumeIntent::Use("22222222-2222-2222-2222-222222222222".to_string())
         );
         assert_eq!(inst_disk.resume_probe_failed_sid, None);
+        assert_eq!(
+            inst_disk
+                .resume_binding
+                .as_ref()
+                .unwrap()
+                .execution
+                .as_ref()
+                .unwrap()
+                .stores,
+            vec![crate::session::capture::canonicalize_allowing_missing_leaf(
+                &temp.path().join(".claude")
+            )
+            .unwrap()]
+        );
     }
 }
 
@@ -3651,17 +3663,12 @@ mod acp_reject_tests {
             SetSessionIdArgs {
                 identifier: id.clone(),
                 session_id: "11111111-1111-1111-1111-111111111111".to_string(),
+                store: None,
             },
         )
         .await;
 
-        let err = result.expect_err("set-session-id must reject structured view-mode sessions");
-        let msg = format!("{:#}", err);
-        assert!(
-            msg.contains("acp"),
-            "error must mention structured view: {}",
-            msg
-        );
+        assert!(result.is_err());
 
         let loaded = storage.load().unwrap();
         let inst_disk = loaded.iter().find(|i| i.id == id).unwrap();
@@ -3685,6 +3692,7 @@ mod import_tests {
     fn summary(id: &str, cwd: &str, title: Option<&str>) -> ClaudeSessionSummary {
         ClaudeSessionSummary {
             session_id: id.to_string(),
+            config_dir: std::path::PathBuf::from("/claude-import-store"),
             cwd: cwd.to_string(),
             title: title.map(str::to_string),
             last_modified_ms: 0,

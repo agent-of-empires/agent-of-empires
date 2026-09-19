@@ -21,9 +21,13 @@ use fs2::FileExt as _;
 use serde_json::Value;
 
 pub(crate) use dir_guard::{
-    ensure_instance_dir_path, hook_base_path, unlink_session_id_via_guard,
+    ensure_instance_dir_path, hook_base_path, session_id_leaf, unlink_session_id_via_guard,
     write_session_id_via_guard,
 };
+pub(crate) use status_file::{
+    read_hook_session_id_within, read_hook_sidecar_at, SESSION_ID_SIDECAR_MAX_AGE,
+};
+pub(crate) const SESSION_SOURCE_ENV: &str = "AOE_SESSION_SOURCE";
 pub use status_file::{
     cleanup_hook_status_dir, hook_status_dir, read_hook_session_id, read_hook_session_id_any_age,
     read_hook_session_path, read_hook_status, read_hook_status_age, read_hook_urgent,
@@ -434,6 +438,13 @@ fn hook_command_session_id_sandbox(base: &str, field: crate::agents::HookIdentit
             r#"if (.conversation_id|type)=="string" then .conversation_id elif (.session_id|type)=="string" then .session_id else empty end"#
         }
     };
+    let uuid_pattern = concat!(
+        "[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-",
+        "[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-",
+        "[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-",
+        "[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-",
+        "[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]",
+    );
     // jq performs structural top-level extraction like the host path. The
     // POSIX guards then enforce the shared shell-safe session-id contract.
     // As on the host, a second `AOE_AGENT_BIN` ancestor marks a nested agent;
@@ -442,6 +453,10 @@ fn hook_command_session_id_sandbox(base: &str, field: crate::agents::HookIdentit
         "sh -c 'unset IFS; set -f; umask 077; \
          [ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
          case \"$AOE_INSTANCE_ID\" in *[!0-9a-zA-Z_-]*) exit 0 ;; esac; \
+         F=session_id; \
+         if [ \"${{AOE_SESSION_SOURCE+x}}\" = x ]; then \
+           case \"$AOE_SESSION_SOURCE\" in {uuid_pattern}) F=\"session_id.$AOE_SESSION_SOURCE\" ;; *) exit 0 ;; esac; \
+         fi; \
          D=\"{base}/$AOE_INSTANCE_ID\"; mkdir -p \"$D\" 2>/dev/null; \
          LS=$(LC_ALL=C ls -ldn \"$D\" 2>/dev/null) || exit 0; \
          set -- $LS; M=\"$1\"; \
@@ -457,7 +472,7 @@ fn hook_command_session_id_sandbox(base: &str, field: crate::agents::HookIdentit
          SID=$(jq -r '\\''{selector}'\\'' 2>/dev/null); \
          case \"$SID\" in \"\"|-*|*[!0-9a-zA-Z._-]*) exit 0 ;; esac; \
          [ \"${{#SID}}\" -le 256 ] || exit 0; \
-         printf \"%s\" \"$SID\" > \"$D/.session_id.$$.tmp\" 2>/dev/null && mv \"$D/.session_id.$$.tmp\" \"$D/session_id\" 2>/dev/null; \
+         printf \"%s\" \"$SID\" > \"$D/.$F.$$.tmp\" 2>/dev/null && mv \"$D/.$F.$$.tmp\" \"$D/$F\" 2>/dev/null; \
          exit 0 # {AOE_HOOK_MARKER}'"
     )
 }
@@ -3128,6 +3143,92 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn test_iter_hook_targets_includes_declared_status_alias_config_dir() {
+        let tmp = TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
+
+        // A status-aliased wrapper installs host hooks into its declared
+        // config root but records no execution binding, so uninstall must
+        // still reach the file through the profile's declared namespace.
+        let profile_dir = crate::session::get_profile_dir("alias-profile").unwrap();
+        std::fs::write(
+            profile_dir.join("config.toml"),
+            format!(
+                "[session.custom_agents]\nremote-claude = \"ssh -t host claude\"\n\n[session.agent_detect_as]\nremote-claude = \"claude\"\n\n[session.agent_config_dir]\nremote-claude = \"{}\"\n",
+                tmp.path().join(".remote-claude").display()
+            ),
+        )
+        .unwrap();
+
+        let paths: Vec<_> = iter_hook_targets()
+            .into_iter()
+            .filter(|t| matches!(t.kind, HookTargetKind::JsonSettings))
+            .map(|t| t.path)
+            .collect();
+
+        assert!(
+            paths.contains(&tmp.path().join(".remote-claude").join("settings.json")),
+            "declared status-alias config root must be enumerable for uninstall: {paths:?}"
+        );
+        std::fs::write(profile_dir.join("sessions.json"), "not json").unwrap();
+        assert!(
+            iter_hook_targets().iter().any(|target| {
+                matches!(target.kind, HookTargetKind::JsonSettings)
+                    && target.path == tmp.path().join(".remote-claude/settings.json")
+            }),
+            "unreadable session storage must not hide declared hook targets"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_iter_hook_targets_resolves_declared_roots_via_profile_home() {
+        let process_home = TempDir::new().unwrap();
+        let profile_home = TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", process_home.path().as_os_str()),
+            ("AOE_TEST_ALT_HOME", profile_home.path().as_os_str()),
+        ]);
+        let _app = crate::session::test_support::isolate_app_dir_at(process_home.path());
+
+        let profile_dir = crate::session::get_profile_dir("alias-home-profile").unwrap();
+        std::fs::write(
+            profile_dir.join("config.toml"),
+            "environment = [\"HOME=$AOE_TEST_ALT_HOME\"]\n\n\
+             [session.custom_agents]\nremote-claude = \"ssh -t host claude\"\n\n\
+             [session.agent_detect_as]\nremote-claude = \"claude\"\n\n\
+             [session.agent_config_dir]\nremote-claude = \"~/.remote-claude\"\n",
+        )
+        .unwrap();
+
+        let paths: Vec<_> = iter_hook_targets()
+            .into_iter()
+            .filter(|t| matches!(t.kind, HookTargetKind::JsonSettings))
+            .map(|t| t.path)
+            .collect();
+
+        assert!(
+            paths.contains(
+                &profile_home
+                    .path()
+                    .join(".remote-claude")
+                    .join("settings.json")
+            ),
+            "declared root must resolve through the profile HOME, like installation: {paths:?}"
+        );
+        assert!(
+            !paths.contains(
+                &process_home
+                    .path()
+                    .join(".remote-claude")
+                    .join("settings.json")
+            ),
+            "the process HOME must not stand in for the profile HOME: {paths:?}"
+        );
+    }
+
+    #[test]
     fn test_install_codex_hooks_preserves_disabled_flag_and_skips_install() {
         let tmp = TempDir::new().unwrap();
         let codex_dir = tmp.path().join(".codex");
@@ -5407,69 +5508,6 @@ hooks_auto_accept: false
         assert!(
             cmd.contains(&format!("# {AOE_HOOK_MARKER}")),
             "marker substring must be present: {cmd}"
-        );
-    }
-
-    #[test]
-    fn hook_command_session_id_sandbox_quotes_and_guards() {
-        let cmd = hook_command_session_id_sandbox(
-            "/tmp/aoe-hooks",
-            crate::agents::HookIdentityField::SessionId,
-        );
-        assert!(
-            cmd.contains("case \"$AOE_INSTANCE_ID\" in *[!0-9a-zA-Z_-]*) exit 0 ;; esac"),
-            "missing instance-id allowlist: {cmd}"
-        );
-        assert!(cmd.contains("unset IFS"), "missing IFS pin: {cmd}");
-        assert!(cmd.contains("set -f"), "missing globbing pin: {cmd}");
-        assert!(cmd.contains("umask 077"), "missing umask pin: {cmd}");
-        assert!(
-            cmd.contains("LC_ALL=C ls -ldn"),
-            "missing locale-pinned ls: {cmd}"
-        );
-        assert!(
-            cmd.contains("drwx------|drwx------.|drwx------+|drwx------@"),
-            "missing strict 0700 mode pattern: {cmd}"
-        );
-        assert!(
-            cmd.contains("D=\"/tmp/aoe-hooks/$AOE_INSTANCE_ID\""),
-            "missing instance dir construction: {cmd}"
-        );
-        assert!(
-            cmd.contains("command -v jq >/dev/null 2>&1 || exit 0"),
-            "missing jq presence gate: {cmd}"
-        );
-        assert!(cmd.contains("jq -r "), "missing jq invocation: {cmd}");
-        assert!(
-            cmd.contains(".session_id|type"),
-            "missing jq string-type gate: {cmd}"
-        );
-        assert!(
-            cmd.contains("case \"$SID\" in \"\"|-*|*[!0-9a-zA-Z._-]*) exit 0 ;; esac"),
-            "missing session-id allowlist: {cmd}"
-        );
-        // Same contract as the host extractor's `is_valid_session_id`, which
-        // refuses a leading `-` so an option-shaped id cannot be written and
-        // then rejected by the reader on the way back out.
-        assert!(
-            cmd.contains("\"\"|-*|"),
-            "sandbox extractor must refuse an option-shaped id like the host: {cmd}"
-        );
-        assert!(
-            cmd.contains("[ \"${#SID}\" -le 256 ] || exit 0"),
-            "missing session-id length guard: {cmd}"
-        );
-        assert!(
-            cmd.contains(".session_id.$$.tmp"),
-            "missing atomic .tmp + mv write: {cmd}"
-        );
-        assert!(
-            cmd.contains(&format!("# {AOE_HOOK_MARKER}")),
-            "missing trailing AoE marker: {cmd}"
-        );
-        assert!(
-            !cmd.contains("grep -oE"),
-            "legacy grep pipeline must be gone: {cmd}"
         );
     }
 

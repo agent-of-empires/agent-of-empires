@@ -106,7 +106,8 @@ pub(crate) fn launched_agent(outcome: &Result<StartOutcome, String>) -> bool {
         outcome,
         Ok(StartOutcome::Fresh
             | StartOutcome::Resumed
-            | StartOutcome::FreshAfterFailedResume { .. })
+            | StartOutcome::FreshAfterFailedResume { .. }
+            | StartOutcome::FreshAfterUnavailableResume { .. })
     )
 }
 

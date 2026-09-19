@@ -254,11 +254,12 @@ impl Instance {
         let hook_result = self.run_pre_launch_hooks(skip_on_launch, &profile);
         let (_title_lock, _lifecycle_lock) =
             self.reacquire_launch_locks_after_hooks(&storage, hook_result)?;
+        self.reconcile_sidecar_into_disk();
         let skipped_failed_resume_sid = self.apply_resume_policy(resume_policy);
-        self.apply_fresh_launch_intent();
+        let expected = self.apply_fresh_launch_intent();
 
         let result = (|| {
-            let prepared = self.stop_carry_and_prepare(restart, conversation_carry)?;
+            let prepared = self.stop_carry_and_prepare(restart, conversation_carry, expected)?;
             let launch_outcome = self.spawn_prepared_launch(size, &profile, prepared)?;
             let outcome =
                 self.finish_resume_launch(launch_outcome, skipped_failed_resume_sid, &profile)?;
@@ -288,14 +289,39 @@ impl Instance {
         &mut self,
         restart: bool,
         conversation_carry: Option<ConversationCarry>,
+        expected: ConversationState,
     ) -> Result<PreparedLaunch> {
         if restart {
             self.kill_clean_locked()?;
         }
         if let Some(carry) = conversation_carry {
-            carry.run();
+            // Only the default conversation may be refreshed from a final
+            // observation: under Use/Fork/Cleared the launch names a specific
+            // conversation, and an outgoing sidecar must not rebind it
+            // (launch_command's preparation applies the same gate).
+            if matches!(self.resume_intent, ResumeIntent::Default) {
+                if let Some(observation) = self.capture_freshest_conversation() {
+                    self.apply_conversation_observation(&observation);
+                }
+            }
+            let original = self.agent_session_binding.clone();
+            let relocated = match carry.run_for(self) {
+                Ok(relocated) => relocated,
+                Err(error) => {
+                    self.adopt_conversation_state(expected);
+                    return Err(error);
+                }
+            };
+            let excluded = original
+                .filter(|binding| self.retroactive_capture_excludes.insert(binding.clone()));
+            let mut prepared = self.prepare_launch_command(expected)?;
+            if let Some(binding) = excluded {
+                self.retroactive_capture_excludes.remove(&binding);
+            }
+            prepared.carry_relocated = relocated;
+            return Ok(prepared);
         }
-        let prepared = self.prepare_launch_command()?;
+        let prepared = self.prepare_launch_command(expected)?;
         if restart {
             return self.refresh_prepared_prime_launch_after_pane_stop(prepared);
         }
@@ -419,26 +445,35 @@ impl Instance {
         skipped_failed_resume_sid: Option<String>,
         profile: &str,
     ) -> Result<StartOutcome> {
-        let (attempted_sid, pinned_prior_sid) = match launch_outcome {
+        let (attempted_sid, pinned_prior_sid, fresh_notice) = match launch_outcome {
             LaunchSidOutcome::Existing { sid }
                 if is_valid_session_id(&sid) && self.supports_native_resume() =>
             {
-                (Some(sid), None)
+                (Some(sid), None, None)
             }
-            LaunchSidOutcome::Fresh { pinned_prior_sid }
-                if self.should_probe_pinned_fresh_launch(pinned_prior_sid.as_deref()) =>
-            {
-                (None, pinned_prior_sid)
+            LaunchSidOutcome::Fresh {
+                pinned_prior_sid,
+                fresh_notice,
+            } if self.should_probe_pinned_fresh_launch(pinned_prior_sid.as_deref()) => {
+                (None, pinned_prior_sid, fresh_notice)
             }
-            _ => (None, None),
+            LaunchSidOutcome::Fresh { fresh_notice, .. } => (None, None, fresh_notice),
+            _ => (None, None, None),
         };
         let Some(stale_sid) = attempted_sid else {
             if let Some(sid) = pinned_prior_sid {
                 self.probe_pinned_fresh_launch(&sid)?;
             }
-            return Ok(match skipped_failed_resume_sid {
-                Some(sid) => StartOutcome::FreshAfterFailedResume { sid },
-                None => StartOutcome::Fresh,
+            return Ok(match (skipped_failed_resume_sid, fresh_notice) {
+                (Some(sid), _) => StartOutcome::FreshAfterFailedResume { sid },
+                (None, Some(notice)) => {
+                    let sid = match &notice {
+                        FreshLaunchNotice::UnqualifiedStoredConversation { sid }
+                        | FreshLaunchNotice::UnattestedContext { sid } => sid.clone(),
+                    };
+                    StartOutcome::FreshAfterUnavailableResume { sid, notice }
+                }
+                (None, None) => StartOutcome::Fresh,
             });
         };
 
@@ -502,6 +537,8 @@ mod tests {
     fn carry_runs_before_the_launch_command_picks_its_resume_flag() {
         const SID: &str = "11111111-2222-3333-4444-555555555555";
         let _app_dir = crate::session::test_support::isolate_app_dir();
+        let stub = tempdir().unwrap();
+        let _claude = install_fake_claude(stub.path(), "#!/bin/sh\nexit 1\n");
         let home = dirs::home_dir().expect("home");
         let app_dir = crate::session::get_app_dir().expect("app dir");
         std::fs::create_dir_all(&app_dir).expect("app dir");
@@ -538,6 +575,8 @@ mod tests {
         let seeded = home.join("dot-claude-1").join("projects").join(&encoded);
         std::fs::create_dir_all(&seeded).expect("seed dir");
         std::fs::write(seeded.join(format!("{SID}.jsonl")), "conversation\n").expect("seed");
+        inst.agent_session_binding =
+            Some(inst.asserted_resume_binding(SID, None).expect("binding"));
 
         let carry = match crate::session::conversation_carry::classify(&inst, &profile, "claude-2")
         {
@@ -545,9 +584,9 @@ mod tests {
             other => panic!("expected a planned carry, got {other:?}"),
         };
         inst.swap_account("claude-2");
-
+        let expected = inst.conversation_state();
         let prepared = inst
-            .stop_carry_and_prepare(false, Some(carry))
+            .stop_carry_and_prepare(false, Some(carry), expected)
             .expect("prepare");
 
         assert!(
@@ -561,6 +600,14 @@ mod tests {
                 .is_some_and(|command| command.contains(&format!("--resume {SID}"))),
             "expected --resume on the carried conversation, got: {:?}",
             prepared.command
+        );
+        let resumed = inst
+            .resolve_native_execution(inst.conversation_target())
+            .expect("execution");
+        assert_eq!(
+            resumed.binding.stores.first(),
+            Some(&home.join("dot-claude-2").canonicalize().unwrap()),
+            "account swap must consume target store"
         );
     }
     type PostShellCallback = Box<dyn FnOnce(&crate::tmux::Session)>;
@@ -608,6 +655,130 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn account_restart_consumes_persisted_selected_store() {
+        const SID: &str = "11111111-2222-3333-4444-555555555555";
+        let temp = tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _env = isolate_resume_environment(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("config.toml"),
+            "[session.agent_detect_as]\na = \"claude\"\nb = \"claude\"\n[session.agent_config_dir]\na = \"~/source\"\nb = \"~/destination\"\n").unwrap();
+        let profile = crate::session::config::effective_profile("");
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(&profile);
+        crate::session::config::profile_config::resolve_config_or_warn(&profile);
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let relative = std::path::Path::new("projects")
+            .join(crate::session::capture::encode_claude_project_path(
+                &project.canonicalize().unwrap().to_string_lossy(),
+            ))
+            .join(format!("{SID}.jsonl"));
+        for (root, content, seconds) in [
+            ("source", "unselected\n", 200),
+            ("destination", "selected\n", 100),
+        ] {
+            let path = temp.path().join(root).join(&relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, content).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new().set_modified(
+                        std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds),
+                    ),
+                )
+                .unwrap();
+        }
+        let record = temp.path().join("launched");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$@\" > {}\nexec sleep 60\n",
+            shell_escape(&record.to_string_lossy()),
+        );
+        let _claude = install_fake_claude(temp.path(), &script);
+        let destination = temp.path().join("destination");
+        let mut instance = Instance::new("carry-runtime", project.to_str().unwrap());
+        instance.source_profile = profile.clone();
+        instance.tool = "a".into();
+        instance.command = "claude".into();
+        instance.detect_as = "claude".into();
+        let binding = instance
+            .asserted_resume_binding(SID, Some(&destination))
+            .unwrap();
+        instance.set_agent_conversation(Some(SID.into()), Some(binding), None);
+        let storage = crate::session::storage::Storage::new_unwatched(&profile).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let name = crate::tmux::Session::generate_name(&instance.id, &instance.title);
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(name);
+        instance
+            .start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow)
+            .unwrap();
+        std::fs::remove_file(&record).unwrap();
+        let crate::session::conversation_carry::ToolSwap::KeepConversation(Some(carry)) =
+            crate::session::conversation_carry::classify(&instance, &profile, "b")
+        else {
+            panic!("expected account carry");
+        };
+        storage
+            .update(|rows, _| {
+                rows.iter_mut()
+                    .find(|row| row.id == instance.id)
+                    .unwrap()
+                    .swap_account("b");
+                Ok(())
+            })
+            .unwrap();
+        let outcome = instance.restart_discarding_sandbox_container(None, true, false, Some(carry));
+        instance.stop_and_flush_poller();
+        let observed = std::fs::read_to_string(&record).unwrap();
+        instance.kill_clean().unwrap();
+        assert!(outcome.is_ok(), "{outcome:?}");
+        // Line 0 is the launched CLAUDE_CONFIG_DIR; the remaining lines are
+        // the argv.
+        let recorded_store = observed.lines().next().unwrap_or_default().to_string();
+        assert_eq!(
+            crate::session::capture::canonicalize_allowing_missing_leaf(std::path::Path::new(
+                &recorded_store
+            ),)
+            .unwrap_or_else(|| {
+                crate::git::template::lexical_normalize(std::path::Path::new(&recorded_store))
+            }),
+            crate::session::capture::canonicalize_allowing_missing_leaf(&destination).unwrap(),
+            "the launch must receive the asserted store"
+        );
+        let args: Vec<_> = observed.lines().skip(1).collect();
+        assert!(
+            args.windows(2).any(|pair| pair == ["--resume", SID]),
+            "{args:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(destination.join(relative)).unwrap(),
+            "selected\n"
+        );
+        let rows = storage.load().unwrap();
+        let row = rows.iter().find(|row| row.id == instance.id).unwrap();
+        assert_eq!(row.tool, "b");
+        assert_eq!(
+            row.agent_session_binding
+                .as_ref()
+                .unwrap()
+                .execution
+                .as_ref()
+                .unwrap()
+                .stores,
+            vec![destination.canonicalize().unwrap()]
+        );
+    }
+
+    #[test]
     fn resume_and_capture_capabilities_control_each_path() {
         let sid = "11111111-1111-1111-1111-111111111111";
         let cases = [
@@ -646,13 +817,18 @@ mod tests {
                 .unwrap()
                 .launch_base_command();
             let base_command = command.clone();
-            let resumed = inst.apply_session_flags(&mut command, "test").unwrap();
-            assert_eq!(resumed, resume_supported, "{tool}: launch resume decision");
-            assert_eq!(
-                command != base_command,
-                resume_supported,
-                "{tool}: resume argv emission: {command}"
-            );
+            let resumed =
+                inst.apply_session_flags(&mut command, "test", inst.resolved_agent(), None);
+            if resume_supported {
+                assert!(resumed.unwrap(), "{tool}: launch resume decision");
+                assert_ne!(command, base_command, "{tool}: resume selector missing");
+            } else {
+                assert!(
+                    resumed.is_err(),
+                    "{tool}: an explicit unsupported resume must fail"
+                );
+                assert_eq!(command, base_command, "{tool}: rejected command changed");
+            }
             assert_eq!(
                 build_resume_flags(tool, sid, true).is_empty(),
                 !resume_supported,
@@ -663,6 +839,7 @@ mod tests {
                     inst.finish_resume_launch(
                         LaunchSidOutcome::Fresh {
                             pinned_prior_sid: Some(sid.to_string()),
+                            fresh_notice: None,
                         },
                         None,
                         "test",
@@ -729,7 +906,7 @@ mod tests {
         inst.command = "claude".to_string();
         inst.source_profile = PROFILE.to_string();
         inst.agent_session_id = Some(LAUNCHED_SID.to_string());
-        seed_claude_transcript(&inst.project_path, LAUNCHED_SID);
+        seed_claude_transcript(&mut inst, LAUNCHED_SID);
         let storage = crate::session::storage::Storage::new_unwatched(PROFILE).unwrap();
         storage
             .update(|rows, _| {
@@ -823,19 +1000,13 @@ mod tests {
         assert!(inst.tmux_session().unwrap().is_pane_dead());
     }
 
-    /// Seed a Claude transcript on disk for `sid` under `project_path`, in
-    /// the exact location `acquire_session_id`'s existence check reads
-    /// (`CLAUDE_CONFIG_DIR` or `$HOME/.claude`). The probe tests below drive
-    /// the `--resume` cascade, which acquire now only takes when a stored
-    /// sid has a real prior conversation on disk; an empty thread's sid
-    /// launches fresh-pinned (`--session-id`) instead. Callers must have set
-    /// `HOME` to a temp dir first.
-    fn seed_claude_transcript(project_path: &str, sid: &str) {
+    /// Seed a resumable Claude conversation in the isolated native store.
+    fn seed_claude_transcript(instance: &mut Instance, sid: &str) {
         let home = std::env::var("CLAUDE_CONFIG_DIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| dirs::home_dir().expect("home dir").join(".claude"));
-        let canonical = std::fs::canonicalize(project_path)
-            .unwrap_or_else(|_| std::path::PathBuf::from(project_path));
+        let canonical = std::fs::canonicalize(&instance.project_path)
+            .unwrap_or_else(|_| std::path::PathBuf::from(&instance.project_path));
         let dir = home
             .join("projects")
             .join(crate::session::capture::encode_claude_project_path(
@@ -843,6 +1014,8 @@ mod tests {
             ));
         std::fs::create_dir_all(&dir).expect("create claude project dir");
         std::fs::write(dir.join(format!("{sid}.jsonl")), "seed\n").expect("write transcript");
+        let binding = instance.asserted_resume_binding(sid, None).unwrap();
+        instance.set_agent_conversation(Some(sid.into()), Some(binding), None);
     }
 
     #[test]
@@ -886,7 +1059,7 @@ mod tests {
         inst.agent_session_id = Some(stale_sid.clone());
         inst.status = Status::Idle;
         // Real prior conversation on disk so acquire takes the --resume path.
-        seed_claude_transcript(&inst.project_path, &stale_sid);
+        seed_claude_transcript(&mut inst, &stale_sid);
         let id = inst.id.clone();
 
         let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
@@ -965,7 +1138,7 @@ mod tests {
         inst.agent_session_id = Some(stale_sid.clone());
         inst.status = Status::Idle;
         // Real prior conversation on disk so acquire takes the --resume path.
-        seed_claude_transcript(&inst.project_path, &stale_sid);
+        seed_claude_transcript(&mut inst, &stale_sid);
 
         let xs = vec![inst.clone()];
         storage
@@ -1106,7 +1279,7 @@ mod tests {
         inst.agent_session_id = Some(stale_sid.clone());
         inst.status = Status::Idle;
         // Real prior conversation on disk so acquire takes the --resume path.
-        seed_claude_transcript(&inst.project_path, &stale_sid);
+        seed_claude_transcript(&mut inst, &stale_sid);
 
         let xs = vec![inst.clone()];
         storage
@@ -1168,7 +1341,7 @@ mod tests {
         // Real prior conversation on disk so the FIRST attempt takes the
         // --resume path (and fails); the loop-breaker on the second attempt
         // then fires from the persisted marker, independent of the transcript.
-        seed_claude_transcript(&inst.project_path, &stale_sid);
+        seed_claude_transcript(&mut inst, &stale_sid);
 
         let xs = vec![inst.clone()];
         storage
@@ -1259,7 +1432,7 @@ mod tests {
         inst.agent_session_id = Some(stale_sid.clone());
         inst.status = Status::Idle;
         // Real prior conversation on disk so acquire takes the --resume path.
-        seed_claude_transcript(&inst.project_path, &stale_sid);
+        seed_claude_transcript(&mut inst, &stale_sid);
 
         let xs = vec![inst.clone()];
         storage

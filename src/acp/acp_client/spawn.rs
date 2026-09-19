@@ -115,6 +115,11 @@ pub struct SpawnConfig {
     /// Lifecycle epoch stamped on the runner's registry record; the
     /// supervisor sets it from the lease that admitted the spawn.
     pub generation: u64,
+    /// Claude store pin threaded from `SpawnRequest::claude_store_pin` for a
+    /// host claude spawn. Applied after hooks on the initial launch and on
+    /// watchdog respawns (which clone this config), so `CLAUDE_CONFIG_DIR`
+    /// keeps pointing at the conversation's transcript store.
+    pub claude_store_pin: Option<PathBuf>,
 }
 
 /// Reject `provider_env` request entries whose key would either escape
@@ -320,7 +325,90 @@ pub(super) fn apply_env_filter(cmd: &mut std::process::Command, config: &SpawnCo
     }
 }
 
-pub(super) fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpError> {
+pub(super) fn native_store_snapshot(
+    config: &SpawnConfig,
+    command: &std::process::Command,
+    overrides: &[(String, String)],
+) -> Option<crate::session::ExecutionBinding> {
+    if config.sandbox_info.is_some()
+        || !matches!(config.agent_key.as_str(), "claude" | "claude-code")
+    {
+        return None;
+    }
+    let value = |name: &str| {
+        overrides
+            .iter()
+            .rev()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+            .or_else(|| {
+                command
+                    .get_envs()
+                    .find(|(key, _)| *key == name)
+                    .and_then(|(_, value)| value?.to_str().map(str::to_owned))
+            })
+            .filter(|value| !value.is_empty())
+    };
+    let cwd = crate::session::capture::canonicalize_allowing_missing_leaf(&config.cwd)?;
+    let root = value("CLAUDE_CONFIG_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| value("HOME").map(|home| std::path::PathBuf::from(home).join(".claude")))?;
+    let root = if root.is_absolute() {
+        root
+    } else {
+        cwd.join(root)
+    };
+    Some(crate::session::ExecutionBinding {
+        agent: "claude".into(),
+        stores: vec![crate::session::capture::canonicalize_allowing_missing_leaf(
+            &root,
+        )?],
+        configuration: Vec::new(),
+        cwd,
+        filesystem: "host".into(),
+        cwd_filesystem: "host".into(),
+    })
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use crate::acp::acp_client::test_helpers::env_test_spawn_config;
+
+    #[test]
+    fn snapshot_accepts_the_claude_code_alias_like_the_primary_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().to_path_buf();
+        let store = cwd.join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        let mut primary = env_test_spawn_config(cwd.clone());
+        primary.agent_key = "claude".into();
+        let mut alias = env_test_spawn_config(cwd.clone());
+        alias.agent_key = "claude-code".into();
+        let resolved = |config: &SpawnConfig| {
+            let mut command = std::process::Command::new("true");
+            command.env("CLAUDE_CONFIG_DIR", &store);
+            native_store_snapshot(config, &command, &[])
+                .expect("the snapshot must prove the store")
+                .stores
+        };
+        assert_eq!(
+            resolved(&alias),
+            resolved(&primary),
+            "the alias must capture the same store as the primary name"
+        );
+    }
+}
+
+pub(super) fn spawn_subprocess(
+    config: &SpawnConfig,
+) -> Result<
+    (
+        tokio::process::Child,
+        Option<crate::session::ExecutionBinding>,
+    ),
+    AcpError,
+> {
     // Resolve bare command names against PATH + known node-manager dirs.
     // `aoe serve` captures PATH at daemon-launch time and freezes it for
     // its lifetime; without this, a `nvm use` after launch leaves the
@@ -442,6 +530,7 @@ pub(super) fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::C
         "spawning ACP agent subprocess"
     );
 
+    let native_store = native_store_snapshot(config, cmd.as_std(), &[]);
     let mut child = cmd.spawn().map_err(|e| {
         warn!(
             target: "acp.protocol.spawn",
@@ -523,7 +612,7 @@ pub(super) fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::C
         );
     }
 
-    Ok(child)
+    Ok((child, native_store))
 }
 
 #[cfg(test)]
@@ -537,6 +626,7 @@ mod tests {
     #[serial_test::serial]
     async fn spawn_with_nonexistent_command_errors_cleanly() {
         let config = SpawnConfig {
+            claude_store_pin: None,
             wrapper_substitution: None,
             agent_key: "claude".into(),
             tool: "claude".into(),
@@ -578,6 +668,7 @@ mod tests {
         // Ensure the path truly does not exist.
         let _ = std::fs::remove_dir_all(&missing);
         let config = SpawnConfig {
+            claude_store_pin: None,
             wrapper_substitution: None,
             agent_key: "claude".into(),
             tool: "claude".into(),

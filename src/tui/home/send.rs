@@ -90,6 +90,10 @@ impl HomeView {
                         ));
                         return;
                     }
+                    Ok(Some(EnsureReadyOutcome::FreshAfterUnavailableResume { notice })) => {
+                        self.info_dialog =
+                            Some(InfoDialog::new("Started fresh", &notice.warning_message()));
+                    }
                     Ok(_) => {}
                     Err(err) => {
                         self.info_dialog = Some(InfoDialog::new(

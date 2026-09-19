@@ -6,7 +6,7 @@ use std::sync::Arc;
 use super::state::AppState;
 
 pub(super) type SessionIdentityBaseline = (
-    Option<String>,
+    crate::session::ConversationState,
     Option<String>,
     Option<String>,
     Option<std::time::Instant>,
@@ -15,26 +15,16 @@ pub(super) type SessionIdentityBaseline = (
     crate::session::Status,
 );
 
-/// Merge a drained instance's captured identity back into live state, but only
-/// the identity fields and only if they are unchanged since the baseline. The
-/// daemon needs this field-level, baseline-guarded merge because it drops the
-/// shared async lock across `spawn_blocking`, so the live instance may have
-/// been mutated meanwhile. The single-threaded TUI re-inserts the whole
-/// instance instead (see `apply_session_id_updates`); keep the two in sync.
+/// Preserve concurrent changes to any part of the native conversation.
 pub(super) fn apply_drained_identity_if_unchanged(
     live: &mut Instance,
     drained: &Instance,
     baseline: &SessionIdentityBaseline,
 ) {
-    let (baseline_sid, baseline_marker, baseline_generation, _, _, _, _) = baseline;
-    if live.agent_session_id == *baseline_sid && live.omp_capture_generation == *baseline_generation
-    {
-        live.agent_session_id = drained.agent_session_id.clone();
+    let (baseline_conversation, baseline_marker, baseline_generation, _, _, _, _) = baseline;
+    if baseline_conversation.matches(live) && live.omp_capture_generation == *baseline_generation {
+        live.adopt_conversation_state(drained.conversation_state());
         live.omp_capture_generation = drained.omp_capture_generation.clone();
-        // The drain also records the transcript path a Pi pane published.
-        // Guarded by the same sid baseline: the path names a conversation, so
-        // carrying it onto a row whose sid moved would pair two conversations.
-        live.pi_session_path = drained.pi_session_path.clone();
         if live.resume_probe_failed_sid == *baseline_marker {
             live.resume_probe_failed_sid = drained.resume_probe_failed_sid.clone();
         }
@@ -46,7 +36,8 @@ fn apply_poller_runtime_if_unchanged(
     repaired: &Instance,
     baseline: &SessionIdentityBaseline,
 ) {
-    if live.omp_capture_generation == repaired.omp_capture_generation
+    if live.active_execution == repaired.active_execution
+        && live.omp_capture_generation == repaired.omp_capture_generation
         && live.session_id_poller_retry_after == baseline.3
         && live.capture_started_at == baseline.4
         && live.lifecycle_generation == baseline.5
@@ -73,7 +64,7 @@ pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
                 (
                     inst.id.clone(),
                     (
-                        inst.agent_session_id.clone(),
+                        inst.conversation_state(),
                         inst.resume_probe_failed_sid.clone(),
                         inst.omp_capture_generation.clone(),
                         inst.session_id_poller_retry_after,
@@ -180,7 +171,10 @@ mod tests {
     #[test]
     fn drained_identity_reapply_honors_concurrent_generation_and_marker_writes() {
         let baseline = (
-            Some("old-sid".to_string()),
+            crate::session::ConversationState {
+                session_id: Some("old-sid".into()),
+                ..Instance::new("session", "/tmp/project").conversation_state()
+            },
             Some("old-marker".to_string()),
             Some("generation-a".to_string()),
             None,
@@ -217,12 +211,19 @@ mod tests {
             marker_changed.resume_probe_failed_sid.as_deref(),
             Some("peer-marker")
         );
+        let mut peer = Instance::new("session", "/tmp/project");
+        peer.adopt_conversation_state(baseline.0.clone());
+        peer.omp_capture_generation = baseline.2.clone();
+        peer.pi_session_path = Some("/peer/transcript.jsonl".into());
+        let expected = peer.conversation_state();
+        apply_drained_identity_if_unchanged(&mut peer, &drained, &baseline);
+        assert_eq!(peer.conversation_state(), expected);
     }
 
     #[test]
     fn poller_runtime_reapply_keeps_a_deferred_retry() {
         let baseline: SessionIdentityBaseline = (
-            None,
+            Instance::new("session", "/tmp/project").conversation_state(),
             None,
             None,
             None,

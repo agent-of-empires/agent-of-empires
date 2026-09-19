@@ -119,6 +119,7 @@ export async function ensureSession(id: string, signal?: AbortSignal): Promise<E
     return {
       ok: true,
       status: body.status as "alive" | "restarted" | undefined,
+      message: typeof body.message === "string" ? body.message : undefined,
     };
   } catch (e) {
     if ((e as { name?: string }).name === "AbortError") {
@@ -1523,12 +1524,26 @@ export async function acpEnable(sessionId: string): Promise<ViewSwitchResponse |
 }
 
 /** Switch a session back to a terminal (POST /acp/disable). A claude session's
- *  conversation continues via `claude --resume`; other agents restart fresh.
- *  Resolves with the updated view or null on non-2xx. */
-export async function acpDisable(sessionId: string): Promise<ViewSwitchResponse | null> {
-  return fetchJson<ViewSwitchResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/acp/disable`, {
-    method: "POST",
-  });
+ *  conversation continues via `claude --resume` when AoE resolves the shared
+ *  native store; an unresolvable or worker-mismatched store returns 409 with
+ *  `set-session-id --store` recovery guidance. Other agents restart fresh.
+ *  Resolves with the view on success; on failure, carries the server text
+ *  (when any) so the caller can surface the recovery guidance. */
+export async function acpDisable(
+  sessionId: string,
+): Promise<{ ok: true; data: ViewSwitchResponse } | { ok: false; message?: string }> {
+  try {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/disable`, {
+      method: "POST",
+    });
+    if (res.ok) {
+      return { ok: true, data: (await res.json()) as ViewSwitchResponse };
+    }
+    const text = (await res.text()).trim();
+    return text ? { ok: false, message: text } : { ok: false };
+  } catch {
+    return { ok: false };
+  }
 }
 
 // The daemon owns the structured-view prompt queue, so a follow-up queued
