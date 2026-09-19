@@ -325,11 +325,18 @@ export interface GroupInfo {
   session_count: number;
 }
 
+export interface ProjectOverrides {
+  worktree_enabled?: boolean;
+  smart_rename?: boolean;
+}
+
 export interface ProjectInfo {
   name: string;
   path: string;
   scope: "global" | "profile";
   default_base_branch?: string;
+  /** Absent keys inherit the configured default. */
+  overrides?: ProjectOverrides;
   /** Shown as a sessionless sidebar header. */
   pinned: boolean;
 }

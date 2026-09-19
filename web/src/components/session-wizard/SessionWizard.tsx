@@ -52,6 +52,8 @@ export interface WizardPrefill {
   group?: string;
   initialTab?: "recent" | "browse" | "clone";
   scratch?: boolean;
+  /** The registered project's worktree override for `path`; `undefined` means none. */
+  worktreeEnabled?: boolean;
 }
 
 function initialWizardData(prefill: WizardPrefill | undefined, nameOnly: boolean): WizardData {
@@ -73,7 +75,9 @@ function initialWizardData(prefill: WizardPrefill | undefined, nameOnly: boolean
     profile: prefill.profile || "",
     group: prefill.group || "",
     scratch: prefill.scratch ?? false,
-    useWorktree: prefill.scratch ? false : base.useWorktree,
+    useWorktree: prefill.scratch ? false : (prefill.worktreeEnabled ?? base.useWorktree),
+    // Seeded here rather than dispatched so APPLY_PROFILE_DEFAULTS cannot clobber it.
+    projectWorktreeOverride: prefill.scratch ? undefined : prefill.worktreeEnabled,
     extraRepoPaths: prefill.scratch ? [] : base.extraRepoPaths,
   };
 }
@@ -265,6 +269,7 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
               onChange={handleChange}
               initialTab={prefill?.initialTab}
               agents={state.agents}
+              onSelectSavedProject={(override) => dispatch({ type: "SEED_PROJECT_WORKTREE_OVERRIDE", override })}
             />
           )}
 

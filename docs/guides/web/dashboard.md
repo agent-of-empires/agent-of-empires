@@ -62,7 +62,7 @@ A session is never pinned and sunk at once, but either transition is one step: p
 
 A **Projects** section near the bottom of the sidebar lists saved projects that are not pinned and have no live session; a project with sessions, or a pinned one, renders above as its own header. It is the same registry the wizard's "Saved projects" tab reads. See [Multi-repo workspaces](../multi-repo-workspaces.md#the-project-registry).
 
-Add one with the **+** on the section header (browse or type a path, optionally a name and default base branch, global or profile scope). Clicking a project row starts a session in that repo. **Edit base branch** and **Remove** live in the row's context menu; removing deletes every registration for that path. The add / edit / remove controls are hidden in read-only mode.
+Add one with the **+** on the section header (browse or type a path, optionally a name and default base branch, global or profile scope). Clicking a project row starts a session in that repo. **Project settings** (default base branch, worktree-by-default and smart-rename overrides) and **Remove** live in the row's context menu, opened by right-click or long-press; removing deletes every registration for that path. The add / edit / remove controls are hidden in read-only mode.
 
 ## Settings and profiles
 

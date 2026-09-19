@@ -17,13 +17,16 @@ interface Props {
   initialTab?: Tab;
   /** Only used to gate the Claude import tab. */
   agents?: AgentInfo[];
+  /** Called on every path selection with the saved project's worktree override, or `undefined`
+   *  when the path is unregistered or has none. */
+  onSelectSavedProject?: (override: boolean | undefined) => void;
 }
 
-export function ProjectStep({ data, onChange, initialTab, agents = [] }: Props) {
+export function ProjectStep({ data, onChange, initialTab, agents = [], onSelectSavedProject }: Props) {
   // Until a tab is picked, show Recent while loading, when there are picks, or
   // when a remembered path is set (so its selection shows); else Browse.
   const [manualTab, setManualTab] = useState<Tab | null>(initialTab ?? null);
-  const { loading, query, setQuery, filteredSaved, filteredRecent, hasPicks } = useProjectPicker();
+  const { loading, saved, query, setQuery, filteredSaved, filteredRecent, hasPicks } = useProjectPicker();
   const activeTab: Tab = manualTab ?? (!loading && !hasPicks && !data.path ? "browse" : "recent");
 
   // Show the "Selected project" box only when no saved or recent row highlights the path.
@@ -34,8 +37,15 @@ export function ProjectStep({ data, onChange, initialTab, agents = [] }: Props) 
     (filteredSaved.some((s) => normalizePath(s.path) === selectedPath) ||
       filteredRecent.some((r) => normalizePath(r.path) === selectedPath));
 
-  const selectAndShowRecent = (path: string) => {
+  // Match against the full saved list: a registered project can fall outside the search filter.
+  const selectPath = (path: string) => {
     onChange("path", path);
+    const matched = saved.find((p) => normalizePath(p.path) === normalizePath(path));
+    onSelectSavedProject?.(matched?.overrides?.worktree_enabled);
+  };
+
+  const selectAndShowRecent = (path: string) => {
+    selectPath(path);
     setManualTab("recent");
   };
 
@@ -120,7 +130,7 @@ export function ProjectStep({ data, onChange, initialTab, agents = [] }: Props) 
               filteredSaved={filteredSaved}
               filteredRecent={filteredRecent}
               isSelected={(path) => data.path === path}
-              onSelect={(path) => onChange("path", path)}
+              onSelect={(path) => selectPath(path)}
               emptyMessage="No projects match that search. Try the Browse tab."
             />
           )}

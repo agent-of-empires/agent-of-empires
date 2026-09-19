@@ -329,3 +329,42 @@ impl<'a> SessionCfgCache<'a> {
             })
     }
 }
+
+/// Per-request cache of each profile's merged project registry, so a
+/// per-project override lookup (e.g. `smart_rename`) reads the registry
+/// files once per profile per request rather than once per session row.
+/// Mirrors `SessionCfgCache`'s once-per-unique-key approach.
+pub(super) struct ProjectRegistryCache {
+    by_profile: HashMap<String, Vec<crate::session::Project>>,
+}
+
+impl ProjectRegistryCache {
+    pub(super) fn new() -> Self {
+        Self {
+            by_profile: HashMap::new(),
+        }
+    }
+
+    /// The registered project (if any) whose canonical path matches
+    /// `project_path`, loading `profile`'s merged registry from disk on
+    /// first use only.
+    fn find(&mut self, profile: &str, project_path: &str) -> Option<&crate::session::Project> {
+        let projects = self
+            .by_profile
+            .entry(profile.to_string())
+            .or_insert_with(|| crate::session::projects::load_merged(profile).unwrap_or_default());
+        let target = crate::session::projects::canonical_key(project_path);
+        projects
+            .iter()
+            .find(|p| crate::session::projects::canonical_key(&p.path) == target)
+    }
+
+    pub(super) fn smart_rename_override(
+        &mut self,
+        profile: &str,
+        project_path: &str,
+    ) -> Option<bool> {
+        self.find(profile, project_path)
+            .and_then(|p| p.overrides.smart_rename)
+    }
+}

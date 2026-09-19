@@ -190,12 +190,16 @@ async fn add(profile: &str, profile_explicit: bool, args: ProjectAddArgs) -> Res
         );
     }
 
-    let name = args.name.unwrap_or_else(|| {
-        canonical
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "project".to_string())
-    });
+    let name = match args.name {
+        Some(n) => n,
+        None => {
+            let base = canonical
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "project".to_string());
+            projects::unique_name(profile, scope, &base)
+        }
+    };
 
     let project = Project::new(name.clone(), canonical.to_string_lossy(), scope)
         .with_base_branch(args.base_branch);

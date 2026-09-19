@@ -10,6 +10,7 @@ import type {
   BrowseResponse,
   GroupInfo,
   ProjectInfo,
+  ProjectOverrides,
   DockerStatusResponse,
   CreateSessionRequest,
   ClaudeSessionSummary,
@@ -1260,6 +1261,7 @@ export function createProject(body: {
   default_base_branch?: string;
   /** Show it as a sessionless sidebar header. */
   pinned?: boolean;
+  overrides?: ProjectOverrides;
 }): Promise<ProjectResult> {
   return projectRequest("/api/projects", jsonInit("POST", body));
 }
@@ -1268,13 +1270,18 @@ export function deleteProject(name: string, scope: "global" | "profile"): Promis
   return projectRequest(projectPath(name, scope), { method: "DELETE" }, false);
 }
 
-/** Pass `null` to clear the default base branch. */
+/** Pass `null` to clear the default base branch. An override sub-field of `null` clears it; an absent
+ *  one is left untouched. */
 export function updateProject(
   name: string,
   scope: "global" | "profile",
   defaultBaseBranch: string | null,
+  overrides?: { [K in keyof ProjectOverrides]?: ProjectOverrides[K] | null },
 ): Promise<ProjectResult> {
-  return projectRequest(projectPath(name, scope), jsonInit("PATCH", { default_base_branch: defaultBaseBranch }));
+  return projectRequest(
+    projectPath(name, scope),
+    jsonInit("PATCH", { default_base_branch: defaultBaseBranch, ...(overrides ? { overrides } : {}) }),
+  );
 }
 
 /** Unpinning keeps the registry entry; it only drops from the sidebar. */

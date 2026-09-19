@@ -12,7 +12,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::session::projects::{self, RegistryError};
-use crate::session::{Project, ProjectScope};
+use crate::session::{Project, ProjectOverrides, ProjectScope};
 
 use super::AppState;
 use super::{api_error, read_only_response};
@@ -27,6 +27,8 @@ pub struct ProjectResponse {
     /// Whether the project shows as a sessionless sidebar header, which drives
     /// the pin marker and empty-header visibility (#2208).
     pub pinned: bool,
+    #[serde(skip_serializing_if = "ProjectOverrides::is_empty")]
+    pub overrides: ProjectOverrides,
 }
 
 impl From<Project> for ProjectResponse {
@@ -37,6 +39,7 @@ impl From<Project> for ProjectResponse {
             scope: p.scope.as_str().to_string(),
             default_base_branch: p.default_base_branch,
             pinned: p.pinned,
+            overrides: p.overrides,
         }
     }
 }
@@ -111,6 +114,10 @@ pub struct CreateProjectBody {
     /// saves a project; the sidebar "Pin project" action sends `true` (#2208).
     #[serde(default)]
     pub pinned: bool,
+    /// Per-project overrides for otherwise-global settings. Absent/empty
+    /// means "don't override anything".
+    #[serde(default)]
+    pub overrides: ProjectOverrides,
 }
 
 #[tracing::instrument(
@@ -159,12 +166,16 @@ pub async fn create_project(
     let path_buf = std::path::PathBuf::from(&body.path);
     let canonical = path_buf.canonicalize().unwrap_or_else(|_| path_buf.clone());
 
-    let name = body.name.unwrap_or_else(|| {
-        canonical
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "project".to_string())
-    });
+    let name = match body.name {
+        Some(n) => n,
+        None => {
+            let base = canonical
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "project".to_string());
+            projects::unique_name(&state.profile, scope, &base)
+        }
+    };
 
     // Non-git directories are allowed: their sessions run in place. A path that
     // does not resolve to a directory is still rejected.
@@ -182,7 +193,8 @@ pub async fn create_project(
 
     let project = Project::new(name, canonical.to_string_lossy(), scope)
         .with_base_branch(body.default_base_branch)
-        .with_pinned(body.pinned);
+        .with_pinned(body.pinned)
+        .with_overrides(body.overrides);
     match projects::add(&state.profile, scope, project, body.allow_override) {
         Ok(saved) => {
             tracing::info!(target: "http.api.projects", name = %saved.name, path = %saved.path, scope = saved.scope.as_str(), "created project");
@@ -277,6 +289,55 @@ struct ProjectPatch {
     base_branch: Option<Option<String>>,
     /// `None`: key absent. `Some(b)`: set the pin flag to `b`.
     pinned: Option<bool>,
+    /// `None`: `overrides` key absent (leave untouched). `Some(patch)`: apply
+    /// each present sub-field of `patch` (same absent/null/value semantics as
+    /// the top-level fields, scoped per override).
+    overrides: Option<OverridesPatch>,
+}
+
+/// Per-sub-field absent/null/value patch for `overrides`, mirroring
+/// [`ProjectPatch`]'s semantics one level deeper.
+#[derive(Debug, PartialEq)]
+struct OverridesPatch {
+    worktree_enabled: Option<Option<bool>>,
+    smart_rename: Option<Option<bool>>,
+}
+
+impl OverridesPatch {
+    fn is_empty(&self) -> bool {
+        self.worktree_enabled.is_none() && self.smart_rename.is_none()
+    }
+}
+
+fn parse_overrides_patch(
+    body: &serde_json::Value,
+) -> Result<OverridesPatch, (&'static str, &'static str)> {
+    let worktree_enabled = match body.get("worktree_enabled") {
+        None => None,
+        Some(serde_json::Value::Null) => Some(None),
+        Some(serde_json::Value::Bool(b)) => Some(Some(*b)),
+        Some(_) => {
+            return Err((
+                "bad_field",
+                "overrides.worktree_enabled must be a boolean or null",
+            ))
+        }
+    };
+    let smart_rename = match body.get("smart_rename") {
+        None => None,
+        Some(serde_json::Value::Null) => Some(None),
+        Some(serde_json::Value::Bool(b)) => Some(Some(*b)),
+        Some(_) => {
+            return Err((
+                "bad_field",
+                "overrides.smart_rename must be a boolean or null",
+            ))
+        }
+    };
+    Ok(OverridesPatch {
+        worktree_enabled,
+        smart_rename,
+    })
 }
 
 fn parse_project_patch(
@@ -293,15 +354,28 @@ fn parse_project_patch(
         Some(serde_json::Value::Bool(b)) => Some(*b),
         Some(_) => return Err(("bad_field", "pinned must be a boolean")),
     };
-    if base_branch.is_none() && pinned.is_none() {
+    let overrides = match body.get("overrides") {
+        None => None,
+        Some(v @ serde_json::Value::Object(_)) => {
+            let patch = parse_overrides_patch(v)?;
+            if patch.is_empty() {
+                None
+            } else {
+                Some(patch)
+            }
+        }
+        Some(_) => return Err(("bad_field", "overrides must be an object")),
+    };
+    if base_branch.is_none() && pinned.is_none() && overrides.is_none() {
         return Err((
             "no_fields",
-            "provide at least one of: default_base_branch, pinned",
+            "provide at least one of: default_base_branch, pinned, overrides",
         ));
     }
     Ok(ProjectPatch {
         base_branch,
         pinned,
+        overrides,
     })
 }
 
@@ -366,6 +440,23 @@ pub async fn update_project(
             result = Some(projects::set_pinned(&state.profile, scope, &name, pinned));
         }
     }
+    if let Some(overrides) = patch.overrides {
+        if !matches!(&result, Some(Err(_))) {
+            result = Some(projects::update_overrides(
+                &state.profile,
+                scope,
+                &name,
+                |ov| {
+                    if let Some(w) = overrides.worktree_enabled {
+                        ov.worktree_enabled = w;
+                    }
+                    if let Some(s) = overrides.smart_rename {
+                        ov.smart_rename = s;
+                    }
+                },
+            ));
+        }
+    }
 
     match result.expect("parse_project_patch guarantees at least one field") {
         Ok(updated) => {
@@ -393,7 +484,7 @@ pub async fn update_project(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_project_patch, ProjectPatch};
+    use super::{parse_project_patch, OverridesPatch, ProjectPatch};
     use serde_json::json;
 
     #[test]
@@ -404,7 +495,7 @@ mod tests {
             parse_project_patch(&json!({})),
             Err((
                 "no_fields",
-                "provide at least one of: default_base_branch, pinned"
+                "provide at least one of: default_base_branch, pinned, overrides"
             ))
         );
     }
@@ -416,14 +507,16 @@ mod tests {
             parse_project_patch(&json!({"default_base_branch": null})),
             Ok(ProjectPatch {
                 base_branch: Some(None),
-                pinned: None
+                pinned: None,
+                overrides: None,
             })
         );
         assert_eq!(
             parse_project_patch(&json!({"default_base_branch": "develop"})),
             Ok(ProjectPatch {
                 base_branch: Some(Some("develop".to_string())),
-                pinned: None
+                pinned: None,
+                overrides: None,
             })
         );
         assert_eq!(
@@ -439,12 +532,57 @@ mod tests {
             parse_project_patch(&json!({"pinned": false})),
             Ok(ProjectPatch {
                 base_branch: None,
-                pinned: Some(false)
+                pinned: Some(false),
+                overrides: None,
             })
         );
         assert_eq!(
             parse_project_patch(&json!({"pinned": "yes"})),
             Err(("bad_field", "pinned must be a boolean"))
+        );
+    }
+
+    #[test]
+    fn project_patch_parses_overrides() {
+        assert_eq!(
+            parse_project_patch(&json!({"overrides": {"worktree_enabled": true}})),
+            Ok(ProjectPatch {
+                base_branch: None,
+                pinned: None,
+                overrides: Some(OverridesPatch {
+                    worktree_enabled: Some(Some(true)),
+                    smart_rename: None,
+                }),
+            })
+        );
+        assert_eq!(
+            parse_project_patch(&json!({"overrides": {"smart_rename": null}})),
+            Ok(ProjectPatch {
+                base_branch: None,
+                pinned: None,
+                overrides: Some(OverridesPatch {
+                    worktree_enabled: None,
+                    smart_rename: Some(None),
+                }),
+            })
+        );
+        assert_eq!(
+            parse_project_patch(&json!({"overrides": {}})),
+            Err((
+                "no_fields",
+                "provide at least one of: default_base_branch, pinned, overrides"
+            ))
+        );
+        assert_eq!(
+            parse_project_patch(&json!({"overrides": {"worktree_enabled": "yes"}})),
+            Err((
+                "bad_field",
+                "overrides.worktree_enabled must be a boolean or null"
+            ))
+        );
+        assert_eq!(
+            parse_project_patch(&json!({"overrides": "nope"})),
+            Err(("bad_field", "overrides must be an object"))
         );
     }
 }

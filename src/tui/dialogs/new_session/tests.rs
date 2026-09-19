@@ -1092,3 +1092,44 @@ fn branch_picker_mouse_selection_routes_to_the_focused_field() {
         dialog.worktree_branch.value()
     );
 }
+
+#[test]
+#[serial_test::serial]
+fn test_reload_config_defaults_uses_project_worktree_override() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+
+    let repo = tempfile::tempdir().expect("temp repo");
+    crate::session::projects::add(
+        "default",
+        crate::session::ProjectScope::Global,
+        crate::session::Project::new(
+            "demo",
+            repo.path().to_string_lossy(),
+            crate::session::ProjectScope::Global,
+        ),
+        false,
+    )
+    .expect("register project");
+    crate::session::projects::update_overrides(
+        "default",
+        crate::session::ProjectScope::Global,
+        "demo",
+        |ov| ov.worktree_enabled = Some(true),
+    )
+    .expect("set override");
+
+    let mut dialog = single_tool_dialog();
+    dialog.path = Input::new(repo.path().to_string_lossy().to_string());
+    dialog.available_profiles = vec!["default".to_string()];
+    dialog.profile_descriptions = vec![None];
+    dialog.profile_index = 0;
+    // Global config's worktree.enabled defaults to false; the project's
+    // override should win.
+    dialog.reload_config_defaults();
+
+    assert!(
+        dialog.worktree_enabled,
+        "project override should win over the false global default"
+    );
+}

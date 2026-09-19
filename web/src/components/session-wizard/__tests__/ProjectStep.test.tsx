@@ -148,6 +148,18 @@ describe("recent and saved projects", () => {
     expect(onChange).toHaveBeenCalledWith("path", path);
   });
 
+  it("reports each selection's saved worktree override, undefined when there is none", async () => {
+    vi.mocked(fetchProjects).mockResolvedValue([
+      { name: "alpha", path: "/repo/alpha", scope: "global", pinned: false, overrides: { worktree_enabled: true } },
+      { name: "beta", path: "/repo/beta", scope: "global", pinned: false },
+    ] as ProjectInfo[]);
+    const onSelectSavedProject = vi.fn();
+    render(<ProjectStep data={initialData} onChange={vi.fn()} onSelectSavedProject={onSelectSavedProject} />);
+    fireEvent.click((await screen.findByText("/repo/alpha")).closest("button")!);
+    fireEvent.click((await screen.findByText("/repo/beta")).closest("button")!);
+    expect(onSelectSavedProject.mock.calls).toEqual([[true], [undefined]]);
+  });
+
   it("highlights the selected saved row", async () => {
     savedProjects("/repo/alpha");
     renderStep({ path: "/repo/alpha" });

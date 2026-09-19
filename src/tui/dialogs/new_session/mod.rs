@@ -420,7 +420,13 @@ impl NewSessionDialog {
             .is_some_and(|a| a.host_only);
         let sandbox_enabled =
             docker_available && config.sandbox.enabled_by_default && !is_default_tool_host_only;
-        let worktree_enabled = config.worktree.enabled && !is_default_tool_host_only;
+        let project_worktree_override = crate::session::projects::find_by_canonical_path(
+            profile,
+            std::path::Path::new(&current_dir),
+        )
+        .and_then(|p| p.overrides.worktree_enabled);
+        let worktree_enabled = project_worktree_override.unwrap_or(config.worktree.enabled)
+            && !is_default_tool_host_only;
         let yolo_mode = config.session.yolo_mode_default;
 
         let selected_tool = available_tools
@@ -759,7 +765,13 @@ impl NewSessionDialog {
         self.sandbox_enabled = self.docker_available
             && config.sandbox.enabled_by_default
             && !self.selected_tool_host_only();
-        self.worktree_enabled = config.worktree.enabled && !self.selected_tool_host_only();
+        let project_worktree_override = crate::session::projects::find_by_canonical_path(
+            &profile,
+            std::path::Path::new(self.path.value().trim()),
+        )
+        .and_then(|p| p.overrides.worktree_enabled);
+        self.worktree_enabled = project_worktree_override.unwrap_or(config.worktree.enabled)
+            && !self.selected_tool_host_only();
 
         self.sandbox_image = Input::new(config.sandbox.default_image.clone());
 
@@ -1205,7 +1217,7 @@ impl NewSessionDialog {
                             .and_then(path_input::compute_path_ghost);
                         self.workspace_repo_dir_picker_active = false;
                     } else {
-                        self.path = Input::new(path);
+                        self.set_path(path);
                         self.recompute_path_ghost();
                     }
                 }

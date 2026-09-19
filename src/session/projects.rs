@@ -56,6 +56,31 @@ impl ProjectScope {
     }
 }
 
+/// Per-project overrides for otherwise-global settings. Every field is
+/// `None` when the project doesn't override that setting, so resolution
+/// falls through to the global/profile default. Add a field here to make
+/// a new global toggle project-overridable; existing call sites that
+/// resolve overrides (`find_by_canonical_path`, `resolve_smart_rename_config`)
+/// don't need to change shape, only the new call site that consults the
+/// new field.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectOverrides {
+    /// Overrides `worktree.enabled` (create-worktree-by-default) for new
+    /// sessions launched against this project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_enabled: Option<bool>,
+    /// Overrides `session.smart_rename` (agent-driven auto-naming) for
+    /// sessions launched against this project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smart_rename: Option<bool>,
+}
+
+impl ProjectOverrides {
+    pub fn is_empty(&self) -> bool {
+        self.worktree_enabled.is_none() && self.smart_rename.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub name: String,
@@ -67,6 +92,10 @@ pub struct Project {
     /// Whether this project shows as an empty (sessionless) header in the sidebar / project view.
     #[serde(default = "default_pinned")]
     pub pinned: bool,
+    /// Per-project overrides for otherwise-global settings (worktree
+    /// default, smart rename, ...). See [`ProjectOverrides`].
+    #[serde(default, skip_serializing_if = "ProjectOverrides::is_empty")]
+    pub overrides: ProjectOverrides,
     /// Populated by the loader; not persisted.
     #[serde(skip, default = "default_scope")]
     pub scope: ProjectScope,
@@ -87,6 +116,7 @@ impl Project {
             path: path.into(),
             default_base_branch: None,
             pinned: false,
+            overrides: ProjectOverrides::default(),
             scope,
         }
     }
@@ -101,6 +131,11 @@ impl Project {
     /// Set the pin flag (whether the project shows as a sessionless header).
     pub fn with_pinned(mut self, pinned: bool) -> Self {
         self.pinned = pinned;
+        self
+    }
+
+    pub fn with_overrides(mut self, overrides: ProjectOverrides) -> Self {
+        self.overrides = overrides;
         self
     }
 
@@ -276,6 +311,36 @@ fn locked_update_scope<R>(
     .map_err(RegistryError::Other)?
 }
 
+/// Return `base_name` if no entry in `scope` already uses it (case
+/// insensitive, matching `add`'s own conflict check), otherwise
+/// `"{base_name}-2"`, `"{base_name}-3"`, ... until one is free. Only used
+/// when a name was auto-derived (e.g. from a path basename), never when
+/// the user typed one explicitly — an explicit collision is a real
+/// conflict the user should see, not silently rename around.
+pub fn unique_name(profile: &str, scope: ProjectScope, base_name: &str) -> String {
+    let existing = match scope {
+        ProjectScope::Global => load_global().unwrap_or_default(),
+        ProjectScope::Profile => load_profile(profile).unwrap_or_default(),
+    };
+    if !existing
+        .iter()
+        .any(|p| p.name.eq_ignore_ascii_case(base_name))
+    {
+        return base_name.to_string();
+    }
+    let mut n = 2;
+    loop {
+        let candidate = format!("{base_name}-{n}");
+        if !existing
+            .iter()
+            .any(|p| p.name.eq_ignore_ascii_case(&candidate))
+        {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
 /// Append a project to the given scope.
 pub fn add(
     profile: &str,
@@ -423,6 +488,56 @@ pub fn set_pinned(
         })?;
 
     existing[idx].pinned = pinned;
+    let updated = existing[idx].clone();
+    save_scope(profile, scope, &existing).map_err(RegistryError::Other)?;
+    Ok(updated)
+}
+
+/// Look up the merged-registry entry (profile shadows global) whose path
+/// canonicalizes to `path`, if any. Used to resolve per-project overrides
+/// at call sites that only have a filesystem path in hand (no pre-built
+/// canonical-path map).
+pub fn find_by_canonical_path(profile: &str, path: &Path) -> Option<Project> {
+    let target = canonical_key(&path.to_string_lossy());
+    load_merged(profile)
+        .ok()?
+        .into_iter()
+        .find(|p| canonical_key(&p.path) == target)
+}
+
+/// Mutate the override bundle on the entry matching `name_or_path` in the
+/// given scope. `mutate` receives the entry's current `ProjectOverrides`
+/// and edits it in place, so a caller can set/clear any subset of fields
+/// in one read-modify-write without a bespoke mutator per field (see
+/// [`update_base_branch`] and [`set_pinned`], which predate this and are
+/// intentionally not migrated onto this to avoid an unrelated diff).
+/// Same last-writer-wins semantics as `update_base_branch`.
+pub fn update_overrides(
+    profile: &str,
+    scope: ProjectScope,
+    name_or_path: &str,
+    mutate: impl FnOnce(&mut ProjectOverrides),
+) -> std::result::Result<Project, RegistryError> {
+    let mut existing = match scope {
+        ProjectScope::Global => load_global().map_err(RegistryError::Other)?,
+        ProjectScope::Profile => load_profile(profile).map_err(RegistryError::Other)?,
+    };
+
+    let canonical_target = canonical_key(name_or_path);
+    let idx = existing
+        .iter()
+        .position(|p| {
+            p.name.eq_ignore_ascii_case(name_or_path) || canonical_key(&p.path) == canonical_target
+        })
+        .ok_or_else(|| {
+            RegistryError::NotFound(format!(
+                "No project '{}' in {} scope",
+                name_or_path,
+                scope.as_str()
+            ))
+        })?;
+
+    mutate(&mut existing[idx].overrides);
     let updated = existing[idx].clone();
     save_scope(profile, scope, &existing).map_err(RegistryError::Other)?;
     Ok(updated)
@@ -822,6 +937,87 @@ mod tests {
         assert_eq!(removed.name, "repoR");
         let loaded = load_global()?;
         assert!(loaded.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn update_overrides_sets_and_clears_individual_fields() -> Result<()> {
+        let temp = tempdir()?;
+        let _app_dir = isolate_app_dir_at(temp.path());
+        let repo = temp.path().join("demo");
+        let _ = git2::Repository::init(&repo);
+
+        add(
+            "default",
+            ProjectScope::Global,
+            Project::new("demo", repo.to_string_lossy(), ProjectScope::Global),
+            false,
+        )?;
+
+        let updated = update_overrides("default", ProjectScope::Global, "demo", |ov| {
+            ov.worktree_enabled = Some(true);
+        })?;
+        assert_eq!(updated.overrides.worktree_enabled, Some(true));
+        assert_eq!(updated.overrides.smart_rename, None);
+
+        let updated = update_overrides("default", ProjectScope::Global, "demo", |ov| {
+            ov.smart_rename = Some(false);
+        })?;
+        assert_eq!(updated.overrides.worktree_enabled, Some(true));
+        assert_eq!(updated.overrides.smart_rename, Some(false));
+
+        let updated = update_overrides("default", ProjectScope::Global, "demo", |ov| {
+            ov.worktree_enabled = None;
+        })?;
+        assert_eq!(updated.overrides.worktree_enabled, None);
+        assert_eq!(updated.overrides.smart_rename, Some(false));
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn find_by_canonical_path_matches_registered_project() -> Result<()> {
+        let temp = tempdir()?;
+        let _app_dir = isolate_app_dir_at(temp.path());
+        let repo = temp.path().join("demo");
+        let _ = git2::Repository::init(&repo);
+
+        add(
+            "default",
+            ProjectScope::Global,
+            Project::new("demo", repo.to_string_lossy(), ProjectScope::Global),
+            false,
+        )?;
+
+        let found = find_by_canonical_path("default", repo.as_path());
+        assert_eq!(found.map(|p| p.name), Some("demo".to_string()));
+        assert!(find_by_canonical_path("default", Path::new("/nope")).is_none());
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn unique_name_suffixes_on_collision() -> Result<()> {
+        let temp = tempdir()?;
+        let _app_dir = isolate_app_dir_at(temp.path());
+        let repo_a = temp.path().join("repoA");
+        let _ = git2::Repository::init(&repo_a);
+
+        add(
+            "default",
+            ProjectScope::Global,
+            Project::new("demo", repo_a.to_string_lossy(), ProjectScope::Global),
+            false,
+        )?;
+        assert_eq!(
+            unique_name("default", ProjectScope::Global, "demo"),
+            "demo-2"
+        );
+        assert_eq!(
+            unique_name("default", ProjectScope::Global, "other"),
+            "other"
+        );
         Ok(())
     }
 }

@@ -62,6 +62,8 @@ interface Props {
   onCreateSession: (repoPath: string) => void;
   onPinProject?: (repoPath: string) => void;
   onUnpinProject?: (group: SidebarGroup) => void;
+  /** Opens project settings, registering the repo first if needed. */
+  onEditProjectSettings?: (group: SidebarGroup) => void;
   /** Saved projects with no live session. */
   savedProjects: RepoGroup[];
   onAddProject: () => void;
@@ -169,6 +171,7 @@ export function WorkspaceSidebar(props: Props) {
     onUpdateAppearance: props.onUpdateRepoAppearance,
     onPinProject: props.onPinProject,
     onUnpinProject: props.onUnpinProject,
+    onEditProjectSettings: props.onEditProjectSettings,
     onArchiveGroup,
     rowProps: (v: SidebarWorkspaceView) => ({
       workspace: v.workspace,

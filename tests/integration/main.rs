@@ -63,6 +63,7 @@ mod filewatch_tui_drop_then_abort;
 mod log_filter_watcher_migration;
 mod no_stale_doc_refs;
 mod plugin_install;
+mod project_create_dedupe;
 mod serve_cityhall_lockdown;
 mod serve_daemon_session_id_drain;
 mod serve_disk_reload_helper_equivalence;
