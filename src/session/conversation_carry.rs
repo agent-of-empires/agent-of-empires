@@ -169,6 +169,12 @@ pub(crate) fn classify(instance: &Instance, new_profile: &str, new_tool: &str) -
 #[serial_test::serial]
 fn shared_account_roots_carry_the_selected_external_store() {
     let _app = crate::session::test_support::isolate_app_dir();
+    let stub = tempfile::tempdir().unwrap();
+    let _claude = crate::session::test_support::install_login_shell_path_command(
+        stub.path(),
+        "claude",
+        "#!/bin/sh\nexit 1\n",
+    );
     let home = dirs::home_dir().unwrap();
     let app = crate::session::get_app_dir().unwrap();
     std::fs::create_dir_all(&app).unwrap();
@@ -238,6 +244,12 @@ fn shared_account_roots_carry_the_selected_external_store() {
 #[serial_test::serial]
 fn carry_preserves_known_conversation_already_in_destination() {
     let _app = crate::session::test_support::isolate_app_dir();
+    let stub = tempfile::tempdir().unwrap();
+    let _claude = crate::session::test_support::install_login_shell_path_command(
+        stub.path(),
+        "claude",
+        "#!/bin/sh\nexit 1\n",
+    );
     let home = dirs::home_dir().unwrap();
     let app = crate::session::get_app_dir().unwrap();
     std::fs::create_dir_all(&app).unwrap();

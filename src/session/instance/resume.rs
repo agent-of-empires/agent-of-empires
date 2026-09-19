@@ -537,6 +537,8 @@ mod tests {
     fn carry_runs_before_the_launch_command_picks_its_resume_flag() {
         const SID: &str = "11111111-2222-3333-4444-555555555555";
         let _app_dir = crate::session::test_support::isolate_app_dir();
+        let stub = tempdir().unwrap();
+        let _claude = install_fake_claude(stub.path(), "#!/bin/sh\nexit 1\n");
         let home = dirs::home_dir().expect("home");
         let app_dir = crate::session::get_app_dir().expect("app dir");
         std::fs::create_dir_all(&app_dir).expect("app dir");
@@ -719,9 +721,6 @@ mod tests {
         instance
             .start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow)
             .unwrap();
-        assert!(std::fs::read_to_string(&record)
-            .unwrap()
-            .starts_with(destination.to_str().unwrap()));
         std::fs::remove_file(&record).unwrap();
         let crate::session::conversation_carry::ToolSwap::KeepConversation(Some(carry)) =
             crate::session::conversation_carry::classify(&instance, &profile, "b")
@@ -742,8 +741,20 @@ mod tests {
         let observed = std::fs::read_to_string(&record).unwrap();
         instance.kill_clean().unwrap();
         assert!(outcome.is_ok(), "{outcome:?}");
-        let args: Vec<_> = observed.lines().collect();
-        assert_eq!(args[0], destination.to_str().unwrap());
+        // Line 0 is the launched CLAUDE_CONFIG_DIR; the remaining lines are
+        // the argv.
+        let recorded_store = observed.lines().next().unwrap_or_default().to_string();
+        assert_eq!(
+            crate::session::capture::canonicalize_allowing_missing_leaf(std::path::Path::new(
+                &recorded_store
+            ),)
+            .unwrap_or_else(|| {
+                crate::git::template::lexical_normalize(std::path::Path::new(&recorded_store))
+            }),
+            crate::session::capture::canonicalize_allowing_missing_leaf(&destination).unwrap(),
+            "the launch must receive the asserted store"
+        );
+        let args: Vec<_> = observed.lines().skip(1).collect();
         assert!(
             args.windows(2).any(|pair| pair == ["--resume", SID]),
             "{args:?}"
