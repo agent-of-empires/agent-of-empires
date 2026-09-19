@@ -236,6 +236,80 @@ fn shared_account_roots_carry_the_selected_external_store() {
 #[cfg(test)]
 #[test]
 #[serial_test::serial]
+fn carry_preserves_known_conversation_already_in_destination() {
+    let _app = crate::session::test_support::isolate_app_dir();
+    let home = dirs::home_dir().unwrap();
+    let app = crate::session::get_app_dir().unwrap();
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(
+        app.join("config.toml"),
+        "[session.agent_detect_as]\na = \"claude\"\nb = \"claude\"\n\
+         [session.agent_config_dir]\na = \"~/source\"\nb = \"~/destination\"\n",
+    )
+    .unwrap();
+    let profile = crate::session::config::effective_profile("");
+    let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(&profile);
+    crate::session::config::profile_config::resolve_config_or_warn(&profile);
+    let project = home.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let sid = "11111111-2222-3333-4444-555555555555";
+    let relative = Path::new("projects")
+        .join(crate::session::capture::encode_claude_project_path(
+            &project.to_string_lossy(),
+        ))
+        .join(format!("{sid}.jsonl"));
+    for (root, contents, seconds) in [
+        ("source", "unselected conversation\n", 200),
+        ("destination", "selected conversation\n", 100),
+    ] {
+        let path = home.join(root).join(&relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds)),
+            )
+            .unwrap();
+    }
+    let destination = home.join("destination").canonicalize().unwrap();
+    let mut instance = Instance::new("carry", project.to_str().unwrap());
+    instance.source_profile = profile.clone();
+    instance.tool = "a".into();
+    instance.command = "claude".into();
+    instance.detect_as = "claude".into();
+    instance.agent_session_id = Some(sid.into());
+    instance.agent_session_binding = Some(crate::session::ConversationBinding {
+        session_id: sid.into(),
+        provenance: crate::session::ConversationProvenance::Asserted,
+        transcript_path: None,
+        execution: Some(crate::session::ExecutionBinding {
+            agent: "claude".into(),
+            stores: vec![destination.clone()],
+            configuration: vec![],
+            cwd: project,
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+        }),
+    });
+    let ToolSwap::KeepConversation(Some(carry)) = classify(&instance, &profile, "b") else {
+        panic!("different configured roots must plan a carry");
+    };
+    instance.swap_account("b");
+    carry.run_for(&mut instance).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(destination.join(relative)).unwrap(),
+        "selected conversation\n",
+        "a newer unselected transcript must not overwrite the selected conversation",
+    );
+}
+
+#[cfg(test)]
+#[test]
+#[serial_test::serial]
 fn carry_refuses_unproven_destination_before_writing() {
     let _app = crate::session::test_support::isolate_app_dir();
     let home = dirs::home_dir().unwrap();
@@ -416,7 +490,7 @@ impl ConversationCarry {
             let [agent, resume] = bindings;
             instance.agent_session_binding = agent;
             instance.resume_binding = resume;
-        } else {
+        } else if !bindings.iter().flatten().any(|binding| binding.is_known()) {
             self.run();
         }
         Ok(relocated)
