@@ -3171,6 +3171,61 @@ mod tests {
             paths.contains(&tmp.path().join(".remote-claude").join("settings.json")),
             "declared status-alias config root must be enumerable for uninstall: {paths:?}"
         );
+        std::fs::write(profile_dir.join("sessions.json"), "not json").unwrap();
+        assert!(
+            iter_hook_targets().iter().any(|target| {
+                matches!(target.kind, HookTargetKind::JsonSettings)
+                    && target.path == tmp.path().join(".remote-claude/settings.json")
+            }),
+            "unreadable session storage must not hide declared hook targets"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_iter_hook_targets_resolves_declared_roots_via_profile_home() {
+        let process_home = TempDir::new().unwrap();
+        let profile_home = TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", process_home.path().as_os_str()),
+            ("AOE_TEST_ALT_HOME", profile_home.path().as_os_str()),
+        ]);
+        let _app = crate::session::test_support::isolate_app_dir_at(process_home.path());
+
+        let profile_dir = crate::session::get_profile_dir("alias-home-profile").unwrap();
+        std::fs::write(
+            profile_dir.join("config.toml"),
+            "environment = [\"HOME=$AOE_TEST_ALT_HOME\"]\n\n\
+             [session.custom_agents]\nremote-claude = \"ssh -t host claude\"\n\n\
+             [session.agent_detect_as]\nremote-claude = \"claude\"\n\n\
+             [session.agent_config_dir]\nremote-claude = \"~/.remote-claude\"\n",
+        )
+        .unwrap();
+
+        let paths: Vec<_> = iter_hook_targets()
+            .into_iter()
+            .filter(|t| matches!(t.kind, HookTargetKind::JsonSettings))
+            .map(|t| t.path)
+            .collect();
+
+        assert!(
+            paths.contains(
+                &profile_home
+                    .path()
+                    .join(".remote-claude")
+                    .join("settings.json")
+            ),
+            "declared root must resolve through the profile HOME, like installation: {paths:?}"
+        );
+        assert!(
+            !paths.contains(
+                &process_home
+                    .path()
+                    .join(".remote-claude")
+                    .join("settings.json")
+            ),
+            "the process HOME must not stand in for the profile HOME: {paths:?}"
+        );
     }
 
     #[test]
