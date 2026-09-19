@@ -410,7 +410,7 @@ fn test_move_to_profile_commits_without_pending_bookkeeping() {
 
     let mut requested = view.get_instance(&id).unwrap().clone();
     requested.group_path = "moved/group".to_string();
-    view.move_to_profile_with_effect(&id, "target", requested, None, |_| Ok(()))
+    view.move_to_profile_with_effect(&id, "target", requested, None, false, |_| Ok(()))
         .unwrap();
     view.reload_preserving_profile_move_runtime(std::slice::from_ref(&id))
         .unwrap();
@@ -453,7 +453,7 @@ fn test_move_to_profile_save_roundtrip_persists_under_target() {
 
     let mut requested = view.get_instance(&id).unwrap().clone();
     requested.group_path.clear();
-    view.move_to_profile_with_effect(&id, "target", requested, None, |_| Ok(()))
+    view.move_to_profile_with_effect(&id, "target", requested, None, false, |_| Ok(()))
         .unwrap();
     view.save().expect("save must succeed across profiles");
 
@@ -552,7 +552,7 @@ fn profile_only_move_seeds_target_from_authoritative_title_and_lifecycle() {
     assert_eq!(authoritative.status, Status::Running);
 
     let requested = authoritative.clone();
-    view.move_to_profile_with_effect(&id, "target", requested, None, |_| Ok(()))
+    view.move_to_profile_with_effect(&id, "target", requested, None, false, |_| Ok(()))
         .unwrap();
     view.save().unwrap();
 
@@ -601,7 +601,7 @@ fn profile_move_blocks_fresh_but_allows_stale_lifecycle_reservation() {
     let _guards = view.lock_session_mutation_and_reload(&id).unwrap();
     let requested = view.get_instance(&id).cloned().unwrap();
     let error = view
-        .move_to_profile_with_effect(&id, "target", requested, None, |_| Ok(()))
+        .move_to_profile_with_effect(&id, "target", requested, None, false, |_| Ok(()))
         .expect_err("reserved session must not move profiles");
 
     assert!(error
@@ -640,7 +640,7 @@ fn profile_move_blocks_fresh_but_allows_stale_lifecycle_reservation() {
 
     let requested = view.get_instance(&id).unwrap().clone();
     let baseline = requested.clone();
-    view.move_to_profile_with_effect(&id, "target", requested, Some(&baseline), |_| Ok(()))
+    view.move_to_profile_with_effect(&id, "target", requested, Some(&baseline), false, |_| Ok(()))
         .expect("stale reservation must not block profile move");
     assert!(source.load().unwrap().is_empty());
     assert!(Storage::new_unwatched("target")
@@ -658,7 +658,7 @@ fn test_move_to_profile_same_profile_only_updates_group_path() {
 
     let mut requested = view.get_instance(&id).unwrap().clone();
     requested.group_path = "newgrp".to_string();
-    view.move_to_profile_with_effect(&id, "test", requested, None, |_| Ok(()))
+    view.move_to_profile_with_effect(&id, "test", requested, None, false, |_| Ok(()))
         .unwrap();
 
     assert!(

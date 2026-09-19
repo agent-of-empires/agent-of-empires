@@ -135,6 +135,26 @@ pub(super) fn resolved_acp_config(
     }
 }
 
+/// Spawn a tailer for each `(agent_id, output_file)` pair a resume sweep
+/// found unresolved on attach. Shared by both command-loop arms.
+fn handle_resume_background_tailing_cmd(
+    launches: Vec<(String, String)>,
+    bg_transcript_source: &crate::acp::background_agent::TranscriptSource,
+    event_tx: &tokio::sync::mpsc::Sender<crate::acp::state::Event>,
+    between_prompt_bg_agents: &std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+) {
+    for (agent_id, output_file) in launches {
+        crate::acp::background_agent::spawn_tailer(
+            agent_id,
+            output_file,
+            bg_transcript_source.clone(),
+            event_tx.clone(),
+            between_prompt_bg_agents.clone(),
+            crate::acp::background_agent::TailerStart::Resumed,
+        );
+    }
+}
+
 /// Bridge a handler's `Result<Response, Error>` onto a crate [`Responder`].
 ///
 /// Separating the work from the reply keeps each handler transport-agnostic:
@@ -659,7 +679,10 @@ pub(super) async fn run_connection_task<W, R>(
                     // owns its own lifecycle (self-terminates on
                     // completion, hard-idle, or when event_tx closes),
                     // so it can never outlive the session. Skipped on
-                    // replay (the agent already finished). See
+                    // replay: completion knowledge for a replayed launch
+                    // lives in the event store, and `Supervisor::attach`
+                    // drives resume via `ClientCmd::ResumeBackgroundTailing`
+                    // once the connection is up. See
                     // src/acp/background_agent.rs.
                     if let Event::BackgroundAgentLaunched {
                         agent_id,
@@ -674,6 +697,7 @@ pub(super) async fn run_connection_task<W, R>(
                                 bg_transcript_source.clone(),
                                 event_tx.clone(),
                                 between_prompt_bg_agents.clone(),
+                                crate::acp::background_agent::TailerStart::Live,
                             );
                         }
                     }
@@ -2243,6 +2267,14 @@ pub(super) async fn run_connection_task<W, R>(
                                                 respond_to,
                                             );
                                         }
+                                        Some(ClientCmd::ResumeBackgroundTailing(launches)) => {
+                                            handle_resume_background_tailing_cmd(
+                                                launches,
+                                                &bg_transcript_source,
+                                                &event_tx_for_block,
+                                                &between_prompt_bg_agents,
+                                            );
+                                        }
                                         Some(ClientCmd::Prompt(followup_blocks)) => {
                                             // A follow-up arriving while
                                             // a cancel is in flight means
@@ -2801,6 +2833,14 @@ pub(super) async fn run_connection_task<W, R>(
                         respond_to,
                     }) => {
                         handle_delete_session_cmd(&connection, target_id, respond_to);
+                    }
+                    Some(ClientCmd::ResumeBackgroundTailing(launches)) => {
+                        handle_resume_background_tailing_cmd(
+                            launches,
+                            &bg_transcript_source,
+                            &event_tx_for_block,
+                            &between_prompt_bg_agents,
+                        );
                     }
                     Some(ClientCmd::SetConfigOption { config_id, value }) => {
                         dispatch_set_config_option(

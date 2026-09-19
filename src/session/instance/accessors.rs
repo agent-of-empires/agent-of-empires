@@ -456,6 +456,25 @@ impl Instance {
             )
     }
 
+    /// The `session.agent_config_dir` entry `tool` reads, resolved against the
+    /// session's host `HOME`.
+    ///
+    /// The declared directory wins over the agent's config-dir environment
+    /// variable wherever both could answer, the precedence
+    /// [`crate::hooks::trust_host_project`] applies: the setting exists for a
+    /// wrapper that exports that variable itself, which happens after AoE has
+    /// handed the launch its environment, so AoE never sees it.
+    ///
+    /// `tool` is a parameter rather than `self.tool` because a swap has to
+    /// resolve the directory of the tool it is moving to as well as the one it
+    /// is moving from.
+    pub(crate) fn declared_agent_config_dir_for(&self, tool: &str) -> Option<std::path::PathBuf> {
+        let home = self.resolved_host_home()?;
+        crate::session::config::profile_config::resolve_config_or_warn(&self.effective_profile())
+            .session
+            .agent_config_dir_for(tool, &home)
+    }
+
     pub(super) fn sandbox_capture_store_dir(&self) -> Option<std::path::PathBuf> {
         if !self.is_sandboxed() {
             return None;
@@ -587,7 +606,7 @@ impl Instance {
 
 /// Resolve a built-in from the instance's stored alias or its profile registry.
 /// The stored value wins; legacy rows with no value consult the live registry.
-fn resolved_agent_for(
+pub(crate) fn resolved_agent_for(
     profile: &str,
     tool: &str,
     detect_as: &str,

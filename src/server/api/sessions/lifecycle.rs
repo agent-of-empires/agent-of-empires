@@ -1185,6 +1185,7 @@ pub async fn restart_session(
 fn admit_restart(
     row: &mut Instance,
     body: &crate::daemon::RestartSessionBody,
+    account_swap: bool,
 ) -> anyhow::Result<()> {
     let now = chrono::Utc::now();
     if row.is_trashed()
@@ -1201,7 +1202,11 @@ fn admit_restart(
     )?;
     if let Some(tool) = &body.tool {
         if row.tool != *tool {
-            row.swap_tool(tool);
+            if account_swap {
+                row.swap_account(tool);
+            } else {
+                row.swap_tool(tool);
+            }
         }
     }
     if let Some(command) = &body.command_override {
@@ -1326,13 +1331,33 @@ pub(super) async fn prepare_agent_session(
             })
             .transpose()?;
         let mut outgoing = instance.clone();
-        if let Some(body) = &worker_restart {
+        if worker_restart.is_some() {
             outgoing.reconcile_from_store(&native)?;
+        }
+        let (account_swap, mut conversation_carry) = match worker_restart
+            .as_ref()
+            .and_then(|body| body.tool.as_deref())
+        {
+            Some(tool) if tool != outgoing.tool => {
+                match crate::session::conversation_carry::classify(
+                    &outgoing,
+                    target.unwrap_or(&profile),
+                    tool,
+                ) {
+                    crate::session::conversation_carry::ToolSwap::KeepConversation(carry) => {
+                        (true, carry)
+                    }
+                    crate::session::conversation_carry::ToolSwap::Park => (false, None),
+                }
+            }
+            _ => (false, None),
+        };
+        if let Some(body) = &worker_restart {
             let mut probe = outgoing.clone();
             if let Some(target) = target {
                 probe.source_profile = target.into();
             }
-            admit_restart(&mut probe, body)?;
+            admit_restart(&mut probe, body, account_swap)?;
             if let Some(target_native) = &target_native {
                 let rows = target_native.storage().load()?;
                 if rows.iter().any(|row| row.id == outgoing.id)
@@ -1364,11 +1389,14 @@ pub(super) async fn prepare_agent_session(
                     ) {
                         return Err(duplicate_session_error(&candidate.title));
                     }
-                    admit_restart(candidate, body)?;
+                    admit_restart(candidate, body, account_swap)?;
                     moved = Some(candidate.clone());
                     Ok(())
                 },
             )?;
+            if let (Some(carry), Some(moved)) = (conversation_carry.as_mut(), moved.as_ref()) {
+                carry.retarget(crate::session::conversation_carry::conversation_ids(moved));
+            }
             lifecycle_lock = target_native
                 .storage()
                 .acquire_instance_lifecycle_lock(&instance.id)?;
@@ -1386,7 +1414,7 @@ pub(super) async fn prepare_agent_session(
                 }
                 if let Some(body) = &worker_restart {
                     row.source_profile.clone_from(&profile);
-                    admit_restart(row, body)?;
+                    admit_restart(row, body, account_swap)?;
                     return Ok(Some(row.clone()));
                 }
                 let now = chrono::Utc::now();
@@ -1453,14 +1481,14 @@ pub(super) async fn prepare_agent_session(
             },
         )?;
         drop(identity);
-        Ok(Some((generation, started, native)))
+        Ok(Some((generation, started, native, conversation_carry)))
     })
     .await;
     drop(guard);
     drop(submission);
     drop(namespace);
     let hooked = match result {
-        Ok(Ok(Some((generation, mut started, native)))) => {
+        Ok(Ok(Some((generation, mut started, native, conversation_carry)))) => {
             tokio::task::spawn_blocking(move || {
                 let _timeout = restart.as_ref().filter(|body| body.bound_hooks).map(|_| {
                     crate::session::recovery::HookTimeoutScope::new(
@@ -1472,7 +1500,13 @@ pub(super) async fn prepare_agent_session(
                     &native,
                     None,
                 );
-                Ok(Some((generation, started, native, hooks)))
+                Ok(Some((
+                    generation,
+                    started,
+                    native,
+                    hooks,
+                    conversation_carry,
+                )))
             })
             .await
         }
@@ -1488,18 +1522,21 @@ pub(super) async fn prepare_agent_session(
     let guard = lock.lock().await;
     let mut restart_identity = None;
     let result = match hooked {
-        Ok(Ok(Some((generation, mut started, native, hooks)))) => {
+        Ok(Ok(Some((generation, mut started, native, hooks, conversation_carry)))) => {
             tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
                 use crate::session::SessionStore;
                 let outcome = started.finish_reserved_launch(
                     &native,
                     size,
-                    if preparation == AgentPreparation::Ensure {
-                        crate::session::ResumeAttemptPolicy::Allow
-                    } else {
-                        crate::session::ResumeAttemptPolicy::HonorAutoResumeSetting
+                    crate::session::ResumeLaunchOptions {
+                        resume_policy: if preparation == AgentPreparation::Ensure {
+                            crate::session::ResumeAttemptPolicy::Allow
+                        } else {
+                            crate::session::ResumeAttemptPolicy::HonorAutoResumeSetting
+                        },
+                        restart: true,
+                        conversation_carry,
                     },
-                    true,
                     generation,
                     hooks,
                 );

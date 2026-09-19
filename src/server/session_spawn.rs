@@ -530,8 +530,15 @@ pub(crate) async fn spawn_structured_session(
             native.adopt_runtime_fields(&instance)?;
         } else {
             let outcome = instance.finish_reserved_launch(
-                store, size.map(|size| (size.cols.get(), size.rows.get())), crate::session::ResumeAttemptPolicy::HonorAutoResumeSetting,
-                false, generation, hooks,
+                store,
+                size.map(|size| (size.cols.get(), size.rows.get())),
+                crate::session::ResumeLaunchOptions {
+                    resume_policy: crate::session::ResumeAttemptPolicy::HonorAutoResumeSetting,
+                    restart: false,
+                    conversation_carry: None,
+                },
+                generation,
+                hooks,
             );
             let _title = crate::session::acquire_session_title_lock(&instance.id)?;
             let _lifecycle = native.storage().acquire_instance_lifecycle_lock(&instance.id)?;

@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
-import { highlightSnippet } from "../../lib/snippetHighlighter";
+import { useMemo } from "react";
+import { File, Virtualizer } from "@pierre/diffs/react";
+import type { FileContents, FileOptions } from "@pierre/diffs";
 import { useShikiTheme } from "../../hooks/useShikiTheme";
-import { extensionToLanguage } from "./comments/language";
+import { DiffWorkerPoolProvider } from "./pierre/DiffWorkerPoolProvider";
 
 interface Props {
   /** Full file text to render. */
@@ -10,61 +11,49 @@ interface Props {
   filePath: string;
 }
 
+/** djb2 over the file text, as a 32-bit unsigned hex string. Not a checksum:
+ *  it only has to change when the content does, so an equal-length edit
+ *  remounts the renderer instead of keeping stale row measurements. */
+function hashContent(content: string): string {
+  let h = 5381;
+  for (let i = 0; i < content.length; i++) {
+    h = (h * 33) ^ content.charCodeAt(i);
+  }
+  return (h >>> 0).toString(16);
+}
+
 /**
- * Full-file viewer for an agent-cited file that has no diff against the base
- * (#1810). Syntax-highlights the whole file with the shared shiki highlighter,
- * mirroring the markdown code-block renderer, and falls back to a plain `<pre>`
- * while the grammar loads or for unknown languages.
+ * Full-file viewer for a file with no diff against the base (#1810, #4003).
+ * Renders through the same `@pierre/diffs` file renderer the diff pane drives,
+ * so a file pane and a diff pane of the same file share one gutter, one
+ * highlighter and one theme path. Line numbers come from the renderer; the
+ * library handles an unresolved grammar as plain text itself, so no local
+ * fallback or stale-markup guard is needed here.
+ *
+ * Continues the consolidation in #3913: #3958 moved highlighting onto this
+ * library, this moves whole-file rendering.
  */
 export function FullFileViewer({ content, filePath }: Props) {
-  const [html, setHtml] = useState<string | null>(null);
-  const shiki = useShikiTheme();
+  const { theme } = useShikiTheme();
 
-  // Drop stale highlighted markup when the rendered input changes, so a switch
-  // to an unknown-language or load-failing file can't keep painting the
-  // previous file's html. Synced at render time (not in an effect) to satisfy
-  // the set-state-in-effect lint, mirroring DiffFileViewer's syncKey pattern.
-  // NUL-delimited (as the escape sequence: a raw NUL byte in source makes
-  // git treat the file as binary) so field concatenations cannot collide.
-  const inputKey = `${filePath}\u0000${content.length}`;
-  const [handledKey, setHandledKey] = useState(inputKey);
-  if (inputKey !== handledKey) {
-    setHandledKey(inputKey);
-    setHtml(null);
-  }
+  const file = useMemo<FileContents>(() => ({ name: filePath, contents: content }), [filePath, content]);
 
-  useEffect(() => {
-    let cancelled = false;
-    const lang = extensionToLanguage(filePath);
-    if (!lang) return;
-    (async () => {
-      try {
-        const out = await highlightSnippet(content, {
-          langHint: lang,
-          theme: shiki.theme,
-          appearance: shiki.appearance,
-        });
-        if (cancelled) return;
-        if (out) setHtml(out);
-      } catch {
-        // Unknown lang or load failure: keep the plain-text fallback.
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [content, filePath, shiki.theme, shiki.appearance]);
+  const options = useMemo<FileOptions<undefined>>(() => ({ theme, disableFileHeader: true }), [theme]);
+
+  // Keyed on the path plus a content hash, standing in for DiffFileViewer's
+  // revision (the /file read carries no revision or etag to key on): the same
+  // path re-rendering with new content remeasures rows from scratch instead of
+  // reusing the previous file's layout. A length alone would miss an
+  // equal-length edit. See #4008 review.
+  const viewKey = useMemo(() => `${filePath}:${content.length}:${hashContent(content)}`, [filePath, content]);
 
   return (
-    <div className="flex-1 min-h-0 overflow-auto">
-      {html ? (
-        <div
-          className="px-3 py-2 text-xs [&_pre]:!bg-transparent [&_pre]:!m-0 [&_pre]:!p-0"
-          dangerouslySetInnerHTML={{ __html: html }}
-        />
-      ) : (
-        <pre className="px-3 py-2 text-xs font-mono text-text-primary whitespace-pre">{content}</pre>
-      )}
+    <div className="flex-1 min-h-0 flex flex-col">
+      <DiffWorkerPoolProvider>
+        <Virtualizer key={viewKey} className="flex-1 overflow-auto">
+          <File file={file} options={options} />
+        </Virtualizer>
+      </DiffWorkerPoolProvider>
     </div>
   );
 }

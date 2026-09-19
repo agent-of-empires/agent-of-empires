@@ -139,6 +139,17 @@ const CITYHALL_TAB_IDS = new Set<TabId>(["theme", "session", "mcp", "telemetry",
 const CITYHALL_SESSION_FIELDS = ["delete_to_trash", "confirm_delete", "trash_retention_days"];
 const CITYHALL_THEME_HIDDEN = ["color_mode", "idle_decay_minutes"];
 
+/** `session.*` fields the app shell reads into its own state and hands down by
+ *  context. Saving one has to re-read settings, or the shell keeps the old
+ *  value until a reload: the field is written and the surface it drives does
+ *  not move. Keep in step with `applyAppSettings` in App.tsx. */
+const SESSION_FIELDS_THE_APP_READS = new Set([
+  "row_tag",
+  "show_session_colors",
+  "show_diagnostics_pane",
+  "unread_indicator",
+]);
+
 // Fields the CityHall settings search may surface: only sections whose tab is in
 // the curated sidebar, and within those only the fields the curated tabs
 // actually render. Without this, search lists every advanced field (type "yolo"
@@ -547,7 +558,7 @@ export function SettingsView({
                 values={session}
                 onSaveField={saveSubField}
                 onAfterSave={(descriptor) => {
-                  if (descriptor.field === "row_tag" || descriptor.field === "show_session_colors") {
+                  if (SESSION_FIELDS_THE_APP_READS.has(descriptor.field)) {
                     return onSettingsRefresh();
                   }
                 }}

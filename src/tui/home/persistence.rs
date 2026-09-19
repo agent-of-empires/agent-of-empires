@@ -311,6 +311,7 @@ impl HomeView {
         target: &str,
         mut requested: Instance,
         baseline: Option<&Instance>,
+        account_swap: bool,
         before_commit: B,
     ) -> anyhow::Result<()>
     where
@@ -355,6 +356,7 @@ impl HomeView {
             target_storage,
             &before,
             &requested,
+            account_swap,
             |instances, candidate| {
                 if crate::session::is_duplicate_session(
                     instances.iter(),
