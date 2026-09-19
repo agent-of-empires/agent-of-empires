@@ -29,6 +29,7 @@ test("palette 'New scratch session' opens the wizard and launches a scratch sess
   // the Launch button + scratch callout prove the prefill plumbing fired.
   await expect(wizard.getByRole("button", { name: /Launch session/ })).toBeVisible({ timeout: 10_000 });
   await expect(wizard.getByText("Scratch session")).toBeVisible();
+  await expect(wizard.getByRole("button", { name: /Launch session/ })).toBeEnabled();
 
   await page.keyboard.press("ControlOrMeta+Enter");
 
