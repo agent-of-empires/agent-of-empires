@@ -3328,7 +3328,7 @@ impl HomeView {
     }
 
     /// "Auto-name now": run the agent one-shot title generator for the selected
-    /// still-default-named session, even when auto-rename-on-start is off (#3039).
+    /// session, even when auto-rename-on-start is off (#3039) and over a chosen title.
     /// Terminal sessions rename via a detached child, structured ones through the daemon.
     /// Best-effort, not a synchronous rename.
     fn auto_name_selected(&mut self) -> Option<Action> {
@@ -3356,16 +3356,6 @@ impl HomeView {
             return None;
         };
 
-        // Gate on a still-default name, mirroring the web action: never
-        // overwrite a title the user (or a prior rename) already chose.
-        if !crate::session::civilizations::is_default_civ_name(&title) {
-            self.info_dialog = Some(InfoDialog::new(
-                "Already Named",
-                "This session already has a custom name, so it will not be auto-named.",
-            ));
-            return None;
-        }
-
         if structured {
             return Some(Action::SmartRenameNow(id));
         }
@@ -3373,15 +3363,16 @@ impl HomeView {
         // Preflight the gates the detached child re-applies, so this action stops
         // reporting "auto-naming" for a session the child will silently drop
         // (#3159). The child stays the authority; this is feedback and
-        // fork avoidance. `setting_on = true` because the manual action runs even
-        // when auto-rename-on-start is off (#3039), matching the `--force` the
-        // child receives and the web endpoint's preflight.
+        // fork avoidance. `setting_on` and `force` are true because the manual
+        // action runs even when auto-rename-on-start is off (#3039) and over any
+        // title, matching the `--force` the child receives and the web preflight.
         let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
             &profile,
             std::path::Path::new(&project_path),
         );
         let cfg = crate::session::smart_rename::resolve_smart_rename_config(&resolved.session);
         if let Err(reason) = crate::session::smart_rename::check_eligible_resolved(
+            true,
             true,
             true,
             &title,

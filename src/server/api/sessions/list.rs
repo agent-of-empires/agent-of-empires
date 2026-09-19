@@ -234,6 +234,7 @@ pub async fn list_sessions(
             let eligible = check_eligible_resolved(
                 inst.is_structured(),
                 cfg.setting_on,
+                false,
                 &inst.title,
                 &inst.tool,
                 cfg.rename_agent,

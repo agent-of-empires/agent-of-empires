@@ -67,10 +67,12 @@ impl SkipReason {
     }
 }
 
-/// Single source of truth for "is this session eligible to be auto-named right now".
+/// Single source of truth for "is this session eligible to be auto-named right now". `force` is the
+/// manual "Auto-name now" action, which may regenerate over an already-chosen title.
 pub fn check_eligible(
     structured: bool,
     setting_on: bool,
+    force: bool,
     title: &str,
     agent: Option<&agents::AgentDef>,
     command: &str,
@@ -82,7 +84,7 @@ pub fn check_eligible(
     if !setting_on {
         return Err(SkipReason::Disabled);
     }
-    if !is_default_civ_name(title) {
+    if !force && !is_default_civ_name(title) {
         return Err(SkipReason::NameNotDefault);
     }
     let Some(agent) = agent else {
@@ -116,6 +118,7 @@ pub fn resolve_rename_tool<'a>(session_tool: &'a str, rename_setting: &'a str) -
 pub fn check_eligible_resolved(
     structured: bool,
     setting_on: bool,
+    force: bool,
     title: &str,
     session_tool: &str,
     rename_setting: &str,
@@ -133,6 +136,7 @@ pub fn check_eligible_resolved(
     check_eligible(
         structured,
         setting_on,
+        force,
         title,
         agent,
         command,
@@ -483,10 +487,16 @@ pub(crate) async fn resolve_oneshot_target(
     }
 }
 
-/// Whether an automatic renamer may overwrite this session's title: either it is still a default
-/// civ name (never explicitly set), or it still matches the last title an auto renamer wrote.
-pub(crate) fn title_is_auto_overwritable(inst: &crate::session::instance::Instance) -> bool {
-    is_default_civ_name(&inst.title) || inst.last_auto_title.as_deref() == Some(inst.title.as_str())
+/// Whether a renamer may overwrite this session's title: `force` (the manual "Auto-name now"
+/// action) always may; otherwise only a still-default civ name or the last title an auto renamer
+/// wrote.
+pub(crate) fn title_is_auto_overwritable(
+    inst: &crate::session::instance::Instance,
+    force: bool,
+) -> bool {
+    force
+        || is_default_civ_name(&inst.title)
+        || inst.last_auto_title.as_deref() == Some(inst.title.as_str())
 }
 
 // Terminal (non-ACP) smart rename.
@@ -512,6 +522,7 @@ pub fn maybe_spawn_terminal_smart_rename(inst: &crate::session::instance::Instan
     if check_eligible_resolved(
         true,
         cfg.setting_on,
+        false,
         &inst.title,
         &inst.tool,
         cfg.rename_agent,
@@ -526,7 +537,8 @@ pub fn maybe_spawn_terminal_smart_rename(inst: &crate::session::instance::Instan
     spawn_detached(&inst.source_profile, &inst.id, false);
 }
 
-/// Spawn an on-demand terminal rename for a session, forcing past the `smart_rename`-disabled gate.
+/// Spawn an on-demand terminal rename for a session, forcing past the `smart_rename`-disabled and
+/// name-not-default gates.
 pub fn spawn_smart_rename_now(profile: &str, session_id: &str) {
     spawn_detached(profile, session_id, true);
 }
@@ -730,11 +742,13 @@ fn extract_echo_baseline(context: &str) -> String {
         .to_string()
 }
 
-/// Persist the outcome of a terminal one-shot.
+/// Persist the outcome of a terminal one-shot. Without `force`, a manual rename that landed during
+/// the one-shot wins.
 fn apply_terminal_title(
     storage: &crate::session::storage::Storage,
     id: &str,
     new_title: Option<&str>,
+    force: bool,
 ) -> anyhow::Result<()> {
     let id = id.to_string();
     let new_title = new_title.map(str::to_string);
@@ -746,7 +760,7 @@ fn apply_terminal_title(
         if let Some(index) = instances.iter().position(|instance| instance.id == id) {
             instances[index].smart_rename_attempted = true;
             if let Some(title) = &new_title {
-                let should_write = title_is_auto_overwritable(&instances[index])
+                let should_write = title_is_auto_overwritable(&instances[index], force)
                     && instances[index].title != *title;
                 // Manual and automatic rename paths share one domain predicate; exclude this row
                 // explicitly so the uniqueness contract does not depend on `should_write` remaining
@@ -877,6 +891,7 @@ pub async fn run_terminal_rename(
         // this deliberate terminal trigger.
         true,
         cfg.setting_on || force,
+        force,
         &title,
         &tool,
         cfg.rename_agent,
@@ -945,7 +960,7 @@ pub async fn run_terminal_rename(
         return Ok(());
     };
     let new_title = sanitize_title(&raw, &baseline);
-    apply_terminal_title(&storage, session_id, new_title.as_deref())?;
+    apply_terminal_title(&storage, session_id, new_title.as_deref(), force)?;
     Ok(())
 }
 
@@ -1057,6 +1072,7 @@ mod serve {
         let agent = match check_eligible_resolved(
             structured,
             cfg.setting_on || force,
+            force,
             &title,
             &tool,
             cfg.rename_agent,
@@ -1128,15 +1144,17 @@ mod serve {
 
         // Serialization against manual rename / worktree edits is handled
         // inside apply_auto_title via the per-session instance lock.
-        apply_auto_title(&state, &session_id, &profile, &new_title).await;
+        apply_auto_title(&state, &session_id, &profile, &new_title, force).await;
     }
 
-    /// Persist an automatically generated title and mirror it into AppState.
+    /// Persist a generated title and mirror it into AppState. Without `force`, a manual rename that
+    /// landed during the one-shot wins.
     pub(crate) async fn apply_auto_title(
         state: &Arc<AppState>,
         id: &str,
         profile: &str,
         new_title: &str,
+        force: bool,
     ) {
         let lock = state.instance_lock(id).await;
         let _serialized = lock.lock().await;
@@ -1168,7 +1186,7 @@ mod serve {
                 // Manual and automatic rename paths share one domain predicate; exclude this row
                 // explicitly so a future no-op policy change cannot make the row collide with
                 // itself.
-                let should_write = title_is_auto_overwritable(&instances[index])
+                let should_write = title_is_auto_overwritable(&instances[index], force)
                     && instances[index].title != title_owned;
                 let path = instances[index].project_path.clone();
                 let duplicate = should_write
@@ -1242,7 +1260,7 @@ mod serve {
                 .unwrap();
             let state = crate::server::test_support::build_test_app_state(vec![target, owner]);
 
-            apply_auto_title(&state, &target_id, "default", "Already owned").await;
+            apply_auto_title(&state, &target_id, "default", "Already owned", false).await;
 
             let persisted = storage.load().unwrap();
             assert_eq!(
@@ -1262,6 +1280,38 @@ mod serve {
                     .title,
                 "Franks"
             );
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn apply_auto_title_forced_overwrites_a_manual_title() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let storage =
+                crate::session::storage::Storage::new_unwatched("default").expect("storage");
+            let mut manual = crate::session::Instance::new("Britons", "/tmp/y");
+            manual.source_profile = "default".to_string();
+            manual.title = "Hand-picked".to_string();
+            let manual_id = manual.id.clone();
+            storage
+                .update(|instances, _groups| {
+                    *instances = vec![manual.clone()];
+                    Ok(())
+                })
+                .unwrap();
+            let state = crate::server::test_support::build_test_app_state(vec![manual]);
+
+            apply_auto_title(&state, &manual_id, "default", "Regenerated title", true).await;
+
+            let title_of = |instances: &[crate::session::Instance]| {
+                instances
+                    .iter()
+                    .find(|instance| instance.id == manual_id)
+                    .unwrap()
+                    .title
+                    .clone()
+            };
+            assert_eq!(title_of(&storage.load().unwrap()), "Regenerated title");
+            assert_eq!(title_of(&state.instances.read().await), "Regenerated title");
         }
 
         #[test]
@@ -1311,21 +1361,23 @@ mod serve {
             use crate::session::instance::Instance;
             // A still-default civ name is overwritable.
             let mut inst = Instance::new("Britons", "/tmp");
-            assert!(title_is_auto_overwritable(&inst));
+            assert!(title_is_auto_overwritable(&inst, false));
             // After an auto write, title == last_auto_title, so a forced
             // retry can still replace an automatic title.
             inst.title = "Fix login redirect".to_string();
             inst.last_auto_title = Some("Fix login redirect".to_string());
-            assert!(title_is_auto_overwritable(&inst));
+            assert!(title_is_auto_overwritable(&inst, false));
             // A manual rename diverges title from last_auto_title: frozen.
             inst.title = "Production hotfix".to_string();
-            assert!(!title_is_auto_overwritable(&inst));
+            assert!(!title_is_auto_overwritable(&inst, false));
             // Legacy record: a non-default title with no recorded auto title
             // is left untouched.
             let mut legacy = Instance::new("Vikings", "/tmp");
             legacy.title = "Hand-picked name".to_string();
             legacy.last_auto_title = None;
-            assert!(!title_is_auto_overwritable(&legacy));
+            assert!(!title_is_auto_overwritable(&legacy, false));
+            // The manual "Auto-name now" action may overwrite even a hand-picked title.
+            assert!(title_is_auto_overwritable(&legacy, true));
         }
 
         #[test]
@@ -1516,27 +1568,28 @@ mod tests {
     #[test]
     fn check_eligible_reasons() {
         let c = Some(claude());
-        assert!(check_eligible(true, true, "Vikings", c, "", false).is_ok());
+        assert!(check_eligible(true, true, false, "Vikings", c, "", false).is_ok());
         assert_eq!(
-            check_eligible(false, true, "Vikings", c, "", false),
+            check_eligible(false, true, false, "Vikings", c, "", false),
             Err(SkipReason::NotStructured)
         );
         assert_eq!(
-            check_eligible(true, false, "Vikings", c, "", false),
+            check_eligible(true, false, false, "Vikings", c, "", false),
             Err(SkipReason::Disabled)
         );
         assert_eq!(
-            check_eligible(true, true, "Fix login bug", c, "", false),
+            check_eligible(true, true, false, "Fix login bug", c, "", false),
             Err(SkipReason::NameNotDefault)
         );
         assert_eq!(
-            check_eligible(true, true, "Vikings", None, "", false),
+            check_eligible(true, true, false, "Vikings", None, "", false),
             Err(SkipReason::NoOneshot)
         );
         assert_eq!(
             check_eligible(
                 true,
                 true,
+                false,
                 "Vikings",
                 Some(agents::get_agent("cursor").unwrap()),
                 "",
@@ -1545,14 +1598,14 @@ mod tests {
             Err(SkipReason::NoOneshot)
         );
         assert_eq!(
-            check_eligible(true, true, "Vikings", c, "", true),
+            check_eligible(true, true, false, "Vikings", c, "", true),
             Err(SkipReason::CommandOverridden)
         );
         assert_eq!(
-            check_eligible(true, true, "Vikings", c, "my-wrapper", false),
+            check_eligible(true, true, false, "Vikings", c, "my-wrapper", false),
             Err(SkipReason::CommandOverridden)
         );
-        assert!(check_eligible(true, true, "Vikings", c, "claude", false).is_ok());
+        assert!(check_eligible(true, true, false, "Vikings", c, "claude", false).is_ok());
     }
 
     #[test]
@@ -1562,6 +1615,7 @@ mod tests {
             check_eligible_resolved(
                 true,
                 true,
+                false,
                 "Vikings",
                 "claude",
                 rename_agent,
@@ -1651,17 +1705,17 @@ mod tests {
     }
 
     #[test]
-    fn manual_force_bypasses_only_the_disabled_gate() {
+    fn manual_force_bypasses_the_disabled_and_name_gates_only() {
         let c = Some(claude());
         let auto = false;
         let force = true;
         assert_eq!(
-            check_eligible(true, auto, "Vikings", c, "", false),
+            check_eligible(true, auto, false, "Vikings", c, "", false),
             Err(SkipReason::Disabled),
             "automatic path must still honor the disabled setting"
         );
         assert!(
-            check_eligible(true, auto || force, "Vikings", c, "", false).is_ok(),
+            check_eligible(true, auto || force, force, "Vikings", c, "", false).is_ok(),
             "manual force must bypass the disabled gate"
         );
         assert!(
@@ -1669,6 +1723,7 @@ mod tests {
                 check_eligible_resolved(
                     true,
                     auto || force,
+                    force,
                     "Vikings",
                     "claude",
                     "codex",
@@ -1680,23 +1735,22 @@ mod tests {
             ),
             "sandbox rename-agent gate still applies when forced"
         );
-        assert_eq!(
-            check_eligible(true, auto || force, "Fix login bug", c, "", false),
-            Err(SkipReason::NameNotDefault),
-            "already-named gate still applies when forced"
+        assert!(
+            check_eligible(true, auto || force, force, "Fix login bug", c, "", false).is_ok(),
+            "manual force must bypass the already-named gate too"
         );
         assert_eq!(
-            check_eligible(false, auto || force, "Vikings", c, "", false),
+            check_eligible(false, auto || force, force, "Vikings", c, "", false),
             Err(SkipReason::NotStructured),
             "structured gate still applies when forced"
         );
         assert_eq!(
-            check_eligible(true, auto || force, "Vikings", None, "", false),
+            check_eligible(true, auto || force, force, "Vikings", None, "", false),
             Err(SkipReason::NoOneshot),
             "no-one-shot gate still applies when forced"
         );
         assert_eq!(
-            check_eligible(true, auto || force, "Vikings", c, "", true),
+            check_eligible(true, auto || force, force, "Vikings", c, "", true),
             Err(SkipReason::CommandOverridden),
             "command-override gate still applies when forced"
         );
@@ -1746,6 +1800,7 @@ mod tests {
             check_eligible_resolved(
                 true,
                 true,
+                false,
                 "Vikings",
                 "claude",
                 rename_agent,
@@ -1777,7 +1832,7 @@ mod tests {
 
         assert!(
             check_eligible_resolved(
-                true, true, "Vikings", "opencode", "claude", false, "opencode", &none
+                true, true, false, "Vikings", "opencode", "claude", false, "opencode", &none
             )
             .is_ok(),
             "the session's own command is irrelevant to a distinct rename agent"
@@ -1999,6 +2054,7 @@ claude = "repo-wrapper"
         let agent = check_eligible_resolved(
             true,
             cfg.setting_on,
+            false,
             "Vikings",
             "claude",
             cfg.rename_agent,
@@ -2014,27 +2070,30 @@ claude = "repo-wrapper"
     fn terminal_eligibility_reasons() {
         let overrides = HashMap::new();
         assert!(check_eligible_resolved(
-            true, true, "Vikings", "claude", "", false, "", &overrides
+            true, true, false, "Vikings", "claude", "", false, "", &overrides
         )
         .is_ok());
-        assert!(
-            check_eligible_resolved(true, true, "Vikings", "claude", "", true, "", &overrides)
-                .is_ok()
-        );
+        assert!(check_eligible_resolved(
+            true, true, false, "Vikings", "claude", "", true, "", &overrides
+        )
+        .is_ok());
         assert!(matches!(
-            check_eligible_resolved(true, true, "Vikings", "cursor", "", false, "", &overrides),
+            check_eligible_resolved(
+                true, true, false, "Vikings", "cursor", "", false, "", &overrides
+            ),
             Err(SkipReason::NoOneshot)
         ));
         let mut ov = HashMap::new();
         ov.insert("claude".to_string(), "my-wrapper".to_string());
         assert!(matches!(
-            check_eligible_resolved(true, true, "Vikings", "claude", "", false, "", &ov),
+            check_eligible_resolved(true, true, false, "Vikings", "claude", "", false, "", &ov),
             Err(SkipReason::CommandOverridden)
         ));
         assert!(matches!(
             check_eligible_resolved(
                 true,
                 true,
+                false,
                 "Fix login bug",
                 "claude",
                 "",
@@ -2140,7 +2199,7 @@ claude = "repo-wrapper"
             let _observer =
                 crate::session::storage::observe_lock_contention_for_test(identity_contended_tx);
             let storage = Storage::new_unwatched("identity-lock").unwrap();
-            apply_terminal_title(&storage, &writer_id, Some("Shared title")).unwrap();
+            apply_terminal_title(&storage, &writer_id, Some("Shared title"), false).unwrap();
             finished_tx.send(()).unwrap();
         });
         let contended = identity_contended_rx.recv_timeout(std::time::Duration::from_secs(2));
@@ -2179,7 +2238,7 @@ claude = "repo-wrapper"
             })
             .unwrap();
 
-        apply_terminal_title(&storage, &civ_id, Some("Fix login bug")).unwrap();
+        apply_terminal_title(&storage, &civ_id, Some("Fix login bug"), false).unwrap();
 
         let inst = storage
             .load()
@@ -2214,8 +2273,8 @@ claude = "repo-wrapper"
             })
             .unwrap();
 
-        apply_terminal_title(&storage, &manual_id, Some("Should Not Apply")).unwrap();
-        apply_terminal_title(&storage, &duplicate_id, Some("Already owned")).unwrap();
+        apply_terminal_title(&storage, &manual_id, Some("Should Not Apply"), false).unwrap();
+        apply_terminal_title(&storage, &duplicate_id, Some("Already owned"), false).unwrap();
 
         let instances = storage.load().unwrap();
         let manual = instances.iter().find(|i| i.id == manual_id).unwrap();
@@ -2225,6 +2284,33 @@ claude = "repo-wrapper"
         assert_eq!(duplicate.title, "Franks");
         assert_eq!(duplicate.last_auto_title, None);
         assert!(duplicate.smart_rename_attempted);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_terminal_title_forced_overwrites_a_manual_title() {
+        use crate::session::instance::Instance;
+        use crate::session::storage::Storage;
+        let home = tempfile::tempdir().expect("tempdir HOME");
+        let _home_guard = crate::session::test_support::isolate_home(home.path());
+        let storage = Storage::new_unwatched("default").expect("storage");
+        let mut manual = Instance::new("Britons", "/tmp/y");
+        manual.title = "Hand-picked".to_string();
+        let manual_id = manual.id.clone();
+        storage
+            .update(|instances, _groups| {
+                instances.push(manual);
+                Ok(())
+            })
+            .unwrap();
+
+        apply_terminal_title(&storage, &manual_id, Some("Regenerated title"), true).unwrap();
+
+        let instances = storage.load().unwrap();
+        let manual = instances.iter().find(|i| i.id == manual_id).unwrap();
+        assert_eq!(manual.title, "Regenerated title");
+        assert_eq!(manual.last_auto_title.as_deref(), Some("Regenerated title"));
+        assert!(manual.smart_rename_attempted);
     }
 
     #[test]
@@ -2266,7 +2352,7 @@ claude = "repo-wrapper"
         };
 
         storage.set_fail_writes_for_test(true);
-        let error = apply_terminal_title(&storage, &failed_id, Some("Must Not Land"))
+        let error = apply_terminal_title(&storage, &failed_id, Some("Must Not Land"), false)
             .expect_err("injected persistence failure must abort the title mutation");
         assert!(error
             .to_string()
@@ -2326,7 +2412,7 @@ claude = "repo-wrapper"
         );
         crate::tmux::refresh_session_cache();
 
-        apply_terminal_title(&storage, &civ_id, Some("Fix login bug")).unwrap();
+        apply_terminal_title(&storage, &civ_id, Some("Fix login bug"), false).unwrap();
 
         assert!(!crate::tmux::Session::from_name(&old_tmux_name).exists());
         assert!(
