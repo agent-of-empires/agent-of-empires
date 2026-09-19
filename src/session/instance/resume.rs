@@ -606,7 +606,7 @@ mod tests {
             .expect("execution");
         assert_eq!(
             resumed.binding.stores.first(),
-            Some(&home.join("dot-claude-2")),
+            Some(&home.join("dot-claude-2").canonicalize().unwrap()),
             "account swap must consume target store"
         );
     }
@@ -672,7 +672,7 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         let relative = std::path::Path::new("projects")
             .join(crate::session::capture::encode_claude_project_path(
-                &project.to_string_lossy(),
+                &project.canonicalize().unwrap().to_string_lossy(),
             ))
             .join(format!("{SID}.jsonl"));
         for (root, content, seconds) in [
@@ -774,7 +774,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .stores,
-            vec![destination]
+            vec![destination.canonicalize().unwrap()]
         );
     }
 
