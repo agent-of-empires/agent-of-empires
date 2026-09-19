@@ -57,6 +57,10 @@ pub(super) struct PreparedLaunch {
     pub(super) execution: Option<super::execution::NativeExecution>,
     pub(super) fresh_notice: Option<FreshLaunchNotice>,
     pub(super) abandoned_conversation: Option<ConversationBinding>,
+    /// A known conversation was physically relocated before this launch; the
+    /// finalize step must confirm the durable row carries the relocated state
+    /// before the restart can claim success.
+    pub(super) carry_relocated: bool,
 }
 
 /// Append yolo-mode flags or environment variables to a launch command.
@@ -659,6 +663,7 @@ impl Instance {
             execution,
             fresh_notice,
             abandoned_conversation,
+            carry_relocated: false,
         })
     }
 

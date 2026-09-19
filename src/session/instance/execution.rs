@@ -1798,6 +1798,31 @@ impl Instance {
         );
         Ok(())
     }
+    /// The native execution the carry must attest before copying anything.
+    ///
+    /// Resolving without the source binding keeps the recorded store from
+    /// masking the configured destination, and the identity match then proves
+    /// the conversation's context (cwd, configuration, filesystem) survives
+    /// the store relocation.
+    pub(crate) fn attested_carry_destination(&self) -> Result<ExecutionBinding> {
+        let native = self.resolve_native_execution(None)?;
+        anyhow::ensure!(
+            native.agent.name == "claude" && native.binding.filesystem == "host",
+            "conversation carry requires a host Claude launch destination"
+        );
+        Ok(native.binding)
+    }
+
+    /// Whether a conversation binding's context survives relocation to
+    /// `destination` with only its store replaced.
+    pub(crate) fn execution_matches_destination(
+        execution: &ExecutionBinding,
+        destination: &ExecutionBinding,
+    ) -> bool {
+        let mut expected = execution.clone();
+        expected.stores = destination.stores.clone();
+        Self::execution_identity_matches(&expected, destination)
+    }
 }
 
 pub(super) fn validate_managed_arguments(

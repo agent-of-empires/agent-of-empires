@@ -310,7 +310,7 @@ impl Instance {
         Ok(())
     }
 
-    fn resolved_host_home(&self) -> Option<std::path::PathBuf> {
+    pub(super) fn resolved_host_home(&self) -> Option<std::path::PathBuf> {
         crate::session::environment::resolve_host_environment_value(
             &self.resolved_host_environment(),
             "HOME",

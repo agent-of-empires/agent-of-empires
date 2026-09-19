@@ -620,19 +620,16 @@ impl Instance {
                         crate::session::capture::claude_host_transcript_confirmed_absent(
                             execution.inputs.cwd.to_str().unwrap_or(&self.project_path),
                             &stored,
-                            root,
+                            &[],
+                            Some(root),
                         )
                     }),
-                    None => crate::session::capture::claude_home_for_host_environment(
+                    None => crate::session::capture::claude_host_transcript_confirmed_absent(
+                        &self.project_path,
+                        &stored,
                         &self.resolved_host_environment(),
-                    )
-                    .is_ok_and(|root| {
-                        crate::session::capture::claude_host_transcript_confirmed_absent(
-                            &self.project_path,
-                            &stored,
-                            &root,
-                        )
-                    }),
+                        self.declared_agent_config_dir_for(&self.tool).as_deref(),
+                    ),
                 };
             if absent {
                 tracing::info!(

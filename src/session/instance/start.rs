@@ -437,7 +437,7 @@ impl Instance {
             profile,
             &prepared.expected_conversation,
             omp_capture_metadata,
-            canonicalized,
+            canonicalized || prepared.carry_relocated,
         )?;
 
         #[cfg(test)]
@@ -458,7 +458,7 @@ impl Instance {
         profile: &str,
         expected: &ConversationState,
         mut omp_capture_metadata: Option<OmpCaptureMetadata>,
-        canonicalized: bool,
+        confirm_desired_conversation: bool,
     ) -> Result<()> {
         if let Some(metadata) = omp_capture_metadata.as_ref() {
             let published = serde_json::to_string(metadata).ok().and_then(|encoded| {
@@ -481,9 +481,16 @@ impl Instance {
             }
         }
 
-        let desired = canonicalized.then(|| {
+        let desired = confirm_desired_conversation.then(|| {
             let mut desired = self.conversation_state();
-            if matches!(desired.intent, ResumeIntent::Use(_)) && self.launch_has_session_publisher()
+            // Mirror persist_session_id's promotion of one-shot launch
+            // directives, or the comparison below would reject the state it
+            // itself produces for Cleared, Fork and publisher-pinned Use.
+            if matches!(
+                desired.intent,
+                ResumeIntent::Cleared | ResumeIntent::Fork { .. }
+            ) || (matches!(desired.intent, ResumeIntent::Use(_))
+                && self.launch_has_session_publisher())
             {
                 desired.intent = ResumeIntent::Default;
                 desired.resume_binding = None;
@@ -495,7 +502,7 @@ impl Instance {
             !matches!(outcome, SidPersistOutcome::Published) || !desired.matches(self)
         }) {
             self.reconcile_from_disk();
-            anyhow::bail!("Hermes canonical publication was not confirmed; durable reconciliation was attempted but may be unavailable, and the pane may remain if reservation verification or teardown fails");
+            anyhow::bail!("durable publication was not confirmed; durable reconciliation was attempted but may be unavailable, and the pane may remain if reservation verification or teardown fails");
         }
 
         // Skip outcomes leave AOE_CAPTURED_SESSION_ID untouched: this path

@@ -3,9 +3,9 @@
 use anyhow::{bail, Context, Result};
 use nix::dir::Dir;
 use nix::errno::Errno;
-use nix::fcntl::{open, openat, AtFlags, OFlag};
+use nix::fcntl::{open, openat, renameat, AtFlags, OFlag};
 use nix::sys::stat::{fstat, fstatat, mkdirat, Mode};
-use nix::unistd::{unlinkat, UnlinkatFlags};
+use nix::unistd::{linkat, unlinkat, UnlinkatFlags};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::Read;
@@ -144,6 +144,23 @@ impl AnchoredDir {
         Ok(Some(bytes))
     }
 
+    /// Create `relative` for writing, or `None` when an entry is already
+    /// there. `O_EXCL | O_NOFOLLOW` so a planted symlink is never followed
+    /// and an existing file is never truncated.
+    pub(crate) fn create_new_regular(&self, relative: &Path) -> Result<Option<File>> {
+        let (parent, leaf) = self.open_parent(relative)?;
+        match openat(
+            &parent,
+            leaf.as_os_str(),
+            OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_WRONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::S_IRUSR | Mode::S_IWUSR,
+        ) {
+            Ok(fd) => Ok(Some(File::from(fd))),
+            Err(Errno::EEXIST) => Ok(None),
+            Err(error) => Err(error).context("creating anchored file"),
+        }
+    }
+
     pub(crate) fn read_dir(&self, relative: &Path, max_entries: usize) -> Result<Vec<OsString>> {
         let fd = self.open_dir(relative)?;
         let mut dir = Dir::from_fd(fd)?;
@@ -200,6 +217,45 @@ impl AnchoredDir {
 
     pub(crate) fn regular_exists(&self, relative: &Path) -> bool {
         matches!(self.regular_lookup(relative), Ok(Some(true)))
+    }
+
+    /// Publish the staging file `from` at `to` and drop the staging name.
+    /// `false` means something was already at `to` and was left untouched,
+    /// which only happens when `replace` is unset.
+    ///
+    /// Makes a file visible only once it is complete, so a process killed
+    /// mid-write leaves a staging name rather than a half file under the real
+    /// one. Without `replace` this is `linkat`, not `renameat`, because rename
+    /// replaces the destination: a writer that created `to` between a caller's
+    /// existence check and this call would lose its file.
+    /// `renameat2(RENAME_NOREPLACE)` would also answer, but it is Linux-only
+    /// and this has to hold on macOS.
+    pub(crate) fn publish_staged(&self, from: &Path, to: &Path, replace: bool) -> Result<bool> {
+        let (from_parent, from_leaf) = self.open_parent(from)?;
+        let (to_parent, to_leaf) = self.open_parent(to)?;
+        if replace {
+            renameat(
+                &from_parent,
+                from_leaf.as_os_str(),
+                &to_parent,
+                to_leaf.as_os_str(),
+            )
+            .context("replacing anchored file")?;
+            return Ok(true);
+        }
+        let published = match linkat(
+            &from_parent,
+            from_leaf.as_os_str(),
+            &to_parent,
+            to_leaf.as_os_str(),
+            AtFlags::empty(),
+        ) {
+            Ok(()) => true,
+            Err(Errno::EEXIST) => false,
+            Err(error) => return Err(error).context("publishing anchored file"),
+        };
+        self.remove_file(from)?;
+        Ok(published)
     }
 
     pub(crate) fn remove_file(&self, relative: &Path) -> Result<()> {

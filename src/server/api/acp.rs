@@ -2157,12 +2157,6 @@ pub async fn acp_enable(
     let claude_store_pin = selected_conversation
         .as_ref()
         .and_then(|(_, execution)| execution.stores.first().cloned());
-    // #2252 direction B: a claude terminal session's resumable transcript lives
-    // in `agent_session_id`, not `acp_session_id`. When present on the host (the
-    // seeded `session/load` hard-fails on a missing id), carry it into the
-    // structured spawn so the conversation continues in structured view. The
-    // in-container transcript can't be probed from the host, so sandboxed
-    // sessions attempt the load unconditionally. The probe resolves through the
     let resume_sid = selected_conversation
         .as_ref()
         .map(|(sid, _)| sid.as_str())
@@ -2170,21 +2164,14 @@ pub async fn acp_enable(
     let transcript_present = instance.is_sandboxed()
         || resume_sid
             .map(|sid| {
-                let home = match &claude_store_pin {
-                    Some(store) => Some(store.clone()),
-                    None => crate::session::capture::claude_home_for_host_environment(
-                        &instance.resolved_host_environment(),
-                    )
-                    .ok(),
-                };
-                home.map(|home| {
-                    !crate::session::capture::claude_host_transcript_confirmed_absent(
-                        &instance.project_path,
-                        sid,
-                        &home,
-                    )
-                })
-                .unwrap_or(true)
+                !crate::session::capture::claude_host_transcript_confirmed_absent(
+                    &instance.project_path,
+                    sid,
+                    &instance.resolved_host_environment(),
+                    claude_store_pin.as_deref().or(instance
+                        .declared_agent_config_dir_for(&instance.tool)
+                        .as_deref()),
+                )
             })
             .unwrap_or(false);
     let seed = resolve_structured_seed(

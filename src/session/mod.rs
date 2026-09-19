@@ -12,6 +12,7 @@ pub(crate) mod claim;
 // `acp` because terminal/tmux import via the CLI does not involve ACP.
 pub mod claude_import;
 pub mod config;
+pub mod conversation_carry;
 // Depends on `crate::acp` (Event / event store) and is only driven from the
 // serve daemon. See #2808.
 pub mod conversation_summary;
@@ -69,6 +70,8 @@ pub use groups::{
     TRASH_SECTION_PATH,
 };
 #[cfg(test)]
+pub(crate) use instance::install_aliases;
+#[cfg(test)]
 pub(crate) use instance::test_helpers::publish_host_pi_transcript;
 pub(crate) use instance::{
     duplicate_session_error, find_duplicate_session, is_duplicate_session,
@@ -76,8 +79,8 @@ pub(crate) use instance::{
     NEWER_GENERATION_BUSY_REASON,
 };
 pub(crate) use instance::{
-    generic_host_config_path_for, sidecar_host_config_path_for, ConversationState,
-    ResumeAttemptPolicy, TerminalContextResume,
+    generic_host_config_path_for, resolved_agent_for, sidecar_host_config_path_for,
+    ConversationState, ResumeAttemptPolicy, TerminalContextResume,
 };
 pub use instance::{
     is_valid_session_color, ConversationBinding, ConversationProvenance, DetectionState,
