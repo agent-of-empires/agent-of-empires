@@ -3,6 +3,7 @@ import { lazy, Suspense } from "react";
 import { TerminalSessionStack } from "./TerminalSessionStack";
 import { PairedShellPane } from "./PairedTerminal";
 import { BackgroundAgentsPanel } from "./acp/BackgroundAgentsPanel";
+import { FilesPane } from "./FilesPane";
 import { DiffFileList } from "./diff/DiffFileList";
 import { DiffFileViewer } from "./diff/DiffFileViewer";
 import { CommentsBanner } from "./diff/comments/CommentsBanner";
@@ -92,11 +93,13 @@ export function MobileMainPane({
   const viewLabel =
     view === "diff"
       ? "Diff"
-      : view === "paired"
-        ? "Paired terminal"
-        : view === "agents"
-          ? "Sub agents"
-          : (activePluginPane?.title ?? "Plugin");
+      : view === "files"
+        ? "Files"
+        : view === "paired"
+          ? "Paired terminal"
+          : view === "agents"
+            ? "Sub agents"
+            : (activePluginPane?.title ?? "Plugin");
 
   return (
     <div className="flex-1 flex flex-col min-h-0">
@@ -215,6 +218,15 @@ export function MobileMainPane({
             style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
           >
             <BackgroundAgentsPanel sessionId={activeSessionId} />
+          </div>
+        )}
+
+        {view === "files" && (
+          <div
+            className="absolute inset-0 z-10 flex flex-col min-h-0 overflow-hidden bg-surface-900"
+            style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
+          >
+            <FilesPane key={activeSessionId ?? "none"} sessionId={activeSessionId} />
           </div>
         )}
 

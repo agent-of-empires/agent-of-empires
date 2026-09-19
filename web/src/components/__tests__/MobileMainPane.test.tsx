@@ -42,6 +42,9 @@ vi.mock("../acp/BackgroundAgentsPanel", () => ({
     <div data-testid="background-agents-panel">{sessionId}</div>
   ),
 }));
+vi.mock("../FilesPane", () => ({
+  FilesPane: ({ sessionId }: { sessionId: string | null }) => <div data-testid="files-pane">{sessionId}</div>,
+}));
 
 import { MobileMainPane } from "../MobileMainPane";
 
@@ -155,6 +158,13 @@ describe("MobileMainPane", () => {
     setup({ view: "agents", activeSessionId: "s1" });
     expect(screen.getByTestId("background-agents-panel").textContent).toBe("s1");
     expect(screen.getByText("Sub agents")).toBeDefined();
+    expect(screen.getByTestId("mobile-back-to-agent")).toBeDefined();
+  });
+
+  it("shows the files pane in files view", () => {
+    setup({ view: "files", activeSessionId: "s1" });
+    expect(screen.getByTestId("files-pane").textContent).toBe("s1");
+    expect(screen.getByText("Files")).toBeDefined();
     expect(screen.getByTestId("mobile-back-to-agent")).toBeDefined();
   });
 
