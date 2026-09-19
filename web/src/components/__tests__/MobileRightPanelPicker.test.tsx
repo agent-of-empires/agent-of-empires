@@ -13,6 +13,7 @@ function setup(overrides: Partial<Parameters<typeof MobileRightPanelPicker>[0]> 
       open
       active="agent"
       pluginPanes={[]}
+      showAgents={false}
       onSelect={onSelect}
       onClose={onClose}
       {...overrides}
@@ -42,6 +43,17 @@ describe("MobileRightPanelPicker", () => {
     const { onSelect } = setup();
     fireEvent.click(screen.getByTestId("mobile-right-panel-pick-diff"));
     expect(onSelect).toHaveBeenCalledWith("diff");
+  });
+
+  it("hides the Sub agents entry for non-structured sessions", () => {
+    setup({ showAgents: false });
+    expect(screen.queryByTestId("mobile-right-panel-pick-agents")).toBeNull();
+  });
+
+  it("shows the Sub agents entry and selects it for structured sessions", () => {
+    const { onSelect } = setup({ showAgents: true });
+    fireEvent.click(screen.getByTestId("mobile-right-panel-pick-agents"));
+    expect(onSelect).toHaveBeenCalledWith("agents");
   });
 
   it("lists plugin panes after the built-ins and selects them by id", () => {

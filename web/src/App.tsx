@@ -1806,6 +1806,7 @@ function AppContent({
           view={rightPanelView}
           pluginPanes={pluginPanes}
           onBackToAgent={() => handlePickView("agent")}
+          onOpenAgentsPane={() => handlePickView("agents")}
           pairedMounted={pairedMounted}
           activeSession={activeSession ?? null}
           activeSessionId={activeSessionId}
@@ -2404,6 +2405,7 @@ function AppContent({
             open={pickerOpen && singlePane}
             active={rightPanelView}
             pluginPanes={pluginPanes}
+            showAgents={activeSession?.view === "structured"}
             onSelect={handlePickView}
             onClose={() => setPickerOpen(false)}
           />

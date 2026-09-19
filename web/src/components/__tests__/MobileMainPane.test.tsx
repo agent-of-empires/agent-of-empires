@@ -37,6 +37,11 @@ vi.mock("../diff/comments/SendCommentsDialog", () => ({
 vi.mock("../acp/StructuredView", () => ({
   StructuredView: () => <div data-testid="acp-view" />,
 }));
+vi.mock("../acp/BackgroundAgentsPanel", () => ({
+  BackgroundAgentsPanel: ({ sessionId }: { sessionId: string | null }) => (
+    <div data-testid="background-agents-panel">{sessionId}</div>
+  ),
+}));
 
 import { MobileMainPane } from "../MobileMainPane";
 
@@ -85,6 +90,7 @@ function setup(overrides: Partial<Parameters<typeof MobileMainPane>[0]> = {}) {
     view: "agent",
     pluginPanes: [],
     onBackToAgent,
+    onOpenAgentsPane: vi.fn(),
     pairedMounted: false,
     activeSession: session(),
     activeSessionId: "s1",
@@ -143,6 +149,13 @@ describe("MobileMainPane", () => {
   it("keeps the paired shell mounted after first activation", () => {
     setup({ view: "agent", pairedMounted: true });
     expect(screen.getByTestId("paired-shell")).toBeDefined();
+  });
+
+  it("shows the sub agents panel in agents view", () => {
+    setup({ view: "agents", activeSessionId: "s1" });
+    expect(screen.getByTestId("background-agents-panel").textContent).toBe("s1");
+    expect(screen.getByText("Sub agents")).toBeDefined();
+    expect(screen.getByTestId("mobile-back-to-agent")).toBeDefined();
   });
 
   it("shows the diff file list in diff view", () => {
