@@ -172,25 +172,35 @@ fn create_tool_session(sock: &std::path::Path, session_id: &str, title: &str) ->
 
 /// PATCH `/api/sessions/:id/archive` with `{archived: true, kill_pane}` against
 /// the no-auth daemon. Asserts a 2xx so a routing/handler regression fails the
-/// test rather than silently skipping the teardown.
+/// test rather than silently skipping the teardown. A 404 is retried briefly:
+/// a disk reload whose snapshot predates the session can transiently evict the
+/// row from the daemon's in-memory list (see disk_watch's stale-reload note)
+/// before the next tick's merge re-ingests it. Any other non-2xx fails fast.
 fn archive_via_api(port: u16, session_id: &str, kill_pane: bool) {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
         let client = reqwest::Client::new();
-        let resp = client
-            .patch(format!(
-                "http://127.0.0.1:{port}/api/sessions/{session_id}/archive"
-            ))
-            .json(&serde_json::json!({ "archived": true, "kill_pane": kill_pane }))
-            .send()
-            .await
-            .expect("PATCH archive send");
-        assert!(
-            resp.status().is_success(),
-            "archive PATCH failed: {} {}",
-            resp.status(),
-            resp.text().await.unwrap_or_default(),
-        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let resp = client
+                .patch(format!(
+                    "http://127.0.0.1:{port}/api/sessions/{session_id}/archive"
+                ))
+                .json(&serde_json::json!({ "archived": true, "kill_pane": kill_pane }))
+                .send()
+                .await
+                .expect("PATCH archive send");
+            let status = resp.status();
+            if status.is_success() {
+                return;
+            }
+            let body = resp.text().await.unwrap_or_default();
+            assert!(
+                status == reqwest::StatusCode::NOT_FOUND && Instant::now() < deadline,
+                "archive PATCH failed: {status} {body}"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
     });
 }
 
