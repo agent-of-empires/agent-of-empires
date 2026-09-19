@@ -4379,20 +4379,32 @@ mod tests {
                         .unwrap()
                         .into_response();
                     assert_eq!(response.status(), expected_status, "reload={reload:?}");
+                    // 200: the handoff cleared the durable ACP id everywhere.
+                    // 409: the tierce reload keeps both its structured cache
+                    // row and the untouched durable id.
+                    let expected_sid = if expected_status == StatusCode::OK {
+                        None
+                    } else {
+                        Some("22222222-2222-4222-8222-222222222222".to_string())
+                    };
                     let expected_view = if expected_status == StatusCode::OK {
                         crate::session::View::Terminal
                     } else {
                         crate::session::View::Structured
                     };
-                    assert_eq!(state.instances.read().await[0].view, expected_view);
+                    let cached = state.instances.read().await;
+                    assert_eq!(cached[0].view, expected_view);
+                    assert_eq!(cached[0].acp_session_id, expected_sid);
                     let durable_rows = storage.load().unwrap();
                     assert_eq!(durable_rows[0].view, expected_view);
-                    let expected_sid = if expected_status == StatusCode::OK {
+                    // The 409 leaves the durable row at its original id, not
+                    // the reloaded tierce id.
+                    let durable_sid = if expected_status == StatusCode::OK {
                         None
                     } else {
                         Some("11111111-1111-4111-8111-111111111111".to_string())
                     };
-                    assert_eq!(durable_rows[0].acp_session_id, expected_sid);
+                    assert_eq!(durable_rows[0].acp_session_id, durable_sid);
                 }
             });
     }
