@@ -25,7 +25,8 @@ use crate::plugin::automation_policy::{classify_mode, AutomationPolicy, ModeDeci
 use crate::plugin::host_api::{DispatchError, PluginRpcContext};
 use crate::plugin::protocol::codes;
 use crate::server::session_service::{
-    CreateIdempotencyProbe, IdempotencyConflict, SendTurnError, SessionCaller, SessionService,
+    CreateIdempotencyProbe, IdempotencyConflict, SendTurnError, SendTurnRequest, SessionCaller,
+    SessionService,
 };
 use crate::server::session_spawn::StructuredSessionSpec;
 
@@ -648,10 +649,13 @@ async fn sessions_turn_send(
             .send_turn(
                 &caller,
                 &req.session_id,
-                &req.text,
-                &[],
-                woke_idle_dormant,
-                None,
+                SendTurnRequest {
+                    text: &req.text,
+                    attachments: &[],
+                    woke_idle_dormant,
+                    prompt_id: None,
+                    synthesized: false,
+                },
             )
             .await
             .map_err(map_send_error)
@@ -1088,7 +1092,13 @@ mod tests {
         // that flips the control fold to `turn_active`.
         deps.session_service
             .acp_supervisor
-            .publish_user_prompt_with_attachments("sess-3649", "the winning turn".into(), &[], None)
+            .publish_user_prompt_with_attachments(
+                "sess-3649",
+                "the winning turn".into(),
+                &[],
+                None,
+                false,
+            )
             .await;
         drop(winner);
 
@@ -1147,6 +1157,7 @@ mod tests {
             text: "the owner's turn".into(),
             attachments: Vec::new(),
             prompt_id: None,
+            synthesized: false,
         };
         // Each state named by the disposition it would have leaked.
         for (label, events, expected) in [

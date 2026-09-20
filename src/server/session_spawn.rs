@@ -224,7 +224,12 @@ pub(crate) async fn spawn_structured_session(
         instance.source_profile = profile.clone();
         instance.created_by_plugin = created_by_plugin;
         instance.plugin_create_idempotency = plugin_create_idempotency;
-        instance.pending_initial_turn = pending_initial_turn;
+        instance.pending_initial_turn =
+            pending_initial_turn.map(|text| crate::session::PendingInitialTurn {
+                text,
+                attachments: Vec::new(),
+                synthesized: false,
+            });
         instance.acp_mode_id = acp_mode_id;
         instance.callback_url = callback_url;
         instance.idempotency_key = idempotency_key;

@@ -24,7 +24,7 @@ use crate::acp::protocol::{
 };
 use crate::acp::supervisor::SupervisorError;
 use crate::daemon::PromptAttachmentKind;
-use crate::server::session_service::{SendTurnError, SessionCaller};
+use crate::server::session_service::{SendTurnError, SendTurnRequest, SessionCaller};
 use crate::server::AppState;
 
 /// Maximum attachments per prompt.
@@ -1343,10 +1343,13 @@ pub async fn acp_prompt(
         .send_turn(
             &SessionCaller::User,
             &id,
-            &req.text,
-            &attachments,
-            woke_idle_dormant,
-            req.prompt_id.clone(),
+            SendTurnRequest {
+                text: &req.text,
+                attachments: &attachments,
+                woke_idle_dormant,
+                prompt_id: req.prompt_id.clone(),
+                synthesized: false,
+            },
         )
         .await;
     // Smart-rename fires from `acp_event_listener` on the first clean
@@ -4113,7 +4116,7 @@ mod tests {
         // point that flips the fold to `turn_active`.
         state
             .acp_supervisor
-            .publish_user_prompt_with_attachments(&id, "the winning turn".into(), &[], None)
+            .publish_user_prompt_with_attachments(&id, "the winning turn".into(), &[], None, false)
             .await;
         drop(winner);
 
@@ -4601,6 +4604,7 @@ mod tests {
                 text: "hello".into(),
                 attachments: Vec::new(),
                 prompt_id: None,
+                synthesized: false,
             },
             Event::AgentMessageChunk { text: "hi".into() },
             Event::AgentMessageChunk {

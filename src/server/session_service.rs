@@ -269,6 +269,22 @@ pub(crate) enum SendTurnError {
     Send(crate::acp::supervisor::SupervisorError),
 }
 
+/// Everything [`SessionService::send_turn`] needs beyond the caller and
+/// session id, bundled so the function stays under clippy's argument-count
+/// lint.
+pub(crate) struct SendTurnRequest<'a> {
+    pub text: &'a str,
+    pub attachments: &'a [crate::acp::event_store::AttachmentBlob],
+    /// Forces the resume trigger even when the worker looks alive, mirroring
+    /// the handler's idle-dormant wake (#1689).
+    pub woke_idle_dormant: bool,
+    pub prompt_id: Option<String>,
+    /// True when the daemon queued this turn itself (a rate-limit resume
+    /// continuation) rather than the user typing it just now, so the
+    /// transcript model can skip rendering a duplicate row for it.
+    pub synthesized: bool,
+}
+
 impl std::fmt::Display for SendTurnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -540,18 +556,19 @@ impl SessionService {
     /// non-HTTP caller (the plugin host, #2897) delivers turns through the
     /// same path; the handler keeps HTTP concerns (read-only gate, wake,
     /// attachment validation, smart-rename, status mapping).
-    ///
-    /// `woke_idle_dormant` forces the resume trigger even when the worker
-    /// looks alive, mirroring the handler's idle-dormant wake (#1689).
     pub(crate) async fn send_turn(
         self: &Arc<Self>,
         caller: &SessionCaller,
         id: &str,
-        text: &str,
-        attachments: &[crate::acp::event_store::AttachmentBlob],
-        woke_idle_dormant: bool,
-        prompt_id: Option<String>,
+        turn: SendTurnRequest<'_>,
     ) -> Result<(), SendTurnError> {
+        let SendTurnRequest {
+            text,
+            attachments,
+            woke_idle_dormant,
+            prompt_id,
+            synthesized,
+        } = turn;
         use crate::server::acp_reconciler::ResumeTrigger;
         // Ownership gate, before ANY side effect (no wake, resume, publish,
         // or forward for a denied caller): a plugin may deliver turns only
@@ -644,7 +661,13 @@ impl SessionService {
         // unresumable across a worker restart (upstream #906).
         let disposition = self
             .acp_supervisor
-            .publish_user_prompt_with_attachments(id, text.to_string(), attachments, prompt_id)
+            .publish_user_prompt_with_attachments(
+                id,
+                text.to_string(),
+                attachments,
+                prompt_id,
+                synthesized,
+            )
             .await;
         let outcome = match disposition {
             crate::acp::supervisor::PromptDisposition::Forward => {
@@ -702,10 +725,10 @@ impl SessionService {
         let Some(_submission) = self.prompt_submission_for_session(id).await else {
             return;
         };
-        let Some((text, attachment_refs, profile, caller)) = ({
+        let Some((text, attachment_refs, synthesized, profile, caller)) = ({
             let instances = self.instances.read().await;
             instances.iter().find(|i| i.id == id).and_then(|i| {
-                i.pending_initial_turn.clone().map(|text| {
+                i.pending_initial_turn.clone().map(|turn| {
                     // Reconstruct the creator principal so plugin-created
                     // pending turns keep plugin attribution and the plugin
                     // mode-assertion path; user-created ones stay User.
@@ -716,8 +739,9 @@ impl SessionService {
                         None => SessionCaller::User,
                     };
                     (
-                        text,
-                        i.pending_initial_turn_attachments.clone(),
+                        turn.text,
+                        turn.attachments,
+                        turn.synthesized,
                         i.source_profile.clone(),
                         caller,
                     )
@@ -757,7 +781,17 @@ impl SessionService {
             .unwrap_or_default()
         };
         if let Err(e) = self
-            .send_turn(&caller, id, &text, &attachments, false, None)
+            .send_turn(
+                &caller,
+                id,
+                SendTurnRequest {
+                    text: &text,
+                    attachments: &attachments,
+                    woke_idle_dormant: false,
+                    prompt_id: None,
+                    synthesized,
+                },
+            )
             .await
         {
             tracing::warn!(
@@ -771,7 +805,6 @@ impl SessionService {
             let mut instances = self.instances.write().await;
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
                 inst.pending_initial_turn = None;
-                inst.pending_initial_turn_attachments = Vec::new();
             }
         }
         match crate::session::Storage::new(&profile, self.file_watch.clone()) {
@@ -781,7 +814,6 @@ impl SessionService {
                     storage.update(|instances, _groups| {
                         if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
                             inst.pending_initial_turn = None;
-                            inst.pending_initial_turn_attachments = Vec::new();
                         }
                         Ok(())
                     })
@@ -817,12 +849,16 @@ impl SessionService {
         text: String,
         attachments: Vec<crate::daemon::PromptAttachmentRef>,
     ) {
+        let turn = crate::session::PendingInitialTurn {
+            text,
+            attachments,
+            synthesized: true,
+        };
         let profile = {
             let mut instances = self.instances.write().await;
             match instances.iter_mut().find(|i| i.id == id) {
                 Some(inst) if inst.pending_initial_turn.is_none() => {
-                    inst.pending_initial_turn = Some(text.clone());
-                    inst.pending_initial_turn_attachments = attachments.clone();
+                    inst.pending_initial_turn = Some(turn.clone());
                     inst.source_profile.clone()
                 }
                 _ => return,
@@ -834,8 +870,7 @@ impl SessionService {
                 let persisted = tokio::task::spawn_blocking(move || {
                     storage.update(|instances, _groups| {
                         if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
-                            inst.pending_initial_turn = Some(text);
-                            inst.pending_initial_turn_attachments = attachments;
+                            inst.pending_initial_turn = Some(turn);
                         }
                         Ok(())
                     })
@@ -869,7 +904,6 @@ impl SessionService {
             match instances.iter_mut().find(|i| i.id == id) {
                 Some(inst) if inst.pending_initial_turn.is_some() => {
                     inst.pending_initial_turn = None;
-                    inst.pending_initial_turn_attachments = Vec::new();
                     inst.source_profile.clone()
                 }
                 _ => return,
@@ -882,7 +916,6 @@ impl SessionService {
                     storage.update(|instances, _groups| {
                         if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
                             inst.pending_initial_turn = None;
-                            inst.pending_initial_turn_attachments = Vec::new();
                         }
                         Ok(())
                     })
@@ -1350,7 +1383,17 @@ impl SessionService {
         // blobs under the real `UserPromptSent` seq. On failure leave the rows
         // (and their buffered blobs) queued; the next tick retries.
         if let Err(e) = self
-            .send_turn(&caller, id, &combined, &attachments, false, None)
+            .send_turn(
+                &caller,
+                id,
+                SendTurnRequest {
+                    text: &combined,
+                    attachments: &attachments,
+                    woke_idle_dormant: false,
+                    prompt_id: None,
+                    synthesized: false,
+                },
+            )
             .await
         {
             tracing::warn!(target: "acp.queue", session = %id, "queue drain delivery failed; will retry: {e}");
@@ -2034,19 +2077,49 @@ mod tests {
         // plugin's session, or a missing session.
         assert!(matches!(
             service
-                .send_turn(&cron, "sess-user", "hi", &[], false, None)
+                .send_turn(
+                    &cron,
+                    "sess-user",
+                    SendTurnRequest {
+                        text: "hi",
+                        attachments: &[],
+                        woke_idle_dormant: false,
+                        prompt_id: None,
+                        synthesized: false,
+                    },
+                )
                 .await,
             Err(SendTurnError::NotOwner)
         ));
         assert!(matches!(
             service
-                .send_turn(&other, "sess-cron", "hi", &[], false, None)
+                .send_turn(
+                    &other,
+                    "sess-cron",
+                    SendTurnRequest {
+                        text: "hi",
+                        attachments: &[],
+                        woke_idle_dormant: false,
+                        prompt_id: None,
+                        synthesized: false,
+                    },
+                )
                 .await,
             Err(SendTurnError::NotOwner)
         ));
         assert!(matches!(
             service
-                .send_turn(&cron, "sess-gone", "hi", &[], false, None)
+                .send_turn(
+                    &cron,
+                    "sess-gone",
+                    SendTurnRequest {
+                        text: "hi",
+                        attachments: &[],
+                        woke_idle_dormant: false,
+                        prompt_id: None,
+                        synthesized: false,
+                    },
+                )
                 .await,
             Err(SendTurnError::SessionNotFound)
         ));
@@ -2057,13 +2130,33 @@ mod tests {
         // ownership check specifically.
         assert!(!matches!(
             service
-                .send_turn(&cron, "sess-cron", "hi", &[], false, None)
+                .send_turn(
+                    &cron,
+                    "sess-cron",
+                    SendTurnRequest {
+                        text: "hi",
+                        attachments: &[],
+                        woke_idle_dormant: false,
+                        prompt_id: None,
+                        synthesized: false,
+                    },
+                )
                 .await,
             Ok(()) | Err(SendTurnError::NotOwner)
         ));
         assert!(!matches!(
             service
-                .send_turn(&SessionCaller::User, "sess-user", "hi", &[], false, None)
+                .send_turn(
+                    &SessionCaller::User,
+                    "sess-user",
+                    SendTurnRequest {
+                        text: "hi",
+                        attachments: &[],
+                        woke_idle_dormant: false,
+                        prompt_id: None,
+                        synthesized: false,
+                    },
+                )
                 .await,
             Ok(()) | Err(SendTurnError::NotOwner)
         ));
@@ -2220,6 +2313,7 @@ mod tests {
                     text: "go".into(),
                     attachments: Vec::new(),
                     prompt_id: None,
+                    synthesized: false,
                 },
             ),
             "publish must reach the event store"
@@ -2457,7 +2551,11 @@ mod tests {
             inst.id = id.to_string();
             inst.view = crate::session::View::Structured;
             inst.status = crate::session::Status::Idle;
-            inst.pending_initial_turn = Some("hello".to_string());
+            inst.pending_initial_turn = Some(crate::session::PendingInitialTurn {
+                text: "hello".to_string(),
+                attachments: Vec::new(),
+                synthesized: false,
+            });
             inst
         }
 
