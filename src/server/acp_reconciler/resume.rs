@@ -96,6 +96,34 @@ fn publish_orphaned_turn_stop<S: BroadcastSink>(
     supervisor.synthesize_stopped_for_orphan(session_id, reason);
 }
 
+/// Reminder queued as the resumed session's next turn when its `Monitor`
+/// (background watch) died with the replaced worker process. The watch
+/// itself runs inside the agent subprocess, external to aoe, so aoe has no
+/// handle to revive it directly; this hands the fresh process a real turn
+/// so the agent can decide to re-arm it. `Attach`/`AdoptStaleForDrain` never
+/// reach this: the old process, and its watch, is still alive there.
+const MONITOR_RESTART_REMINDER: &str = "Note: this session's agent process restarted, so any background Monitor watch that was armed is no longer running. Re-arm it if it's still needed.";
+
+async fn requeue_interrupted_monitor(state: &AppState, session_id: &str, decision: AdoptDecision) {
+    if matches!(
+        decision,
+        AdoptDecision::Attach | AdoptDecision::AdoptStaleForDrain
+    ) {
+        return;
+    }
+    if state
+        .acp_event_store
+        .latest_active_monitor(session_id)
+        .is_none()
+    {
+        return;
+    }
+    state
+        .session_service
+        .set_pending_initial_turn(session_id, MONITOR_RESTART_REMINDER.to_string(), vec![])
+        .await;
+}
+
 async fn admit(
     state: &AppState,
     id: &str,
@@ -120,7 +148,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
 
     // Take the lease before any preparation so a stop landing from here on is honored.
     let record = worker_registry::load(&id).ok().flatten();
-    let decision = record.as_ref().map_or(AdoptDecision::FreshSpawn, |r| {
+    let mut decision = record.as_ref().map_or(AdoptDecision::FreshSpawn, |r| {
         adopt_decision(
             worker_registry::is_record_live(r),
             worker_registry::is_build_current(r),
@@ -196,6 +224,11 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                     Ok(Err(e)) => {
                         tracing::warn!(target: "acp.supervisor", session = %id, "attach failed; terminating the worker and falling back to fresh spawn: {e}");
                         worker_registry::terminate_and_wait(&id).await;
+                        // The fallback below spawns a fresh process, so
+                        // downstream decision-based logic (the Monitor
+                        // restart reminder) must see this as a fresh spawn,
+                        // not the original attach it failed to be.
+                        decision = AdoptDecision::FreshSpawn;
                     }
                     Err(_) => {
                         tracing::warn!(target: "acp.supervisor", session = %id, "attach timed out after 3s; terminating the worker and falling back to fresh spawn");
@@ -235,6 +268,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
     }
 
     publish_orphaned_turn_stop(&state.acp_supervisor, &id, decision, in_flight_turn);
+    requeue_interrupted_monitor(&state, &id, decision).await;
     let Ok(req) = build_spawn_request(&state.session_service, &target).await else {
         return ResumeOutcome::SpawnFinished;
     };
@@ -636,5 +670,90 @@ mod tests {
             crate::daemon::AcpWorkerState::Absent
         );
         assert!(state.acp_event_store.replay_from(id, 0).is_empty());
+    }
+
+    // --- monitor reminder survives a worker restart (#monitor-restart) ---
+
+    fn state_with_armed_monitor(
+        session_id: &str,
+    ) -> (
+        crate::session::test_support::AppDirGuard,
+        Arc<AppState>,
+        tempfile::TempDir,
+    ) {
+        let (home, state, project) = test_state(session_id);
+        state
+            .acp_event_store
+            .record(
+                session_id,
+                1,
+                &crate::acp::state::Event::MonitorArmed {
+                    description: Some("watch for X".to_string()),
+                },
+            )
+            .expect("record MonitorArmed");
+        (home, state, project)
+    }
+
+    /// A fresh spawn replaces the subprocess the armed Monitor's watch task
+    /// lived in, so the badge would otherwise stay stuck forever (the arming
+    /// turn already ended normally, so no orphan-repair path touches it).
+    /// The reminder gives the new process a real turn to decide whether to
+    /// re-arm.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn requeue_interrupted_monitor_queues_reminder_on_fresh_spawn() {
+        let (_home, state, _project) = state_with_armed_monitor("sess-monitor-fresh");
+        requeue_interrupted_monitor(&state, "sess-monitor-fresh", AdoptDecision::FreshSpawn).await;
+
+        let instances = state.instances.read().await;
+        let inst = instances
+            .iter()
+            .find(|i| i.id == "sess-monitor-fresh")
+            .expect("instance");
+        let turn = inst
+            .pending_initial_turn
+            .as_ref()
+            .expect("fresh spawn over an armed monitor must queue a re-arm reminder");
+        assert!(
+            turn.synthesized,
+            "the reminder rides set_pending_initial_turn's synthesized flag so it \
+             doesn't render as a fake user message in the transcript"
+        );
+    }
+
+    /// Attach reuses the still-live process, so the Monitor's watch task
+    /// never died; queuing a reminder here would nag the agent for no reason.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn requeue_interrupted_monitor_skips_attach() {
+        let (_home, state, _project) = state_with_armed_monitor("sess-monitor-attach");
+        requeue_interrupted_monitor(&state, "sess-monitor-attach", AdoptDecision::Attach).await;
+
+        let instances = state.instances.read().await;
+        let inst = instances
+            .iter()
+            .find(|i| i.id == "sess-monitor-attach")
+            .expect("instance");
+        assert!(
+            inst.pending_initial_turn.is_none(),
+            "attach keeps the same process alive; no reminder is needed"
+        );
+    }
+
+    /// No armed monitor in the log means nothing to revive.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn requeue_interrupted_monitor_skips_when_none_armed() {
+        let (_home, state, _project) = test_state("sess-no-monitor");
+
+        requeue_interrupted_monitor(&state, "sess-no-monitor", AdoptDecision::FreshSpawn).await;
+
+        let instances = state.instances.read().await;
+        let inst = instances
+            .iter()
+            .find(|i| i.id == "sess-no-monitor")
+            .expect("instance");
+        assert!(inst.pending_initial_turn.is_none());
     }
 }
