@@ -2721,6 +2721,7 @@ mod tests {
                     prompt_id: None,
                     text: "continue".to_string(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
                 stopped("prompt_complete"),
                 tool_started("t1"),
@@ -2793,6 +2794,7 @@ mod tests {
                         prompt_id: None,
                         text: "go".to_string(),
                         attachments: Vec::new(),
+                        synthesized: false,
                     },
                     usage(true),
                 ],
@@ -3174,6 +3176,7 @@ mod tests {
                     text: "keep going".into(),
                     attachments: Vec::new(),
                     prompt_id: None,
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -3636,6 +3639,7 @@ mod tests {
             text: "run the nightly task".into(),
             attachments: Vec::new(),
             prompt_id: None,
+            synthesized: false,
         };
         let mut seq = 0u64;
         let mut push = |event: &Event| {
@@ -3682,6 +3686,7 @@ mod tests {
             .iter()
             .find(|i| i.id == id)
             .and_then(|i| i.pending_initial_turn.clone())
+            .map(|t| t.text)
     }
 
     fn latest_stop_reason(state: &Arc<crate::server::AppState>, id: &str) -> Option<String> {
@@ -3803,6 +3808,18 @@ mod tests {
         assert!(
             pending_turn(&state, id).await.is_some(),
             "the interrupted prompt stays queued for the respawned worker"
+        );
+        assert!(
+            state
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|i| i.id == id)
+                .and_then(|i| i.pending_initial_turn.as_ref())
+                .is_some_and(|t| t.synthesized),
+            "a rate-limit continuation is daemon-queued, not user-typed, so the \
+             transcript model must skip rendering a duplicate row for it"
         );
     }
 

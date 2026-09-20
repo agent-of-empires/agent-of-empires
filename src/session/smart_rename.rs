@@ -1715,6 +1715,7 @@ mod serve {
                 prompt_id: None,
                 text: "hi".into(),
                 attachments: vec![],
+                synthesized: false,
             };
             assert!(!should_trigger_smart_rename(&non_stop, id, &empty, &empty));
 

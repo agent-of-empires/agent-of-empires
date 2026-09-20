@@ -893,6 +893,7 @@ done
                     prompt_id: None,
                     text: "prior user turn".into(),
                     attachments: vec![],
+                    synthesized: false,
                 });
                 events.push(Event::AgentMessageChunk {
                     text: "prior assistant turn".into(),

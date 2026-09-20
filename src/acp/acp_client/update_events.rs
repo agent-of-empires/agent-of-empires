@@ -239,6 +239,7 @@ pub(super) fn map_update_to_events(
                 text: text.text,
                 attachments: Vec::new(),
                 prompt_id: None,
+                synthesized: false,
             }],
             other => vec![raw_event(&other)],
         },

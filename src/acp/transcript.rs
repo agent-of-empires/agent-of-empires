@@ -242,20 +242,33 @@ impl TranscriptModel {
                 text,
                 attachments,
                 prompt_id,
+                synthesized,
             } => {
                 self.begin_turn();
-                let group_id = self.fresh_group();
-                // When the client minted a prompt id, key the row by it so an
-                // optimistic client row reconciles by id; otherwise fall back
-                // to the seq-derived id both reducers use.
-                let id = match prompt_id {
-                    Some(pid) if !pid.is_empty() => pid.clone(),
-                    _ => format!("user-seq-{seq}"),
-                };
-                let mut row =
-                    TranscriptRow::new(id, group_id, TranscriptRowKind::UserPrompt, text.clone());
-                row.attachments = attachments.clone();
-                vec![self.append(row)]
+                // A rate-limit resume continuation replays a prompt the user
+                // already saw once, before the park; render nothing so the
+                // transcript reads as an uninterrupted continuation instead
+                // of the same message appearing twice.
+                if *synthesized {
+                    Vec::new()
+                } else {
+                    let group_id = self.fresh_group();
+                    // When the client minted a prompt id, key the row by it so
+                    // an optimistic client row reconciles by id; otherwise
+                    // fall back to the seq-derived id both reducers use.
+                    let id = match prompt_id {
+                        Some(pid) if !pid.is_empty() => pid.clone(),
+                        _ => format!("user-seq-{seq}"),
+                    };
+                    let mut row = TranscriptRow::new(
+                        id,
+                        group_id,
+                        TranscriptRowKind::UserPrompt,
+                        text.clone(),
+                    );
+                    row.attachments = attachments.clone();
+                    vec![self.append(row)]
+                }
             }
             Event::UserDiffCommentsPrompt {
                 intro,
@@ -960,6 +973,7 @@ mod tests {
             text: text.into(),
             attachments: Vec::new(),
             prompt_id: None,
+            synthesized: false,
         }
     }
 
@@ -1093,6 +1107,7 @@ mod tests {
                 size: 1234,
             }],
             prompt_id: None,
+            synthesized: false,
         };
         let mut m = TranscriptModel::new();
         let deltas = m.apply_event(3, &ev);
@@ -1103,6 +1118,26 @@ mod tests {
         assert_eq!(row.kind, TranscriptRowKind::UserPrompt);
         assert_eq!(row.attachments.len(), 1);
         assert_eq!(row.attachments[0].id, "att-1");
+    }
+
+    #[test]
+    fn synthesized_prompt_renders_no_row_but_still_opens_the_turn() {
+        // A rate-limit resume continuation replays a prompt the user already
+        // saw once, before the park (#3028, #4040). It must not appear a
+        // second time in the transcript, but it still opens a fresh turn so
+        // `empty_output` and divider suppression behave like a real prompt.
+        let ev = Event::UserPromptSent {
+            text: "run the nightly task".into(),
+            attachments: Vec::new(),
+            prompt_id: None,
+            synthesized: true,
+        };
+        let mut m = TranscriptModel::new();
+        let deltas = m.apply_event(1, &ev);
+        assert!(deltas.is_empty());
+        assert!(m.rows().is_empty());
+        assert!(m.turn_active);
+        assert!(!m.turn_has_output);
     }
 
     #[test]
@@ -1119,6 +1154,7 @@ mod tests {
                 text: "hi".into(),
                 attachments: Vec::new(),
                 prompt_id: pid.map(|s| s.to_string()),
+                synthesized: false,
             };
             let mut m = TranscriptModel::new();
             m.apply_event(7, &ev);

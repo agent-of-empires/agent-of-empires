@@ -191,6 +191,7 @@ mod tests {
             text: "go".into(),
             attachments: Vec::new(),
             prompt_id: None,
+            synthesized: false,
         }
     }
 

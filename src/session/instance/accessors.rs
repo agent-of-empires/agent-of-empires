@@ -39,7 +39,6 @@ impl Instance {
             created_by_plugin: None,
             plugin_create_idempotency: None,
             pending_initial_turn: None,
-            pending_initial_turn_attachments: Vec::new(),
             queued_prompts: Vec::new(),
             queued_prompt_next_seq: 0,
             acp_mode_id: None,
