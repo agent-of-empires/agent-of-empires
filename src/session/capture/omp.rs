@@ -18,13 +18,14 @@
 //!   3. non-empty pending pre-launch session path
 //!   4. routing fingerprint (64 lowercase hex; the second CAS anchor)
 //!
-//! Terminal breadcrumb, 2 or 3 lines (written by OMP, rewritten or installed by
-//! `wrap_omp_launch`; readers `wrap_omp_launch` (which reads all three fields
-//! inline before it rewrites them), `parse_breadcrumb`, and
+//! Terminal breadcrumb, 2 to 4 lines (written by OMP, rewritten or installed by
+//! `wrap_omp_launch`; readers `wrap_omp_launch`, `parse_breadcrumb`, and
 //! `CONTAINER_BREADCRUMB_SCRIPT`):
 //!   1. cwd (absolute)
 //!   2. session path
-//!   3. optional literal `fresh`
+//!   3. zero, one, or both extras in either order, each at most once:
+//!      - literal `fresh`
+//!      - `cwdstat <dev> <ino>` with decimal device and inode values
 //!
 //! The two marker CAS anchors (launch id, routing fingerprint) prove the marker
 //! belongs to this generation, but NOT that the breadcrumb was authored after
@@ -1353,6 +1354,36 @@ struct Breadcrumb<'a> {
     fresh: bool,
 }
 
+fn parse_breadcrumb_extras<'a>(extras: impl Iterator<Item = &'a str>) -> Result<bool> {
+    let mut fresh = false;
+    let mut cwdstat = false;
+    for extra in extras {
+        if extra == "fresh" {
+            if fresh {
+                anyhow::bail!("OMP terminal breadcrumb has duplicate fresh metadata");
+            }
+            fresh = true;
+            continue;
+        }
+
+        let Some(identity) = extra.strip_prefix("cwdstat ") else {
+            anyhow::bail!("OMP terminal breadcrumb has unknown metadata");
+        };
+        if cwdstat {
+            anyhow::bail!("OMP terminal breadcrumb has duplicate cwdstat metadata");
+        }
+        let mut fields = identity.split(' ');
+        let valid = matches!(fields.next(), Some(dev) if !dev.is_empty() && dev.bytes().all(|byte| byte.is_ascii_digit()))
+            && matches!(fields.next(), Some(ino) if !ino.is_empty() && ino.bytes().all(|byte| byte.is_ascii_digit()))
+            && fields.next().is_none();
+        if !valid {
+            anyhow::bail!("OMP terminal breadcrumb has invalid cwdstat metadata");
+        }
+        cwdstat = true;
+    }
+    Ok(fresh)
+}
+
 fn parse_breadcrumb(content: &str) -> Result<Breadcrumb<'_>> {
     let mut lines = content.lines();
     let cwd = lines
@@ -1363,14 +1394,7 @@ fn parse_breadcrumb(content: &str) -> Result<Breadcrumb<'_>> {
         .next()
         .filter(|value| !value.is_empty())
         .context("OMP terminal breadcrumb has no session path")?;
-    let fresh = match lines.next() {
-        None => false,
-        Some("fresh") => true,
-        Some(_) => anyhow::bail!("OMP terminal breadcrumb has an invalid marker"),
-    };
-    if lines.next().is_some() {
-        anyhow::bail!("OMP terminal breadcrumb has unexpected trailing data");
-    }
+    let fresh = parse_breadcrumb_extras(lines)?;
     Ok(Breadcrumb {
         cwd,
         session_path,
@@ -1777,7 +1801,32 @@ breadcrumb_bytes=$(head -c 16385 "$f" 2>/dev/null | wc -c) || exit 0
 # so normalizing here would add sh complexity for an unreachable input.
 cwd=$(head -c 16385 "$f" 2>/dev/null | sed -n '1p')
 session_path=$(head -c 16385 "$f" 2>/dev/null | sed -n '2p')
-marker=$(head -c 16385 "$f" 2>/dev/null | sed -n '3p')
+extra_1=$(head -c 16385 "$f" 2>/dev/null | sed -n '3p')
+extra_2=$(head -c 16385 "$f" 2>/dev/null | sed -n '4p')
+breadcrumb_lines=$(head -c 16385 "$f" 2>/dev/null | sed -n '$=') || exit 0
+case "$breadcrumb_lines" in 2|3|4) ;; *) exit 0 ;; esac
+[ -n "$cwd" ] && [ -n "$session_path" ] || exit 0
+marker=
+cwdstat_seen=
+validate_extra() {
+  case "$1" in
+    fresh) [ -z "$marker" ] || exit 0; marker=fresh ;;
+    'cwdstat '*)
+      [ -z "$cwdstat_seen" ] || exit 0
+      cwdstat_values=${1#cwdstat }
+      cwdstat_dev=${cwdstat_values%% *}
+      cwdstat_ino=${cwdstat_values#* }
+      [ "$cwdstat_ino" != "$cwdstat_values" ] \
+        && [ -n "$cwdstat_dev" ] && [ -n "$cwdstat_ino" ] || exit 0
+      case "$cwdstat_dev$cwdstat_ino" in *[!0-9]*) exit 0 ;; esac
+      case "$cwdstat_ino" in *' '*) exit 0 ;; esac
+      cwdstat_seen=1
+      ;;
+    *) exit 0 ;;
+  esac
+}
+[ "$breadcrumb_lines" -lt 3 ] || validate_extra "$extra_1"
+[ "$breadcrumb_lines" -lt 4 ] || validate_extra "$extra_2"
 [ "$session_path" != "$marker_pending" ] || exit 0
 full_path=$session_path
 case "$full_path" in /*) ;; *) full_path="$cwd/$full_path" ;; esac
@@ -2057,6 +2106,34 @@ mod tests {
         path
     }
 
+    #[test]
+    fn breadcrumb_extras_accept_known_formats_and_reject_invalid_ones() {
+        let accepted = [
+            ("/work\n/session.jsonl\n", false),
+            ("/work\n/session.jsonl\nfresh\n", true),
+            ("/work\n/session.jsonl\ncwdstat 12 34\n", false),
+            ("/work\n/session.jsonl\nfresh\ncwdstat 12 34\n", true),
+            ("/work\n/session.jsonl\ncwdstat 12 34\nfresh\n", true),
+        ];
+        for (content, expected_fresh) in accepted {
+            let breadcrumb = parse_breadcrumb(content)
+                .unwrap_or_else(|error| panic!("expected valid breadcrumb {content:?}: {error:#}"));
+            assert_eq!(breadcrumb.cwd, "/work");
+            assert_eq!(breadcrumb.session_path, "/session.jsonl");
+            assert_eq!(breadcrumb.fresh, expected_fresh, "{content:?}");
+        }
+
+        for content in [
+            "/work\n/session.jsonl\nunknown\n",
+            "/work\n/session.jsonl\ncwdstat 12\n",
+            "/work\n/session.jsonl\ncwdstat 12 34 56\n",
+            "/work\n/session.jsonl\ncwdstat twelve 34\n",
+            "/work\n/session.jsonl\nfresh\nfresh\n",
+            "/work\n/session.jsonl\ncwdstat 12 34\ncwdstat 12 34\n",
+        ] {
+            assert!(parse_breadcrumb(content).is_err(), "{content:?}");
+        }
+    }
     fn launch_marker(metadata: &OmpCaptureMetadata, terminal: &str, pending: &str) -> String {
         format!(
             "{terminal}\n{}\n{pending}\n{}\n",
@@ -2979,6 +3056,37 @@ mod tests {
         let captured =
             select_omp_session_in_container(&output.stdout, &meta, &HashSet::new()).unwrap();
         assert_eq!(captured, id);
+        let extra_cases = [
+            ("", true),
+            ("fresh\n", true),
+            ("cwdstat 12 34\n", true),
+            ("fresh\ncwdstat 12 34\n", true),
+            ("cwdstat 12 34\nfresh\n", true),
+            ("unknown\n", false),
+            ("cwdstat 12\n", false),
+            ("cwdstat 12 34 56\n", false),
+            ("fresh\nfresh\n", false),
+            ("cwdstat 12 34\ncwdstat 12 34\n", false),
+        ];
+        for (extras, accepted) in extra_cases {
+            std::fs::write(
+                &breadcrumb,
+                format!("{cwd}\n{}\n{extras}", session.display()),
+            )
+            .unwrap();
+            set_mtime_ms(&breadcrumb, 4_000_000_000_000);
+            let output = run(&marker);
+            if accepted {
+                let captured =
+                    select_omp_session_in_container(&output.stdout, &meta, &HashSet::new())
+                        .unwrap_or_else(|error| panic!("{extras:?}: {error:#}"));
+                assert_eq!(captured, id, "{extras:?}");
+            } else {
+                assert!(output.stdout.is_empty(), "{extras:?}");
+            }
+        }
+        std::fs::write(&breadcrumb, format!("{cwd}\n{}\n", session.display())).unwrap();
+        set_mtime_ms(&breadcrumb, 4_000_000_000_000);
         std::fs::write(&marker, launch_marker(&meta, "pts-9", "")).unwrap();
         assert!(
             run(&marker).stdout.is_empty(),
