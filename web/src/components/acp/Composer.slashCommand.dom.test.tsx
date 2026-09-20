@@ -158,6 +158,14 @@ describe("slash command completion (#3418)", () => {
     expect(option(/address-pr-comments/)).toHaveLength(0);
   });
 
+  it("offers the local switch-agent command even when the adapter omits it", async () => {
+    const { container } = render(<Harness />);
+    const ta = textarea(container);
+
+    await typeAt(ta, "/switch", 7);
+    expect(option(/\/switch-agent/)).toHaveLength(1);
+  });
+
   it("inserts the command at the caret, not at the end of the buffer", async () => {
     const { container } = render(<Harness />);
     const ta = textarea(container);

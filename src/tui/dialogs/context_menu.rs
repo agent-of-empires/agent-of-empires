@@ -33,11 +33,12 @@ pub enum ContextMenuAction {
     /// Fork the right-clicked session into a new independent session that
     /// resumes its captured conversation (mirrors the palette "Fork session").
     Fork,
+    /// Open the restart picker with the terminal agent field focused.
+    SwitchTerminalAgent,
     /// Flip the session's persisted view between structured (ACP) and tmux
     /// terminal via the daemon's switch endpoints. Routes through a confirm
     /// dialog because the swap destroys the in-flight conversation history.
     SwitchView,
-    /// Open the sort-order picker (mirrors `'o'`).
     OpenSortPicker,
     /// Attach another repo to this session (#3103).
     AddProject,
@@ -120,7 +121,6 @@ impl ContextMenuDialog {
     /// `switch_view` is `None` when the row can't change views (non-ACP
     /// tool, or a terminal row while the structured-view opt-in is off), and
     /// `Some(is_structured)` when the entry should appear, with the label
-    /// naming the view the switch lands on.
     pub fn for_session(
         anchor: (u16, u16),
         is_archived: bool,
@@ -128,6 +128,26 @@ impl ContextMenuDialog {
         unread: Option<bool>,
         can_fork: bool,
         switch_view: Option<bool>,
+    ) -> Self {
+        Self::for_session_with_switch(
+            anchor,
+            is_archived,
+            snooze,
+            unread,
+            can_fork,
+            switch_view,
+            false,
+        )
+    }
+
+    pub fn for_session_with_switch(
+        anchor: (u16, u16),
+        is_archived: bool,
+        snooze: Option<bool>,
+        unread: Option<bool>,
+        can_fork: bool,
+        switch_view: Option<bool>,
+        can_switch_terminal_agent: bool,
     ) -> Self {
         let archive_label = if is_archived { "Unarchive" } else { "Archive" };
         let mut items = vec![
@@ -151,6 +171,12 @@ impl ContextMenuDialog {
         items.push((ContextMenuAction::Delete, "Delete"));
         if can_fork {
             items.push((ContextMenuAction::Fork, "Fork session"));
+        }
+        if can_switch_terminal_agent {
+            items.push((
+                ContextMenuAction::SwitchTerminalAgent,
+                "Switch terminal agent",
+            ));
         }
         if let Some(is_structured) = switch_view {
             let label = if is_structured {
@@ -485,6 +511,22 @@ mod tests {
     fn session_menu_starts_on_new_session() {
         let menu = ContextMenuDialog::for_session((0, 0), false, Some(false), None, true, None);
         assert_eq!(menu.selected_action(), ContextMenuAction::NewFromSelection);
+    }
+
+    #[test]
+    fn terminal_switch_menu_includes_action_when_enabled() {
+        let menu = ContextMenuDialog::for_session_with_switch(
+            (0, 0),
+            false,
+            Some(false),
+            None,
+            true,
+            None,
+            true,
+        );
+        assert!(menu.items_for_test().iter().any(|(action, label)| {
+            *action == ContextMenuAction::SwitchTerminalAgent && *label == "Switch terminal agent"
+        }));
     }
 
     #[test]

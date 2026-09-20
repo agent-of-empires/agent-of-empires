@@ -4876,13 +4876,20 @@ impl HomeView {
                     super::Item::Session { id, .. } => self.session_switch_view_target(id),
                     super::Item::Group { .. } => None,
                 };
-                ContextMenuDialog::for_session(
+                let can_switch_terminal_agent = match &self.flat_items[idx] {
+                    super::Item::Session { id, .. } => self.get_instance(id).is_some_and(|inst| {
+                        !inst.is_structured() && !inst.is_archived() && !inst.is_trashed()
+                    }),
+                    super::Item::Group { .. } => false,
+                };
+                ContextMenuDialog::for_session_with_switch(
                     anchor,
                     is_archived,
                     snooze,
                     unread,
                     can_fork,
                     switch_view,
+                    can_switch_terminal_agent,
                 )
             });
             return true;
@@ -4973,6 +4980,7 @@ impl HomeView {
             // same way `'N'` does.
             ContextMenuAction::NewFromSelection => self.open_new_from_selection(),
             ContextMenuAction::Fork => self.open_fork_from_selection(),
+            ContextMenuAction::SwitchTerminalAgent => self.open_restart_dialog(),
             ContextMenuAction::SwitchView => self.prompt_switch_view_for_selected(),
             ContextMenuAction::OpenSortPicker => self.show_sort_picker(),
             ContextMenuAction::AddProject => self.open_add_project_for_selected(),

@@ -213,9 +213,9 @@ matters when you handed a session off (say, claude to codex during a rate limit)
 and later want to return to the original agent.
 
 - **Web dashboard:** right-click a structured view session in the sidebar and
-  pick "Switch agent". It opens the same picker and switches on confirm. The
-  composer is pre-filled with a recap; review and send manually. The picker
-  lists built-in agents only.
+  pick "Switch agent", or type `/switch-agent` in the structured composer. It
+  opens the picker and switches on confirm. The composer is pre-filled with a
+  recap; review and send manually. The picker lists built-in agents only.
 - **CLI:** `aoe acp switch-agent <session> <target>` (run `aoe acp agents` to
   list the built-in target keys). Pass `--model <name>` to override the model
   the new agent starts with. A custom agent with an `agent_acp_cmd` entry is
