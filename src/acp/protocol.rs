@@ -368,6 +368,8 @@ pub struct SwitchTerminalAgentResponse {
     pub session_id: String,
     pub tool: String,
     pub status: String,
+    #[serde(default)]
+    pub context_handoff: String,
 }
 
 #[cfg(test)]

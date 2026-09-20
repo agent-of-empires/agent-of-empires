@@ -42,7 +42,12 @@ describe("SwitchTerminalAgentModal", () => {
         acp_installed: true,
       },
     ]);
-    switchTerminalAgentMock.mockResolvedValue({ session_id: "s-1", tool: "codex", status: "running" });
+    switchTerminalAgentMock.mockResolvedValue({
+      session_id: "s-1",
+      tool: "codex",
+      status: "running",
+      context_handoff: "sent",
+    });
   });
 
   it("offers another installed tool and switches the existing session", async () => {

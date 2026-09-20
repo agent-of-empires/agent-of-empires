@@ -2562,6 +2562,7 @@ export interface SwitchTerminalAgentResponse {
   session_id: string;
   tool: string;
   status: string;
+  context_handoff: "sent" | "unavailable" | string;
 }
 
 /** Switch a terminal/tmux session to another agent CLI while preserving the

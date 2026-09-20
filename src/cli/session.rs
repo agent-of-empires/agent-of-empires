@@ -436,8 +436,8 @@ async fn switch_agent(args: SwitchAgentArgs) -> Result<()> {
         .switch_terminal_agent(&args.identifier, &args.target)
         .await?;
     println!(
-        "switched terminal agent for {} -> {}",
-        response.session_id, response.tool
+        "switched terminal agent for {} -> {} (context handoff: {})",
+        response.session_id, response.tool, response.context_handoff
     );
     Ok(())
 }

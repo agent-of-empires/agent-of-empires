@@ -46,7 +46,11 @@ export function SwitchTerminalAgentModal({ open, sessionId, currentTool, onClose
       reportError("Could not switch the terminal agent. The previous configuration remains recoverable.");
       return;
     }
-    reportInfo(`Switched terminal agent to ${result.tool}. The new CLI starts a fresh conversation.`);
+    const handoff =
+      result.context_handoff === "sent"
+        ? "Previous terminal context was handed off."
+        : "Previous terminal context was unavailable.";
+    reportInfo(`Switched terminal agent to ${result.tool}. ${handoff}`);
     onClose();
   };
 
