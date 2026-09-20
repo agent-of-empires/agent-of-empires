@@ -1499,6 +1499,7 @@ mod tests {
                     text: "spawn and go".into(),
                     attachments: Vec::new(),
                     prompt_id: None,
+                    synthesized: false,
                 },
             )
             .expect("record prompt");
@@ -1606,6 +1607,7 @@ mod tests {
                     text: "first turn".into(),
                     attachments: Vec::new(),
                     prompt_id: None,
+                    synthesized: false,
                 },
             )
             .expect("record prompt");
@@ -1950,6 +1952,7 @@ mod tests {
                     text: "spawn and go".into(),
                     attachments: Vec::new(),
                     prompt_id: None,
+                    synthesized: false,
                 },
             )
             .expect("record prompt");
@@ -2096,6 +2099,7 @@ mod tests {
                     text: "spawn and go".into(),
                     attachments: Vec::new(),
                     prompt_id: None,
+                    synthesized: false,
                 },
             )
             .expect("record prompt");
@@ -2439,6 +2443,7 @@ mod tests {
                     prompt_id: None,
                     text: "hi".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
                 false,
                 false
@@ -2671,6 +2676,7 @@ mod tests {
                 prompt_id: None,
                 text: "spawn and go".into(),
                 attachments: Vec::new(),
+                synthesized: false,
             })
             .unwrap();
         state
@@ -2847,6 +2853,7 @@ mod tests {
                     prompt_id: None,
                     text: "hi".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             ),
             (
@@ -3112,6 +3119,7 @@ mod tests {
                 prompt_id: None,
                 text: "hi".into(),
                 attachments: Vec::new(),
+                synthesized: false,
             },
             true,
             false,
@@ -3338,6 +3346,7 @@ mod tests {
                     prompt_id: None,
                     text: "go".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .expect("record");

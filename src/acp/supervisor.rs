@@ -1465,7 +1465,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// is text-based but routed through the session's `AgentProfile`
     /// so each agent's aliases match the right surface. See #1101.
     pub async fn publish_user_prompt(&self, session_id: &str, text: String) -> PromptDisposition {
-        self.publish_user_prompt_with_attachments(session_id, text, &[], None)
+        self.publish_user_prompt_with_attachments(session_id, text, &[], None, false)
             .await
     }
 
@@ -1480,6 +1480,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         text: String,
         attachments: &[crate::acp::event_store::AttachmentBlob],
         prompt_id: Option<String>,
+        synthesized: bool,
     ) -> PromptDisposition {
         let agent_key = self.agent_key_for_session(session_id).await;
         let profile = super::agent_profiles::resolve(&agent_key);
@@ -1517,6 +1518,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 text,
                 attachments: refs,
                 prompt_id,
+                synthesized,
             },
         );
         if !persisted {
@@ -7343,6 +7345,48 @@ cursor-acp-bridge = "agent acp"
         ));
     }
 
+    /// `synthesized` rides straight through to the published event: a
+    /// rate-limit resume continuation (`synthesized: true`) must be
+    /// distinguishable from an ordinary prompt so the transcript model can
+    /// skip rendering a duplicate row for it (#4040).
+    #[tokio::test]
+    async fn publish_user_prompt_with_attachments_carries_synthesized_flag() {
+        let sink = VecSink::new();
+        let sup = Supervisor::new(sink.clone());
+        sup.publish_user_prompt_with_attachments(
+            "s-1",
+            "typed by the user".into(),
+            &[],
+            None,
+            false,
+        )
+        .await;
+        sup.publish_user_prompt_with_attachments(
+            "s-1",
+            "resent after rate limit".into(),
+            &[],
+            None,
+            true,
+        )
+        .await;
+
+        let frames = sink.frames.lock().unwrap().clone();
+        assert!(matches!(
+            &frames[0].2,
+            Event::UserPromptSent {
+                synthesized: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &frames[1].2,
+            Event::UserPromptSent {
+                synthesized: true,
+                ..
+            }
+        ));
+    }
+
     /// After `hydrate_seqs` (called at startup with the on-disk
     /// max-seq map), the next publish for that session must return
     /// stored_max + 1, not 1. Without this, restoring from a
@@ -8327,6 +8371,7 @@ cursor-acp-bridge = "agent acp"
                 prompt_id: None,
                 text: "hello world".into(),
                 attachments: Vec::new(),
+                synthesized: false,
             },
         );
         sink.publish(

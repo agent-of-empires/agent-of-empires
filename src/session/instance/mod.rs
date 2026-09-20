@@ -166,6 +166,26 @@ pub struct DetectionState {
     pub pending: Option<Status>,
 }
 
+/// A turn queued for delivery once the (resumed) worker is live. See
+/// `Instance::pending_initial_turn`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingInitialTurn {
+    pub text: String,
+    /// Attachment refs for a rate-limit resume continuation replaying a
+    /// prompt that carried images/files (#3028). Metadata only; bytes stay in
+    /// the acp_attachments store and are reloaded at drain time. Empty for
+    /// create-time initial turns (those are text-only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<crate::daemon::PromptAttachmentRef>,
+    /// True when the daemon queued this turn itself (a rate-limit resume
+    /// continuation) rather than the user typing it at session-create time.
+    /// Carried onto the resulting `Event::UserPromptSent` so the transcript
+    /// model skips rendering a row for it: the user already saw this text
+    /// once, before the park.
+    #[serde(default)]
+    pub synthesized: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Instance {
     pub id: String,
@@ -352,29 +372,22 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin_create_idempotency: Option<PluginCreateIdempotency>,
 
-    /// An initial prompt persisted with the session at create time and not
-    /// yet delivered to the agent (#2897). Written in the same
-    /// `Storage::update` that creates the row, so the create request and its
-    /// first turn are accepted atomically; the session service drains it
-    /// once the ACP worker is live (create fast path, and the reconciler
-    /// tick after a crash or restart) and clears it after a successful
-    /// publish + forward. Delivery is at-least-once: a crash between the
-    /// forward and this field's clear re-delivers on the next drain.
-    // ponytail: plain text plus a companion attachment-refs field below (no
-    // dedup turn id); fold both into a typed record via a vNNN migration if
-    // more turn state becomes necessary.
+    /// A turn persisted with the session and not yet delivered to the agent:
+    /// either the initial prompt from session create (#2897), or a
+    /// rate-limit resume continuation replaying an interrupted prompt
+    /// (#3028). Written in the same `Storage::update` that creates the row
+    /// (create case) or by `SessionService::set_pending_initial_turn`
+    /// (continuation case), so the write and its first turn are accepted
+    /// atomically; the session service drains it once the ACP worker is live
+    /// (create fast path, and the reconciler tick after a crash or restart)
+    /// and clears it after a successful publish + forward. Delivery is
+    /// at-least-once: a crash between the forward and this field's clear
+    /// re-delivers on the next drain. v029 folded this from two flat fields
+    /// (`pending_initial_turn: Option<String>` plus a companion
+    /// `pending_initial_turn_attachments`) into one typed record once a third
+    /// piece of turn state (`synthesized`) needed to ride along.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pending_initial_turn: Option<String>,
-
-    /// Attachment refs for `pending_initial_turn` when the queued turn is a
-    /// rate-limit resume continuation replaying a prompt that carried
-    /// images/files (#3028). Metadata only; bytes stay in the acp_attachments
-    /// store and are reloaded at drain time. Empty for create-time initial
-    /// turns (those are text-only). `#[serde(default)]` + skip-when-empty keeps
-    /// pre-existing rows deserialising unchanged, so no migration is needed.
-    /// Only the structured-view resume path populates it.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub pending_initial_turn_attachments: Vec<crate::daemon::PromptAttachmentRef>,
+    pub pending_initial_turn: Option<PendingInitialTurn>,
 
     /// Server-owned follow-ups, ordered by `QueuedPromptEntry::seq`. Persisted
     /// here so the daemon can drain them without a connected client.

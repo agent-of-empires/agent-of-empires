@@ -144,13 +144,24 @@ pub fn extract_transcript_delta(events: &[(u64, Event)], since_seq: u64) -> (Str
         }
         snapshot_seq = *seq;
         match event {
-            Event::UserPromptSent { text, .. } => {
+            // A rate-limit resume continuation replays a prompt already
+            // captured earlier in this same event log (#4041); counting or
+            // re-rendering it here would double the turn and duplicate the
+            // `[User]` block for what is really one interrupted turn.
+            Event::UserPromptSent {
+                text,
+                synthesized: false,
+                ..
+            } => {
                 agent_open = false;
                 new_turns += 1;
                 out.push_str("\n[User]\n");
                 out.push_str(text.trim());
                 out.push('\n');
             }
+            Event::UserPromptSent {
+                synthesized: true, ..
+            } => {}
             Event::AgentMessageChunk { text } => {
                 // Coalesce a run of chunks under one [Assistant] header.
                 if !agent_open {
@@ -420,6 +431,15 @@ mod tests {
             prompt_id: None,
             text: text.into(),
             attachments: vec![],
+            synthesized: false,
+        }
+    }
+    fn synthesized_user(text: &str) -> Event {
+        Event::UserPromptSent {
+            prompt_id: None,
+            text: text.into(),
+            attachments: vec![],
+            synthesized: true,
         }
     }
     fn agent(text: &str) -> Event {
@@ -454,6 +474,23 @@ mod tests {
         assert!(text.contains("Looking at auth.rs"));
         assert_eq!(snap, 3);
         assert_eq!(turns, 1);
+    }
+
+    #[test]
+    fn extract_skips_a_rate_limit_resend_so_it_neither_counts_nor_duplicates() {
+        // The interrupted prompt already appears once (seq 1); the daemon's
+        // redelivery at seq 3 (#4041) must not add a second [User] block or
+        // count as a new turn.
+        let events = vec![
+            (1, user("keep working")),
+            (2, agent("on it")),
+            (3, synthesized_user("keep working")),
+            (4, agent("done")),
+        ];
+        let (text, snap, turns) = extract_transcript_delta(&events, 0);
+        assert_eq!(text.matches("[User]").count(), 1);
+        assert_eq!(turns, 1);
+        assert_eq!(snap, 4);
     }
 
     #[test]

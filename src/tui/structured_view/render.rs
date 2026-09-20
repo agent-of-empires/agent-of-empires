@@ -2958,6 +2958,7 @@ mod tests {
                 prompt_id: None,
                 text: "Hello.".into(),
                 attachments: Vec::new(),
+                synthesized: false,
             },
             crate::acp::state::Event::AgentMessageChunk {
                 text: "What should we build?".into(),

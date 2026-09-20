@@ -2511,6 +2511,7 @@ mod tests {
             prompt_id: None,
             text: text.into(),
             attachments: vec![],
+            synthesized: false,
         }
     }
 
@@ -2629,6 +2630,7 @@ mod tests {
                 name: Some("shot.png".into()),
                 size: 7,
             }],
+            synthesized: false,
         }
     }
 
@@ -2639,6 +2641,7 @@ mod tests {
             prompt_id: None,
             text: text.into(),
             attachments: vec![],
+            synthesized: false,
         };
         // A session with no prompt yet => None (manual rename has nothing to
         // name from).
@@ -2944,6 +2947,7 @@ mod tests {
                     prompt_id: None,
                     text: "hello".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -3154,6 +3158,7 @@ mod tests {
                     prompt_id: None,
                     text: "hi".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -3462,6 +3467,7 @@ mod tests {
                     prompt_id: None,
                     text: "go".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -3524,6 +3530,7 @@ mod tests {
                     prompt_id: None,
                     text: "go".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -3569,6 +3576,7 @@ mod tests {
                     prompt_id: None,
                     text: "go".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -3595,6 +3603,7 @@ mod tests {
                     prompt_id: None,
                     text: "go".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -3630,6 +3639,7 @@ mod tests {
                     prompt_id: None,
                     text: "go".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -3658,6 +3668,7 @@ mod tests {
                     prompt_id: None,
                     text: "keep working".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -3696,6 +3707,7 @@ mod tests {
                     prompt_id: None,
                     text: "look at this".into(),
                     attachments: vec![att.clone()],
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -3726,6 +3738,7 @@ mod tests {
                     prompt_id: None,
                     text: "go".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -3754,6 +3767,7 @@ mod tests {
                     prompt_id: None,
                     text: "old prompt".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -3797,6 +3811,7 @@ mod tests {
                     prompt_id: None,
                     text: "first".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -3817,6 +3832,7 @@ mod tests {
                     prompt_id: None,
                     text: "second".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -3844,6 +3860,7 @@ mod tests {
                     prompt_id: None,
                     text: "schedule a wake in 2m".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -3866,6 +3883,7 @@ mod tests {
                     prompt_id: None,
                     text: "btw, ping me when you wake".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -3982,6 +4000,7 @@ mod tests {
                     prompt_id: None,
                     text: "stop watching".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -4078,6 +4097,7 @@ mod tests {
                     prompt_id: None,
                     text: "hi".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -4103,6 +4123,7 @@ mod tests {
                     prompt_id: None,
                     text: "schedule a wake".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -4125,6 +4146,7 @@ mod tests {
                     prompt_id: None,
                     text: "ping me when you wake".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -4156,6 +4178,7 @@ mod tests {
                     prompt_id: None,
                     text: "Wake-up fired. Confirm.".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -4182,6 +4205,7 @@ mod tests {
                     prompt_id: None,
                     text: "first prompt past at".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -4193,6 +4217,7 @@ mod tests {
                     prompt_id: None,
                     text: "second prompt past at".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -4217,6 +4242,7 @@ mod tests {
                         prompt_id: None,
                         text: "hello".into(),
                         attachments: Vec::new(),
+                        synthesized: false,
                     },
                 )
                 .unwrap();
@@ -4253,6 +4279,7 @@ mod tests {
                     prompt_id: None,
                     text: "go".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -4350,6 +4377,7 @@ mod tests {
                     text: "again".into(),
                     attachments: Vec::new(),
                     prompt_id: None,
+                    synthesized: false,
                 }],
                 false,
                 false,
@@ -5064,6 +5092,7 @@ mod tests {
             prompt_id: None,
             text: t.into(),
             attachments: vec![],
+            synthesized: false,
         };
         store.record("s-1", 2, &prompt("A")).unwrap();
         store.record("s-1", 3, &Event::ThinkingStarted).unwrap();
