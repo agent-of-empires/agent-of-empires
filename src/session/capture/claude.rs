@@ -88,7 +88,10 @@ mod tests {
     #[test]
     fn transcript_absence_is_existence_only() {
         let tmp = tempfile::tempdir().unwrap();
-        let project_dir = tmp.path().join("projects").join("-tmp-myproject");
+        let project_path = "/tmp/myproject";
+        let project_dir = tmp.path().join("projects").join(encode_claude_project_path(
+            &canonicalize_or_raw(project_path).to_string_lossy(),
+        ));
         std::fs::create_dir_all(&project_dir).unwrap();
         let present = "11111111-2222-3333-4444-555555555555";
         let missing = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
@@ -106,13 +109,13 @@ mod tests {
             crate::session::test_support::EnvGuard::set(&[("CLAUDE_CONFIG_DIR", tmp.path())]);
 
         assert!(!claude_host_transcript_confirmed_absent(
-            "/tmp/myproject",
+            project_path,
             present,
             &[],
             None
         ));
         assert!(claude_host_transcript_confirmed_absent(
-            "/tmp/myproject",
+            project_path,
             missing,
             &[],
             None
@@ -135,7 +138,13 @@ mod tests {
         let declared = tempfile::tempdir().unwrap();
         let from_env = tempfile::tempdir().unwrap();
         let sid = "11111111-2222-3333-4444-555555555555";
-        let project_dir = declared.path().join("projects").join("-tmp-myproject");
+        let project_path = "/tmp/myproject";
+        let project_dir = declared
+            .path()
+            .join("projects")
+            .join(encode_claude_project_path(
+                &canonicalize_or_raw(project_path).to_string_lossy(),
+            ));
         std::fs::create_dir_all(&project_dir).unwrap();
         std::fs::write(project_dir.join(format!("{sid}.jsonl")), "data\n").unwrap();
 
@@ -143,16 +152,11 @@ mod tests {
             crate::session::test_support::EnvGuard::set(&[("CLAUDE_CONFIG_DIR", from_env.path())]);
 
         assert!(
-            claude_host_transcript_confirmed_absent("/tmp/myproject", sid, &[], None),
+            claude_host_transcript_confirmed_absent(project_path, sid, &[], None),
             "pre-condition: the environment's directory does not hold it"
         );
         assert!(
-            !claude_host_transcript_confirmed_absent(
-                "/tmp/myproject",
-                sid,
-                &[],
-                Some(declared.path())
-            ),
+            !claude_host_transcript_confirmed_absent(project_path, sid, &[], Some(declared.path())),
             "the declared directory is the one the agent actually opens"
         );
     }
