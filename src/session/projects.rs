@@ -505,42 +505,32 @@ pub fn find_by_canonical_path(profile: &str, path: &Path) -> Option<Project> {
         .find(|p| canonical_key(&p.path) == target)
 }
 
-/// Mutate the override bundle on the entry matching `name_or_path` in the
-/// given scope. `mutate` receives the entry's current `ProjectOverrides`
-/// and edits it in place, so a caller can set/clear any subset of fields
-/// in one read-modify-write without a bespoke mutator per field (see
-/// [`update_base_branch`] and [`set_pinned`], which predate this and are
-/// intentionally not migrated onto this to avoid an unrelated diff).
-/// Same last-writer-wins semantics as `update_base_branch`.
+/// Edit the override bundle on the entry matching `name_or_path` in the given scope, under the
+/// registry lock.
 pub fn update_overrides(
     profile: &str,
     scope: ProjectScope,
     name_or_path: &str,
     mutate: impl FnOnce(&mut ProjectOverrides),
 ) -> std::result::Result<Project, RegistryError> {
-    let mut existing = match scope {
-        ProjectScope::Global => load_global().map_err(RegistryError::Other)?,
-        ProjectScope::Profile => load_profile(profile).map_err(RegistryError::Other)?,
-    };
-
     let canonical_target = canonical_key(name_or_path);
-    let idx = existing
-        .iter()
-        .position(|p| {
-            p.name.eq_ignore_ascii_case(name_or_path) || canonical_key(&p.path) == canonical_target
-        })
-        .ok_or_else(|| {
-            RegistryError::NotFound(format!(
-                "No project '{}' in {} scope",
-                name_or_path,
-                scope.as_str()
-            ))
-        })?;
-
-    mutate(&mut existing[idx].overrides);
-    let updated = existing[idx].clone();
-    save_scope(profile, scope, &existing).map_err(RegistryError::Other)?;
-    Ok(updated)
+    locked_update_scope(profile, scope, |existing| {
+        let entry = existing
+            .iter_mut()
+            .find(|p| {
+                p.name.eq_ignore_ascii_case(name_or_path)
+                    || canonical_key(&p.path) == canonical_target
+            })
+            .ok_or_else(|| {
+                RegistryError::NotFound(format!(
+                    "No project '{}' in {} scope",
+                    name_or_path,
+                    scope.as_str()
+                ))
+            })?;
+        mutate(&mut entry.overrides);
+        Ok(entry.clone())
+    })
 }
 
 /// Resolve a list of project names against the merged registry. Errors on the

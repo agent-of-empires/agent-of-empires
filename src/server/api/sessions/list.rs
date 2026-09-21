@@ -232,7 +232,7 @@ pub async fn list_sessions(
             }
             let session_cfg = session_cfg_cache.resolve(&inst.source_profile, &inst.project_path);
             let smart_rename_override = project_override_cache
-                .smart_rename_override(&inst.source_profile, &inst.project_path);
+                .smart_rename_override(&inst.source_profile, inst.repo_path());
             let cfg = resolve_smart_rename_config(session_cfg, smart_rename_override);
             let eligible = check_eligible_resolved(
                 inst.is_structured(),

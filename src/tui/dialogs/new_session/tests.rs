@@ -1132,4 +1132,16 @@ fn test_reload_config_defaults_uses_project_worktree_override() {
         dialog.worktree_enabled,
         "project override should win over the false global default"
     );
+
+    // Browsing to the project applies its override without resetting other edits.
+    let mut dialog = multi_tool_dialog();
+    dialog.tool_index = 1;
+    dialog.yolo_mode = true;
+    dialog.focused_field = 0;
+    dialog.path = Input::new(repo.path().to_string_lossy().to_string());
+    dialog.handle_key(ctrl_key(KeyCode::Char('p')));
+    dialog.handle_key(key(KeyCode::Enter));
+    assert!(!dialog.dir_picker.is_active());
+    assert!(dialog.worktree_enabled);
+    assert_eq!((dialog.tool_index, dialog.yolo_mode), (1, true));
 }

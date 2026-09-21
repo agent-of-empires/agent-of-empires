@@ -327,6 +327,12 @@ fn handle_editable_list_key(
     }
 }
 
+/// The registered project's `worktree.enabled` override for `path`, if any.
+fn project_worktree_override(profile: &str, path: &str) -> Option<bool> {
+    crate::session::projects::find_by_canonical_path(profile, std::path::Path::new(path.trim()))
+        .and_then(|p| p.overrides.worktree_enabled)
+}
+
 /// Whether `tool` can back a structured-view (ACP) session, judged against
 /// the resolved config.
 fn compute_structured_capable(tool: &str, config: &crate::session::Config) -> bool {
@@ -420,12 +426,8 @@ impl NewSessionDialog {
             .is_some_and(|a| a.host_only);
         let sandbox_enabled =
             docker_available && config.sandbox.enabled_by_default && !is_default_tool_host_only;
-        let project_worktree_override = crate::session::projects::find_by_canonical_path(
-            profile,
-            std::path::Path::new(&current_dir),
-        )
-        .and_then(|p| p.overrides.worktree_enabled);
-        let worktree_enabled = project_worktree_override.unwrap_or(config.worktree.enabled)
+        let worktree_enabled = project_worktree_override(profile, &current_dir)
+            .unwrap_or(config.worktree.enabled)
             && !is_default_tool_host_only;
         let yolo_mode = config.session.yolo_mode_default;
 
@@ -765,12 +767,8 @@ impl NewSessionDialog {
         self.sandbox_enabled = self.docker_available
             && config.sandbox.enabled_by_default
             && !self.selected_tool_host_only();
-        let project_worktree_override = crate::session::projects::find_by_canonical_path(
-            &profile,
-            std::path::Path::new(self.path.value().trim()),
-        )
-        .and_then(|p| p.overrides.worktree_enabled);
-        self.worktree_enabled = project_worktree_override.unwrap_or(config.worktree.enabled)
+        self.worktree_enabled = project_worktree_override(&profile, self.path.value())
+            .unwrap_or(config.worktree.enabled)
             && !self.selected_tool_host_only();
 
         self.sandbox_image = Input::new(config.sandbox.default_image.clone());
@@ -1217,7 +1215,13 @@ impl NewSessionDialog {
                             .and_then(path_input::compute_path_ghost);
                         self.workspace_repo_dir_picker_active = false;
                     } else {
-                        self.set_path(path);
+                        self.path = Input::new(path);
+                        // Only the worktree toggle follows the picked project; other edits stay.
+                        let over =
+                            project_worktree_override(self.selected_profile(), self.path.value());
+                        if let Some(on) = over {
+                            self.worktree_enabled = on && !self.selected_tool_host_only();
+                        }
                         self.recompute_path_ghost();
                     }
                 }

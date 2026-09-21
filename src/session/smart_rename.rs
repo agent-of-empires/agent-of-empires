@@ -524,7 +524,7 @@ pub fn maybe_spawn_terminal_smart_rename(inst: &crate::session::instance::Instan
     );
     let smart_rename_override = crate::session::projects::find_by_canonical_path(
         &inst.source_profile,
-        Path::new(&inst.project_path),
+        Path::new(inst.repo_path()),
     )
     .and_then(|p| p.overrides.smart_rename);
     let cfg = resolve_smart_rename_config(&resolved.session, smart_rename_override);
@@ -861,6 +861,7 @@ pub async fn run_terminal_rename(
         tool,
         command,
         project_path,
+        repo_path,
         sandboxed,
         container_workdir,
         detect_as,
@@ -872,6 +873,7 @@ pub async fn run_terminal_rename(
             i.tool.clone(),
             i.command.clone(),
             i.project_path.clone(),
+            i.repo_path().to_string(),
             i.is_sandboxed(),
             i.container_workdir(),
             i.detect_as.clone(),
@@ -894,7 +896,7 @@ pub async fn run_terminal_rename(
         Path::new(&project_path),
     );
     let smart_rename_override =
-        crate::session::projects::find_by_canonical_path(profile, Path::new(&project_path))
+        crate::session::projects::find_by_canonical_path(profile, Path::new(&repo_path))
             .and_then(|p| p.overrides.smart_rename);
     let cfg = resolve_smart_rename_config(&resolved.session, smart_rename_override);
     let agent = match check_eligible_resolved(
@@ -1053,6 +1055,7 @@ mod serve {
             tool,
             command,
             project_path,
+            repo_path,
             sandboxed,
             container_workdir,
             title,
@@ -1065,6 +1068,7 @@ mod serve {
                     i.tool.clone(),
                     i.command.clone(),
                     i.project_path.clone(),
+                    i.repo_path().to_string(),
                     i.is_sandboxed(),
                     i.container_workdir(),
                     i.title.clone(),
@@ -1081,7 +1085,7 @@ mod serve {
             Path::new(&project_path),
         );
         let smart_rename_override =
-            crate::session::projects::find_by_canonical_path(&profile, Path::new(&project_path))
+            crate::session::projects::find_by_canonical_path(&profile, Path::new(&repo_path))
                 .and_then(|p| p.overrides.smart_rename);
         let cfg = resolve_smart_rename_config(&resolved.session, smart_rename_override);
         let agent = match check_eligible_resolved(
