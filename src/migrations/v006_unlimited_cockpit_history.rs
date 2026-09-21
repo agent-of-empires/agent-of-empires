@@ -9,10 +9,10 @@
 //! user who has explicitly set a different cap is left alone; only the
 //! exact v005 seed value triggers the rewrite.
 
+use super::config_file;
 use anyhow::Result;
-use std::fs;
 use std::path::Path;
-use tracing::{debug, info};
+use tracing::info;
 
 pub fn run() -> Result<()> {
     let app_dir = crate::session::get_app_dir()?;
@@ -21,53 +21,27 @@ pub fn run() -> Result<()> {
 
 pub(crate) fn run_in(app_dir: &Path) -> Result<()> {
     let global_config = app_dir.join("config.toml");
-    if !global_config.exists() {
-        debug!("global config.toml not present, nothing to migrate");
-        return Ok(());
-    }
-
-    let content = fs::read_to_string(&global_config)?;
-    let mut doc: toml::Table = match content.parse() {
-        Ok(table) => table,
-        Err(e) => {
-            debug!("failed to parse {}: {e}, skipping", global_config.display());
-            return Ok(());
+    config_file::rewrite(&global_config, |doc| {
+        let Some(toml::Value::Table(cockpit)) = doc.get_mut("cockpit") else {
+            return false;
+        };
+        // Only the v005 seed is flipped; any other value is a user's own.
+        if cockpit.get("replay_events") != Some(&toml::Value::Integer(500)) {
+            return false;
         }
-    };
-
-    let Some(toml::Value::Table(cockpit)) = doc.get_mut("cockpit") else {
-        debug!("no [cockpit] section, nothing to migrate");
-        return Ok(());
-    };
-
-    let Some(toml::Value::Integer(replay_events)) = cockpit.get("replay_events") else {
-        debug!("replay_events absent or non-integer, nothing to migrate");
-        return Ok(());
-    };
-
-    if *replay_events != 500 {
-        debug!(
-            current = replay_events,
-            "replay_events differs from v005 seed value, leaving alone"
+        cockpit.insert("replay_events".into(), (0_i64).into());
+        info!(
+            "v006: flipped cockpit.replay_events from 500 to 0 (unlimited) in {}",
+            global_config.display()
         );
-        return Ok(());
-    }
-
-    cockpit.insert("replay_events".into(), (0_i64).into());
-
-    let serialized = toml::to_string_pretty(&doc)?;
-    crate::session::atomic_write(&global_config, serialized.as_bytes())?;
-
-    info!(
-        "v006: flipped cockpit.replay_events from 500 to 0 (unlimited) in {}",
-        global_config.display()
-    );
-    Ok(())
+        true
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn rewrites_default_seed_value() {

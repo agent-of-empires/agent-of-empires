@@ -32,35 +32,20 @@ pub(super) fn opencode_db_path() -> Option<PathBuf> {
         return opencode_data_dir().map(|dir| dir.join(path));
     }
 
+    // The most recently written `opencode.db` or `opencode-<name>.db`.
     let data_dir = opencode_data_dir()?;
-    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
-    let entries = std::fs::read_dir(&data_dir).ok()?;
-    for entry in entries.filter_map(Result::ok) {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        let is_candidate =
-            name == "opencode.db" || (name.starts_with("opencode-") && name.ends_with(".db"));
-        if !is_candidate {
-            continue;
-        }
-        let Ok(meta) = entry.metadata() else {
-            continue;
-        };
-        let Ok(modified) = meta.modified() else {
-            continue;
-        };
-        if best
-            .as_ref()
-            .map(|(best_mtime, _)| modified > *best_mtime)
-            .unwrap_or(true)
-        {
-            best = Some((modified, path));
-        }
-    }
-    best.map(|(_, path)| path)
-        .or_else(|| Some(data_dir.join("opencode.db")))
+    let newest = std::fs::read_dir(&data_dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry.file_name().to_str().is_some_and(|name| {
+                name == "opencode.db" || (name.starts_with("opencode-") && name.ends_with(".db"))
+            })
+        })
+        .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
+        .max_by_key(|(modified, _)| *modified)
+        .map(|(_, path)| path);
+    Some(newest.unwrap_or_else(|| data_dir.join("opencode.db")))
 }
 
 pub(super) fn recover_opencode_prompt_error_from_sqlite_at(
@@ -157,28 +142,34 @@ mod tests {
         dir
     }
 
+    /// The newest error for this session at or after the prompt started. Rows
+    /// from another session, from before the prompt, or with no error message
+    /// are all skipped.
     #[test]
-    fn recover_opencode_prompt_error_from_sqlite_returns_latest_matching_error() {
-        let dir = create_opencode_error_test_db(&[
-            ("ses-1", 99, Some("old error")),
-            ("ses-1", 100, None),
-            ("ses-1", 110, Some("new error")),
-            ("ses-2", 120, Some("wrong session")),
-        ]);
-        let db_path = dir.path().join("opencode.db");
-        let result = recover_opencode_prompt_error_from_sqlite_at(&db_path, "ses-1", 100);
-        assert_eq!(result.as_deref(), Some("new error"));
-    }
-
-    #[test]
-    fn recover_opencode_prompt_error_from_sqlite_returns_none_without_match() {
-        let dir = create_opencode_error_test_db(&[
-            ("ses-1", 90, Some("too early")),
-            ("ses-1", 100, None),
-            ("ses-2", 110, Some("wrong session")),
-        ]);
-        let db_path = dir.path().join("opencode.db");
-        let result = recover_opencode_prompt_error_from_sqlite_at(&db_path, "ses-1", 100);
-        assert_eq!(result, None);
+    fn recover_opencode_prompt_error_from_sqlite_picks_the_latest_match() {
+        for (rows, want) in [
+            (
+                vec![
+                    ("ses-1", 99, Some("old error")),
+                    ("ses-1", 100, None),
+                    ("ses-1", 110, Some("new error")),
+                    ("ses-2", 120, Some("wrong session")),
+                ],
+                Some("new error"),
+            ),
+            (
+                vec![
+                    ("ses-1", 90, Some("too early")),
+                    ("ses-1", 100, None),
+                    ("ses-2", 110, Some("wrong session")),
+                ],
+                None,
+            ),
+        ] {
+            let dir = create_opencode_error_test_db(&rows);
+            let db_path = dir.path().join("opencode.db");
+            let got = recover_opencode_prompt_error_from_sqlite_at(&db_path, "ses-1", 100);
+            assert_eq!(got.as_deref(), want);
+        }
     }
 }

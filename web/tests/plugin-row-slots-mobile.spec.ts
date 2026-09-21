@@ -1,42 +1,26 @@
-// Mocked-Playwright coverage for the plugin row slots on a narrow mobile
-// sidebar (#2514).
-//
-// The github plugin's row-badge (icon chips) and row-column (status text) used
-// to render inline on the session-name line. On the narrow mobile drawer the
-// truncating name kept its width, so the column squeezed to zero and the
-// shrink-0 badges overflowed past the row's right edge. They now sit on their
-// own line (PluginRowLine), so both stay within the row regardless of how long
-// the session name is. This drives the real-CSS layout at a mobile viewport,
-// which jsdom cannot reproduce.
+// #2514: the github plugin's row-badge chips and row-column status used to
+// render inline with the session name, so on the narrow mobile drawer the
+// truncating name kept its width and the shrink-0 badges overflowed the row.
+// They now sit on their own line. Real CSS at a mobile viewport, which jsdom
+// cannot reproduce.
 
 import { test, expect } from "./helpers/mockedTest";
+import { sessionResponse as baseSession } from "./helpers/sessions";
+import { mockStaticApis } from "./helpers/apiMocks";
 import { Page } from "@playwright/test";
 
 const LONG_TITLE = "this-is-a-deliberately-very-long-session-name-that-eats-the-whole-row-width-on-mobile";
 
-function sessionResponse() {
-  return {
+const sessionResponse = () =>
+  baseSession({
     id: "s1",
     title: LONG_TITLE,
     project_path: "/tmp/repo",
-    group_path: "/tmp/repo",
-    tool: "claude",
-    status: "Idle",
-    yolo_mode: false,
     created_at: "2025-01-01T00:00:00Z",
-    last_accessed_at: null,
-    idle_entered_at: null,
-    last_error: null,
     branch: "feature/x",
-    main_repo_path: null,
-    is_sandboxed: false,
     favorited: false,
     urgent: false,
-    has_terminal: true,
-    profile: "default",
-    workspace_repos: [],
-  };
-}
+  });
 
 // One icon chip per repo across a multi-repo workspace: enough shrink-0 badges
 // that the old inline layout overflowed the narrow row instead of wrapping.
@@ -64,7 +48,7 @@ const UI_ENTRIES = [
 ];
 
 async function mockApis(page: Page) {
-  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
+  await mockStaticApis(page);
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
     return r.fulfill({
@@ -72,9 +56,6 @@ async function mockApis(page: Page) {
     });
   });
   await page.route("**/api/plugins/ui-state", (r) => r.fulfill({ json: { entries: UI_ENTRIES, notifications: [] } }));
-  for (const path of ["settings", "themes", "agents", "profiles", "groups", "devices", "docker/status", "about"]) {
-    await page.route(`**/api/${path}`, (r) => r.fulfill({ json: path === "docker/status" ? {} : [] }));
-  }
 }
 
 // A child element is "within" the row when its right edge does not spill past

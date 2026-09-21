@@ -1,21 +1,11 @@
 import { test, expect, observeFor } from "./helpers/mockedTest";
+import { openLiveSession } from "./helpers/liveTerminal";
 import { devices, type Page } from "@playwright/test";
-import { clickSidebarSession, openMobileSidebar } from "./helpers/sidebar";
 import { mockTerminalApis, type MockHandle } from "./helpers/terminal-mocks";
 
-// #1432: the soft keyboard shrinks the mobile terminal visually but never
-// resizes tmux. Rows are latched to the no-keyboard height, so a keyboard
-// cycle only shrinks the visible part of the scroller; while shrunk, the
-// live-edge scroll target anchors the CURSOR near the viewport bottom, so the
-// agent's prompt stays in view instead of scrolling off the top behind a tail
-// of blank rows.
-//
-// Resizing tmux on every keyboard cycle was tried and reverted: on the
-// capture+network path it flashed the pane (blank-then-redraw) and clipped
-// scrollback. The pane is padded by the LIVE cross-platform keyboard occlusion
-// (stableFullHeight - visualViewport.height) on iOS regular Safari, where the
-// layout viewport does not shrink; on iOS PWA / iOS 26 / Android, 100dvh
-// shrinks natively and the live view adds no inset of its own.
+// #1432: the soft keyboard shrinks the mobile terminal visually but never resizes tmux (that flashed and clipped
+// scrollback). Rows latch to the no-keyboard height and the cursor stays near the viewport bottom. iOS Safari
+// pads by the live occlusion; where 100dvh shrinks natively the live view adds no inset.
 
 test.use({ ...devices["iPhone 13"] });
 
@@ -45,8 +35,6 @@ function lastResize(handle: MockHandle): ResizeMsg | undefined {
   return all[all.length - 1];
 }
 
-// Override visualViewport.height (and optionally innerHeight) to simulate
-// a keyboard event. Matches the helper in mobile-keyboard.spec.ts.
 async function setKeyboard(page: Page, opts: { open: boolean; px?: number; pwa?: boolean }) {
   await page.evaluate(
     ({ open, px, pwa }) => {
@@ -87,17 +75,11 @@ async function paneHeight(page: Page): Promise<number> {
   });
 }
 
-async function openSession(page: Page, handle: MockHandle) {
-  await openMobileSidebar(page);
-  await clickSidebarSession(page, "pinch-test");
-  await page.locator('[data-term="agent"] [data-live-terminal]').waitFor({ state: "visible", timeout: 10_000 });
-  await handle.waitForLiveReady();
-}
+const openSession = (page: Page, handle: MockHandle) => openLiveSession(page, handle, { mobile: true, settings: null });
 
 test.describe("Keyboard auto-resize (#1432)", () => {
   test("Safari mode: keyboard insets the pane but never resizes tmux", async ({ page }) => {
     const handle = await mockTerminalApis(page);
-    await page.goto("/");
     await openSession(page, handle);
 
     const baselineCount = extractResizes(handle).length;
@@ -105,11 +87,7 @@ test.describe("Keyboard auto-resize (#1432)", () => {
     expect(baselineRows).toBeGreaterThan(0);
     const paneHeightBefore = await paneHeight(page);
 
-    // iOS regular Safari: the layout viewport does not shrink with the
-    // keyboard, so the live view insets itself by the visualViewport
-    // delta. The pane shrinks visually, but rows are latched to the
-    // no-keyboard height, so tmux must NOT be resized: the scroller
-    // pins to the live content and simply shows fewer rows.
+    // iOS Safari: inset by the occlusion, show fewer rows, never resize tmux.
     await setKeyboard(page, { open: true, px: 320, pwa: false });
     await expect.poll(() => paneHeight(page)).toBeLessThan(paneHeightBefore);
 
@@ -118,7 +96,6 @@ test.describe("Keyboard auto-resize (#1432)", () => {
       expect(extractResizes(handle).length, "keyboard open must not resize tmux").toBe(baselineCount);
     });
 
-    // Close: inset releases, still no tmux resize.
     await setKeyboard(page, { open: false, pwa: false });
     await expect.poll(() => paneHeight(page)).toBeGreaterThanOrEqual(paneHeightBefore - 2);
 
@@ -130,11 +107,9 @@ test.describe("Keyboard auto-resize (#1432)", () => {
 
   test("Safari mode: opening the keyboard returns a scrollback reader to the visible prompt", async ({ page }) => {
     const handle = await mockTerminalApis(page);
-    await page.goto("/");
     await openSession(page, handle);
 
-    // Leave the live edge first. Keyboard-open is an explicit intent to type,
-    // so it must return to the prompt rather than retain this reading position.
+    // Opening the keyboard is an intent to type, so it returns to the prompt from a reading position.
     await page.evaluate(() => {
       const el = document.querySelector<HTMLElement>("[data-live-terminal] > div");
       if (!el) throw new Error("live terminal scroller missing");
@@ -145,9 +120,7 @@ test.describe("Keyboard auto-resize (#1432)", () => {
 
     await page.locator('textarea[aria-label="Live terminal input"]').focus();
 
-    // The mock screen is a fresh-agent shape: prompt + cursor on the FIRST
-    // screen row, blank rows below. With rows latched, the live target must
-    // anchor that prompt near the keyboard rather than the literal tail.
+    // The prompt is on the first row with blanks below; the target anchors the prompt, not the tail.
     await setKeyboard(page, { open: true, px: 320, pwa: false });
     await expect(page.getByRole("button", { name: "Back to live" })).toHaveCount(0);
 
@@ -165,17 +138,11 @@ test.describe("Keyboard auto-resize (#1432)", () => {
 
   test("PWA mode: dvh shrink owns the layout; no inset, no tmux resize", async ({ page }) => {
     const handle = await mockTerminalApis(page);
-    await page.goto("/");
     await openSession(page, handle);
 
     const baselineCount = extractResizes(handle).length;
 
-    // iOS PWA / iOS 26 / Android: innerHeight (and 100dvh) shrink with
-    // the keyboard, so the layout shrinks natively and the live view
-    // must add NO inset of its own (keyboardHeight is 0 in this mode)
-    // and never resize tmux. The dvh shrink itself cannot be simulated
-    // here (it tracks the real viewport, not the patched innerHeight);
-    // what is testable is that the legacy machinery stays quiet.
+    // Where innerHeight shrinks, no inset and no tmux resize; the dvh shrink itself cannot be simulated.
     await setKeyboard(page, { open: true, px: 320, pwa: true });
     await observeFor(page, 800, async () => {
       expect(extractResizes(handle).length).toBe(baselineCount);
@@ -194,7 +161,6 @@ test.describe("Keyboard auto-resize (#1432)", () => {
 
   test("App root is NOT pinned for live-view sessions (dvh shrink wanted)", async ({ page }) => {
     const handle = await mockTerminalApis(page);
-    await page.goto("/");
     await openSession(page, handle);
 
     const rootInlineHeight = await page.evaluate(() => {
@@ -202,18 +168,14 @@ test.describe("Keyboard auto-resize (#1432)", () => {
       return root?.style?.height ?? "";
     });
 
-    // The stableViewportHeight pin exists to stop dvh from shrinking
-    // under an xterm surface (every shrink would SIGWINCH the PTY). The
-    // live view has no PTY and WANTS the natural dvh shrink, so the pin
-    // must stay off; only the single-pane paired shell still pins.
+    // The live view wants the natural dvh shrink; only the single-pane paired shell pins the height.
     expect(rootInlineHeight, "live sessions must keep the natural 100dvh root").toBe("");
     expect(extractResizes(handle).length).toBeGreaterThan(0);
   });
 
   test("no persisted reservation: a closed keyboard on load starts full-size", async ({ page }) => {
     const handle = await mockTerminalApis(page);
-    // Seed the now-removed reservation key. It must be ignored: the pane
-    // should not start shrunk just because a prior session latched a value.
+    // A stale reservation key from older builds must be ignored.
     await page.addInitScript(() => {
       try {
         localStorage.setItem("aoe-mobile-keyboard-reservation", "320");
@@ -221,7 +183,6 @@ test.describe("Keyboard auto-resize (#1432)", () => {
         // ignore
       }
     });
-    await page.goto("/");
     await openSession(page, handle);
 
     const rootPaddingBottom = await page.evaluate(() => {
@@ -229,8 +190,6 @@ test.describe("Keyboard auto-resize (#1432)", () => {
       const root = panel?.closest<HTMLElement>("div.flex-1.flex.flex-col");
       return root ? getComputedStyle(root).paddingBottom : "";
     });
-    // No keyboard is open, so no occlusion padding is applied regardless of
-    // the stale localStorage value.
     expect(["0px", "", "auto"]).toContain(rootPaddingBottom);
   });
 });

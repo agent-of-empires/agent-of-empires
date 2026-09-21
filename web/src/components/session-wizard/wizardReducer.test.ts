@@ -1,483 +1,147 @@
-// Tests for the SessionWizard reducer's APPLY_PROFILE_DEFAULTS path,
-// added in #1142 so the web wizard now seeds yoloMode/sandboxEnabled/
-// tool/extraEnv from the active profile on mount instead of waiting for
-// the user to flip the (often-hidden) profile picker.
-//
-// The reducer is the seam: the mount-time effect dispatches the same
-// action the picker does, so unit-testing the reducer covers the
-// per-field merge rules without standing up React + the wizard fetch
-// graph.
-
 import { describe, expect, it } from "vitest";
 
-import { initialData, reducer, type WizardState } from "./wizardReducer";
+import { initialData, reducer, type Action, type WizardData, type WizardState } from "./wizardReducer";
 
-function makeState(overrides: Partial<WizardState> = {}): WizardState {
+function makeState(data: Partial<WizardData> = {}): WizardState {
   return {
-    data: { ...initialData },
+    data: { ...initialData, ...data },
     isSubmitting: false,
     error: null,
     agents: [],
     groups: [],
     profiles: [],
     dockerAvailable: false,
-    ...overrides,
   };
 }
 
-describe("SessionWizard reducer / APPLY_PROFILE_DEFAULTS (#1142)", () => {
-  it("never re-enables a worktree on a path the repo probe already rejected", () => {
-    // A remembered or prefilled path resolves `/api/git/is-repo` at mount, often
-    // before the chained profile+settings fetch seeds the defaults. The seeded
-    // worktree default must not flip the toggle back on for a plain folder.
-    const state = makeState({ data: { ...initialData, path: "/tmp/plain", pathIsGitRepo: false, useWorktree: false } });
-    const next = reducer(state, {
-      type: "APPLY_PROFILE_DEFAULTS",
-      yoloMode: false,
-      sandboxEnabled: false,
-      worktreeEnabled: true,
-      tool: "claude",
-      extraEnv: [],
-    });
-    expect(next.data.useWorktree).toBe(false);
-    const repo = makeState({ data: { ...initialData, path: "/tmp/repo", pathIsGitRepo: true } });
-    expect(
-      reducer(repo, {
-        type: "APPLY_PROFILE_DEFAULTS",
-        yoloMode: false,
-        sandboxEnabled: false,
-        worktreeEnabled: true,
-        tool: "claude",
-        extraEnv: [],
-      }).data.useWorktree,
-    ).toBe(true);
-  });
+const set = (field: string, value: unknown): Action => ({ type: "SET_FIELD", field, value });
+const defaults = (over: Partial<Extract<Action, { type: "APPLY_PROFILE_DEFAULTS" }>> = {}): Action => ({
+  type: "APPLY_PROFILE_DEFAULTS",
+  yoloMode: false,
+  sandboxEnabled: false,
+  worktreeEnabled: false,
+  tool: "claude",
+  extraEnv: [],
+  skipIfDirty: true,
+  ...over,
+});
+const run = (state: WizardState, ...actions: Action[]) => actions.reduce(reducer, state);
 
-  it("seeds yoloMode from a profile-resolved fetch on mount", () => {
-    // Simulates the mount-time path: the user never touched the picker,
-    // and /api/settings?profile=<active> resolved with yolo_mode_default
-    // = true. Before #1142 the wizard ignored this and stayed at false.
-    const next = reducer(makeState(), {
-      type: "APPLY_PROFILE_DEFAULTS",
+describe("APPLY_PROFILE_DEFAULTS", () => {
+  it("seeds profile defaults and clears profileDirty", () => {
+    const next = reducer(
+      makeState(),
+      defaults({ yoloMode: true, sandboxEnabled: true, worktreeEnabled: true, extraEnv: ["FOO=1", "BAR=baz"] }),
+    );
+    expect(next.data).toMatchObject({
       yoloMode: true,
-      sandboxEnabled: false,
-      worktreeEnabled: false,
-      tool: "claude",
-      extraEnv: [],
-      skipIfDirty: true,
-    });
-    expect(next.data.yoloMode).toBe(true);
-    expect(next.data.sandboxEnabled).toBe(false);
-    expect(next.data.tool).toBe("claude");
-    expect(next.data.profileDirty).toBe(false);
-  });
-
-  it("seeds sandboxEnabled and extraEnv together so the env list survives", () => {
-    const next = reducer(makeState(), {
-      type: "APPLY_PROFILE_DEFAULTS",
-      yoloMode: false,
       sandboxEnabled: true,
-      worktreeEnabled: false,
+      useWorktree: true,
       tool: "claude",
       extraEnv: ["FOO=1", "BAR=baz"],
-      skipIfDirty: true,
+      profileDirty: false,
     });
-    expect(next.data.sandboxEnabled).toBe(true);
-    expect(next.data.extraEnv).toEqual(["FOO=1", "BAR=baz"]);
   });
 
-  it("falls back to the existing tool when the profile reports an empty default_tool", () => {
-    // `(session?.default_tool as string) || ""` resolves empty when the
-    // profile doesn't set a tool; the reducer must keep whatever the
-    // wizard already had (the prefill or "claude" default).
-    const next = reducer(makeState({ data: { ...initialData, tool: "opencode" } }), {
-      type: "APPLY_PROFILE_DEFAULTS",
-      yoloMode: false,
-      sandboxEnabled: false,
-      worktreeEnabled: false,
-      tool: "",
-      extraEnv: [],
-      skipIfDirty: true,
-    });
-    expect(next.data.tool).toBe("opencode");
+  it("keeps the existing tool when the profile reports none", () => {
+    expect(reducer(makeState({ tool: "opencode" }), defaults({ tool: "" })).data.tool).toBe("opencode");
   });
 
-  it("respects skipIfDirty: a slow mount fetch must not clobber user edits", () => {
-    // The race the reducer guards against: the user toggled yoloMode off
-    // (after picking a profile) before /api/settings resolved. The
-    // mount-time dispatch sets skipIfDirty so the late response is a
-    // no-op instead of stomping back to the profile default.
-    const dirty = makeState({
-      data: {
-        ...initialData,
-        profile: "team-defaults",
-        profileDirty: true,
-        yoloMode: false,
-      },
-    });
-    const next = reducer(dirty, {
-      type: "APPLY_PROFILE_DEFAULTS",
-      yoloMode: true,
-      sandboxEnabled: true,
-      worktreeEnabled: true,
-      tool: "claude",
-      extraEnv: ["FOO=1"],
-      skipIfDirty: true,
-    });
-    expect(next).toBe(dirty);
+  it("never enables worktree for a scratch session", () => {
+    expect(reducer(makeState({ scratch: true }), defaults({ worktreeEnabled: true })).data.useWorktree).toBe(false);
   });
 
-  it("ignores skipIfDirty for the picker-driven path so confirmed overrides apply", () => {
-    // `AgentStep.handleProfileChange` shows a window.confirm() before
-    // dispatching with skipIfDirty omitted/false. Even with
-    // profileDirty: true, the action must apply.
-    const dirty = makeState({
-      data: {
-        ...initialData,
-        profile: "team-defaults",
-        profileDirty: true,
-        yoloMode: false,
-      },
-    });
-    const next = reducer(dirty, {
-      type: "APPLY_PROFILE_DEFAULTS",
-      yoloMode: true,
-      sandboxEnabled: true,
-      worktreeEnabled: true,
-      tool: "claude",
-      extraEnv: [],
-    });
+  // A remembered or prefilled path resolves its repo probe at mount, often
+  // before the chained profile+settings fetch seeds the defaults.
+  it.each([
+    [false, false],
+    [true, true],
+  ])("re-enables worktree only where the repo probe said yes (pathIsGitRepo %s)", (pathIsGitRepo, expected) => {
+    const state = makeState({ path: "/tmp/p", pathIsGitRepo });
+    expect(reducer(state, defaults({ worktreeEnabled: true })).data.useWorktree).toBe(expected);
+  });
+
+  it.each([
+    ["yoloMode", true],
+    ["useWorktree", true],
+  ])("a %s edit before the mount fetch marks dirty so the late skipIfDirty apply is a no-op", (field, value) => {
+    const edited = reducer(makeState(), set(field, value));
+    expect(edited.data.profile).toBe("");
+    expect(edited.data.profileDirty).toBe(true);
+    expect(reducer(edited, defaults({ yoloMode: false, worktreeEnabled: false }))).toBe(edited);
+  });
+
+  it("applies over dirty edits for the confirmed picker path", () => {
+    const next = reducer(
+      makeState({ profile: "team", profileDirty: true }),
+      defaults({ yoloMode: true, skipIfDirty: undefined }),
+    );
     expect(next.data.yoloMode).toBe(true);
     expect(next.data.profileDirty).toBe(false);
   });
 
-  it("enabling scratch clears path, extraRepoPaths, and useWorktree", () => {
-    // Mutual exclusion: switching to scratch must not leave stale
-    // path/useWorktree state that would otherwise leak into the submit
-    // payload (the server would 400 on scratch + worktree_branch, and
-    // the UI would render an empty path next to a "real" project marker).
+  it("is not suppressed by a structured view toggle, which does not mark dirty", () => {
+    const toggled = reducer(makeState(), set("useStructuredView", false));
+    expect(toggled.data.useStructuredView).toBe(false);
+    expect(toggled.data.profileDirty).toBe(false);
+    expect(reducer(toggled, defaults({ yoloMode: true })).data.yoloMode).toBe(true);
+    expect(reducer(toggled, set("tool", "opencode")).data.useStructuredView).toBe(false);
+  });
+});
+
+describe("SET_FIELD mutual exclusion", () => {
+  it("enabling scratch clears path sources, worktree, import id and a stale non-repo probe", () => {
     const seeded = makeState({
-      data: {
-        ...initialData,
-        path: "/Users/me/old-project",
-        extraRepoPaths: ["/Users/me/lib-a", "/Users/me/lib-b"],
-        useWorktree: true,
-      },
+      path: "/old",
+      extraRepoPaths: ["/a", "/b"],
+      useWorktree: true,
+      importAcpSessionId: "abc",
+      pathIsGitRepo: false,
     });
-    const next = reducer(seeded, {
-      type: "SET_FIELD",
-      field: "scratch",
-      value: true,
+    expect(reducer(seeded, set("scratch", true)).data).toMatchObject({
+      scratch: true,
+      path: "",
+      extraRepoPaths: [],
+      useWorktree: false,
+      importAcpSessionId: "",
+      pathIsGitRepo: true,
     });
-    expect(next.data.scratch).toBe(true);
-    expect(next.data.path).toBe("");
-    expect(next.data.extraRepoPaths).toEqual([]);
-    expect(next.data.useWorktree).toBe(false);
   });
 
-  it("setting a real path clears scratch (bidirectional reset)", () => {
-    const seeded = makeState({
-      data: { ...initialData, scratch: true, path: "" },
-    });
-    const next = reducer(seeded, {
-      type: "SET_FIELD",
-      field: "path",
-      value: "/Users/me/picked-project",
-    });
+  it.each([
+    ["path", "/picked"],
+    ["extraRepoPaths", ["/lib"]],
+  ])("a non-empty %s clears scratch and the import id", (field, value) => {
+    const next = reducer(makeState({ scratch: true, importAcpSessionId: "abc" }), set(field, value));
     expect(next.data.scratch).toBe(false);
-    expect(next.data.path).toBe("/Users/me/picked-project");
+    expect(next.data.importAcpSessionId).toBe("");
   });
 
-  it("setting extraRepoPaths to a non-empty array clears scratch", () => {
-    const seeded = makeState({
-      data: { ...initialData, scratch: true },
-    });
-    const next = reducer(seeded, {
-      type: "SET_FIELD",
-      field: "extraRepoPaths",
-      value: ["/Users/me/lib"],
-    });
-    expect(next.data.scratch).toBe(false);
+  it("disabling scratch keeps the existing path", () => {
+    expect(reducer(makeState({ path: "/keep" }), set("scratch", false)).data.path).toBe("/keep");
   });
 
-  it("setting scratch to false does NOT clear an existing path", () => {
-    // A redundant SET_FIELD scratch=false (e.g. user toggles off and
-    // then back to a real project) must not wipe whatever path the
-    // user just picked.
-    const seeded = makeState({
-      data: { ...initialData, scratch: false, path: "/Users/me/keep-me" },
-    });
-    const next = reducer(seeded, {
-      type: "SET_FIELD",
-      field: "scratch",
-      value: false,
-    });
-    expect(next.data.path).toBe("/Users/me/keep-me");
+  it("keeps the import id when the import picker dispatches path then id", () => {
+    const next = run(makeState(), set("path", "/cwd"), set("importAcpSessionId", "imp"));
+    expect(next.data).toMatchObject({ path: "/cwd", importAcpSessionId: "imp" });
   });
 
-  it("marks dirty on user toggles even without a profile selected", () => {
-    // The dirty guard initially only fired when state.data.profile was
-    // truthy, which left no-prefill / no-active-profile users exposed
-    // to a race: a fast yoloMode toggle before /api/settings resolved
-    // wouldn't set profileDirty, so the late APPLY_PROFILE_DEFAULTS
-    // with skipIfDirty: true would still stomp the edit. Now any
-    // SET_FIELD on yoloMode/sandboxEnabled/tool/extraEnv marks dirty.
-    const fresh = reducer(makeState(), {
-      type: "SET_FIELD",
-      field: "yoloMode",
-      value: true,
-    });
-    expect(fresh.data.profile).toBe("");
-    expect(fresh.data.profileDirty).toBe(true);
-
-    // Verify the dirty flag protects against the late mount fetch.
-    const late = reducer(fresh, {
-      type: "APPLY_PROFILE_DEFAULTS",
-      yoloMode: false,
-      sandboxEnabled: false,
-      worktreeEnabled: false,
-      tool: "claude",
-      extraEnv: [],
-      skipIfDirty: true,
-    });
-    expect(late).toBe(fresh);
-    expect(late.data.yoloMode).toBe(true);
-  });
-});
-
-describe("SessionWizard reducer / useStructuredView (#1580)", () => {
-  it("defaults useStructuredView to true so ACP-capable tools use the structured view by default", () => {
-    expect(initialData.useStructuredView).toBe(true);
-  });
-
-  it("SET_FIELD useStructuredView updates the flag", () => {
-    const next = reducer(makeState(), {
-      type: "SET_FIELD",
-      field: "useStructuredView",
-      value: false,
-    });
-    expect(next.data.useStructuredView).toBe(false);
-  });
-
-  it("toggling useStructuredView does NOT mark profileDirty", () => {
-    // useStructuredView is deliberately excluded from the dirty-tracking list:
-    // the mount-time APPLY_PROFILE_DEFAULTS seeder uses skipIfDirty, so
-    // marking dirty on a structured view toggle would suppress the profile's
-    // tool/yolo/sandbox/env defaults even though structured view is unrelated.
-    const next = reducer(makeState(), {
-      type: "SET_FIELD",
-      field: "useStructuredView",
-      value: false,
-    });
-    expect(next.data.profileDirty).toBe(false);
-
-    // A late profile-defaults fetch must still apply (not be skipped).
-    const late = reducer(next, {
-      type: "APPLY_PROFILE_DEFAULTS",
-      yoloMode: true,
-      sandboxEnabled: false,
-      worktreeEnabled: false,
-      tool: "claude",
-      extraEnv: [],
-      skipIfDirty: true,
-    });
-    expect(late.data.yoloMode).toBe(true);
-  });
-
-  it("switching tool preserves the user's useStructuredView choice", () => {
-    const optedOut = reducer(makeState(), {
-      type: "SET_FIELD",
-      field: "useStructuredView",
-      value: false,
-    });
-    const next = reducer(optedOut, {
-      type: "SET_FIELD",
-      field: "tool",
-      value: "opencode",
-    });
-    expect(next.data.tool).toBe("opencode");
-    expect(next.data.useStructuredView).toBe(false);
-  });
-});
-
-describe("SessionWizard reducer / SUBMIT_CANCEL (#2045)", () => {
-  it("re-enables submit without an error when a pre-create confirm is cancelled", () => {
-    // SUBMIT_START disables the button; backing out of the glob volume_ignores
-    // confirm modal must restore the interactive state and leave no error.
-    const submitting = reducer(makeState(), { type: "SUBMIT_START" });
-    expect(submitting.isSubmitting).toBe(true);
-
-    const cancelled = reducer(submitting, { type: "SUBMIT_CANCEL" });
-    expect(cancelled.isSubmitting).toBe(false);
-    expect(cancelled.error).toBeNull();
-  });
-});
-
-describe("SessionWizard reducer / import id clearing (#2276)", () => {
-  it("clears importAcpSessionId when a non-import path is chosen", () => {
-    const imported = reducer(makeState(), {
-      type: "SET_FIELD",
-      field: "importAcpSessionId",
-      value: "abc-123",
-    });
-    expect(imported.data.importAcpSessionId).toBe("abc-123");
-
-    // User switches to Browse and picks a different path.
-    const browsed = reducer(imported, {
-      type: "SET_FIELD",
-      field: "path",
-      value: "/Users/me/other-repo",
-    });
-    expect(browsed.data.importAcpSessionId).toBe("");
-    expect(browsed.data.path).toBe("/Users/me/other-repo");
-  });
-
-  it("clears importAcpSessionId when scratch is enabled", () => {
-    const imported = reducer(makeState(), {
-      type: "SET_FIELD",
-      field: "importAcpSessionId",
-      value: "abc-123",
-    });
-    const scratch = reducer(imported, { type: "SET_FIELD", field: "scratch", value: true });
-    expect(scratch.data.importAcpSessionId).toBe("");
-  });
-
-  it("preserves importAcpSessionId across the import picker's path-then-id dispatch order", () => {
-    // ProjectStep.handleImportSelect dispatches path first, then the id.
-    const withPath = reducer(makeState(), {
-      type: "SET_FIELD",
-      field: "path",
-      value: "/Users/me/imported-cwd",
-    });
-    const withId = reducer(withPath, {
-      type: "SET_FIELD",
-      field: "importAcpSessionId",
-      value: "imp-789",
-    });
-    expect(withId.data.importAcpSessionId).toBe("imp-789");
-    expect(withId.data.path).toBe("/Users/me/imported-cwd");
-  });
-});
-
-describe("SessionWizard reducer / worktree default from config (#2423)", () => {
-  it("defaults useWorktree to false so it matches the backend worktree.enabled default", () => {
-    // Before #2423 this was hardcoded true, so the wizard ignored both
-    // worktree.enabled and the web Settings toggle.
-    expect(initialData.useWorktree).toBe(false);
-  });
-
-  it("seeds useWorktree from worktreeEnabled on the mount fetch", () => {
-    const off = reducer(makeState(), {
-      type: "APPLY_PROFILE_DEFAULTS",
-      yoloMode: false,
-      sandboxEnabled: false,
-      worktreeEnabled: false,
-      tool: "claude",
-      extraEnv: [],
-      skipIfDirty: true,
-    });
-    expect(off.data.useWorktree).toBe(false);
-
-    const on = reducer(makeState(), {
-      type: "APPLY_PROFILE_DEFAULTS",
-      yoloMode: false,
-      sandboxEnabled: false,
-      worktreeEnabled: true,
-      tool: "claude",
-      extraEnv: [],
-      skipIfDirty: true,
-    });
-    expect(on.data.useWorktree).toBe(true);
-  });
-
-  it("never enables worktree for a scratch session even when worktreeEnabled is true", () => {
-    const scratch = makeState({ data: { ...initialData, scratch: true } });
-    const next = reducer(scratch, {
-      type: "APPLY_PROFILE_DEFAULTS",
-      yoloMode: false,
-      sandboxEnabled: false,
-      worktreeEnabled: true,
-      tool: "claude",
-      extraEnv: [],
-      skipIfDirty: true,
-    });
-    expect(next.data.useWorktree).toBe(false);
-  });
-
-  it("does not stomp a user worktree toggle made before the mount fetch resolves", () => {
-    // The user opens the wizard and turns the toggle off (or on) before
-    // /api/settings resolves. SET_FIELD on useWorktree marks profileDirty,
-    // so the late skipIfDirty apply must be a no-op.
-    const toggled = reducer(makeState(), {
-      type: "SET_FIELD",
-      field: "useWorktree",
-      value: true,
-    });
-    expect(toggled.data.useWorktree).toBe(true);
-    expect(toggled.data.profileDirty).toBe(true);
-
-    const late = reducer(toggled, {
-      type: "APPLY_PROFILE_DEFAULTS",
-      yoloMode: false,
-      sandboxEnabled: false,
-      worktreeEnabled: false,
-      tool: "claude",
-      extraEnv: [],
-      skipIfDirty: true,
-    });
-    expect(late).toBe(toggled);
-    expect(late.data.useWorktree).toBe(true);
-  });
-});
-
-describe("SessionWizard reducer / worktree gating on non-git paths", () => {
-  it("forces useWorktree off when the probe reports a non-repo path", () => {
-    const withWorktree = reducer(makeState(), {
-      type: "SET_FIELD",
-      field: "useWorktree",
-      value: true,
-    });
-    expect(withWorktree.data.useWorktree).toBe(true);
-
-    const nonRepo = reducer(withWorktree, {
-      type: "SET_FIELD",
-      field: "pathIsGitRepo",
-      value: false,
-    });
-    expect(nonRepo.data.pathIsGitRepo).toBe(false);
+  it("a non-repo probe forces worktree off, and a new path resets the probe optimistically", () => {
+    const nonRepo = run(makeState(), set("useWorktree", true), set("pathIsGitRepo", false));
     expect(nonRepo.data.useWorktree).toBe(false);
+    expect(reducer(nonRepo, set("path", "/repo")).data.pathIsGitRepo).toBe(true);
   });
+});
 
-  it("optimistically resets pathIsGitRepo to true on a path change so a stale non-repo result can't linger", () => {
-    const nonRepo = reducer(makeState(), {
-      type: "SET_FIELD",
-      field: "pathIsGitRepo",
-      value: false,
-    });
-    expect(nonRepo.data.pathIsGitRepo).toBe(false);
+it("mirrors the title into the branch until the branch is edited, even to empty", () => {
+  const mirrored = reducer(makeState(), set("title", "Fix login"));
+  expect(mirrored.data.worktreeBranch).toBe("fix-login");
+  const cleared = run(mirrored, set("worktreeBranch", ""), set("title", "Other"));
+  expect(cleared.data).toMatchObject({ worktreeBranch: "", worktreeBranchDirty: true });
+});
 
-    const newPath = reducer(nonRepo, {
-      type: "SET_FIELD",
-      field: "path",
-      value: "/home/user/some-repo",
-    });
-    expect(newPath.data.pathIsGitRepo).toBe(true);
-  });
-
-  it("clears a stale non-repo result when scratch is turned on, so a scratch round-trip leaves an empty path optimistic", () => {
-    const nonRepo = reducer(makeState(), {
-      type: "SET_FIELD",
-      field: "pathIsGitRepo",
-      value: false,
-    });
-    expect(nonRepo.data.pathIsGitRepo).toBe(false);
-
-    const scratchOn = reducer(nonRepo, {
-      type: "SET_FIELD",
-      field: "scratch",
-      value: true,
-    });
-    expect(scratchOn.data.path).toBe("");
-    expect(scratchOn.data.pathIsGitRepo).toBe(true);
-  });
+it("SUBMIT_CANCEL re-enables submit without an error", () => {
+  const cancelled = run(makeState(), { type: "SUBMIT_START" }, { type: "SUBMIT_CANCEL" });
+  expect(cancelled.isSubmitting).toBe(false);
+  expect(cancelled.error).toBeNull();
 });

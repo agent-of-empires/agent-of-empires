@@ -225,19 +225,9 @@ impl GroupDeleteOptionsDialog {
             dialog_height += 1;
         }
 
-        let dialog_area = super::centered_rect(area, dialog_width, dialog_height);
-
-        frame.render_widget(Clear, dialog_area);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.error))
-            .title(" Delete Group ")
-            .title_style(Style::default().fg(theme.error).bold());
-
-        let inner = block.inner(dialog_area);
-        frame.render_widget(block, dialog_area);
+        let block = super::toned_dialog_block(" Delete Group ", theme.error, theme.error);
+        let (_, inner) =
+            super::render_dialog_frame(frame, area, dialog_width, dialog_height, block);
 
         let mut constraints = vec![
             Constraint::Length(2), // Group info
@@ -422,324 +412,40 @@ impl GroupDeleteOptionsDialog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyModifiers;
+    use crate::tui::dialogs::test_keys::{key, shift_key};
 
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
+    /// A dialog over a 3-session group, with or without worktrees and
+    /// containers among those sessions.
+    fn dialog(worktrees: bool, containers: bool) -> GroupDeleteOptionsDialog {
+        GroupDeleteOptionsDialog::new("work".to_string(), 3, worktrees, containers)
     }
 
-    fn shift_key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::SHIFT)
-    }
-
-    fn dialog() -> GroupDeleteOptionsDialog {
-        GroupDeleteOptionsDialog::new("work".to_string(), 3, false, false)
-    }
-
-    fn dialog_with_worktrees() -> GroupDeleteOptionsDialog {
-        GroupDeleteOptionsDialog::new("work".to_string(), 3, true, false)
-    }
-
-    fn dialog_with_containers() -> GroupDeleteOptionsDialog {
-        GroupDeleteOptionsDialog::new("work".to_string(), 3, false, true)
-    }
-
-    fn dialog_with_both() -> GroupDeleteOptionsDialog {
-        GroupDeleteOptionsDialog::new("work".to_string(), 3, true, true)
+    /// The same, already switched to delete (the mode that reveals the
+    /// per-resource checkboxes).
+    fn deleting(worktrees: bool, containers: bool) -> GroupDeleteOptionsDialog {
+        let mut d = dialog(worktrees, containers);
+        d.options.delete_sessions = true;
+        d
     }
 
     #[test]
-    fn test_default_options() {
-        let options = GroupDeleteOptions::default();
-        assert!(!options.delete_sessions);
-        assert!(!options.delete_worktrees);
-        assert!(!options.force_delete_worktrees);
-        assert!(!options.delete_branches);
-        assert!(!options.delete_containers);
-    }
-
-    #[test]
-    fn test_esc_cancels() {
-        let mut dialog = dialog();
-        let result = dialog.handle_key(key(KeyCode::Esc));
-        assert!(matches!(result, DialogResult::Cancel));
-    }
-
-    #[test]
-    fn test_enter_confirms() {
-        let mut dialog = dialog();
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        assert!(matches!(result, DialogResult::Submit(_)));
-    }
-
-    #[test]
-    fn test_default_is_move() {
-        let mut dialog = dialog();
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        match result {
-            DialogResult::Submit(opts) => {
-                assert!(!opts.delete_sessions);
-            }
-            _ => panic!("Expected Submit"),
+    fn enter_submits_and_defaults_to_moving_the_sessions() {
+        let mut d = dialog(false, false);
+        assert!(matches!(
+            d.handle_key(key(KeyCode::Esc)),
+            DialogResult::Cancel
+        ));
+        match dialog(false, false).handle_key(key(KeyCode::Enter)) {
+            DialogResult::Submit(opts) => assert!(!opts.delete_sessions),
+            _ => panic!("expected Submit"),
         }
-    }
 
-    #[test]
-    fn test_tab_cycles_fields() {
-        let mut dialog = dialog();
-        assert_eq!(dialog.focused_field, 0);
-
-        dialog.handle_key(key(KeyCode::Tab));
-        assert_eq!(dialog.focused_field, 1);
-
-        dialog.handle_key(key(KeyCode::Tab));
-        assert_eq!(dialog.focused_field, 0);
-    }
-
-    #[test]
-    fn test_backtab_cycles_reverse() {
-        let mut dialog = dialog();
-        assert_eq!(dialog.focused_field, 0);
-
-        dialog.handle_key(shift_key(KeyCode::BackTab));
-        assert_eq!(dialog.focused_field, 1);
-
-        dialog.handle_key(shift_key(KeyCode::BackTab));
-        assert_eq!(dialog.focused_field, 0);
-    }
-
-    #[test]
-    fn test_space_selects_delete() {
-        let mut dialog = dialog();
-        dialog.handle_key(key(KeyCode::Tab)); // Move to delete option
-        dialog.handle_key(key(KeyCode::Char(' ')));
-        assert!(dialog.options.delete_sessions);
-    }
-
-    #[test]
-    fn test_space_selects_move() {
-        let mut dialog = dialog();
-        dialog.options.delete_sessions = true;
-        dialog.focused_field = 0;
-        dialog.handle_key(key(KeyCode::Char(' ')));
-        assert!(!dialog.options.delete_sessions);
-    }
-
-    #[test]
-    fn test_worktree_checkbox_appears_when_delete_selected() {
-        let mut dialog = dialog_with_worktrees();
-        assert_eq!(dialog.max_field(), 2); // No worktree option yet
-
-        dialog.options.delete_sessions = true;
-        assert_eq!(dialog.max_field(), 4); // Now worktree + branch options are available
-    }
-
-    #[test]
-    fn test_worktree_checkbox_toggle() {
-        let mut dialog = dialog_with_worktrees();
-        dialog.options.delete_sessions = true;
-        dialog.focused_field = 2;
-        assert!(!dialog.options.delete_worktrees);
-
-        dialog.handle_key(key(KeyCode::Char(' ')));
-        assert!(dialog.options.delete_worktrees);
-
-        dialog.handle_key(key(KeyCode::Char(' ')));
-        assert!(!dialog.options.delete_worktrees);
-    }
-
-    #[test]
-    fn test_tab_includes_worktree_when_delete_selected() {
-        let mut dialog = dialog_with_worktrees();
-        dialog.options.delete_sessions = true;
-        assert_eq!(dialog.focused_field, 0);
-
-        dialog.handle_key(key(KeyCode::Tab));
-        assert_eq!(dialog.focused_field, 1);
-
-        dialog.handle_key(key(KeyCode::Tab));
-        assert_eq!(dialog.focused_field, 2); // worktree checkbox
-
-        dialog.handle_key(key(KeyCode::Tab));
-        assert_eq!(dialog.focused_field, 3); // branch checkbox
-
-        dialog.handle_key(key(KeyCode::Tab));
-        assert_eq!(dialog.focused_field, 0);
-    }
-
-    #[test]
-    fn test_up_down_navigation() {
-        let mut dialog = dialog();
-        assert_eq!(dialog.focused_field, 0);
-
-        dialog.handle_key(key(KeyCode::Down));
-        assert_eq!(dialog.focused_field, 1);
-
-        dialog.handle_key(key(KeyCode::Up));
-        assert_eq!(dialog.focused_field, 0);
-    }
-
-    #[test]
-    fn test_jk_navigation() {
-        let mut dialog = dialog();
-        assert_eq!(dialog.focused_field, 0);
-
-        dialog.handle_key(key(KeyCode::Char('j')));
-        assert_eq!(dialog.focused_field, 1);
-
-        dialog.handle_key(key(KeyCode::Char('k')));
-        assert_eq!(dialog.focused_field, 0);
-    }
-
-    #[test]
-    fn test_submit_with_delete_and_worktrees() {
-        let mut dialog = dialog_with_worktrees();
-        dialog.options.delete_sessions = true;
-        dialog.options.delete_worktrees = true;
-
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        match result {
-            DialogResult::Submit(opts) => {
-                assert!(opts.delete_sessions);
-                assert!(opts.delete_worktrees);
-            }
-            _ => panic!("Expected Submit"),
-        }
-    }
-
-    #[test]
-    fn test_selecting_move_clears_delete_worktrees() {
-        let mut dialog = dialog_with_worktrees();
-        dialog.options.delete_sessions = true;
-        dialog.options.delete_worktrees = true;
-        dialog.options.force_delete_worktrees = true;
-        dialog.options.delete_branches = true;
-        dialog.focused_field = 0;
-
-        dialog.handle_key(key(KeyCode::Char(' ')));
-        assert!(!dialog.options.delete_sessions);
-        assert!(!dialog.options.delete_worktrees);
-        assert!(!dialog.options.force_delete_worktrees);
-        assert!(!dialog.options.delete_branches);
-    }
-
-    #[test]
-    fn test_selecting_move_clears_delete_containers() {
-        let mut dialog = dialog_with_containers();
-        dialog.options.delete_sessions = true;
-        dialog.options.delete_containers = true;
-        dialog.focused_field = 0;
-
-        dialog.handle_key(key(KeyCode::Char(' ')));
-        assert!(!dialog.options.delete_sessions);
-        assert!(!dialog.options.delete_containers);
-    }
-
-    #[test]
-    fn test_container_checkbox_appears_when_delete_selected() {
-        let mut dialog = dialog_with_containers();
-        assert_eq!(dialog.max_field(), 2); // No container option yet
-
-        dialog.options.delete_sessions = true;
-        assert_eq!(dialog.max_field(), 3); // Now container option is available
-    }
-
-    #[test]
-    fn test_container_checkbox_toggle() {
-        let mut dialog = dialog_with_containers();
-        dialog.options.delete_sessions = true;
-        dialog.focused_field = 2; // Container is at index 2 when no worktrees
-        assert!(!dialog.options.delete_containers);
-
-        dialog.handle_key(key(KeyCode::Char(' ')));
-        assert!(dialog.options.delete_containers);
-
-        dialog.handle_key(key(KeyCode::Char(' ')));
-        assert!(!dialog.options.delete_containers);
-    }
-
-    #[test]
-    fn test_tab_includes_container_when_delete_selected() {
-        let mut dialog = dialog_with_containers();
-        dialog.options.delete_sessions = true;
-        assert_eq!(dialog.focused_field, 0);
-
-        dialog.handle_key(key(KeyCode::Tab));
-        assert_eq!(dialog.focused_field, 1);
-
-        dialog.handle_key(key(KeyCode::Tab));
-        assert_eq!(dialog.focused_field, 2); // Container checkbox
-
-        dialog.handle_key(key(KeyCode::Tab));
-        assert_eq!(dialog.focused_field, 0);
-    }
-
-    #[test]
-    fn test_both_checkboxes_when_delete_selected() {
-        let mut dialog = dialog_with_both();
-        assert_eq!(dialog.max_field(), 2); // No checkboxes yet
-
-        dialog.options.delete_sessions = true;
-        assert_eq!(dialog.max_field(), 5); // worktree + branch + container checkboxes
-    }
-
-    #[test]
-    fn test_tab_includes_both_checkboxes() {
-        let mut dialog = dialog_with_both();
-        dialog.options.delete_sessions = true;
-        assert_eq!(dialog.focused_field, 0);
-
-        dialog.handle_key(key(KeyCode::Tab));
-        assert_eq!(dialog.focused_field, 1); // Delete option
-
-        dialog.handle_key(key(KeyCode::Tab));
-        assert_eq!(dialog.focused_field, 2); // Worktree checkbox
-
-        dialog.handle_key(key(KeyCode::Tab));
-        assert_eq!(dialog.focused_field, 3); // Branch checkbox
-
-        dialog.handle_key(key(KeyCode::Tab));
-        assert_eq!(dialog.focused_field, 4); // Container checkbox
-
-        dialog.handle_key(key(KeyCode::Tab));
-        assert_eq!(dialog.focused_field, 0); // Wrap around
-    }
-
-    #[test]
-    fn test_container_checkbox_at_correct_index_with_worktrees() {
-        let mut dialog = dialog_with_both();
-        dialog.options.delete_sessions = true;
-
-        // Worktree is at index 2
-        assert_eq!(dialog.worktree_field_index(), Some(2));
-        // Branch is at index 3 (after worktree)
-        assert_eq!(dialog.branch_field_index(), Some(3));
-        // Container is at index 4 (after branch)
-        assert_eq!(dialog.container_field_index(), Some(4));
-    }
-
-    #[test]
-    fn test_container_checkbox_at_correct_index_without_worktrees() {
-        let mut dialog = dialog_with_containers();
-        dialog.options.delete_sessions = true;
-
-        // No worktree
-        assert_eq!(dialog.worktree_field_index(), None);
-        // Container is at index 2
-        assert_eq!(dialog.container_field_index(), Some(2));
-    }
-
-    #[test]
-    fn test_submit_with_all_options() {
-        let mut dialog = dialog_with_both();
-        dialog.options.delete_sessions = true;
-        dialog.options.delete_worktrees = true;
-        dialog.options.force_delete_worktrees = true;
-        dialog.options.delete_branches = true;
-        dialog.options.delete_containers = true;
-
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        match result {
+        let mut d = deleting(true, true);
+        d.options.delete_worktrees = true;
+        d.options.force_delete_worktrees = true;
+        d.options.delete_branches = true;
+        d.options.delete_containers = true;
+        match d.handle_key(key(KeyCode::Enter)) {
             DialogResult::Submit(opts) => {
                 assert!(opts.delete_sessions);
                 assert!(opts.delete_worktrees);
@@ -747,56 +453,114 @@ mod tests {
                 assert!(opts.delete_branches);
                 assert!(opts.delete_containers);
             }
-            _ => panic!("Expected Submit"),
+            _ => panic!("expected Submit"),
         }
     }
 
     #[test]
-    fn test_selecting_move_clears_all_options() {
-        let mut dialog = dialog_with_both();
-        dialog.options.delete_sessions = true;
-        dialog.options.delete_worktrees = true;
-        dialog.options.force_delete_worktrees = true;
-        dialog.options.delete_branches = true;
-        dialog.options.delete_containers = true;
-        dialog.focused_field = 0;
+    fn every_navigation_key_moves_between_the_visible_rows() {
+        for (forward, back) in [
+            (key(KeyCode::Tab), shift_key(KeyCode::BackTab)),
+            (key(KeyCode::Down), key(KeyCode::Up)),
+            (key(KeyCode::Char('j')), key(KeyCode::Char('k'))),
+        ] {
+            let mut d = dialog(false, false);
+            d.handle_key(forward);
+            assert_eq!(d.focused_field, 1);
+            d.handle_key(back);
+            assert_eq!(d.focused_field, 0);
+        }
 
-        dialog.handle_key(key(KeyCode::Char(' ')));
-        assert!(!dialog.options.delete_sessions);
-        assert!(!dialog.options.delete_worktrees);
-        assert!(!dialog.options.force_delete_worktrees);
-        assert!(!dialog.options.delete_branches);
-        assert!(!dialog.options.delete_containers);
+        // Tab wraps through however many checkbox rows the group's resources
+        // and the delete mode expose.
+        for (worktrees, containers, last) in [(true, false, 3), (false, true, 2), (true, true, 4)] {
+            let mut d = deleting(worktrees, containers);
+            for expected in 1..=last {
+                d.handle_key(key(KeyCode::Tab));
+                assert_eq!(d.focused_field, expected, "{worktrees} {containers}");
+            }
+            d.handle_key(key(KeyCode::Tab));
+            assert_eq!(d.focused_field, 0, "wraps");
+        }
     }
 
     #[test]
-    fn hover_highlights_row_without_moving_focus() {
-        // Stage focusable rects manually; the real ones come from render().
-        let mut dialog = dialog();
-        dialog.focusable_rects = vec![(0, Rect::new(2, 4, 40, 1)), (1, Rect::new(2, 5, 40, 1))];
-        dialog.focused_field = 0;
+    fn checkbox_rows_appear_only_while_deleting_and_keep_their_order() {
+        // Move mode offers the two mode rows alone.
+        for (worktrees, containers, deleting_max) in
+            [(true, false, 4), (false, true, 3), (true, true, 5)]
+        {
+            let mut d = dialog(worktrees, containers);
+            assert_eq!(d.max_field(), 2, "move mode has no checkboxes");
+            d.options.delete_sessions = true;
+            assert_eq!(d.max_field(), deleting_max);
+        }
 
-        // Over the delete row: highlight it, focus unchanged.
-        assert!(dialog.handle_hover(5, 5));
-        assert_eq!(dialog.hover.current(), Some(Rect::new(2, 5, 40, 1)));
-        assert_eq!(dialog.focused_field, 0, "hover must not move focus");
+        let d = deleting(true, true);
+        assert_eq!(d.worktree_field_index(), Some(2));
+        assert_eq!(d.branch_field_index(), Some(3));
+        assert_eq!(d.container_field_index(), Some(4));
 
-        // Off all rows clears the highlight.
-        assert!(dialog.handle_hover(99, 99));
-        assert_eq!(dialog.hover.current(), None);
+        let d = deleting(false, true);
+        assert_eq!(d.worktree_field_index(), None);
+        assert_eq!(d.container_field_index(), Some(2));
     }
 
     #[test]
-    fn test_branch_checkbox_toggle() {
-        let mut dialog = dialog_with_worktrees();
-        dialog.options.delete_sessions = true;
-        dialog.focused_field = 3; // Branch checkbox
-        assert!(!dialog.options.delete_branches);
+    fn space_toggles_the_focused_row() {
+        // Mode row 1 switches to delete; row 0 switches back.
+        let mut d = dialog(false, false);
+        d.handle_key(key(KeyCode::Tab));
+        d.handle_key(key(KeyCode::Char(' ')));
+        assert!(d.options.delete_sessions);
+        d.focused_field = 0;
+        d.handle_key(key(KeyCode::Char(' ')));
+        assert!(!d.options.delete_sessions);
 
-        dialog.handle_key(key(KeyCode::Char(' ')));
-        assert!(dialog.options.delete_branches);
+        // (worktrees, containers, focused row, the option it owns)
+        type ToggleCase = (bool, bool, usize, fn(&GroupDeleteOptions) -> bool);
+        let rows: &[ToggleCase] = &[
+            (true, false, 2, |o| o.delete_worktrees),
+            (true, false, 3, |o| o.delete_branches),
+            (false, true, 2, |o| o.delete_containers),
+        ];
+        for (worktrees, containers, field, read) in rows {
+            let mut d = deleting(*worktrees, *containers);
+            d.focused_field = *field;
+            assert!(!read(&d.options));
+            d.handle_key(key(KeyCode::Char(' ')));
+            assert!(read(&d.options), "row {field}");
+            d.handle_key(key(KeyCode::Char(' ')));
+            assert!(!read(&d.options), "row {field}");
+        }
+    }
 
-        dialog.handle_key(key(KeyCode::Char(' ')));
-        assert!(!dialog.options.delete_branches);
+    #[test]
+    fn switching_back_to_move_clears_every_delete_option() {
+        let mut d = deleting(true, true);
+        d.options.delete_worktrees = true;
+        d.options.force_delete_worktrees = true;
+        d.options.delete_branches = true;
+        d.options.delete_containers = true;
+        d.focused_field = 0;
+
+        d.handle_key(key(KeyCode::Char(' ')));
+        assert!(!d.options.delete_sessions);
+        assert!(!d.options.delete_worktrees);
+        assert!(!d.options.force_delete_worktrees);
+        assert!(!d.options.delete_branches);
+        assert!(!d.options.delete_containers);
+    }
+
+    #[test]
+    fn hover_highlights_a_row_without_moving_focus() {
+        let mut d = dialog(false, false);
+        // Staged manually; the real rects come from render().
+        d.focusable_rects = vec![(0, Rect::new(2, 4, 40, 1)), (1, Rect::new(2, 5, 40, 1))];
+        assert!(d.handle_hover(5, 5));
+        assert_eq!(d.hover.current(), Some(Rect::new(2, 5, 40, 1)));
+        assert_eq!(d.focused_field, 0, "hover must not move focus");
+        assert!(d.handle_hover(99, 99));
+        assert_eq!(d.hover.current(), None);
     }
 }

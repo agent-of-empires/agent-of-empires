@@ -1,12 +1,7 @@
 //! Native ratatui rendering of a structured view session.
 //!
-//! Consumes the same daemon HTTP / WebSocket surface that the web
-//! frontend uses; the per-frame reducer mirrors the activity semantics
-//! of `web/src/hooks/useAcp.ts` without the React-specific shapes.
-//!
-//! Directory name is `structured_view` (not `structured view`) to avoid colliding
-//! with `src/acp/` per the recipe in
-//! <https://github.com/agent-of-empires/agent-of-empires/issues/1018#issuecomment-4444040929>.
+//! Consumes the same daemon HTTP / WebSocket surface as the web frontend; the
+//! per-frame reducer mirrors the activity semantics of `web/src/hooks/useAcp.ts`.
 
 pub mod embedded;
 pub mod input;
@@ -43,24 +38,18 @@ use crate::plugin::ui_state::{Tone, UiSnapshot};
 use crate::session::config::{resolve_theme_name, resolve_theme_palette_mode};
 use crate::tui::styles::Theme;
 
-/// Per-keystroke redraw interval. The animations are minimal (just the
-/// blinking caret in the composer); 120ms keeps it from looking laggy
-/// without burning CPU.
+/// Per-keystroke redraw interval: fast enough for the blinking caret without
+/// burning CPU.
 const REDRAW_INTERVAL: Duration = Duration::from_millis(120);
 /// Toasts auto-clear after this long.
 const TOAST_TTL: Duration = Duration::from_secs(4);
-/// How often to poll the daemon's plugin UI-state snapshot (#2402). Matches
-/// the web dashboard's cadence. The fetch runs on its own task so a slow or
-/// unreachable daemon never blocks the event loop on the HTTP client's
-/// 15-second timeout.
+/// Plugin UI-state poll cadence (#2402). The fetch runs on its own task so a
+/// slow or unreachable daemon never blocks the event loop.
 const PLUGIN_UI_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
-/// Set up an alternate-screen terminal, run the structured view against
-/// the given session, and tear it back down on exit. Used by the
-/// `aoe acp attach <id>` CLI verb to jump straight into the
-/// structured view without going through the home screen. Pair with
-/// `AOE_DAEMON_URL` for remote-attach against another machine's
-/// structured view daemon.
+/// Set up an alternate-screen terminal, run the structured view against the
+/// given session, and tear it down on exit. Used by `aoe acp attach <id>`;
+/// pair with `AOE_DAEMON_URL` to attach to another machine's daemon.
 pub async fn run_standalone(session_id: &str) -> anyhow::Result<()> {
     use crossterm::event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -87,8 +76,7 @@ pub async fn run_standalone(session_id: &str) -> anyhow::Result<()> {
         EnableMouseCapture
     )?;
     // Push the kitty enhancement stack so `Shift+Enter` arrives as
-    // `KeyEvent { Enter, SHIFT }` inside the structured-view composer
-    // (#2362). Best-effort like `TerminalGuard::enter`.
+    // `KeyEvent { Enter, SHIFT }` in the composer (#2362). Best-effort.
     #[cfg(unix)]
     let _ = execute!(
         stdout,
@@ -116,11 +104,9 @@ pub async fn run_standalone(session_id: &str) -> anyhow::Result<()> {
     result
 }
 
-/// Open the full-screen structured view for `session_id` and run its
-/// event loop until the user exits with `Esc`, or until the structured
-/// view daemon becomes unreachable in a way the view can't recover
-/// from. Used by the standalone `aoe acp attach` path; the home screen
-/// embeds the view in its preview pane instead (see [`embedded`]).
+/// Open the full-screen structured view for `session_id` and run its event loop
+/// until the user exits with `Esc` or the daemon becomes unrecoverable. The home
+/// screen embeds the view in its preview pane instead (see [`embedded`]).
 pub async fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     event_stream: &mut EventStream,
@@ -148,11 +134,9 @@ pub async fn run(
             return Ok(());
         }
         Err(ManagerError::NoDaemonRunning(_)) => {
-            // Not a dead end: a structured session cannot function
-            // without the daemon, so offer to start a localhost one
-            // right here (Enter). Remote modes keep their manual
-            // commands on the same screen; auto-picking a tunnel on
-            // the user's behalf would hide that choice.
+            // A structured session cannot function without the daemon, so
+            // offer to start a localhost one here (Enter). Remote modes keep
+            // their manual commands: auto-picking a tunnel would hide the choice.
             match offer_daemon_start(terminal, event_stream, theme).await? {
                 Some(endpoint) => endpoint,
                 None => return Ok(()),
@@ -162,13 +146,9 @@ pub async fn run(
     run_for_endpoint(terminal, event_stream, theme, endpoint, session_id).await
 }
 
-/// Render the "no daemon running" screen with a one-key recovery:
-/// Enter spawns a localhost daemon (via the serve dialog's shared
-/// spawn path) and waits for it to become healthy, then returns its
-/// endpoint so the caller can proceed straight into the view. Any
-/// other key returns `None` (back to the session list). Spawn or
-/// health-check failures render an error screen and also return
-/// `None` after a dismiss keypress.
+/// Render the "no daemon running" screen. Enter spawns a localhost daemon and
+/// waits for it to become healthy, returning its endpoint; any other key, or a
+/// spawn or health-check failure, returns `None`.
 async fn offer_daemon_start(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     event_stream: &mut EventStream,
@@ -218,16 +198,11 @@ async fn offer_daemon_start(
     }
 }
 
-/// Same as [`run`] but the caller has already located the daemon
-/// endpoint (e.g. the remote-home picker that ran a session discovery
-/// step against a fixed `AOE_DAEMON_URL`). Skips `require_daemon` so
-/// the view doesn't re-run discovery / health-check when the caller
-/// has already done it.
-/// Everything a structured-view surface needs after connecting: the
-/// hydrated state, the folded startup error (if any), and the two
-/// side-channel receivers (plugin UI snapshots, session view metadata).
-/// Shared by the full-screen loop and the embedded (preview-pane)
-/// variant so the two cannot drift.
+/// Same as [`run`] but for a caller that already located the daemon endpoint,
+/// so discovery and the health check are not re-run.
+/// Everything a structured-view surface needs after connecting: hydrated state,
+/// the folded startup error, and the side-channel receivers. Shared by the
+/// full-screen loop and the embedded variant so the two cannot drift.
 /// One plugin poll tick from the daemon: the UI-state snapshot plus, when the
 /// fetch succeeded, the active command list. `commands` is `None` on a transient
 /// command-fetch failure so the last-good set is kept rather than wiped.
@@ -243,32 +218,24 @@ struct ViewSetup {
     session_info_rx: tokio::sync::mpsc::Receiver<ViewSideInfo>,
 }
 
-/// One-shot daemon reads the view wants at open but must not block on:
-/// the session header / path roots, and the resolved compaction-reminder
-/// threshold. Batched onto one channel because they share a task and both
-/// land before the first user interaction. A failed fetch degrades to the
-/// fallback header or a disabled reminder, never to a startup error.
+/// One-shot daemon reads the view wants at open but must not block on. A failed
+/// fetch degrades to the fallback header or a disabled reminder, never to a
+/// startup error.
 pub(crate) struct ViewSideInfo {
     session: Result<crate::acp::session_paths::SessionViewInfo, String>,
     compaction_reminder: Option<u8>,
-    /// Initial daemon-owned prompt-queue snapshot, so the composer's queue
-    /// strip and ArrowUp recall reflect prompts queued from another client
-    /// (or before this attach) the moment the view opens. Empty on a fetch
-    /// error; the next turn-edge refresh recovers.
+    /// Initial daemon-owned prompt-queue snapshot, so the queue strip and
+    /// ArrowUp recall reflect prompts queued elsewhere. Empty on a fetch error.
     queued: Vec<QueuedPromptEntry>,
 }
 
-/// Hydrate the transcript via /replay, open the WebSocket, and spawn
-/// the side-channel tasks (session-info fetch, plugin UI-state poll).
-/// Both spawned tasks exit once their receiver is dropped, so the
-/// setup owns no cleanup obligations beyond dropping the `ViewSetup`.
+/// Hydrate the transcript via /replay, open the WebSocket, and spawn the
+/// side-channel tasks. Both exit once their receiver is dropped.
 async fn setup_view(endpoint: DaemonEndpoint, session_id: &str) -> Result<ViewSetup> {
     let http = HttpClient::new(endpoint.clone()).context("build structured view HTTP client")?;
 
-    // `frames=0`: this view renders the server's folded projections and reads
-    // no raw frame, so the daemon skips forwarding the session's whole event
-    // history on every open. It still replays it internally to build the
-    // connect snapshots.
+    // `frames=0`: this view renders the server's folded projections, so the
+    // daemon skips forwarding the session's whole event history on open.
     let ws_result = ws_connect_projections_only(&endpoint, session_id, 0).await;
 
     let (ws, ws_err) = match ws_result {
@@ -277,9 +244,8 @@ async fn setup_view(endpoint: DaemonEndpoint, session_id: &str) -> Result<ViewSe
     };
 
     let mut state = StructuredViewState::new(session_id.to_string(), endpoint, http, ws);
-    // Land in the composer so the user can type immediately, live-view
-    // style. Reading history is scroll (wheel / PageUp/PageDown), not a
-    // focus switch, so there is no "which pane am I in" juggling.
+    // Land in the composer so the user can type immediately; reading history
+    // is scroll, not a focus switch.
     state.focus = Focus::Composer;
 
     let (session_info_tx, session_info_rx) = tokio::sync::mpsc::channel(1);
@@ -315,17 +281,13 @@ async fn setup_view(endpoint: DaemonEndpoint, session_id: &str) -> Result<ViewSe
         });
     }
 
-    // Seed the server-owned transcript rows via `?view=rows` so the activity
-    // stream paints the historical conversation instead of a blank pane. The
-    // WS transcript_snapshot reconciles by id, so the overlap is a no-op.
-    // Control state needs no seed of its own: the socket opens with a
-    // `reduced_state` snapshot. Capture the error rather than toasting here,
-    // so a shared root cause (e.g. a 401 from the auth middleware) folds into
-    // one message with the WS error below.
+    // Seed the server-owned transcript rows via `?view=rows` so the pane paints
+    // history instead of blank; the WS snapshot reconciles by id. Capture the
+    // error rather than toasting, so a shared root cause folds into one message
+    // with the WS error below.
     let replay_err = reseed_server_rows(&mut state).await;
     // `reconcile_selection` also focus-grabs a pending approval (modal). A
-    // pending elicitation is auto-presented by the caller, which owns the
-    // toast deadline its menu needs.
+    // pending elicitation is auto-presented by the caller.
     state.reconcile_selection();
     state.reconcile_slash_selection();
 
@@ -341,9 +303,8 @@ async fn setup_view(endpoint: DaemonEndpoint, session_id: &str) -> Result<ViewSe
         (None, None) => None,
     };
 
-    // Poll the daemon's plugin UI-state on its own task and stream snapshots
-    // back over a channel, so a slow daemon stalls neither input nor render.
-    // The task exits once the view returns and drops the receiver.
+    // Poll the daemon's plugin UI-state on its own task so a slow daemon stalls
+    // neither input nor render. The task exits once the receiver is dropped.
     let (plugin_tx, plugin_rx) = tokio::sync::mpsc::channel::<PluginPoll>(8);
     {
         let http = state.http.clone();
@@ -355,9 +316,8 @@ async fn setup_view(endpoint: DaemonEndpoint, session_id: &str) -> Result<ViewSe
                 let snapshot = match http.plugin_ui_state().await {
                     Ok(snapshot) => snapshot,
                     // A fixed env credential cannot recover inside this view.
-                    // Stop instead of turning its 3-second poll into repeated
-                    // IP-wide lockouts. Local credentials refresh from disk,
-                    // so rotation does not reach this branch.
+                    // Stop rather than turn the 3-second poll into repeated
+                    // IP-wide lockouts.
                     Err(e) if !should_retry_plugin_ui_poll(&e) => {
                         tracing::warn!(
                             target: "acp.tui",
@@ -365,17 +325,16 @@ async fn setup_view(endpoint: DaemonEndpoint, session_id: &str) -> Result<ViewSe
                         );
                         break;
                     }
-                    // Transient or older-daemon-without-the-endpoint: keep the
-                    // last good snapshot and retry on the next tick rather than
-                    // toasting repeatedly.
+                    // Transient, or an older daemon without the endpoint: keep
+                    // the last good snapshot and retry on the next tick.
                     Err(e) => {
                         tracing::debug!(target: "acp.tui", "plugin ui-state poll failed: {e}");
                         continue;
                     }
                 };
-                // Command metadata comes from the daemon so a remote-daemon
-                // session resolves plugins it doesn't have locally. A failed
-                // fetch leaves the last-good set in place (`None`).
+                // Command metadata comes from the daemon so a remote session
+                // resolves plugins it lacks locally; a failed fetch keeps the
+                // last-good set.
                 let commands = match http.plugin_commands().await {
                     Ok(commands) => Some(commands),
                     Err(e) => {
@@ -424,8 +383,7 @@ pub async fn run_for_endpoint(
     if let Some(text) = startup_toast {
         set_toast(&mut state, &mut toast_deadline, text, ToastKind::Error);
     }
-    // A question already pending in the replay presents its menu now, so
-    // opening onto a waiting elicitation shows the prompt immediately.
+    // A question already pending in the replay presents its menu now.
     auto_present_elicitation(&mut state, &mut toast_deadline);
 
     redraw(terminal, theme, &mut state)?;
@@ -440,8 +398,8 @@ pub async fn run_for_endpoint(
             biased;
             evt = event_stream.next() => {
                 let Some(evt) = evt else {
-                    // EventStream closed; bail out so the parent App
-                    // can do its own cleanup.
+                            // EventStream closed; bail out for the parent
+                            // App's cleanup.
                     return Ok(());
                 };
                 let evt = evt.context("read terminal event")?;
@@ -465,8 +423,8 @@ pub async fn run_for_endpoint(
                         redraw(terminal, theme, &mut state)?;
                     }
                     None => {
-                        // Either no ws handle or the channel closed.
-                        // Sleep briefly to avoid spinning the select loop.
+                        // No ws handle, or the channel closed. Sleep briefly
+                        // rather than spin the select loop.
                         tokio::time::sleep(Duration::from_millis(200)).await;
                     }
                 }
@@ -521,20 +479,17 @@ pub(crate) fn apply_side_info(state: &mut StructuredViewState, side: ViewSideInf
     }
 }
 
-/// Apply one WebSocket message to the view state: reduce a frame (with
-/// turn-edge queue draining), rehydrate from /replay on Lagged, or run
-/// the bounded-backoff reconnect on a dropped socket. Shared by the
-/// full-screen loop and the embedded (preview-pane) variant; callers
-/// redraw afterwards.
+/// Apply one WebSocket message to the view state: reduce a frame (with turn-edge
+/// queue draining), rehydrate from /replay on Lagged, or run the bounded-backoff
+/// reconnect. Shared with the embedded variant; callers redraw afterwards.
 async fn apply_ws_message(
     state: &mut StructuredViewState,
     toast_deadline: &mut Option<Instant>,
     msg: Result<WsMessage, WsError>,
 ) {
     match msg {
-        // Raw frames still stream (they feed `aoe acp tail`), but the view
-        // renders the two server-folded projections instead: this one for
-        // control state, the transcript channel below for the rows.
+        // Raw frames still stream (they feed `aoe acp tail`); the view renders
+        // the two server-folded projections instead.
         Ok(WsMessage::Frame(_)) => {}
         Ok(WsMessage::ReducedState {
             seq,
@@ -550,22 +505,18 @@ async fn apply_ws_message(
             state.reconcile_slash_selection();
             let now_active = state.transcript.turn_active;
             if !was_active && now_active {
-                // Turn started (our own prompt echoed back, or
-                // another client's). The optimistic lock has
-                // served its purpose; release it.
+                // Turn started; the optimistic lock has served its purpose.
                 state.in_flight = false;
             } else if was_active && !now_active {
-                // Turn ended: release the lock and refresh the queue mirror.
-                // The daemon drains the next batch server-side at this edge, so
-                // pull the post-drain snapshot to keep the strip honest.
+                // Turn ended: release the lock and pull the post-drain queue
+                // snapshot, since the daemon drains server-side at this edge.
                 state.in_flight = false;
                 refresh_queue(state).await;
             }
         }
         Ok(WsMessage::TranscriptSnapshot(rows)) => {
-            // Server-folded transcript rows on connect / reconnect. Reconcile
-            // by id, so an overlap with the initial `?view=rows` replay (or a
-            // reconnect that raced live deltas) is idempotent.
+            // Server-folded rows on connect / reconnect. Reconcile by id, so an
+            // overlap with the initial replay is idempotent.
             state.transcript.merge_server_rows(rows);
         }
         Ok(WsMessage::TranscriptDelta(delta)) => {
@@ -573,11 +524,9 @@ async fn apply_ws_message(
             state.transcript.apply_transcript_delta(*delta);
         }
         Ok(WsMessage::Lagged) => {
-            // The daemon evicted events we never saw. It repairs its own
-            // control fold at the source and pushes a corrected whole-state
-            // frame, so nothing to do for that half here. The row buffer does
-            // need rebuilding, and no reconnect happens on a lag, so nothing
-            // else will resend it.
+            // The daemon evicted events we never saw. It repairs its control
+            // fold at the source, but the row buffer still needs rebuilding and
+            // no reconnect happens on a lag.
             state.transcript.drop_rows();
             if let Some(e) = reseed_server_rows(state).await {
                 set_toast(
@@ -596,12 +545,9 @@ async fn apply_ws_message(
             refresh_queue(state).await;
         }
         Err(e) => {
-            // WS dropped; show a banner and try to reconnect
-            // from the last seq we processed. Bounded backoff
-            // so a flaky daemon restart (e.g. a 2-second
-            // process bounce) survives without paging the
-            // user, but a permanently-down daemon doesn't
-            // pin a worker tight-looping retries.
+            // WS dropped; show a banner and reconnect from the last seq with
+            // bounded backoff, so a brief daemon bounce survives without paging
+            // the user and a dead daemon doesn't pin a worker retrying.
             tracing::warn!(target: "acp.tui.ws", "ws disconnect: {e}");
             set_toast(
                 state,
@@ -610,10 +556,9 @@ async fn apply_ws_message(
                 ToastKind::Error,
             );
             state.ws = None;
-            // Can't observe turn boundaries while the socket
-            // is down; drop the lock so a stuck send doesn't
-            // wedge the composer, and queue any new prompts
-            // (is_busy() is true while ws is None).
+            // Turn boundaries are unobservable while the socket is down: drop
+            // the lock so a stuck send doesn't wedge the composer, and queue new
+            // prompts (is_busy() is true while ws is None).
             state.in_flight = false;
             let since = state.transcript.last_seq;
             match reconnect_with_backoff(&state.endpoint, &state.session_id, since).await {
@@ -625,9 +570,8 @@ async fn apply_ws_message(
                         "ws reconnected".into(),
                         ToastKind::Info,
                     );
-                    // Resync the queue mirror after the gap: the daemon may
-                    // have drained entries while the socket was down, and there
-                    // may be no future turn edge to refresh on.
+                    // Resync the queue after the gap: the daemon may have
+                    // drained entries while the socket was down.
                     refresh_queue(state).await;
                 }
                 Err(e) => {
@@ -643,9 +587,8 @@ async fn apply_ws_message(
     }
 }
 
-/// Show the next buffered plugin notification as a toast, but only when no
-/// toast is currently up, so app toasts (errors, send confirmations) are not
-/// pre-empted and queued notifications show one at a time.
+/// Show the next buffered plugin notification as a toast, but only when no toast
+/// is up, so app toasts are not pre-empted and queued ones show one at a time.
 fn drain_plugin_toast(state: &mut StructuredViewState, toast_deadline: &mut Option<Instant>) {
     if state.toast.is_some() {
         return;
@@ -657,9 +600,8 @@ fn drain_plugin_toast(state: &mut StructuredViewState, toast_deadline: &mut Opti
         Tone::Warn | Tone::Danger => ToastKind::Error,
         _ => ToastKind::Info,
     };
-    // A notification carrying an href is a worker `ui.open_url`: the native TUI
-    // opens it directly the first (and only) time it is shown. The seq dedupe in
-    // `next_plugin_toast` guarantees one open per notification.
+    // A notification carrying an href is a worker `ui.open_url`; the seq dedupe
+    // in `next_plugin_toast` guarantees one open per notification.
     if let Some(href) = &n.href {
         let _ = crate::tui::open_url::open_url(href);
     }
@@ -678,9 +620,8 @@ async fn handle_terminal_event(
     let has_pending = !state.transcript.pending_approvals.is_empty();
     let intent = match evt {
         CrosstermEvent::Key(key) => {
-            // Skip key-release events on terminals that emit them (Windows
-            // crossterm, kitty enhanced protocol). Otherwise every keypress
-            // triggers two handle_key calls.
+            // Skip key-release events on terminals that emit them; otherwise
+            // every keypress triggers two handle_key calls.
             if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                 return Ok(false);
             }
@@ -706,13 +647,10 @@ async fn handle_terminal_event(
                 agent_busy: state.transcript.turn_active || state.in_flight,
             };
             let intent = input::dispatch(state.focus, &key, ctx);
-            // Plugin keybinds are a fallback: consult them only for a key the
-            // view did not claim (`Ignore`), or a Ctrl-modified chord the
-            // composer would otherwise swallow as text. Composer text entry and
-            // the universal chords keep priority, mirroring how the home view
-            // resolves core bindings before plugin ones. Chords resolve against
-            // the daemon's command list (not the TUI's local registry) so a
-            // remote-daemon session can drive plugins installed only there.
+            // Plugin keybinds are a fallback: consulted only for a key the view
+            // did not claim (`Ignore`), or a Ctrl chord the composer would
+            // swallow as text. Chords resolve against the daemon's command list,
+            // so a remote session can drive plugins installed only there.
             let try_plugin = matches!(intent, Intent::Ignore)
                 || matches!(&intent, Intent::Compose(k) if k.modifiers.contains(KeyModifiers::CONTROL));
             if try_plugin {
@@ -732,10 +670,8 @@ async fn handle_terminal_event(
             }
             intent
         }
-        // Bracketed paste lands as one event with the raw text; it goes
-        // into the composer no matter which pane is focused (there is
-        // nowhere else pasted text could meaningfully go), pulling focus
-        // there so the result is visible.
+        // Bracketed paste goes into the composer whichever pane is focused,
+        // pulling focus there so the result is visible.
         CrosstermEvent::Paste(text) => {
             paste_into_composer(state, &text);
             ensure_files_loaded(state, toast_deadline).await;
@@ -744,16 +680,15 @@ async fn handle_terminal_event(
         CrosstermEvent::Mouse(mouse) => {
             input::dispatch_mouse(&mouse, state.focus, state.layout.as_ref())
         }
-        // Resize needs no bookkeeping: the caller redraws after every
-        // event and the next frame recomputes the layout.
+        // Resize needs no bookkeeping: the next frame recomputes the layout.
         _ => return Ok(false),
     };
     match intent {
         Intent::Ignore => Ok(false),
         Intent::Exit => Ok(true),
         Intent::SetFocus(focus) => {
-            // Approval focus only makes sense when there's one to
-            // select; otherwise fall through to transcript.
+            // Approval focus needs an approval to select; otherwise fall
+            // through to transcript.
             state.focus = if matches!(focus, Focus::Approval) && !has_pending {
                 Focus::Transcript
             } else {
@@ -763,8 +698,8 @@ async fn handle_terminal_event(
             if matches!(state.focus, Focus::Pane) {
                 state.pane_scroll = 0;
             }
-            // Leaving the composer ends any queue-recall browse; the
-            // in-progress text stays put as a draft.
+            // Leaving the composer ends any queue-recall browse; the text stays
+            // put as a draft.
             if state.focus != Focus::Composer {
                 state.cancel_recall();
             }
@@ -772,10 +707,9 @@ async fn handle_terminal_event(
             Ok(false)
         }
         Intent::Compose(k) => {
-            // ratatui_textarea consumes raw crossterm KeyEvent through
-            // its `Input` conversion. Snapshot the slash query first so
-            // we can detect a query-text change (vs. mere cursor motion)
-            // and reset the picker highlight only when the text shifts.
+            // ratatui_textarea consumes raw crossterm KeyEvent. Snapshot the
+            // slash query first to detect a text change (vs. cursor motion) and
+            // reset the picker highlight only then.
             let before = state.slash_query();
             state.composer.input(k);
             if state.slash_query() != before {
@@ -822,17 +756,13 @@ async fn handle_terminal_event(
             // the recall state.
             let recall = state.recall.take();
             let text = state.take_composer_text();
-            // Submitting while browsing edits that queued entry in place,
-            // preserving its position rather than enqueuing a duplicate.
-            // If the entry drained between recall and now, the index is
-            // stale; fall through to the normal send / queue path so the
-            // edited text is never lost.
+            // Submitting while browsing edits that queued entry in place. If it
+            // drained between recall and now the index is stale, so fall through
+            // to the normal send / queue path and never lose the edited text.
             if !text.is_empty() {
                 if let Some(r) = recall {
-                    // Edit that queued entry in place on the daemon, by its
-                    // stable id, preserving its position. If the entry drained
-                    // between recall and now its id is gone from the mirror, so
-                    // fall through to the normal send / queue path.
+                    // Edit the queued entry in place on the daemon by its stable
+                    // id; if it drained, fall through to send / queue.
                     if let Some(id) = state.queue.id_at(r.index).map(str::to_string) {
                         return Ok(edit_queued_prompt(state, toast_deadline, &id, &text).await);
                     }
@@ -840,8 +770,7 @@ async fn handle_terminal_event(
             }
             if text.is_empty() {
                 // Empty Enter is a manual resync now that the daemon owns the
-                // drain: pull a fresh snapshot so a queue drained from another
-                // client (or server-side) is reflected. Nothing to send.
+                // drain: pull a fresh snapshot. Nothing to send.
                 if !state.is_busy() && !state.queue.is_empty() {
                     refresh_queue(state).await;
                 } else {
@@ -854,9 +783,8 @@ async fn handle_terminal_event(
                 }
                 return Ok(false);
             }
-            // Double-submit lock, not a dispatch decision: this covers only the
-            // window between our POST and its response. The daemon decides
-            // whether to send, steer, or queue the prompt.
+            // Double-submit lock covering only the window between our POST and
+            // its response; the daemon decides send vs. steer vs. queue.
             if state.in_flight {
                 state.set_composer_text(&text);
                 return Ok(false);
@@ -921,9 +849,9 @@ async fn handle_terminal_event(
                         ApprovalDecisionWire::Deny => "denied",
                         ApprovalDecisionWire::Cancelled => "cancelled",
                     };
-                    // Clear the card now instead of waiting on the
-                    // ApprovalResolved broadcast, which the seq dedupe can
-                    // drop and leave the card stuck. See #1821.
+                    // Clear the card now rather than wait on the
+                    // ApprovalResolved broadcast, which the seq dedupe can drop
+                    // and leave the card stuck (#1821).
                     state.transcript.resolve_approval_locally(&pending.nonce);
                     // The selected/last approval may have just disappeared;
                     // re-anchor focus like the replay/live-frame paths do.
@@ -935,10 +863,8 @@ async fn handle_terminal_event(
                         ToastKind::Info,
                     );
                 }
-                // The daemon reports the nonce already gone: the approval
-                // resolved server-side (concurrent decision, watchdog
-                // cancel, or no matching option). Clear the card without an
-                // error toast. See #1821.
+                // The nonce is already gone: the approval resolved server-side.
+                // Clear the card without an error toast (#1821).
                 Err(HttpError::ApprovalGone) => {
                     state.transcript.resolve_approval_locally(&pending.nonce);
                     state.reconcile_selection();
@@ -1059,18 +985,15 @@ async fn handle_terminal_event(
     }
 }
 
-/// Async pull from the structured view WebSocket. Returns `None` when no ws
-/// handle is currently attached so the select arm degrades to a
-/// timed wait instead of busy-looping.
+/// Async pull from the structured view WebSocket. `None` when no ws handle is
+/// attached, so the select arm degrades to a timed wait instead of busy-looping.
 async fn recv_ws(state: &mut StructuredViewState) -> Option<Result<WsMessage, WsError>> {
     let ws = state.ws.as_mut()?;
     ws.recv().await
 }
 
-/// Reconnect with three attempts and 250ms / 500ms / 1000ms backoff.
-/// Daemon restarts on the same box come back in under a second; a
-/// remote daemon failure usually doesn't recover inside our budget,
-/// so the user gets a toast and can hit retry themselves.
+/// Reconnect with three attempts and 250ms / 500ms / 1000ms backoff: enough for
+/// a local daemon restart, not enough to pin a worker on a dead remote one.
 async fn reconnect_with_backoff(
     endpoint: &DaemonEndpoint,
     session_id: &str,
@@ -1098,8 +1021,7 @@ async fn reconnect_with_backoff(
 }
 
 /// Open the permission-mode picker over the modes the agent advertised,
-/// preselecting the current mode. No-op when none were announced (the
-/// `m` key is also gated on that, so this is defense in depth).
+/// preselecting the current one. No-op when none were announced.
 fn open_mode_picker(state: &mut StructuredViewState) {
     let modes = &state.transcript.available_modes;
     if modes.is_empty() {
@@ -1122,17 +1044,11 @@ fn open_mode_picker(state: &mut StructuredViewState) {
     });
 }
 
-/// Start the native answer flow for the oldest pending elicitation, when
-/// its form is answerable in the TUI: every required question is a
-/// single-select with options (the AskUserQuestion shape; its optional
-/// free-text "custom answer" fields are simply omitted). Richer forms
-/// (required free text, multi-select, numbers) punt to the web with a
-/// toast instead of half-answering.
-/// Present a pending single-select question as its answer menu, once
-/// per question, so an elicitation surfaces itself the way a native
-/// agent would (the menu just appears) without any focus juggling.
-/// Approvals take priority (they are already modal via
-/// `reconcile_selection`); a menu the user has open is left alone.
+/// Start the native answer flow for the oldest pending elicitation when every
+/// required question is a single-select with options (the AskUserQuestion
+/// shape). Richer forms punt to the web with a toast rather than half-answering.
+/// Present a pending single-select question as its answer menu, once per
+/// question. Approvals take priority; a menu the user has open is left alone.
 fn auto_present_elicitation(state: &mut StructuredViewState, toast_deadline: &mut Option<Instant>) {
     if state.choice.is_some() || !state.transcript.pending_approvals.is_empty() {
         return;
@@ -1205,8 +1121,7 @@ fn question_picker(
         .clone()
         .filter(|t| !t.trim().is_empty())
         .unwrap_or_else(|| {
-            // Later questions in a multi-question form advance with an
-            // empty lead-in; never render a blank picker title.
+            // Later questions advance with an empty lead-in; never a blank title.
             if message.trim().is_empty() {
                 "Answer".to_string()
             } else {
@@ -1239,12 +1154,10 @@ enum ApprovalKeyOutcome {
 
 /// Map a decision key onto what it can actually mean for this approval.
 ///
-/// An answer list has no permission vocabulary to express, so neither
-/// half of the trio survives: an allow-shaped key opens the picker
-/// instead of guessing an option, and `d` dismisses without answering.
-/// Dismissal must be `Cancelled`, not `Deny`, or the daemon would map it
-/// onto the first reject-kind option and send that as the user's answer.
-/// See #3741.
+/// An answer list has no permission vocabulary, so an allow-shaped key opens the
+/// picker instead of guessing an option and `d` dismisses without answering.
+/// Dismissal must be `Cancelled`, not `Deny`, or the daemon would send the first
+/// reject-kind option as the user's answer (#3741).
 fn approval_key_outcome(
     pending: &reducer::PendingApproval,
     decision: ApprovalDecisionWire,

@@ -1,10 +1,8 @@
-//! Plugin manager: list plugins (builtin and external) with their trust and
-//! enabled/approval state, toggle them (reconciling a running daemon's workers
-//! live), inspect a plugin's full disclosure (capabilities, keybinds, runtime),
-//! and run the whole external-plugin lifecycle in-TUI: install from GitHub
-//! discovery, update, re-approve a stale grant, and uninstall, each behind the
-//! same consent popup the CLI prompt and the web modals render. The TUI twin of
-//! `aoe plugin` and the web Plugins tab.
+//! Plugin manager: list plugins with their trust and enabled state, toggle
+//! them (reconciling a running daemon's workers live), inspect a plugin's full
+//! disclosure, and run the external-plugin lifecycle in-TUI (install from
+//! GitHub discovery, update, re-approve a stale grant, uninstall), each behind
+//! the consent popup the CLI and web modals render. The twin of `aoe plugin`.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -25,10 +23,8 @@ use crate::plugin::install::{
 use crate::plugin::update_check::UpdateStatus;
 use crate::tui::styles::Theme;
 
-/// An open update review popup. Every update (safe or consent-required) shows
-/// the changelog; `consent` is `Some` only when the update also expands access,
-/// adding the capability / build / UI / runtime / trust disclosures and the
-/// Decline (dismiss) action.
+/// An open update review popup. Every update shows its changelog; `consent` is
+/// `Some` only when it also expands access, adding the disclosures and Decline.
 struct Review {
     id: String,
     from_version: String,
@@ -49,8 +45,7 @@ struct Details {
     dir: Option<String>,
 }
 
-/// A running or finished lifecycle operation (install / update) whose log file
-/// the popup tails, the TUI twin of the dashboard's job progress modal.
+/// A lifecycle operation whose log file the popup tails.
 struct Progress {
     title: String,
     log_path: PathBuf,
@@ -58,9 +53,8 @@ struct Progress {
     done: Option<Result<String, String>>,
 }
 
-/// Content for [`PluginManagerDialog::draw_popup`]: a scrollable body over a
-/// pinned footer (the decision keys / status), and whether the body should
-/// follow its tail as it grows (the running progress log).
+/// A scrollable body over a pinned footer, and whether the body follows its
+/// tail as it grows.
 struct PopupContent<'a> {
     body: Vec<Line<'a>>,
     footer: Vec<Line<'a>>,
@@ -70,92 +64,67 @@ struct PopupContent<'a> {
 
 /// The floating popup owning the keyboard; at most one at a time.
 enum Popup {
-    /// Update review: changelog plus, when access expands, the consent
-    /// disclosure.
     Review(Box<Review>),
-    /// Install consent for a discovery result.
     Install(Box<InstallConsent>),
-    /// Re-approval consent for an installed plugin whose grant went stale.
     Reapprove(ReapproveConsent),
-    /// Uninstall confirmation.
     ConfirmUninstall { id: String },
-    /// Installed-plugin details (Enter on a row).
     Details(Box<Details>),
-    /// A lifecycle operation streaming its log tail.
     Progress(Progress),
 }
 
-/// Which view the manager is showing: the installed list or GitHub discovery
-/// results.
+/// The installed list, or GitHub discovery results.
 #[derive(PartialEq, Eq)]
 enum Mode {
     Browse,
     Discover,
 }
 
-/// A network task running off the event loop, polled by [`PluginManagerDialog::tick`].
-/// The work runs on a spawned tokio task so the TUI never blocks on git or
-/// GitHub (a dead remote would otherwise freeze the whole UI).
+/// A network task polled by [`PluginManagerDialog::tick`], spawned so a dead
+/// remote cannot freeze the UI.
 enum Pending {
     Updates(oneshot::Receiver<Vec<UpdateStatus>>),
     Discover(oneshot::Receiver<Result<Vec<DiscoveryResult>, String>>),
-    /// Classifying one plugin's available update (the `u` key).
     Preview(oneshot::Receiver<Result<UpdatePreview, String>>),
-    /// Applying an approved update; the Ok string is the final report line.
     Apply(oneshot::Receiver<Result<String, String>>),
-    /// An enable/disable via [`crate::plugin::install::set_enabled_live`];
-    /// the Ok string reports whether the daemon reconciled its workers.
+    /// An enable/disable; the Ok string says whether the daemon reconciled.
     Toggle(oneshot::Receiver<Result<String, String>>),
-    /// Fetching the install consent disclosure for a discovery result.
     InstallPreview(oneshot::Receiver<Result<InstallConsent, String>>),
-    /// Applying an approved install.
     InstallApply(oneshot::Receiver<Result<String, String>>),
     Uninstall(oneshot::Receiver<Result<String, String>>),
 }
 
 pub struct PluginManagerDialog {
-    /// The shared manager view-model, the same shape the web dashboard renders
-    /// from (`crate::plugin::view`). Built straight off the registry, so the
-    /// TUI never re-derives plugin fields.
+    /// The shared view-model the web dashboard also renders from, built off
+    /// the registry so the TUI re-derives no plugin fields.
     rows: Vec<crate::plugin::PluginView>,
     load_errors: Vec<String>,
     selected: usize,
     error: Option<String>,
     info: Option<String>,
-    /// Set when on-disk plugin config changes. An embedding surface calls
-    /// [`Self::take_mutated`] to refresh its config view; the modal ignores it.
+    /// Set when on-disk plugin config changes, for an embedding surface to
+    /// pick up with [`Self::take_mutated`].
     mutated: bool,
-    /// True when hosted inside the settings screen (vs the command-palette
-    /// modal). Only changes the footer hint: Esc returns to the category list.
+    /// Hosted inside the settings screen, so Esc returns to the categories.
     embedded: bool,
-    /// Set by the settings host when an editable plugin-settings pane renders
-    /// beneath the manager, so the footer advertises the Tab sub-focus.
+    /// Set when a plugin-settings pane renders beneath, so the footer can
+    /// advertise the Tab sub-focus.
     has_settings_pane: bool,
     mode: Mode,
-    /// An in-flight discovery / update-check / lifecycle task; `None` when idle.
     pending: Option<Pending>,
-    /// A transient status line shown while a task runs ("Checking for updates…").
     loading: Option<&'static str>,
-    /// Update statuses from the last `c` check, keyed by plugin id; drives the
-    /// per-row "update!" marker.
+    /// Update statuses from the last `c` check, driving the per-row marker.
     updates: HashMap<String, UpdateStatus>,
-    /// Discovery results from the last `d` search, plus the cursor into them.
     discover_rows: Vec<DiscoveryResult>,
     discover_selected: usize,
-    /// The free-text GitHub search term, edited with `/` in discover mode.
     discover_query: String,
-    /// The `/` input line is active: printable keys edit the query.
     query_editing: bool,
-    /// The plugin id a preview/apply is running for, so `tick` knows which row
-    /// the result belongs to.
+    /// The plugin a preview or apply is running for, so `tick` can place it.
     pending_plugin: Option<String>,
-    /// The floating popup owning the keyboard, if any.
     popup: Option<Popup>,
-    /// Scroll offset into the open popup's body. A `Cell` so render (`&self`)
-    /// can clamp it to the real content height, which only render knows.
+    /// Scroll offset into the popup body. A `Cell` so render can clamp it to
+    /// the content height only render knows.
     popup_scroll: Cell<u16>,
-    /// The user scrolled the open popup themselves; a following popup (the
-    /// running progress log) stops auto-scrolling to the tail once set.
+    /// Once the user scrolls, a following popup stops chasing its tail.
     popup_user_scrolled: bool,
 }
 
@@ -165,23 +134,18 @@ impl Default for PluginManagerDialog {
     }
 }
 
-/// Most changelog lines the review popup renders before linking out to GitHub
-/// for the rest. The popup scrolls, so this only bounds the popup body (the
-/// entry counts are already capped by the backend; this bounds multi-line
-/// release bodies too).
+/// Changelog lines the review popup renders before linking out for the rest.
 const MAX_CHANGELOG_LINES: usize = 60;
 
 /// How many trailing log lines the progress popup tails.
 const PROGRESS_TAIL_LINES: usize = 30;
 
-/// How far back in the log file the tail reads. Build output can grow to
-/// megabytes; only the end is ever shown.
+/// How far back the tail reads; build output can grow to megabytes.
 const PROGRESS_TAIL_BYTES: u64 = 16 * 1024;
 
-/// Append the changelog to a review popup's lines: release notes or commit
-/// subjects, or a single "unavailable" / "none" line. The rendered body is
-/// capped at [`MAX_CHANGELOG_LINES`] and the full history is linked via
-/// `more_url`.
+/// Append the changelog: release notes, commit subjects, or a single
+/// "unavailable" line. Capped at [`MAX_CHANGELOG_LINES`], with `more_url` for
+/// the rest.
 fn push_changelog_lines(lines: &mut Vec<Line>, changelog: &UpdateChangelog, theme: &Theme) {
     if let Some(reason) = &changelog.unavailable_reason {
         lines.push(Line::from(Span::styled(
@@ -243,8 +207,7 @@ fn push_changelog_lines(lines: &mut Vec<Line>, changelog: &UpdateChangelog, them
             }
         }
     }
-    // Link to the full history when the changelog was clipped here or already
-    // truncated upstream. Fall back to a plain marker if there is no URL.
+    // Link the full history when clipped here or upstream.
     if clipped || changelog.truncated {
         let marker = match &changelog.more_url {
             Some(url) => format!("  ... full changelog: {url}"),
@@ -257,8 +220,8 @@ fn push_changelog_lines(lines: &mut Vec<Line>, changelog: &UpdateChangelog, them
     }
 }
 
-/// The log file a TUI-run lifecycle operation writes build output to, beside
-/// the dashboard's job logs (`<plugins_dir>/jobs/`).
+/// Where a TUI-run lifecycle operation writes build output, beside the
+/// dashboard's job logs.
 fn tui_job_log(op: &str, id: &str) -> anyhow::Result<PathBuf> {
     Ok(crate::plugin::plugins_dir()?
         .join("jobs")
@@ -266,8 +229,7 @@ fn tui_job_log(op: &str, id: &str) -> anyhow::Result<PathBuf> {
 }
 
 /// Last `max_lines` lines of a log file, reading at most
-/// [`PROGRESS_TAIL_BYTES`] from its end. Returns an empty vec while the file
-/// does not exist yet.
+/// [`PROGRESS_TAIL_BYTES`] from its end; empty while the file is absent.
 fn read_log_tail(path: &Path, max_lines: usize) -> Vec<String> {
     let Ok(mut file) = std::fs::File::open(path) else {
         return Vec::new();
@@ -300,11 +262,9 @@ fn read_log_tail(path: &Path, max_lines: usize) -> Vec<String> {
         .collect()
 }
 
-/// Rows `line` occupies when rendered with `Wrap { trim: true }` into `width`
-/// columns: greedy word wrap, leading indentation counted toward the first
-/// row, over-wide words split across rows. Popup sizing and scroll bounds use
-/// this so a wrapped line can never push content (like the decision-key
-/// footer) off the bottom edge.
+/// Rows `line` occupies under `Wrap { trim: true }` at `width` columns. Popup
+/// sizing and scroll bounds use it, so a wrapped line can never push the
+/// decision-key footer off the bottom edge.
 fn wrapped_rows(line: &Line, width: u16) -> u16 {
     use unicode_width::UnicodeWidthStr;
     if width == 0 {
@@ -392,37 +352,30 @@ impl PluginManagerDialog {
         dialog
     }
 
-    /// A manager hosted inside the settings screen rather than the command
-    /// palette. Only the footer differs: Esc returns to the category list.
+    /// A manager hosted inside the settings screen; only the footer differs.
     pub fn embedded() -> Self {
         let mut dialog = Self::new();
         dialog.embedded = true;
         dialog
     }
 
-    /// Take and clear the "config mutated" flag (a lifecycle action wrote to
-    /// disk and reloaded the registry).
+    /// Take and clear the "config mutated" flag.
     pub fn take_mutated(&mut self) -> bool {
         std::mem::take(&mut self.mutated)
     }
 
-    /// Whether the dialog currently owns every key (an open popup, or discover
-    /// mode). The settings host checks this before intercepting Space to stage
-    /// an enable/disable, so a popup or the discovery search never loses keys
-    /// to the staging shortcut.
+    /// Whether the dialog owns every key (an open popup, or discover mode).
+    /// The settings host checks it before intercepting Space.
     pub fn captures_input(&self) -> bool {
         self.popup.is_some() || self.mode == Mode::Discover
     }
 
-    /// Told by the settings host whether an editable plugin-settings pane
-    /// renders beneath the manager, so the footer can advertise Tab.
     pub fn set_has_settings_pane(&mut self, has: bool) {
         self.has_settings_pane = has;
     }
 
-    /// Height the inline (settings-embedded) manager wants: its rows plus
-    /// chrome. The settings host sizes the master-detail split from this so
-    /// the list stops taking half the pane to show two rows.
+    /// Height the embedded manager wants, so the settings host can size the
+    /// master-detail split to the rows rather than to half the pane.
     pub fn preferred_inline_height(&self) -> u16 {
         let errors: u16 = if self.load_errors.is_empty() { 0 } else { 2 };
         (self.rows.len().max(1) as u16)
@@ -431,17 +384,15 @@ impl PluginManagerDialog {
             .saturating_add(errors)
     }
 
-    /// Select the row owning a `plugin:<id>.<field>` settings ident, so a
-    /// settings-search jump into the Plugins tab lands on the right plugin's
-    /// detail pane. Returns whether a row matched.
+    /// Select the row owning a `plugin:<id>.<field>` ident, so a settings
+    /// search jump lands on the right plugin. True when a row matched.
     pub fn select_plugin_owning_ident(&mut self, ident: &str) -> bool {
         let Some(rest) =
             ident.strip_prefix(crate::session::config::settings_schema::PLUGIN_SECTION_PREFIX)
         else {
             return false;
         };
-        // Plugin ids are dotted themselves, so match "<id>." as a prefix of
-        // the remainder rather than splitting on the first dot.
+        // Plugin ids are dotted, so match "<id>." as a prefix.
         if let Some(idx) = self.rows.iter().position(|r| {
             rest.strip_prefix(r.id.as_str())
                 .is_some_and(|tail| tail.starts_with('.'))
@@ -454,8 +405,7 @@ impl PluginManagerDialog {
     }
 
     fn reload(&mut self) {
-        // reload() runs only after a config-mutating action (and once at
-        // construction), so it is the single place to flag a mutation.
+        // Only a config-mutating action reloads, so flag the mutation here.
         self.mutated = true;
         let registry = crate::plugin::reload_registry();
         self.rows = registry.all().iter().map(|p| p.view()).collect();
@@ -505,8 +455,8 @@ impl PluginManagerDialog {
                 self.open_reapprove();
                 DialogResult::Continue
             }
-            // Explicit, on-demand network actions. They run off the event loop
-            // (see `tick`); a second press while one is in flight is ignored.
+            // On-demand network actions; a second press while one is in
+            // flight is ignored.
             KeyCode::Char('c') => {
                 self.start_update_check();
                 DialogResult::Continue
@@ -515,8 +465,7 @@ impl PluginManagerDialog {
                 self.start_discover();
                 DialogResult::Continue
             }
-            // Update the selected plugin, but only when the last `c` check found
-            // one available (the preview re-fetches and classifies it).
+            // Only when the last `c` check found an update available.
             KeyCode::Char('u') => {
                 if let Some(row) = self.rows.get(self.selected) {
                     if self.updates.get(&row.id).is_some_and(|u| u.needs_update) {
@@ -535,8 +484,7 @@ impl PluginManagerDialog {
                 }
                 DialogResult::Continue
             }
-            // Re-read the registry from disk (an external `aoe plugin` command
-            // may have changed it while the manager was open).
+            // An external `aoe plugin` may have changed it meanwhile.
             KeyCode::Char('r') => {
                 self.reload();
                 self.info = Some("Refreshed.".to_string());
@@ -622,10 +570,9 @@ impl PluginManagerDialog {
                 }
             },
             Popup::Progress(progress) => {
-                // Once done, any decision key dismisses the popup. While the
-                // operation still runs, Esc hides the popup without cancelling
-                // it (a hung network fetch must never trap the keyboard); the
-                // result then lands in the footer.
+                // Once done any decision key dismisses it. While it runs, Esc
+                // hides the popup without cancelling, so a hung fetch cannot
+                // trap the keyboard; the result then lands in the footer.
                 let dismiss = if progress.done.is_some() {
                     matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter)
                 } else {
@@ -639,25 +586,22 @@ impl PluginManagerDialog {
         }
     }
 
-    /// Keys while the update review popup is open: approve/update, decline (only
-    /// when access expands), or close. The popup was taken out of `self.popup`
-    /// by the caller; put it back unless the key decided it.
+    /// Keys for the update review popup. The caller took it out of
+    /// `self.popup`; put it back unless the key decided it.
     fn handle_review_key(&mut self, key: KeyEvent, review: Review) -> DialogResult<()> {
         match key.code {
             KeyCode::Char('y') | KeyCode::Enter => {
                 self.start_apply(review.id, Some(review.fingerprint));
                 DialogResult::Continue
             }
-            // Decline only applies to a consent-expanding update: record the
-            // dismissal so it stops nagging, keep the active version. A safe
-            // update has nothing to dismiss, so `n` just closes it.
+            // Decline records the dismissal and keeps the active version. A
+            // safe update has nothing to dismiss, so `n` just closes.
             KeyCode::Char('n') => {
                 if review.consent.is_some() {
                     match crate::plugin::install::dismiss_update(&review.id, &review.fingerprint) {
                         Ok(()) => {
-                            // dismiss_update wrote plugin config; flag it so
-                            // an embedding settings surface resyncs and a
-                            // later save does not clobber the dismissal.
+                            // Flag the config write so an embedding surface
+                            // resyncs and cannot clobber the dismissal.
                             self.mutated = true;
                             self.info = Some(format!("Declined update for {}.", review.id));
                         }
@@ -692,7 +636,6 @@ impl PluginManagerDialog {
             return DialogResult::Continue;
         }
         match key.code {
-            // Esc/q leave discovery for the installed list, not the whole dialog.
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.mode = Mode::Browse;
                 DialogResult::Continue
@@ -726,8 +669,7 @@ impl PluginManagerDialog {
         }
     }
 
-    /// Toggle via [`crate::plugin::install::set_enabled_live`], reconciling daemon
-    /// workers asynchronously or falling back to a local config write.
+    /// Toggle live, reconciling daemon workers or falling back to a config write.
     fn start_toggle(&mut self) {
         if self.pending.is_some() {
             return;
@@ -757,8 +699,7 @@ impl PluginManagerDialog {
         self.error = None;
     }
 
-    /// Open the details popup for the selected row: the full disclosure
-    /// (`aoe plugin info`'s TUI twin).
+    /// Open the full disclosure for the selected row.
     fn open_details(&mut self) {
         let Some(row) = self.rows.get(self.selected) else {
             return;
@@ -843,8 +784,7 @@ impl PluginManagerDialog {
         self.open_popup(Popup::Details(Box::new(details)));
     }
 
-    /// Open the re-approval consent popup for a plugin whose grant no longer
-    /// covers its installed manifest.
+    /// Re-approval consent for a grant that no longer covers the manifest.
     fn open_reapprove(&mut self) {
         let Some(row) = self.rows.get(self.selected) else {
             return;
@@ -958,8 +898,7 @@ impl PluginManagerDialog {
         self.error = None;
     }
 
-    /// Fetch the consent disclosure for the selected discovery result (the
-    /// `preview_install` probe: network-only, installs nothing).
+    /// Probe the selected discovery result for its consent disclosure.
     fn start_install_preview(&mut self) {
         if self.pending.is_some() {
             return;
@@ -985,8 +924,7 @@ impl PluginManagerDialog {
         self.error = None;
     }
 
-    /// Apply an approved install, pinned to the fingerprint the consent popup
-    /// showed. Build output streams to a job log the progress popup tails.
+    /// Apply an approved install, pinned to the fingerprint the popup showed.
     fn start_install_apply(&mut self, consent: InstallConsent) {
         if self.pending.is_some() {
             return;
@@ -1048,9 +986,7 @@ impl PluginManagerDialog {
         self.error = None;
     }
 
-    /// Resolve a finished lifecycle task into the open progress popup (so the
-    /// user reads the outcome over the log tail) or, if the popup is gone, the
-    /// footer.
+    /// Land a finished task in the open progress popup, or the footer.
     fn finish_operation(&mut self, result: Result<String, String>) {
         let ok = result.is_ok();
         if ok {
@@ -1065,8 +1001,7 @@ impl PluginManagerDialog {
         }
     }
 
-    /// Poll an in-flight task. Returns true when the result landed (the host
-    /// should redraw). Called from the event-loop tick.
+    /// Poll an in-flight task; true when the result landed.
     pub fn tick(&mut self) -> bool {
         use oneshot::error::TryRecvError;
         let Some(pending) = &mut self.pending else {
@@ -1077,10 +1012,9 @@ impl PluginManagerDialog {
                 Ok(statuses) => {
                     let outdated = statuses.iter().filter(|s| s.needs_update).count();
                     let errors = statuses.iter().filter(|s| s.error.is_some()).count();
-                    // outdated() skips builtins, so an empty result means there
-                    // are no external plugins; the dialog still lists builtin
-                    // rows, so "all up to date" would read as if they were
-                    // checked. Match the CLI's wording instead.
+                    // outdated() skips builtins, so an empty result means no
+                    // external plugins; "all up to date" would read as if the
+                    // builtin rows had been checked.
                     let empty = statuses.is_empty();
                     self.updates = statuses.into_iter().map(|s| (s.id.clone(), s)).collect();
                     self.info = Some(if empty {
@@ -1135,8 +1069,6 @@ impl PluginManagerDialog {
                         Ok(UpdatePreview::NoUpdate) => {
                             self.info = Some("Already up to date.".to_string());
                         }
-                        // A safe update needs no consent, but still shows its
-                        // changelog in a review popup before applying.
                         Ok(UpdatePreview::SafeUpdate {
                             to_version,
                             fingerprint,
@@ -1159,8 +1091,8 @@ impl PluginManagerDialog {
                                 })));
                             }
                         }
-                        // An already-dismissed version must not re-prompt; it
-                        // surfaces again only when a new version appears.
+                        // A dismissed version resurfaces only when a newer
+                        // one appears.
                         Ok(UpdatePreview::ConsentRequired { consent, dismissed }) => {
                             if dismissed {
                                 self.info = Some(format!(
@@ -1292,44 +1224,35 @@ impl PluginManagerDialog {
         }
     }
 
-    /// The currently selected plugin row, if any. Lets an embedding surface
-    /// (the settings Plugins tab) read the selection.
+    /// The selected plugin row, for an embedding surface to read.
     pub fn selected(&self) -> Option<&crate::plugin::PluginView> {
         self.rows.get(self.selected)
     }
 
-    /// Reflect a staged enable/disable in the displayed list without touching
-    /// disk or the registry. The settings host stages the change in its own
-    /// config and persists it on save, so the row shows the pending state
-    /// immediately while still following the normal save flow.
+    /// Show a staged enable/disable without touching disk: the settings host
+    /// persists it on save, so the row can reflect it at once.
     pub fn set_row_enabled(&mut self, id: &str, enabled: bool) {
         if let Some(row) = self.rows.iter_mut().find(|r| r.id == id) {
             row.enabled = enabled;
         }
     }
 
-    /// Render as a centered modal (the command-palette surface): clears a
-    /// clamped sub-rect and draws into it.
+    /// Render as a centered modal into a cleared, clamped sub-rect.
     pub fn render(&self, f: &mut Frame, area: Rect, theme: &Theme) {
         let width = area.width.clamp(40, 100);
         let height = area.height.clamp(12, 28);
         let rect = centered_rect(area, width, height);
         f.render_widget(Clear, rect);
-        // A modal always owns the keyboard, so its border is always accent.
         self.render_into(f, rect, theme, true);
     }
 
-    /// Render directly into the given rect, no centering or clearing, for
-    /// embedding in the settings screen's Plugins category. Same manager, same
-    /// state, same key handler; only the framing differs. `focused` mirrors the
-    /// settings fields-pane focus so the border matches every other pane.
+    /// Render into `area` without centering or clearing, for the settings
+    /// Plugins category. `focused` mirrors the fields-pane focus.
     pub fn render_inline(&self, f: &mut Frame, area: Rect, theme: &Theme, focused: bool) {
         self.render_into(f, area, theme, focused);
     }
 
     fn render_into(&self, f: &mut Frame, rect: Rect, theme: &Theme, focused: bool) {
-        // Focus-aware border, matching the settings fields pane: accent when
-        // the pane holds the keyboard, dim border otherwise.
         let border_color = if focused { theme.accent } else { theme.border };
         let block = Block::default()
             .title(" Plugins ")
@@ -1340,7 +1263,6 @@ impl PluginManagerDialog {
         let inner = block.inner(rect);
         f.render_widget(block, rect);
         self.render_browse(f, inner, theme);
-        // The popup floats over the list, centered on the dialog rect.
         match &self.popup {
             Some(Popup::Review(review)) => self.render_review(f, rect, theme, review),
             Some(Popup::Install(consent)) => self.render_install_consent(f, rect, theme, consent),
@@ -1375,7 +1297,6 @@ impl PluginManagerDialog {
         lines.push(Line::from(""));
 
         let Some(consent) = &review.consent else {
-            // Safe update: changelog only, with an update/cancel hint.
             let footer = vec![Line::from(Span::styled(
                 "enter update · esc cancel · j/k scroll",
                 Style::default().fg(theme.dimmed),
@@ -1804,8 +1725,7 @@ impl PluginManagerDialog {
                 Style::default().fg(theme.dimmed),
             )));
         }
-        // Status and keys live in the pinned footer so a long log tail (or a
-        // long error) can never push them off screen.
+        // Pinned, so a long log tail cannot push them off screen.
         let mut footer: Vec<Line> = Vec::new();
         match &progress.done {
             None => {
@@ -1846,9 +1766,7 @@ impl PluginManagerDialog {
                 )));
             }
         }
-        // While the operation runs, follow the newest log rows (unless the
-        // user scrolled away themselves); once done, the last position keeps
-        // the outcome context in view.
+        // Follow the newest rows while it runs, unless the user scrolled away.
         let follow = progress.done.is_none() && !self.popup_user_scrolled;
         self.draw_popup(
             f,
@@ -1863,11 +1781,9 @@ impl PluginManagerDialog {
         );
     }
 
-    /// Draw a popup as a scrollable body above a pinned footer (the decision
-    /// keys / status), both word-wrapped, in a clamped centered sub-rect.
-    /// Sizing and the scroll bound are computed from wrapped (visual) rows,
-    /// not logical line counts, so a wrapping body can never push the footer
-    /// off screen and the last body row is always reachable by scrolling.
+    /// Draw a scrollable body above a pinned footer, both word-wrapped, in a
+    /// clamped centered sub-rect. Sizing and the scroll bound count wrapped
+    /// rows, so the footer stays on screen and every body row is reachable.
     fn draw_popup(&self, f: &mut Frame, area: Rect, theme: &Theme, content: PopupContent) {
         let PopupContent {
             body,
@@ -1875,16 +1791,15 @@ impl PluginManagerDialog {
             follow_tail,
             title,
         } = content;
-        // A tiny terminal can be narrower/shorter than our preferred size;
-        // never pass clamp/centered_rect a max below the min (it panics).
+        // A tiny terminal can be smaller than the preferred size, and a max
+        // below the min panics.
         if area.width == 0 || area.height == 0 {
             return;
         }
         let width = area.width.clamp(1, 72);
         let inner_width = width.saturating_sub(2).max(1);
         let body_rows = wrapped_rows_total(&body, inner_width);
-        // The footer is pinned in full, but a pathological one (a long error
-        // chain) may never starve the body of its half of the popup.
+        // The footer is pinned in full but never starves the body.
         let footer_rows = wrapped_rows_total(&footer, inner_width)
             .min((area.height.saturating_sub(2) / 2).max(1));
         let height = body_rows
@@ -1907,18 +1822,15 @@ impl PluginManagerDialog {
             footer_rows.min(inner.height)
         };
         let body_height = inner.height.saturating_sub(footer_rows);
-        // Clamp the scroll so the last body row can always be brought into
-        // view but never scrolled far past; `Cell` because render is `&self`.
-        // One slack row absorbs any wrap-estimation drift, erring toward
-        // reachable rather than clipped.
+        // Clamp so the last body row is reachable but not far overscrolled,
+        // with one slack row for wrap-estimation drift.
         let max_scroll = if body_rows > body_height {
             (body_rows - body_height).saturating_add(1)
         } else {
             0
         };
-        // A following popup (the running progress log) pins the view to the
-        // newest rows; writing it back to the Cell means a later manual `k`
-        // scrolls up from the bottom, not from wherever the offset last was.
+        // A following popup pins to the newest rows, and writing that back
+        // means a later `k` scrolls up from the bottom.
         if follow_tail {
             self.popup_scroll.set(max_scroll);
         }
@@ -1971,8 +1883,7 @@ impl PluginManagerDialog {
                 let state = if !row.enabled {
                     ("disabled", theme.dimmed)
                 } else if row.needs_reapproval {
-                    // Waiting on the user to re-approve, not failed: use the
-                    // attention-needed color, not the error color.
+                    // Waiting on re-approval, not failed.
                     ("needs approval", theme.waiting)
                 } else {
                     ("enabled", theme.running)
@@ -1992,9 +1903,7 @@ impl PluginManagerDialog {
                 if self.updates.get(&row.id).is_some_and(|u| u.needs_update) {
                     spans.push(Span::styled("update! ", Style::default().fg(theme.accent)));
                 }
-                // Disclose the dashboard UI slots the plugin renders into, so the
-                // manager shows that a plugin modifies the UI (#2366). Distinct
-                // slot names only; ids are in the details popup (Enter).
+                // Distinct slot names only; ids are in the details popup.
                 if !row.ui_contributions.is_empty() {
                     let mut slots: Vec<&str> = Vec::new();
                     for u in &row.ui_contributions {
@@ -2036,8 +1945,6 @@ impl PluginManagerDialog {
     }
 
     fn render_discover_list(&self, f: &mut Frame, area: Rect, theme: &Theme) {
-        // The search line renders whenever a query exists or is being edited,
-        // so the list always shows what filtered it.
         let show_query = self.query_editing || !self.discover_query.is_empty();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -2099,8 +2006,7 @@ impl PluginManagerDialog {
     }
 
     fn render_footer(&self, f: &mut Frame, area: Rect, theme: &Theme) {
-        // A running task wins the footer; then a transient error/info; then the
-        // mode-appropriate key hints.
+        // A running task wins, then a transient message, then the key hints.
         let (text, color) = if let Some(loading) = self.loading {
             (loading.to_string(), theme.waiting)
         } else if let Some(e) = self.error.as_deref() {
@@ -2125,8 +2031,7 @@ impl PluginManagerDialog {
             } else {
                 "esc close"
             };
-            // Contextual hints for the selected row keep the footer short:
-            // update / approve / uninstall only apply to some rows.
+            // Update / approve / uninstall only apply to some rows.
             let mut hints = vec![
                 "space toggle",
                 "enter details",

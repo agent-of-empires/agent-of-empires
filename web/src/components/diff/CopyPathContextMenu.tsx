@@ -7,7 +7,6 @@ import { toastBus } from "../../lib/toastBus";
 export interface PathMenuState {
   x: number;
   y: number;
-  /** Repo-relative path of the right-clicked file or folder. */
   path: string;
 }
 
@@ -16,18 +15,11 @@ interface Props {
   onClose: () => void;
 }
 
-/** A minimal right-click menu for the diff file list offering "Copy relative
- *  path". Rendered in a portal at the click position, clamped inside the
- *  viewport, and dismissed on any outside click, another right-click, or
- *  Escape. */
+/** "Copy relative path" menu at the click position, clamped to the viewport. */
 export function CopyPathContextMenu({ menu, onClose }: Props) {
   const menuRef = useRef<HTMLDivElement | null>(null);
 
-  // Mirror the click position into local state so the clamp hook can nudge it
-  // inside the viewport. The initial open is seeded by the lazy initializer;
-  // render-time re-seeds on reopen at a new spot, both before paint so the
-  // clamp hook below lands the menu on-screen without flashing at the raw
-  // coordinates first.
+  // Local position so the clamp can nudge it on-screen before paint.
   const [pos, setPos] = useState<{ x: number; y: number } | null>(menu ? { x: menu.x, y: menu.y } : null);
   const [trackedMenu, setTrackedMenu] = useState(menu);
   if (menu !== trackedMenu) {
@@ -40,17 +32,13 @@ export function CopyPathContextMenu({ menu, onClose }: Props) {
     if (!menu) return;
     const close = () => onClose();
     const onDocClick = (e: MouseEvent) => {
-      // Clicks inside the menu are handled by the item's onClick.
       if (menuRef.current?.contains(e.target as Node)) return;
       close();
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") close();
     };
-    // Defer so the contextmenu event that opened this menu finishes bubbling
-    // first; otherwise React flushes this effect synchronously for the discrete
-    // event and the same right-click immediately hits the document listener,
-    // closing the menu before it ever paints.
+    // Deferred so the opening right-click does not immediately close the menu.
     const raf = requestAnimationFrame(() => {
       document.addEventListener("click", onDocClick);
       document.addEventListener("contextmenu", close);

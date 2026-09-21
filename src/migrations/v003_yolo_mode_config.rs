@@ -2,97 +2,58 @@
 //!
 //! Applies to global and profile configs, preserving the existing value.
 
+use super::config_file;
 use anyhow::Result;
-use std::fs;
-use std::path::PathBuf;
-use tracing::{debug, info};
+use std::path::Path;
+use tracing::info;
 
 pub fn run() -> Result<()> {
     let app_dir = crate::session::get_app_dir()?;
-
-    // Migrate global config
-    let global_config = app_dir.join("config.toml");
-    migrate_config_file(&global_config)?;
-
-    // Migrate all profile configs
-    let profiles_dir = app_dir.join("profiles");
-    if profiles_dir.exists() {
-        for entry in fs::read_dir(&profiles_dir)? {
-            let entry = entry?;
-            if entry.path().is_dir() {
-                let profile_config = entry.path().join("config.toml");
-                migrate_config_file(&profile_config)?;
-            }
-        }
+    for path in config_file::all_configs(&app_dir)? {
+        migrate_config_file(&path)?;
     }
-
     Ok(())
 }
 
-fn migrate_config_file(path: &PathBuf) -> Result<()> {
-    if !path.exists() {
-        debug!("Config file {} does not exist, skipping", path.display());
-        return Ok(());
-    }
-
-    let content = fs::read_to_string(path)?;
-    let mut doc: toml::Table = match content.parse() {
-        Ok(table) => table,
-        Err(e) => {
-            debug!("Failed to parse {}: {}, skipping", path.display(), e);
-            return Ok(());
-        }
-    };
-
-    // Check if [sandbox] has yolo_mode_default
-    let yolo_value = doc
-        .get("sandbox")
-        .and_then(|s| s.as_table())
-        .and_then(|t| t.get("yolo_mode_default"))
-        .and_then(|v| v.as_bool());
-
-    let Some(yolo_enabled) = yolo_value else {
-        debug!(
-            "No [sandbox] yolo_mode_default in {}, skipping",
+fn migrate_config_file(path: &Path) -> Result<()> {
+    config_file::rewrite(path, |doc| {
+        let Some(enabled) = doc
+            .get("sandbox")
+            .and_then(|s| s.as_table())
+            .and_then(|t| t.get("yolo_mode_default"))
+            .and_then(|v| v.as_bool())
+        else {
+            return false;
+        };
+        info!(
+            "Migrating yolo_mode_default={} from [sandbox] to [session] in {}",
+            enabled,
             path.display()
         );
-        return Ok(());
-    };
-
-    info!(
-        "Migrating yolo_mode_default={} from [sandbox] to [session] in {}",
-        yolo_enabled,
-        path.display()
-    );
-
-    // Remove from [sandbox]
-    if let Some(sandbox) = doc.get_mut("sandbox").and_then(|s| s.as_table_mut()) {
-        sandbox.remove("yolo_mode_default");
-    }
-
-    // Set in [session] (only if it was true -- false is the default anyway)
-    if yolo_enabled {
-        let session = doc
-            .entry("session")
-            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
-            .as_table_mut()
-            .expect("session should be a table");
-
-        // Only set if not already present (don't overwrite an explicit value)
-        session
-            .entry("yolo_mode_default")
-            .or_insert(toml::Value::Boolean(true));
-    }
-
-    let new_content = toml::to_string_pretty(&doc)?;
-    crate::session::atomic_write(path, new_content.as_bytes())?;
-
-    Ok(())
+        if let Some(sandbox) = doc.get_mut("sandbox").and_then(|s| s.as_table_mut()) {
+            sandbox.remove("yolo_mode_default");
+        }
+        // `false` is the new default, so only a `true` needs carrying over, and
+        // never over an explicit value already there.
+        if enabled {
+            if let Some(session) = doc
+                .entry("session")
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                .as_table_mut()
+            {
+                session
+                    .entry("yolo_mode_default")
+                    .or_insert(toml::Value::Boolean(true));
+            }
+        }
+        true
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn test_migrate_yolo_from_sandbox_to_session() {

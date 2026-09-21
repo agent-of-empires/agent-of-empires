@@ -1,27 +1,17 @@
-//! Migration v016: clear the spurious tmux-gone Error left on archived
-//! sessions by builds shipped between #1868 (tear down tmux on archive) and
-//! #2206 (stop the status poller flipping archived rows to Error).
+//! Migration v016: demote archived sessions still persisted at
+//! `status = "error"` back to Idle.
 //!
-//! Those builds archived a session, killed its tmux, then let the status
-//! poller observe the missing tmux and stamp `status = "error"` with a
-//! "tmux session is gone" message. `last_error` is not persisted
-//! (`#[serde(skip)]`), so on reload the row carries only `status = "error"`
-//! and the message is gone; the in-process #2206 guard cannot recognize it.
-//! This one-shot migration walks every sessions.json and demotes any archived
-//! row still sitting at Error back to Idle. An archived row has no live tmux
-//! by design, so an Error status on one can only be that spurious transition.
-//!
-//! ## Failure policy
-//!
-//! Per `AGENTS.md > Data Migrations`, a returned `Err` aborts boot. A
-//! sessions.json that fails to parse is logged and skipped (a corrupt file
-//! must not block boot or spam every launch). Only `get_app_dir` and
-//! directory-read failures propagate.
+//! Builds between #1868 and #2206 archived a session, killed its tmux, then
+//! let the poller stamp the missing tmux as an error. `last_error` is not
+//! persisted, so the row survives as a bare Error. An archived row has no
+//! live tmux by design, so that Error can only be the spurious transition.
+//! A sessions.json that fails to parse is logged and skipped.
 
+use super::sessions_file;
 use anyhow::Result;
 use std::fs;
 use std::path::Path;
-use tracing::{debug, info};
+use tracing::info;
 
 pub fn run() -> Result<()> {
     let app_dir = crate::session::get_app_dir()?;
@@ -29,55 +19,27 @@ pub fn run() -> Result<()> {
 }
 
 pub(crate) fn run_in(app_dir: &Path) -> Result<()> {
-    let profiles_dir = app_dir.join("profiles");
-    if profiles_dir.exists() {
-        for entry in fs::read_dir(&profiles_dir)? {
-            let entry = entry?;
-            if entry.path().is_dir() {
-                clear_archived_error(&entry.path().join("sessions.json"))?;
-            }
-        }
+    for path in sessions_file::session_files(app_dir)? {
+        clear_archived_error(&path)?;
     }
-    // Legacy top-level sessions.json (pre-profiles layout).
-    clear_archived_error(&app_dir.join("sessions.json"))?;
     Ok(())
 }
 
-/// Demote any archived session still persisted at `status = "error"` back to
-/// `"idle"`. Leaves non-archived rows and archived rows in any other status
-/// untouched.
+/// Demote any archived row still persisted at `status = "error"` back to Idle,
+/// leaving non-archived rows and every other status alone.
 fn clear_archived_error(path: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    let content = fs::read_to_string(path)?;
-    let mut value: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(e) => {
-            debug!("v016: failed to parse {}: {e}, skipping", path.display());
-            return Ok(());
+    let healed = sessions_file::heal_rows(path, &fs::read_to_string(path)?, |row| {
+        let spurious =
+            sessions_file::is_archived(row) && sessions_file::status(row) == Some("error");
+        if spurious {
+            sessions_file::settle_to_idle(row);
         }
-    };
-
-    let mut healed = 0usize;
-    if let Some(array) = value.as_array_mut() {
-        for instance in array.iter_mut() {
-            if let Some(obj) = instance.as_object_mut() {
-                let archived = obj.get("archived_at").is_some_and(|v| !v.is_null());
-                let errored = obj.get("status").and_then(|v| v.as_str()) == Some("error");
-                if archived && errored {
-                    obj.insert(
-                        "status".to_string(),
-                        serde_json::Value::String("idle".to_string()),
-                    );
-                    healed += 1;
-                }
-            }
-        }
-    }
-
+        spurious
+    })?;
     if healed > 0 {
-        crate::session::atomic_write(path, serde_json::to_string_pretty(&value)?.as_bytes())?;
         info!(
             "v016: cleared spurious archived Error on {healed} session(s) in {} (#2206)",
             path.display()

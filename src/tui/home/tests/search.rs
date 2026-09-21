@@ -49,10 +49,9 @@ fn test_search_mode_enter_commits_without_clearing_matches() {
 #[test]
 #[serial]
 fn test_reload_after_enter_preserves_search_state() {
-    // Regression guard for #2676: `refresh_search_matches` wipes matches
-    // whenever the query is empty. If Enter cleared search_query, the very
-    // next storage/config reload would destroy the matches Enter promised
-    // to keep, silently breaking `n` match cycling.
+    // #2676: `refresh_search_matches` wipes matches whenever the query is empty, so if
+    // Enter cleared search_query the next reload would destroy the matches Enter promised to
+    // keep and silently break `n` cycling.
     let mut env = create_test_env_with_sessions(5);
     env.view.handle_key(key(KeyCode::Char('/')), None);
     env.view.handle_key(key(KeyCode::Char('s')), None);
@@ -84,13 +83,9 @@ fn test_reload_after_enter_preserves_search_state() {
 #[test]
 #[serial]
 fn test_sort_order_change_after_enter_rescores_search_matches() {
-    // Regression guard for #2676: paths that rebuild `flat_items`
-    // (`apply_sort_order`, `apply_group_by`, `toggle_group_collapsed`)
-    // must re-score `search_matches` against the new indices, or `n`/`N`
-    // jumps to stale positions and row highlights land on wrong sessions.
-    // Query "session0" matches only session0. With Newest sort it sits at
-    // index 4; with Oldest at index 0. Without the fix the stale index 4
-    // would land on session4 after the sort change.
+    // #2676: paths that rebuild `flat_items` must re-score `search_matches` against the new
+    // indices, or `n`/`N` jumps to stale positions. Query "session0" sits at index 4 under
+    // Newest and 0 under Oldest, so the stale index would land on session4.
     use crate::session::config::SortOrder;
     let mut env = create_test_env_with_sessions(5);
     env.view.handle_key(key(KeyCode::Char('/')), None);
@@ -363,9 +358,8 @@ fn test_search_n_wraps_around() {
 #[test]
 #[serial]
 fn test_search_shift_n_opens_new_from_selection_not_cycle() {
-    // #3038 regression guard: after a committed search, Shift+N must create a
-    // new session (new-from-selection), not jump to the previous match. Before
-    // #3038 the committed search shadowed Shift+N with a reverse-cycle.
+    // #3038: after a committed search, Shift+N must create a new session rather than jump
+    // to the previous match, which the committed search used to shadow.
     let mut env = create_test_env_with_sessions(5);
     env.view.search_query = Input::new("session".to_string());
     env.view.update_search();
@@ -387,11 +381,9 @@ fn test_search_shift_n_opens_new_from_selection_not_cycle() {
 #[test]
 #[serial]
 fn matched_running_row_keeps_status_color_on_spinner_and_bolds() {
-    // #3038 follow-up: a search match must not recolor the status spinner. A
-    // running match used to paint its spinner theme.search (amber in most
-    // themes), which read as "waiting" while the true status was running. The
-    // spinner and title must keep the running status color and highlight with
-    // bold only.
+    // #3038 follow-up: a search match must not recolor the status spinner. A running match
+    // painted its spinner theme.search (amber), reading as "waiting"; spinner and title keep
+    // the status color and highlight with bold only.
     use ratatui::style::Modifier;
 
     let (env, running, _waiting) = attention_env_running_then_waiting();
@@ -443,9 +435,8 @@ fn test_esc_clears_search_matches() {
 #[test]
 #[serial]
 fn committed_search_keeps_bar_visible_until_esc() {
-    // The searched text should stay pinned at the bottom of the list after you
-    // press Enter, until you Esc out. `search_bar_visible` gates both the render
-    // and the list-row reservation, so it must stay true through a commit.
+    // The searched text stays pinned at the bottom until Esc. `search_bar_visible` gates
+    // both the render and the row reservation, so it must stay true through a commit.
     let mut env = create_test_env_with_sessions(5);
     env.view.handle_key(key(KeyCode::Char('/')), None);
     env.view.handle_key(key(KeyCode::Char('s')), None);
@@ -475,10 +466,9 @@ fn committed_search_keeps_bar_visible_until_esc() {
 #[test]
 #[serial]
 fn committed_zero_result_search_keeps_bar_visible() {
-    // A committed search that matched nothing is still something you searched
-    // for: the bar must stay visible (showing `/query [0/0]`) until Esc, rather
-    // than vanishing the instant you press Enter. Gating on the committed query
-    // rather than on matches keeps it visible.
+    // A committed search that matched nothing is still something you searched for, so the
+    // bar stays visible showing `/query [0/0]` until Esc; gating on the committed query
+    // rather than on matches is what keeps it up.
     let mut env = create_test_env_with_sessions(5);
     env.view.handle_key(key(KeyCode::Char('/')), None);
     for ch in ['z', 'q', 'x', 'w', 'v'] {

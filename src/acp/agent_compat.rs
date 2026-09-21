@@ -1,31 +1,4 @@
 //! Per-adapter compatibility policy for ACP agents.
-//!
-//! aoe spawns several ACP adapters (claude-agent-acp, codex-acp,
-//! opencode, aoe-agent, gemini, pi-acp). Some require a minimum upstream
-//! version because aoe relies on behavior that only landed past a known
-//! release. This module centralizes those rules so `acp_client` has a
-//! single hook to call after `initialize` succeeds, instead of scattering
-//! ad-hoc semver checks at every spawn site.
-//!
-//! `ClaudeAgentAcp` carries a minimum version (see
-//! `CLAUDE_AGENT_ACP_MIN_VERSION`,
-//! required for `memory_recall` tool-call emission, native `cancelled`
-//! stop reason, force-cancel of a wedged `TaskOutput` block (upstream
-//! #680), the upstream #641 fix, the `fable` model, and several other
-//! behaviors aoe builds on). `OpenCode` carries one too (see
-//! `OPENCODE_MIN_VERSION`, the release that stopped sending empty
-//! `rawInput` on `external_directory` permission requests so the approval
-//! card shows the path and command; AoE issue #1907, upstream #30567). The
-//! Codex validates the maintained adapter package name but has no minimum
-//! version floor. aoe-agent, Gemini, Pi ACP, and unknown adapters get a
-//! permissive policy (protocol check only). Long-term aoe should
-//! prefer ACP capability flags over package-version gating; until upstream
-//! exposes those, package versions are the only precise contract.
-//!
-//! Failure mode: missing `agent_info`, missing version, parse failure, or
-//! version below the floor all reject for adapters with a minimum. Other
-//! adapters are passed through. The supervisor's known spawn intent is
-//! the gate, not the self-reported `agent_info.name` on the wire.
 
 use agent_client_protocol::schema::v1::InitializeResponse;
 use agent_client_protocol::schema::ProtocolVersion;
@@ -33,63 +6,14 @@ use agent_client_protocol::schema::ProtocolVersion;
 use super::state::StartupErrorDetail;
 
 /// Single source of truth for the `claude-agent-acp` minimum-version floor.
-///
-/// Bumping the floor is a one-line edit here: the gate, the startup-error
-/// strings, and the boundary tests all derive from this value. The one
-/// peer that cannot read a Rust const, the npm pin in `docker/Dockerfile`,
-/// is held in sync by the `dockerfile_pin_matches_floor` test below, so a
-/// bump that forgets the Dockerfile fails CI rather than shipping a
-/// sandbox image stuck below the host floor. User docs deliberately do not
-/// restate the number; the startup-error path reports the exact floor
-/// dynamically at rejection time.
 pub const CLAUDE_AGENT_ACP_MIN_VERSION: &str = "0.55.0";
-
-/// Parsed form of [`CLAUDE_AGENT_ACP_MIN_VERSION`]. Runs once per adapter
-/// initialize, not in a hot path, so parsing on demand is fine.
-fn claude_agent_acp_min_version() -> semver::Version {
-    semver::Version::parse(CLAUDE_AGENT_ACP_MIN_VERSION)
-        .expect("CLAUDE_AGENT_ACP_MIN_VERSION must be valid semver")
-}
-
-/// Version at which `claude-agent-acp`'s `_session/steering` extension
-/// became safe for AoE to use, i.e. the release that added the
-/// request-level `_meta.steering.idleBehavior: "promptRequired"` opt-in
-/// (upstream #903, PR #919).
-///
-/// This is a *feature* floor, deliberately separate from
-/// [`CLAUDE_AGENT_ACP_MIN_VERSION`]: that one is a hard startup reject,
-/// so folding steering into it would force every user to upgrade for an
-/// optional capability. Below this floor the adapter still advertises
-/// `steering.supported` (steering itself landed in 0.61.0) but answers a
-/// racing steer with `startedNewTurn`, spawning a detached turn whose
-/// `PromptResponse` nobody owns. AoE scopes streaming, cancellation, and
-/// UI state to a pending prompt request, so it cannot consume that turn;
-/// gating on the opt-in is what keeps the race safe.
-///
-/// `steering_floor_at_or_above_hard_floor` below pins the invariant
-/// that a feature floor never sits under the startup floor.
 pub const CLAUDE_AGENT_ACP_STEERING_MIN_VERSION: &str = "0.64.0";
-
-/// Parsed form of [`CLAUDE_AGENT_ACP_STEERING_MIN_VERSION`].
-fn claude_agent_acp_steering_min_version() -> semver::Version {
-    semver::Version::parse(CLAUDE_AGENT_ACP_STEERING_MIN_VERSION)
-        .expect("CLAUDE_AGENT_ACP_STEERING_MIN_VERSION must be valid semver")
-}
-
 /// Single source of truth for the `opencode` minimum-version floor.
-///
-/// 1.16.0 is the first release that ships upstream #30567: pre-1.16
-/// opencode sent an empty `rawInput` on `external_directory` permission
-/// requests, so the structured-view approval card had no path or command
-/// to show and the user could not tell what was being approved (#1907).
-/// opencode installs via `curl | bash`, not npm, so there is no Dockerfile
-/// pin to keep in sync; the sandbox image's `curl` install always pulls a
-/// release at or above this floor.
 pub const OPENCODE_MIN_VERSION: &str = "1.16.0";
 
-/// Parsed form of [`OPENCODE_MIN_VERSION`].
-fn opencode_min_version() -> semver::Version {
-    semver::Version::parse(OPENCODE_MIN_VERSION).expect("OPENCODE_MIN_VERSION must be valid semver")
+/// Parse one of the floor constants above.
+fn floor(version: &str) -> semver::Version {
+    semver::Version::parse(version).expect("version floors must be valid semver")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,8 +26,7 @@ pub struct VersionGate {
     pub auto_install: bool,
 }
 
-/// The adapter aoe is trying to launch. Drives which `CompatibilityPolicy`
-/// is applied at initialize-time.
+/// The adapter aoe is trying to launch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExpectedAgent {
     ClaudeAgentAcp,
@@ -112,29 +35,14 @@ pub enum ExpectedAgent {
     AoeAgent,
     Gemini,
     PiAcp,
-    /// Unknown / user-configured agent. Permissive policy.
+    /// Unknown / user-configured agent.
     Other,
 }
 
 impl ExpectedAgent {
-    /// Resolve from the binary name as configured in `AgentRegistry`. Maps
-    /// the string the supervisor is about to spawn to the matching policy
-    /// enum so the supervisor can call this once and pass the result down.
-    ///
-    /// Robust to surface variations seen in the wild: a wrapper command
-    /// string ("bash claude-agent-acp"), POSIX or Windows path
-    /// separators, and the `.exe` / `.cmd` suffixes Windows shims add.
-    /// Without this normalization a wrapped or Windows-installed
-    /// `claude-agent-acp` would land in `Other` and silently bypass the
-    /// minimum-version gate.
+    /// Resolve from the binary name as configured in `AgentRegistry`.
     pub fn from_command(command: &str) -> Self {
-        // Scan every whitespace-separated token. The actual binary can
-        // be the first token (`/usr/local/bin/claude-agent-acp`) but
-        // also a later one when a wrapper prefixes the command line
-        // (`bash claude-agent-acp`, `env -u FOO claude-agent-acp`,
-        // `npx claude-agent-acp`, etc.). Match against the first token
-        // that classifies as a known adapter so wrappers don't bypass
-        // the minimum-version gate.
+        // Scan every whitespace-separated token.
         command
             .split_whitespace()
             .find_map(|token| {
@@ -165,10 +73,10 @@ struct CompatibilityPolicy {
     /// If set, the adapter's `agent_info.version` must parse as semver
     /// and be at least this value.
     min_version: Option<semver::Version>,
-    /// The protocol version the client requested. Adapter must match.
+    /// The protocol version the client requested.
     required_protocol: ProtocolVersion,
     /// If `true`, missing `agent_info` or empty/unparseable version
-    /// rejects. `false` means we tolerate adapters that don't advertise.
+    /// rejects.
     fail_on_missing_agent_info: bool,
 }
 
@@ -177,33 +85,25 @@ impl ExpectedAgent {
         match self {
             Self::ClaudeAgentAcp => CompatibilityPolicy {
                 expected_name: Some("@agentclientprotocol/claude-agent-acp"),
-                min_version: Some(claude_agent_acp_min_version()),
+                min_version: Some(floor(CLAUDE_AGENT_ACP_MIN_VERSION)),
                 required_protocol: ProtocolVersion::V1,
                 fail_on_missing_agent_info: true,
             },
             Self::OpenCode => CompatibilityPolicy {
-                // opencode's ACP handshake reports `agentInfo.name`
-                // "OpenCode" (a display string, not an npm id), verified
-                // against opencode v1.16.0 `acp/service.ts`. Gating the
-                // name mirrors the claude policy and yields a precise
-                // mismatch diagnostic if a different binary is shimmed in.
                 expected_name: Some("OpenCode"),
-                min_version: Some(opencode_min_version()),
+                min_version: Some(floor(OPENCODE_MIN_VERSION)),
                 required_protocol: ProtocolVersion::V1,
                 fail_on_missing_agent_info: true,
             },
             Self::CodexAcp => CompatibilityPolicy {
                 // The deprecated @zed-industries package still exposes the
                 // same binary name, but lacks current Codex model metadata.
-                // Match the maintained package when agent_info is present;
-                // tolerate missing info because Codex has no version floor.
                 expected_name: Some("@agentclientprotocol/codex-acp"),
                 min_version: None,
                 required_protocol: ProtocolVersion::V1,
                 fail_on_missing_agent_info: false,
             },
-            // Other adapters: protocol check only. aoe doesn't yet
-            // depend on a version-gated behavior in any of them.
+            // Other adapters: protocol check only.
             Self::AoeAgent | Self::Gemini | Self::PiAcp | Self::Other => CompatibilityPolicy {
                 expected_name: None,
                 min_version: None,
@@ -214,47 +114,11 @@ impl ExpectedAgent {
     }
 }
 
-/// Reasons aoe refuses to enter a session after a successful `initialize`
-/// handshake. Surfaced to the user via the structured view StartupErrorScreen.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StartupError {
-    /// Adapter reported a version below the minimum aoe requires.
-    IncompatibleAgentVersion {
-        package_name: String,
-        installed: String,
-        required: String,
-        install_command: String,
-        auto_install: bool,
-    },
-    /// Adapter passed name/version checks but reported a protocol version
-    /// aoe does not speak.
-    UnsupportedProtocolVersion { expected: String, received: String },
-    /// Adapter omitted `agent_info` (or `agent_info.version`) entirely,
-    /// and the policy for this adapter kind requires it.
-    MissingAgentInfo {
-        expected_package: String,
-        install_command: String,
-        auto_install: bool,
-    },
-    /// Adapter advertised a different package name than aoe expected for
-    /// this `ExpectedAgent`. Probably a wrapper or stale install.
-    MismatchedAgentName {
-        expected: String,
-        received: String,
-        install_command: String,
-        auto_install: bool,
-    },
-    /// `agent_info.version` was present but did not parse as semver.
-    UnparseableAgentVersion {
-        package_name: String,
-        raw_version: String,
-        required: String,
-        install_command: String,
-        auto_install: bool,
-    },
-}
+/// Why aoe refuses a session after a successful `initialize`; the same
+/// shape the structured view event carries.
+pub type StartupError = StartupErrorDetail;
 
-impl StartupError {
+impl StartupErrorDetail {
     /// Short, machine-stable identifier used by tests, logs, and the
     /// frontend reducer's discriminator.
     pub fn kind(&self) -> &'static str {
@@ -268,9 +132,7 @@ impl StartupError {
     }
 
     /// User-facing one-liner suitable for the legacy
-    /// `AgentStartupError { message }` event channel. Lets the existing
-    /// status-derivation paths flip the session into Error state without
-    /// having to teach every consumer about the structured variant.
+    /// `AgentStartupError { message }` event channel.
     pub fn user_message(&self) -> String {
         match self {
             Self::IncompatibleAgentVersion {
@@ -313,69 +175,14 @@ impl StartupError {
     }
 }
 
-impl From<&StartupError> for StartupErrorDetail {
-    fn from(err: &StartupError) -> Self {
-        match err {
-            StartupError::IncompatibleAgentVersion {
-                package_name,
-                installed,
-                required,
-                install_command,
-                auto_install,
-            } => StartupErrorDetail::IncompatibleAgentVersion {
-                package_name: package_name.clone(),
-                installed: installed.clone(),
-                required: required.clone(),
-                install_command: install_command.clone(),
-                auto_install: *auto_install,
-            },
-            StartupError::MissingAgentInfo {
-                expected_package,
-                install_command,
-                auto_install,
-            } => StartupErrorDetail::MissingAgentInfo {
-                expected_package: expected_package.clone(),
-                install_command: install_command.clone(),
-                auto_install: *auto_install,
-            },
-            StartupError::MismatchedAgentName {
-                expected,
-                received,
-                install_command,
-                auto_install,
-            } => StartupErrorDetail::MismatchedAgentName {
-                expected: expected.clone(),
-                received: received.clone(),
-                install_command: install_command.clone(),
-                auto_install: *auto_install,
-            },
-            StartupError::UnparseableAgentVersion {
-                package_name,
-                raw_version,
-                required,
-                install_command,
-                auto_install,
-            } => StartupErrorDetail::UnparseableAgentVersion {
-                package_name: package_name.clone(),
-                raw_version: raw_version.clone(),
-                required: required.clone(),
-                install_command: install_command.clone(),
-                auto_install: *auto_install,
-            },
-            StartupError::UnsupportedProtocolVersion { expected, received } => {
-                StartupErrorDetail::UnsupportedProtocolVersion {
-                    expected: expected.clone(),
-                    received: received.clone(),
-                }
-            }
-        }
+impl From<&StartupErrorDetail> for StartupErrorDetail {
+    fn from(err: &StartupErrorDetail) -> Self {
+        err.clone()
     }
 }
 
 /// Validate an `InitializeResponse` against the policy for the adapter
-/// aoe was launching. Returns `Ok(())` on success; `Err(StartupError)`
-/// surfaces a structured failure the supervisor can route into the
-/// startup-error UI path.
+/// aoe was launching.
 pub fn validate(expected: ExpectedAgent, init: &InitializeResponse) -> Result<(), StartupError> {
     let policy = expected.policy();
 
@@ -459,23 +266,7 @@ pub fn validate(expected: ExpectedAgent, init: &InitializeResponse) -> Result<()
 }
 
 /// Whether AoE may steer this agent's running turn via the
-/// `_session/steering` extension request (#2805).
-///
-/// Two conditions, both required. The adapter must advertise
-/// `_meta.steering.supported` on its `initialize` response, and, for
-/// `claude-agent-acp`, report a version at or above
-/// [`CLAUDE_AGENT_ACP_STEERING_MIN_VERSION`]. The advertised bit alone is
-/// not enough: 0.61.0 through 0.63.x advertise steering but predate the
-/// `promptRequired` idle opt-in, so a steer that races the turn's end
-/// spawns a detached turn AoE cannot own.
-///
-/// Other adapters get the advertised bit alone. None ships steering
-/// today, so the version arm would have nothing to gate on; when one
-/// does, its floor belongs here next to claude's.
-///
-/// Callers must re-derive this on every `initialize`, including
-/// reconnect and resume, rather than caching it across connections: a
-/// worker respawn can land on a different adapter build.
+/// `_session/steering` extension request.
 pub fn supports_steering(expected: ExpectedAgent, init: &InitializeResponse) -> bool {
     let advertised = init
         .meta
@@ -493,7 +284,7 @@ pub fn supports_steering(expected: ExpectedAgent, init: &InitializeResponse) -> 
     init.agent_info
         .as_ref()
         .and_then(|info| semver::Version::parse(info.version.trim()).ok())
-        .is_some_and(|version| version >= claude_agent_acp_steering_min_version())
+        .is_some_and(|version| version >= floor(CLAUDE_AGENT_ACP_STEERING_MIN_VERSION))
 }
 
 /// The ACP binary name aoe expects for this agent, or `None` for agents
@@ -510,16 +301,13 @@ fn binary_for(expected: ExpectedAgent) -> Option<&'static str> {
 }
 
 /// Lookup table for the install commands surfaced in startup errors.
-/// Kept in sync with `install_hints::install_hint_for` so the error UI
-/// shows the exact command the doctor would run.
 fn install_command_for(expected: ExpectedAgent) -> Option<String> {
     let bin = binary_for(expected)?;
     crate::acp::install_hints::install_hint_for(bin).map(|s| s.to_string())
 }
 
 /// Whether the web "Update & restart" action can install this agent itself
-/// via a plain `npm install -g`. Server-authoritative pre-gate for the
-/// button; non-npm agents fall back to the displayed manual hint. See #2109.
+/// via a plain `npm install -g`.
 fn auto_install_for(expected: ExpectedAgent) -> bool {
     binary_for(expected)
         .and_then(crate::acp::install_hints::npm_package_for)
@@ -558,98 +346,150 @@ mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::Implementation;
 
-    fn make_init(name: &str, version: &str) -> InitializeResponse {
-        InitializeResponse::new(ProtocolVersion::V1).agent_info(Implementation::new(name, version))
+    fn init(info: Option<(&str, &str)>) -> InitializeResponse {
+        let init = InitializeResponse::new(ProtocolVersion::V1);
+        match info {
+            Some((name, version)) => init.agent_info(Implementation::new(name, version)),
+            None => init,
+        }
     }
 
-    fn make_init_no_info() -> InitializeResponse {
-        InitializeResponse::new(ProtocolVersion::V1)
-    }
+    const CLAUDE: &str = "@agentclientprotocol/claude-agent-acp";
 
     #[test]
-    fn claude_below_minimum_rejected() {
-        let init = make_init("@agentclientprotocol/claude-agent-acp", "0.0.0");
-        let err = validate(ExpectedAgent::ClaudeAgentAcp, &init).unwrap_err();
-        assert_eq!(err.kind(), "incompatible_agent_version");
-        let StartupError::IncompatibleAgentVersion {
+    fn validate_gates_name_and_version_per_agent() {
+        use ExpectedAgent::*;
+        let below_floor = format!("{CLAUDE_AGENT_ACP_MIN_VERSION}-alpha.1");
+        // (agent, reported name and version, expected error kind or None for accepted)
+        type Case<'a> = (ExpectedAgent, Option<(&'a str, &'a str)>, Option<&'a str>);
+        let cases: Vec<Case> = vec![
+            (
+                ClaudeAgentAcp,
+                Some((CLAUDE, "0.0.0")),
+                Some("incompatible_agent_version"),
+            ),
+            (
+                ClaudeAgentAcp,
+                Some((CLAUDE, &below_floor)),
+                Some("incompatible_agent_version"),
+            ),
+            (
+                ClaudeAgentAcp,
+                Some((CLAUDE, CLAUDE_AGENT_ACP_MIN_VERSION)),
+                None,
+            ),
+            (ClaudeAgentAcp, Some((CLAUDE, "999.0.0")), None),
+            (ClaudeAgentAcp, None, Some("missing_agent_info")),
+            (
+                ClaudeAgentAcp,
+                Some((CLAUDE, "")),
+                Some("missing_agent_info"),
+            ),
+            (
+                ClaudeAgentAcp,
+                Some((CLAUDE, "not-semver")),
+                Some("unparseable_agent_version"),
+            ),
+            (
+                ClaudeAgentAcp,
+                Some(("some-other-package", "0.39.0")),
+                Some("mismatched_agent_name"),
+            ),
+            (CodexAcp, None, None),
+            (AoeAgent, None, None),
+            (Other, None, None),
+            (
+                OpenCode,
+                Some(("OpenCode", "1.15.13")),
+                Some("incompatible_agent_version"),
+            ),
+            (OpenCode, Some(("OpenCode", OPENCODE_MIN_VERSION)), None),
+            (OpenCode, Some(("OpenCode", "1.17.9")), None),
+            (OpenCode, None, Some("missing_agent_info")),
+            (
+                OpenCode,
+                Some(("opencode", OPENCODE_MIN_VERSION)),
+                Some("mismatched_agent_name"),
+            ),
+            (
+                CodexAcp,
+                Some(("@agentclientprotocol/codex-acp", "0.0.1")),
+                None,
+            ),
+            (
+                CodexAcp,
+                Some(("codex-acp", "0.16.0")),
+                Some("mismatched_agent_name"),
+            ),
+        ];
+        for (agent, info, want) in cases {
+            let got = validate(agent, &init(info)).err();
+            assert_eq!(got.as_ref().map(|e| e.kind()), want, "{agent:?} {info:?}");
+        }
+
+        let Err(StartupError::IncompatibleAgentVersion {
             installed,
             required,
             auto_install,
             ..
-        } = err
+        }) = validate(ClaudeAgentAcp, &init(Some((CLAUDE, "0.0.0"))))
         else {
-            panic!()
+            panic!("expected an incompatible version");
         };
-        assert_eq!(installed, "0.0.0");
-        assert_eq!(required, CLAUDE_AGENT_ACP_MIN_VERSION);
-        // claude-agent-acp is npm-installable, so the web can offer
-        // "Update & restart". See #2109.
-        assert!(auto_install);
-    }
-
-    #[test]
-    fn auto_install_only_for_npm_agents() {
-        assert!(auto_install_for(ExpectedAgent::ClaudeAgentAcp));
-        assert!(auto_install_for(ExpectedAgent::CodexAcp));
-        assert!(auto_install_for(ExpectedAgent::Gemini));
-        // Manual-install agents fall back to the displayed hint.
-        assert!(!auto_install_for(ExpectedAgent::OpenCode));
-        assert!(!auto_install_for(ExpectedAgent::PiAcp));
-        assert!(!auto_install_for(ExpectedAgent::AoeAgent));
-        assert!(!auto_install_for(ExpectedAgent::Other));
-    }
-
-    #[test]
-    fn version_gates_expose_floor_metadata() {
-        let claude = version_gate_for(ExpectedAgent::ClaudeAgentAcp).unwrap();
-        assert_eq!(claude.binary, "claude-agent-acp");
-        assert_eq!(claude.package_name, "@agentclientprotocol/claude-agent-acp");
-        assert_eq!(claude.min_version, CLAUDE_AGENT_ACP_MIN_VERSION);
-        assert!(claude.auto_install);
-
-        let opencode = version_gate_for(ExpectedAgent::OpenCode).unwrap();
-        assert_eq!(opencode.binary, "opencode");
-        assert_eq!(opencode.package_name, "OpenCode");
-        assert_eq!(opencode.min_version, OPENCODE_MIN_VERSION);
-        assert!(!opencode.auto_install);
-
-        assert!(version_gate_for(ExpectedAgent::CodexAcp).is_none());
-        assert!(version_gate_for(ExpectedAgent::Other).is_none());
-    }
-
-    #[test]
-    fn claude_just_below_floor_rejected() {
-        // The strict lower boundary, derived from the floor so a bump
-        // never needs to touch this fixture: a prerelease of the floor
-        // sorts strictly below the release under semver, so it must be
-        // rejected. Guards an accidental `<=` slip in the gate.
-        let version = format!("{CLAUDE_AGENT_ACP_MIN_VERSION}-alpha.1");
-        let init = make_init("@agentclientprotocol/claude-agent-acp", &version);
-        let err = validate(ExpectedAgent::ClaudeAgentAcp, &init).unwrap_err();
-        assert_eq!(err.kind(), "incompatible_agent_version");
-    }
-
-    #[test]
-    fn claude_at_minimum_accepted() {
-        let init = make_init(
-            "@agentclientprotocol/claude-agent-acp",
-            CLAUDE_AGENT_ACP_MIN_VERSION,
+        assert_eq!(
+            (installed.as_str(), required.as_str()),
+            ("0.0.0", CLAUDE_AGENT_ACP_MIN_VERSION)
         );
-        validate(ExpectedAgent::ClaudeAgentAcp, &init).unwrap();
+        assert!(auto_install);
+
+        let legacy_codex = validate(CodexAcp, &init(Some(("codex-acp", "0.16.0")))).unwrap_err();
+        assert!(legacy_codex
+            .user_message()
+            .contains("npm install -g @agentclientprotocol/codex-acp@latest"));
     }
 
     #[test]
-    fn claude_above_minimum_accepted() {
-        let init = make_init("@agentclientprotocol/claude-agent-acp", "999.0.0");
-        validate(ExpectedAgent::ClaudeAgentAcp, &init).unwrap();
-    }
+    fn install_metadata_matches_each_agent() {
+        use ExpectedAgent::*;
+        for (agent, auto) in [
+            (ClaudeAgentAcp, true),
+            (CodexAcp, true),
+            (Gemini, true),
+            (OpenCode, false),
+            (PiAcp, false),
+            (AoeAgent, false),
+            (Other, false),
+        ] {
+            assert_eq!(auto_install_for(agent), auto, "{agent:?}");
+        }
 
-    #[test]
-    fn dockerfile_pin_matches_floor() {
-        // docker/Dockerfile cannot read a Rust const, so the sandbox npm
-        // pin is the one floor restatement outside this module. Assert it
-        // tracks the gate so a bump that forgets the Dockerfile fails CI
-        // instead of shipping an image stuck below the host floor.
+        let claude = version_gate_for(ClaudeAgentAcp).unwrap();
+        assert_eq!(
+            (
+                claude.binary,
+                claude.package_name,
+                claude.min_version,
+                claude.auto_install
+            ),
+            (
+                "claude-agent-acp",
+                CLAUDE,
+                CLAUDE_AGENT_ACP_MIN_VERSION,
+                true
+            )
+        );
+        let opencode = version_gate_for(OpenCode).unwrap();
+        assert_eq!(
+            (
+                opencode.binary,
+                opencode.package_name,
+                opencode.min_version,
+                opencode.auto_install
+            ),
+            ("opencode", "OpenCode", OPENCODE_MIN_VERSION, false)
+        );
+        assert!(version_gate_for(CodexAcp).is_none() && version_gate_for(Other).is_none());
+
         let dockerfile = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/docker/Dockerfile"));
         let needle = "@agentclientprotocol/claude-agent-acp@^";
         let pins: Vec<String> = dockerfile
@@ -663,46 +503,38 @@ mod tests {
             .collect();
         assert_eq!(
             pins,
-            vec![CLAUDE_AGENT_ACP_MIN_VERSION.to_string()],
+            [CLAUDE_AGENT_ACP_MIN_VERSION],
             "docker/Dockerfile claude-agent-acp pin must match CLAUDE_AGENT_ACP_MIN_VERSION",
         );
     }
 
-    /// Steering needs the advertised bit AND, for claude, the
-    /// `promptRequired` floor. The table is the whole contract: an
-    /// advertised-but-old adapter is the case that matters, since 0.61
-    /// through 0.63 answer a racing steer with a detached turn.
     #[test]
     fn steering_gate_requires_advert_and_floor() {
-        let below = "0.63.9";
-        let cases: [(ExpectedAgent, Option<bool>, &str, bool); 8] = [
-            // (agent, advertised bit, version, expected)
+        use ExpectedAgent::*;
+        assert!(
+            floor(CLAUDE_AGENT_ACP_STEERING_MIN_VERSION) >= floor(CLAUDE_AGENT_ACP_MIN_VERSION),
+            "the steering floor must not sit below the startup floor",
+        );
+        // (agent, advertised bit, version, expected)
+        let cases = [
             (
-                ExpectedAgent::ClaudeAgentAcp,
+                ClaudeAgentAcp,
                 Some(true),
                 CLAUDE_AGENT_ACP_STEERING_MIN_VERSION,
                 true,
             ),
-            (ExpectedAgent::ClaudeAgentAcp, Some(true), "999.0.0", true),
+            (ClaudeAgentAcp, Some(true), "999.0.0", true),
             // Advertised but pre-opt-in: the case the floor exists for.
-            (ExpectedAgent::ClaudeAgentAcp, Some(true), below, false),
-            // A prerelease of the floor sorts strictly below it.
-            (
-                ExpectedAgent::ClaudeAgentAcp,
-                Some(true),
-                "0.64.0-alpha.1",
-                false,
-            ),
-            // Floor met but the adapter never advertised.
-            (ExpectedAgent::ClaudeAgentAcp, Some(false), "999.0.0", false),
-            (ExpectedAgent::ClaudeAgentAcp, None, "999.0.0", false),
-            // Unparseable version cannot clear the floor.
-            (ExpectedAgent::ClaudeAgentAcp, Some(true), "nightly", false),
-            // Non-claude adapters have no floor to clear, only the bit.
-            (ExpectedAgent::CodexAcp, Some(true), "0.0.1", true),
+            (ClaudeAgentAcp, Some(true), "0.63.9", false),
+            (ClaudeAgentAcp, Some(true), "0.64.0-alpha.1", false),
+            (ClaudeAgentAcp, Some(false), "999.0.0", false),
+            (ClaudeAgentAcp, None, "999.0.0", false),
+            (ClaudeAgentAcp, Some(true), "nightly", false),
+            // Other adapters have no floor, only the bit.
+            (CodexAcp, Some(true), "0.0.1", true),
         ];
         for (agent, advertised, version, expected) in cases {
-            let mut init = make_init("@agentclientprotocol/claude-agent-acp", version);
+            let mut init = init(Some((CLAUDE, version)));
             if let Some(supported) = advertised {
                 init = init.meta(
                     serde_json::json!({ "steering": { "supported": supported } })
@@ -719,171 +551,28 @@ mod tests {
         }
     }
 
-    /// A feature floor that sat below the startup floor would be dead
-    /// weight: every session that got past `validate` would already
-    /// clear it. Fails if a future hard-floor bump overtakes steering.
     #[test]
-    fn steering_floor_at_or_above_hard_floor() {
-        assert!(
-            claude_agent_acp_steering_min_version() >= claude_agent_acp_min_version(),
-            "steering floor {CLAUDE_AGENT_ACP_STEERING_MIN_VERSION} must not sit below the startup floor {CLAUDE_AGENT_ACP_MIN_VERSION}",
-        );
-    }
-
-    #[test]
-    fn claude_missing_agent_info_rejected() {
-        let init = make_init_no_info();
-        let err = validate(ExpectedAgent::ClaudeAgentAcp, &init).unwrap_err();
-        assert_eq!(err.kind(), "missing_agent_info");
-    }
-
-    #[test]
-    fn claude_empty_version_rejected() {
-        let init = make_init("@agentclientprotocol/claude-agent-acp", "");
-        let err = validate(ExpectedAgent::ClaudeAgentAcp, &init).unwrap_err();
-        assert_eq!(err.kind(), "missing_agent_info");
-    }
-
-    #[test]
-    fn claude_unparseable_version_rejected() {
-        let init = make_init("@agentclientprotocol/claude-agent-acp", "not-semver");
-        let err = validate(ExpectedAgent::ClaudeAgentAcp, &init).unwrap_err();
-        assert_eq!(err.kind(), "unparseable_agent_version");
-    }
-
-    #[test]
-    fn claude_mismatched_name_rejected() {
-        let init = make_init("some-other-package", "0.39.0");
-        let err = validate(ExpectedAgent::ClaudeAgentAcp, &init).unwrap_err();
-        assert_eq!(err.kind(), "mismatched_agent_name");
-    }
-
-    #[test]
-    fn non_gated_permissive_on_missing_info() {
-        let init = make_init_no_info();
-        validate(ExpectedAgent::CodexAcp, &init).unwrap();
-        validate(ExpectedAgent::AoeAgent, &init).unwrap();
-        validate(ExpectedAgent::Other, &init).unwrap();
-    }
-
-    #[test]
-    fn opencode_below_floor_rejected() {
-        let init = make_init("OpenCode", "1.15.13");
-        let err = validate(ExpectedAgent::OpenCode, &init).unwrap_err();
-        assert_eq!(err.kind(), "incompatible_agent_version");
-    }
-
-    #[test]
-    fn opencode_at_floor_accepted() {
-        let init = make_init("OpenCode", OPENCODE_MIN_VERSION);
-        validate(ExpectedAgent::OpenCode, &init).unwrap();
-    }
-
-    #[test]
-    fn opencode_above_floor_accepted() {
-        let init = make_init("OpenCode", "1.17.9");
-        validate(ExpectedAgent::OpenCode, &init).unwrap();
-    }
-
-    #[test]
-    fn opencode_missing_agent_info_rejected() {
-        let init = make_init_no_info();
-        let err = validate(ExpectedAgent::OpenCode, &init).unwrap_err();
-        assert_eq!(err.kind(), "missing_agent_info");
-    }
-
-    #[test]
-    fn opencode_mismatched_name_rejected() {
-        let init = make_init("opencode", OPENCODE_MIN_VERSION);
-        let err = validate(ExpectedAgent::OpenCode, &init).unwrap_err();
-        assert_eq!(err.kind(), "mismatched_agent_name");
-    }
-
-    #[test]
-    fn codex_accepts_current_package_without_a_version_floor() {
-        let init = make_init("@agentclientprotocol/codex-acp", "0.0.1");
-        validate(ExpectedAgent::CodexAcp, &init).unwrap();
-    }
-
-    #[test]
-    fn codex_rejects_legacy_adapter_reported_name() {
-        let init = make_init("codex-acp", "0.16.0");
-        let err = validate(ExpectedAgent::CodexAcp, &init).unwrap_err();
-        assert_eq!(err.kind(), "mismatched_agent_name");
-        assert!(err
-            .user_message()
-            .contains("@agentclientprotocol/codex-acp"));
-        assert!(err
-            .user_message()
-            .contains("npm install -g @agentclientprotocol/codex-acp@latest"));
-    }
-
-    #[test]
-    fn from_command_recognises_path_prefixed_binary() {
-        assert_eq!(
-            ExpectedAgent::from_command("/usr/local/bin/claude-agent-acp"),
-            ExpectedAgent::ClaudeAgentAcp
-        );
-        assert_eq!(
-            ExpectedAgent::from_command("claude-agent-acp"),
-            ExpectedAgent::ClaudeAgentAcp
-        );
+    fn from_command_finds_the_adapter_binary_in_any_launch_shape() {
+        for command in [
+            "claude-agent-acp",
+            "/usr/local/bin/claude-agent-acp",
+            "C:\\Users\\u\\AppData\\Roaming\\npm\\claude-agent-acp.cmd",
+            "claude-agent-acp.exe",
+            "D:\\bin\\claude-agent-acp.bat",
+            "claude-agent-acp --some-flag",
+            "  /usr/local/bin/claude-agent-acp  ",
+            "bash claude-agent-acp",
+            "env FOO=bar /usr/local/bin/claude-agent-acp",
+        ] {
+            assert_eq!(
+                ExpectedAgent::from_command(command),
+                ExpectedAgent::ClaudeAgentAcp,
+                "{command:?}"
+            );
+        }
         assert_eq!(
             ExpectedAgent::from_command("unknown-bin"),
             ExpectedAgent::Other
         );
-    }
-
-    #[test]
-    fn from_command_handles_windows_paths_and_extensions() {
-        assert_eq!(
-            ExpectedAgent::from_command(
-                "C:\\Users\\u\\AppData\\Roaming\\npm\\claude-agent-acp.cmd"
-            ),
-            ExpectedAgent::ClaudeAgentAcp
-        );
-        assert_eq!(
-            ExpectedAgent::from_command("claude-agent-acp.exe"),
-            ExpectedAgent::ClaudeAgentAcp
-        );
-        assert_eq!(
-            ExpectedAgent::from_command("D:\\bin\\claude-agent-acp.bat"),
-            ExpectedAgent::ClaudeAgentAcp
-        );
-    }
-
-    #[test]
-    fn from_command_handles_wrapper_token_prefix() {
-        // `AgentRegistry` exposes `command` plus a separate `args`
-        // vector, but defensive code paths sometimes hand us the joined
-        // string (e.g. `aoe acp doctor --json` output, log lines
-        // round-tripped through user config). Tolerate the joined form
-        // so the gate doesn't silently flip to `Other` and skip the
-        // claude check. Wrapper-prefixed commands count too: the
-        // classifier scans every whitespace-separated token so
-        // `bash claude-agent-acp` or `npx claude-agent-acp` is gated
-        // on the wrapped binary, not on the wrapper.
-        assert_eq!(
-            ExpectedAgent::from_command("claude-agent-acp --some-flag"),
-            ExpectedAgent::ClaudeAgentAcp
-        );
-        assert_eq!(
-            ExpectedAgent::from_command("  /usr/local/bin/claude-agent-acp  "),
-            ExpectedAgent::ClaudeAgentAcp
-        );
-        assert_eq!(
-            ExpectedAgent::from_command("bash claude-agent-acp"),
-            ExpectedAgent::ClaudeAgentAcp
-        );
-        assert_eq!(
-            ExpectedAgent::from_command("env FOO=bar /usr/local/bin/claude-agent-acp"),
-            ExpectedAgent::ClaudeAgentAcp
-        );
-        // `npx`-style npm-package-spec invocations are out of scope:
-        // npx itself resolves the package and the spawned binary's
-        // argv[0] is `claude-agent-acp`, not `claude-agent-acp@0.39.0`.
-        // The version-suffixed form would only show up if a user wired
-        // it manually into AgentSpec.command, which is not a supported
-        // configuration today.
     }
 }

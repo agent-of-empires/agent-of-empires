@@ -8,19 +8,11 @@ import {
 import { triageStateOf } from "./sidebarSort";
 import type { Workspace } from "./types";
 
-/** Eligible subsets of a multi-selection for each bulk triage action.
- *  Mixed selections (live + pinned + archived + snoozed) split into
- *  count-labelled buckets so the bulk bar can offer "Pin 3" / "Unpin 2"
- *  rather than one ambiguous toggle, mirroring the single-row menu's
- *  state machine (triageMenuShape). A workspace's eligibility is computed
- *  from its effective triage state (server value overlaid with any pending
- *  optimistic override). See #1724. */
+/** Selection split per bulk action from each workspace's effective (optimistic) triage state, so the bar can offer "Pin 3" / "Unpin 2". */
 export interface BulkTriageBuckets {
-  /** Live rows can be pinned, archived, or snoozed. */
   pinnable: Workspace[];
   archivable: Workspace[];
   snoozable: Workspace[];
-  /** Already-triaged rows offer only their inverse. */
   unpinnable: Workspace[];
   unarchivable: Workspace[];
   unsnoozable: Workspace[];
@@ -53,9 +45,7 @@ export function bucketSelectionForBulk(
         buckets.snoozable.push(ws);
         break;
       case "pinned":
-        // Pinned rows can be unpinned, and also archived or snoozed
-        // directly: the backend clears the pin on either transition,
-        // matching the single-row menu (triageMenuShape) and the TUI.
+        // Pinned rows can also be archived or snoozed directly; the backend clears the pin.
         buckets.unpinnable.push(ws);
         buckets.archivable.push(ws);
         buckets.snoozable.push(ws);
@@ -71,9 +61,7 @@ export function bucketSelectionForBulk(
   return buckets;
 }
 
-/** One-line summary toast for a completed bulk action, e.g.
- *  "Archived 12 workspaces. 2 failed." Skipped rows (no session) are folded
- *  in only when present. */
+/** E.g. "Archived 12 workspaces. 2 failed." */
 export function summarizeBulkResults(verb: string, results: readonly { ok: boolean; skipped?: boolean }[]): string {
   const ok = results.filter((r) => r.ok).length;
   const skipped = results.filter((r) => r.skipped).length;

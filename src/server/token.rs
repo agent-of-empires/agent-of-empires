@@ -1,5 +1,4 @@
-//! The dashboard access token: generation, validation, rotation, and the
-//! file it is persisted to.
+//! The dashboard access token.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,7 +45,6 @@ impl TokenManager {
     }
 
     /// Validate a token against current and previous (grace period).
-    /// Returns `(is_valid, needs_cookie_upgrade)`.
     pub async fn validate(&self, token: &str) -> (bool, bool) {
         let state = self.state.read().await;
 
@@ -93,9 +91,7 @@ impl TokenManager {
         self.state.read().await.previous.is_some()
     }
 
-    /// Rotate: generate new token, move current to previous with grace period.
-    /// Returns the instant the previous token stops validating, which is when
-    /// its state must be cleared.
+    /// Rotate.
     pub async fn rotate(&self) -> tokio::time::Instant {
         let mut state = self.state.write().await;
         let new_token = generate_token();
@@ -119,10 +115,7 @@ impl TokenManager {
         grace_expires
     }
 
-    /// Spawn a background rotation task. Production paths only call this
-    /// from the `--remote` branch; debug builds also call it when the
-    /// `AOE_TEST_TOKEN_LIFETIME_SECS` env override is set, so live e2e
-    /// specs can observe the grace window without waiting hours.
+    /// Spawn a background rotation task.
     pub fn spawn_rotation_task(self: &Arc<Self>) {
         let manager = Arc::clone(self);
         tokio::spawn(async move {
@@ -137,9 +130,7 @@ impl TokenManager {
     }
 }
 
-/// Read `AOE_TEST_TOKEN_LIFETIME_SECS`. Debug builds only; ignored in
-/// release so production cannot be forced into a short rotation cycle
-/// by a stray env var.
+/// Read `AOE_TEST_TOKEN_LIFETIME_SECS`.
 #[cfg(debug_assertions)]
 pub(super) fn test_token_lifetime_override() -> Option<Duration> {
     std::env::var("AOE_TEST_TOKEN_LIFETIME_SECS")
@@ -201,7 +192,6 @@ pub(crate) fn generate_token() -> String {
 }
 
 /// Validate that a token matches the expected format.
-/// Accepts 64-char hex (new) or 32-char alphanumeric (legacy).
 pub(super) fn is_valid_token_format(token: &str) -> bool {
     let len = token.len();
     (len == 64 || len == 32)
@@ -210,18 +200,8 @@ pub(super) fn is_valid_token_format(token: &str) -> bool {
             .all(|c| c.is_ascii_hexdigit() || c.is_ascii_lowercase())
 }
 
-/// Load an existing auth token from disk if it was last used less than 24
-/// hours ago, otherwise generate a fresh one and persist it.
-///
-/// "Last used" is the file's mtime, which we refresh on every reuse. The age
-/// window is therefore idle-based: a server that is restarted at least once a
-/// day keeps the same token indefinitely, and only a token untouched for 24h
-/// rotates. This is deliberate. A token change forces the rotation-prune path
-/// (`retain_owners`) to drop push subscriptions bound to the now-stale hash,
-/// so if the window were measured from creation, every restart after the first
-/// day would rotate the token and silently kill push notifications until each
-/// device re-subscribed (#3386). Rotation while the server runs continuously
-/// is still driven by the scheduled rotation loop, not by this function.
+/// Load an existing auth token from disk if it was last used less than 24 hours ago,
+/// otherwise generate a fresh one and persist it.
 pub(super) async fn load_or_generate_token() -> anyhow::Result<String> {
     let app_dir = crate::session::get_app_dir()?;
     let max_age = std::time::Duration::from_secs(24 * 60 * 60);
@@ -262,44 +242,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn generate_token_correct_length_and_charset() {
-        let token = generate_token();
-        assert_eq!(token.len(), 64);
-        assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn valid_token_format_accepts_hex_64() {
-        assert!(is_valid_token_format(
-            "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
-        ));
-    }
-
-    #[test]
-    fn valid_token_format_accepts_legacy_32() {
+    fn token_format_accepts_hex_64_and_legacy_32() {
+        let generated = generate_token();
+        assert_eq!(generated.len(), 64);
+        assert!(is_valid_token_format(&generated));
         assert!(is_valid_token_format("abcdef0123456789abcdef0123456789"));
-    }
-
-    #[test]
-    fn valid_token_format_rejects_garbage() {
-        assert!(!is_valid_token_format("short"));
-        assert!(!is_valid_token_format(""));
-        assert!(!is_valid_token_format("ZZZZ0000111122223333444455556666"));
+        for bad in ["short", "", "ZZZZ0000111122223333444455556666"] {
+            assert!(!is_valid_token_format(bad), "{bad:?}");
+        }
     }
 
     #[tokio::test]
-    async fn token_manager_validates_current() {
+    async fn token_manager_validates_only_the_current_token() {
         let mgr = TokenManager::new(Some("abc123".to_string()), Duration::from_secs(3600));
-        let (valid, upgrade) = mgr.validate("abc123").await;
-        assert!(valid);
-        assert!(!upgrade);
-    }
-
-    #[tokio::test]
-    async fn token_manager_rejects_invalid() {
-        let mgr = TokenManager::new(Some("abc123".to_string()), Duration::from_secs(3600));
-        let (valid, _) = mgr.validate("wrong").await;
-        assert!(!valid);
+        assert_eq!(mgr.validate("abc123").await, (true, false));
+        assert!(!mgr.validate("wrong").await.0);
+        assert!(
+            TokenManager::new(None, Duration::from_secs(3600))
+                .is_no_auth()
+                .await
+        );
     }
 
     #[tokio::test]
@@ -308,26 +270,13 @@ mod tests {
         let mgr = TokenManager::new(Some("old_token".to_string()), Duration::from_secs(3600));
         mgr.rotate().await;
 
-        // Old token should still be valid during grace period
-        let (valid, upgrade) = mgr.validate("old_token").await;
-        assert!(valid);
-        assert!(upgrade); // needs cookie upgrade
+        // The old token stays valid through the grace window, flagged for cookie upgrade.
+        assert_eq!(mgr.validate("old_token").await, (true, true));
 
-        // New token should also be valid
+        // The rotation minted a different token, and it validates without an upgrade.
         let current = mgr.current_token().await.unwrap();
-        let (valid, upgrade) = mgr.validate(&current).await;
-        assert!(valid);
-        assert!(!upgrade);
-    }
-
-    #[tokio::test]
-    async fn token_manager_rotate_changes_token() {
-        let _app_dir = crate::session::test_support::isolate_app_dir();
-        let mgr = TokenManager::new(Some("original".to_string()), Duration::from_secs(3600));
-        let before = mgr.current_token().await;
-        mgr.rotate().await;
-        let after = mgr.current_token().await;
-        assert_ne!(before, after);
+        assert_ne!(current, "old_token");
+        assert_eq!(mgr.validate(&current).await, (true, false));
     }
 
     #[cfg(unix)]
@@ -399,11 +348,5 @@ mod tests {
         // A zero window makes expiration independent of filesystem precision.
         let rotated = load_or_generate_token_at(&path, std::time::Duration::ZERO).await;
         assert_ne!(rotated, first, "a token idle past the window rotates");
-    }
-
-    #[tokio::test]
-    async fn token_manager_no_auth_mode() {
-        let mgr = TokenManager::new(None, Duration::from_secs(3600));
-        assert!(mgr.is_no_auth().await);
     }
 }

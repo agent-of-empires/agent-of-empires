@@ -11,8 +11,6 @@ import {
   resolveCommandLinks,
 } from "../pluginCommands";
 
-// buildPluginCommandActions' action-less entries dispatch through invokePluginCommand;
-// mock just that export so performing one records the call instead of hitting the network.
 vi.mock("../api", async (orig) => ({
   ...(await orig<typeof import("../api")>()),
   invokePluginCommand: vi.fn().mockResolvedValue(true),
@@ -22,264 +20,191 @@ import { invokePluginCommand } from "../api";
 vi.mock("../toastBus", () => ({ reportError: vi.fn() }));
 import { reportError } from "../toastBus";
 
-const badge: PluginCommand = {
+const openPr: PluginCommand = {
   fqid: "plugin.acme.github.open_pr",
   plugin_id: "acme.github",
   id: "open_pr",
   title: "Open GitHub PR",
   description: "",
   keybinds: ["Ctrl+Shift+G"],
-  action: { kind: "open-ui-link", slot: "row-badge", id: "github_pr_badge" },
-};
-
-function badgeEntry(items: unknown[], href?: string): PluginUiEntry {
-  return {
-    plugin_id: "acme.github",
-    slot: "row-badge",
-    id: "github_pr_badge",
-    session_id: "s1",
-    payload: href ? { items, href } : { items },
-  };
-}
-
-const openPr: PluginCommand = {
-  fqid: "plugin.acme.github.open_pr",
-  plugin_id: "acme.github",
-  id: "open_pr",
-  title: "Open GitHub PR",
-  description: "Open the active session's PR",
-  keybinds: ["Ctrl+Shift+G"],
   action: { kind: "open-ui-link", slot: "row-column", id: "pr" },
 };
-
-// An action-less command (no client action): invoked through the worker path.
 const refresh: PluginCommand = {
+  ...openPr,
   fqid: "plugin.acme.github.refresh",
-  plugin_id: "acme.github",
   id: "refresh",
   title: "Refresh PRs",
-  description: "Re-fetch open PRs",
   keybinds: ["Ctrl+Shift+R"],
   action: null,
 };
 
-function entry(over: Partial<PluginUiEntry>): PluginUiEntry {
-  return {
-    plugin_id: "acme.github",
-    slot: "row-column",
-    id: "pr",
-    session_id: "s1",
-    payload: { href: "https://github.com/o/r/pull/12" },
-    ...over,
-  };
-}
+const entry = (payload: Record<string, unknown>, plugin_id = "acme.github"): PluginUiEntry => ({
+  plugin_id,
+  slot: "row-column",
+  id: "pr",
+  session_id: "s1",
+  payload,
+});
+const prA = { href: "https://github.com/o/a/pull/1", tooltip: "a: PR #1" };
+const prB = { href: "https://github.com/o/b/pull/2", tooltip: "b: PR #2" };
+const key = (k: string, over: Partial<KeyboardEvent> = {}) =>
+  ({ ctrlKey: true, shiftKey: true, altKey: false, metaKey: false, key: k, ...over }) as KeyboardEvent;
 
-describe("isExternalHttpUrl", () => {
-  it("accepts http/https and rejects everything else", () => {
-    expect(isExternalHttpUrl("https://x.test")).toBe(true);
-    expect(isExternalHttpUrl("http://x.test")).toBe(true);
-    expect(isExternalHttpUrl("javascript:alert(1)")).toBe(false);
-    expect(isExternalHttpUrl("file:///etc/passwd")).toBe(false);
-    expect(isExternalHttpUrl("")).toBe(false);
-    expect(isExternalHttpUrl(undefined)).toBe(false);
+it.each([
+  ["https://x.test", true],
+  ["http://x.test", true],
+  ["javascript:alert(1)", false],
+  ["file:///etc/passwd", false],
+  ["", false],
+  [undefined, false],
+])("isExternalHttpUrl(%j) is %s", (url, expected) => {
+  expect(isExternalHttpUrl(url)).toBe(expected);
+});
+
+describe("chords", () => {
+  it.each([
+    ["Ctrl+Shift+G", { ctrl: true, shift: true, alt: false, meta: false, base: "g" }],
+    ["g+h", null],
+    ["Ctrl+Shift", null],
+  ])("parsePluginChord(%j)", (chord, expected) => {
+    expect(parsePluginChord(chord)).toEqual(expected);
+  });
+
+  it("matchPluginChord needs every modifier and the base key", () => {
+    const chord = parsePluginChord("Ctrl+Shift+G")!;
+    expect(matchPluginChord(chord, key("G"))).toBe(true);
+    expect(matchPluginChord(chord, key("g", { shiftKey: false }))).toBe(false);
+  });
+});
+
+describe("resolveCommandLinks", () => {
+  it.each<[string, Record<string, unknown>, { href: string; label: string }[]]>([
+    [
+      "one link per item href",
+      { items: [prA, prB, { tooltip: "c: no PR" }] },
+      [
+        { href: prA.href, label: prA.tooltip },
+        { href: prB.href, label: prB.tooltip },
+      ],
+    ],
+    ["deduped hrefs", { items: [prA, prA] }, [{ href: prA.href, label: prA.tooltip }]],
+    ["malformed items skipped", { items: [null, "nope", 42, prA] }, [{ href: prA.href, label: prA.tooltip }]],
+    [
+      "the top-level href fallback",
+      { items: [], href: "https://github.com/o/a/pull/9" },
+      [{ href: "https://github.com/o/a/pull/9", label: "https://github.com/o/a/pull/9" }],
+    ],
+  ])("%s", (_name, payload, expected) => {
+    expect(resolveCommandLinks(openPr, [entry(payload)], "s1")).toEqual(expected);
   });
 });
 
 describe("buildPluginCommandActions", () => {
-  it("includes an open-ui-link command when its href resolves", () => {
-    const actions = buildPluginCommandActions([openPr], [entry({})], "s1");
-    expect(actions).toHaveLength(1);
-    expect(actions[0]).toMatchObject({ id: "plugin:plugin.acme.github.open_pr", group: "Actions" });
+  it("builds one titled entry for a single link, and none without a link", () => {
+    const actions = buildPluginCommandActions([openPr], [entry({ href: prA.href })], "s1");
+    expect(actions).toEqual([
+      expect.objectContaining({
+        id: "plugin:plugin.acme.github.open_pr",
+        title: "Open GitHub PR",
+        group: "Actions",
+        shortcut: "Ctrl+Shift+G",
+      }),
+    ]);
+    expect(buildPluginCommandActions([openPr], [], "s1")).toEqual([]);
   });
-  it("hides the open-ui-link command when no href resolves", () => {
-    expect(buildPluginCommandActions([openPr], [], "s1")).toHaveLength(0);
+
+  it("builds one entry per PR in a multi-repo workspace", () => {
+    const actions = buildPluginCommandActions([openPr], [entry({ items: [prA, prB] })], "s1");
+    expect(actions.map((a) => [a.id, a.title, a.shortcut])).toEqual([
+      ["plugin:plugin.acme.github.open_pr:0", "Open GitHub PR: a: PR #1", undefined],
+      ["plugin:plugin.acme.github.open_pr:1", "Open GitHub PR: b: PR #2", undefined],
+    ]);
   });
-  it("includes an action-less command as an invoke entry when a session is active", () => {
-    const actions = buildPluginCommandActions([refresh], [], "s1");
-    expect(actions).toHaveLength(1);
-    expect(actions[0]).toMatchObject({
+
+  it("invokes an action-less command only with an active session", () => {
+    expect(buildPluginCommandActions([refresh], [], null)).toEqual([]);
+    const [action] = buildPluginCommandActions([refresh], [], "s1");
+    expect(action).toMatchObject({
       id: "plugin:plugin.acme.github.refresh",
       title: "Refresh PRs",
       shortcut: "Ctrl+Shift+R",
     });
     vi.mocked(invokePluginCommand).mockClear();
-    vi.mocked(invokePluginCommand).mockResolvedValue(true);
-    actions[0].perform();
+    action!.perform();
     expect(invokePluginCommand).toHaveBeenCalledWith("plugin.acme.github.refresh", "s1");
-  });
-  it("omits an action-less command when there is no active session", () => {
-    expect(buildPluginCommandActions([refresh], [], null)).toHaveLength(0);
   });
 });
 
 describe("invokeActionlessCommand", () => {
-  it("error-toasts when the invocation is rejected", async () => {
-    vi.mocked(invokePluginCommand).mockResolvedValueOnce(false);
+  it("error-toasts only when the invocation is rejected", async () => {
     vi.mocked(reportError).mockClear();
-    invokeActionlessCommand(refresh, "s1");
-    await vi.waitFor(() => expect(reportError).toHaveBeenCalledWith("Failed to run Refresh PRs"));
-  });
-
-  it("does not toast when the invocation succeeds", async () => {
     vi.mocked(invokePluginCommand).mockResolvedValueOnce(true);
-    vi.mocked(reportError).mockClear();
     invokeActionlessCommand(refresh, "s1");
     await new Promise((r) => setTimeout(r, 0));
     expect(reportError).not.toHaveBeenCalled();
-  });
-});
-
-describe("parsePluginChord", () => {
-  it("parses modifiers plus a base key", () => {
-    expect(parsePluginChord("Ctrl+Shift+G")).toEqual({
-      ctrl: true,
-      shift: true,
-      alt: false,
-      meta: false,
-      base: "g",
-    });
-  });
-  it("returns null for two base keys", () => {
-    expect(parsePluginChord("g+h")).toBeNull();
-  });
-  it("returns null with no base key", () => {
-    expect(parsePluginChord("Ctrl+Shift")).toBeNull();
-  });
-});
-
-describe("matchPluginChord", () => {
-  const chord = parsePluginChord("Ctrl+Shift+G")!;
-  it("matches an exact event", () => {
-    const e = { ctrlKey: true, shiftKey: true, altKey: false, metaKey: false, key: "G" } as KeyboardEvent;
-    expect(matchPluginChord(chord, e)).toBe(true);
-  });
-  it("does not match when a modifier differs", () => {
-    const e = { ctrlKey: true, shiftKey: false, altKey: false, metaKey: false, key: "g" } as KeyboardEvent;
-    expect(matchPluginChord(chord, e)).toBe(false);
-  });
-});
-
-describe("multi-repo workspaces", () => {
-  const items = [
-    { href: "https://github.com/o/a/pull/1", tooltip: "a: PR #1" },
-    { href: "https://github.com/o/b/pull/2", tooltip: "b: PR #2" },
-    { tooltip: "c: no PR" }, // no href -> skipped
-  ];
-
-  it("resolveCommandLinks returns one link per open PR from items", () => {
-    const links = resolveCommandLinks(badge, [badgeEntry(items)], "s1");
-    expect(links).toEqual([
-      { href: "https://github.com/o/a/pull/1", label: "a: PR #1" },
-      { href: "https://github.com/o/b/pull/2", label: "b: PR #2" },
-    ]);
-  });
-
-  it("dedupes repeated hrefs", () => {
-    const dup = [items[0], items[0]];
-    expect(resolveCommandLinks(badge, [badgeEntry(dup)], "s1")).toHaveLength(1);
-  });
-
-  it("skips malformed (null/primitive) item entries without throwing", () => {
-    const mixed = [null, "nope", 42, items[0]];
-    const links = resolveCommandLinks(badge, [badgeEntry(mixed)], "s1");
-    expect(links).toEqual([{ href: "https://github.com/o/a/pull/1", label: "a: PR #1" }]);
-  });
-
-  it("falls back to the top-level href when there are no item hrefs", () => {
-    const links = resolveCommandLinks(badge, [badgeEntry([], "https://github.com/o/a/pull/9")], "s1");
-    expect(links).toEqual([{ href: "https://github.com/o/a/pull/9", label: "https://github.com/o/a/pull/9" }]);
-  });
-
-  it("builds one palette entry per PR, titled by item label", () => {
-    const actions = buildPluginCommandActions([badge], [badgeEntry(items)], "s1");
-    expect(actions.map((a) => a.title)).toEqual(["Open GitHub PR: a: PR #1", "Open GitHub PR: b: PR #2"]);
-    expect(actions.map((a) => a.id)).toEqual([
-      "plugin:plugin.acme.github.open_pr:0",
-      "plugin:plugin.acme.github.open_pr:1",
-    ]);
-    // No single-entry shortcut hint when the command fans out.
-    expect(actions[0].shortcut).toBeUndefined();
-  });
-
-  it("builds a single titled entry when only one PR is open", () => {
-    const actions = buildPluginCommandActions([badge], [badgeEntry([items[0]])], "s1");
-    expect(actions).toHaveLength(1);
-    expect(actions[0]).toMatchObject({ id: "plugin:plugin.acme.github.open_pr", title: "Open GitHub PR" });
-    expect(actions[0].shortcut).toBe("Ctrl+Shift+G");
+    vi.mocked(invokePluginCommand).mockResolvedValueOnce(false);
+    invokeActionlessCommand(refresh, "s1");
+    await vi.waitFor(() => expect(reportError).toHaveBeenCalledWith("Failed to run Refresh PRs"));
   });
 });
 
 describe("pickKeybindEffect", () => {
-  const ev = { ctrlKey: true, shiftKey: true, altKey: false, metaKey: false, key: "g" } as KeyboardEvent;
-  const cmdA: PluginCommand = {
-    fqid: "plugin.acme.a.open",
-    plugin_id: "acme.a",
-    id: "open",
-    title: "A",
-    description: "",
-    keybinds: ["Ctrl+Shift+G"],
-    action: { kind: "open-ui-link", slot: "row-column", id: "pr" },
-  };
+  const cmdA: PluginCommand = { ...openPr, fqid: "plugin.acme.a.open", plugin_id: "acme.a" };
   const cmdB: PluginCommand = { ...cmdA, fqid: "plugin.acme.b.open", plugin_id: "acme.b" };
 
-  function entryFor(pluginId: string, href: string): PluginUiEntry {
-    return { plugin_id: pluginId, slot: "row-column", id: "pr", session_id: "s1", payload: { href } };
-  }
-
-  it("opens the matching command's single link", () => {
-    expect(pickKeybindEffect([cmdA], [entryFor("acme.a", "https://x.test/1")], "s1", ev)).toEqual({
-      kind: "open",
-      href: "https://x.test/1",
-    });
-  });
-
-  it("returns a picker for a chord that resolves to several links", () => {
-    const multi: PluginUiEntry = {
-      plugin_id: "acme.a",
-      slot: "row-column",
-      id: "pr",
-      session_id: "s1",
-      payload: {
-        items: [
-          { href: "https://x.test/1", tooltip: "one" },
-          { href: "https://x.test/2", tooltip: "two" },
+  it.each<[string, PluginCommand[], PluginUiEntry[], string | null, KeyboardEvent, unknown]>([
+    [
+      "opens a single link",
+      [cmdA],
+      [entry({ href: "https://x.test/1" }, "acme.a")],
+      "s1",
+      key("g"),
+      { kind: "open", href: "https://x.test/1" },
+    ],
+    [
+      "picks among several links",
+      [cmdA],
+      [
+        entry(
+          {
+            items: [
+              { href: "https://x.test/1", tooltip: "one" },
+              { href: "https://x.test/2", tooltip: "two" },
+            ],
+          },
+          "acme.a",
+        ),
+      ],
+      "s1",
+      key("g"),
+      {
+        kind: "pick",
+        links: [
+          { href: "https://x.test/1", label: "one" },
+          { href: "https://x.test/2", label: "two" },
         ],
       },
-    };
-    expect(pickKeybindEffect([cmdA], [multi], "s1", ev)).toEqual({
-      kind: "pick",
-      links: [
-        { href: "https://x.test/1", label: "one" },
-        { href: "https://x.test/2", label: "two" },
-      ],
-    });
-  });
-
-  it("invokes an action-less command with an active session", () => {
-    const refreshEv = { ctrlKey: true, shiftKey: true, altKey: false, metaKey: false, key: "r" } as KeyboardEvent;
-    expect(pickKeybindEffect([refresh], [], "s1", refreshEv)).toEqual({
-      kind: "invoke",
-      cmd: refresh,
-    });
-    // No session: nothing to scope the invocation to.
-    expect(pickKeybindEffect([refresh], [], null, refreshEv)).toBeNull();
-  });
-
-  it("falls through to a later command sharing the chord when the first is inactive", () => {
-    // cmdA matches the chord but has no entry (inactive for this session); cmdB
-    // shares the chord and resolves, so it must still fire.
-    expect(pickKeybindEffect([cmdA, cmdB], [entryFor("acme.b", "https://x.test/2")], "s1", ev)).toEqual({
-      kind: "open",
-      href: "https://x.test/2",
-    });
-  });
-
-  it("returns null when no matching command can execute", () => {
-    expect(pickKeybindEffect([cmdA, cmdB], [], "s1", ev)).toBeNull();
-  });
-
-  it("ignores commands whose chord does not match", () => {
-    const other = { ctrlKey: false, shiftKey: false, altKey: false, metaKey: false, key: "x" } as KeyboardEvent;
-    expect(pickKeybindEffect([cmdA], [entryFor("acme.a", "https://x.test/1")], "s1", other)).toBeNull();
+    ],
+    ["invokes an action-less command", [refresh], [], "s1", key("r"), { kind: "invoke", cmd: refresh }],
+    ["skips an action-less command without a session", [refresh], [], null, key("r"), null],
+    [
+      "falls through to a later command sharing the chord",
+      [cmdA, cmdB],
+      [entry({ href: "https://x.test/2" }, "acme.b")],
+      "s1",
+      key("g"),
+      { kind: "open", href: "https://x.test/2" },
+    ],
+    ["returns null when nothing can execute", [cmdA, cmdB], [], "s1", key("g"), null],
+    [
+      "ignores non-matching chords",
+      [cmdA],
+      [entry({ href: "https://x.test/1" }, "acme.a")],
+      "s1",
+      key("x", { ctrlKey: false, shiftKey: false }),
+      null,
+    ],
+  ])("%s", (_name, commands, entries, session, event, expected) => {
+    expect(pickKeybindEffect(commands, entries, session, event)).toEqual(expected);
   });
 });

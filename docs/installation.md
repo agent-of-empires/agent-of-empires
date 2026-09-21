@@ -1,57 +1,24 @@
 # Installation
 
-## Prerequisites
+**Prerequisites:** [tmux](https://github.com/tmux/tmux/wiki). Docker (or another container runtime) is optional, for [sandboxing](guides/sandbox.md), and [Node.js](https://nodejs.org/) is needed only to build the web dashboard from source. Building also needs a C toolchain for the bundled native dependencies (SQLite, libgit2, OpenSSL, liblzma, AWS-LC); a stock `cc` covers most platforms, and targets without pre-generated AWS-LC bindings also need CMake.
 
-- [tmux](https://github.com/tmux/tmux/wiki) (required)
-- [Docker](https://www.docker.com/) (optional, for sandboxing agents in containers)
-- [Node.js](https://nodejs.org/) (optional, only needed when building the web dashboard from source with `--features web`)
-
-Building from source also needs a C toolchain for the bundled native
-dependencies (SQLite, libgit2, OpenSSL, liblzma, and AWS-LC). Most platforms
-are covered by a stock `cc`; targets without pre-generated AWS-LC bindings
-also need CMake.
-
-## Install Agent of Empires
-
-### Quick Install (Recommended)
-
-Run the install script:
+## Install
 
 ```bash
+# Quick install (Linux and macOS)
 curl -fsSL \
   https://raw.githubusercontent.com/agent-of-empires/agent-of-empires/main/scripts/install.sh \
   | bash
-```
 
-### Homebrew
-
-```bash
+# Homebrew
 brew install aoe
-```
 
-### Build from Source
-
-```bash
+# From source; add --features web for the dashboard (needs Node and npm)
 git clone https://github.com/agent-of-empires/agent-of-empires
-cd agent-of-empires
-cargo build --release
+cd agent-of-empires && cargo build --release
 ```
 
-The binary will be at `target/release/aoe`.
-
-To include the web dashboard (browser access):
-
-```bash
-cargo build --release --features web
-```
-
-This requires Node.js and npm. The web frontend is built automatically during compilation.
-
-## Verify Installation
-
-```bash
-aoe --version
-```
+A source build leaves the binary at `target/release/aoe`. Verify any install with `aoe --version`.
 
 ## Updating
 
@@ -59,16 +26,14 @@ aoe --version
 aoe update
 ```
 
-The `aoe update` command detects how aoe was installed (Homebrew, the curl install script, Nix, or Cargo) and dispatches to the right upgrade mechanism. For Nix and Cargo it prints the manual upgrade command instead of attempting an automatic update, since those cases need external tooling.
+`aoe update` detects how aoe was installed (Homebrew, the install script, Nix, or Cargo) and dispatches to the right mechanism. For Nix and Cargo it prints the manual command instead, since those need external tooling. In the TUI, press `u` while the update bar is visible to run the same flow, or `Ctrl+x` to dismiss the bar.
 
-Inside the TUI, press `u` when the update bar is visible to run the same flow without leaving the app. Press `Ctrl+x` to dismiss the bar for the current session.
+If you installed shell completions as a static file, regenerate it afterwards so it picks up new commands and flags; see [Shell completions](guides/shell-completions.md) for the always-fresh setup that avoids this.
 
-If you installed shell completions as a static file, regenerate it after an update so it picks up new commands and flags. See [Shell Completions](guides/shell-completions.md) for both the static and the always-fresh eval-on-startup setup.
-
-## Uninstall
+## Uninstalling
 
 ```bash
 aoe uninstall
 ```
 
-Prompts to remove the binary, configuration (the app data dir), and tmux settings.
+It prompts before removing the binary, the app data directory, and the tmux settings.

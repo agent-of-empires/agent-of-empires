@@ -1,28 +1,5 @@
-// Mocked coverage for the WorkspaceSidebar grouping surface, ported from
-// the live suite (tests/live/sidebar-groups.spec.ts, sidebar-groups-axis
-// .spec.ts, sidebar-nested-axis.spec.ts and the acp-stories filter /
-// fold-group user stories).
-//
-//   - Two sessions in two different repos surface as two repo groups,
-//     each with its session row (#1220).
-//   - The filter input narrows the visible groups/rows by matching
-//     against title, project path, branch, or agent, and a no-match
-//     query renders the empty-state placeholder (#1220).
-//   - The group header chevron flips `aria-expanded` and hides the row
-//     list; tapping again restores it (#1220).
-//   - The axis toggle re-buckets sessions by `group_path` (#1234), the
-//     per-axis collapse map persists across reload, and the nested
-//     repo+group axis renders subgroup headers inside the repository
-//     block with independent collapse (#1720).
-//   - The org axis buckets repos by their remote owner, renders a
-//     collapsible org header holding its member repo headers, and repos
-//     with no resolvable owner collect into "No organization" (#3283).
-//
-// Bucketing/split correctness is unit-tested in
-// `src/lib/__tests__/sidebarGroups.test.ts`; live persistence semantics
-// were folded into this mocked port because every assertion here is
-// driven by client-side state (localStorage axis + collapse maps) over
-// a static session list, which the stubbed /api surface reproduces.
+// Sidebar grouping axes (#1220, #1234, #1720, #3283): repo, group, nested repo+group, and org buckets with
+// per-axis collapse persisted in localStorage. Bucketing is unit-tested in src/lib/__tests__/sidebarGroups.test.ts.
 
 import { test, expect } from "./helpers/mockedTest";
 import type { Locator, Page } from "@playwright/test";
@@ -39,8 +16,6 @@ function twoRepoSessions(): MockSessionInput[] {
   ];
 }
 
-// Three sessions in ONE repo across two user groups, mirroring the live
-// seed (`aoe add -g feature` / `-g refactor`).
 function groupedSessions(): MockSessionInput[] {
   return [
     { id: "s-f1", title: "feat-one", project_path: "/tmp/project", branch: "feat/one", group: "feature" },
@@ -49,8 +24,6 @@ function groupedSessions(): MockSessionInput[] {
   ];
 }
 
-// groupedSessions plus a "fix" group and one ungrouped session, for the
-// nested repo+group axis.
 function nestedSessions(): MockSessionInput[] {
   return [
     { id: "s-f1", title: "feat-one", project_path: "/tmp/project", branch: "feat/one", group: "feature" },
@@ -60,8 +33,6 @@ function nestedSessions(): MockSessionInput[] {
   ];
 }
 
-// Two repos owned by the same org, and a third with no resolvable remote
-// owner, for the org axis.
 function orgSessions(): MockSessionInput[] {
   return [
     { id: "s-a", title: "alpha-session", project_path: "/tmp/repo-alpha", branch: "feat/a", remote_owner: "acme" },
@@ -70,16 +41,11 @@ function orgSessions(): MockSessionInput[] {
   ];
 }
 
-// The org header renders an `OwnerAvatar`, an `<img>` pointed at a real
-// `github.com` URL, whenever a session carries a `remote_owner`. Stub it so
-// the mocked test never makes a live network request; the component already
-// hides itself gracefully on a failed load.
+// Stub owner avatars so the test makes no network request.
 async function stubOwnerAvatars(page: Page) {
   await page.route("https://github.com/**", (r) => r.fulfill({ status: 404, body: "" }));
 }
 
-// A theme token as the browser reports it on a painted element, so a
-// computed `rgb(...)` can be compared against the projected hex.
 async function resolvedColor(page: Page, token: string): Promise<string> {
   return await page.evaluate((name) => {
     const probe = document.createElement("span");
@@ -96,16 +62,13 @@ async function gotoDesktop(page: Page) {
   await page.goto("/");
 }
 
-// Click the layers toggle until it reaches the requested axis. The toggle
-// cycles repo -> org -> group -> repo+group -> repo, so a bounded loop
-// lands on any target without hard-coding the click count.
+// The toggle cycles repo, org, group, repo+group.
 async function cycleAxisTo(toggle: Locator, target: string) {
   for (let i = 0; i < 3; i++) {
     const current = await toggle.getAttribute("data-axis");
     if (current === target) return;
     await toggle.click();
-    // Wait for the axis to actually advance before reading again, so a
-    // not-yet-flushed re-render cannot trigger an extra overshooting click.
+    // Wait for each advance so a pending render cannot cause an extra click.
     await expect(toggle).not.toHaveAttribute("data-axis", current ?? "");
   }
   await expect(toggle).toHaveAttribute("data-axis", target);
@@ -140,14 +103,10 @@ test.describe("sidebar repo groups (#1220)", () => {
     await expect(page.getByText("repo-alpha")).toBeVisible();
     await expect(page.getByText("repo-beta")).toBeHidden();
 
-    // Clearing the input restores both groups; we drive the same input
-    // rather than toggling the filter off because the toggle button
-    // ALSO clears the query, which would hide the input we'd want to
-    // assert on.
+    // Clear the input rather than the toggle, which would also hide the input.
     await filter.fill("");
     await expect(page.locator(HEADER)).toHaveCount(2);
 
-    // No-match query renders the empty-state placeholder.
     await filter.fill("nonexistent-repo-xyz");
     await expect(page.getByText(/No matches for/)).toBeVisible();
     await expect(page.locator(ROW)).toHaveCount(0);
@@ -164,8 +123,6 @@ test.describe("sidebar repo groups (#1220)", () => {
     await expandBtn.click();
     await expect(expandBtn).toHaveAttribute("aria-expanded", "false");
 
-    // Collapsing the alpha group hides its row but leaves beta's row
-    // (in the other group) untouched.
     await expect(page.getByText("alpha-session")).toBeHidden();
     await expect(page.getByText("beta-session")).toBeVisible();
 
@@ -183,20 +140,16 @@ test.describe("sidebar repo groups (#1220)", () => {
     const betaHeader = page.locator(HEADER, { has: page.getByText("repo-beta") });
     const expandBtn = alphaHeader.locator("button[aria-expanded]");
 
-    // Expanded, the open session's own row carries the frame, so the
-    // header stays unmarked.
+    // Expanded, the open session's row carries the frame instead of the header.
     await expect(expandBtn).toHaveAttribute("aria-expanded", "true");
     expect(await alphaHeader.getAttribute("class")).not.toContain("border-session-active");
 
-    // Collapsed, the header is the only remaining cue. It has to paint in
-    // the projected token: `border-brand-600` sits at 2.04:1 against the
-    // sidebar panel on catppuccin-latte, under the non-text floor.
+    // Collapsed, the header uses the projected token; border-brand-600 fails contrast on catppuccin-latte.
     await expandBtn.click();
     await expect(page.getByText("alpha-session")).toBeHidden();
     expect(await alphaHeader.getAttribute("class")).toContain("border-session-active");
     expect(await betaHeader.getAttribute("class")).not.toContain("border-session-active");
-    // `toHaveCSS` polls, which matters here: the header transitions its
-    // colors, so a one-shot read lands mid-interpolation from currentColor.
+    // toHaveCSS polls past the color transition.
     await expect(alphaHeader).toHaveCSS("border-left-color", await resolvedColor(page, "--color-session-active"));
   });
 });
@@ -206,13 +159,10 @@ test.describe("sidebar user-group axis (#1234)", () => {
     await installSidebarMocks(page, { sessions: groupedSessions() });
     await gotoDesktop(page);
 
-    // Default axis is "By repo": all three sessions live in one repo dir,
-    // so there is a single repo group and three rows.
     const headers = page.locator(HEADER);
     await expect(headers).toHaveCount(1);
     await expect(page.locator(ROW)).toHaveCount(3);
 
-    // The control-row heading names the repo axis "Sessions", not "Projects".
     const axisHeading = page.getByTestId("sidebar-axis-heading");
     await expect(axisHeading).toHaveText("Sessions");
 
@@ -222,8 +172,6 @@ test.describe("sidebar user-group axis (#1234)", () => {
     await expect(axisToggle).toHaveAttribute("data-axis", "group");
     await expect(axisHeading).toHaveText("Groups");
 
-    // Group axis: two headers, keyed by group_path. All three rows stay
-    // visible, now nested under their group.
     await expect(headers).toHaveCount(2);
     await expect(page.locator(`${HEADER}[data-group-id='feature']`)).toBeVisible();
     await expect(page.locator(`${HEADER}[data-group-id='refactor']`)).toBeVisible();
@@ -246,16 +194,11 @@ test.describe("sidebar user-group axis (#1234)", () => {
     await expect(featureExpand).toHaveAttribute("aria-expanded", "false");
     await expect(page.getByText("feat-one")).toBeHidden();
 
-    // Reload: the axis choice and the group collapse both restore from
-    // localStorage.
     await page.reload();
     await expect(axisToggle).toHaveAttribute("data-axis", "group");
     await expect(featureHeader.locator("button[aria-expanded]")).toHaveAttribute("aria-expanded", "false");
 
-    // Cycling back to the repo axis shows an independent collapse map:
-    // the repo group is not collapsed just because a user group was. The
-    // toggle cycles repo -> org -> group -> repo+group -> repo (#1720,
-    // #3283), so returning to repo from group takes two clicks.
+    // Collapse maps are per axis; repo is two clicks past group.
     await cycleAxisTo(axisToggle, "repo");
     await expect(page.locator(`${HEADER} button[aria-expanded]`)).toHaveAttribute("aria-expanded", "true");
   });
@@ -270,8 +213,6 @@ test.describe("sidebar nested repo+group axis (#1720)", () => {
     await expect(axisToggle).toHaveAttribute("data-axis", "repo");
     await cycleAxisTo(axisToggle, "repo+group");
 
-    // One repository block holds all four sessions, split into three
-    // nested subgroups: feature, fix, and Ungrouped.
     const repoBlocks = page.locator("[data-testid='sidebar-nested-repo']");
     await expect(repoBlocks).toHaveCount(1);
     const repo = repoBlocks.first();
@@ -281,7 +222,6 @@ test.describe("sidebar nested repo+group axis (#1720)", () => {
     await expect(repo.locator("[data-testid='sidebar-nested-subgroup'] [data-group-id='fix']")).toBeVisible();
     await expect(repo.locator("[data-testid='sidebar-nested-subgroup'] [data-group-id='__ungrouped__']")).toBeVisible();
 
-    // Every session stays visible, now nested under its subgroup.
     await expect(page.locator(ROW)).toHaveCount(4);
   });
 
@@ -297,14 +237,11 @@ test.describe("sidebar nested repo+group axis (#1720)", () => {
     const featureExpand = featureSub.locator("button[aria-expanded]");
     await expect(featureExpand).toHaveAttribute("aria-expanded", "true");
 
-    // Collapse just the feature subgroup: its rows hide, the fix
-    // subgroup's rows stay, and the repo header stays expanded.
     await featureExpand.click();
     await expect(featureExpand).toHaveAttribute("aria-expanded", "false");
     await expect(page.getByText("feat-one")).toBeHidden();
     await expect(page.getByText("fix-one")).toBeVisible();
 
-    // The subgroup collapse survives a reload (per-repo localStorage key).
     await page.reload();
     await expect(axisToggle).toHaveAttribute("data-axis", "repo+group");
     await expect(
@@ -313,7 +250,6 @@ test.describe("sidebar nested repo+group axis (#1720)", () => {
         .locator("button[aria-expanded]"),
     ).toHaveAttribute("aria-expanded", "false");
 
-    // Collapsing the repo header hides every nested subgroup.
     const repoHeader = page.locator("[data-testid='sidebar-nested-repo']").first().locator(HEADER).first();
     await repoHeader.locator("button[aria-expanded]").click();
     await expect(page.locator("[data-testid='sidebar-nested-subgroup']")).toHaveCount(0);
@@ -341,12 +277,9 @@ test.describe("sidebar org axis (#3283)", () => {
     await expect(noOrg.locator(HEADER).first()).toContainText("No organization");
     await expect(noOrg.locator("[data-testid='sidebar-org-repo']")).toHaveCount(1);
 
-    // The No-organization bucket renders after the named org, matching the
-    // "pinned last" alphabetical order.
     await expect(orgBlocks.nth(0)).toHaveAttribute("data-org-id", "acme@example.com");
     await expect(orgBlocks.nth(1)).toHaveAttribute("data-org-id", "__no_org__");
 
-    // Every session stays visible, now nested under org -> repo.
     await expect(page.locator(ROW)).toHaveCount(3);
   });
 
@@ -364,21 +297,17 @@ test.describe("sidebar org axis (#3283)", () => {
     const alphaExpand = alphaRepo.locator("button[aria-expanded]");
     await expect(alphaExpand).toHaveAttribute("aria-expanded", "true");
 
-    // Collapsing the alpha repo hides its row but leaves the sibling beta
-    // repo (in the same org) and the org header untouched.
     await alphaExpand.click();
     await expect(alphaExpand).toHaveAttribute("aria-expanded", "false");
     await expect(page.getByText("alpha-session")).toBeHidden();
     await expect(page.getByText("beta-session")).toBeVisible();
 
-    // The repo collapse survives a reload (per-(org, repo) localStorage key).
     await page.reload();
     await expect(axisToggle).toHaveAttribute("data-axis", "org");
     await expect(
       page.locator("[data-testid='sidebar-org-repo'][data-repo-id='/tmp/repo-alpha']").locator("button[aria-expanded]"),
     ).toHaveAttribute("aria-expanded", "false");
 
-    // Collapsing the org header hides every member repo.
     const orgHeader = acmeOrg.locator(HEADER).first();
     await orgHeader.locator("button[aria-expanded]").click();
     await expect(acmeOrg.locator("[data-testid='sidebar-org-repo']")).toHaveCount(0);

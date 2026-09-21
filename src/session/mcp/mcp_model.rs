@@ -1,57 +1,38 @@
-//! Always-compiled, ACP-free model of the merged MCP server set (#1996).
+//! Resolver for the effective MCP server set, shared by forwarding and every display surface.
 //!
-//! AoE assembles an effective MCP server set from up to four layers
-//! (`agent-native` -> `global` -> `per-profile` -> `project-local`, higher wins
-//! per server name). `acp::mcp_config` used to own both the parsing and the
-//! merge, but it returned ACP `McpServer` wire types and dropped
-//! the layer label on merge, so the unified management surface had nowhere to
-//! read the merged set, its provenance, or its shadowing.
-//!
-//! This module is the single resolver for both jobs. It lives outside the serve
-//! gate (like [`super::project_mcp`]) so the TUI panel, the CLI, and the
-//! always-compiled drift store can read the model without depending on the ACP
-//! schema. Serve-side forwarding consumes the SAME resolver and converts only
-//! the winning set to ACP just before sending, so what the user sees and what
-//! the agent receives can never diverge.
-//!
-//! Secret values (env values, header values) are kept in memory because
-//! forwarding and the drift store need them, but every display path goes through
-//! [`ProjectMcpServer::redacted_summary`], so names reach a screen, a log, or
-//! CLI output and values never do.
+//! Layers, lowest first: agent-native, global, per-profile, project-local; higher
+//! wins per server name. Display must go through [`ResolvedMcpServer::redacted`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::BufReader;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use super::project_mcp::{ProjectMcpServer, ProjectMcpTransport};
+use super::project_mcp::{
+    convert_standard, load_standard_mcp_servers, ProjectMcpServer, ProjectMcpTransport,
+    StandardMcpFile,
+};
 
-/// Where a resolved server came from, carrying the dynamic name where the layer
-/// needs one (the agent key, the profile name). `label` renders the provenance
-/// string the management surfaces display.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpProvenance {
-    /// The active agent's own config (`~/.claude.json`, `~/.gemini/...`, ...).
-    AgentNative { agent: String },
-    /// The global `<app_dir>/mcp.json`.
+    AgentNative {
+        agent: String,
+    },
     Global,
-    /// A per-profile `<profile_dir>/mcp.json`.
-    Profile { name: String },
-    /// The repo's trusted `cwd/.mcp.json`.
+    Profile {
+        name: String,
+    },
     ProjectLocal,
-    /// A server AoE last saw in the named agent's native config that has since
-    /// disappeared from it. Kept in AoE's view (keep-on-removal, feature D) and
-    /// not forwarded until the user keeps it (promoting it to `global`) or drops
-    /// it. `agent` is the native config it last lived in.
-    KeptOnRemoval { agent: String },
+    /// Vanished from the agent's native config; shown but not forwarded until kept or dropped.
+    KeptOnRemoval {
+        agent: String,
+    },
 }
 
 impl McpProvenance {
-    /// The provenance string shown on every surface, e.g. `agent-native:claude`,
-    /// `profile:rust`, `global`, `project-local`.
     pub fn label(&self) -> String {
         match self {
             McpProvenance::AgentNative { agent } => format!("agent-native:{agent}"),
@@ -63,18 +44,12 @@ impl McpProvenance {
     }
 }
 
-/// One layer of the precedence stack, lowest first. The `provenance` is owned so
-/// the per-profile layer can carry the dynamic profile name (the old
-/// `&'static str` label could not).
 pub struct McpLayer {
     pub provenance: McpProvenance,
     pub servers: Vec<ProjectMcpServer>,
 }
 
-/// A server in the merged effective set: its winning definition, the layer it
-/// won from, and every lower layer it shadowed (in precedence order, lowest
-/// first). `shadowed` is what lets the surface explain "this `fs` came from
-/// per-profile and overrode the agent-native one".
+/// A winning definition plus the lower layers it shadowed, lowest first.
 #[derive(Debug, Clone)]
 pub struct ResolvedMcpServer {
     pub def: ProjectMcpServer,
@@ -83,57 +58,35 @@ pub struct ResolvedMcpServer {
 }
 
 impl ResolvedMcpServer {
-    /// The redaction-safe, serializable view shared by every surface (web JSON,
-    /// CLI `--json`, TUI rows). This is the single chokepoint: the connection
-    /// detail the user needs to identify a server (command/args/url) is kept, but
-    /// env and header VALUES never leave [`ResolvedMcpServer`]; only their names
-    /// do. The unredacted [`def`](Self::def) is reachable only for forwarding and
-    /// the drift store, never for display.
+    /// The only display view: env and header values are reduced to their names.
     pub fn redacted(&self) -> RedactedMcpServer {
-        let (transport, command, args, url, env_names, header_names) = match &self.def.transport {
-            ProjectMcpTransport::Stdio { command, args, env } => (
-                "stdio",
-                Some(command.clone()),
-                args.clone(),
-                None,
-                env.keys().cloned().collect(),
-                Vec::new(),
-            ),
-            ProjectMcpTransport::Http { url, headers } => (
-                "http",
-                None,
-                Vec::new(),
-                Some(url.clone()),
-                Vec::new(),
-                headers.keys().cloned().collect(),
-            ),
-            ProjectMcpTransport::Sse { url, headers } => (
-                "sse",
-                None,
-                Vec::new(),
-                Some(url.clone()),
-                Vec::new(),
-                headers.keys().cloned().collect(),
-            ),
-        };
-        RedactedMcpServer {
+        let mut view = RedactedMcpServer {
             name: self.def.name.clone(),
-            transport,
-            command,
-            args,
-            url,
-            env_names,
-            header_names,
+            transport: self.def.kind(),
+            command: None,
+            args: Vec::new(),
+            url: None,
+            env_names: Vec::new(),
+            header_names: Vec::new(),
             provenance: self.provenance.label(),
             shadowed: self.shadowed.iter().map(McpProvenance::label).collect(),
+        };
+        match &self.def.transport {
+            ProjectMcpTransport::Stdio { command, args, env } => {
+                view.command = Some(command.clone());
+                view.args = args.clone();
+                view.env_names = env.keys().cloned().collect();
+            }
+            ProjectMcpTransport::Http { url, headers }
+            | ProjectMcpTransport::Sse { url, headers } => {
+                view.url = Some(url.clone());
+                view.header_names = headers.keys().cloned().collect();
+            }
         }
+        view
     }
 }
 
-/// Redaction-safe view of a resolved server for all surfaces. `command`, `args`,
-/// and `url` identify the server and are not secret; env and header VALUES are
-/// secret and are reduced to their NAMES (`env_names` / `header_names`). Built
-/// only via [`ResolvedMcpServer::redacted`].
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RedactedMcpServer {
@@ -154,31 +107,25 @@ pub struct RedactedMcpServer {
     pub shadowed: Vec<String>,
 }
 
-/// Merge layers by precedence. `layers` are ordered lowest first; a server in a
-/// later layer overrides one of the same name in an earlier layer (per server,
-/// not whole layer). The shadowed provenances accumulate in precedence order so
-/// the surface can render the full override chain. Output is name-sorted (the
-/// `BTreeMap` key order) so every surface lists servers deterministically.
+/// Merges `layers` (lowest first) per server name; output is name-sorted.
 pub fn resolve(layers: Vec<McpLayer>) -> Vec<ResolvedMcpServer> {
     let mut by_name: BTreeMap<String, ResolvedMcpServer> = BTreeMap::new();
     for layer in layers {
         for server in layer.servers {
+            let provenance = layer.provenance.clone();
             match by_name.get_mut(&server.name) {
                 Some(existing) => {
-                    let shadowed =
-                        std::mem::replace(&mut existing.provenance, layer.provenance.clone());
+                    let shadowed = std::mem::replace(&mut existing.provenance, provenance);
                     existing.shadowed.push(shadowed);
                     existing.def = server;
                 }
                 None => {
-                    by_name.insert(
-                        server.name.clone(),
-                        ResolvedMcpServer {
-                            def: server,
-                            provenance: layer.provenance.clone(),
-                            shadowed: Vec::new(),
-                        },
-                    );
+                    let resolved = ResolvedMcpServer {
+                        def: server,
+                        provenance,
+                        shadowed: Vec::new(),
+                    };
+                    by_name.insert(resolved.def.name.clone(), resolved);
                 }
             }
         }
@@ -186,8 +133,7 @@ pub fn resolve(layers: Vec<McpLayer>) -> Vec<ResolvedMcpServer> {
     by_name.into_values().collect()
 }
 
-/// Names + transports of a resolved set for logging. Reuses the redaction-safe
-/// `kind()` so no secret value can reach the log sink.
+/// Names and transports only, safe for logs.
 pub fn summarize(servers: &[ResolvedMcpServer]) -> String {
     servers
         .iter()
@@ -196,174 +142,110 @@ pub fn summarize(servers: &[ResolvedMcpServer]) -> String {
         .join(", ")
 }
 
-/// The environment a host session of `profile` launches with, as far as it
-/// can be known without spawning: the static `environment` entries that
-/// carry a value. A bare key inherits from AoE's own environment, which the
-/// config-dir lookup already falls back to, so those are skipped here rather
-/// than warned about on every poll. `host_hooks.before_session` output is
-/// only known at spawn, so the spawn path passes its minted environment
-/// instead (#3734).
+/// The valued static `environment` entries a host session of `profile` launches
+/// with. Spawn passes its full minted environment instead (includes `before_session`).
 pub fn session_env_for_discovery(profile: Option<&str>) -> Vec<(String, String)> {
-    let cfg = crate::session::config::profile_config::resolve_config_or_warn(
-        &crate::session::config::effective_profile(profile.unwrap_or_default()),
-    );
-    let valued: Vec<String> = cfg
+    let valued: Vec<String> = resolved_profile_config(profile)
         .environment
-        .iter()
+        .into_iter()
         .filter(|entry| entry.contains('='))
-        .cloned()
         .collect();
     crate::session::environment::resolve_host_environment_pairs(&valued)
 }
 
-/// Resolve the effective MCP server set for a session context, applying the
-/// full precedence stack: agent-native -> global -> per-profile ->
-/// project-local (trust-gated), higher wins per name. This is the single source
-/// of truth for BOTH forwarding (the supervisor converts the winning set to ACP)
-/// and the management surfaces (#1996), so what the user sees equals what the
-/// agent receives.
-///
-/// Each layer is isolated: a missing, unreadable, or malformed source warns and
-/// contributes nothing rather than aborting, so a single broken file never
-/// blocks a spawn. `profile` is the session's source profile; an empty/`None`
-/// value resolves to the default. `cwd` is the session working directory, from
-/// which the project-local repo (and its `.mcp.json`) is resolved. The
-/// project-local layer is forwarded ONLY when the repo is trusted at the file's
-/// current fingerprint; an untrusted (or changed) file is skipped and logged,
-/// exactly like the create-time trust gate refuses untrusted hooks.
+fn resolved_profile_config(profile: Option<&str>) -> crate::session::config::Config {
+    crate::session::config::profile_config::resolve_config_or_warn(
+        &crate::session::config::effective_profile(profile.unwrap_or_default()),
+    )
+}
+
+/// A broken source must never block a spawn: warn and contribute nothing.
+fn or_warn<T: Default>(result: Result<T>, source: &str) -> T {
+    result.unwrap_or_else(|e| {
+        warn!(target: "acp.mcp", error = %e, "failed to load {source} MCP config; contributing none from it");
+        T::default()
+    })
+}
+
+/// The set forwarded to the agent for this session context. Project-local servers
+/// are included only when the repo is trusted at the file's current fingerprint.
 pub fn resolve_effective(
     agent_key: &str,
     profile: Option<&str>,
     cwd: &Path,
     session_env: &[(String, String)],
 ) -> Vec<ResolvedMcpServer> {
-    let native =
-        load_native_mcp_servers_from_home(agent_key, profile, session_env).unwrap_or_else(|e| {
-            warn!(
-                target: "acp.mcp",
-                agent = %agent_key,
-                error = %e,
-                "failed to load native MCP config; contributing none from it"
-            );
-            Vec::new()
-        });
-
-    let global = match crate::session::get_app_dir() {
-        Ok(app_dir) => load_global_mcp_servers(&app_dir).unwrap_or_else(|e| {
-            warn!(target: "acp.mcp", error = %e, "failed to load global MCP config; contributing none from it");
-            Vec::new()
-        }),
-        Err(e) => {
-            warn!(target: "acp.mcp", error = %e, "could not resolve app dir for MCP config; contributing none from it");
-            Vec::new()
-        }
-    };
-
-    let per_profile = match crate::session::get_profile_dir_path(profile.unwrap_or_default()) {
-        Ok(profile_dir) => load_profile_mcp_servers(&profile_dir).unwrap_or_else(|e| {
-            warn!(target: "acp.mcp", error = %e, "failed to load per-profile MCP config; contributing none from it");
-            Vec::new()
-        }),
-        Err(e) => {
-            warn!(target: "acp.mcp", error = %e, "could not resolve profile dir for MCP config; contributing none from it");
-            Vec::new()
-        }
-    };
-
-    let source = crate::session::config::repo_config::repo_config_source_path(cwd);
-    let project_local = match super::project_mcp::load_project_mcp_servers(&source) {
-        Ok(servers) if servers.is_empty() => Vec::new(),
-        Ok(servers) => {
-            let hash = super::project_mcp::fingerprint(&servers);
-            match crate::session::config::repo_config::is_repo_trusted(&source, None, Some(&hash)) {
-                Ok(true) => servers,
-                Ok(false) => {
-                    warn!(
-                        target: "acp.mcp",
-                        repo = %source.display(),
-                        count = servers.len(),
-                        "skipping project-local MCP servers: repo not trusted at this .mcp.json fingerprint; review and approve by creating a session for this repo in the TUI or CLI"
-                    );
-                    Vec::new()
-                }
-                Err(e) => {
-                    warn!(target: "acp.mcp", repo = %source.display(), error = %e, "could not check project-local MCP trust; contributing none from it");
-                    Vec::new()
-                }
-            }
-        }
-        Err(e) => {
-            warn!(target: "acp.mcp", repo = %source.display(), error = %e, "failed to load project-local MCP config; contributing none from it");
-            Vec::new()
-        }
-    };
+    let native = load_native_mcp_servers_checked_from_home(agent_key, profile, session_env)
+        .map(NativeRead::into_enabled);
+    let global = crate::session::get_app_dir().and_then(|dir| load_global_mcp_servers(&dir));
+    let per_profile = crate::session::get_profile_dir_path(profile.unwrap_or_default())
+        .and_then(|dir| load_standard_mcp_servers(&dir.join("mcp.json")));
 
     resolve(vec![
         McpLayer {
             provenance: McpProvenance::AgentNative {
                 agent: agent_key.to_string(),
             },
-            servers: native,
+            servers: or_warn(native, &format!("native ({agent_key})")),
         },
         McpLayer {
             provenance: McpProvenance::Global,
-            servers: global,
+            servers: or_warn(global, "global"),
         },
         McpLayer {
             provenance: McpProvenance::Profile {
                 name: profile.unwrap_or_default().to_string(),
             },
-            servers: per_profile,
+            servers: or_warn(per_profile, "per-profile"),
         },
         McpLayer {
             provenance: McpProvenance::ProjectLocal,
-            servers: project_local,
+            servers: or_warn(trusted_project_servers(cwd), "project-local"),
         },
     ])
 }
 
-/// The full management-surface view for a session context (#1996): the
-/// effective forwarded set, plus servers kept-on-removal, plus the conflicts and
-/// drift-paused state the surfaces render. Built by [`resolve_surface`].
+fn trusted_project_servers(cwd: &Path) -> Result<Vec<ProjectMcpServer>> {
+    use crate::session::config::repo_config::{is_repo_trusted, repo_config_source_path};
+    let source = repo_config_source_path(cwd);
+    let servers = super::project_mcp::load_project_mcp_servers(&source)?;
+    if servers.is_empty() {
+        return Ok(servers);
+    }
+    let hash = super::project_mcp::fingerprint(&servers);
+    if is_repo_trusted(&source, None, Some(&hash))? {
+        return Ok(servers);
+    }
+    warn!(
+        target: "acp.mcp",
+        repo = %source.display(),
+        count = servers.len(),
+        "skipping project-local MCP servers: repo not trusted at this .mcp.json fingerprint; review and approve by creating a session for this repo in the TUI or CLI"
+    );
+    Ok(Vec::new())
+}
+
 pub struct McpSurfaceView {
-    /// The merged, trust-gated set that actually forwards to the agent, each
-    /// tagged with its winning provenance and shadow chain. Same set
-    /// [`resolve_effective`] feeds to forwarding.
+    /// Same set [`resolve_effective`] forwards.
     pub effective: Vec<ResolvedMcpServer>,
-    /// Servers that vanished from the active agent's native config since AoE
-    /// last saw them, kept in the view with `KeptOnRemoval` provenance and NOT
-    /// forwarded until the user keeps (promote to global) or drops them.
+    /// Not forwarded until the user keeps (promotes to global) or drops them.
     pub kept_on_removal: Vec<ResolvedMcpServer>,
-    /// Servers whose native definition diverged from AoE's snapshot, awaiting a
-    /// which-side-wins decision.
     pub conflicts: Vec<super::mcp_state::McpConflict>,
-    /// True when drift detection was paused for the active agent because its
-    /// native config has a malformed entry; conflicts and kept-on-removal are
-    /// then empty and the surface should say so rather than imply no drift.
+    /// Drift detection paused on a malformed native entry; the two lists above it are empty.
     pub drift_paused: bool,
 }
 
-/// Resolve the full management-surface view for the active agent and session
-/// context. Combines the forwarded effective set ([`resolve_effective`]) with a
-/// reconcile of the agent's native config against the drift store, so the
-/// surface shows provenance, conflicts, and kept-on-removal in one shot. The
-/// reconcile updates the snapshot (silent adoption of new servers); conflicts
-/// and removals persist until the user resolves them.
+/// The management-surface view: the effective set plus drift reconciled
+/// against (and recorded in) the drift store.
 pub fn resolve_surface(agent: &str, profile: Option<&str>, cwd: &Path) -> McpSurfaceView {
     let session_env = session_env_for_discovery(profile);
     let effective = resolve_effective(agent, profile, cwd, &session_env);
-
-    let reconcile = match load_native_mcp_servers_checked_from_home(agent, profile, &session_env) {
-        Ok(read) => super::mcp_state::reconcile_agent(agent, &read).unwrap_or_else(|e| {
+    let reconcile = load_native_mcp_servers_checked_from_home(agent, profile, &session_env)
+        .and_then(|read| super::mcp_state::reconcile_agent(agent, &read))
+        .unwrap_or_else(|e| {
             warn!(target: "acp.mcp", agent = %agent, error = %e, "failed to reconcile MCP drift store");
             Default::default()
-        }),
-        Err(e) => {
-            warn!(target: "acp.mcp", agent = %agent, error = %e, "failed to read native MCP config for drift");
-            Default::default()
-        }
-    };
-
+        });
     let kept_on_removal = reconcile
         .removed
         .into_iter()
@@ -375,7 +257,6 @@ pub fn resolve_surface(agent: &str, profile: Option<&str>, cwd: &Path) -> McpSur
             shadowed: Vec::new(),
         })
         .collect();
-
     McpSurfaceView {
         effective,
         kept_on_removal,
@@ -384,43 +265,20 @@ pub fn resolve_surface(agent: &str, profile: Option<&str>, cwd: &Path) -> McpSur
     }
 }
 
-// ---------------------------------------------------------------------------
-// Standard `.mcp.json` layers: global and per-profile.
-// ---------------------------------------------------------------------------
-
-/// Read and parse the global `<app_dir>/mcp.json`. A missing file yields an
-/// empty list; a present-but-malformed file is an error the caller surfaces.
 pub fn load_global_mcp_servers(app_dir: &Path) -> Result<Vec<ProjectMcpServer>> {
-    super::project_mcp::load_standard_mcp_servers(&app_dir.join("mcp.json"))
+    load_standard_mcp_servers(&app_dir.join("mcp.json"))
 }
 
-/// Read and parse a profile's `<profile_dir>/mcp.json` (#1986). Same on-disk
-/// shape and missing/malformed semantics as the global file.
-pub fn load_profile_mcp_servers(profile_dir: &Path) -> Result<Vec<ProjectMcpServer>> {
-    super::project_mcp::load_standard_mcp_servers(&profile_dir.join("mcp.json"))
-}
-
-// ---------------------------------------------------------------------------
-// Agent-native layer: each agent's own MCP config, read live (no caching).
-// ---------------------------------------------------------------------------
-
-/// Where an agent keeps its own MCP server config, and in what shape. Adding an
-/// agent is one match arm in [`native_config_for`] plus, if its format differs,
-/// one converter. AoE only ever READS these files; it never writes them.
+/// Native config readers AoE knows, by home-relative path. AoE never writes these.
 enum NativeMcpConfig {
-    /// Standard `{ "mcpServers": { ... } }` JSON with the ecosystem `type`/`url`
-    /// shape, at a home-relative path. Claude (`~/.claude.json`).
+    /// Standard `mcpServers` JSON (Claude).
     StandardJson(&'static str),
-    /// Gemini `settings.json`: entries discriminate transport by which key is
-    /// present (`command` -> stdio, `httpUrl` -> http, `url` -> sse).
+    /// Transport chosen by which of `command` / `httpUrl` / `url` is present.
     GeminiJson(&'static str),
-    /// Codex `config.toml`: `[mcp_servers.<name>]` tables (stdio, or `url` for
-    /// streamable http on newer Codex).
+    /// `[mcp_servers.<name>]` tables with an optional boolean `enabled`.
     CodexToml(&'static str),
 }
 
-/// Map an agent registry key to its native MCP config descriptor, or `None` for
-/// an agent AoE has no native reader for (those contribute no native servers).
 fn native_config_for(agent_key: &str) -> Option<NativeMcpConfig> {
     match agent_key {
         "claude" | "claude-code" => Some(NativeMcpConfig::StandardJson(".claude.json")),
@@ -430,14 +288,9 @@ fn native_config_for(agent_key: &str) -> Option<NativeMcpConfig> {
     }
 }
 
-/// A native config read: every converted definition, the names disabled by the
-/// native agent, and the names of entries skipped because they failed to
-/// convert. Disabled definitions remain in `servers` so drift reconciliation
-/// sees them as present; only the effective-set loader filters them out. The
-/// skipped list gates drift detection (#1996): a native file with a malformed
-/// entry must not make the drift detector report that entry as "removed" (it is
-/// still there, just unparseable), so callers pause drift for that agent when
-/// `skipped` is non-empty.
+/// Disabled definitions stay in `servers` so drift sees them as present.
+/// `skipped` names malformed entries, which pause drift detection.
+#[derive(Default)]
 pub struct NativeRead {
     pub servers: Vec<ProjectMcpServer>,
     pub disabled_names: BTreeSet<String>,
@@ -445,170 +298,93 @@ pub struct NativeRead {
 }
 
 impl NativeRead {
-    fn empty() -> Self {
-        NativeRead {
-            servers: Vec::new(),
-            disabled_names: BTreeSet::new(),
-            skipped: Vec::new(),
-        }
+    fn into_enabled(self) -> Vec<ProjectMcpServer> {
+        let disabled = self.disabled_names;
+        self.servers
+            .into_iter()
+            .filter(|server| !disabled.contains(&server.name))
+            .collect()
     }
 }
 
-/// Read the active agent's own MCP config (the file its CLI reads) and convert
-/// it to neutral servers, reporting any skipped malformed entries. Live
-/// read-through: called once per spawn, no caching, so edits are picked up on
-/// the next session. Returns an empty read for an agent with no known native
-/// reader and for a missing file. A present-but-unparseable file is an error the
-/// caller downgrades to a warning, so a broken native file (which AoE does not
-/// own) never blocks a spawn. Individual malformed server entries are skipped
-/// with a warning and recorded in `skipped`.
-pub fn load_native_mcp_servers_checked(agent_key: &str, home: &Path) -> Result<NativeRead> {
-    load_native_mcp_servers_checked_in(agent_key, home, None)
-}
-
-/// [`load_native_mcp_servers_checked`] against a config directory the agent
-/// reads instead of its home default. Claude relocates `.claude.json` there, so
-/// discovery must open the file the launched process will. `config_dir` is the
-/// caller's already-resolved answer; this function reads no environment of its
-/// own, so an injected `home` stays authoritative. Only the Claude-family
-/// reader honors it; Gemini and Codex keep their fixed home-relative paths.
-pub fn load_native_mcp_servers_checked_in(
-    agent_key: &str,
-    home: &Path,
-    config_dir: Option<&Path>,
-) -> Result<NativeRead> {
-    let Some(config) = native_config_for(agent_key) else {
-        return Ok(NativeRead::empty());
-    };
-    match config {
-        NativeMcpConfig::StandardJson(rel) => {
-            read_standard_json(&config_dir.unwrap_or(home).join(rel))
+/// Reads an agent's native config. A missing file or unknown agent yields nothing;
+/// an unparseable file is an error; malformed entries are skipped. Only the Claude
+/// reader honors `config_dir`.
+fn read_native(agent_key: &str, home: &Path, config_dir: Option<&Path>) -> Result<NativeRead> {
+    match native_config_for(agent_key) {
+        None => Ok(NativeRead::default()),
+        Some(NativeMcpConfig::StandardJson(rel)) => read_json::<StandardMcpFile, _>(
+            &config_dir.unwrap_or(home).join(rel),
+            |f| f.mcp_servers,
+            convert_standard,
+        ),
+        Some(NativeMcpConfig::GeminiJson(rel)) => {
+            read_json::<GeminiConfigFile, _>(&home.join(rel), |f| f.mcp_servers, convert_gemini)
         }
-        NativeMcpConfig::GeminiJson(rel) => read_gemini_json(&home.join(rel)),
-        NativeMcpConfig::CodexToml(rel) => read_codex_toml(&home.join(rel)),
+        Some(NativeMcpConfig::CodexToml(rel)) => read_codex_toml(&home.join(rel)),
     }
 }
 
-/// Like [`load_native_mcp_servers_checked`] but returns only definitions enabled
-/// by the native agent. Used by effective-set resolution and forwarding.
+/// Enabled native servers under an injected `home`.
 pub fn load_native_mcp_servers(agent_key: &str, home: &Path) -> Result<Vec<ProjectMcpServer>> {
-    let read = load_native_mcp_servers_checked(agent_key, home)?;
-    Ok(read
-        .servers
-        .into_iter()
-        .filter(|server| !read.disabled_names.contains(&server.name))
-        .collect())
+    read_native(agent_key, home, None).map(NativeRead::into_enabled)
 }
 
-/// Convenience wrapper that resolves the real home dir. Kept separate from
-/// [`load_native_mcp_servers`] so tests can inject a temp home.
-pub fn load_native_mcp_servers_from_home(
-    agent_key: &str,
-    profile: Option<&str>,
-    session_env: &[(String, String)],
-) -> Result<Vec<ProjectMcpServer>> {
-    let read = load_native_mcp_servers_checked_from_home(agent_key, profile, session_env)?;
-    Ok(read
-        .servers
-        .into_iter()
-        .filter(|server| !read.disabled_names.contains(&server.name))
-        .collect())
-}
-
-/// Like [`load_native_mcp_servers_checked`] but resolves the real home dir. Used
-/// by the management surface, which needs the skipped-entry list to gate drift.
 pub fn load_native_mcp_servers_checked_from_home(
     agent_key: &str,
     profile: Option<&str>,
     session_env: &[(String, String)],
 ) -> Result<NativeRead> {
     let home = dirs::home_dir().context("could not resolve home dir for native MCP config")?;
-    let config_dir = native_config_dir_for(agent_key, profile, &home, session_env);
-    load_native_mcp_servers_checked_in(agent_key, &home, config_dir.as_deref())
-}
-
-/// The directory the launched agent will read its native config from, or `None`
-/// for the home default.
-///
-/// `session.agent_config_dir` wins: it is the value the launch itself acts on
-/// (`container_config`, `hooks::trust_host_project`), and the daemon's own
-/// environment does not carry what a session exports. Read from the
-/// profile-merged config, since the setting is how one profile points at a
-/// second account.
-///
-/// The lookup key is the exact session tool, with no `claude` / `claude-code`
-/// aliasing. The launch keys on the exact tool everywhere, so honoring the
-/// other spelling here would point discovery at a directory the agent does not
-/// read, and these definitions carry credentials. `acp::agent_policy` holds the
-/// same line for the same reason.
-///
-/// The result is the directory the session's agent will actually read, so
-/// discovery and the launched agent agree on one `.claude.json` (#3734):
-/// `session.agent_config_dir`, then `CLAUDE_CONFIG_DIR` in the session's own
-/// environment (profile `environment`, with `before_session` output on top
-/// when the caller has it), then AoE's own environment (a shell that
-/// exports the variable exports it to the agent too, a guess rather than a
-/// fact about the session), then the home default.
-fn native_config_dir_for(
-    agent_key: &str,
-    profile: Option<&str>,
-    home: &Path,
-    session_env: &[(String, String)],
-) -> Option<std::path::PathBuf> {
-    let cfg = crate::session::config::profile_config::resolve_config_or_warn(
-        &crate::session::config::effective_profile(profile.unwrap_or_default()),
+    let explicit = resolved_profile_config(profile)
+        .session
+        .agent_config_dir_for(agent_key, &home);
+    let reads_env = matches!(
+        native_config_for(agent_key),
+        Some(NativeMcpConfig::StandardJson(_))
     );
-    pick_native_config_dir(
-        cfg.session.agent_config_dir_for(agent_key, home),
-        matches!(
-            native_config_for(agent_key),
-            Some(NativeMcpConfig::StandardJson(_))
-        ),
+    let config_dir = pick_native_config_dir(
+        explicit,
+        reads_env,
         session_env,
         std::env::var_os("CLAUDE_CONFIG_DIR"),
-    )
+    );
+    read_native(agent_key, &home, config_dir.as_deref())
 }
 
-/// Pure precedence behind `native_config_dir_for`. Later `session_env`
-/// entries win, matching the last-wins merge the spawn applies.
+/// The directory the launched agent reads its native config from: the exact-tool
+/// `agent_config_dir` setting, then `CLAUDE_CONFIG_DIR` from the session env (last
+/// entry wins), then from the daemon env, else the home default (`None`).
 fn pick_native_config_dir(
-    explicit: Option<std::path::PathBuf>,
+    explicit: Option<PathBuf>,
     reads_claude_config_dir: bool,
     session_env: &[(String, String)],
     daemon_env: Option<std::ffi::OsString>,
-) -> Option<std::path::PathBuf> {
-    if explicit.is_some() {
+) -> Option<PathBuf> {
+    if explicit.is_some() || !reads_claude_config_dir {
         return explicit;
     }
-    if !reads_claude_config_dir {
-        return None;
-    }
-    // A relative value would resolve against the daemon's working directory
-    // here and the agent's there; it is not a directory both can agree on.
-    let usable = |dir: std::path::PathBuf| dir.is_absolute().then_some(dir);
+    // A relative path would resolve differently for the daemon and the agent.
+    let usable = |dir: PathBuf| dir.is_absolute().then_some(dir);
     session_env
         .iter()
         .rev()
         .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
-        .map(|(_, value)| std::path::PathBuf::from(value))
-        .and_then(usable)
-        .or_else(|| daemon_env.map(std::path::PathBuf::from).and_then(usable))
+        .and_then(|(_, value)| usable(PathBuf::from(value)))
+        .or_else(|| daemon_env.map(PathBuf::from).and_then(usable))
 }
 
-/// Convert a map of raw server entries, skipping (with a warning) any entry that
-/// fails to convert rather than failing the whole file. Native configs are owned
-/// by other tools, so one bad entry must not discard the user's other servers.
-/// Returns the converted servers and the names of the skipped entries.
+/// Converts entries individually so one bad entry in a config AoE does not own
+/// does not discard the others.
 fn convert_tolerant<R>(
     servers: BTreeMap<String, R>,
     path: &Path,
     convert: impl Fn(String, R) -> Result<ProjectMcpServer>,
 ) -> NativeRead {
-    let mut out = Vec::new();
-    let mut skipped = Vec::new();
+    let mut read = NativeRead::default();
     for (name, raw) in servers {
         match convert(name.clone(), raw) {
-            Ok(server) => out.push(server),
+            Ok(server) => read.servers.push(server),
             Err(e) => {
                 warn!(
                     target: "acp.mcp",
@@ -617,93 +393,32 @@ fn convert_tolerant<R>(
                     error = %e,
                     "skipping malformed MCP server in native config"
                 );
-                skipped.push(name);
+                read.skipped.push(name);
             }
         }
     }
-    NativeRead {
-        servers: out,
-        disabled_names: BTreeSet::new(),
-        skipped,
-    }
+    read
 }
 
-/// Open a config file, mapping "not found" to `None` (the user does not use that
-/// agent) and any other IO error to a context-tagged failure.
-fn open_optional(path: &Path) -> Result<Option<std::fs::File>> {
-    match std::fs::File::open(path) {
-        Ok(f) => Ok(Some(f)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+/// Streams the file so a large `~/.claude.json` is parsed without materializing history.
+fn read_json<F: serde::de::DeserializeOwned, R>(
+    path: &Path,
+    servers: impl FnOnce(F) -> BTreeMap<String, R>,
+    convert: impl Fn(String, R) -> Result<ProjectMcpServer>,
+) -> Result<NativeRead> {
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(NativeRead::default()),
         Err(e) => {
-            Err(e).with_context(|| format!("opening native MCP config at {}", path.display()))
+            return Err(e)
+                .with_context(|| format!("opening native MCP config at {}", path.display()))
         }
-    }
-}
-
-/// On-disk shape of a standard `mcpServers` entry (Claude `~/.claude.json` and
-/// the AoE-owned `mcp.json` layers share this shape). Unknown keys are ignored.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct StandardConfigFile {
-    #[serde(default)]
-    mcp_servers: BTreeMap<String, StandardRawServer>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct StandardRawServer {
-    #[serde(default, rename = "type")]
-    transport: Option<String>,
-    command: Option<String>,
-    #[serde(default)]
-    args: Vec<String>,
-    #[serde(default)]
-    env: BTreeMap<String, String>,
-    url: Option<String>,
-    #[serde(default)]
-    headers: BTreeMap<String, String>,
-}
-
-fn convert_standard(name: String, raw: StandardRawServer) -> Result<ProjectMcpServer> {
-    let transport = match raw.transport.as_deref() {
-        None | Some("stdio") => ProjectMcpTransport::Stdio {
-            command: raw
-                .command
-                .with_context(|| format!("MCP server \"{name}\" is missing \"command\""))?,
-            args: raw.args,
-            env: raw.env,
-        },
-        Some("http") => ProjectMcpTransport::Http {
-            url: raw
-                .url
-                .with_context(|| format!("MCP server \"{name}\" is missing \"url\""))?,
-            headers: raw.headers,
-        },
-        Some("sse") => ProjectMcpTransport::Sse {
-            url: raw
-                .url
-                .with_context(|| format!("MCP server \"{name}\" is missing \"url\""))?,
-            headers: raw.headers,
-        },
-        Some(other) => bail!("MCP server \"{name}\" has unknown type \"{other}\""),
     };
-    Ok(ProjectMcpServer { name, transport })
-}
-
-/// Read a standard `mcpServers` JSON config, streaming so a large host file
-/// (e.g. `~/.claude.json`, which also holds project history) is parsed without
-/// materializing the unrelated keys.
-fn read_standard_json(path: &Path) -> Result<NativeRead> {
-    let Some(file) = open_optional(path)? else {
-        return Ok(NativeRead::empty());
-    };
-    let parsed: StandardConfigFile = serde_json::from_reader(BufReader::new(file))
+    let parsed: F = serde_json::from_reader(BufReader::new(file))
         .with_context(|| format!("parsing native MCP config at {}", path.display()))?;
-    Ok(convert_tolerant(parsed.mcp_servers, path, convert_standard))
+    Ok(convert_tolerant(servers(parsed), path, convert))
 }
 
-/// On-disk shape of a Gemini `mcpServers` entry. Transport is selected by which
-/// of `command` / `httpUrl` / `url` is present; more than one is ambiguous.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GeminiConfigFile {
@@ -732,8 +447,8 @@ fn convert_gemini(name: String, raw: GeminiRawServer) -> Result<ProjectMcpServer
             args: raw.args,
             env: raw.env,
         },
-        (None, Some(http_url), None) => ProjectMcpTransport::Http {
-            url: http_url,
+        (None, Some(url), None) => ProjectMcpTransport::Http {
+            url,
             headers: raw.headers,
         },
         (None, None, Some(url)) => ProjectMcpTransport::Sse {
@@ -748,18 +463,6 @@ fn convert_gemini(name: String, raw: GeminiRawServer) -> Result<ProjectMcpServer
     Ok(ProjectMcpServer { name, transport })
 }
 
-fn read_gemini_json(path: &Path) -> Result<NativeRead> {
-    let Some(file) = open_optional(path)? else {
-        return Ok(NativeRead::empty());
-    };
-    let parsed: GeminiConfigFile = serde_json::from_reader(BufReader::new(file))
-        .with_context(|| format!("parsing native MCP config at {}", path.display()))?;
-    Ok(convert_tolerant(parsed.mcp_servers, path, convert_gemini))
-}
-
-/// On-disk shape of a Codex `[mcp_servers.<name>]` entry. `command` selects
-/// stdio; `url` selects streamable http (newer Codex). The TOML key is already
-/// snake_case, so no rename is needed.
 #[derive(Debug, Deserialize)]
 struct CodexConfigFile {
     #[serde(default)]
@@ -780,9 +483,8 @@ struct CodexRawServer {
 }
 
 fn convert_codex(name: String, raw: CodexRawServer) -> Result<ProjectMcpServer> {
-    match &raw.enabled {
-        None | Some(toml::Value::Boolean(_)) => {}
-        Some(_) => bail!("MCP server \"{name}\" has non-boolean \"enabled\""),
+    if !matches!(raw.enabled, None | Some(toml::Value::Boolean(_))) {
+        bail!("MCP server \"{name}\" has non-boolean \"enabled\"");
     }
     let transport = match (raw.command, raw.url) {
         (Some(command), None) => ProjectMcpTransport::Stdio {
@@ -800,12 +502,10 @@ fn convert_codex(name: String, raw: CodexRawServer) -> Result<ProjectMcpServer> 
     Ok(ProjectMcpServer { name, transport })
 }
 
-/// Codex config files are small (no embedded history), so a whole-string read is
-/// fine; `toml` has no streaming reader.
 fn read_codex_toml(path: &Path) -> Result<NativeRead> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(NativeRead::empty()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(NativeRead::default()),
         Err(e) => {
             return Err(e)
                 .with_context(|| format!("reading native MCP config at {}", path.display()))
@@ -826,129 +526,6 @@ fn read_codex_toml(path: &Path) -> Result<NativeRead> {
 
 #[cfg(test)]
 mod tests {
-    /// The static profile `environment` reaches discovery the way it
-    /// reaches a host launch, so both resolve the same config dir (#3734).
-    #[test]
-    #[serial_test::serial]
-    fn discovery_reads_claude_config_dir_from_the_profile_environment() {
-        let temp = tempfile::tempdir().unwrap();
-        let _home = crate::session::test_support::isolate_home(temp.path());
-        let app_dir = crate::session::get_app_dir().unwrap();
-        std::fs::create_dir_all(&app_dir).unwrap();
-        std::fs::write(
-            app_dir.join("config.toml"),
-            "environment = [\"CLAUDE_CONFIG_DIR=/from-profile\"]\n",
-        )
-        .unwrap();
-        let env = super::session_env_for_discovery(None);
-        assert!(
-            env.iter()
-                .any(|(k, v)| k == "CLAUDE_CONFIG_DIR" && v == "/from-profile"),
-            "profile environment must reach discovery: {env:?}"
-        );
-    }
-
-    /// #3734: discovery reads the file the agent will read. The session's
-    /// own environment outranks the daemon's, and a later entry (a
-    /// `before_session` value applied on top of the static profile
-    /// environment) outranks an earlier one.
-    #[test]
-    fn native_config_dir_precedence_follows_the_session_environment() {
-        use super::pick_native_config_dir as pick;
-        let p = |s: &str| std::path::PathBuf::from(s);
-        let env = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
-            pairs
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect()
-        };
-        let daemon = Some(std::ffi::OsString::from("/daemon"));
-        type Case = (
-            &'static str,
-            Option<std::path::PathBuf>,
-            bool,
-            Vec<(String, String)>,
-            Option<std::ffi::OsString>,
-            Option<std::path::PathBuf>,
-        );
-        let cases: Vec<Case> = vec![
-            (
-                "explicit agent_config_dir wins",
-                Some(p("/explicit")),
-                true,
-                env(&[("CLAUDE_CONFIG_DIR", "/profile")]),
-                daemon.clone(),
-                Some(p("/explicit")),
-            ),
-            (
-                "profile environment beats the daemon",
-                None,
-                true,
-                env(&[("CLAUDE_CONFIG_DIR", "/profile")]),
-                daemon.clone(),
-                Some(p("/profile")),
-            ),
-            (
-                "a relative session value is ignored like an empty one",
-                None,
-                true,
-                env(&[("CLAUDE_CONFIG_DIR", "relative/dir")]),
-                daemon.clone(),
-                Some(p("/daemon")),
-            ),
-            (
-                "before_session value applied last wins",
-                None,
-                true,
-                env(&[
-                    ("CLAUDE_CONFIG_DIR", "/profile"),
-                    ("CLAUDE_CONFIG_DIR", "/minted"),
-                ]),
-                daemon.clone(),
-                Some(p("/minted")),
-            ),
-            (
-                "daemon environment as fallback",
-                None,
-                true,
-                env(&[("OTHER", "x")]),
-                daemon.clone(),
-                Some(p("/daemon")),
-            ),
-            (
-                "home default when nothing is set",
-                None,
-                true,
-                env(&[]),
-                None,
-                None,
-            ),
-            (
-                "empty session value falls through",
-                None,
-                true,
-                env(&[("CLAUDE_CONFIG_DIR", "")]),
-                daemon.clone(),
-                Some(p("/daemon")),
-            ),
-            (
-                "agents without a config-dir variable ignore the env",
-                None,
-                false,
-                env(&[("CLAUDE_CONFIG_DIR", "/profile")]),
-                daemon,
-                None,
-            ),
-        ];
-        for (label, explicit, reads, session_env, daemon_env, expected) in cases {
-            assert_eq!(
-                pick(explicit, reads, &session_env, daemon_env),
-                expected,
-                "{label}"
-            );
-        }
-    }
-
     use super::*;
 
     fn names(servers: &[ProjectMcpServer]) -> Vec<&str> {
@@ -972,198 +549,20 @@ mod tests {
         }
     }
 
-    fn layer(provenance: McpProvenance, servers: Vec<ProjectMcpServer>) -> McpLayer {
+    fn layer(provenance: McpProvenance, json: &str) -> McpLayer {
         McpLayer {
             provenance,
-            servers,
+            servers: super::super::project_mcp::parse_standard_mcp_servers(json).unwrap(),
         }
     }
 
-    fn standard(json: &str) -> Vec<ProjectMcpServer> {
-        super::super::project_mcp::parse_standard_mcp_servers(json).unwrap()
+    fn native_claude() -> McpProvenance {
+        McpProvenance::AgentNative {
+            agent: "claude".into(),
+        }
     }
 
-    #[test]
-    fn provenance_labels() {
-        assert_eq!(
-            McpProvenance::AgentNative {
-                agent: "claude".into()
-            }
-            .label(),
-            "agent-native:claude"
-        );
-        assert_eq!(McpProvenance::Global.label(), "global");
-        assert_eq!(
-            McpProvenance::Profile {
-                name: "rust".into()
-            }
-            .label(),
-            "profile:rust"
-        );
-        assert_eq!(McpProvenance::ProjectLocal.label(), "project-local");
-    }
-
-    #[test]
-    fn resolve_higher_layer_wins_and_records_shadow() {
-        let merged = resolve(vec![
-            layer(
-                McpProvenance::AgentNative {
-                    agent: "claude".into(),
-                },
-                standard(r#"{ "mcpServers": { "fs": { "command": "native" } } }"#),
-            ),
-            layer(
-                McpProvenance::Global,
-                standard(r#"{ "mcpServers": { "fs": { "command": "global" } } }"#),
-            ),
-        ]);
-        assert_eq!(resolved_names(&merged), vec!["fs"]);
-        assert_eq!(stdio_command(&merged[0].def), "global");
-        assert_eq!(merged[0].provenance, McpProvenance::Global);
-        assert_eq!(
-            merged[0].shadowed,
-            vec![McpProvenance::AgentNative {
-                agent: "claude".into()
-            }]
-        );
-    }
-
-    #[test]
-    fn resolve_records_full_shadow_chain_in_precedence_order() {
-        let merged = resolve(vec![
-            layer(
-                McpProvenance::AgentNative {
-                    agent: "claude".into(),
-                },
-                standard(r#"{ "mcpServers": { "fs": { "command": "n" } } }"#),
-            ),
-            layer(
-                McpProvenance::Global,
-                standard(r#"{ "mcpServers": { "fs": { "command": "g" } } }"#),
-            ),
-            layer(
-                McpProvenance::Profile {
-                    name: "rust".into(),
-                },
-                standard(r#"{ "mcpServers": { "fs": { "command": "p" } } }"#),
-            ),
-        ]);
-        assert_eq!(stdio_command(&merged[0].def), "p");
-        assert_eq!(
-            merged[0].provenance,
-            McpProvenance::Profile {
-                name: "rust".into()
-            }
-        );
-        assert_eq!(
-            merged[0].shadowed,
-            vec![
-                McpProvenance::AgentNative {
-                    agent: "claude".into()
-                },
-                McpProvenance::Global,
-            ]
-        );
-    }
-
-    #[test]
-    fn resolve_unions_distinct_names_sorted() {
-        let merged = resolve(vec![
-            layer(
-                McpProvenance::AgentNative {
-                    agent: "claude".into(),
-                },
-                standard(
-                    r#"{ "mcpServers": { "zebra": { "command": "z" }, "fs": { "command": "n" } } }"#,
-                ),
-            ),
-            layer(
-                McpProvenance::Global,
-                standard(r#"{ "mcpServers": { "alpha": { "command": "a" } } }"#),
-            ),
-        ]);
-        assert_eq!(resolved_names(&merged), vec!["alpha", "fs", "zebra"]);
-    }
-
-    #[test]
-    fn resolve_empty_is_empty() {
-        assert!(resolve(vec![]).is_empty());
-        assert!(resolve(vec![layer(McpProvenance::Global, Vec::new())]).is_empty());
-    }
-
-    #[test]
-    fn summarize_omits_secret_values() {
-        let merged = resolve(vec![layer(
-            McpProvenance::Global,
-            standard(
-                r#"{ "mcpServers": { "fs": { "command": "c", "env": { "TOKEN": "supersecret" } } } }"#,
-            ),
-        )]);
-        let s = summarize(&merged);
-        assert_eq!(s, "fs(stdio)");
-        assert!(!s.contains("supersecret"));
-    }
-
-    #[test]
-    fn redacted_view_keeps_names_drops_secret_values() {
-        let merged = resolve(vec![
-            layer(
-                McpProvenance::AgentNative {
-                    agent: "claude".into(),
-                },
-                standard(r#"{ "mcpServers": { "fs": { "command": "fs-old" } } }"#),
-            ),
-            layer(
-                McpProvenance::Global,
-                standard(
-                    r#"{ "mcpServers": {
-                        "fs": { "command": "mcp-fs", "args": ["--root", "."], "env": { "TOKEN": "SUPER_SECRET_DO_NOT_LEAK" } },
-                        "remote": { "type": "http", "url": "https://e/mcp", "headers": { "Authorization": "Bearer HEADER_SECRET_DO_NOT_LEAK" } }
-                    } }"#,
-                ),
-            ),
-        ]);
-
-        let stdio = merged
-            .iter()
-            .find(|s| s.def.name == "fs")
-            .unwrap()
-            .redacted();
-        assert_eq!(stdio.transport, "stdio");
-        assert_eq!(stdio.command.as_deref(), Some("mcp-fs"));
-        assert_eq!(stdio.args, vec!["--root", "."]);
-        assert_eq!(stdio.env_names, vec!["TOKEN"]);
-        assert_eq!(stdio.provenance, "global");
-        assert_eq!(stdio.shadowed, vec!["agent-native:claude"]);
-
-        let remote = merged
-            .iter()
-            .find(|s| s.def.name == "remote")
-            .unwrap()
-            .redacted();
-        assert_eq!(remote.transport, "http");
-        assert_eq!(remote.url.as_deref(), Some("https://e/mcp"));
-        assert_eq!(remote.header_names, vec!["Authorization"]);
-
-        // The single chokepoint must never serialize a secret VALUE on any
-        // surface (web JSON, CLI --json, TUI rows all go through this).
-        let json = serde_json::to_string(&merged.iter().map(|s| s.redacted()).collect::<Vec<_>>())
-            .unwrap();
-        assert!(
-            !json.contains("SUPER_SECRET_DO_NOT_LEAK"),
-            "env value leaked: {json}"
-        );
-        assert!(
-            !json.contains("HEADER_SECRET_DO_NOT_LEAK"),
-            "header value leaked: {json}"
-        );
-        assert!(json.contains("TOKEN") && json.contains("Authorization"));
-    }
-
-    /// A temp HOME for a test that goes through the real-home entry points.
-    /// `CLAUDE_CONFIG_DIR` is cleared alongside it: native discovery falls back
-    /// to it, so a developer running under a wrapper that exports it would
-    /// otherwise read their own config instead of this one.
+    /// A temp HOME with `CLAUDE_CONFIG_DIR` cleared so a developer's own export is not read.
     fn set_tmp_home() -> (tempfile::TempDir, crate::session::test_support::EnvGuard) {
         let dir = tempfile::tempdir().unwrap();
         let guard = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"])
@@ -1174,87 +573,207 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn surface_shows_effective_then_keep_on_removal_then_promote() {
-        let (home, _env) = set_tmp_home();
-        let cwd = home.path().join("repo");
-        std::fs::create_dir_all(&cwd).unwrap();
-
-        // Native config (claude) with two servers; first open adopts both.
+    fn discovery_reads_claude_config_dir_from_the_profile_environment() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp.path());
+        let app_dir = crate::session::get_app_dir().unwrap();
+        std::fs::create_dir_all(&app_dir).unwrap();
         std::fs::write(
-            home.path().join(".claude.json"),
-            r#"{ "mcpServers": { "fs": { "command": "c" }, "gone": { "command": "g" } } }"#,
+            app_dir.join("config.toml"),
+            "environment = [\"CLAUDE_CONFIG_DIR=/from-profile\"]\n",
         )
         .unwrap();
-        let view = resolve_surface("claude", None, &cwd);
-        assert_eq!(view.effective.len(), 2);
-        assert!(view.kept_on_removal.is_empty());
-        assert!(view.conflicts.is_empty() && !view.drift_paused);
-
-        // Drop "gone" from native: it must be kept-on-removal, not forwarded.
-        std::fs::write(
-            home.path().join(".claude.json"),
-            r#"{ "mcpServers": { "fs": { "command": "c" } } }"#,
-        )
-        .unwrap();
-        let view = resolve_surface("claude", None, &cwd);
-        assert_eq!(view.effective.len(), 1, "removed server no longer forwards");
-        assert_eq!(view.kept_on_removal.len(), 1);
-        let kept = &view.kept_on_removal[0];
-        assert_eq!(kept.def.name, "gone");
-        assert_eq!(kept.provenance.label(), "kept-on-removal:claude");
-
-        // Keep it: promote to global mcp.json; it now forwards as `global` and is
-        // no longer reported as kept-on-removal.
-        assert!(super::super::mcp_state::keep_removed("claude", &kept.def.name).unwrap());
-        let view = resolve_surface("claude", None, &cwd);
+        let env = session_env_for_discovery(None);
         assert!(
-            view.kept_on_removal.is_empty(),
-            "kept server no longer flagged"
+            env.iter()
+                .any(|(k, v)| k == "CLAUDE_CONFIG_DIR" && v == "/from-profile"),
+            "{env:?}"
         );
-        let promoted = view
-            .effective
-            .iter()
-            .find(|s| s.def.name == "gone")
-            .expect("kept server now forwards");
-        assert_eq!(promoted.provenance, McpProvenance::Global);
-        let _ = home;
+    }
+
+    #[test]
+    fn native_config_dir_precedence_follows_the_session_environment() {
+        let p = |s: &str| Some(PathBuf::from(s));
+        let daemon = || Some(std::ffi::OsString::from("/daemon"));
+        let cases: [(&str, Option<PathBuf>, bool, &[(&str, &str)], _, _); 8] = [
+            (
+                "explicit wins",
+                p("/explicit"),
+                true,
+                &[("CLAUDE_CONFIG_DIR", "/profile")],
+                daemon(),
+                p("/explicit"),
+            ),
+            (
+                "profile beats daemon",
+                None,
+                true,
+                &[("CLAUDE_CONFIG_DIR", "/profile")],
+                daemon(),
+                p("/profile"),
+            ),
+            (
+                "relative ignored",
+                None,
+                true,
+                &[("CLAUDE_CONFIG_DIR", "relative/dir")],
+                daemon(),
+                p("/daemon"),
+            ),
+            (
+                "last entry wins",
+                None,
+                true,
+                &[
+                    ("CLAUDE_CONFIG_DIR", "/profile"),
+                    ("CLAUDE_CONFIG_DIR", "/minted"),
+                ],
+                daemon(),
+                p("/minted"),
+            ),
+            (
+                "daemon fallback",
+                None,
+                true,
+                &[("OTHER", "x")],
+                daemon(),
+                p("/daemon"),
+            ),
+            ("home default", None, true, &[], None, None),
+            (
+                "empty falls through",
+                None,
+                true,
+                &[("CLAUDE_CONFIG_DIR", "")],
+                daemon(),
+                p("/daemon"),
+            ),
+            (
+                "non-claude ignores env",
+                None,
+                false,
+                &[("CLAUDE_CONFIG_DIR", "/profile")],
+                daemon(),
+                None,
+            ),
+        ];
+        for (label, explicit, reads, env, daemon_env, expected) in cases {
+            let env: Vec<_> = env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            assert_eq!(
+                pick_native_config_dir(explicit, reads, &env, daemon_env),
+                expected,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_merges_by_precedence_with_shadow_chain() {
+        assert!(resolve(vec![]).is_empty());
+        let profile = McpProvenance::Profile {
+            name: "rust".into(),
+        };
+        let merged = resolve(vec![
+            layer(
+                native_claude(),
+                r#"{ "mcpServers": { "fs": { "command": "n" }, "zebra": { "command": "z" } } }"#,
+            ),
+            layer(
+                McpProvenance::Global,
+                r#"{ "mcpServers": { "fs": { "command": "g" }, "alpha": { "command": "a" } } }"#,
+            ),
+            layer(
+                profile.clone(),
+                r#"{ "mcpServers": { "fs": { "command": "p" } } }"#,
+            ),
+        ]);
+        assert_eq!(resolved_names(&merged), vec!["alpha", "fs", "zebra"]);
+        let fs = &merged[1];
+        assert_eq!(stdio_command(&fs.def), "p");
+        assert_eq!(fs.provenance, profile);
+        assert_eq!(fs.shadowed, vec![native_claude(), McpProvenance::Global]);
+        assert_eq!(
+            fs.redacted().shadowed,
+            vec!["agent-native:claude", "global"]
+        );
+        assert_eq!(merged[1].redacted().provenance, "profile:rust");
+    }
+
+    #[test]
+    fn redacted_view_and_summary_keep_names_drop_secret_values() {
+        let merged = resolve(vec![layer(
+            McpProvenance::Global,
+            r#"{ "mcpServers": {
+                "fs": { "command": "mcp-fs", "args": ["--root", "."], "env": { "TOKEN": "SUPER_SECRET_DO_NOT_LEAK" } },
+                "remote": { "type": "http", "url": "https://e/mcp", "headers": { "Authorization": "Bearer HEADER_SECRET_DO_NOT_LEAK" } }
+            } }"#,
+        )]);
+        assert_eq!(summarize(&merged), "fs(stdio), remote(http)");
+
+        let stdio = merged[0].redacted();
+        assert_eq!(stdio.transport, "stdio");
+        assert_eq!(stdio.command.as_deref(), Some("mcp-fs"));
+        assert_eq!(stdio.args, vec!["--root", "."]);
+        assert_eq!(stdio.env_names, vec!["TOKEN"]);
+        assert_eq!(stdio.provenance, "global");
+        let remote = merged[1].redacted();
+        assert_eq!(remote.transport, "http");
+        assert_eq!(remote.url.as_deref(), Some("https://e/mcp"));
+        assert_eq!(remote.header_names, vec!["Authorization"]);
+
+        let json = serde_json::to_string(&[stdio, remote]).unwrap();
+        assert!(!json.contains("SECRET_DO_NOT_LEAK"), "{json}");
     }
 
     #[test]
     #[serial_test::serial]
-    fn surface_drop_removed_discards_without_promoting() {
+    fn surface_keep_on_removal_then_keep_or_drop() {
         let (home, _env) = set_tmp_home();
         let cwd = home.path().join("repo");
         std::fs::create_dir_all(&cwd).unwrap();
+        let claude_json = home.path().join(".claude.json");
         std::fs::write(
-            home.path().join(".claude.json"),
-            r#"{ "mcpServers": { "gone": { "command": "g" } } }"#,
+            &claude_json,
+            r#"{ "mcpServers": { "fs": { "command": "c" }, "kept": { "command": "k" }, "dropped": { "command": "d" } } }"#,
         )
         .unwrap();
-        resolve_surface("claude", None, &cwd);
-        std::fs::write(home.path().join(".claude.json"), r#"{ "mcpServers": {} }"#).unwrap();
         let view = resolve_surface("claude", None, &cwd);
-        assert_eq!(view.kept_on_removal.len(), 1);
+        assert_eq!(view.effective.len(), 3);
+        assert!(view.kept_on_removal.is_empty() && view.conflicts.is_empty() && !view.drift_paused);
 
-        super::super::mcp_state::forget_native("claude", "gone").unwrap();
+        std::fs::write(
+            &claude_json,
+            r#"{ "mcpServers": { "fs": { "command": "c" } } }"#,
+        )
+        .unwrap();
         let view = resolve_surface("claude", None, &cwd);
-        assert!(
-            view.kept_on_removal.is_empty(),
-            "dropped server is gone entirely"
+        assert_eq!(resolved_names(&view.effective), vec!["fs"]);
+        assert_eq!(
+            resolved_names(&view.kept_on_removal),
+            vec!["dropped", "kept"]
         );
-        assert!(view.effective.is_empty(), "drop must not promote to global");
-        let _ = home;
+        assert_eq!(
+            view.kept_on_removal[0].provenance.label(),
+            "kept-on-removal:claude"
+        );
+
+        assert!(super::super::mcp_state::keep_removed("claude", "kept").unwrap());
+        super::super::mcp_state::forget_native("claude", "dropped").unwrap();
+        let view = resolve_surface("claude", None, &cwd);
+        assert!(view.kept_on_removal.is_empty());
+        assert_eq!(resolved_names(&view.effective), vec!["fs", "kept"]);
+        assert_eq!(view.effective[1].provenance, McpProvenance::Global);
     }
 
     #[test]
-    fn global_missing_file_is_empty() {
+    fn standard_layer_files() {
         let dir = tempfile::tempdir().unwrap();
         assert!(load_global_mcp_servers(dir.path()).unwrap().is_empty());
-    }
-
-    #[test]
-    fn global_loads_and_parses_file() {
-        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("mcp.json"), "{ not json").unwrap();
+        assert!(load_global_mcp_servers(dir.path()).is_err());
         std::fs::write(
             dir.path().join("mcp.json"),
             r#"{ "mcpServers": { "fs": { "command": "mcp-fs" } } }"#,
@@ -1267,81 +786,47 @@ mod tests {
     }
 
     #[test]
-    fn global_malformed_file_is_error() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("mcp.json"), "{ not json").unwrap();
-        assert!(load_global_mcp_servers(dir.path()).is_err());
-    }
-
-    #[test]
-    fn profile_loads_and_parses_file() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("mcp.json"),
-            r#"{ "mcpServers": { "fs": { "command": "profile-fs" } } }"#,
-        )
-        .unwrap();
-        assert_eq!(
-            names(&load_profile_mcp_servers(dir.path()).unwrap()),
-            vec!["fs"]
-        );
-    }
-
-    #[test]
-    fn native_unknown_agent_is_empty() {
+    fn native_missing_malformed_and_unknown() {
         let home = tempfile::tempdir().unwrap();
-        assert!(load_native_mcp_servers("opencode", home.path())
-            .unwrap()
-            .is_empty());
-    }
-
-    #[test]
-    fn native_missing_file_is_empty() {
-        let home = tempfile::tempdir().unwrap();
-        for agent in ["claude", "gemini", "codex"] {
+        for agent in ["claude", "gemini", "codex", "opencode"] {
             assert!(load_native_mcp_servers(agent, home.path())
                 .unwrap()
                 .is_empty());
         }
+        write(home.path(), ".claude.json", "{ not json");
+        write(home.path(), ".codex/config.toml", "this = = not toml");
+        for agent in ["claude", "codex"] {
+            assert!(
+                load_native_mcp_servers(agent, home.path()).is_err(),
+                "{agent}"
+            );
+        }
     }
 
-    /// The config-dir override redirects only the Claude-family reader, and an
-    /// injected home stays authoritative against a `CLAUDE_CONFIG_DIR` in the
-    /// ambient environment: discovery resolves the directory at the real-home
-    /// entry point, never inside the injected-home one.
+    /// Only the Claude reader honors `config_dir`, and an injected home ignores
+    /// an ambient `CLAUDE_CONFIG_DIR`.
     #[test]
     fn native_claude_reads_config_dir_over_injected_home() {
         let home = tempfile::tempdir().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
         let stray = tempfile::tempdir().unwrap();
-        write(
-            home.path(),
-            ".claude.json",
-            r#"{ "mcpServers": { "from-home": { "command": "h" } } }"#,
-        );
-        write(
-            config_dir.path(),
-            ".claude.json",
-            r#"{ "mcpServers": { "from-config-dir": { "command": "c" } } }"#,
-        );
-        write(
-            stray.path(),
-            ".claude.json",
-            r#"{ "mcpServers": { "from-env": { "command": "e" } } }"#,
-        );
-
+        for (dir, name) in [
+            (&home, "from-home"),
+            (&config_dir, "from-config-dir"),
+            (&stray, "from-env"),
+        ] {
+            write(
+                dir.path(),
+                ".claude.json",
+                &format!(r#"{{ "mcpServers": {{ "{name}": {{ "command": "x" }} }} }}"#),
+            );
+        }
         let _guard = crate::session::test_support::EnvGuard::set(&[(
             "CLAUDE_CONFIG_DIR",
             stray.path().to_path_buf(),
         )]);
-        assert_eq!(
-            names(
-                &load_native_mcp_servers_checked_in("claude", home.path(), Some(config_dir.path()))
-                    .unwrap()
-                    .servers
-            ),
-            vec!["from-config-dir"]
-        );
+        let read = read_native("claude", home.path(), Some(config_dir.path())).unwrap();
+        assert_eq!(names(&read.servers), vec!["from-config-dir"]);
         assert_eq!(
             names(&load_native_mcp_servers("claude", home.path()).unwrap()),
             vec!["from-home"]
@@ -1349,182 +834,77 @@ mod tests {
     }
 
     #[test]
-    fn native_claude_parses_and_ignores_history() {
+    fn native_readers_convert_and_skip_bad_entries() {
         let home = tempfile::tempdir().unwrap();
         write(
             home.path(),
             ".claude.json",
             r#"{
                 "projects": { "/some/path": { "lastSessionId": "abc" } },
-                "numStartups": 42,
                 "mcpServers": {
+                    "broken": { "args": ["--x"] },
                     "fs": { "command": "mcp-fs", "args": ["--root", "."] },
                     "remote": { "type": "http", "url": "https://e/mcp" }
                 }
             }"#,
         );
-        let servers = load_native_mcp_servers("claude", home.path()).unwrap();
-        assert_eq!(names(&servers), vec!["fs", "remote"]);
-        // `claude-code` is the legacy alias and resolves to the same reader.
-        let aliased = load_native_mcp_servers("claude-code", home.path()).unwrap();
-        assert_eq!(names(&aliased), vec!["fs", "remote"]);
-    }
-
-    #[test]
-    fn native_claude_skips_bad_entry_keeps_rest() {
-        let home = tempfile::tempdir().unwrap();
-        write(
-            home.path(),
-            ".claude.json",
-            r#"{ "mcpServers": {
-                "broken": { "args": ["--x"] },
-                "ok": { "command": "good" }
-            } }"#,
-        );
-        assert_eq!(
-            names(&load_native_mcp_servers("claude", home.path()).unwrap()),
-            vec!["ok"]
-        );
-    }
-
-    #[test]
-    fn native_claude_malformed_file_is_error() {
-        let home = tempfile::tempdir().unwrap();
-        write(home.path(), ".claude.json", "{ not json");
-        assert!(load_native_mcp_servers("claude", home.path()).is_err());
-    }
-
-    #[test]
-    fn native_gemini_discriminates_transport_by_key() {
-        let home = tempfile::tempdir().unwrap();
         write(
             home.path(),
             ".gemini/settings.json",
-            r#"{
-                "theme": "dark",
-                "mcpServers": {
-                    "local":  { "command": "g", "args": ["--x"] },
-                    "httpish": { "httpUrl": "https://e/mcp", "headers": { "Authorization": "Bearer x" } },
-                    "sseish":  { "url": "https://e/sse" }
-                }
-            }"#,
-        );
-        let servers = load_native_mcp_servers("gemini", home.path()).unwrap();
-        assert_eq!(names(&servers), vec!["httpish", "local", "sseish"]);
-        assert!(matches!(
-            servers[0].transport,
-            ProjectMcpTransport::Http { .. }
-        ));
-        assert!(matches!(
-            servers[1].transport,
-            ProjectMcpTransport::Stdio { .. }
-        ));
-        assert!(matches!(
-            servers[2].transport,
-            ProjectMcpTransport::Sse { .. }
-        ));
-    }
-
-    #[test]
-    fn native_gemini_ambiguous_entry_is_skipped() {
-        let home = tempfile::tempdir().unwrap();
-        write(
-            home.path(),
-            ".gemini/settings.json",
-            r#"{ "mcpServers": {
+            r#"{ "theme": "dark", "mcpServers": {
                 "ambiguous": { "command": "c", "httpUrl": "https://e/mcp" },
-                "ok": { "command": "good" }
+                "httpish": { "httpUrl": "https://e/mcp", "headers": { "Authorization": "Bearer x" } },
+                "local": { "command": "g", "args": ["--x"] },
+                "sseish": { "url": "https://e/sse" }
             } }"#,
         );
-        assert_eq!(
-            names(&load_native_mcp_servers("gemini", home.path()).unwrap()),
-            vec!["ok"]
-        );
-    }
-
-    #[test]
-    fn native_codex_parses_toml() {
-        let home = tempfile::tempdir().unwrap();
         write(
             home.path(),
             ".codex/config.toml",
             r#"
 model = "gpt-5"
-
-[mcp_servers.fs]
-command = "mcp-fs"
-args = ["--root", "."]
-env = { TOKEN = "secret" }
-
-[mcp_servers.remote]
-url = "https://e/mcp"
-"#,
-        );
-        let servers = load_native_mcp_servers("codex", home.path()).unwrap();
-        assert_eq!(names(&servers), vec!["fs", "remote"]);
-        assert_eq!(stdio_command(&servers[0]), "mcp-fs");
-        assert!(matches!(
-            servers[1].transport,
-            ProjectMcpTransport::Http { .. }
-        ));
-        // Secret env value never appears in the redacted summary.
-        assert!(!servers[0].redacted_summary().contains("secret"));
-    }
-
-    #[test]
-    fn native_codex_honors_enabled_flag() {
-        let home = tempfile::tempdir().unwrap();
-        write(
-            home.path(),
-            ".codex/config.toml",
-            r#"
-[mcp_servers.omitted]
-command = "omitted"
-
-[mcp_servers.explicit_true]
-command = "true"
-enabled = true
-
-[mcp_servers.explicit_false]
-command = "false"
-enabled = false
-"#,
-        );
-
-        let effective = load_native_mcp_servers("codex", home.path()).unwrap();
-        assert_eq!(names(&effective), vec!["explicit_true", "omitted"]);
-
-        let checked = load_native_mcp_servers_checked("codex", home.path()).unwrap();
-        assert_eq!(
-            names(&checked.servers),
-            vec!["explicit_false", "explicit_true", "omitted"],
-            "disabled definitions remain present for drift bookkeeping"
-        );
-        assert_eq!(
-            checked.disabled_names,
-            BTreeSet::from(["explicit_false".to_string()])
-        );
-    }
-
-    #[test]
-    fn native_codex_invalid_enabled_is_skipped_with_valid_siblings() {
-        let home = tempfile::tempdir().unwrap();
-        write(
-            home.path(),
-            ".codex/config.toml",
-            r#"
 [mcp_servers.bad]
 command = "bad"
 enabled = "sometimes"
-
-[mcp_servers.good]
-command = "good"
+[mcp_servers.fs]
+command = "mcp-fs"
+env = { TOKEN = "secret" }
+[mcp_servers.remote]
+url = "https://e/mcp"
+[mcp_servers.off]
+command = "off"
+enabled = false
+[mcp_servers.on]
+command = "on"
+enabled = true
 "#,
         );
 
-        let read = load_native_mcp_servers_checked("codex", home.path()).unwrap();
-        assert_eq!(names(&read.servers), vec!["good"]);
-        assert_eq!(read.skipped, vec!["bad"]);
+        for agent in ["claude", "claude-code"] {
+            let read = read_native(agent, home.path(), None).unwrap();
+            assert_eq!(names(&read.servers), vec!["fs", "remote"]);
+            assert_eq!(read.skipped, vec!["broken"]);
+        }
+
+        let gemini = read_native("gemini", home.path(), None).unwrap();
+        assert_eq!(gemini.skipped, vec!["ambiguous"]);
+        let kinds: Vec<_> = gemini
+            .servers
+            .iter()
+            .map(|s| (s.name.as_str(), s.kind()))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![("httpish", "http"), ("local", "stdio"), ("sseish", "sse")]
+        );
+
+        let codex = read_native("codex", home.path(), None).unwrap();
+        assert_eq!(names(&codex.servers), vec!["fs", "off", "on", "remote"]);
+        assert_eq!(codex.skipped, vec!["bad"]);
+        assert_eq!(codex.disabled_names, BTreeSet::from(["off".to_string()]));
+        assert_eq!(codex.servers[3].kind(), "http");
+        let enabled = load_native_mcp_servers("codex", home.path()).unwrap();
+        assert_eq!(names(&enabled), vec!["fs", "on", "remote"]);
     }
 
     #[test]
@@ -1533,53 +913,18 @@ command = "good"
         let (home, _env) = set_tmp_home();
         let cwd = home.path().join("repo");
         std::fs::create_dir_all(&cwd).unwrap();
-
-        let write_toggle = |enabled: bool| {
+        for enabled in [true, false, true] {
             write(
                 home.path(),
                 ".codex/config.toml",
-                &format!(
-                    r#"
-[mcp_servers.toggle]
-command = "toggle"
-enabled = {enabled}
-"#
-                ),
+                &format!("[mcp_servers.toggle]\ncommand = \"toggle\"\nenabled = {enabled}\n"),
             );
-        };
-
-        write_toggle(true);
-        let enabled = resolve_surface("codex", None, &cwd);
-        assert_eq!(resolved_names(&enabled.effective), vec!["toggle"]);
-        assert!(enabled.kept_on_removal.is_empty());
-        assert!(enabled.conflicts.is_empty());
-        assert!(!enabled.drift_paused);
-
-        write_toggle(false);
-        let disabled = resolve_surface("codex", None, &cwd);
-        assert!(disabled.effective.is_empty());
-        assert!(
-            disabled.kept_on_removal.is_empty(),
-            "disabling a native server is not a removal"
-        );
-        assert!(disabled.conflicts.is_empty());
-        assert!(!disabled.drift_paused);
-
-        write_toggle(true);
-        let re_enabled = resolve_surface("codex", None, &cwd);
-        assert_eq!(resolved_names(&re_enabled.effective), vec!["toggle"]);
-        assert!(re_enabled.kept_on_removal.is_empty());
-        assert!(
-            re_enabled.conflicts.is_empty(),
-            "re-enabling the same definition must not create a stale conflict"
-        );
-        assert!(!re_enabled.drift_paused);
-    }
-
-    #[test]
-    fn native_codex_malformed_file_is_error() {
-        let home = tempfile::tempdir().unwrap();
-        write(home.path(), ".codex/config.toml", "this = = not toml");
-        assert!(load_native_mcp_servers("codex", home.path()).is_err());
+            let view = resolve_surface("codex", None, &cwd);
+            let expected: &[&str] = if enabled { &["toggle"] } else { &[] };
+            assert_eq!(resolved_names(&view.effective), expected);
+            assert!(view.kept_on_removal.is_empty());
+            assert!(view.conflicts.is_empty(), "re-enabling must not conflict");
+            assert!(!view.drift_paused);
+        }
     }
 }

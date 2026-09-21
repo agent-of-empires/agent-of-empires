@@ -3586,7 +3586,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             sandbox_resources,
             attach_agent_key,
             record.source_profile.clone(),
-            Some(tokio::time::Instant::now() + Duration::from_secs(3)),
+            Some(tokio::time::Instant::now() + std::time::Duration::from_secs(3)),
         )
         .await?;
 

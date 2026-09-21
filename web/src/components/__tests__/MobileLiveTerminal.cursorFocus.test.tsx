@@ -1,86 +1,46 @@
 // @vitest-environment jsdom
-//
-// The cursor cell always rendered as a hollow outline, with no path for the
-// input's focus state to reach it (#2684). `Row` now takes a `focused` prop
-// and picks a filled style (solid background, inverted text) when true,
-// keeping the hollow outline for the default/blurred case so existing
-// placement tests (MobileLiveTerminal.cjkCursor.test.tsx) need no changes.
-// Focused also gets the blink animation class; jsdom doesn't run the CSS
-// animation itself, but the class presence is what drives it in a browser.
 
 import { describe, expect, it } from "vitest";
 import { render } from "@testing-library/react";
-import { Row } from "../MobileLiveTerminal";
-import type { AnsiSegment } from "../../lib/ansi";
+import { Row } from "../live-terminal/TermRow";
 
-function seg(text: string): AnsiSegment {
-  return { text, style: {} };
-}
+const cursorCell = (segs: string[], cursorCol: number, focused?: boolean) =>
+  render(
+    <Row segs={segs.map((text) => ({ text, style: {} }))} cursorCol={cursorCol} focused={focused} />,
+  ).container.querySelector("[data-live-cursor]") as HTMLElement;
 
-function cursorCell(container: HTMLElement) {
-  return container.querySelector("[data-live-cursor]") as HTMLElement | null;
-}
-
-describe("Row cursor fill state", () => {
-  it("renders a hollow outline, no fill, no blink, when unfocused (default)", () => {
-    const { container } = render(<Row segs={[seg("hi")]} cursorCol={2} />);
-    const cell = cursorCell(container);
-    expect(cell).not.toBeNull();
-    expect(cell!.style.outline).toContain("var(--term-cursor");
-    expect(cell!.style.backgroundColor).toBe("");
-    expect(cell!.className).toBe("");
+describe("Row cursor cell", () => {
+  it.each([undefined, false])("is a hollow, non-blinking outline when focused=%s", (focused) => {
+    const cell = cursorCell(["hi"], 2, focused);
+    expect(cell.style.outline).toContain("var(--term-cursor");
+    expect(cell.style.backgroundColor).toBe("");
+    expect(cell.className).toBe("");
   });
 
-  it("renders a hollow outline, no fill, no blink, when focused=false", () => {
-    const { container } = render(<Row segs={[seg("hi")]} cursorCol={2} focused={false} />);
-    const cell = cursorCell(container);
-    expect(cell!.style.outline).toContain("var(--term-cursor");
-    expect(cell!.style.backgroundColor).toBe("");
-    expect(cell!.className).toBe("");
-  });
-
-  it("fills solid with inverted text color and blinks when focused=true", () => {
-    const { container } = render(<Row segs={[seg("hi")]} cursorCol={2} focused />);
-    const cell = cursorCell(container);
-    expect(cell).not.toBeNull();
-    expect(cell!.style.backgroundColor).toContain("var(--term-cursor");
-    expect(cell!.style.color).toContain("var(--term-bg");
-    expect(cell!.style.outline).toBe("");
-    expect(cell!.className).toContain("animate-term-cursor-blink");
-  });
-
-  it("fills and blinks the blank-cell cursor (cursor past row text) when focused", () => {
-    const { container } = render(<Row segs={[seg("hi")]} cursorCol={5} focused />);
-    const cell = cursorCell(container);
-    expect(cell).not.toBeNull();
-    expect(cell!.style.backgroundColor).toContain("var(--term-cursor");
-    expect(cell!.style.outline).toBe("");
-    expect(cell!.className).toContain("animate-term-cursor-blink");
+  it.each([
+    ["on text", 1],
+    ["past the row text", 5],
+  ])("fills with inverted text and blinks when focused, %s", (_n, col) => {
+    const cell = cursorCell(["hi"], col, true);
+    expect(cell.style.backgroundColor).toContain("var(--term-cursor");
+    expect(cell.style.color).toContain("var(--term-bg");
+    expect(cell.style.outline).toBe("");
+    expect(cell.className).toContain("animate-term-cursor-blink");
   });
 
   it("keeps a glued mark inside the cursor cell on a flow run (NFD input)", () => {
-    // Flow runs can carry zero-width marks too (NFD text typed into the
-    // live input); slicing must stay cluster-aware so the mark is not
-    // stranded outside the highlight.
-    const { container } = render(<Row segs={[seg("cafe\u0301")]} cursorCol={3} />);
-    const cell = cursorCell(container);
-    expect(cell!.textContent).toBe("e\u0301");
-    expect(cell!.style.width).toBe("calc(var(--term-cell, 1em) * 1)");
-    expect(cell!.previousSibling!.textContent).toBe("caf");
+    const cell = cursorCell(["café"], 3);
+    expect(cell.textContent).toBe("é");
+    expect(cell.style.width).toBe("calc(var(--term-cell, 1em) * 1)");
+    expect(cell.previousSibling!.textContent).toBe("caf");
   });
 
-  it("boxes the cursor on a completely empty row (no segments)", () => {
-    // A blank live-input line carries no segments; the pad + blank-cell
-    // path must still run or the cursor vanishes from an empty prompt.
-    // The pad is an explicit box so a fallback font's space advance
-    // cannot push the cursor off its column either.
-    const { container } = render(<Row segs={[]} cursorCol={3} />);
-    const cell = cursorCell(container);
-    expect(cell).not.toBeNull();
-    expect(cell!.textContent).toBe(" ");
-    expect(cell!.style.width).toBe("calc(var(--term-cell, 1em) * 1)");
-    const pad = cell!.previousSibling!;
+  it("boxes both the pad and the cursor on an empty row", () => {
+    const cell = cursorCell([], 3);
+    expect(cell.textContent).toBe(" ");
+    expect(cell.style.width).toBe("calc(var(--term-cell, 1em) * 1)");
+    const pad = cell.previousSibling as HTMLElement;
     expect(pad.textContent).toBe("   ");
-    expect((pad as HTMLElement).style.width).toBe("calc(var(--term-cell, 1em) * 3)");
+    expect(pad.style.width).toBe("calc(var(--term-cell, 1em) * 3)");
   });
 });

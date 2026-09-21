@@ -1,17 +1,6 @@
-// AskUserQuestion / elicitation card. Renders a pending ACP form
-// elicitation inline in the conversation, matching ApprovalCard's visual
-// language so it reads as part of the same flow.
-//
-// AskUserQuestion is the common producer (single/multi-select questions
-// plus an "Other" free-text box), but the same form path also carries
-// arbitrary MCP-server elicitations, so the card renders the full ACP
-// form-schema surface: single-select -> radios, multi-select -> checkboxes,
-// string -> a text input (typed by `format`), number/integer -> a numeric
-// input, boolean -> a checkbox. Submit sends the answers (ACP `accept`);
-// Skip sends `decline` (the agent continues with no answer); Cancel sends
-// `cancel` (aborts the tool call). Client-side validation mirrors the
-// server's (required / length / range / pattern / item bounds), but the
-// server re-validates so the browser is never the only gate.
+// Inline card for a pending ACP form elicitation (AskUserQuestion and MCP
+// elicitations). Submit accepts, Skip declines, Cancel aborts the tool call.
+// Validation mirrors the server's, which re-validates anyway.
 
 import { useCallback, useMemo, useState } from "react";
 import { HelpCircle } from "lucide-react";
@@ -29,9 +18,7 @@ interface Props {
   onResolve: (resolution: ElicitationResolution) => Promise<void>;
 }
 
-/** Per-question answer state: a single scalar (string for free-text /
- *  single-select, the numeric input's raw text for number / integer,
- *  "true" / "false" for boolean) plus a set of values for multi-select. */
+/** `single` holds free text, the selected value, raw numeric text, or "true"/"false"; `multi` holds multi-select values. */
 interface AnswerEntry {
   single: string;
   multi: Set<string>;
@@ -40,16 +27,12 @@ type AnswerMap = Record<string, AnswerEntry>;
 
 const EMPTY_ENTRY: AnswerEntry = { single: "", multi: new Set<string>() };
 
-/** Definite lookup: every question seeds an entry in `initialAnswers`,
- *  but indexed access is `T | undefined` under noUncheckedIndexedAccess,
- *  so fall back to an empty entry rather than spreading guards. */
 function entryFor(answers: AnswerMap, key: string): AnswerEntry {
   return answers[key] ?? EMPTY_ENTRY;
 }
 
 const isNumeric = (kind: ElicitationQuestion["kind"]) => kind === "number" || kind === "integer";
 
-/** Seed answer state from each field's `default`, shaped to its kind. */
 function initialAnswers(questions: ElicitationQuestion[]): AnswerMap {
   const out: AnswerMap = {};
   for (const q of questions) {
@@ -69,31 +52,12 @@ function initialAnswers(questions: ElicitationQuestion[]): AnswerMap {
   return out;
 }
 
-/** Map a string `format` annotation to a native input type; unknown
- *  formats fall back to plain text. */
-function inputTypeFor(format: string | null | undefined): string {
-  switch (format) {
-    case "email":
-      return "email";
-    case "uri":
-      return "url";
-    case "date":
-      return "date";
-    case "date-time":
-      return "datetime-local";
-    default:
-      return "text";
-  }
-}
+const INPUT_TYPES: Record<string, string> = { email: "email", uri: "url", date: "date", "date-time": "datetime-local" };
+const inputTypeFor = (format: string | null | undefined) =>
+  format && Object.hasOwn(INPUT_TYPES, format) ? INPUT_TYPES[format]! : "text";
 
-/** A titled option can carry its description in the structured `description`
- *  field (current adapters); prefer that. An older adapter shape flattened
- *  it into the enum title instead, as `"<label> — <description>"` with the
- *  bare label surviving as the option `value`, so when no structured
- *  description is present and the human label matches that pattern we
- *  recover the two-tier label/description from it; otherwise the title is
- *  shown verbatim (a generic MCP enum where `value` is a code and `label` is
- *  the display text). */
+/** Older adapters flattened options to `"<value> — <description>"`; recover the two
+ *  tiers from that, but a structured `description` (even empty) wins. */
 const OPTION_DESC_SEP = " — ";
 function optionParts(opt: ElicitationOption): { label: string; description?: string } {
   const prefix = `${opt.value}${OPTION_DESC_SEP}`;
@@ -105,10 +69,7 @@ function optionParts(opt: ElicitationOption): { label: string; description?: str
 
 const labelOf = (q: ElicitationQuestion) => q.title || q.field_key;
 
-/** Pre-submit check for a string `format` annotation. The server treats
- *  format as advisory (the ACP spec says unknown formats are annotations,
- *  not gates), so this only catches obviously malformed email / uri / date
- *  values before a round-trip; it never blocks an unknown format. */
+/** Catches obviously malformed known formats; unknown formats are advisory and never block. */
 function isValidByFormat(format: string | null | undefined, value: string): boolean {
   switch (format) {
     case "email":
@@ -150,10 +111,8 @@ function validate(questions: ElicitationQuestion[], answers: AnswerMap): string 
       if (q.minimum != null && num < q.minimum) return `${name} must be at least ${q.minimum}`;
       if (q.maximum != null && num > q.maximum) return `${name} must be at most ${q.maximum}`;
     } else if (q.kind === "boolean") {
-      // A checkbox always carries a definite value; nothing to validate.
       continue;
     } else {
-      // free_text / single_select
       const v = a.single;
       if (q.required && v.trim() === "") return `Please answer: ${name}`;
       if (q.kind === "free_text" && v !== "") {
@@ -165,8 +124,7 @@ function validate(questions: ElicitationQuestion[], answers: AnswerMap): string 
           try {
             if (!new RegExp(q.pattern).test(v)) return `${name} does not match the required format`;
           } catch {
-            // An unparseable pattern is treated as no constraint, matching
-            // the server, which skips invalid regexes.
+            // Like the server, an invalid regex is no constraint.
           }
         }
       }
@@ -252,8 +210,6 @@ export function AskUserQuestionCard({ elicitation, onResolve }: Props) {
       </div>
 
       <div className="flex flex-col gap-4 px-3 py-3">
-        {/* The full prompt wraps here rather than being truncated, so a long
-            question is never cut off. */}
         <p className="whitespace-pre-wrap break-words text-xs text-text-secondary">{elicitation.message}</p>
         {elicitation.description && (
           <p className="whitespace-pre-wrap break-words text-[11px] text-text-dim">{elicitation.description}</p>
@@ -327,8 +283,6 @@ function QuestionField({
   onSetSingle: (value: string) => void;
   onToggleMulti: (value: string) => void;
 }) {
-  // A radio group needs a stable per-question name so selections don't
-  // bleed across questions in a multi-question form.
   const groupName = useMemo(() => `elicit-${question.field_key}`, [question.field_key]);
   const inputClass =
     "w-full rounded-md border border-surface-700 bg-surface-900 px-2 py-1.5 text-xs text-text-primary outline-none focus:border-brand-600 disabled:opacity-60";

@@ -2,23 +2,17 @@ import { useEffect, useMemo, useState } from "react";
 import { listClaudeSessions } from "../../../lib/api";
 import type { ClaudeSessionSummary } from "../../../lib/types";
 
-/** Picker for importing an existing Claude Code session into a structured-view
- *  session (#2276). Lists on-disk sessions newest-first with a filter box;
- *  selecting one hands the caller the id + cwd to prefill the wizard. Sessions
- *  whose recorded cwd no longer exists are shown disabled, since `claude
- *  --resume` has no valid working directory for them. */
+/** Lists on-disk Claude Code sessions to import; ones whose cwd is gone cannot be resumed. */
 export function ClaudeSessionPicker({
   onSelect,
   selectedSessionId,
 }: {
   onSelect: (session: ClaudeSessionSummary) => void;
-  /** Currently-picked session id, so the chosen row stays highlighted. */
   selectedSessionId?: string;
 }) {
   const [sessions, setSessions] = useState<ClaudeSessionSummary[] | null>(null);
   const [filter, setFilter] = useState("");
-  // Sessions whose recorded cwd is gone cannot be resumed, so hide them by
-  // default; the toggle reveals them (shown disabled). See #2276.
+  // Missing-cwd sessions are hidden until toggled, then shown disabled.
   const [showMissing, setShowMissing] = useState(false);
 
   useEffect(() => {
@@ -115,8 +109,6 @@ export function ClaudeSessionPicker({
   );
 }
 
-/** Coarse "x ago" stamp for the last-modified time. Avoids a date library;
- *  the picker only needs rough recency. */
 function formatRelative(ms: number): string {
   if (!ms) return "unknown";
   const diff = Date.now() - ms;

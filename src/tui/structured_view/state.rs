@@ -1,7 +1,6 @@
-//! Owned state for an open structured view: the focus, the reducer-
-//! produced transcript, the composer text, and the websocket handle.
-//! Side effects run in the [`structured_view`](super) async loop;
-//! this state stays freely borrowable by the render layer.
+//! Owned state for an open structured view: focus, transcript, composer text,
+//! and the websocket handle. Side effects run in the async loop in [`super`],
+//! so this state stays freely borrowable by the render layer.
 
 use std::collections::VecDeque;
 
@@ -19,9 +18,8 @@ use crate::daemon::QueuedPromptEntry;
 use crate::plugin::ui_state::{Notification, UiSnapshot};
 use crate::tui::plugin_ui;
 
-/// Most plugin notifications buffered locally awaiting a free toast slot. The
-/// daemon already bounds its notification ring; this is a second guard so a
-/// burst can't grow the view's memory, and old un-shown toasts drop rather
+/// Most plugin notifications buffered awaiting a free toast slot. The daemon
+/// already bounds its ring; this second guard drops old un-shown toasts rather
 /// than the newest.
 const MAX_PENDING_PLUGIN_TOASTS: usize = 20;
 
@@ -41,25 +39,20 @@ pub struct StructuredViewState {
     /// Toast banner that appears briefly above the composer, e.g.
     /// "prompt sent" or an HTTP error.
     pub toast: Option<ToastBanner>,
-    /// Mirror of the daemon-owned prompt queue (the daemon drains it
-    /// server-side at the turn edge; see [`QueueMirror`]). Refreshed from
-    /// `/queue` on connect and at each turn edge, with optimistic edits in
-    /// between.
+    /// Mirror of the daemon-owned prompt queue (drained server-side at the turn
+    /// edge). Refreshed from `/queue` on connect and at each turn edge, with
+    /// optimistic edits in between.
     pub queue: QueueMirror,
-    /// Optimistic in-flight lock: set the instant a prompt POST is sent
-    /// and cleared when the daemon echoes the turn start / end (or the
-    /// POST fails). Without it, a second Enter pressed in the window
-    /// between the POST returning and the `UserPromptSent` echo would see
-    /// a stale-idle reducer and fire a duplicate concurrent prompt.
+    /// Optimistic in-flight lock: set when a prompt POST is sent, cleared when
+    /// the daemon echoes the turn start / end (or the POST fails). Without it a
+    /// second Enter in that window would fire a duplicate concurrent prompt.
     pub in_flight: bool,
     /// Highlighted row in the slash-command picker. Meaningful only
     /// while the picker is open; clamped against the live match count.
     pub slash_selected: usize,
-    /// The exact slash query the user dismissed with Esc. The picker
-    /// stays closed while the composer text still maps to this query,
-    /// so cursor movement (which the textarea reports as edits) can't
-    /// reopen it; the picker reappears only once the query text
-    /// actually changes.
+    /// The exact slash query dismissed with Esc. The picker stays closed while
+    /// the composer text still maps to it, so cursor motion (reported as edits)
+    /// cannot reopen it; it reappears once the query text changes.
     pub dismissed_slash_query: Option<String>,
     /// Workspace file list for the `@`-mention picker, fetched once per
     /// session on the first `@` and cached for its lifetime.
@@ -67,71 +60,56 @@ pub struct StructuredViewState {
     /// Session roots used to shorten tool-call paths in the transcript.
     /// Fetched best-effort from the daemon; `None` keeps raw paths.
     pub path_roots: Option<SessionPathRoots>,
-    /// `Some` while the `@`-mention picker is open. Holds only the
-    /// highlighted-row index; the query and token range are always
-    /// recomputed from the composer via [`super::mention::active_mention`]
-    /// so there is a single source of truth for the typed text.
+    /// `Some` while the `@`-mention picker is open, holding only the highlighted
+    /// row; the query and token range are recomputed from the composer via
+    /// [`super::mention::active_mention`], the single source of truth.
     pub mention: Option<MentionSession>,
-    /// Anchor `(row, col)` of an `@`-token the user dismissed with Esc.
-    /// Keeps the picker closed while they keep typing in that same
-    /// token; cleared once the token goes away or a fresh `@` is typed.
+    /// Anchor `(row, col)` of an `@`-token dismissed with Esc. Keeps the picker
+    /// shut while the user types in that token; cleared once the token goes away.
     pub dismissed_mention: Option<(usize, usize)>,
     /// Active ArrowUp/ArrowDown queue-recall browse, or `None` when the
     /// composer is in its normal typing mode. See [`RecallState`].
     pub recall: Option<RecallState>,
-    /// Latest plugin UI-state snapshot polled from the daemon (#2402). Empty
-    /// until the first poll lands; the status line renders the
-    /// TUI-applicable slots (global `StatusBar`, this session's
+    /// Latest plugin UI-state snapshot polled from the daemon (#2402). The status
+    /// line renders the TUI-applicable slots (global `StatusBar`, this session's
     /// `DetailBadge`) from it.
     pub plugin_ui: UiSnapshot,
-    /// The daemon's active plugin commands (fqid, keybinds, client action),
-    /// polled alongside `plugin_ui`. Plugin chords resolve against this, not the
-    /// TUI's local registry, so a session on a remote daemon can drive plugins
-    /// installed only there (#2528). Empty until the first poll.
+    /// The daemon's active plugin commands, polled alongside `plugin_ui`. Plugin
+    /// chords resolve against this, not the TUI's local registry, so a session on
+    /// a remote daemon can drive plugins installed only there (#2528).
     pub plugin_commands: Vec<PluginCommandView>,
     /// Notification bookkeeping so each `ui.notify` toasts once. See
     /// [`PluginNotifyState`].
     pub plugin_notify: PluginNotifyState,
     /// Vertical scroll of the plugin pane panel (#2467), in wrapped rows.
-    /// `u16::MAX` sticks to the bottom; the renderer clamps it to the content
-    /// height. Reset to 0 each time the panel is opened.
+    /// `u16::MAX` sticks to the bottom; reset to 0 each time the panel opens.
     pub pane_scroll: u16,
-    /// The pane panel's maximum scroll offset from the last render, stashed so
-    /// a scroll step can resolve the `u16::MAX` "stick to bottom" sentinel to a
-    /// concrete row before moving. Same role `last_scroll_max` plays for the
-    /// transcript, and interior-mutable for the same reason: the render borrows
-    /// the state immutably. See `apply_pane_scroll`.
+    /// The pane panel's maximum scroll offset from the last render, so a scroll
+    /// step can resolve the `u16::MAX` sentinel to a concrete row. Interior-mutable
+    /// because the render borrows the state immutably. See `apply_pane_scroll`.
     pub last_pane_scroll_max: std::cell::Cell<u16>,
-    /// Pane rectangles of the most recent draw, so mouse events can be
-    /// hit-tested against what is actually on screen. `None` until the
-    /// first frame renders.
+    /// Pane rectangles of the most recent draw, so mouse events hit-test against
+    /// what is on screen. `None` until the first frame renders.
     pub layout: Option<ViewLayout>,
-    /// Floating single-choice picker: the permission-mode picker
-    /// (Shift+Tab), or the auto-opened answer menu for a pending
-    /// single-select question. `None` when closed. While open it owns
-    /// Up/Down/Enter/Esc, whatever the focus.
+    /// Floating single-choice picker: the permission-mode picker (Shift+Tab), or
+    /// the auto-opened answer menu for a pending single-select question. While
+    /// open it owns Up/Down/Enter/Esc, whatever the focus.
     pub choice: Option<ChoicePicker>,
-    /// Nonce of the elicitation whose answer menu was last auto-opened,
-    /// so a pending question presents itself once, not repeatedly, instead of
-    /// re-opening (or re-toasting) on every frame.
+    /// Nonce of the elicitation whose answer menu was last auto-opened, so a
+    /// pending question presents itself once rather than on every frame.
     pub auto_presented_elicitation: Option<String>,
-    /// The maximum scroll offset (wrapped rows minus visible rows) from
-    /// the last render, stashed so a wheel/PageUp step can resolve the
-    /// `u16::MAX` "stick to bottom" sentinel to a concrete position
-    /// before moving. Interior-mutable so the render (which borrows the
-    /// state immutably) can record it. See `apply_scroll`.
+    /// The maximum scroll offset from the last render, so a wheel/PageUp step can
+    /// resolve the `u16::MAX` "stick to bottom" sentinel to a concrete position.
+    /// Interior-mutable: the render borrows the state immutably. See `apply_scroll`.
     pub last_scroll_max: std::cell::Cell<u16>,
-    /// Context-window percentage at which the status line nudges the user
-    /// to run `/compact`, or `None` when the daemon has the reminder off
-    /// (the default) or its config fetch failed. Read from the daemon's
-    /// `/api/about`, not local config, so a view attached to a remote
-    /// daemon honours that daemon's setting. See #3253.
+    /// Context-window percentage at which the status line nudges toward `/compact`,
+    /// or `None` when off or the fetch failed. Read from the daemon's `/api/about`,
+    /// not local config, so a remote-attached view honours that daemon (#3253).
     pub compaction_reminder_percent: Option<u8>,
 }
 
-/// One open choice-picker: a titled option list plus what accepting the
-/// highlighted option means. Kept generic so the mode picker and the
-/// elicitation answer flow share the input routing and render path.
+/// One open choice-picker: a titled option list plus what accepting means.
+/// Generic so the mode picker and the elicitation answer flow share routing.
 pub struct ChoicePicker {
     pub title: String,
     /// `(value, label)` rows; `value` is what gets submitted.
@@ -143,18 +121,14 @@ pub struct ChoicePicker {
 pub enum ChoicePurpose {
     /// Accepting POSTs `session/set_mode` with the chosen mode id.
     Mode,
-    /// A numbered plugin-link picker: the option `value` is the URL to open in
-    /// the browser. Shown when a plugin `open-ui-link` chord resolves to more
-    /// than one link (a multi-repo workspace with several open PRs).
+    /// A numbered plugin-link picker: the option `value` is the URL to open.
+    /// Shown when an `open-ui-link` chord resolves to more than one link.
     OpenLink,
-    /// Accepting POSTs the approval with the chosen `option_id`, for a
-    /// permission request whose options carry a question rather than an
-    /// allow/deny vocabulary. The option `value` is the `option_id`. See
-    /// #3741.
+    /// Accepting POSTs the approval with the chosen `option_id`, for a request
+    /// whose options carry a question rather than an allow/deny vocabulary (#3741).
     Approval { nonce: String },
-    /// Accepting records the answer for the current question and either
-    /// advances to the next single-select question or, when `remaining`
-    /// is empty, POSTs the accumulated answers.
+    /// Accepting records the answer and either advances to the next single-select
+    /// question or, when `remaining` is empty, POSTs the accumulated answers.
     Elicitation {
         nonce: String,
         /// Field key the open picker answers.
@@ -179,10 +153,8 @@ impl ChoicePicker {
     }
 }
 
-/// Where each pane landed in the last-rendered frame, in screen
-/// coordinates. Computed by `render::compute_layout` and stored here on
-/// every redraw; the input layer maps mouse clicks to focus regions
-/// against it.
+/// Where each pane landed in the last-rendered frame, in screen coordinates.
+/// The input layer maps mouse clicks to focus regions against it.
 #[derive(Debug, Clone, Copy)]
 pub struct ViewLayout {
     pub transcript: Rect,
@@ -192,36 +164,31 @@ pub struct ViewLayout {
     pub composer: Rect,
 }
 
-/// Tracks which plugin notifications have been shown and buffers any awaiting
-/// a free toast slot, so a poll that returns several new notifications shows
-/// them in turn instead of clobbering the single-slot banner down to the last.
+/// Tracks which plugin notifications have been shown and buffers any awaiting a
+/// free toast slot, so a poll returning several shows them in turn.
 #[derive(Debug, Default)]
 pub struct PluginNotifyState {
     /// Highest notification seq already accounted for. Notifications at or
     /// below this are not re-toasted.
     pub last_seen_seq: u64,
-    /// False until the first snapshot establishes the baseline. The first
-    /// snapshot only sets `last_seen_seq` (pre-existing notifications must not
-    /// toast on open); subsequent ones enqueue what is genuinely new.
+    /// False until the first snapshot establishes the baseline: notifications
+    /// that predate opening the view must not toast.
     pub initialized: bool,
     /// Notifications waiting to be shown, oldest first.
     pub pending: VecDeque<Notification>,
 }
 
-/// In-progress shell-history-style browse of the prompt queue. The user
-/// pressed ArrowUp on an empty-origin composer; `index` points at the
-/// queued entry currently loaded into the composer and `stashed_draft`
-/// holds the text that was there before browsing started, restored when
-/// ArrowDown walks back past the newest entry.
+/// In-progress shell-history-style browse of the prompt queue. `index` points at
+/// the queued entry loaded into the composer; `stashed_draft` holds the text from
+/// before browsing, restored when ArrowDown walks past the newest entry.
 #[derive(Debug, Clone)]
 pub struct RecallState {
     pub index: usize,
     pub stashed_draft: String,
 }
 
-/// Build a composer textarea with the shared placeholder + cursor
-/// styling. ratatui-textarea has no public "clear", so resetting the
-/// composer means swapping in a fresh one from here.
+/// Build a composer textarea with the shared placeholder + cursor styling.
+/// ratatui-textarea has no public "clear", so resetting means a fresh one.
 fn new_composer_textarea() -> TextArea<'static> {
     let mut ta = TextArea::default();
     ta.set_placeholder_text("Message the agent…  @ files  / commands");
@@ -229,9 +196,8 @@ fn new_composer_textarea() -> TextArea<'static> {
     ta
 }
 
-/// Lifecycle of the workspace file list backing the `@`-mention picker.
-/// Distinguishes "not fetched yet", "in flight", "loaded" (possibly
-/// empty), and "failed" so the picker can render the right placeholder.
+/// Lifecycle of the workspace file list backing the `@`-mention picker, so the
+/// picker can render the right placeholder for each state.
 #[derive(Debug, Clone)]
 pub enum FileIndex {
     Unloaded,
@@ -302,22 +268,19 @@ impl StructuredViewState {
         }
     }
 
-    /// Drop the plugin pane overlay if it is up, returning focus to the
-    /// transcript (#2467). The overlay is modal and keyed off focus alone, so
-    /// anything that takes the keyboard away from this view has to close it
-    /// first or it paints on with no key able to dismiss it.
+    /// Drop the plugin pane overlay if up, returning focus to the transcript
+    /// (#2467). It is modal and keyed off focus alone, so anything taking the
+    /// keyboard away has to close it or it paints on, undismissable.
     pub fn close_plugin_pane(&mut self) {
         if matches!(self.focus, Focus::Pane) {
             self.focus = Focus::Transcript;
         }
     }
 
-    /// Fold a freshly-polled plugin UI snapshot into state: store it for the
-    /// renderer and enqueue any genuinely-new notifications for this session
-    /// as toasts. The first snapshot only baselines the seq watermark (so
-    /// notifications that predate opening the view stay silent); a snapshot
-    /// whose max seq regressed below the watermark is treated as a daemon
-    /// restart (seq ring reset) and re-baselines without toasting.
+    /// Fold a freshly-polled plugin UI snapshot into state and enqueue
+    /// genuinely-new notifications for this session. The first snapshot only
+    /// baselines the seq watermark; one whose max seq regressed is treated as a
+    /// daemon restart and re-baselines without toasting.
     pub fn ingest_plugin_ui(&mut self, snapshot: UiSnapshot) {
         let max_seq = plugin_ui::max_notification_seq(&snapshot);
         if !self.plugin_notify.initialized || max_seq < self.plugin_notify.last_seen_seq {
@@ -344,11 +307,10 @@ impl StructuredViewState {
         self.plugin_notify.pending.pop_front()
     }
 
-    /// Whether the composer should treat Enter as send-vs-park and whether
-    /// the empty-Enter queue resync should fire. Tracks only the main turn
-    /// (and the connection/POST state), not a display-only background
-    /// sub-agent signal (see `AcpTranscript.background_agent_active`), or an
-    /// idle main turn would suppress the resync while a sub-agent runs
+    /// Whether the composer treats Enter as send-vs-park and whether the
+    /// empty-Enter queue resync fires: mid-turn, a POST in flight, or the
+    /// WebSocket down. Deliberately excludes the display-only
+    /// `AcpTranscript::background_agent_active`, whose turn is genuinely idle
     /// (#4001).
     pub fn is_busy(&self) -> bool {
         self.transcript.turn_active || self.in_flight || self.ws.is_none()
@@ -372,23 +334,19 @@ impl StructuredViewState {
         text
     }
 
-    /// True when the composer caret sits at the very start (row 0, col 0).
-    /// An empty composer trivially satisfies this. Gates entry into
-    /// queue-recall so ArrowUp keeps moving the caret inside a multi-line
-    /// draft until the user is at the top-left, then falls through to the
-    /// queue like a shell history.
+    /// True when the composer caret sits at row 0, col 0 (an empty composer
+    /// trivially qualifies). Gates entry into queue-recall, so ArrowUp keeps
+    /// moving inside a multi-line draft until the top-left, then falls through
+    /// to the queue like shell history.
     pub fn caret_at_origin(&self) -> bool {
         self.composer.cursor() == (0, 0)
     }
 
-    /// Whether an ArrowUp/ArrowDown queue browse is active.
     pub fn browsing_queue(&self) -> bool {
         self.recall.is_some()
     }
 
     /// Replace the composer contents with `text`, caret at the end.
-    /// Mirrors [`Self::take_composer_text`] since
-    /// ratatui-textarea has no public clear.
     pub(crate) fn set_composer_text(&mut self, text: &str) {
         self.composer = new_composer_textarea();
         self.composer.insert_str(text);
@@ -398,10 +356,9 @@ impl StructuredViewState {
         self.dismissed_mention = None;
     }
 
-    /// Step the queue-recall browse by `delta` (-1 = older via ArrowUp,
-    /// +1 = newer via ArrowDown). Entering from the normal composer
-    /// stashes the current draft; walking past the newest entry restores
-    /// it and exits browse. A no-op on an empty queue.
+    /// Step the queue-recall browse by `delta` (-1 older, +1 newer). Entering
+    /// from the normal composer stashes the draft; walking past the newest
+    /// restores it and exits browse. A no-op on an empty queue.
     pub fn recall_step(&mut self, delta: i32) {
         let len = self.queue.len();
         if len == 0 {
@@ -410,8 +367,7 @@ impl StructuredViewState {
         }
         match self.recall.take() {
             None => {
-                // Only ArrowUp enters browse; ArrowDown with no browse is a
-                // no-op (the dispatcher already gates this, but stay safe).
+                // Only ArrowUp enters browse; ArrowDown without one is a no-op.
                 if delta >= 0 {
                     return;
                 }
@@ -452,12 +408,10 @@ impl StructuredViewState {
         }
     }
 
-    /// Replace the queue mirror with a fresh daemon snapshot, keeping an
-    /// active ArrowUp/ArrowDown browse pointed at the same entry across a
-    /// server-side drain. The browsed entry is tracked by its stable id (not
-    /// its index), so entries draining off the front reindex it correctly; if
-    /// that entry is gone from the snapshot the browse ends, leaving the
-    /// in-progress composer text as a normal draft.
+    /// Replace the queue mirror with a fresh daemon snapshot, keeping an active
+    /// browse pointed at the same entry across a server-side drain. The entry is
+    /// tracked by stable id, so drains reindex it correctly; if it is gone the
+    /// browse ends, leaving the composer text as a normal draft.
     pub fn set_queue_snapshot(&mut self, entries: Vec<QueuedPromptEntry>) {
         let browsed_id = self
             .recall
@@ -472,9 +426,8 @@ impl StructuredViewState {
         }
     }
 
-    /// End a queue-recall browse without touching the composer text, so
-    /// any edited prompt is retained as a draft. Called when the queue is
-    /// cleared or focus leaves the composer mid-browse.
+    /// End a queue-recall browse without touching the composer text, so an
+    /// edited prompt is retained as a draft.
     pub fn cancel_recall(&mut self) {
         self.recall = None;
     }
@@ -516,8 +469,7 @@ impl StructuredViewState {
         !self.slash_matches().is_empty()
     }
 
-    /// Move the picker highlight by `delta` rows, saturating at both
-    /// ends of the live match list.
+    /// Move the picker highlight by `delta` rows, saturating at both ends.
     pub fn move_slash_selection(&mut self, delta: i32) {
         let len = self.slash_matches().len();
         if len == 0 {
@@ -535,9 +487,8 @@ impl StructuredViewState {
         self.dismissed_slash_query = self.slash_query();
     }
 
-    /// Replace the composer with `/{name} ` (trailing space, ready for
-    /// arguments) for the highlighted command. Does not submit. Returns
-    /// false when there's no match to accept.
+    /// Replace the composer with `/{name} ` for the highlighted command. Does
+    /// not submit; false when there is no match to accept.
     pub fn accept_selected_slash(&mut self) -> bool {
         let name = match self.slash_matches().get(self.slash_selected) {
             Some(cmd) => cmd.name.clone(),
@@ -551,13 +502,11 @@ impl StructuredViewState {
         true
     }
 
-    /// Keep `slash_selected` in bounds and reset the dismissal latch
-    /// when the query text changes. Call after every composer edit and
-    /// whenever the available-command list shifts under the cursor.
+    /// Keep `slash_selected` in bounds and reset the dismissal latch when the
+    /// query text changes. Call after every composer edit and list shift.
     pub fn reconcile_slash_selection(&mut self) {
-        // A query change clears the dismissal so a freshly-typed query
-        // reopens the picker even if its text once matched a dismissed
-        // one earlier in the session.
+        // A query change clears the dismissal so a freshly-typed query reopens
+        // the picker even if its text once matched a dismissed one.
         let query = self.slash_query();
         if self.dismissed_slash_query.is_some() && self.dismissed_slash_query != query {
             self.dismissed_slash_query = None;
@@ -594,10 +543,9 @@ impl StructuredViewState {
                 .first()
                 .map(|pending| pending.nonce.clone());
         }
-        // A pending approval is modal, like a native agent's permission
-        // prompt: it grabs focus so the decision keys work with no Tab
-        // into the chat. A menu the user opened themselves (mode) keeps
-        // the keyboard until dismissed.
+        // A pending approval is modal, like a native agent's permission prompt:
+        // it grabs focus so decision keys work with no Tab into the chat. A menu
+        // the user opened themselves keeps the keyboard until dismissed.
         if self.choice.is_none() {
             self.focus = Focus::Approval;
         }

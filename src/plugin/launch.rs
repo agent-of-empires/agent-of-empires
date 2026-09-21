@@ -1,22 +1,4 @@
 //! Resolve a plugin's declared `[runtime]` into a concrete, launchable
-//! command, dispatched off the runtime kind.
-//!
-//! The host, not the plugin, decides how to turn a `RuntimeSpec` into a real
-//! program path. This module is the single place that branching lives: a
-//! `Command` runtime resolves its `argv[0]` on `PATH` or inside the plugin
-//! directory; a `ReleaseBinary` runtime points at the per-platform binary
-//! installation already placed in the plugin directory. Adding a new runtime
-//! kind later is a new match arm in [`resolve_launch`], not a rewrite of the
-//! supervisor or the transport: they only ever see a [`ResolvedLaunch`].
-//!
-//! Resolution is language-agnostic. The Python reference plugin declares a
-//! console-script entrypoint (`aoe-github-worker`) or an interpreter
-//! invocation (`python -m aoe_github_plugin.main`); a Rust/native plugin
-//! ships a `release-binary`. Both reach the worker through the same path.
-//!
-//! Filesystem and `PATH` probing go through the [`LaunchResolver`] trait so
-//! the resolution policy is unit-testable without touching the real
-//! filesystem.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -25,25 +7,14 @@ use aoe_plugin_api::RuntimeSpec;
 
 use crate::plugin::registry::LoadedPlugin;
 
-/// Everything `std::process::Command` needs to launch a worker, computed once
-/// and free of any `RuntimeSpec` branching. The supervisor takes this, applies
-/// the sandbox backend, wires stdio, and spawns; it never re-inspects the
-/// manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedLaunch {
-    /// Absolute program path to execute.
     pub program: PathBuf,
-    /// Arguments after the program (the manifest argv tail, or empty).
     pub args: Vec<String>,
-    /// Working directory: the plugin's installed directory.
     pub cwd: PathBuf,
-    /// Environment overlay applied on top of the inherited host environment.
     pub env: BTreeMap<String, String>,
 }
 
-/// Why a plugin's runtime could not be resolved into a launchable command.
-/// Every variant carries the plugin id and an actionable hint, matching the
-/// project's error-with-hint style.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum LaunchError {
@@ -89,21 +60,12 @@ pub enum LaunchError {
     },
 }
 
-/// Indirection over `PATH` lookup and filesystem probing, so the resolution
-/// policy in [`resolve_launch`] can be exercised by unit tests with a fake
-/// that never touches the real filesystem. The real implementation is
-/// [`OsLaunchResolver`].
 pub trait LaunchResolver {
-    /// Resolve a bare program name on `PATH`, returning its absolute path.
     fn which(&self, program: &str) -> Option<PathBuf>;
-    /// Whether `path` exists.
     fn exists(&self, path: &Path) -> bool;
-    /// Whether `path` is a regular file with an executable bit (Unix) or
-    /// simply a file (non-Unix).
     fn is_executable(&self, path: &Path) -> bool;
 }
 
-/// The production [`LaunchResolver`]: real `PATH` and filesystem.
 pub struct OsLaunchResolver;
 
 impl LaunchResolver for OsLaunchResolver {
@@ -130,13 +92,6 @@ impl LaunchResolver for OsLaunchResolver {
     }
 }
 
-/// Resolve a plugin's runtime into a launchable command.
-///
-/// The single dispatch site. A new `RuntimeSpec` variant becomes a new match
-/// arm here; nothing downstream changes. Builtins do not declare a runtime in
-/// this release, so a builtin (or any plugin with `runtime = None`) returns
-/// [`LaunchError::NoRuntime`]: it has no worker. The `aoe __plugin-worker`
-/// self-exec path for builtin workers arrives with the first builtin worker.
 pub fn resolve_launch(
     plugin: &LoadedPlugin,
     resolver: &dyn LaunchResolver,
@@ -185,26 +140,12 @@ pub fn resolve_launch(
     })
 }
 
-/// Resolve a `Command` runtime's argv into `(program, args)`.
-///
-/// `argv[0]` policy: an absolute path is rejected (it pins a host path and
-/// breaks portability); a path containing a separator is resolved relative to
-/// the plugin directory and verified executable; a bare name is resolved on
-/// `PATH` via `which` (the console-script / interpreter case).
-///
-/// Shared with the install-time build runner (`crate::plugin::install`): a
-/// build step's argv is resolved with the exact same policy, against the same
-/// plugin directory, so a step like `.venv/bin/pip` resolves once the prior
-/// step created it.
 pub(crate) fn resolve_command(
     plugin_id: &str,
     dir: &Path,
     command: &[String],
     resolver: &dyn LaunchResolver,
 ) -> Result<(PathBuf, Vec<String>), LaunchError> {
-    // The manifest validator guarantees a non-empty command with non-empty
-    // arguments, so `split_first` cannot fail in practice; treat an empty one
-    // as a missing runtime rather than panicking.
     let (head, tail) = command
         .split_first()
         .ok_or_else(|| LaunchError::NoRuntime {
@@ -235,10 +176,6 @@ pub(crate) fn resolve_command(
     Ok((program, tail.to_vec()))
 }
 
-/// Resolve a plugin-relative executable path under `dir`, rejecting traversal
-/// and verifying the file exists and is executable. `missing` builds the
-/// not-found error so callers can distinguish a command in-tree miss from a
-/// release-binary platform miss.
 fn resolve_in_tree(
     plugin_id: &str,
     dir: &Path,
@@ -246,9 +183,6 @@ fn resolve_in_tree(
     resolver: &dyn LaunchResolver,
     missing: impl FnOnce(PathBuf) -> LaunchError,
 ) -> Result<PathBuf, LaunchError> {
-    // Reject explicit parent traversal before joining. This is defense in
-    // depth: per the honest model (D8) the security boundary is not here, but
-    // a relative worker path should never reach outside its own directory.
     if Path::new(rel)
         .components()
         .any(|c| matches!(c, std::path::Component::ParentDir))
@@ -278,8 +212,6 @@ mod tests {
     use aoe_plugin_api::{PluginManifest, TrustLevel};
     use std::collections::HashSet;
 
-    /// A fake resolver: a fixed `PATH` map plus a set of existing and
-    /// executable in-tree paths. No real filesystem access.
     struct FakeResolver {
         path: BTreeMap<String, PathBuf>,
         exists: HashSet<PathBuf>,
@@ -345,13 +277,6 @@ capabilities = ["runtime.worker"]
     }
 
     #[test]
-    fn no_runtime_has_no_worker() {
-        let p = plugin(None, Some("/plugins/acme.worker"));
-        let err = resolve_launch(&p, &FakeResolver::new()).unwrap_err();
-        assert!(matches!(err, LaunchError::NoRuntime { .. }));
-    }
-
-    #[test]
     fn command_bare_name_resolves_on_path() {
         let p = plugin(
             Some("[runtime]\nkind = \"command\"\ncommand = [\"python3\", \"-m\", \"acme.main\"]\nsystem = true"),
@@ -369,57 +294,56 @@ capabilities = ["runtime.worker"]
     }
 
     #[test]
-    fn command_console_script_missing_on_path_fails_loudly() {
-        let p = plugin(
-            Some("[runtime]\nkind = \"command\"\ncommand = [\"aoe-github-worker\"]\nsystem = true"),
-            Some("/plugins/acme.worker"),
-        );
-        let err = resolve_launch(&p, &FakeResolver::new()).unwrap_err();
-        match err {
-            LaunchError::ProgramNotOnPath { program, .. } => {
-                assert_eq!(program, "aoe-github-worker");
-            }
-            other => panic!("expected ProgramNotOnPath, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn command_relative_path_resolves_in_plugin_dir() {
+    fn command_relative_path_must_exist_in_the_plugin_dir_and_be_executable() {
         let p = plugin(
             Some("[runtime]\nkind = \"command\"\ncommand = [\"bin/worker\"]"),
             Some("/plugins/acme.worker"),
         );
         let bin = PathBuf::from("/plugins/acme.worker/bin/worker");
+
         let resolver = FakeResolver::new().file(bin.clone(), true);
-        let launch = resolve_launch(&p, &resolver).unwrap();
-        assert_eq!(launch.program, bin);
-    }
+        assert_eq!(resolve_launch(&p, &resolver).unwrap().program, bin);
 
-    #[test]
-    fn command_relative_path_not_executable_fails() {
-        let p = plugin(
-            Some("[runtime]\nkind = \"command\"\ncommand = [\"bin/worker\"]"),
-            Some("/plugins/acme.worker"),
-        );
-        let bin = PathBuf::from("/plugins/acme.worker/bin/worker");
         let resolver = FakeResolver::new().file(bin, false);
         let err = resolve_launch(&p, &resolver).unwrap_err();
-        assert!(matches!(err, LaunchError::NotExecutable { .. }));
+        assert!(matches!(err, LaunchError::NotExecutable { .. }), "{err:?}");
     }
 
     #[test]
-    fn command_absolute_argv0_rejected() {
-        // `Path::is_absolute` is platform-specific: a Unix-style path is not
-        // absolute on Windows (it lacks a drive/UNC prefix), so pick an
-        // argv[0] that is absolute under the host's own semantics.
+    fn unusable_runtimes_are_refused_with_their_own_error() {
+        let cases = [
+            ("no runtime at all", None, "no-runtime"),
+            (
+                "console script missing from PATH",
+                Some("[runtime]\nkind = \"command\"\ncommand = [\"aoe-github-worker\"]\nsystem = true"),
+                "not-on-path",
+            ),
+            (
+                "command escaping the plugin dir",
+                Some("[runtime]\nkind = \"command\"\ncommand = [\"../escape\"]"),
+                "path-escape",
+            ),
+        ];
+        for (label, runtime, expected) in cases {
+            let p = plugin(runtime, Some("/plugins/acme.worker"));
+            let err = resolve_launch(&p, &FakeResolver::new()).unwrap_err();
+            let seen = match &err {
+                LaunchError::NoRuntime { .. } => "no-runtime",
+                LaunchError::ProgramNotOnPath { program, .. } => {
+                    assert_eq!(program, "aoe-github-worker", "{label}");
+                    "not-on-path"
+                }
+                LaunchError::PathEscape { .. } => "path-escape",
+                other => panic!("{label}: unexpected {other:?}"),
+            };
+            assert_eq!(seen, expected, "{label}");
+        }
+
         let argv0 = if cfg!(windows) {
             "C:/Windows/py.exe"
         } else {
             "/usr/bin/python3"
         };
-        // An absolute argv[0] never survives manifest validation, so exercise
-        // the resolver directly: it still guards build-step argv, which is not
-        // shape-validated up front.
         let err = resolve_command(
             "acme.worker",
             Path::new("/plugins/acme.worker"),
@@ -427,40 +351,25 @@ capabilities = ["runtime.worker"]
             &FakeResolver::new(),
         )
         .unwrap_err();
-        assert!(matches!(err, LaunchError::AbsoluteArgv0 { .. }));
+        assert!(matches!(err, LaunchError::AbsoluteArgv0 { .. }), "{err:?}");
     }
 
     #[test]
-    fn command_parent_traversal_rejected() {
-        let p = plugin(
-            Some("[runtime]\nkind = \"command\"\ncommand = [\"../escape\"]"),
-            Some("/plugins/acme.worker"),
-        );
-        let err = resolve_launch(&p, &FakeResolver::new()).unwrap_err();
-        assert!(matches!(err, LaunchError::PathEscape { .. }));
-    }
-
-    #[test]
-    fn release_binary_resolves_in_tree() {
+    fn release_binary_resolves_in_tree_or_names_the_platform() {
         let p = plugin(
             Some("[runtime]\nkind = \"release-binary\"\nasset = \"worker-${os}-${arch}\"\nbin = \"bin/worker\""),
             Some("/plugins/acme.worker"),
         );
         let bin = PathBuf::from("/plugins/acme.worker/bin/worker");
-        let resolver = FakeResolver::new().file(bin.clone(), true);
-        let launch = resolve_launch(&p, &resolver).unwrap();
+        let launch = resolve_launch(&p, &FakeResolver::new().file(bin.clone(), true)).unwrap();
         assert_eq!(launch.program, bin);
         assert!(launch.args.is_empty());
-    }
 
-    #[test]
-    fn release_binary_missing_names_platform() {
         let p = plugin(
             Some("[runtime]\nkind = \"release-binary\"\nasset = \"worker\""),
             Some("/plugins/acme.worker"),
         );
-        let err = resolve_launch(&p, &FakeResolver::new()).unwrap_err();
-        match err {
+        match resolve_launch(&p, &FakeResolver::new()).unwrap_err() {
             LaunchError::ReleaseBinaryMissing { os, arch, .. } => {
                 assert_eq!(os, std::env::consts::OS);
                 assert_eq!(arch, std::env::consts::ARCH);

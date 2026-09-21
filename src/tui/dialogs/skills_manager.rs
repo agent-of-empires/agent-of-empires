@@ -1,14 +1,9 @@
-//! Skills manager: list every discovered skill (the AoE-managed store plus
-//! every host-discovered agent skills directory), view a skill's `SKILL.md`,
-//! and run the managed-skill lifecycle in-TUI: create, edit, delete, adopt a
-//! host skill into the managed store, and share every managed skill out to
-//! every agent's skills directory. The TUI twin of `aoe skill` and the
-//! backend model in `crate::session::skills_model`.
+//! Skills manager: list every discovered skill, view a `SKILL.md`, and run the
+//! managed-skill lifecycle (create, edit, delete, adopt a host skill, share to
+//! every agent). The TUI twin of `aoe skill` over `crate::session::skills_model`.
 //!
-//! `home`/`app_dir` are resolved once at construction and reused for every
-//! action rather than re-resolved per keypress, so the mutating helpers below
-//! take no I/O-resolution path of their own (and so a test can hand them a
-//! tempdir directly).
+//! `home`/`app_dir` resolve once at construction, so the mutating helpers take
+//! no resolution path of their own and a test can hand them a tempdir.
 
 use std::path::PathBuf;
 
@@ -30,17 +25,23 @@ struct SyncRequest {
 
 /// The floating popup owning the keyboard; at most one at a time.
 enum Popup {
-    /// Read-only view of a skill's `SKILL.md` (Enter on a row).
-    View { content: String, scroll: u16 },
+    View {
+        content: String,
+        scroll: u16,
+    },
     /// Editing a managed skill's `SKILL.md`.
     Edit {
         directory: String,
         text_area: Box<TextArea<'static>>,
     },
     /// Creating a new managed skill: the directory name being typed.
-    Create { name: String },
+    Create {
+        name: String,
+    },
     /// Confirming deletion of a managed skill.
-    ConfirmDelete { directory: String },
+    ConfirmDelete {
+        directory: String,
+    },
 }
 
 pub struct SkillsManagerDialog {
@@ -50,10 +51,8 @@ pub struct SkillsManagerDialog {
     popup: Option<Popup>,
     home: PathBuf,
     app_dir: PathBuf,
-    /// Spawned on the first share, so a panel that is only browsed never
-    /// starts a thread. Reconciling every skill against every root walks and
-    /// digests whole packages, so it cannot run on the thread that draws
-    /// frames and reads keys without freezing both.
+    /// Spawned on the first share, so browsing starts no thread. Reconciling
+    /// walks and digests whole packages, which would freeze the draw loop.
     sync_worker: Option<Worker<SyncRequest, Vec<SyncOutcome>>>,
     syncing: bool,
 }
@@ -64,8 +63,7 @@ impl Default for SkillsManagerDialog {
     }
 }
 
-/// Map a [`SkillError`] to the message shown in `info`, the same wording the
-/// CLI and the web API surface for the same failures.
+/// The `info` message for a [`SkillError`], worded as the CLI and web do.
 fn describe_skill_error(error: SkillError) -> String {
     match error {
         SkillError::InvalidInput(m)
@@ -129,8 +127,7 @@ impl SkillsManagerDialog {
         dialog
     }
 
-    /// Drain a finished share. Returns whether anything changed, so the caller
-    /// only redraws when it must, matching the other pollers.
+    /// Drain a finished share; true when the caller must redraw.
     pub fn tick(&mut self) -> bool {
         let Some(worker) = &self.sync_worker else {
             return false;
@@ -207,18 +204,15 @@ impl SkillsManagerDialog {
         }
     }
 
-    /// Take a bracketed paste. Only the editor and the create prompt accept
-    /// text; anywhere else in the panel a paste is a no-op, which still has to
-    /// be swallowed here rather than falling through to the home view's other
-    /// dialogs while this one is open.
+    /// Take a bracketed paste. Only the editor and create prompt accept text;
+    /// elsewhere it is swallowed rather than falling through to the home view.
     pub fn handle_paste(&mut self, text: &str) {
         match &mut self.popup {
             Some(Popup::Edit { text_area, .. }) => {
                 text_area.insert_str(text);
             }
             Some(Popup::Create { name }) => {
-                // A directory name is one line, so a multi-line paste takes its
-                // first line rather than smuggling newlines into a path.
+                // A directory name is one line; take the first.
                 name.push_str(text.lines().next().unwrap_or_default());
             }
             _ => {}
@@ -317,8 +311,7 @@ impl SkillsManagerDialog {
                 name.pop();
                 self.popup = Some(Popup::Create { name });
             }
-            // Only a plain keypress is text. Without this, a chord like Ctrl+U
-            // types its letter into the name instead of being ignored.
+            // Only a plain keypress is text, or Ctrl+U types its letter.
             KeyCode::Char(c)
                 if !key
                     .modifiers
@@ -350,7 +343,7 @@ impl SkillsManagerDialog {
         DialogResult::Continue
     }
 
-    /// Open the read-only view popup for the selected row (any provenance).
+    /// Open the read-only view popup for the selected row.
     fn open_view(&mut self) {
         let Some(row) = self.rows.get(self.selected) else {
             return;
@@ -438,8 +431,7 @@ impl SkillsManagerDialog {
         self.popup = Some(Popup::ConfirmDelete { directory });
     }
 
-    /// Reconcile every managed skill into every agent's skills directory and
-    /// summarize the outcome counts.
+    /// Reconcile every managed skill into every agent's skills directory.
     fn share_all(&mut self) {
         if self.syncing {
             self.info = Some("Already sharing.".to_string());

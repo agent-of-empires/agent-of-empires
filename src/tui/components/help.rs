@@ -30,6 +30,12 @@ const SMALL_VIEWPORT_WIDTH: u16 = 40;
 /// Same idea for height: drop top/bottom margin below this.
 const SMALL_VIEWPORT_HEIGHT: u16 = 16;
 
+/// `(key, description)` literals as the owned rows a section holds.
+fn owned<const N: usize>(rows: [(&str, &str); N]) -> Vec<(String, String)> {
+    rows.map(|(key, desc)| (key.to_string(), desc.to_string()))
+        .to_vec()
+}
+
 fn shortcuts(strict: bool, live_on_enter: bool) -> Vec<(&'static str, Vec<(String, String)>)> {
     use crate::tui::home::bindings::{self, HelpSection as Sec};
 
@@ -81,48 +87,31 @@ fn shortcuts(strict: bool, live_on_enter: bool) -> Vec<(&'static str, Vec<(Strin
     ];
     actions_rows.append(&mut actions);
 
-    // Non-action rows with no single registry binding.
+    // Rows with no single registry binding. Tips has no global hotkey at all
+    // (it is palette / badge driven), so `?` would not document it otherwise.
     views.push(("< >".to_string(), "Resize list panel".to_string()));
-    other.push(("n".to_string(), "Next match (after search)".to_string()));
-    other.push((
-        "Ctrl+x".to_string(),
-        "Dismiss update bar (this session)".to_string(),
-    ));
-    other.push((
-        "Shift+drag".to_string(),
-        "Select text in preview".to_string(),
-    ));
-    other.push((
-        "Drag".to_string(),
-        "Select + copy preview (live mode)".to_string(),
-    ));
-    other.push((
-        "Click link".to_string(),
-        "Open underlined preview link or URL".to_string(),
-    ));
-    other.push(("Ctrl+K".to_string(), "Command palette".to_string()));
-    // Tips has no global hotkey (it's palette / badge driven), so it isn't in
-    // the registry-derived rows above; surface it here so `?` still documents it.
-    other.push((
-        "\u{1f4a1}".to_string(),
-        "Tips (badge, or Ctrl+K \u{2192} \"tips\")".to_string(),
-    ));
+    other.extend(owned([
+        ("n", "Next match (after search)"),
+        ("Ctrl+x", "Dismiss update bar (this session)"),
+        ("Shift+drag", "Select text in preview"),
+        ("Drag", "Select + copy preview (live mode)"),
+        ("Click link", "Open underlined preview link or URL"),
+        ("Ctrl+K", "Command palette"),
+        ("\u{1f4a1}", "Tips (badge, or Ctrl+K \u{2192} \"tips\")"),
+    ]));
 
     // Navigation is mode-invariant except the collapse row: in non-strict mode
     // bare `h` is the contextual snooze key, so only `<-` is advertised for
     // collapse; in strict mode `h` always collapses.
     let nav_collapse = if strict { "h/\u{2190}" } else { "\u{2190}" };
-    let navigation = vec![
-        ("j/\u{2193}".to_string(), "Move down".to_string()),
-        ("k/\u{2191}".to_string(), "Move up".to_string()),
-        (nav_collapse.to_string(), "Collapse group".to_string()),
-        ("l/\u{2192}".to_string(), "Expand group".to_string()),
-        ("Home/End/G".to_string(), "Go to top / bottom".to_string()),
-        (
-            "PgUp/Dn".to_string(),
-            "Move 10 (also Shift+\u{2191}/\u{2193}, { })".to_string(),
-        ),
-    ];
+    let navigation = owned([
+        ("j/\u{2193}", "Move down"),
+        ("k/\u{2191}", "Move up"),
+        (nav_collapse, "Collapse group"),
+        ("l/\u{2192}", "Expand group"),
+        ("Home/End/G", "Go to top / bottom"),
+        ("PgUp/Dn", "Move 10 (also Shift+\u{2191}/\u{2193}, { })"),
+    ]);
 
     let actions_title = if strict {
         "Actions (strict mode)"

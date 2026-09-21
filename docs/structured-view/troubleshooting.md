@@ -1,391 +1,117 @@
-# Structured view Troubleshooting
+# Structured View Troubleshooting
 
-The security model structured view enforces, followed by a field guide to every
-failure mode and how to recover. For the day-to-day interface, see
-[Structured view Interface](interface.md); for what survives a restart, see
-[Persistence & recovery](../development/internals/structured-view.md).
+A field guide to the structured view's failure modes. For the day-to-day interface see [Interface](interface.md); for the security model and what survives a restart, see [Structured View Internals](../development/internals/structured-view.md).
 
-## Security
-
-- Agents never touch the disk directly. They go through ACP's
-  `fs/read_text_file` / `fs/write_text_file`, and aoe reads/writes on their
-  behalf, enforcing the sandbox roots (the session's worktree plus any explicit
-  `--repo` paths).
-- Terminal commands run in the session's worktree, or inside the
-  `aoe-sandbox-<id>` container (via `docker exec`) when sandbox is enabled.
-- Approval nonces are server-generated and single-use; aoe never reveals them
-  to the agent, so a compromised agent cannot synthesise approvals.
-- Auth tokens (`AOE_TOKEN`) are not forwarded to the agent subprocess.
-
-### Sandbox containers
-
-Structured view sessions honor the wizard's **Run in a safe container** toggle.
-When enabled, the ACP agent runs inside the same `aoe-sandbox-<id>` Docker
-container the tmux view uses, and the daemon wraps the agent argv in
-`docker exec`.
-
-The published `aoe-sandbox` image bundles the ACP adapters structured view
-sessions need (`claude-agent-acp`, `codex-acp`, `pi-acp`) alongside the
-underlying CLIs whose binaries already provide ACP themselves (`opencode acp`,
-`gemini --acp`, `vibe-acp`). Custom sandbox images must include the same
-adapters or the `docker exec` invocation fails with exit status 127 and the ACP
-handshake times out after 30s.
-
-## Troubleshooting
+## Prerequisites
 
 ### `aoe acp doctor` says Node is missing
 
-Install Node.js 22 or newer:
+Install Node.js 22 or newer (`brew install node`, `apt install nodejs`, `nvm install 22`) and re-run `aoe acp doctor`. For a non-standard location, set `AOE_ACP_NODE=/path/to/node` or `acp.node_path` in `config.toml`.
 
-- macOS: `brew install node`
-- Linux: `apt install nodejs` or `nvm install 22`
-- Windows: download from <https://nodejs.org/>
+### An adapter is missing or too old
 
-Then re-run `aoe acp doctor` to verify. If you have Node installed in a
-non-standard location, set `AOE_ACP_NODE=/path/to/node` or configure
-`acp.node_path` in `config.toml`.
+aoe refuses to start a session whose adapter is below the version floor and reports the exact requirement. Install the official adapter (`npm install -g @agentclientprotocol/claude-agent-acp@latest`), then `claude login` if you have not.
 
-### `aoe acp doctor` says aoe-agent is missing
+`aoe-agent` ships inside the `aoe` binary and installs into the data dir on demand: `aoe acp doctor --fix --adapter aoe-agent`. It needs Node 22.6+. An `aoe` upgrade that changes its bundled sources makes an installed copy stale, and sessions refuse it until `doctor --fix` reinstalls it.
 
-`aoe-agent` ships inside the `aoe` binary as sources and is installed into the
-data dir on demand, like the npm adapters: run
-`aoe acp doctor --fix --adapter aoe-agent`. It needs Node 22.6 or newer (the
-other adapters accept any 22). Until it is installed, sessions that pick it
-fail to start with an install hint and `aoe acp agents` reports it as missing
-rather than present (#3553). An aoe upgrade that changes the bundled sources
-makes the installed copy stale; sessions refuse it with the same hint until
-`doctor --fix` reinstalls it.
+The dashboard surfaces the same thing inline: a compatibility screen with the installed and required versions, the install command to copy, and two controls. **Restart agent** respawns the worker and re-runs the version check, which is all you need after installing the adapter in a shell. **Update & restart** runs the agent's `npm install -g` on the host as the daemon user and then respawns, queueing every other session blocked on that adapter for a respawn too.
 
-### `aoe acp doctor` says claude-code adapter is missing
-
-aoe requires a recent `claude-agent-acp`. If your installed adapter is too old,
-aoe refuses to start the session and reports the exact required version. Install
-the official adapter:
-
-```bash
-npm install -g @agentclientprotocol/claude-agent-acp@latest
-```
-
-Then run `claude login` if you haven't already. If an older version is pinned by
-an internal mirror, ship the required floor from the mirror or run the `@latest`
-install above before starting `aoe serve`.
-
-### Recovering a missing or out-of-date agent from the web dashboard
-
-When the structured view refuses a session because the agent is missing or too
-old, the web dashboard surfaces the reason inline instead of leaving you to read
-the logs:
-
-- The compatibility screen shows the installed vs required version and the exact
-  install command to copy.
-- A missing-binary error message includes the install command for the agent it
-  could not find.
-
-Two recovery controls sit on the compatibility screen:
-
-- **Restart agent** respawns the worker and re-runs the version check at the next
-  handshake. Use it after you have installed or updated the adapter in a shell;
-  no full restart of `aoe serve` is needed.
-- **Update & restart** runs the agent's `npm install -g` on the host (as the
-  user running the daemon) and then respawns. It appears only for
-  npm-installable agents (`claude-agent-acp`, `codex-acp`, `gemini`) and only
-  when `acp.allow_agent_install` is enabled. Because the install is global, the
-  same click also queues **every other session blocked on that same adapter** for
-  an automatic respawn, so one update clears every red X at once (the screen
-  reports how many other sessions it recovered). When the setting is off the
-  button is shown disabled with a hint to enable it.
-
-`acp.allow_agent_install` is **off by default**: running a global package install
-from the daemon is a host-level capability that executes the package's npm
-lifecycle scripts as the daemon user. It is always blocked in `--read-only` mode,
-and the setting is `local_only`, so the web dashboard cannot turn it on (the leaf
-is stripped from every web settings write, remote or local). Enable it from the
-`aoe` TUI settings (Advanced) or in the config file; the button activates on the
-next reload. For agents that install some other way (`opencode`, `vibe-acp`,
-`pi-acp`), the screen shows the manual command instead of an Update button.
-Inside a sandbox session, a host install would not reach the containerized agent,
-so the action is refused; install the agent in the container image instead.
+That second button appears only for npm-installable agents and only when `acp.allow_agent_install` is on. It is **off by default**, because a global install runs the package's lifecycle scripts as the daemon user; it is always blocked in read-only mode and is `local_only`, so the dashboard cannot turn it on. Enable it from the TUI settings (Advanced) or the config file. Inside a sandbox a host install would not reach the containerized agent, so the action is refused: install the agent in the image instead.
 
 ### "Failed to start structured view agent" while the adapter is installed
 
-`aoe serve` captures the launching shell's PATH at startup. If the adapter lives
-under a node-version-manager dir (nvm, fnm, mise, asdf) and the node version on
-the daemon's PATH doesn't match, the spawn fails with
-`agent spawn failed: No such file or directory`.
+`aoe serve` captures the launching shell's `PATH` at startup. If the adapter lives under a node-version-manager directory (nvm, fnm, mise, asdf) and the node version on the daemon's `PATH` does not match, the spawn fails with `No such file or directory`. Restart `aoe serve` from a shell where `which claude-agent-acp` resolves, or symlink the binary into `/usr/local/bin` or `~/.local/bin`.
 
-Either restart `aoe serve` from a shell where `which claude-agent-acp`
-resolves, or symlink the binary into a standard dir (`/usr/local/bin`,
-`~/.local/bin`, etc.).
+### Native binary launch failure
 
-### "Project path no longer exists" banner
+A banner reading `Claude Code native binary at ... exists but failed to launch` means the adapter found its bundled native sub-binary but the kernel rejected `execve`. Reinstalling the adapter does not help. The causes:
 
-The session's working directory was renamed, moved, or deleted out from under
-`aoe serve` (most often a `git worktree move` or a manual `mv`). Three ways to
-recover:
+1. **Architecture mismatch.** The filename ends in a target triple (`...-linux-arm64/claude`); if the host or container reports a different `uname -m`, the loader refuses it. Most often an arm64 host pulling an amd64 image without `--platform`.
+2. **Missing dynamic loader or old glibc** in a slim base image. `ldd <binary>` inside the container reports the gap.
+3. **A `node_modules` bind-mounted across architectures.**
 
-1. **Restart `aoe serve`.** For an aoe-managed worktree relocated with
-   `git worktree move`, the daemon repairs `project_path` from
-   `git worktree list` on startup and the banner clears on its own. This does
-   not cover a plain `mv` (see the worktrees guide), does not happen while the
-   daemon keeps running, and is skipped entirely on a read-only daemon, which
-   never writes `sessions.json`.
-2. **Restore the directory at the path the banner shows** (e.g.
-   `git worktree move <new> <old>`, or recreate the dir), then click **Retry**.
-   Transcript continuity is preserved.
-3. **Stop `aoe serve`**, edit `project_path` for this session in
-   `~/.agent-of-empires/profiles/<profile>/sessions.json` to point at the new
-   location (update `worktree_info.branch` too if the branch was renamed), then
-   start `aoe serve` again. History and `acp_session_id` are preserved; the
-   conversation resumes against the new path.
+Use **Open agent log** on the banner, or `aoe acp logs --session <id>`, for the verbatim adapter error, and compare `file <binary>` with `uname -m` inside the container. Fix it by re-pulling the image with `--platform linux/<host-arch>` or installing the adapter inside the container rather than bind-mounting it.
 
-Reinstalling the adapter does not help here; the adapter is fine, the cwd is
-gone.
+## During a session
+
+### "Project path no longer exists"
+
+The session's working directory was renamed, moved, or deleted out from under `aoe serve`. Three ways back:
+
+1. **Restart `aoe serve`.** For a managed worktree moved with `git worktree move`, the daemon repairs `project_path` from `git worktree list` at startup. That does not cover a plain `mv` (see the [worktrees guide](../guides/worktrees.md#when-the-directory-moves-outside-aoe)), does not happen while the daemon keeps running, and is skipped on a read-only daemon.
+2. **Restore the directory** at the path the banner names, then click **Retry**. Transcript continuity is preserved.
+3. **Stop the daemon and edit `project_path`** for the session in `sessions.json` (and `worktree_info.branch` if the branch was renamed), then start it again. History and `acp_session_id` are preserved.
 
 ### Agent stopped responding to cancel
 
-If the agent ignores `session/cancel` mid-tool-call, aoe restarts the worker and
-resumes the transcript. The structured view shows "Agent stopped responding to
-cancel. Restarting worker; your transcript will be preserved" while the respawn
-is in flight, and the banner clears once the new worker is online.
-
-Follow-up prompts the daemon refused while the original turn was still in flight
-show in the composer as amber "Rejected" pills with a Retry button; clicking
-Retry re-dispatches the prompt against the freshly-respawned worker.
+If the agent ignores `session/cancel` mid-tool, aoe restarts the worker and resumes the transcript, showing a banner until the respawn lands. Follow-up prompts the daemon refused while the original turn was in flight appear as amber "Rejected" pills with a Retry button.
 
 ### Tool card stuck "running" after a stop
 
-Stopping the agent while a tool call is mid-execution settles that tool's card
-to a muted **stopped** state: the elapsed-time timer freezes and the badge
-leaves the orange "running" state. This is intentional. "stopped" is neither
-"done" nor "failed"; the tool's real outcome was never reported. The same
-applies on reload and when the backend switches agents mid-turn.
+Stopping mid-tool settles that card into a muted **stopped** state: the timer freezes and the badge leaves "running". That is deliberate, since "stopped" is neither done nor failed and the tool's real outcome was never reported.
 
-### Rate-limit recovery
+### "Force end turn" button under the spinner
 
-When the active backend hits its rate limit, aoe parks the session rather than
-respawning into the same limit. The dashboard shows a banner with the reset
-time and a primary **Continue in another agent** CTA. Agents do not always
-report a reset time; when none was reported the banner shows the agent's own
-wording instead of a clock, which usually names the reset ("resets 4am
-(Europe/Paris)"). Clicking it opens a picker
-of the structured view ACP registry (claude / codex / opencode / gemini / vibe
-/ pi / aoe-agent by default, plus anything you've added), preselects `codex`
-when installed, switches on confirm, and pre-fills the composer with a recap of
-the prior conversation (including your last prompt if it triggered the limit).
-Review and send manually; it is not auto-sent.
+If the agent finished but the spinner keeps rattling, a **Force end turn** button appears beneath it; clicking it clears the spinner and cancels the agent. It only appears for a silent model with no tool running, and the view auto-recovers on its own if you do nothing. It stays hidden while a tool is in flight, while a question or approval card awaits you, and during a `/compact` (where the spinner reads "Compaction in progress" instead), because compaction runs for a minute or more with no output and force-ending it would discard the summarization.
 
-#### Optional auto-resume after reset
+### "Restarting worker" after a turn looked done
 
-If you would rather stay on the same backend and have AoE pick the session back
-up automatically once the limit clears, enable the opt-in setting (off by
-default):
+Some adapters finish a turn, stream the final message and end-of-turn usage, but never send the protocol's turn-complete acknowledgement. When the usage arrived and no background or scheduled task was running, the daemon ends the turn cleanly. A genuine stall still restarts the worker and shows the banner; the transcript is preserved either way.
+
+### The view feels stuck with no events
+
+- Read `aoe acp logs --session <id>`, or **Open agent log** on the red startup-error banner.
+- Check the connection chrome at the top of the view for reconnect status.
+- A repeatedly-failing worker is parked with a red "session parked" banner: retry from the dashboard or run `aoe acp restart <session>`.
+
+The view auto-reconnects with exponential backoff if the WebSocket drops and resumes the transcript where it left off. The banner counts the attempts and offers a manual **Reconnect** once they are exhausted; returning the tab to the foreground reconnects immediately.
+
+### Approval card vanished without resolving
+
+Approvals expire after `approval_timeout_secs` (default 300). The agent receives a structured cancellation and typically asks again. Raise the timeout if your approvals legitimately take longer.
+
+## Rate limits and agent hand-off
+
+When the active backend hits its rate limit, aoe parks the session rather than respawning into the same limit. The banner shows the reset time, or the agent's own wording when it reported no clock, and a **Continue in another agent** CTA. That opens a picker over the ACP registry, preselects `codex` when installed, switches on confirm, and pre-fills the composer with a recap of the prior conversation (including the prompt that triggered the limit). Review and send it yourself; nothing is auto-sent.
+
+### Auto-resume after reset
+
+To stay on the same backend instead, opt in:
 
 ```toml
 [acp]
 rate_limit_auto_resume = true
 ```
 
-The setting is editable in the structured view settings (TUI and web
-dashboard) and can be overridden per profile. The park survives a resume
-that fails to start: the sidebar badge and the banner stay until the worker
-is back or the session is stopped for another reason. Resume fires once the reported
-reset time plus a fixed 15-second cushion passes, and the reset time survives
-an `aoe serve` restart. With no reported reset time, resume retries an hour
-after the park, and each further attempt waits twice as long as the last: 1h,
-2h, 4h, 8h, 16h. A quota that is exhausted for days is then retried on a
-schedule that matches it, instead of once an hour forever.
+Resume fires once the reported reset plus a 15-second cushion passes, and the reset time survives an `aoe serve` restart. With no reported reset, the first retry is an hour after the park and each further attempt waits twice as long (1h, 2h, 4h, 8h, 16h), so a quota exhausted for days is retried on a matching schedule. The park survives a resume that fails to start.
 
-Auto-resume re-sends the interrupted prompt each time, so it stops after five
-re-sends that all come back rate-limited. Those five span 31 hours, so a limit
-that clears overnight is still picked up. The banner then reads "Auto-resume
-stopped: the same prompt was re-sent too many times without getting through",
-and the session stays put rather than burning the same turn indefinitely. The park itself resets the count, so recovering from it starts a
-fresh five whether you use "Resume now" or send a new prompt. A completed turn
-and an agent switch reset it too, and "Resume now" retries never count against
-it. A prompt sent before auto-resume gives up does not reset anything: it
-continues on whatever is left of the five. The manual "Continue in another
-agent" and reconnect paths stay available regardless of the setting.
+Each resume re-sends the interrupted prompt, so it gives up after five re-sends that all come back rate-limited, spanning 31 hours. The banner then reads "Auto-resume stopped" and the session stays put. Recovering from the park resets the count, as do a completed turn and an agent switch; manual "Resume now" retries never count against it.
 
 ### Switching agents manually
 
-The same hand-off is available at any time, not just during a rate limit. This
-matters when you handed a session off (say, claude to codex during a rate limit)
-and later want to return to the original agent.
+The same hand-off is available any time, which is how you return to the original agent after a rate-limit switch.
 
-- **Web dashboard:** right-click a structured view session in the sidebar and
-  pick "Switch agent". It opens the same picker and switches on confirm. The
-  composer is pre-filled with a recap; review and send manually. The picker
-  lists built-in agents only.
-- **CLI:** `aoe acp switch-agent <session> <target>` (run `aoe acp agents` to
-  list the built-in target keys). Pass `--model <name>` to override the model
-  the new agent starts with. A custom agent with an `agent_acp_cmd` entry is
-  also a valid target even though neither surface lists it, so switching to one
-  means naming it here.
+- **Web**: right-click the session and pick "Switch agent". The picker lists built-in agents only.
+- **CLI**: `aoe acp switch-agent <session> <target>` (`aoe acp agents` lists the target keys; `--model <name>` overrides the model it starts with). A custom agent with an `agent_acp_cmd` is a valid target even though neither surface lists it.
 
-The transcript divider reads `Switched structured view agent from <from> to <to>
-(manual)`, distinct from the `(rate_limited)` divider the recovery flow emits.
+The transcript divider reads `Switched structured view agent from <from> to <to> (manual)`, distinct from the `(rate_limited)` one the recovery flow emits.
 
-### Native binary launch failure
+## `/clear` collapsed earlier turns
 
-When the structured view banner shows an error of the form
+`/clear` wipes the model's context on the adapter side but preserves the visible transcript: the view appends a "Conversation cleared" divider, resets the plan, mode, approvals, and usage, then folds everything above the divider behind a `Show N earlier turns` banner. The slash palette and mode picker stay populated.
 
-```text
-Claude Code native binary at /usr/lib/node_modules/.../claude exists but failed to launch.
-```
+For claude and codex a clear starts a genuinely new agent conversation rather than clearing in place, so it survives a worker restart: after an idle-out or daemon restart the next prompt resumes the post-clear conversation. The trade-off is that a clear is refused while background sub-agents or tool calls are still draining, since switching conversations mid-drain would file their output under the new one. Wait and send it again. A clear can also fail outright if the new conversation cannot start (an MCP server that will not re-initialize), leaving the existing conversation untouched.
 
-the adapter found its bundled Claude Code native sub-binary on disk but `execve`
-was rejected by the kernel. Reinstalling `claude-agent-acp` does not help; the
-binary is already there.
+A `/clear` queued mid-turn (or an agent's alias, such as `/new`) fires as its own send when the turn ends, so `foo`, `/clear`, `bar` lands as three prompts; the queued strip shows an amber `fires separately` divider between rows landing in different sub-batches. The session cost in the composer footer counts from the most recent `/clear` or `/compact`, not the session's lifetime.
 
-The common causes:
+## Diff viewer is blank
 
-1. **Architecture mismatch.** The binary's filename ends in a target triple
-   (`...-linux-arm64/claude`, `...-linux-x64/claude`). If the host or container
-   reports a different arch via `uname -m`, the loader refuses it. Most often an
-   `arm64` host pulling an `amd64` image without `--platform`.
-2. **Missing dynamic loader or old glibc.** Slim base images sometimes ship
-   without `/lib64/ld-linux-x86-64.so.2` or with a glibc too old. `ldd <binary>`
-   from inside the container reports the gap.
-3. **Bind-mounted `node_modules` across arch.** A host `arm64` binary cannot
-   launch in an `amd64` container and vice versa.
+If the Changes panel shows a file's header but no diff body, with no error and a clean console, a page-restyling browser extension is almost certainly overriding the styling: the diff renders into a shadow DOM and "dark mode for every site" extensions reach into it and make the rows invisible. This is most common on Firefox. Confirm in Troubleshoot Mode, then disable the extension for the dashboard or allowlist the dashboard's origin.
 
-Use **Open agent log** on the red startup banner for the verbatim adapter error,
-or run `aoe acp logs --session <id>`. To inspect the binary:
+## Editing settings asks for the passphrase again
 
-```sh
-docker exec <container> file /usr/lib/node_modules/@agentclientprotocol/claude-agent-acp/node_modules/@anthropic-ai/claude-agent-sdk-*/claude
-docker exec <container> uname -m
-```
+Day-to-day flows (prompts, cancels, approvals, mode switches, worker restarts, terminal attach) never re-prompt; editing persisted config does. See [step-up elevation](../guides/web-dashboard.md#security).
 
-If the file's arch line does not match `uname -m`, either re-pull the image with
-`--platform linux/<host-arch>` or install `claude-agent-acp` inside the
-container (rather than bind-mounting from the host).
+## Sharing debug logs
 
-### Structured view feels "stuck" with no events
-
-- Check `aoe acp logs --session <id>`, or **Open agent log** on the red
-  startup-error banner in the dashboard.
-- Check the dashboard's connection chrome at the top of the view; it shows
-  reconnect status if the WebSocket is degraded.
-- A repeatedly-failing worker is parked with a red "session parked" banner.
-  Retry from the dashboard or run `aoe acp restart <session>`.
-- A session that was auto-stopped for inactivity and then respawned (for
-  example after a version upgrade) used to be able to keep a stale "dormant"
-  marker, which made the daemon refuse to bring the worker back after it next
-  exited; a follow-up message would then sit unsent. A worker coming online now
-  clears that marker, so this no longer strands a queued message.
-
-### "Restarting worker" banner after a turn looked done
-
-Some agents (notably `claude-agent-acp`) occasionally finish a turn, stream
-the final message and the end-of-turn usage, but never send the protocol's
-turn-complete acknowledgement. The daemon used to treat that as a wedge and
-restart the worker, showing **Agent finished but didn't notify the daemon.
-Restarting worker; your transcript will be preserved.** When the agent had
-already emitted its end-of-turn usage and was not running a background or
-scheduled task, the daemon now ends the turn cleanly instead, so a completed
-turn no longer triggers a restart. A genuine stall (no end-of-turn usage, or a
-monitor / scheduled-wake turn that overran) still restarts the worker and
-shows the banner; the transcript is preserved either way.
-
-### Diff viewer is blank (page-restyling browser extensions)
-
-If the Changes panel shows a file's header (path, `+`/`-` counts, the
-Unified/Split toggle) but the diff body below is empty, with no error and a
-clean console, a page-restyling browser extension is almost certainly
-overriding the diff styling. The diff renders into a shadow DOM, and "dark
-mode for every site" extensions (Midnight Lizard, DocsAfterDark, and similar)
-reach into it and make the rows invisible. This is most common on Firefox.
-
-To confirm it is an extension, open the dashboard in Firefox Troubleshoot Mode
-(Menu, Help, Troubleshoot Mode); if the diff renders there, an extension is
-the cause. Fix it by disabling the restyling extension for the dashboard, or
-allowlist the dashboard origin in the extension's settings.
-
-### "Force end turn" button under the spinner
-
-If the agent finished a turn but the working spinner is still rattling, a small
-**Force end turn** button appears beneath it. Click it to clear the spinner and
-cancel the agent. It only appears for a silent model with no tool running, and
-the view auto-recovers on its own if you do nothing. During healthy streaming, or
-while a tool is in flight, the spinner keeps running but the button stays hidden.
-While a question or approval card is awaiting your input, both the spinner and the
-button are hidden, so the actionable card stands alone.
-
-During a `/compact` the button also stays hidden and the spinner reads
-"Compaction in progress" instead: compaction runs for a minute or more with no
-output at all, and force-ending it would discard the summarization. Messages you
-type meanwhile are queued and sent once it finishes.
-
-### Editing settings asks for the passphrase again
-
-When passphrase login is configured, the daily-use structured view flows
-(sending prompts, cancelling turns, resolving approvals, switching mode,
-restarting workers, attaching terminals) do NOT prompt for the passphrase again.
-Your session cookie plus the device-binding secret are sufficient. See #1137.
-
-Editing the persisted config IS gated. Saving the global settings panel,
-creating / deleting / renaming a profile, editing a profile's settings, or
-changing the default profile requires that your login session has been
-"elevated" within the last 15 minutes. The first such action after a fresh page
-load surfaces an inline passphrase prompt; subsequent edits inside the same
-window go through without re-prompting.
-
-### WebSocket auto-reconnect and keepalive
-
-The view auto-reconnects with exponential backoff if the WebSocket drops, and
-resumes the transcript from where it left off so it stays continuous. The banner
-shows `Reconnecting (N/7) in Xs...` while the auto-retry is armed, and a manual
-**Reconnect** button after the attempts exhaust. Returning the tab to the
-foreground triggers an immediate reconnect.
-
-
-### Approval card vanished without resolving
-
-Approvals expire after `approval_timeout_secs` (default 300). The agent receives
-a structured cancellation; you'll typically see a follow-up message asking
-again. Bump the timeout if you're in a context where approvals legitimately take
-longer.
-
-### `/clear` collapsed earlier turns
-
-When you run `/clear` in a structured view session, the model's context is wiped
-on the adapter side but the visible transcript is preserved. The view appends a
-"Conversation cleared" divider, resets the active plan, current mode, in-flight
-approvals, and usage snapshot, then folds every row above the divider behind a
-disclosure banner: `Show N earlier turns (cleared, not in the model's memory)`.
-Click the banner to expand the older transcript for your own reference; the
-model still won't see those turns. See
-[#1101](https://github.com/agent-of-empires/agent-of-empires/issues/1101).
-
-The slash-command palette and mode picker stay populated across a `/clear`.
-
-For claude and codex, a clear starts a genuinely new agent conversation rather
-than clearing the existing one in place, so it survives a worker restart: if the
-session later idles out or the daemon restarts, the next prompt resumes the
-post-clear conversation instead of starting from nothing. The trade-off is that
-a clear is refused while background sub-agents or tool calls are still draining,
-because switching conversations mid-drain would file their remaining output
-under the new one. Wait for that work to finish, then send the clear again. A
-clear can also fail outright if starting the new conversation fails, for
-instance when an MCP server will not re-initialize; the existing conversation is
-left untouched when that happens, so no divider appears and nothing is lost.
-
-A `/clear` queued mid-turn (or any agent's clear alias, e.g. codex / opencode
-`/new`) fires as its own send when the turn ends. An ordering like `foo`,
-`/clear`, `bar` lands as three separate prompts; the queued-prompt strip shows
-an amber `fires separately` divider between rows that will land in different
-sub-batches. See #1356.
-
-The session cost figure in the composer footer reads "since the most recent
-`/clear` (or `/compact`)" rather than session-lifetime cumulative. See #1354.
-
-### Sharing debug logs
-
-`AOE_LOG_LEVEL=debug` (or the legacy `AGENT_OF_EMPIRES_DEBUG=1`) writes agent
-stderr verbatim to `debug.log` under the app data dir. We scrub common API-key
-prefixes (Anthropic `sk-...`, GitHub `ghp_...`, AWS `AKIA...`, `Bearer <token>`,
-etc.) before they hit disk, but the scrub is best-effort; a hand-rolled secret
-with no recognisable shape will pass through. Before attaching `debug.log` to a
-bug report, skim it for anything that looks like a credential and replace it
-with `<redacted>` if needed.
+`AOE_LOG_LEVEL=debug` writes agent stderr verbatim to `debug.log` in the app data dir. Common API-key shapes (`sk-...`, `ghp_...`, `AKIA...`, `Bearer <token>`) are scrubbed before they hit disk, but the scrub is best-effort: a hand-rolled secret with no recognizable shape passes through. Skim the file before attaching it to a bug report.

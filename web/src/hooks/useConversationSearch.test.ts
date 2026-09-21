@@ -1,8 +1,4 @@
 // @vitest-environment jsdom
-//
-// Coverage for useConversationSearch: debounces, skips queries below the
-// minimum length, and drops a stale in-flight response when the query
-// changes so out-of-order resolution never shows old results.
 
 import { renderHook, act } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -43,8 +39,6 @@ describe("useConversationSearch", () => {
   });
 
   it("drops a stale response when the query changes", async () => {
-    // First query resolves slowly; second resolves immediately. The hook
-    // must show only the second query's results.
     let resolveFirst: (v: api.ConversationSearchHit[]) => void = () => {};
     const spy = vi
       .spyOn(api, "searchConversations")
@@ -65,8 +59,6 @@ describe("useConversationSearch", () => {
       await Promise.resolve();
     });
 
-    // Late first response arrives after the query changed; it was aborted,
-    // so applying it must be a no-op.
     await act(async () => {
       resolveFirst([{ session_id: "s1", seq: 9, kind: "agent", snippet: "first", match_count: 1 }]);
       await Promise.resolve();

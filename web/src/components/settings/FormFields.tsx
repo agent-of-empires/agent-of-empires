@@ -1,4 +1,52 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
+
+const CONTROL = "w-full bg-surface-900 border border-surface-700 rounded-md px-3 py-2 text-sm text-text-primary";
+const FOCUS = "focus:border-brand-600 focus:outline-none";
+
+/** Label above an optional description above the control. A `label` of `undefined` drops the element. */
+function FieldShell({
+  label,
+  description,
+  labelClassName,
+  children,
+}: {
+  label?: string;
+  description?: string;
+  labelClassName?: string;
+  children: ReactNode;
+}) {
+  return (
+    <div>
+      {label !== undefined && (
+        <label className={labelClassName ?? "block text-sm text-text-bright mb-1"}>{label}</label>
+      )}
+      {description && <div className="text-xs text-text-dim mb-1">{description}</div>}
+      {children}
+    </div>
+  );
+}
+
+/** Edits a local draft while focused and commits on blur, so typing never fights the saved value. */
+function useDraft(value: string, onCommit: (draft: string) => void) {
+  const [local, setLocal] = useState(value);
+  const [focused, setFocused] = useState(false);
+
+  if (!focused && local !== value) setLocal(value);
+
+  const commit = () => {
+    onCommit(local);
+    setFocused(false);
+  };
+  return {
+    commit,
+    props: {
+      value: local,
+      onChange: (e: { target: { value: string } }) => setLocal(e.target.value),
+      onFocus: () => setFocused(true),
+      onBlur: commit,
+    },
+  };
+}
 
 export function CollapsibleSection({
   title,
@@ -44,6 +92,36 @@ export function CollapsibleSection({
         </div>
       </button>
       {open && <div className="px-4 py-4 space-y-4 border-t border-surface-700/20">{children}</div>}
+    </div>
+  );
+}
+
+/** Checkbox row used by the per-browser preference panels. */
+export function CheckboxRow({
+  title,
+  description,
+  checked,
+  onChange,
+}: {
+  title: string;
+  description: string;
+  checked: boolean;
+  onChange: (v: boolean) => void;
+}) {
+  return (
+    <div>
+      <label className="flex items-center justify-between gap-3 cursor-pointer">
+        <div>
+          <div className="text-[13px] text-text-secondary">{title}</div>
+          <p className="text-[11px] text-text-muted mt-1">{description}</p>
+        </div>
+        <input
+          type="checkbox"
+          checked={checked}
+          onChange={(e) => onChange(e.target.checked)}
+          className="accent-brand-600 w-4 h-4 shrink-0"
+        />
+      </label>
     </div>
   );
 }
@@ -97,32 +175,20 @@ export function TextField({
   mono?: boolean;
   multiline?: boolean;
 }) {
-  const [local, setLocal] = useState(value);
-  const [focused, setFocused] = useState(false);
+  const draft = useDraft(value, (next) => {
+    if (next !== value) onChange(next);
+  });
 
-  // Sync from parent when not focused (external updates)
-  if (!focused && local !== value) setLocal(value);
-
-  const commit = () => {
-    if (local !== value) onChange(local);
-    setFocused(false);
-  };
-
-  const cls = `w-full bg-surface-900 border border-surface-700 rounded-md px-3 py-2 text-sm text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none ${mono ? "font-mono" : ""}`;
+  const cls = `${CONTROL} placeholder:text-text-dim ${FOCUS} ${mono ? "font-mono" : ""}`;
   return (
-    <div>
-      <label className="block text-sm text-text-bright mb-1">{label}</label>
-      {description && <div className="text-xs text-text-dim mb-1">{description}</div>}
+    <FieldShell label={label} description={description}>
       {multiline ? (
         <textarea
-          value={local}
-          onChange={(e) => setLocal(e.target.value)}
-          onFocus={() => setFocused(true)}
-          onBlur={commit}
+          {...draft.props}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
-              commit();
+              draft.commit();
             }
           }}
           placeholder={placeholder}
@@ -132,18 +198,15 @@ export function TextField({
       ) : (
         <input
           type="text"
-          value={local}
-          onChange={(e) => setLocal(e.target.value)}
-          onFocus={() => setFocused(true)}
-          onBlur={commit}
+          {...draft.props}
           onKeyDown={(e) => {
-            if (e.key === "Enter") commit();
+            if (e.key === "Enter") draft.commit();
           }}
           placeholder={placeholder}
           className={cls}
         />
       )}
-    </div>
+    </FieldShell>
   );
 }
 
@@ -160,27 +223,19 @@ export function SelectField({
   value: string;
   onChange: (v: string) => void;
   options: { value: string; label: string }[];
-  /** Override the default `text-sm text-text-bright mb-1` label classes
-   *  (used by the Logging panel to render heavier section labels).
-   *  Pass `""` to suppress the label element entirely. */
+  /** Overrides the label classes; `""` hides the label. */
   labelClassName?: string;
 }) {
   return (
-    <div>
-      {label && <label className={labelClassName ?? "block text-sm text-text-bright mb-1"}>{label}</label>}
-      {description && <div className="text-xs text-text-dim mb-1">{description}</div>}
-      <select
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        className="w-full bg-surface-900 border border-surface-700 rounded-md px-3 py-2 text-sm text-text-primary focus:border-brand-600 focus:outline-none"
-      >
+    <FieldShell label={label || undefined} description={description} labelClassName={labelClassName}>
+      <select value={value} onChange={(e) => onChange(e.target.value)} className={`${CONTROL} ${FOCUS}`}>
         {options.map((opt) => (
           <option key={opt.value} value={opt.value}>
             {opt.label}
           </option>
         ))}
       </select>
-    </div>
+    </FieldShell>
   );
 }
 
@@ -199,35 +254,24 @@ export function NumberField({
   min?: number;
   max?: number;
 }) {
-  const [local, setLocal] = useState(String(value));
-  const [focused, setFocused] = useState(false);
-
-  if (!focused && local !== String(value)) setLocal(String(value));
-
-  const commit = () => {
-    const n = Number(local);
+  const draft = useDraft(String(value), (next) => {
+    const n = Number(next);
     if (!isNaN(n) && n !== value) onChange(n);
-    setFocused(false);
-  };
+  });
 
   return (
-    <div>
-      <label className="block text-sm text-text-bright mb-1">{label}</label>
-      {description && <div className="text-xs text-text-dim mb-1">{description}</div>}
+    <FieldShell label={label} description={description}>
       <input
         type="number"
-        value={local}
-        onChange={(e) => setLocal(e.target.value)}
-        onFocus={() => setFocused(true)}
-        onBlur={commit}
+        {...draft.props}
         onKeyDown={(e) => {
-          if (e.key === "Enter") commit();
+          if (e.key === "Enter") draft.commit();
         }}
         min={min}
         max={max}
-        className="w-full bg-surface-900 border border-surface-700 rounded-md px-3 py-2 text-sm text-text-primary focus:border-brand-600 focus:outline-none"
+        className={`${CONTROL} ${FOCUS}`}
       />
-    </div>
+    </FieldShell>
   );
 }
 
@@ -289,24 +333,22 @@ export function ListField({
   const [draft, setDraft] = useState("");
   const [error, setError] = useState<string | null>(null);
 
+  const cancel = () => {
+    setAdding(false);
+    setDraft("");
+    setError(null);
+  };
+
   const submit = () => {
     const trimmed = draft.trim();
     if (!trimmed) return;
-    if (validate) {
-      const err = validate(trimmed);
-      if (err) {
-        setError(err);
-        return;
-      }
+    const err = validate?.(trimmed);
+    if (err) {
+      setError(err);
+      return;
     }
     onChange([...items, trimmed]);
-    setDraft("");
-    setError(null);
-    setAdding(false);
-  };
-
-  const remove = (index: number) => {
-    onChange(items.filter((_, i) => i !== index));
+    cancel();
   };
 
   return (
@@ -329,7 +371,7 @@ export function ListField({
           <div key={i} className="flex items-center justify-between gap-2 px-2 py-1.5 bg-surface-900 rounded group">
             <span className="text-sm font-mono text-text-primary truncate">{item}</span>
             <button
-              onClick={() => remove(i)}
+              onClick={() => onChange(items.filter((_, j) => j !== i))}
               className="text-text-dim hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer shrink-0"
               title="Remove"
             >
@@ -353,11 +395,7 @@ export function ListField({
               }}
               onKeyDown={(e) => {
                 if (e.key === "Enter") submit();
-                if (e.key === "Escape") {
-                  setAdding(false);
-                  setDraft("");
-                  setError(null);
-                }
+                if (e.key === "Escape") cancel();
               }}
               placeholder={placeholder}
               autoFocus
@@ -370,11 +408,7 @@ export function ListField({
               Add
             </button>
             <button
-              onClick={() => {
-                setAdding(false);
-                setDraft("");
-                setError(null);
-              }}
+              onClick={cancel}
               className="px-2 py-1.5 text-sm text-text-dim hover:text-text-primary cursor-pointer"
             >
               Cancel

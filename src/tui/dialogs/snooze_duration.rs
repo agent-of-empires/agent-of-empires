@@ -26,13 +26,10 @@ const ONE_WEEK: u32 = 7 * 24 * 60;
 
 pub struct SnoozeDurationDialog {
     title: String,
-    /// Hit rect per preset row, paired with the minutes it submits.
-    /// Captured during `render` so a click on a row produces the same
-    /// Submit as the matching digit key.
+    /// Hit rect per preset row with the minutes it submits, so a click
+    /// matches its digit key.
     row_rects: Vec<(u32, Rect)>,
-    /// Hover-tracked row index. Drives the row highlight without
-    /// changing semantics: a row hover doesn't itself submit, only a
-    /// click on the row does.
+    /// Hovered row. Drives the highlight only; a click submits.
     hovered_row: Option<usize>,
 }
 
@@ -83,18 +80,8 @@ impl SnoozeDurationDialog {
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         self.row_rects.clear();
-        let dialog_area = super::centered_rect(area, 52, 14);
-        frame.render_widget(Clear, dialog_area);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.waiting))
-            .title(" Snooze ")
-            .title_style(Style::default().fg(theme.waiting).bold());
-
-        let inner = block.inner(dialog_area);
-        frame.render_widget(block, dialog_area);
+        let block = super::toned_dialog_block(" Snooze ", theme.waiting, theme.waiting);
+        let (_, inner) = super::render_dialog_frame(frame, area, 52, 14, block);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)

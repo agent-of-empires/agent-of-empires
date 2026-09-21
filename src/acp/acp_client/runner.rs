@@ -5,40 +5,27 @@ use tracing::{info, warn};
 use super::errors::AcpError;
 use super::resolve_command::resolve_agent_command;
 use super::session_sandbox::{build_sandbox_docker_argv, SessionSandbox};
-use super::spawn::{apply_env_filter, host_environment_denyreason, SpawnConfig};
+use super::spawn::{apply_env_filter, host_environment_denyreason, prepend_path_dirs, SpawnConfig};
 
-/// Deadline for the runner unix socket to appear after spawning the
-/// `aoe __acp-runner` shim. 10s is enough in production, but a
-/// debug-build cold-start under heavy CI load (v8 coverage + multiple
-/// parallel `aoe serve` binaries + a runner subprocess that re-execs
-/// the same debug binary) can blow past it deterministically. Honors
-/// `AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS` in debug builds so the
-/// Playwright harness can lift it; release builds keep the original
-/// 10s ceiling.
+/// Deadline for the runner socket to appear. 10s suffices in production, but
+/// a debug-build cold start under CI load blows past it deterministically, so
+/// debug builds honor `AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS`.
 pub(super) fn runner_socket_deadline() -> std::time::Duration {
     #[cfg(debug_assertions)]
     if let Ok(raw) = std::env::var("AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS") {
         if let Ok(ms) = raw.parse::<u64>() {
-            // Clamp to a floor of 100ms so a typo like
-            // `AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS=0` does not make the
-            // control dial fail before it has retried even once, surfacing
-            // as a mysterious "does not speak control protocol".
+            // Floor so a `...=0` typo cannot fail the dial before its first
+            // retry, which surfaces as "does not speak control protocol".
             return std::time::Duration::from_millis(ms.max(100));
         }
     }
     std::time::Duration::from_secs(10)
 }
 
-/// Test-only fault injection for the #1890 regression e2e. When
-/// `AOE_ACP_TEST_FAIL_FIRST_HANDSHAKES=N` is set, the first N *fresh*-spawn
-/// ACP handshakes fail right after the runner has come up, before the daemon
-/// records an in-memory worker. The runner keeps its agent alive and its
-/// on-disk registry entry, so the daemon is left with a live, registered
-/// runner it never adopted: the exact orphan state #1890 got permanently
-/// stuck in, reproduced deterministically without depending on host timing.
-/// Each call consumes one budgeted failure; `0` (the default, var unset) is a
-/// no-op. Debug builds only, so release can never trip it. Mirrors the
-/// `AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS` debug knob above.
+/// Fault injection for the #1890 e2e: the first N fresh-spawn handshakes fail
+/// after the runner is up but before the daemon records a worker, leaving a
+/// live registered runner the daemon never adopted. Each call consumes one
+/// budgeted failure; debug builds only.
 #[cfg(debug_assertions)]
 pub(super) fn take_injected_fresh_handshake_failure() -> bool {
     use std::sync::atomic::{AtomicI64, Ordering};
@@ -58,11 +45,9 @@ pub(super) fn take_injected_fresh_handshake_failure() -> bool {
         .is_ok()
 }
 
-/// Spawn the `aoe __acp-runner` shim as a detached process. The
-/// runner owns the agent subprocess and outlives the daemon. We retain
-/// no `Child` handle here; once the runner is up, the daemon talks to
-/// it over the unix socket and the OS keeps the runner alive across
-/// `aoe serve` restarts.
+/// The runner owns the agent subprocess and outlives the daemon, so no `Child`
+/// handle is kept: the daemon reaches it over the unix socket, and the OS keeps
+/// it alive across `aoe serve` restarts.
 pub(super) fn spawn_runner_detached(
     config: &SpawnConfig,
     socket_path: &std::path::Path,
@@ -77,11 +62,8 @@ pub(super) fn spawn_runner_detached(
         let _ = std::fs::create_dir_all(parent);
     }
 
-    // Sandboxed sessions wrap the agent in `docker exec`. Host-side
-    // PATH resolution is skipped because the agent binary lives inside
-    // the container; the container's own PATH resolves it. The
-    // container_workdir is reused from the SessionSandbox built upstream
-    // so we don't redo `compute_volume_paths`.
+    // A sandboxed session wraps the agent in `docker exec`, so host PATH
+    // resolution is skipped: the container's own PATH resolves the binary.
     let sandbox_argv = match (&config.sandbox_info, session_sandbox) {
         (Some(sandbox), Some(handle)) => {
             let argv = build_sandbox_docker_argv(
@@ -118,11 +100,8 @@ pub(super) fn spawn_runner_detached(
         }
     };
 
-    // Resolve the agent binary against PATH + known node-manager dirs so
-    // the runner spawns the right binary even when the daemon's frozen
-    // PATH doesn't contain it. See #1048. The resolved bin dir is also
-    // prepended to PATH below so the adapter's own `node`/`npx`
-    // subprocesses land in the same install.
+    // Resolve against PATH plus the node-manager dirs so the runner finds the
+    // binary even when the daemon's frozen PATH does not carry it (#1048).
     let resolved = if sandbox_argv.is_some() {
         None
     } else {
@@ -194,25 +173,19 @@ pub(super) fn spawn_runner_detached(
         }
     }
 
-    // Env: apply the same allowlist + provider_env filtering that the
-    // legacy in-proc path does, then hand the cleaned env to the runner.
-    // The runner inherits this env when it spawns the agent (no second
-    // filter pass needed). AOE_TOKEN is stripped here so it never reaches
-    // either process.
+    // The runner inherits this env when it spawns the agent, so one filter
+    // pass covers both. AOE_TOKEN is stripped here and reaches neither.
     cmd.env_clear();
-    apply_env_filter(cmd.as_std_mut(), config);
+    apply_env_filter(cmd.as_std_mut(), config, &[]);
     #[cfg(debug_assertions)]
     if let Ok(interval) = std::env::var("AOE_ACP_WATCHDOG_POLL_MS") {
         cmd.env("AOE_ACP_WATCHDOG_POLL_MS", interval);
     }
-    // Trusted `Config.environment`, destined for the adapter only. It rides
-    // one reserved carrier key rather than the runner's own environment
-    // because HOME / PATH / XDG_CONFIG_HOME are legal entries here: setting
-    // them on the runner would move the worker-registry path it writes (the
-    // respawn loop of #1383) or change which binary it loads, whereas the
-    // terminal-view equivalent only ever prefixes the agent's own command.
-    // The runner strips the carrier and applies the decoded pairs to the
-    // adapter child. Wire format: JSON `[[key, value], ...]`.
+    // Trusted `Config.environment` for the adapter only, riding one reserved
+    // carrier key (JSON `[[key, value], ...]`) that the runner strips and
+    // applies to its child. HOME / PATH / XDG_CONFIG_HOME are legal entries
+    // here, and setting those on the runner itself would move the
+    // worker-registry path it writes (#1383) or change which binary it loads.
     let host_environment: Vec<(String, String)> = config
         .host_environment
         .iter()
@@ -236,41 +209,25 @@ pub(super) fn spawn_runner_detached(
         cmd.env(crate::process::runner::ACP_AGENT_ENV, encoded);
     }
     if let Some(s) = &sandbox_argv {
-        // The agent runs inside the container; docker reads each
-        // `-e KEY` flag's value from its own process env. Set the
-        // corresponding values on the runner so docker (its child)
-        // can forward them across the container boundary.
+        // docker reads each `-e KEY` value from its own process env, so set
+        // them on the runner, which is docker's parent.
         for (key, value) in &s.inherit_env {
             cmd.env(key, value);
         }
     } else if let Some(dir) = &config.artifact_dir {
-        // Non-sandboxed: the agent runs on the host, so point it directly at
-        // the host artifact dir. The sandbox path exports the fixed container
-        // mount as a `-e` flag in build_sandbox_docker_argv instead. See #2587.
+        // On the host, so point at the host dir; the sandbox path exports the
+        // fixed container mount in build_sandbox_docker_argv (#2587).
         cmd.env(crate::session::artifacts::ARTIFACT_DIR_ENV, dir);
     }
     if !extra_path_dirs.is_empty() {
-        // Prepend the resolved adapter bin dir (and, for a bundled adapter,
-        // the Node bin dir) to the PATH we just forwarded so the adapter and
-        // its `#!/usr/bin/env node` shim resolve against the same install,
-        // not whatever node happens to be on the daemon's frozen PATH.
+        // Prepend the resolved bin dirs so the adapter and its
+        // `#!/usr/bin/env node` shim resolve against the same install.
         let current = std::env::var_os("PATH").unwrap_or_default();
-        let existing: Vec<std::path::PathBuf> = std::env::split_paths(&current).collect();
-        let mut chain: Vec<std::path::PathBuf> = Vec::new();
-        for dir in &extra_path_dirs {
-            if !existing.contains(dir) && !chain.contains(dir) {
-                chain.push(dir.clone());
-            }
-        }
-        chain.extend(existing);
-        if let Ok(joined) = std::env::join_paths(&chain) {
-            cmd.env("PATH", joined);
-        }
+        cmd.env("PATH", prepend_path_dirs(&current, &extra_path_dirs));
     }
 
-    // Detach: child becomes its own session leader so a SIGTERM/SIGHUP
-    // to the aoe daemon's group doesn't cascade. The runner installs its
-    // own signal handlers.
+    // Its own session leader, so a SIGTERM to the daemon's group does not
+    // cascade; the runner installs its own handlers.
     #[cfg(unix)]
     {
         unsafe {
@@ -281,10 +238,9 @@ pub(super) fn spawn_runner_detached(
         }
     }
 
-    // Redirect stdio: the runner writes its own log file. Inheriting our
-    // stdio would (a) pollute the shared debug.log with the per-session
-    // noise and (b) keep a pipe open to the daemon, which then closes
-    // when we die, making the runner observe EOF on its own stdin/stdout.
+    // The runner writes its own log file. Inheriting our stdio would put
+    // per-session noise in debug.log and leave the runner reading EOF on its
+    // own stdin once the daemon dies.
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -310,9 +266,8 @@ pub(super) fn spawn_runner_detached(
     let pid = child
         .id()
         .ok_or_else(|| AcpError::Spawn("runner exited before it could be identified".into()))?;
-    // setsid above detaches the runner; reap it on exit so a finished runner
-    // does not linger as a zombie that still answers `kill(pid, 0)`, which
-    // would keep a teardown from ever proving the process gone.
+    // Reap it, so a finished runner does not linger as a zombie that still
+    // answers `kill(pid, 0)` and keeps a teardown from proving it gone.
     tokio::spawn(async move {
         let _ = child.wait().await;
     });

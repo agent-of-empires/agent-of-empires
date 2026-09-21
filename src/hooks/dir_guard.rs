@@ -1,70 +1,20 @@
-//! Hardened access to the AoE hook status directory.
+//! Hardened access to the AoE hook status directory, the single Rust entry
+//! point for every read, write, and cleanup under `/tmp/aoe-hooks-<euid>`
+//! (#1844).
 //!
-//! Issue #1844: defend against TOCTOU and symlink attacks on the world-known
-//! `/tmp/aoe-hooks` path. This module is the single Rust entry point for every
-//! reader, writer, and cleanup that touches a hook-status file on the host.
+//! The base directory is created `0o700`, opened with `O_DIRECTORY |
+//! O_NOFOLLOW`, then verified by `fstat` on the resulting fd, which pins the
+//! inode against a later path swap: wrong type, wrong uid, or any group or
+//! world bit rejects. That verified `OwnedFd` is cached, and every
+//! per-instance subdirectory and file rides `*at` calls anchored on it. A
+//! failure caches the error rather than retrying, so a bad state stays
+//! visible.
 //!
-//! ## Threat model
-//!
-//! - Defends against another local UID on a multi-tenant POSIX host pre-creating
-//!   or symlinking the base path, racing `lstat` vs `open`, or planting hostile
-//!   leaves under the per-instance directory.
-//! - Does NOT defend against a co-resident attacker with the same UID (they can
-//!   read/write our state directly anyway).
-//! - Sandbox container is per-instance and single-tenant; the multi-tenant
-//!   threat collapses there. Container-side guards live in the shell snippets
-//!   in `super::mod`, not here.
-//!
-//! ## Algorithm
-//!
-//! 1. Resolve the per-user base path: `/tmp/aoe-hooks-<euid>`. The euid
-//!    suffix prevents a co-tenant collision: pure `/tmp/aoe-hooks` would
-//!    deny user B once user A has created it.
-//! 2. `mkdir(0o700)` tolerating `EEXIST`.
-//! 3. `open(O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC | O_RDONLY)`. `O_NOFOLLOW`
-//!    only checks the FINAL component, so `/tmp -> /private/tmp` on macOS is
-//!    fine.
-//! 4. `fstat` ON THE FD. After this, the inode is pinned: any later path swap
-//!    only affects the path, not our fd. Reject if not a directory, wrong uid,
-//!    or any group/world bit set.
-//! 5. Cache the verified `OwnedFd` in a `static OnceLock` so subsequent reads
-//!    and writes ride the same fd. On error we cache an `Arc<anyhow::Error>`
-//!    so retries do not silently mask the bad state.
-//!
-//! Per-instance subdirs and per-file I/O ride the same `*at` discipline,
-//! always anchored on a fd we have already verified.
-//!
-//! ## Squatting DoS (documented limitation)
-//!
-//! An attacker who pre-creates `/tmp/aoe-hooks-<our-euid>` owned by themselves
-//! cannot be cleared by us (sticky bit on `/tmp` plus alien ownership). Effect:
-//! `with_hook_base` returns `Err`; AoE keeps running with hooks disabled and
-//! falls back to pane-detection. Recovery requires the squatter to log out,
-//! reboot, or root cooperation. Bounded DoS only; never a privilege escalation.
-//!
-//! ## `/tmp` reaper (documented limitation)
-//!
-//! systemd-tmpfiles or macOS `periodic.daily` may delete the base directory
-//! while we hold the cached fd. Subsequent `*at` calls keep working against
-//! the orphan inode (POSIX guarantee), but the hook shell snippets do path-
-//! based `mkdir -p` and create a fresh inode at the same path. Reads via
-//! the cached fd then see the orphan, writes via the shell hooks land on
-//! the new inode, and status detection silently breaks until the next AoE
-//! restart. Acceptable: pane-detection is the documented fallback.
-//!
-//! ## POSIX ACL widening (documented limitation)
-//!
-//! `verify_dir_metadata` inspects classic POSIX mode bits only (`mode &
-//! 0o077`, plus `mode & 0o7000` for setuid/setgid/sticky). It does NOT
-//! inspect POSIX ACL entries: a `setfacl -m u:other:rwx <base>` can grant
-//! a co-tenant write access without flipping any bit in `st_mode`. The
-//! mismatch is not exploitable in this threat model. An alien uid cannot
-//! `setfacl` on a `0o700` directory we own (ACL writes require ownership
-//! or write permission), and we never widen our own ACL. The shell pattern
-//! `d*------|d*------.|d*------+|d*------@` tolerates the trailing `+`
-//! glyph emitted by `ls -l` when a legitimate operator-applied ACL is
-//! present; the mode positions still must read `------`, so an ACL that
-//! widens past `r--` triggers a different glyph and the snippet rejects.
+//! The euid suffix keeps two users on a shared host from colliding. A
+//! squatter owning the path first, a `/tmp` reaper unlinking it while the fd
+//! is held, or an operator-widened POSIX ACL (only mode bits are verified)
+//! each degrade to hooks disabled and pane detection, never to escalation:
+//! an alien uid cannot `setfacl` on a `0o700` directory we own.
 
 use std::fs::Metadata;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -87,18 +37,14 @@ use nix::unistd::{geteuid, mkdir, unlinkat, UnlinkatFlags};
 
 #[cfg(test)]
 thread_local! {
-    /// Test-only override for the per-user base path. Each test injects its
-    /// own tempdir to avoid colliding on the real `/tmp/aoe-hooks-<euid>` and
-    /// to dodge the process-wide `OnceLock` pinning the first path it sees.
-    /// Tests using this MUST also call `reset_for_test` and serialize via
-    /// `serial_test::serial(hook_base)`.
+    /// Test-only base path override. A test using it must also call
+    /// `reset_for_test` and serialize via `serial_test::serial(hook_base)`.
     static HOOK_BASE_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// Per-user host base path: `/tmp/aoe-hooks-<euid>`. Suffix from `geteuid()`,
-/// not `getuid()`: the agent runs with the effective uid and writes through
-/// `id -u` (which is also euid), so both ends agree.
+/// Per-user host base path. The suffix is `geteuid()`, not `getuid()`: the
+/// agent writes through `id -u`, so both ends agree.
 pub(crate) fn hook_base_path() -> PathBuf {
     #[cfg(test)]
     {
@@ -123,19 +69,15 @@ pub(crate) fn clear_base_override_for_test() {
 
 type CachedBase = std::result::Result<OwnedFd, Arc<anyhow::Error>>;
 
-// MUST be `static` so the cached `OwnedFd` outlives every call site:
-// `with_hook_base` re-borrows it as a `BorrowedFd<'_>` scoped to the
-// closure invocation, but the underlying owned fd lives in static
-// storage for the program lifetime so its `close` on drop never fires.
+// `static` so the owned fd lives for the program lifetime and its `close` on
+// drop never fires; `with_hook_base` only lends it for a closure call.
 #[cfg(not(test))]
 static HOOK_BASE: OnceLock<CachedBase> = OnceLock::new();
 
 #[cfg(test)]
 thread_local! {
-    /// Per-thread shadow of `HOOK_BASE`. Tests cannot reset a process-wide
-    /// `OnceLock`, so we keep parallel storage gated by `cfg(test)` and route
-    /// the public API through a runtime branch. Production paths NEVER touch
-    /// this cell.
+    /// Per-thread shadow of `HOOK_BASE`, since a test cannot reset a
+    /// process-wide `OnceLock`. Production never touches it.
     static HOOK_BASE_TEST_CELL: std::cell::RefCell<Option<CachedBase>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -146,8 +88,7 @@ pub(crate) fn reset_for_test() {
     OPEN_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
-// `open`/`mkdir`/`fstat` syscall counter for test #6 (`init_caches_error`)
-// and test #7 (`init_caches_success`). Production reads never observe it.
+// Syscall counter the caching tests read. Production never observes it.
 #[cfg(test)]
 static OPEN_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -162,11 +103,8 @@ where
     I: FnOnce() -> std::result::Result<OwnedFd, Arc<anyhow::Error>>,
     A: FnOnce(&std::result::Result<OwnedFd, Arc<anyhow::Error>>) -> Result<T>,
 {
-    // The `RefCell::borrow_mut` is held for the whole call, so a closure
-    // that recursively re-enters `with_hook_base` from inside `apply`
-    // would `BorrowMutError`-panic. No production caller does this and
-    // every existing test invokes `with_hook_base` linearly; the comment
-    // is a guard for future refactors only.
+    // The `borrow_mut` is held for the whole call, so a closure that
+    // re-enters `with_hook_base` would panic with `BorrowMutError`.
     HOOK_BASE_TEST_CELL.with(|cell| {
         let mut slot = cell.borrow_mut();
         if slot.is_none() {
@@ -185,13 +123,9 @@ where
     apply(HOOK_BASE.get_or_init(init))
 }
 
-/// Lazily open-and-verify the per-user hook base directory and run `f` with
-/// a borrowed fd to it. First caller does the real work; subsequent callers
-/// reuse the cached fd (or, on the failure path, the cached `Arc<Error>`).
-///
-/// The borrow lifetime is bound to the closure call: the borrow checker
-/// rejects any attempt to escape the fd outside `f`. This is the soundness
-/// reason for the closure shape over a direct `BorrowedFd<'static>` return.
+/// Open and verify the per-user hook base directory once, then run `f` with
+/// a borrowed fd to it; later callers reuse the cached fd or cached error.
+/// The closure shape is what keeps the fd from escaping its borrow.
 pub(crate) fn with_hook_base<F, T>(f: F) -> Result<T>
 where
     F: FnOnce(BorrowedFd<'_>) -> Result<T>,
@@ -231,9 +165,9 @@ fn open_and_verify_base() -> Result<OwnedFd> {
         }
     }
 
-    // 2. open(O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC | O_RDONLY).
-    //    O_NOFOLLOW only checks the FINAL component; intermediate symlinks
-    //    in the prefix (macOS /tmp -> /private/tmp) are followed normally.
+    // 2. open(O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC | O_RDONLY). O_NOFOLLOW
+    //    checks only the final component, so a prefix symlink such as macOS
+    //    /tmp -> /private/tmp is still followed.
     let fd: OwnedFd = open(
         &path,
         OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
@@ -247,8 +181,7 @@ fn open_and_verify_base() -> Result<OwnedFd> {
         )
     })?;
 
-    // 3. fstat ON THE FD. After this, the inode is pinned for the lifetime of
-    //    the fd. nix 0.31 wants `AsFd`; pass `&fd`.
+    // 3. fstat on the fd, which pins the inode for the fd's lifetime.
     verify_dir_metadata(&fd, &path)?;
 
     Ok(fd)
@@ -344,18 +277,11 @@ pub(crate) fn open_instance_dir_read_only(instance_id: &str) -> Result<Option<Ow
 
 // Per-file I/O.
 
-/// Reject leaf names that could escape the verified parent dirfd via
-/// `openat`. Absolute leaves (`/...`) cause the kernel to ignore the
-/// dirfd entirely; relative components like `subdir/file` would
-/// traverse into nested entries; `..` walks up; `.` is the parent
-/// itself. NUL is rejected because `openat` would fail with `EINVAL`
-/// on it anyway, but checking ahead surfaces the error cleanly.
-///
-/// Leading `.` is allowed because `write_atomic` constructs tmpfile
-/// names of the form `.{name}.tmp.{pid}.{counter}`. The agent-side
-/// shell snippet uses the same pattern. Validating here is
-/// defense-in-depth for future callers; today every call site passes
-/// a hardcoded literal (`status`, `session_id`, `attention.json`).
+/// Reject leaf names that would escape the verified parent dirfd: an
+/// absolute leaf makes the kernel ignore the dirfd, a separator traverses
+/// into nested entries, `..` walks up, `.` is the parent, and NUL would
+/// fail `openat` anyway. A leading `.` is allowed, since `write_atomic`
+/// and the agent-side snippet both name tmpfiles `.{name}.tmp.{pid}.{n}`.
 fn validate_hook_leaf(name: &str) -> Result<()> {
     if name.is_empty() || name == "." || name == ".." {
         bail!("invalid hook leaf name: {name:?}");
@@ -366,12 +292,10 @@ fn validate_hook_leaf(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Open a file inside an already-verified per-instance dir for reading.
-/// `O_NOFOLLOW` forbids the leaf being a symlink. `ENOENT` / `ELOOP` map to
-/// `Ok(None)`. Non-regular leaves (directory, FIFO, device, socket) also
-/// map to `Ok(None)`: only regular files are valid hook sidecars and the
-/// fstat-on-fd check is symmetric with the `S_IFREG` gate in
-/// `remove_instance_dir`.
+/// Open a file in an already-verified per-instance dir for reading, with
+/// `O_NOFOLLOW`. `ENOENT`, `ELOOP` and any non-regular leaf map to
+/// `Ok(None)`: only regular files are valid hook sidecars, matching the
+/// `S_IFREG` gate in `remove_instance_dir`.
 pub(crate) fn read_file_at(
     dir: BorrowedFd<'_>,
     name: &str,
@@ -421,13 +345,10 @@ pub(crate) fn metadata_at(dir: BorrowedFd<'_>, name: &str) -> Result<Option<Meta
     Ok(Some(meta))
 }
 
-/// Single-shot truncating write. Suitable for `<dir>/status` (≤8 bytes,
-/// monotone, last-writer-wins acceptable). Reader is stale-tolerant.
-///
-/// Production `status` writes happen in the agent-side shell snippet
-/// (`hook_command_with_base`); this helper exists for in-process test
-/// fixtures that need to plant status content via the same `*at`-anchored
-/// discipline.
+/// Single-shot truncating write, for last-writer-wins content like
+/// `<dir>/status`. Production writes that file from the agent-side shell
+/// snippet; this exists so test fixtures plant it under the same
+/// `*at`-anchored discipline.
 #[cfg(test)]
 pub(crate) fn write_short(dir: BorrowedFd<'_>, name: &str, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
@@ -444,25 +365,14 @@ pub(crate) fn write_short(dir: BorrowedFd<'_>, name: &str, bytes: &[u8]) -> Resu
     Ok(())
 }
 
-/// Atomic write via `O_CREAT|O_EXCL` tmpfile + `renameat`. Used for
-/// `session_id` sidecar writes (see [`write_session_id_via_guard`]).
-/// `attention.json` is written by the host shell snippet
-/// `cx-script attention-urgent`, not through this Rust helper, but the
-/// same atomicity-not-durability contract applies on its `mv` rename.
+/// Atomic write via an `O_CREAT|O_EXCL` tmpfile and `renameat`, used for the
+/// `session_id` sidecar.
 ///
-/// Atomicity, not durability: there is no `fsync`/`sync_data` before the
-/// rename. After a power loss the file may revert to the previous version
-/// or vanish. Acceptable because the hook status tree lives under `/tmp`
-/// (wiped on reboot) and every reader is stale-tolerant: the next hook
-/// fire rewrites `session_id`, the filesystem-scan fallback in
-/// `claude_poll_fn` recovers when the sidecar is missing, and
-/// `attention.json` is a best-effort UI flag rather than authoritative
-/// state. `crate::session::atomic_write` is the durable counterpart for
-/// files that must survive a crash (e.g. persistent session storage).
-///
-/// Tmp name carries the PID and a process-local counter so multi-thread
-/// writers of the same `name` get distinct tmpfiles and cannot collide via
-/// `O_EXCL`.
+/// Atomicity, not durability: no `fsync` before the rename, so a power loss
+/// may revert or drop the file. The tree lives under `/tmp` and every reader
+/// is stale-tolerant, so that is fine; `crate::session::atomic_write` is the
+/// durable counterpart. The tmp name carries the pid and a process-local
+/// counter so concurrent writers of one `name` cannot collide on `O_EXCL`.
 pub(crate) fn write_atomic(dir: BorrowedFd<'_>, name: &str, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -497,24 +407,17 @@ pub(crate) fn write_atomic(dir: BorrowedFd<'_>, name: &str, bytes: &[u8]) -> Res
     Ok(())
 }
 
-/// One-shot helper used by the host-side `aoe __extract-session-id`
-/// subcommand. Validates the instance id, opens the per-instance dir with
-/// `dir_guard` discipline, and atomic-renames the session id sidecar.
+/// For `aoe __extract-session-id`: validate the instance id, open its dir
+/// under `dir_guard` discipline, and atomically write the sidecar.
 pub(crate) fn write_session_id_via_guard(instance_id: &str, session_id: &str) -> Result<()> {
     let dir = open_instance_dir(instance_id)?;
     write_atomic(dir.as_fd(), "session_id", session_id.as_bytes())
 }
 
-/// Symlink-safe deletion of the `session_id` sidecar via `unlinkat` against
-/// a `dir_guard`-verified per-instance dirfd. Replaces path-based
-/// `std::fs::remove_file(dir.join("session_id"))` so deletion participates
-/// in the same `*at`-anchored, mode-checked, owner-checked discipline as
-/// every other hook write.
-///
-/// Idempotent: a missing dir or missing leaf returns `Ok(())`. Returns
-/// `Err` only on guard-validation failure (squatted/wrong-mode base) or
-/// hard `unlinkat` errors. Caller policy on `Err`: best-effort cleanup
-/// (the next hook fire overwrites the sidecar anyway).
+/// Delete the `session_id` sidecar with `unlinkat` against a verified
+/// per-instance dirfd, so deletion runs under the same discipline as every
+/// other hook write. Idempotent; `Err` only on guard validation or a hard
+/// `unlinkat` failure, and callers treat that as best-effort.
 pub(crate) fn unlink_session_id_via_guard(instance_id: &str) -> Result<()> {
     let Some(dir) = open_instance_dir_read_only(instance_id)? else {
         return Ok(());
@@ -526,30 +429,21 @@ pub(crate) fn unlink_session_id_via_guard(instance_id: &str) -> Result<()> {
     }
 }
 
-/// Ensure the per-instance hook directory exists with `dir_guard` discipline
-/// and return its host path, canonically resolved. Used by callers that hand
-/// the path to an external resolver (Docker/Podman bind-mount source, sidecar
-/// config writer) rather than performing in-process I/O directly.
+/// Create the per-instance hook directory under `dir_guard` discipline and
+/// return its canonically resolved host path, for callers that hand the path
+/// to an external resolver (a bind-mount source, a sidecar config writer)
+/// rather than doing their own I/O.
 ///
-/// The function calls `open_instance_dir` to verify-and-create with
-/// `*at`+`O_NOFOLLOW`+`fstat-on-fd`, then drops the fd and returns the
-/// resolved path. Closes both attack vectors that an unguarded
-/// `create_dir_all` would re-introduce: self-DoS at default umask 022
-/// (would create `0o755`, which `with_hook_base`'s `verify_dir_metadata`
-/// would reject) and the multi-tenant pre-squat + symlink-swap race
-/// against Docker's bind-mount resolution.
+/// Going through `open_instance_dir` rather than `create_dir_all` keeps both
+/// guards: the default umask would create `0o755`, which `verify_dir_metadata`
+/// then rejects, and an unguarded create races a pre-squat plus symlink swap
+/// against the runtime's mount resolution.
 ///
-/// #3240: VM-backed runtimes resolve mount sources inside their VM,
-/// against a fixed share set keyed by real paths (podman machine shares
-/// `/private`, never `/tmp`). The lexical base (`/tmp/aoe-hooks-<euid>`) is
-/// therefore canonicalized before it leaves the process; on macOS that turns
-/// `/tmp/...` into the shared `/private/tmp/...` spelling.
-///
-/// Resolution errors propagate: a path that no longer resolves on the host
-/// would fail container creation with the same `statfs` error class this
-/// fixes, so callers apply their graceful `Err` policy instead. On
-/// `Err`: skip the bind-mount push, surface a `tracing::warn!` and let the
-/// agent boot without status hooks (pane-detection fallback).
+/// The path is canonicalized before it leaves the process because a VM-backed
+/// runtime resolves mount sources against real paths inside its VM (podman
+/// machine shares `/private`, never `/tmp`) (#3240). A resolution error
+/// propagates; callers skip the bind mount, warn, and boot with pane
+/// detection.
 pub(crate) fn ensure_instance_dir_path(instance_id: &str) -> Result<PathBuf> {
     let _fd = open_instance_dir(instance_id)?;
     let lexical = hook_base_path().join(instance_id);
@@ -559,13 +453,12 @@ pub(crate) fn ensure_instance_dir_path(instance_id: &str) -> Result<PathBuf> {
 
 // Cleanup.
 
-/// Remove the per-instance subdir and every file inside, never following
-/// symlinks. Re-fstats each entry's fd before unlink to close the
-/// swap-between-stat-and-unlink window.
+/// Remove the per-instance subdir and its files without following symlinks,
+/// re-fstatting each entry's fd before the unlink to close the swap window.
 ///
-/// Subdirectories under the per-instance dir are NEVER created by AoE; if one
-/// shows up it is hostile or stale. We refuse to descend; final `RemoveDir`
-/// will return `ENOTEMPTY` and we surface that as a warn-skip.
+/// AoE never creates a subdirectory there, so one that appears is hostile or
+/// stale: we refuse to descend and let the final `RemoveDir` fail with
+/// `ENOTEMPTY`, which surfaces as a warn-skip.
 pub(crate) fn remove_instance_dir(instance_id: &str) -> Result<()> {
     crate::session::validate_instance_id(instance_id)?;
     with_hook_base(|base| {
@@ -577,9 +470,9 @@ pub(crate) fn remove_instance_dir(instance_id: &str) -> Result<()> {
         ) {
             Ok(fd) => fd,
             Err(Errno::ENOENT) | Err(Errno::ELOOP) => {
-                // Already gone, or hostile symlink: try to unlink whatever is at
-                // the path so a future open succeeds. unlinkat without RemoveDir
-                // removes the symlink itself, not its target (POSIX guarantee).
+                // Gone, or a hostile symlink: unlink whatever is at the path
+                // so a future open succeeds. Without `RemoveDir` that removes
+                // the symlink itself, never its target.
                 let _ = unlinkat(base, instance_id, UnlinkatFlags::NoRemoveDir);
                 return Ok(());
             }
@@ -587,8 +480,7 @@ pub(crate) fn remove_instance_dir(instance_id: &str) -> Result<()> {
         };
         let label = hook_base_path().join(instance_id);
         if let Err(e) = verify_dir_metadata(&dir_fd, &label) {
-            // Wrong owner / mode: refuse to walk; do not unlink either, the user
-            // needs to inspect manually.
+            // Wrong owner or mode: neither walk nor unlink, leave it to the user.
             tracing::warn!(target: "hooks.guard", "skip cleanup {}: {e:#}", label.display());
             return Ok(());
         }
@@ -608,8 +500,7 @@ pub(crate) fn remove_instance_dir(instance_id: &str) -> Result<()> {
 }
 
 fn walk_and_unlink_entries(dir_fd: &OwnedFd) -> Result<()> {
-    // `Dir::from_fd` consumes the fd. Clone first so we keep the original for
-    // unlinkat afterwards.
+    // `Dir::from_fd` consumes the fd; keep a clone for the unlinkat below.
     let dup = dir_fd.try_clone().context("dup dir fd for readdir")?;
     let mut dir = nix::dir::Dir::from_fd(dup).context("Dir::from_fd")?;
     let names: Vec<std::ffi::CString> = dir
@@ -636,10 +527,8 @@ fn walk_and_unlink_entries(dir_fd: &OwnedFd) -> Result<()> {
                 continue;
             }
         };
-        // Re-validate the entry before removal. Open with O_NOFOLLOW so a
-        // symlink at the leaf rejects with ELOOP rather than chasing the
-        // target. Anything that is not a regular file (subdir, fifo, device)
-        // is hostile or stale; we warn and skip.
+        // Re-validate before removing: O_NOFOLLOW rejects a symlink leaf with
+        // ELOOP, and anything but a regular file is hostile or stale.
         match openat(
             dir_fd,
             name_str,
@@ -664,8 +553,7 @@ fn walk_and_unlink_entries(dir_fd: &OwnedFd) -> Result<()> {
                         hook_base_path().display());
                     continue;
                 }
-                // Regular file we own (parent dir was uid-checked) → safe to
-                // unlink the path-name within our verified dir fd.
+                // Regular file under a uid-checked parent: safe to unlink.
                 drop(child_fd);
                 if let Err(e) = unlinkat(dir_fd, name_str, UnlinkatFlags::NoRemoveDir) {
                     tracing::warn!(target: "hooks.guard",
@@ -743,26 +631,25 @@ mod tests {
         );
     }
 
+    /// Any bit past `0o700`, and any of setuid, setgid or sticky, rejects the
+    /// base rather than being used.
     #[test]
     #[serial(hook_base)]
-    fn init_rejects_dir_mode_0o755() {
-        let (_g, base, _tmp) = BaseGuard::fresh();
-        std::fs::create_dir(&base).unwrap();
-        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let err = with_hook_base(|_| Ok(())).unwrap_err();
-        let s = format!("{err:#}");
-        assert!(s.contains("mode"), "expected mode rejection, got: {s}");
-    }
-
-    #[test]
-    #[serial(hook_base)]
-    fn init_rejects_dir_mode_0o770() {
-        let (_g, base, _tmp) = BaseGuard::fresh();
-        std::fs::create_dir(&base).unwrap();
-        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o770)).unwrap();
-        let err = with_hook_base(|_| Ok(())).unwrap_err();
-        let s = format!("{err:#}");
-        assert!(s.contains("mode"), "expected mode rejection, got: {s}");
+    fn init_rejects_every_mode_but_0o700() {
+        for (mode, expected) in [
+            (0o755, "mode"),
+            (0o770, "mode"),
+            (0o2700, "setuid/setgid/sticky"),
+            (0o4700, "setuid/setgid/sticky"),
+            (0o1700, "setuid/setgid/sticky"),
+        ] {
+            let (_g, base, _tmp) = BaseGuard::fresh();
+            std::fs::create_dir(&base).unwrap();
+            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(mode)).unwrap();
+            let err = with_hook_base(|_| Ok(())).unwrap_err();
+            let rendered = format!("{err:#}");
+            assert!(rendered.contains(expected), "{mode:o}: {rendered}");
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -802,48 +689,6 @@ mod tests {
         assert!(
             message.contains(&format!("owned by uid={alien_uid}, expected euid=0")),
             "expected alien instance owner rejection, got: {message}"
-        );
-    }
-
-    #[test]
-    #[serial(hook_base)]
-    fn init_rejects_setgid_dir() {
-        let (_g, base, _tmp) = BaseGuard::fresh();
-        std::fs::create_dir(&base).unwrap();
-        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o2700)).unwrap();
-        let err = with_hook_base(|_| Ok(())).unwrap_err();
-        let s = format!("{err:#}");
-        assert!(
-            s.contains("setuid/setgid/sticky"),
-            "expected setgid rejection, got: {s}"
-        );
-    }
-
-    #[test]
-    #[serial(hook_base)]
-    fn init_rejects_setuid_dir() {
-        let (_g, base, _tmp) = BaseGuard::fresh();
-        std::fs::create_dir(&base).unwrap();
-        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o4700)).unwrap();
-        let err = with_hook_base(|_| Ok(())).unwrap_err();
-        let s = format!("{err:#}");
-        assert!(
-            s.contains("setuid/setgid/sticky"),
-            "expected setuid rejection, got: {s}"
-        );
-    }
-
-    #[test]
-    #[serial(hook_base)]
-    fn init_rejects_sticky_dir() {
-        let (_g, base, _tmp) = BaseGuard::fresh();
-        std::fs::create_dir(&base).unwrap();
-        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o1700)).unwrap();
-        let err = with_hook_base(|_| Ok(())).unwrap_err();
-        let s = format!("{err:#}");
-        assert!(
-            s.contains("setuid/setgid/sticky"),
-            "expected sticky rejection, got: {s}"
         );
     }
 
@@ -1077,11 +922,8 @@ mod tests {
         let (_g, base, _tmp) = BaseGuard::ready();
         let dir = open_instance_dir("conc").unwrap();
         let dir_fd = dir.as_fd();
-        // Each thread writes a DISTINCT 36-byte payload so the post-condition
-        // catches torn writes: a regression that drops the rename and just
-        // truncates would leave whatever the last (interleaved) writer wrote
-        // partway through, which would not match any single thread's full
-        // 36-byte payload byte-for-byte.
+        // Distinct payloads per thread, so a regression that truncates in
+        // place instead of renaming leaves bytes matching no single writer.
         let payloads: Vec<[u8; 36]> = (0..8u8)
             .map(|tid| {
                 let s = format!("aaaaaaaa-bbbb-cccc-dddd-{tid:012x}");
@@ -1126,9 +968,8 @@ mod tests {
     #[test]
     #[serial(hook_base)]
     fn macos_tmp_prefix_symlink_works() {
-        // /tmp -> /private/tmp on macOS. O_NOFOLLOW only checks the FINAL
-        // component, so a prefix symlink must not block init. Locks the
-        // platform-specific resolution behavior the existing code relies on.
+        // A prefix symlink (macOS /tmp -> /private/tmp) must not block init:
+        // O_NOFOLLOW checks only the final component.
         let tmp = TempDir::new().unwrap();
         let real_parent = tmp.path().join("real-parent");
         std::fs::create_dir(&real_parent).unwrap();

@@ -1,20 +1,13 @@
 // @vitest-environment jsdom
-//
-// Contract test for the API v9 structured plugin settings widgets (#2897):
-// object_list add/remove with a host-populated dynamic_select picker, and
-// dynamic_select dependency-driven option reloads. Pins that the object_list
-// generates a stable id on add, renders nested pickers fed by the resolver
-// endpoint, and emits the full array through onSaveField.
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { SchemaSection } from "../SchemaSection";
-import type { SettingsFieldDescriptor } from "../../../lib/types";
+import type { SettingsFieldDescriptor, SettingsObjectField } from "../../../lib/types";
 
-const ALLOW = { policy: "allow" } as const;
-const NONE = { rule: "none" } as const;
+const SECTION = "plugin:acme.cron";
+const RESOLVE_URL = "/api/plugins/acme.cron/settings/options/resolve";
 
-// Stub the resolver endpoint so the picker has host options without a backend.
 const fetchMock = vi.fn();
 beforeEach(() => {
   fetchMock.mockReset();
@@ -30,371 +23,138 @@ beforeEach(() => {
   vi.stubGlobal("fetch", fetchMock);
 });
 
-const SCHEMA: SettingsFieldDescriptor[] = [
-  {
-    section: "plugin:acme.cron",
-    field: "jobs",
+function descriptor(field: string, widget: SettingsFieldDescriptor["widget"]): SettingsFieldDescriptor {
+  return {
+    section: SECTION,
+    field,
     category: "Plugins",
-    label: "Scheduled jobs",
+    label: field,
     description: "",
-    web_write: ALLOW,
+    web_write: { policy: "allow" },
     profile_overridable: false,
-    validation: NONE,
+    validation: { rule: "none" },
     advanced: false,
-    widget: {
-      kind: "object_list",
-      id_field: "id",
-      fields: [
-        {
-          field: "agent",
-          label: "Agent",
-          required: true,
-          widget: { kind: "dynamic_select", source: "acp_agents" },
-          validation: { rule: "non_empty_string" },
-        },
-        {
-          field: "schedule",
-          label: "Schedule",
-          required: true,
-          widget: { kind: "cron" },
-          validation: { rule: "cron" },
-        },
-      ],
-    },
-  },
+    widget,
+  } as SettingsFieldDescriptor;
+}
+
+const itemField = (field: string, widget: SettingsObjectField["widget"], required = false) =>
+  ({ field, label: field, required, widget, validation: { rule: "str" } }) as SettingsObjectField;
+const jobs = (...fields: SettingsObjectField[]) => [
+  descriptor("jobs", { kind: "object_list", id_field: "id", fields }),
 ];
 
-describe("structured plugin settings widgets", () => {
-  it("adds a new object_list item as an editable draft, persisting only once required fields are filled", async () => {
-    const onSave = vi.fn().mockResolvedValue(true);
-    render(<SchemaSection section="plugin:acme.cron" schema={SCHEMA} values={{ jobs: [] }} onSaveField={onSave} />);
+const CRON_JOBS = jobs(
+  itemField("agent", { kind: "dynamic_select", source: "acp_agents" }, true),
+  itemField("schedule", { kind: "cron" }, true),
+);
+const MULTI_JOBS = jobs(itemField("projects", { kind: "dynamic_multi_select", source: "projects" }));
 
+function renderSection(schema: SettingsFieldDescriptor[], values: Record<string, unknown>) {
+  const onSave = vi.fn().mockResolvedValue(true);
+  const utils = render(<SchemaSection section={SECTION} schema={schema} values={values} onSaveField={onSave} />);
+  const lastValue = async () => {
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+    return onSave.mock.calls.at(-1)![2];
+  };
+  return { onSave, lastValue, ...utils };
+}
+
+const job = (id: string, agent = "codex", schedule = "0 9 * * 1-5") => ({ id, agent, schedule });
+
+describe("object_list", () => {
+  it("keeps a new item as a local draft until its required fields are filled", async () => {
+    const { onSave, lastValue } = renderSection(CRON_JOBS, { jobs: [] });
     fireEvent.click(screen.getByText("Add item"));
-
-    // The new item renders and is editable, but its required fields (agent,
-    // schedule) are empty, so nothing is persisted yet.
-    await waitFor(() => expect(screen.getByText("Item 1")).toBeTruthy());
+    await screen.findByText("Item 1");
     expect(onSave).not.toHaveBeenCalled();
 
-    // Filling every required field promotes the draft to a persisted save.
-    // TextField holds a local buffer while focused and commits on blur; the
-    // native select commits on change.
     const cron = screen.getByPlaceholderText("0 9 * * 1-5");
     fireEvent.focus(cron);
     fireEvent.change(cron, { target: { value: "0 9 * * 1-5" } });
     fireEvent.blur(cron);
-    await waitFor(() => expect(screen.getByText("Claude Code")).toBeTruthy());
+    await screen.findByText("Claude Code");
     fireEvent.change(screen.getByRole("combobox"), { target: { value: "claude-code" } });
 
-    await waitFor(() => expect(onSave).toHaveBeenCalled());
-    const lastCall = onSave.mock.calls.at(-1)!;
-    const [sec, field, value] = lastCall;
-    expect(sec).toBe("plugin:acme.cron");
-    expect(field).toBe("jobs");
-    expect(Array.isArray(value)).toBe(true);
-    expect((value as { id: string }[]).length).toBe(1);
-    expect(typeof (value as { id: string }[])[0]!.id).toBe("string");
+    const value = (await lastValue()) as { id: string }[];
+    expect(onSave.mock.calls.at(-1)!.slice(0, 2)).toEqual([SECTION, "jobs"]);
+    expect(value).toHaveLength(1);
+    expect(typeof value[0]!.id).toBe("string");
   });
 
-  it("renders an item's dynamic_select from host-resolved options", async () => {
-    const onSave = vi.fn().mockResolvedValue(true);
-    render(
-      <SchemaSection
-        section="plugin:acme.cron"
-        schema={SCHEMA}
-        values={{ jobs: [{ id: "id-1", agent: "codex", schedule: "0 9 * * 1-5" }] }}
-        onSaveField={onSave}
-      />,
-    );
-
-    // The nested dynamic_select fetched its options from the resolver endpoint,
-    // scoped to the plugin id, and rendered the host labels.
+  it("feeds an item's dynamic_select from the plugin's resolver endpoint", async () => {
+    renderSection(CRON_JOBS, { jobs: [job("id-1")] });
     await waitFor(() =>
-      expect(fetchMock).toHaveBeenCalledWith(
-        "/api/plugins/acme.cron/settings/options/resolve",
-        expect.objectContaining({ method: "POST" }),
-      ),
+      expect(fetchMock).toHaveBeenCalledWith(RESOLVE_URL, expect.objectContaining({ method: "POST" })),
     );
-    await waitFor(() => expect(screen.getByText("Claude Code")).toBeTruthy());
+    expect(await screen.findByText("Claude Code")).toBeTruthy();
   });
 
-  it("removes an object_list item", async () => {
-    const onSave = vi.fn().mockResolvedValue(true);
-    render(
-      <SchemaSection
-        section="plugin:acme.cron"
-        schema={SCHEMA}
-        values={{ jobs: [{ id: "id-1", agent: "codex", schedule: "0 9 * * 1-5" }] }}
-        onSaveField={onSave}
-      />,
-    );
-
+  it("removes and reorders items", async () => {
+    const removed = renderSection(CRON_JOBS, { jobs: [job("id-1")] });
     fireEvent.click(screen.getByRole("button", { name: "Remove item" }));
-    await waitFor(() => expect(onSave).toHaveBeenCalledWith("plugin:acme.cron", "jobs", []));
-  });
+    await waitFor(() => expect(removed.onSave).toHaveBeenCalledWith(SECTION, "jobs", []));
+    removed.unmount();
 
-  it("reorders two valid items and persists the swap", async () => {
-    const onSave = vi.fn().mockResolvedValue(true);
-    render(
-      <SchemaSection
-        section="plugin:acme.cron"
-        schema={SCHEMA}
-        values={{
-          jobs: [
-            { id: "id-1", agent: "codex", schedule: "0 9 * * 1-5" },
-            { id: "id-2", agent: "claude-code", schedule: "0 17 * * 1-5" },
-          ],
-        }}
-        onSaveField={onSave}
-      />,
-    );
-
-    // Moving the first item down swaps the order; both items stay valid, so the
-    // reordered array persists.
+    const moved = renderSection(CRON_JOBS, { jobs: [job("id-1"), job("id-2", "claude-code", "0 17 * * 1-5")] });
     fireEvent.click(screen.getAllByRole("button", { name: "Move down" })[0]!);
-    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
-    const [, , value] = onSave.mock.calls[0]!;
-    expect((value as { id: string }[]).map((it) => it.id)).toEqual(["id-2", "id-1"]);
+    expect(((await moved.lastValue()) as { id: string }[]).map((it) => it.id)).toEqual(["id-2", "id-1"]);
   });
 
-  it("renders every item field widget kind and the top-level cron/dynamic_select", async () => {
-    const onSave = vi.fn().mockResolvedValue(true);
-    const schema: SettingsFieldDescriptor[] = [
-      {
-        section: "plugin:acme.cron",
-        field: "when",
-        category: "Plugins",
-        label: "When",
-        description: "",
-        web_write: ALLOW,
-        profile_overridable: false,
-        validation: { rule: "cron" },
-        advanced: false,
-        widget: { kind: "cron" },
-      },
-      {
-        section: "plugin:acme.cron",
-        field: "who",
-        category: "Plugins",
-        label: "Who",
-        description: "",
-        web_write: ALLOW,
-        profile_overridable: false,
-        validation: { rule: "str" },
-        advanced: false,
-        widget: { kind: "dynamic_select", source: "acp_agents" },
-      },
-      {
-        section: "plugin:acme.cron",
-        field: "rows",
-        category: "Plugins",
-        label: "Rows",
-        description: "",
-        web_write: ALLOW,
-        profile_overridable: false,
-        validation: NONE,
-        advanced: false,
-        widget: {
-          kind: "object_list",
-          id_field: "id",
-          fields: [
-            { field: "on", label: "On", required: false, widget: { kind: "toggle" }, validation: { rule: "bool" } },
-            { field: "n", label: "N", required: false, widget: { kind: "number" }, validation: { rule: "range_i64" } },
-            {
-              field: "pick",
-              label: "Pick",
-              required: false,
-              widget: { kind: "select", options: ["a", "b"] },
-              validation: { rule: "one_of", options: ["a", "b"] },
-            },
-            { field: "note", label: "Note", required: false, widget: { kind: "text" }, validation: { rule: "str" } },
-          ],
-        },
-      },
-    ];
-
-    render(
-      <SchemaSection
-        section="plugin:acme.cron"
-        schema={schema}
-        values={{ when: "0 9 * * 1-5", who: "codex", rows: [{ id: "r1", on: true, n: 2, pick: "a", note: "hi" }] }}
-        onSaveField={onSave}
-      />,
-    );
-
-    // Top-level cron + dynamic_select render, and the object_list item exposes
-    // every nested widget kind.
-    expect(screen.getByDisplayValue("0 9 * * 1-5")).toBeTruthy();
-    expect(screen.getByText("On")).toBeTruthy();
-    expect(screen.getByText("N")).toBeTruthy();
-    expect(screen.getByText("Pick")).toBeTruthy();
-    expect(screen.getByText("Note")).toBeTruthy();
-    await waitFor(() => expect(screen.getByText("Claude Code")).toBeTruthy());
-  });
-
-  it("toggles a dynamic_multi_select item field and persists the chosen values as an array", async () => {
-    const onSave = vi.fn().mockResolvedValue(true);
-    const schema: SettingsFieldDescriptor[] = [
-      {
-        section: "plugin:acme.cron",
-        field: "jobs",
-        category: "Plugins",
-        label: "Jobs",
-        description: "",
-        web_write: ALLOW,
-        profile_overridable: false,
-        validation: NONE,
-        advanced: false,
-        widget: {
-          kind: "object_list",
-          id_field: "id",
-          fields: [
-            {
-              field: "projects",
-              label: "Projects",
-              required: false,
-              widget: { kind: "dynamic_multi_select", source: "projects" },
-              validation: { rule: "str_list" },
-            },
-          ],
-        },
-      },
-    ];
-    render(
-      <SchemaSection
-        section="plugin:acme.cron"
-        schema={schema}
-        values={{ jobs: [{ id: "j1", projects: [] }] }}
-        onSaveField={onSave}
-      />,
-    );
-
-    // Options resolve from the host; toggling one persists it into the array.
-    await waitFor(() => expect(screen.getByText("Claude Code")).toBeTruthy());
-    fireEvent.click(screen.getByLabelText("Claude Code"));
-
-    await waitFor(() => expect(onSave).toHaveBeenCalled());
-    const [, field, value] = onSave.mock.calls.at(-1)!;
-    expect(field).toBe("jobs");
-    expect((value as { projects: string[] }[])[0]!.projects).toEqual(["claude-code"]);
-  });
-
-  it("multi-select shows an unavailable stored value and toggling off removes it", async () => {
-    const onSave = vi.fn().mockResolvedValue(true);
-    const schema: SettingsFieldDescriptor[] = [
-      {
-        section: "plugin:acme.cron",
-        field: "jobs",
-        category: "Plugins",
-        label: "Jobs",
-        description: "",
-        web_write: ALLOW,
-        profile_overridable: false,
-        validation: NONE,
-        advanced: false,
-        widget: {
-          kind: "object_list",
-          id_field: "id",
-          fields: [
-            {
-              field: "projects",
-              label: "Projects",
-              required: false,
-              widget: { kind: "dynamic_multi_select", source: "projects" },
-              validation: { rule: "str_list" },
-            },
-          ],
-        },
-      },
-    ];
-    // "ghost" is not among the host-resolved options, so it renders as
-    // unavailable but is preserved; "claude-code" is selected and gets removed.
-    render(
-      <SchemaSection
-        section="plugin:acme.cron"
-        schema={schema}
-        values={{ jobs: [{ id: "j1", projects: ["claude-code", "ghost"] }] }}
-        onSaveField={onSave}
-      />,
-    );
-
-    await waitFor(() => expect(screen.getByText("ghost (unavailable)")).toBeTruthy());
-    fireEvent.click(screen.getByLabelText("Claude Code"));
-
-    await waitFor(() => expect(onSave).toHaveBeenCalled());
-    const [, , value] = onSave.mock.calls.at(-1)!;
-    expect((value as { projects: string[] }[])[0]!.projects).toEqual(["ghost"]);
-  });
-
-  it("multi-select resolves depends_on sibling values from the item", async () => {
-    const onSave = vi.fn().mockResolvedValue(true);
-    const schema: SettingsFieldDescriptor[] = [
-      {
-        section: "plugin:acme.cron",
-        field: "jobs",
-        category: "Plugins",
-        label: "Jobs",
-        description: "",
-        web_write: ALLOW,
-        profile_overridable: false,
-        validation: NONE,
-        advanced: false,
-        widget: {
-          kind: "object_list",
-          id_field: "id",
-          fields: [
-            {
-              field: "agent",
-              label: "Agent",
-              required: false,
-              widget: { kind: "dynamic_select", source: "acp_agents" },
-              validation: { rule: "str" },
-            },
-            {
-              field: "models",
-              label: "Models",
-              required: false,
-              widget: { kind: "dynamic_multi_select", source: "acp_models", depends_on: ["agent"] },
-              validation: { rule: "str_list" },
-            },
-          ],
-        },
-      },
-    ];
-    render(
-      <SchemaSection
-        section="plugin:acme.cron"
-        schema={schema}
-        values={{ jobs: [{ id: "j1", agent: "opencode", models: [] }] }}
-        onSaveField={onSave}
-      />,
-    );
-    // The multi-select resolved its options using the sibling `agent` value.
-    await waitFor(() =>
-      expect(fetchMock).toHaveBeenCalledWith(
-        "/api/plugins/acme.cron/settings/options/resolve",
-        expect.objectContaining({ method: "POST" }),
+  it("renders every item widget kind plus top-level cron and dynamic_select", async () => {
+    const schema = [
+      descriptor("when", { kind: "cron" }),
+      descriptor("who", { kind: "dynamic_select", source: "acp_agents" }),
+      ...jobs(
+        itemField("On", { kind: "toggle" }),
+        itemField("N", { kind: "number" }),
+        itemField("Pick", { kind: "select", options: ["a", "b"] } as never),
+        itemField("Note", { kind: "text" }),
       ),
-    );
-    expect(screen.getByText("Models")).toBeTruthy();
+    ];
+    renderSection(schema, {
+      when: "0 9 * * 1-5",
+      who: "codex",
+      jobs: [{ id: "r1", On: true, N: 2, Pick: "a", Note: "hi" }],
+    });
+    expect(screen.getByDisplayValue("0 9 * * 1-5")).toBeTruthy();
+    for (const label of ["On", "N", "Pick", "Note"]) expect(screen.getByText(label)).toBeTruthy();
+    expect(await screen.findByText("Claude Code")).toBeTruthy();
   });
 
-  it("re-syncs its working copy when the persisted items change externally", async () => {
-    const onSave = vi.fn().mockResolvedValue(true);
-    const { rerender } = render(
-      <SchemaSection section="plugin:acme.cron" schema={SCHEMA} values={{ jobs: [] }} onSaveField={onSave} />,
-    );
+  it("re-syncs its working copy when persisted items change externally", async () => {
+    const { rerender, onSave } = renderSection(CRON_JOBS, { jobs: [] });
     expect(screen.queryByText("Item 1")).toBeNull();
-
-    // An external update to the persisted value flows into the rendered list.
     rerender(
-      <SchemaSection
-        section="plugin:acme.cron"
-        schema={SCHEMA}
-        values={{ jobs: [{ id: "id-1", agent: "codex", schedule: "0 9 * * 1-5" }] }}
-        onSaveField={onSave}
-      />,
+      <SchemaSection section={SECTION} schema={CRON_JOBS} values={{ jobs: [job("id-1")] }} onSaveField={onSave} />,
     );
-    await waitFor(() => expect(screen.getByText("Item 1")).toBeTruthy());
+    expect(await screen.findByText("Item 1")).toBeTruthy();
+  });
+});
+
+describe("dynamic_multi_select", () => {
+  it.each([
+    [[], ["claude-code"]],
+    [["claude-code", "ghost"], ["ghost"]],
+  ])("toggling Claude Code on %j persists %j, keeping unavailable values", async (projects, expected) => {
+    const { lastValue } = renderSection(MULTI_JOBS, { jobs: [{ id: "j1", projects }] });
+    await screen.findByText("Claude Code");
+    if (projects.includes("ghost")) expect(screen.getByText("ghost (unavailable)")).toBeTruthy();
+    fireEvent.click(screen.getByLabelText("Claude Code"));
+    expect(((await lastValue()) as { projects: string[] }[])[0]!.projects).toEqual(expected);
+  });
+
+  it("resolves depends_on from sibling item values", async () => {
+    const schema = jobs(
+      itemField("agent", { kind: "dynamic_select", source: "acp_agents" }),
+      itemField("models", { kind: "dynamic_multi_select", source: "acp_models", depends_on: ["agent"] }),
+    );
+    renderSection(schema, { jobs: [{ id: "j1", agent: "opencode", models: [] }] });
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(([url, init]) => url === RESOLVE_URL && String(init.body).includes("opencode")),
+      ).toBe(true),
+    );
+    expect(screen.getByText("models")).toBeTruthy();
   });
 });

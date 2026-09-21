@@ -1,8 +1,7 @@
 id = "cursor"
 
-# Cursor renders its live status bar on the follow-up prompt line or just
-# below it. Everything above belongs to the previous turn, so an interrupt
-# hint or spinner left in that scrollback must not read as a live signal.
+# Cursor renders its live status bar on the follow-up prompt line or just below
+# it.
 prompt_marker = ['(?i)^\s*\x{2192}(?:\s+add a follow-up.*)?\s*$']
 
 [[rules]]
@@ -34,8 +33,7 @@ region = "from_prompt_marker"
 visible = true
 contains_any = ["ctrl+c to stop", "ctrl+c to interrupt", "esc to interrupt"]
 
-# A spinner frame on the same line as a live activity verb. Either alone is
-# ordinary output; together they are Cursor's working line.
+# A spinner frame on the same line as a live activity verb.
 [[rules]]
 id = "spinner_activity"
 state = "running"

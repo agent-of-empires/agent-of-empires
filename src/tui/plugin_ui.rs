@@ -1,16 +1,12 @@
 //! Pure selectors for rendering the daemon's plugin UI-state snapshot in the
-//! native TUI (#2402). Mirrors the web selectors in `web/src/lib/pluginUi.ts`,
-//! narrowed to what a terminal can render: the structured view shows
-//! `StatusBar` (global) and `DetailBadge` (per-session) text, tone-colored,
-//! plus `Notification` toasts, and `Pane` (per session) and `HomePane` (global)
-//! blocks in a toggleable overlay (#2467); the remote-home picker shows
-//! `RowColumn` text per session row
-//! (#2948). Icons, tooltips, hrefs, and the
-//! `Card`/`RowBadge`/`SortKey`/`FilterFacet` slots have no TUI surface here and
-//! are ignored.
+//! native TUI (#2402), mirroring `web/src/lib/pluginUi.ts` narrowed to what a
+//! terminal can render: `StatusBar` / `DetailBadge` text, `Notification` toasts,
+//! `Pane` / `HomePane` blocks in a toggleable overlay (#2467), and `RowColumn`
+//! text on remote-home rows (#2948). Icons, tooltips, hrefs and the
+//! `Card`/`RowBadge`/`SortKey`/`FilterFacet` slots have no TUI surface.
 //!
-//! Kept side-effect-free so the render layer can borrow the snapshot and so the
-//! filtering / tone-mapping logic is unit-testable without a daemon.
+//! Side-effect-free, so the render layer can borrow the snapshot and the
+//! filtering / tone-mapping is unit-testable without a daemon.
 
 use aoe_plugin_api::UiSlot;
 use ratatui::style::{Color, Modifier, Style};
@@ -28,10 +24,9 @@ pub fn global_entries(snapshot: &UiSnapshot, slot: UiSlot) -> impl Iterator<Item
         .filter(move |e| e.slot == slot && e.session_id.is_none())
 }
 
-/// Per-session entries for `slot` whose `session_id` matches exactly. The
-/// exact match is a tearing guard: a snapshot can momentarily carry entries
-/// for a session other than the one on screen, and showing those would
-/// mislabel another session's state as this one's.
+/// Per-session entries for `slot` whose `session_id` matches exactly. Exact, as
+/// a tearing guard: a snapshot can momentarily carry another session's entries,
+/// and showing those would mislabel its state as this one's.
 pub fn session_entries<'a>(
     snapshot: &'a UiSnapshot,
     slot: UiSlot,
@@ -43,9 +38,8 @@ pub fn session_entries<'a>(
         .filter(move |e| e.slot == slot && e.session_id.as_deref() == Some(session_id))
 }
 
-/// The renderable `text` of a `StatusBar` / `DetailBadge` entry, if present
-/// and a non-empty string. Defensive: the daemon validates payloads, but a
-/// malformed or schema-skewed entry must not panic the renderer.
+/// The renderable `text` of a `StatusBar` / `DetailBadge` entry. Defensive: the
+/// daemon validates payloads, but a skewed entry must not panic the renderer.
 pub fn entry_text(entry: &UiEntry) -> Option<&str> {
     entry
         .payload
@@ -64,19 +58,16 @@ pub fn entry_tone(entry: &UiEntry) -> Option<Tone> {
 }
 
 /// This session's `RowColumn` cells as `(text, tone)`, in snapshot order
-/// (#2948). One session can carry several, one per plugin, so the caller
-/// renders them side by side the way the web maps over every entry. Entries
-/// with no renderable text drop out; `tooltip` has no terminal surface and is
-/// ignored, as with the other slots.
+/// (#2948). One session can carry several, one per plugin, rendered side by
+/// side. Entries with no renderable text drop out; `tooltip` has no surface.
 pub fn row_column_cells(snapshot: &UiSnapshot, session_id: &str) -> Vec<(String, Option<Tone>)> {
     session_entries(snapshot, UiSlot::RowColumn, session_id)
         .filter_map(|e| entry_text(e).map(|t| (t.to_string(), entry_tone(e))))
         .collect()
 }
 
-/// Map a tone to a foreground style against the active theme. `None` (no tone)
-/// renders neutral. Reuses existing theme status colors rather than inventing
-/// new fields, matching how the home view tones session rows.
+/// Map a tone to a foreground style against the active theme. `None` renders
+/// neutral. Reuses the theme's status colors rather than inventing fields.
 pub fn tone_style(tone: Option<Tone>, theme: &Theme) -> Style {
     let color = tone_color(tone, theme);
     Style::default().fg(color)
@@ -92,9 +83,8 @@ fn tone_color(tone: Option<Tone>, theme: &Theme) -> Color {
     }
 }
 
-/// The highest notification seq in the snapshot, or 0 when there are none.
-/// Used to initialize the "already seen" watermark so notifications that
-/// predate opening the view do not toast on first load.
+/// The highest notification seq in the snapshot, or 0 when there are none, to
+/// seed the watermark so notifications predating the view do not toast.
 pub fn max_notification_seq(snapshot: &UiSnapshot) -> u64 {
     snapshot
         .notifications
@@ -124,29 +114,23 @@ pub fn new_notifications<'a>(
     out
 }
 
-/// Width of a `divider` block's rule. The renderer pre-wraps every line to the
-/// panel width, so a fixed width is fine: a narrow pane wraps the rule
-/// (harmless) and a wide one shows a partial rule rather than spanning the whole
-/// width. Not worth threading the render width down for a decorative line.
+/// Width of a `divider` block's rule. The renderer pre-wraps to the panel width,
+/// so a fixed width is fine for a decorative line.
 const DIVIDER_WIDTH: usize = 32;
 
-/// Render the open session's `Pane` entries to terminal lines for the
-/// toggleable pane panel (#2467). Mirrors the web renderer's block vocabulary
-/// (`web/src/components/plugin/PluginSlots.tsx`), narrowed to what a terminal
-/// shows: text and tone only, with icons / hrefs / tooltips dropped and
-/// `action` blocks rendered as inert labels (interactive firing is a #2467
-/// follow-up). Forward-compatible: an unknown block `kind` renders nothing
-/// rather than failing, so a newer plugin can push kinds this host has not
-/// heard of. Entries are blank-line separated, and an entry that renders
-/// nothing contributes no separator (so a malformed payload leaves no gap).
+/// Render the open session's `Pane` entries to terminal lines for the toggleable
+/// pane panel (#2467), mirroring the web block vocabulary narrowed to text and
+/// tone; `action` blocks render as inert labels. An unknown block `kind` renders
+/// nothing rather than failing, so a newer plugin can push kinds this host has
+/// not heard of. Entries are blank-line separated, and one that renders nothing
+/// contributes no separator.
 pub fn pane_lines(snapshot: &UiSnapshot, session_id: &str, theme: &Theme) -> Vec<Line<'static>> {
     stack_pane_entries(session_entries(snapshot, UiSlot::Pane, session_id), theme)
 }
 
-/// Render a run of pane entries to lines, each entry's block body separated
-/// from the next by a blank line. An entry that renders nothing contributes no
-/// separator, so a malformed payload leaves no gap. Shared by the per-session
-/// `pane_lines` and the global `home_pane_lines`.
+/// Render a run of pane entries, each entry's body separated from the next by a
+/// blank line; an entry that renders nothing contributes no separator. Shared by
+/// `pane_lines` and `home_pane_lines`.
 fn stack_pane_entries<'a>(
     entries: impl Iterator<Item = &'a UiEntry>,
     theme: &Theme,
@@ -165,36 +149,30 @@ fn stack_pane_entries<'a>(
     out
 }
 
-/// Render global `HomePane` entries (session-less) with the same block
-/// vocabulary as a session `Pane`, the host-wide docked surface a plugin
-/// targets when its panel is not tied to a session. Entries stack in snapshot
-/// (insertion) order, so several plugins compose without colliding. `HomePane`
-/// reuses `PanePayload`, so a payload may carry `default_location`; it is a
-/// session-dock concept and is ignored here.
+/// Render global `HomePane` entries with the same block vocabulary as a session
+/// `Pane`: the host-wide docked surface a plugin targets when its panel is not
+/// tied to a session. Entries stack in snapshot order. `HomePane` reuses
+/// `PanePayload`, whose `default_location` is a session-dock concept, ignored.
 pub fn home_pane_lines(snapshot: &UiSnapshot, theme: &Theme) -> Vec<Line<'static>> {
     stack_pane_entries(global_entries(snapshot, UiSlot::HomePane), theme)
 }
 
 /// One pane entry: a heading naming the pane, then an ordered `blocks` list when
-/// present, else the simple `{ title, body }` form (matching the web renderer's
-/// precedence). The web shows the pane's name on its dock tab and so skips
-/// `title` inside a `blocks` body; the TUI overlay has no tabs, so the heading
-/// carries the attribution, falling back to the `plugin_id` the way the web's
-/// `paneTitle` does (`web/src/lib/pluginPanes.ts`).
+/// present, else the simple `{ title, body }` form. The web puts the pane name on
+/// its dock tab; the TUI overlay has no tabs, so the heading carries the
+/// attribution, falling back to the `plugin_id` as the web's `paneTitle` does.
 fn pane_entry_lines(entry: &UiEntry, theme: &Theme) -> Vec<Line<'static>> {
     // The footer belongs to the entry, not to the `blocks` form: a payload can
-    // pair it with the simple `{ title, body }` shape, and a block list that all
-    // drops out still has a status line worth showing. Computed once, up front, so
-    // both paths below append it and neither can forget.
+    // pair it with `{ title, body }`, and a block list that all drops out still
+    // has a status line worth showing. Computed once so neither path forgets it.
     let footer = footer_lines(&entry.payload, theme);
     if let Some(blocks) = entry.payload.get("blocks").and_then(Value::as_array) {
         let body: Vec<Line<'static>> = blocks
             .iter()
             .flat_map(|b| block_lines(b, 0, theme))
             .collect();
-        // Nothing renderable at all means no heading either: an empty or malformed
-        // payload must not leave a bare plugin name on screen. A footer counts as
-        // content, so it keeps the entry (and its heading) alive on its own.
+        // Nothing renderable means no heading either: a malformed payload must
+        // not leave a bare plugin name on screen. A footer counts as content.
         if body.is_empty() && footer.is_empty() {
             return body;
         }
@@ -322,9 +300,8 @@ fn block_lines(block: &Value, indent: usize, theme: &Theme) -> Vec<Line<'static>
 }
 
 /// `callout`: the pane's headline verdict. A toned title line, the detail
-/// wrapped beneath it, then each of its actions as an inert `[action]` label
-/// (same read-only treatment as a top-level `action`). Renders nothing without a
-/// title or detail, matching the web guard.
+/// wrapped beneath, then each action as an inert `[action]` label. Renders
+/// nothing without a title or detail, matching the web guard.
 fn callout_lines(block: &Value, indent: usize, theme: &Theme) -> Vec<Line<'static>> {
     let title = block_str(block, "title");
     let detail = block_str(block, "detail");
@@ -356,9 +333,8 @@ fn callout_lines(block: &Value, indent: usize, theme: &Theme) -> Vec<Line<'stati
     out
 }
 
-/// Cells in a `bar` block's text rendering. Fixed for the same reason
-/// [`DIVIDER_WIDTH`] is: the bar is a proportion, not a measurement, so it does
-/// not need the live panel width threaded down to read correctly.
+/// Cells in a `bar` block's text rendering. Fixed like [`DIVIDER_WIDTH`]: the
+/// bar is a proportion, not a measurement.
 const BAR_WIDTH: usize = 24;
 
 /// `bar`: the proportional stacked bar as a run of block glyphs per segment,
@@ -394,18 +370,14 @@ fn bar_lines(block: &Value, indent: usize, theme: &Theme) -> Vec<Line<'static>> 
 /// The eight block-fill glyphs, index 0 (lowest) to 7 (full).
 const SPARK_GLYPHS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
-/// `sparkline`: a history plot as a run of block-eighths glyphs, one per value,
-/// scaled against `max`, with an optional caption below. A time series the
-/// other block kinds can't express (`bar` is a proportion, not a series). Wire
-/// shape: `{ kind: "sparkline", values: [f64], max?: f64, tone?, bands?, caption? }`.
+/// `sparkline`: a history plot as block-eighths glyphs, one per value, scaled
+/// against `max`, with an optional caption. Wire shape:
+/// `{ kind: "sparkline", values: [f64], max?: f64, tone?, bands?, caption? }`.
 ///
-/// Coloring: `bands: [{ at: f64, tone }]` colors each glyph by the highest `at`
-/// threshold its value meets, so a series can change color as it climbs
-/// (green/amber/red for a pressure metric). Without `bands`, the whole
-/// series takes the single `tone`. Provide `max` for a stable vertical scale;
-/// it defaults to the data's own max, which rescales as the window changes.
-/// Unknown fields are ignored (forward-compatible); an empty series renders
-/// nothing.
+/// `bands: [{ at: f64, tone }]` colors each glyph by the highest `at` threshold
+/// its value meets, so a series can change color as it climbs; without them the
+/// whole series takes the single `tone`. `max` defaults to the data's own max,
+/// which rescales as the window changes. An empty series renders nothing.
 fn sparkline_lines(block: &Value, indent: usize, theme: &Theme) -> Vec<Line<'static>> {
     let values: Vec<f64> = block
         .get("values")
@@ -480,10 +452,9 @@ fn band_tone(bands: &[(f64, Tone)], value: f64) -> Option<Tone> {
 }
 
 /// Lay the segments out over [`BAR_WIDTH`] cells. Every positive segment gets at
-/// least one cell so a tiny slice is still visible, and the rounding slack is
-/// taken off the widest segments so the run is exactly `BAR_WIDTH` wide. With
-/// more segments than cells the one-cell floor wins and the run is `segments.len()`
-/// wide instead, which is the only case where it exceeds `BAR_WIDTH`.
+/// least one cell so a tiny slice stays visible, and rounding slack comes off the
+/// widest segments. With more segments than cells the one-cell floor wins and the
+/// run is `segments.len()` wide, the only case where it exceeds `BAR_WIDTH`.
 fn bar_spans(segments: &[(f64, Option<Tone>)], indent: usize, theme: &Theme) -> Vec<Span<'static>> {
     let total: f64 = segments.iter().map(|(v, _)| v).sum();
     let mut cells: Vec<usize> = segments
@@ -742,7 +713,6 @@ fn push_sep(spans: &mut Vec<Span<'static>>, indent: usize) {
     }
 }
 
-/// A single styled line at `indent` spaces.
 fn indented_line(indent: usize, text: String, style: Style) -> Line<'static> {
     if indent == 0 {
         Line::from(Span::styled(text, style))

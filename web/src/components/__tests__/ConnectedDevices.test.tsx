@@ -1,16 +1,4 @@
 // @vitest-environment jsdom
-//
-// Tests for ConnectedDevices. The component fetches the list of signed-in
-// devices on mount (via a deferred setTimeout, plus a 10s polling interval
-// and a visibilitychange listener), renders a loading / empty / populated /
-// error state, and exposes per-device "Revoke" and a global "Sign out all"
-// affordance, both elevation-gated through api helpers we mock here.
-//
-// Fake timers drive the deferred first load and the polling interval
-// deterministically. testing-library's `waitFor` polls on a real-timer
-// interval that never advances under fake timers, so instead of `waitFor`
-// we flush the component's own timers + microtasks with
-// `act(() => vi.advanceTimersByTimeAsync(...))` and then assert synchronously.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
@@ -57,9 +45,8 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-/** Advance the timers far enough to fire the deferred first load
- *  (setTimeout(load, 0)) and flush the awaited fetch promise + state update,
- *  all inside act() so React applies the update before we assert. */
+/** Advance the timers far enough to fire the deferred first load (setTimeout(load, 0)) and flush the awaited fetch
+ *  promise + state update, all inside act() so React applies the update before we assert. */
 async function flush(ms = 0) {
   await act(async () => {
     await vi.advanceTimersByTimeAsync(ms);
@@ -76,6 +63,10 @@ function revokeButtons(container: HTMLElement): HTMLButtonElement[] {
   return Array.from(container.querySelectorAll("button")).filter((b) => b.textContent?.trim() === "Revoke");
 }
 
+function signOutButton(container: HTMLElement): HTMLButtonElement {
+  return Array.from(container.querySelectorAll("button")).find((b) => b.textContent?.includes("Sign out all devices"))!;
+}
+
 describe("ConnectedDevices", () => {
   it("shows the loading state before the first fetch resolves", () => {
     // Never-resolving fetch so the component stays in its initial null state.
@@ -85,19 +76,18 @@ describe("ConnectedDevices", () => {
     expect(screen.getByText("Connected Devices")).toBeTruthy();
   });
 
-  it("renders the empty state when no devices are signed in", async () => {
-    mockFetchDevices.mockResolvedValue([]);
-    await renderAndLoad();
-    expect(screen.getByText("No signed-in devices")).toBeTruthy();
-    expect(screen.queryByText("Loading...")).toBeNull();
-  });
-
-  it("renders the error state when the fetch fails (returns null)", async () => {
-    mockFetchDevices.mockResolvedValue(null);
-    await renderAndLoad();
-    expect(screen.getByText("Could not load devices")).toBeTruthy();
-    expect(screen.queryByText("Loading...")).toBeNull();
-  });
+  it.each([
+    ["empty", [], "No signed-in devices"],
+    ["error", null, "Could not load devices"],
+  ] as [string, DeviceSession[] | null, string][])(
+    "renders the %s state once the first fetch resolves",
+    async (_name, result, text) => {
+      mockFetchDevices.mockResolvedValue(result);
+      await renderAndLoad();
+      expect(screen.getByText(text)).toBeTruthy();
+      expect(screen.queryByText("Loading...")).toBeNull();
+    },
+  );
 
   it("renders a populated list flagging the current device and showing a Revoke button only for others", async () => {
     mockFetchDevices.mockResolvedValue([
@@ -170,12 +160,7 @@ describe("ConnectedDevices", () => {
     const { container } = await renderAndLoad();
     expect(screen.getByText("this device")).toBeTruthy();
 
-    const signOutBtn = Array.from(container.querySelectorAll("button")).find((b) =>
-      b.textContent?.includes("Sign out all devices"),
-    )!;
-    expect(signOutBtn).toBeTruthy();
-
-    fireEvent.click(signOutBtn);
+    fireEvent.click(signOutButton(container));
     await flush(0);
 
     expect(confirmSpy).toHaveBeenCalledTimes(1);
@@ -189,11 +174,7 @@ describe("ConnectedDevices", () => {
     const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
 
     const { container } = await renderAndLoad();
-    const signOutBtn = Array.from(container.querySelectorAll("button")).find((b) =>
-      b.textContent?.includes("Sign out all devices"),
-    )!;
-
-    fireEvent.click(signOutBtn);
+    fireEvent.click(signOutButton(container));
     await flush(0);
 
     expect(confirmSpy).toHaveBeenCalledTimes(1);

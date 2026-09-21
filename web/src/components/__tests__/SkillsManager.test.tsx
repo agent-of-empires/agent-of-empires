@@ -148,14 +148,11 @@ describe("SkillsManager", () => {
     confirm.mockRestore();
   });
 
-  // A sync refreshes the skill list, which used to hand the read effect a new
-  // `selected` object reference and silently reset the editor to the on-disk
-  // content. The selection has not changed, so the draft must survive.
+  // A sync refreshes the skill list, which used to hand the read effect a new `selected` object reference and
+  // silently reset the editor to the on-disk content.
   it("keeps an unsaved edit across an action that reloads the skill list", async () => {
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
-    // Fresh skill objects per call, as parsing a real JSON response gives. The
-    // bug was those new references re-firing the read effect, so the default
-    // mock (one shared response, reusing the same element objects) hides it.
+    // Fresh skill objects per call, as parsing a real JSON response gives.
     fetchSkills.mockImplementation(async () => response([{ ...managed }, { ...external }]));
     render(<SkillsManager />);
 

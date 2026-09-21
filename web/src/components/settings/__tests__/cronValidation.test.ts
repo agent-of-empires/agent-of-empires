@@ -1,7 +1,3 @@
-// Unit coverage for the client-side 5-field cron validator (#2897). The server
-// is authoritative; this only mirrors the grammar for early feedback, so the
-// tests pin the field-count, range, list, range, and step branches.
-
 import { describe, expect, it } from "vitest";
 import { validateCron } from "../cronValidation";
 

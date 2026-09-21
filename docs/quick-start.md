@@ -6,129 +6,69 @@
 aoe
 ```
 
-This opens the dashboard. You'll see an empty session list on first run.
-
 | Key | Action |
 |-----|--------|
 | `n` | New session |
-| `b` | New session from saved project |
-| `p` | Manage saved projects (add/remove) |
-| `Enter` | Attach to session |
-| `d` | Delete session |
-| `t` | Toggle Agent/Terminal view |
-| `D` | Open diff view |
+| `b` | New session from a saved project |
+| `p` | Manage saved projects |
+| `Enter` | Attach to a session |
+| `d` | Delete a session |
+| `t` | Toggle Agent / Terminal view |
+| `D` | Open the [diff view](guides/diff-view.md) |
 | `/` | Search sessions |
-| `?` | Show help (full keymap) |
+| `?` | Full keymap |
 | `q` | Quit |
-| `Ctrl+b d` | Detach from tmux session |
+| `Ctrl+b d` | Detach from the tmux session |
 
-Press `?` in the TUI for the full keymap.
+## Your first session
 
-## Create Your First Session
+Press `n` and fill in the path to your project (or leave `.`), or run `aoe add /path/to/project`. The session appears in the dashboard as **Idle**. Select it and press `Enter` to attach; you are now inside a tmux session running the agent. `Ctrl+b d` detaches back to the TUI. If aoe itself runs inside tmux, attaching switches your client to the agent's session and `Ctrl+b L` switches back.
 
-**From the TUI:** Press `n` to open the new session dialog. Fill in the path to your project (or leave it as `.` for the current directory) and press `Enter`.
+Press `t` to toggle between the structured view and the paired shell terminal, where you can run builds and git commands without interrupting the agent.
 
-**From the CLI:**
+## Projects and groups
 
-```bash
-aoe add /path/to/project
-```
+A **project** is a saved directory path you register once so you can start sessions from it without retyping. Registering is only a convenience: `n` and `aoe add <path>` work on any path. Add one with `aoe project add /path/to/repo`, or press `p` in the TUI and then `a`. Once a project exists, `b` starts a session from it. See [Multi-repo workspaces](guides/multi-repo-workspaces.md#the-project-registry).
 
-The session appears in the dashboard with status **Idle**.
+A **group** is unrelated: it is a label you assign to existing sessions to sort them in the sidebar, set from the rename dialog or with `aoe group move`. Projects are where sessions start; groups are how they are bucketed once they exist. See [the grouping axes](guides/web/dashboard.md#sorting-and-grouping).
 
-## Projects and Groups
+## Worktrees
 
-These two words show up around the dashboard and mean different things.
-
-A **project** is a saved directory path, usually a git repository, that you register once so you can start sessions from it without retyping the path. It is an AoE registry entry, not a Claude Code project (which is tied to a directory by Claude itself). You do not have to register your repos; `n` and `aoe add <path>` work on any path. Registering is only a convenience for repos you reach for often.
-
-Add a project two ways:
+To work on a new branch in its own directory:
 
 ```bash
-aoe project add /path/to/repo        # CLI
-```
-
-In the TUI, press `p` to open **Manage projects**, then `a` to add one. Once a project is registered, `b` starts a new session from it (this is why `b` reports "No Projects" until you have added at least one). See [Multi-Repo Workspaces](guides/multi-repo-workspaces.md#the-project-registry) for scopes and multi-repo sessions.
-
-A **group** is unrelated to projects. It is a label you assign to existing sessions to sort them in the sidebar (for example `fix` and `feature`), set from the session rename dialog or with `aoe group move`. Projects are where sessions start; groups are how sessions are bucketed once they exist. See the [Web Dashboard grouping section](guides/web/dashboard.md#sidebar-grouping-by-repo-by-group-or-both) for the grouping axes.
-
-## Attach to a Session
-
-Select a session and press `Enter` to attach. You're now inside a tmux session running your AI agent (Claude Code by default).
-
-To return to the TUI, press **`Ctrl+b d`** (the standard tmux detach shortcut). If aoe itself runs inside tmux, attaching switches your client to the agent's session instead and **`Ctrl+b L`** switches back; the status bar shows whichever applies.
-
-## Use the Terminal View
-
-Press `t` to toggle between Structured View and Terminal View. Each agent session has a paired shell terminal where you can run builds, tests, and git commands without interrupting the agent.
-
-## Review Changes with Diff View
-
-Press `D` to open the diff view. This shows changes between your working directory and the base branch. Navigate files with `j`/`k`, press `e` to edit, and `Esc` to close.
-
-## Create a Worktree Session
-
-To work on a new branch with its own directory:
-
-```bash
-# CLI
 aoe add . -w feat/my-feature -b
-
-# TUI: press n, enter a title, enable Worktree
-# Optional: press Ctrl+P on Worktree and fill in Name
 ```
 
-This creates a new git branch, a worktree directory, and a session pointing at it. When you delete the session, AoE offers to clean up the worktree too.
+In the TUI, press `n`, enter a title, and enable Worktree (`Ctrl+P` on the field for an explicit name). Deleting the session offers to clean the worktree up.
 
-## Attach to Existing Work
+Omit `-b` to attach instead: AoE re-uses the worktree for that branch, or checks the branch out into a new one. The TUI and web wizard have an **Attach to existing branch** toggle. Removing a session only cleans up worktrees AoE created. See the [worktrees reference](guides/worktrees.md).
 
-**Attach to an existing branch or worktree.** Omit `-b` and AoE re-uses the worktree for that branch, or checks the branch out into a new worktree if none exists:
+## Resume a Claude conversation
+
+After attaching, run `/resume` in the Claude pane and pick a conversation. AoE captures the session id and persists it, so the next launch reattaches automatically. See [Session resume](guides/session-resume.md).
+
+## Sandboxes and other agents
 
 ```bash
-aoe add . -w feat/my-feature
+aoe add --sandbox .        # run the agent in a container
+aoe add -c opencode .      # use a different agent
 ```
 
-In the TUI, press `Ctrl+P` on the Worktree field and toggle **Attach to existing branch** (same toggle in the web wizard). Removing the session only cleans up worktrees AoE created; attached ones are left alone. See [Worktrees Reference](guides/worktrees.md) for the full matrix.
+The sandbox mounts your project at `/workspace` and shares authentication through persistent volumes; the TUI has a checkbox for it when a container runtime is available. The agent picker in the new-session dialog lists every detected tool. See the [container sandbox guide](guides/sandbox.md).
 
-**Resume a Claude Code conversation.** After attaching, run `/resume` in the Claude pane and pick a conversation. AoE captures the session ID and persists it so the next launch reattaches automatically. See [Session Resume](guides/session-resume.md), including `aoe session set-session-id` to set the Claude UUID explicitly.
-
-## Create a Sandboxed Session
-
-To run an agent inside a Docker container:
+## The web dashboard
 
 ```bash
-aoe add --sandbox .
+aoe serve                  # localhost only
+aoe serve --remote         # reachable from your phone over HTTPS
+aoe serve --daemon         # run in the background
 ```
 
-In the TUI, toggle the sandbox checkbox when creating a session. The agent runs in an isolated container with your project mounted at `/workspace` and authentication credentials shared via persistent Docker volumes.
+Open the printed URL in any browser for the same sessions, live terminals, and controls, and install it as a PWA for an app-like experience. See the [web dashboard guide](guides/web-dashboard.md).
 
-Requires Docker to be installed.
+## Next steps
 
-## Choose a Different Agent
-
-By default, AoE uses Claude Code. To use a different tool:
-
-```bash
-aoe add -c opencode .   # or any other supported agent
-```
-
-In the TUI, select the tool from the dropdown in the new session dialog.
-
-## Use the Web Dashboard
-
-Prefer a browser? Run `aoe serve` to start the web dashboard:
-
-```bash
-aoe serve                         # localhost only
-aoe serve --host 0.0.0.0          # accessible from other devices (use with VPN)
-aoe serve --daemon                # run in background
-```
-
-Open the printed URL in any browser (phone, tablet, or another computer) for the same session list, live terminal streaming, and session controls. Install it as a PWA for an app-like experience. See the [Web Dashboard Guide](guides/web-dashboard.md) for details.
-
-## Next Steps
-
-- [Web Dashboard](guides/web-dashboard.md): access sessions from any browser
-- [Docker Sandbox](guides/sandbox.md): container configuration and custom images
-- [Repo Config & Hooks](guides/repo-config.md): per-project settings
-- [CLI Reference](cli/reference.md): every command and flag
+- [Repo config & hooks](guides/repo-config.md): per-project settings
+- [Configuration reference](guides/configuration.md): every setting
+- [CLI reference](cli/reference.md): every command and flag

@@ -5,7 +5,6 @@ use super::discovery::get_sounds_dir;
 const GITHUB_SOUNDS_BASE_URL: &str =
     "https://raw.githubusercontent.com/agent-of-empires/agent-of-empires/main/bundled_sounds";
 
-/// List of bundled sound files available for download
 const BUNDLED_SOUND_FILES: &[&str] = &[
     "start.wav",
     "running.wav",
@@ -19,7 +18,6 @@ const BUNDLED_SOUND_FILES: &[&str] = &[
     "gem.wav",
 ];
 
-/// Download and install bundled sounds from GitHub
 pub async fn install_bundled_sounds() -> anyhow::Result<()> {
     let Some(sounds_dir) = get_sounds_dir() else {
         return Err(anyhow::anyhow!("Could not determine sounds directory"));

@@ -1,12 +1,4 @@
 // @vitest-environment jsdom
-//
-// FileContentViewer contract (#3088): fetches the provenance-confined /file
-// endpoint and renders Markdown (rendered by default, Raw toggle) or the
-// whole-file view for other extensions, plus the binary notice.
-//
-// The whole-file view renders through `@pierre/diffs`, which needs a real DOM
-// and workers, so it is stubbed here (as in the DiffFileViewer specs) to keep
-// this spec about the branch that was chosen rather than how it paints.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -17,6 +9,8 @@ vi.mock("../../../hooks/useShikiTheme", () => ({
   useShikiTheme: () => ({ theme: "github-dark", appearance: "dark" }),
 }));
 
+// Stubbed: the whole-file view renders through `@pierre/diffs`, which needs a
+// real DOM and workers. This spec is about which branch is chosen, not paint.
 vi.mock("../FullFileViewer", () => ({
   FullFileViewer: ({ content, filePath }: { content: string; filePath: string }) => (
     <div data-testid="full-file" data-path={filePath}>

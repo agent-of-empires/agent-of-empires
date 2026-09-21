@@ -1,24 +1,5 @@
-// Structured view per-session config picker (#1403).
-//
-// Renders the model dropdown + reasoning-effort selector by filtering
-// the unified `configOptions` snapshot the daemon publishes from
-// ACP `SessionUpdate::ConfigOptionUpdate`. The mode picker lives in the
-// composer (`ModePicker`); it reads a `category:"mode"` config option
-// from this same `configOptions` snapshot when the agent advertises one
-// (OpenCode, claude-agent-acp v0.37.0+), and only falls back to the ACP
-// SessionModeState channel otherwise. See lib/modeChannel.ts (#1764).
-//
-// Behavior:
-// - Pessimistic UI. Current value stays put until the adapter pushes a
-//   confirming `ConfigOptionsUpdated`. The clicked option is dimmed
-//   and disabled while `pendingConfigOption?.configId === id`.
-// - Effort is adaptive: segmented control when the option count and
-//   total label width comfortably fit, dropdown fallback otherwise.
-//   The threshold is intentionally simple (count + label-length); a
-//   container query is YAGNI until adapters actually emit long lists.
-// - Hidden entirely when neither category appears.
-// - `ConfigOptionSwitchFailedNotice` lives in this file because it
-//   shares the dismiss callback's home.
+// Model and reasoning-effort pickers from the agent's config options. Pessimistic:
+// the current value changes only when the adapter confirms; the pending choice is disabled.
 
 import { ChevronUp } from "lucide-react";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
@@ -32,17 +13,9 @@ interface Props {
 }
 
 const MODEL_LABEL_MAX = 24;
-// Cap and floor for the menu's dynamically computed max-height (px). The
-// cap keeps a short list from looking absurdly tall. The floor is only a
-// threshold for picking which direction the menu opens in (see
-// `computeMenuLayout`): rendered height is always clamped to the actual
-// space available in the chosen direction, so the menu never extends
-// past the viewport regardless of which side has room.
+// The floor only picks the open direction; height always clamps to the available space.
 const MENU_MAX_HEIGHT_CAP = 288;
 const MENU_MAX_HEIGHT_FLOOR = 120;
-// Buffer kept beyond the trigger's own `mb-1`/`mt-1` (4px) gap so the
-// menu's outer edge never touches the viewport edge, in whichever
-// direction it opens.
 const MENU_VIEWPORT_MARGIN = 8;
 const EFFORT_SEGMENTED_MAX_COUNT = 5;
 const EFFORT_SEGMENTED_MAX_TOTAL_LABEL_LEN = 40;
@@ -63,8 +36,6 @@ export function SessionConfigControls({ configOptions, pendingConfigOption, onSe
   const model = findByCategory(configOptions, "model");
   const effort = findByCategory(configOptions, "thought_level");
 
-  // Hidden entirely when neither selector exists; avoids empty chrome
-  // on adapters that don't advertise either category.
   if (!model && !effort) return null;
 
   return (
@@ -89,8 +60,7 @@ export function SessionConfigControls({ configOptions, pendingConfigOption, onSe
 
 interface SubProps {
   option: ConfigOptionDescriptor;
-  /** The value currently in flight for this option (rendered with a
-   *  pending affordance), or null when nothing is pending. */
+  /** The value in flight for this option, if any. */
   pending: string | null;
   onSelect: (value: string) => void | Promise<void>;
 }
@@ -102,24 +72,9 @@ interface MenuLayout {
 
 const DEFAULT_MENU_LAYOUT: MenuLayout = { direction: "up", maxHeight: MENU_MAX_HEIGHT_CAP };
 
-/** Picks which side of the trigger the menu opens toward and how tall it
- *  may render, from the trigger's actual position in the viewport.
- *  Prefers opening upward (this menu's usual position, anchored above a
- *  footer control) as long as there's at least floor-height room there;
- *  otherwise flips to whichever side has more room. Height is always
- *  clamped to the space actually available in the chosen direction, so
- *  the menu can render shorter than the floor on a very cramped
- *  viewport, but it never extends past the viewport edge.
- *
- *  `viewportHeight` should be `window.visualViewport?.height ??
- *  window.innerHeight`: on iOS Safari, `innerHeight` stays at the full
- *  layout height while the software keyboard is raised, so it alone
- *  would report room below the trigger that the keyboard has actually
- *  covered. `viewportTop` should be `window.visualViewport?.offsetTop ??
- *  0`: `getBoundingClientRect()` is relative to the layout viewport, but
- *  the visible vertical interval is `offsetTop .. offsetTop + height`
- *  (CSSOM View); a non-zero offset (e.g. after pinch-zoom) shifts both
- *  edges of that interval, not just its size. */
+/** Open upward when a floor's worth of room exists, else toward the roomier side.
+ *  Uses the visual viewport: iOS `innerHeight` ignores the keyboard, and a zoom offset
+ *  shifts both visible edges. */
 function computeMenuLayout(rect: DOMRect, viewportHeight: number, viewportTop = 0): MenuLayout {
   const spaceAbove = rect.top - viewportTop - MENU_VIEWPORT_MARGIN;
   const spaceBelow = viewportTop + viewportHeight - rect.bottom - MENU_VIEWPORT_MARGIN;
@@ -162,14 +117,7 @@ function ModelDropdown({ option, pending, onSelect }: SubProps) {
     };
   }, [open]);
 
-  // The menu prefers opening upward, so its usual ceiling is the trigger
-  // button's distance from the top of the viewport, not a fixed guess.
-  // Recomputed on open and on resize/scroll so a short viewport (or one
-  // that shrinks after opening) still leaves it fully on-screen, flipping
-  // to open downward when there isn't enough room above. Also listens on
-  // `visualViewport` so a software keyboard raising/lowering while the
-  // menu is open (which does not fire `window`'s `resize`) still
-  // recomputes. See `computeMenuLayout`.
+  // visualViewport events catch the soft keyboard, which fires no window resize.
   useLayoutEffect(() => {
     if (!open) return;
     const vv = typeof window !== "undefined" ? window.visualViewport : null;
@@ -321,10 +269,7 @@ interface NoticeProps {
   onDismiss: () => void;
 }
 
-/** Non-blocking notice rendered near the picker when the adapter
- *  rejects a `session/set_config_option`. Auto-dismisses via the
- *  reducer when a later snapshot confirms the requested value; the
- *  manual dismiss button is the user-visible escape hatch. */
+/** The adapter rejected a config change; the reducer clears this once a snapshot confirms the value. */
 export function ConfigOptionSwitchFailedNotice({ failure, configOptions, onDismiss }: NoticeProps) {
   if (!failure) return null;
   const config = configOptions.find((c) => c.id === failure.configId);

@@ -1,11 +1,3 @@
-// CI drift guard for the first-run tutorial, plus resolver coverage.
-//
-// The guard is the cheap, deterministic half of the "tour cannot silently
-// break" contract (issue #1513, user story 3): it couples TOUR_STEPS, the
-// TOUR_ANCHORS constants, and the actual `data-tour` attributes in component
-// source, so renaming or deleting an anchor on either side turns this red in
-// milliseconds. The render-time half (an eligible anchor that fails to paint)
-// is covered by the Dashboard render test and the live Playwright smoke.
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -19,9 +11,6 @@ import {
 } from "../tourSteps";
 
 const SRC_DIR = join(process.cwd(), "src");
-// tourSteps.ts itself legitimately contains the `data-tour="..."` template in
-// tourSelector(); tests and stories are not shipped UI. Everything else must go
-// through the TOUR_ANCHORS constants.
 const EXCLUDED = [join("lib", "tourSteps.ts"), "__tests__", ".test.", ".stories."];
 
 function collectSourceFiles(dir: string, acc: string[] = []): string[] {
@@ -104,7 +93,6 @@ describe("resolveTourSteps", () => {
     expect(ids).toContain("sidebar");
     expect(ids).toContain("new-session");
     expect(ids).toContain("topbar-more");
-    // acp-only steps must not leak onto the dashboard
     expect(ids).not.toContain("composer");
     expect(ids).not.toContain("right-panel");
   });
@@ -127,11 +115,8 @@ describe("resolveTourSteps", () => {
       isDesktop: true,
       hasAnchor: present,
     }).map((s) => s.id);
-    // Worktree and structured-view settings tabs are not in the CityHall
-    // subset, so their (probe-bypassing) settings steps must be dropped.
     expect(ids).not.toContain("settings-worktree");
     expect(ids).not.toContain("settings-agent-defaults");
-    // The plugins settings tab stays in CityHall, so its step remains.
     expect(ids).toContain("settings-plugins");
   });
 
@@ -152,8 +137,6 @@ describe("resolveTourSteps", () => {
       isDesktop: true,
       hasAnchor: () => false,
     });
-    // settingsTab steps mount their anchor only after the tour navigates into
-    // Settings, so they bypass the launch-time DOM probe; everything else drops.
     expect(steps.map((s) => s.id)).toEqual(["settings-worktree", "settings-plugins", "settings-agent-defaults"]);
     expect(steps.every((s) => s.settingsTab)).toBe(true);
   });

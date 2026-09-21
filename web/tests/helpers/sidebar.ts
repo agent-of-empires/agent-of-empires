@@ -1,36 +1,20 @@
 import { spawnSync } from "node:child_process";
-import { initWorkingRepo } from "./gitFixture";
 import { join } from "node:path";
-import type { Page } from "@playwright/test";
+import type { Locator, Page } from "@playwright/test";
+import { initWorkingRepo } from "./gitFixture";
 import { resolveAoeBinary } from "./aoeServe";
 
+/** Click a sidebar session link once it has slid fully into the viewport. */
 export async function clickSidebarSession(page: Page, title: string) {
-  // Sidebar session rows are anchor tags (see WorkspaceSidebar.tsx). The
-  // pre-link button-based fallback that used to live here was dead code by
-  // the time it ran: if the link never appeared, the button locator never
-  // did either, but its click had no timeout and would consume the rest
-  // of the 30s test budget before erroring with a confusing "page closed"
-  // message. Surfacing the link timeout directly gives a clean failure.
-  //
-  // 20s rather than 10s: at 6 mocked workers on a 4-vCPU runner with v8
-  // coverage instrumentation, sidebar slide-in + sessions fetch + render
-  // sometimes lose to scheduler contention past 10s. Two flakes in CI
-  // (pinch-zoom MIN_FONT_SIZE, scrollback scroll-down clamp) traced to
-  // exactly this race.
   const sessionLink = page.getByRole("link").filter({ hasText: title }).first();
+  // Generous: coverage-instrumented parallel workers can take over 10s to render the sidebar.
   await sessionLink.waitFor({ state: "visible", timeout: 20_000 });
-  // On mobile the sidebar slides in from the left; while it is closed or
-  // mid-transition, the row's bounding box has a negative x. Playwright's
-  // `visible` check passes (non-zero box, not display:none) but `.click()`
-  // then loops on "element is outside of the viewport" for the full 30s
-  // test timeout. Wait until the box settles inside the viewport.
+  // A sliding mobile sidebar reports a visible box at negative x, which click() cannot reach.
   await page.waitForFunction(
     (linkTitle) => {
-      const links = Array.from(document.querySelectorAll("a"));
-      const link = links.find((a) => a.textContent?.includes(linkTitle));
-      if (!link) return false;
-      const r = link.getBoundingClientRect();
-      return r.x >= 0 && r.y >= 0 && r.width > 0 && r.height > 0;
+      const link = Array.from(document.querySelectorAll("a")).find((a) => a.textContent?.includes(linkTitle));
+      const r = link?.getBoundingClientRect();
+      return !!r && r.x >= 0 && r.y >= 0 && r.width > 0 && r.height > 0;
     },
     title,
     { timeout: 10_000 },
@@ -38,46 +22,25 @@ export async function clickSidebarSession(page: Page, title: string) {
   await sessionLink.click();
 }
 
-// Mobile specs (`devices['iPhone 13']`) open the workspace sidebar before
-// clicking a session row. The old recipe `if (await toggle.isVisible())`
-// is a single non-retrying snapshot that races with React hydration on
-// loaded CI workers, so the toggle click is skipped and the sidebar stays
-// closed; the subsequent row click then times out on actionability.
-//
-// This helper is deterministic: it waits for the toggle to mount, probes
-// the sidebar's current x via the session-row testid, and only clicks the
-// toggle when the sidebar is fully closed (x < -row width / 2). It then
-// blocks until the slide-in transition settles the box at x >= 0.
+/** Open the mobile sidebar only if it is closed, then wait for the slide-in to settle. */
 export async function openMobileSidebar(page: Page) {
   const toggle = page.getByRole("button", { name: "Toggle sidebar" });
   await toggle.waitFor({ state: "visible", timeout: 10_000 });
   const probe = page.getByTestId("sidebar-session-row").first();
   await probe.waitFor({ state: "attached", timeout: 10_000 });
   const initial = await probe.boundingBox();
-  if (!initial || initial.x < 0) {
-    await toggle.click();
-  }
+  if (!initial || initial.x < 0) await toggle.click();
   await page.waitForFunction(
     () => {
-      const row = document.querySelector('[data-testid="sidebar-session-row"]');
-      if (!row) return false;
-      const r = (row as HTMLElement).getBoundingClientRect();
-      return r.x >= 0 && r.width > 0;
+      const r = document.querySelector('[data-testid="sidebar-session-row"]')?.getBoundingClientRect();
+      return !!r && r.x >= 0 && r.width > 0;
     },
     null,
     { timeout: 5_000 },
   );
 }
 
-/**
- * Read the visible session-row titles in the sidebar, in DOM order.
- *
- * Scopes to the `.truncate` label span inside each row so a Wakeup or
- * Plan chip on the same row can't be confused with the workspace
- * title. Hoisted from `tests/live/workspace-ordering.spec.ts` so the
- * reorder story specs can share the same accessor without redefining
- * it per file.
- */
+/** Session row titles in DOM order, read from the label span so row chips are ignored. */
 export async function readVisibleSessionTitles(page: Page): Promise<string[]> {
   return page.evaluate(() => {
     const rows = Array.from(document.querySelectorAll<HTMLElement>("[data-testid='sidebar-session-row']"));
@@ -85,48 +48,34 @@ export async function readVisibleSessionTitles(page: Page): Promise<string[]> {
   });
 }
 
-/**
- * Build a `seedFn` for `spawnAoeServe` that git-inits a project dir
- * under the isolated HOME, then runs `aoe add` once per supplied
- * title. The arrival order matters: the server prepends new workspace
- * ids newest-first, so the seeded sidebar order in arrival sequence
- * is `titles[-1]` at the top down to `titles[0]` at the bottom.
- *
- * Optional `subdir` lets callers seed multiple repos by pointing each
- * `seedSessionsInRepo` call at a different directory; the cross-group
- * reorder story chains two calls for that reason.
- */
+/** Press near the right edge of `source`, hold past dnd-kit's activation delay, and drop on `target`. */
+export async function dragRow(page: Page, source: Locator, target: Locator, { release = true } = {}) {
+  const sourceBox = await source.boundingBox();
+  const targetBox = await target.boundingBox();
+  if (!sourceBox || !targetBox) throw new Error("row box missing");
+  await page.mouse.move(sourceBox.x + sourceBox.width - 4, sourceBox.y + sourceBox.height / 2);
+  await page.mouse.down();
+  await page.waitForTimeout(250);
+  await page.mouse.move(targetBox.x + targetBox.width / 2, targetBox.y + targetBox.height / 2, { steps: 12 });
+  if (release) await page.mouse.up();
+}
+
+/** A live `seedFn` that registers one repo with an `aoe add` per title; later titles sort first. */
 export function seedSessionsInRepo(opts: {
   titles: string[];
   subdir?: string;
   tool?: string;
 }): (seedEnv: { home: string; shimBin: string; env: NodeJS.ProcessEnv }) => void {
   return ({ home, env }) => {
-    const binary = resolveAoeBinary();
     const projectDir = join(home, opts.subdir ?? "repo");
     initWorkingRepo(projectDir, env);
     for (const title of opts.titles) {
-      const res = spawnSync(binary, ["add", projectDir, "-t", title, "-c", opts.tool ?? "claude"], { env });
+      const res = spawnSync(resolveAoeBinary(), ["add", projectDir, "-t", title, "-c", opts.tool ?? "claude"], { env });
       if (res.status !== 0) {
         throw new Error(
           `aoe add failed for ${title}: status=${res.status} stderr=${res.stderr?.toString() ?? "<none>"}`,
         );
       }
     }
-  };
-}
-
-/**
- * Chain multiple repo seeds into a single `seedFn`. Cross-group
- * reorder stories need at least two repos so dnd-kit's per-group
- * SortableContext renders multiple drag boundaries; this helper runs
- * each repo's `seedSessionsInRepo` in sequence under the same env.
- */
-export function seedRepos(
-  repos: Array<{ titles: string[]; subdir: string; tool?: string }>,
-): (seedEnv: { home: string; shimBin: string; env: NodeJS.ProcessEnv }) => void {
-  const fns = repos.map((r) => seedSessionsInRepo(r));
-  return (seedEnv) => {
-    for (const fn of fns) fn(seedEnv);
   };
 }

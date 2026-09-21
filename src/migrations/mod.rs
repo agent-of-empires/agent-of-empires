@@ -8,7 +8,9 @@
 //! 2. Implement the migration function
 //! 3. Add it to the `MIGRATIONS` array below
 
+mod config_file;
 pub mod progress;
+mod sessions_file;
 mod store_fs;
 mod v001_xdg_linux;
 mod v002_seed_sandbox_from_volumes;
@@ -45,6 +47,41 @@ mod v032_capture_purge_runners;
 mod v033_canonical_sidebar;
 mod v034_fold_pending_initial_turn;
 
+/// Fixtures shared by migrations that rewrite agent hook files.
+#[cfg(test)]
+mod hook_fixtures {
+    use crate::session::test_support::EnvGuard;
+    use serde_json::Value;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use tempfile::TempDir;
+
+    pub(super) fn unset_agent_home_env() -> EnvGuard {
+        EnvGuard::unset(&[
+            "CODEX_HOME",
+            "CLAUDE_CONFIG_DIR",
+            "CURSOR_CONFIG_DIR",
+            "GEMINI_CONFIG_DIR",
+            "QWEN_CONFIG_DIR",
+        ])
+    }
+
+    pub(super) fn setup_dirs() -> (TempDir, PathBuf, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let app_dir = tmp.path().join("app");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&app_dir).unwrap();
+        (tmp, home, app_dir)
+    }
+
+    pub(super) fn write_json(path: &Path, value: &Value) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, serde_json::to_string_pretty(value).unwrap()).unwrap();
+    }
+}
 use anyhow::Result;
 use std::fs;
 use tracing::{debug, info};

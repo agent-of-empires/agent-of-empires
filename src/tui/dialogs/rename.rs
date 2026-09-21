@@ -471,19 +471,8 @@ impl RenameDialog {
 
         let dialog_width = 50;
         let height = 15 + if show_toggle { 1 } else { 0 } + if show_warning { 2 } else { 0 };
-        let dialog_area = super::centered_rect(area, dialog_width, height);
-
-        frame.render_widget(Clear, dialog_area);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.accent))
-            .title(" Edit Session ")
-            .title_style(Style::default().fg(theme.title).bold());
-
-        let inner = block.inner(dialog_area);
-        frame.render_widget(block, dialog_area);
+        let block = super::dialog_block(" Edit Session ", theme);
+        let (_, inner) = super::render_dialog_frame(frame, area, dialog_width, height, block);
 
         // Fixed rows first (current values, spacer, the three input fields),
         // then the optional branch toggle / warning, then spacer + hint. The
@@ -614,18 +603,13 @@ impl RenameDialog {
         let dialog_width = 50;
         let has_error = self.validation_error.is_some();
         let dialog_height = if has_error { 16 } else { 13 };
-        let dialog_area = super::centered_rect(area, dialog_width, dialog_height);
-
-        frame.render_widget(Clear, dialog_area);
-
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.accent))
             .title(" Rename Group ")
             .title_style(Style::default().fg(theme.title).bold());
-
-        let inner = block.inner(dialog_area);
-        frame.render_widget(block, dialog_area);
+        let (_, inner) =
+            super::render_dialog_frame(frame, area, dialog_width, dialog_height, block);
 
         let mut constraints = vec![
             Constraint::Length(1), // Current group
@@ -781,988 +765,393 @@ impl RenameDialog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crate::tui::dialogs::test_keys::{ctrl_key, key, shift_key};
 
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::empty())
+    const ONE_PROFILE: &[&str] = &["default"];
+    const MULTI_PROFILES: &[&str] = &["default", "work", "personal"];
+    const GROUPS: &[&str] = &["work", "work/frontend", "personal"];
+
+    fn owned(values: &[&str]) -> Vec<String> {
+        values.iter().map(|s| s.to_string()).collect()
     }
 
-    fn shift_key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::SHIFT)
+    fn dlg(
+        title: &str,
+        group: &str,
+        profile: &str,
+        profiles: &[&str],
+        groups: &[&str],
+    ) -> RenameDialog {
+        RenameDialog::new(title, group, profile, owned(profiles), owned(groups))
     }
 
-    fn default_profiles() -> Vec<String> {
-        vec!["default".to_string()]
+    /// Session dialog over "Old Title" / "old-group" with three profiles.
+    fn fixture() -> RenameDialog {
+        dlg("Old Title", "old-group", "default", MULTI_PROFILES, &[])
     }
 
-    fn multi_profiles() -> Vec<String> {
-        vec![
-            "default".to_string(),
-            "work".to_string(),
-            "personal".to_string(),
-        ]
+    fn group_dlg() -> RenameDialog {
+        RenameDialog::new_for_group("work", "default", owned(ONE_PROFILE), owned(GROUPS))
     }
 
-    #[test]
-    fn test_new_dialog() {
-        let dialog = RenameDialog::new(
-            "Original Title",
-            "work/frontend",
-            "default",
-            default_profiles(),
-            Vec::new(),
-        );
-        assert_eq!(dialog.current_title, "Original Title");
-        assert_eq!(dialog.current_group, "work/frontend");
-        assert_eq!(dialog.current_profile, "default");
-        assert_eq!(dialog.new_title.value(), "");
-        assert_eq!(dialog.new_group.value(), "work/frontend"); // Pre-populated with current group
-        assert_eq!(dialog.profile_index, 0);
-        assert_eq!(dialog.focused_field, 0);
-    }
-
-    #[test]
-    fn test_new_dialog_empty_group() {
-        let dialog = RenameDialog::new("Title", "", "default", default_profiles(), Vec::new());
-        assert_eq!(dialog.current_group, "");
-    }
-
-    #[test]
-    fn test_new_dialog_with_non_default_profile() {
-        let dialog = RenameDialog::new("Title", "group", "work", multi_profiles(), Vec::new());
-        assert_eq!(dialog.current_profile, "work");
-        assert_eq!(dialog.profile_index, 1); // "work" is at index 1
-    }
-
-    #[test]
-    fn test_esc_cancels() {
-        let mut dialog =
-            RenameDialog::new("Test", "group", "default", default_profiles(), Vec::new());
-        let result = dialog.handle_key(key(KeyCode::Esc));
-        assert!(matches!(result, DialogResult::Cancel));
-    }
-
-    #[test]
-    fn test_enter_with_unchanged_fields_cancels() {
-        let mut dialog =
-            RenameDialog::new("Test", "group", "default", default_profiles(), Vec::new());
-        // Title is empty, group is pre-populated but unchanged, profile unchanged - should cancel
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        assert!(matches!(result, DialogResult::Cancel));
-    }
-
-    #[test]
-    fn test_enter_with_title_only_submits() {
-        let mut dialog = RenameDialog::new(
-            "Old Title",
-            "group",
-            "default",
-            default_profiles(),
-            Vec::new(),
-        );
-        dialog.handle_key(key(KeyCode::Char('N')));
-        dialog.handle_key(key(KeyCode::Char('e')));
-        dialog.handle_key(key(KeyCode::Char('w')));
-
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        match result {
-            DialogResult::Submit(data) => {
-                assert_eq!(data.title, "New");
-                assert_eq!(data.group, None); // Group unchanged
-                assert_eq!(data.profile, None); // Profile unchanged
-            }
-            _ => panic!("Expected Submit result"),
-        }
-    }
-
-    #[test]
-    fn test_enter_with_group_only_submits() {
-        let mut dialog = RenameDialog::new(
-            "Title",
-            "old-group",
-            "default",
-            default_profiles(),
-            Vec::new(),
-        );
-        // Switch to group field and clear it
-        dialog.handle_key(key(KeyCode::Tab));
-        for _ in 0.."old-group".len() {
-            dialog.handle_key(key(KeyCode::Backspace));
-        }
-        // Type new group
-        for c in "new-group".chars() {
-            dialog.handle_key(key(KeyCode::Char(c)));
-        }
-
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        match result {
-            DialogResult::Submit(data) => {
-                assert_eq!(data.title, ""); // Title unchanged
-                assert_eq!(data.group, Some("new-group".to_string()));
-                assert_eq!(data.profile, None); // Profile unchanged
-            }
-            _ => panic!("Expected Submit result"),
-        }
-    }
-
-    #[test]
-    fn test_enter_with_both_fields_submits() {
-        let mut dialog = RenameDialog::new(
-            "Old Title",
-            "old-group",
-            "default",
-            default_profiles(),
-            Vec::new(),
-        );
-        // Type title
-        for c in "New Title".chars() {
-            dialog.handle_key(key(KeyCode::Char(c)));
-        }
-        // Switch to group field and clear it
-        dialog.handle_key(key(KeyCode::Tab));
-        for _ in 0.."old-group".len() {
-            dialog.handle_key(key(KeyCode::Backspace));
-        }
-        // Type new group
-        for c in "new-group".chars() {
-            dialog.handle_key(key(KeyCode::Char(c)));
-        }
-
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        match result {
-            DialogResult::Submit(data) => {
-                assert_eq!(data.title, "New Title");
-                assert_eq!(data.group, Some("new-group".to_string()));
-                assert_eq!(data.profile, None); // Profile unchanged
-            }
-            _ => panic!("Expected Submit result"),
-        }
-    }
-
-    #[test]
-    fn test_clearing_group_removes_from_group() {
-        let mut dialog = RenameDialog::new(
-            "Title",
-            "some-group",
-            "default",
-            default_profiles(),
-            Vec::new(),
-        );
-        // Switch to group field and clear it
-        dialog.handle_key(key(KeyCode::Tab));
-        // Clear the pre-populated value
-        for _ in 0.."some-group".len() {
-            dialog.handle_key(key(KeyCode::Backspace));
-        }
-
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        match result {
-            DialogResult::Submit(data) => {
-                assert_eq!(data.title, "");
-                assert_eq!(data.group, Some(String::new())); // Empty string means ungroup
-                assert_eq!(data.profile, None);
-            }
-            _ => panic!("Expected Submit result"),
-        }
-    }
-
-    #[test]
-    fn test_tab_switches_fields() {
-        let mut dialog =
-            RenameDialog::new("Test", "group", "default", default_profiles(), Vec::new());
-        assert_eq!(dialog.focused_field, 0);
-
-        dialog.handle_key(key(KeyCode::Tab));
-        assert_eq!(dialog.focused_field, 1);
-
-        dialog.handle_key(key(KeyCode::Tab));
-        assert_eq!(dialog.focused_field, 2);
-
-        dialog.handle_key(key(KeyCode::Tab));
-        assert_eq!(dialog.focused_field, 0);
-    }
-
-    #[test]
-    fn test_shift_tab_switches_fields_backwards() {
-        let mut dialog =
-            RenameDialog::new("Test", "group", "default", default_profiles(), Vec::new());
-        assert_eq!(dialog.focused_field, 0);
-
-        dialog.handle_key(shift_key(KeyCode::Tab));
-        assert_eq!(dialog.focused_field, 2);
-
-        dialog.handle_key(shift_key(KeyCode::Tab));
-        assert_eq!(dialog.focused_field, 1);
-
-        dialog.handle_key(shift_key(KeyCode::Tab));
-        assert_eq!(dialog.focused_field, 0);
-    }
-
-    #[test]
-    fn test_down_switches_to_next_field() {
-        let mut dialog =
-            RenameDialog::new("Test", "group", "default", default_profiles(), Vec::new());
-        assert_eq!(dialog.focused_field, 0);
-
-        dialog.handle_key(key(KeyCode::Down));
-        assert_eq!(dialog.focused_field, 1);
-
-        dialog.handle_key(key(KeyCode::Down));
-        assert_eq!(dialog.focused_field, 2);
-    }
-
-    #[test]
-    fn test_up_switches_to_previous_field() {
-        let mut dialog =
-            RenameDialog::new("Test", "group", "default", default_profiles(), Vec::new());
-        dialog.focused_field = 2;
-
-        dialog.handle_key(key(KeyCode::Up));
-        assert_eq!(dialog.focused_field, 1);
-
-        dialog.handle_key(key(KeyCode::Up));
-        assert_eq!(dialog.focused_field, 0);
-    }
-
-    #[test]
-    fn test_char_input_goes_to_focused_field() {
-        let mut dialog =
-            RenameDialog::new("Test", "group", "default", default_profiles(), Vec::new());
-
-        // Type in title field
-        dialog.handle_key(key(KeyCode::Char('a')));
-        assert_eq!(dialog.new_title.value(), "a");
-        assert_eq!(dialog.new_group.value(), "group"); // Pre-populated
-
-        // Switch to group and type (appends to pre-populated value)
-        dialog.handle_key(key(KeyCode::Tab));
-        dialog.handle_key(key(KeyCode::Char('b')));
-        assert_eq!(dialog.new_title.value(), "a");
-        assert_eq!(dialog.new_group.value(), "groupb");
-    }
-
-    #[test]
-    fn test_char_input_ignored_on_profile_field() {
-        let mut dialog =
-            RenameDialog::new("Test", "group", "default", multi_profiles(), Vec::new());
-        dialog.focused_field = 2; // Profile field
-
-        // Typing should not affect anything
-        dialog.handle_key(key(KeyCode::Char('a')));
-        assert_eq!(dialog.profile_index, 0);
-        assert_eq!(dialog.new_title.value(), "");
-        assert_eq!(dialog.new_group.value(), "group");
-    }
-
-    #[test]
-    fn test_backspace_removes_char_from_focused_field() {
-        let mut dialog =
-            RenameDialog::new("Test", "group", "default", default_profiles(), Vec::new());
-        dialog.handle_key(key(KeyCode::Char('a')));
-        dialog.handle_key(key(KeyCode::Char('b')));
-        dialog.handle_key(key(KeyCode::Char('c')));
-
-        dialog.handle_key(key(KeyCode::Backspace));
-        assert_eq!(dialog.new_title.value(), "ab");
-    }
-
-    #[test]
-    fn test_current_values_preserved() {
-        let mut dialog = RenameDialog::new(
-            "Original",
-            "original-group",
-            "default",
-            default_profiles(),
-            Vec::new(),
-        );
-        dialog.handle_key(key(KeyCode::Char('N')));
-        dialog.handle_key(key(KeyCode::Char('e')));
-        dialog.handle_key(key(KeyCode::Char('w')));
-
-        assert_eq!(dialog.current_title, "Original");
-        assert_eq!(dialog.current_group, "original-group");
-        assert_eq!(dialog.current_profile, "default");
-        assert_eq!(dialog.new_title.value(), "New");
-    }
-
-    #[test]
-    fn test_full_workflow_type_both_and_submit() {
-        let mut dialog = RenameDialog::new(
-            "Old Name",
-            "old/group",
-            "default",
-            default_profiles(),
-            Vec::new(),
-        );
-
-        // Type new title
-        for c in "Renamed Project".chars() {
-            dialog.handle_key(key(KeyCode::Char(c)));
-        }
-
-        // Switch to group and clear it, then type new group
-        dialog.handle_key(key(KeyCode::Tab));
-        for _ in 0.."old/group".len() {
-            dialog.handle_key(key(KeyCode::Backspace));
-        }
-        for c in "new/group".chars() {
-            dialog.handle_key(key(KeyCode::Char(c)));
-        }
-
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        match result {
-            DialogResult::Submit(data) => {
-                assert_eq!(data.title, "Renamed Project");
-                assert_eq!(data.group, Some("new/group".to_string()));
-                assert_eq!(data.profile, None);
-            }
-            _ => panic!("Expected Submit"),
-        }
-    }
-
-    #[test]
-    fn test_full_workflow_type_and_cancel() {
-        let mut dialog = RenameDialog::new(
-            "Old Name",
-            "group",
-            "default",
-            default_profiles(),
-            Vec::new(),
-        );
-
-        dialog.handle_key(key(KeyCode::Char('N')));
-        dialog.handle_key(key(KeyCode::Char('e')));
-        dialog.handle_key(key(KeyCode::Char('w')));
-
-        let result = dialog.handle_key(key(KeyCode::Esc));
-        assert!(matches!(result, DialogResult::Cancel));
-    }
-
-    #[test]
-    fn test_whitespace_is_trimmed() {
-        let mut dialog =
-            RenameDialog::new("Test", "group", "default", default_profiles(), Vec::new());
-        for c in "  New Title  ".chars() {
-            dialog.handle_key(key(KeyCode::Char(c)));
-        }
-        dialog.handle_key(key(KeyCode::Tab));
-        // Clear pre-populated value first
-        for _ in 0.."group".len() {
-            dialog.handle_key(key(KeyCode::Backspace));
-        }
-        for c in "  new-group  ".chars() {
-            dialog.handle_key(key(KeyCode::Char(c)));
-        }
-
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        match result {
-            DialogResult::Submit(data) => {
-                assert_eq!(data.title, "New Title");
-                assert_eq!(data.group, Some("new-group".to_string()));
-            }
-            _ => panic!("Expected Submit"),
-        }
-    }
-
-    #[test]
-    fn test_left_right_arrow_moves_cursor_in_input() {
-        let mut dialog =
-            RenameDialog::new("Test", "group", "default", default_profiles(), Vec::new());
-        dialog.handle_key(key(KeyCode::Char('a')));
-        dialog.handle_key(key(KeyCode::Char('b')));
-        dialog.handle_key(key(KeyCode::Char('c')));
-
-        // Move cursor left and insert
-        dialog.handle_key(key(KeyCode::Left));
-        dialog.handle_key(key(KeyCode::Char('X')));
-
-        assert_eq!(dialog.new_title.value(), "abXc");
-    }
-
-    #[test]
-    fn test_profile_selection_with_right_arrow() {
-        let mut dialog =
-            RenameDialog::new("Test", "group", "default", multi_profiles(), Vec::new());
-        assert_eq!(dialog.profile_index, 0);
-        assert_eq!(dialog.selected_profile(), "default");
-
-        // Move to profile field
-        dialog.focused_field = 2;
-
-        // Cycle forward
-        dialog.handle_key(key(KeyCode::Right));
-        assert_eq!(dialog.profile_index, 1);
-        assert_eq!(dialog.selected_profile(), "work");
-
-        dialog.handle_key(key(KeyCode::Right));
-        assert_eq!(dialog.profile_index, 2);
-        assert_eq!(dialog.selected_profile(), "personal");
-
-        // Wrap around
-        dialog.handle_key(key(KeyCode::Right));
-        assert_eq!(dialog.profile_index, 0);
-        assert_eq!(dialog.selected_profile(), "default");
-    }
-
-    #[test]
-    fn test_profile_selection_with_space_key() {
-        let mut dialog =
-            RenameDialog::new("Test", "group", "default", multi_profiles(), Vec::new());
-        dialog.focused_field = 2;
-
-        // Space cycles forward like Right arrow
-        dialog.handle_key(key(KeyCode::Char(' ')));
-        assert_eq!(dialog.profile_index, 1);
-        assert_eq!(dialog.selected_profile(), "work");
-
-        dialog.handle_key(key(KeyCode::Char(' ')));
-        assert_eq!(dialog.profile_index, 2);
-        assert_eq!(dialog.selected_profile(), "personal");
-
-        // Wrap around
-        dialog.handle_key(key(KeyCode::Char(' ')));
-        assert_eq!(dialog.profile_index, 0);
-        assert_eq!(dialog.selected_profile(), "default");
-    }
-
-    #[test]
-    fn test_profile_selection_with_left_arrow() {
-        let mut dialog =
-            RenameDialog::new("Test", "group", "default", multi_profiles(), Vec::new());
-        dialog.focused_field = 2;
-
-        // Cycle backward (should wrap to end)
-        dialog.handle_key(key(KeyCode::Left));
-        assert_eq!(dialog.profile_index, 2);
-        assert_eq!(dialog.selected_profile(), "personal");
-
-        dialog.handle_key(key(KeyCode::Left));
-        assert_eq!(dialog.profile_index, 1);
-        assert_eq!(dialog.selected_profile(), "work");
-
-        dialog.handle_key(key(KeyCode::Left));
-        assert_eq!(dialog.profile_index, 0);
-        assert_eq!(dialog.selected_profile(), "default");
-    }
-
-    #[test]
-    fn test_profile_arrows_only_work_on_profile_field() {
-        let mut dialog =
-            RenameDialog::new("Test", "group", "default", multi_profiles(), Vec::new());
-        assert_eq!(dialog.focused_field, 0); // Title field
-
-        // Right arrow on title field should move cursor, not change profile
-        dialog.handle_key(key(KeyCode::Char('a')));
-        dialog.handle_key(key(KeyCode::Char('b')));
-        let initial_profile = dialog.profile_index;
-        dialog.handle_key(key(KeyCode::Right));
-        assert_eq!(dialog.profile_index, initial_profile);
-    }
-
-    #[test]
-    fn test_submit_with_profile_change() {
-        let mut dialog =
-            RenameDialog::new("Test", "group", "default", multi_profiles(), Vec::new());
-
-        // Change profile
-        dialog.focused_field = 2;
-        dialog.handle_key(key(KeyCode::Right)); // Select "work"
-
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        match result {
-            DialogResult::Submit(data) => {
-                assert_eq!(data.title, "");
-                assert_eq!(data.group, None);
-                assert_eq!(data.profile, Some("work".to_string()));
-            }
-            _ => panic!("Expected Submit"),
-        }
-    }
-
-    #[test]
-    fn test_submit_with_all_changes() {
-        let mut dialog = RenameDialog::new(
-            "Old Title",
-            "old-group",
-            "default",
-            multi_profiles(),
-            Vec::new(),
-        );
-
-        // Change title
-        for c in "New Title".chars() {
-            dialog.handle_key(key(KeyCode::Char(c)));
-        }
-
-        // Change group
-        dialog.handle_key(key(KeyCode::Tab));
-        for _ in 0.."old-group".len() {
-            dialog.handle_key(key(KeyCode::Backspace));
-        }
-        for c in "new-group".chars() {
-            dialog.handle_key(key(KeyCode::Char(c)));
-        }
-
-        // Change profile
-        dialog.handle_key(key(KeyCode::Tab));
-        dialog.handle_key(key(KeyCode::Right)); // Select "work"
-
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        match result {
-            DialogResult::Submit(data) => {
-                assert_eq!(data.title, "New Title");
-                assert_eq!(data.group, Some("new-group".to_string()));
-                assert_eq!(data.profile, Some("work".to_string()));
-            }
-            _ => panic!("Expected Submit"),
-        }
-    }
-
-    #[test]
-    fn test_same_profile_returns_none() {
-        let mut dialog = RenameDialog::new("Test", "group", "work", multi_profiles(), Vec::new());
-
-        // Change title to trigger submit
-        dialog.handle_key(key(KeyCode::Char('X')));
-
-        // Profile stays at "work" (don't change it)
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        match result {
-            DialogResult::Submit(data) => {
-                assert_eq!(data.profile, None); // Same profile, returns None
-            }
-            _ => panic!("Expected Submit"),
-        }
-    }
-
-    fn ctrl_p() -> KeyEvent {
-        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)
-    }
-
-    fn sample_groups() -> Vec<String> {
-        vec![
-            "work".to_string(),
-            "work/frontend".to_string(),
-            "personal".to_string(),
-        ]
-    }
-
-    #[test]
-    fn test_ctrl_p_opens_group_picker_on_group_field() {
-        let mut dialog = RenameDialog::new(
-            "Test",
-            "group",
-            "default",
-            default_profiles(),
-            sample_groups(),
-        );
-        // Focus group field
-        dialog.handle_key(key(KeyCode::Tab));
-        assert_eq!(dialog.focused_field, 1);
-
-        dialog.handle_key(ctrl_p());
-        assert!(dialog.group_picker.is_active());
-    }
-
-    #[test]
-    fn test_ctrl_p_ignored_on_title_field() {
-        let mut dialog = RenameDialog::new(
-            "Test",
-            "group",
-            "default",
-            default_profiles(),
-            sample_groups(),
-        );
-        assert_eq!(dialog.focused_field, 0);
-
-        dialog.handle_key(ctrl_p());
-        assert!(!dialog.group_picker.is_active());
-    }
-
-    #[test]
-    fn test_ctrl_p_ignored_on_profile_field() {
-        let mut dialog = RenameDialog::new(
-            "Test",
-            "group",
-            "default",
-            default_profiles(),
-            sample_groups(),
-        );
-        dialog.focused_field = 2;
-
-        dialog.handle_key(ctrl_p());
-        assert!(!dialog.group_picker.is_active());
-    }
-
-    #[test]
-    fn test_ctrl_p_ignored_when_no_groups() {
-        let mut dialog =
-            RenameDialog::new("Test", "group", "default", default_profiles(), Vec::new());
-        dialog.handle_key(key(KeyCode::Tab)); // Focus group field
-        dialog.handle_key(ctrl_p());
-        assert!(!dialog.group_picker.is_active());
-    }
-
-    #[test]
-    fn test_group_picker_select_sets_group_field() {
-        let mut dialog = RenameDialog::new(
-            "Test",
-            "old-group",
-            "default",
-            default_profiles(),
-            sample_groups(),
-        );
-        dialog.handle_key(key(KeyCode::Tab)); // Focus group field
-        dialog.handle_key(ctrl_p()); // Open picker
-        assert!(dialog.group_picker.is_active());
-
-        // Select first item ("work")
-        dialog.handle_key(key(KeyCode::Enter));
-        assert!(!dialog.group_picker.is_active());
-        assert_eq!(dialog.new_group.value(), "work");
-    }
-
-    #[test]
-    fn test_group_picker_cancel_keeps_original_value() {
-        let mut dialog = RenameDialog::new(
-            "Test",
-            "old-group",
-            "default",
-            default_profiles(),
-            sample_groups(),
-        );
-        dialog.handle_key(key(KeyCode::Tab)); // Focus group field
-        dialog.handle_key(ctrl_p()); // Open picker
-        assert!(dialog.group_picker.is_active());
-
-        // Cancel picker
-        dialog.handle_key(key(KeyCode::Esc));
-        assert!(!dialog.group_picker.is_active());
-        assert_eq!(dialog.new_group.value(), "old-group");
-    }
-
-    #[test]
-    fn test_group_picker_navigate_and_select() {
-        let mut dialog = RenameDialog::new(
-            "Test",
-            "old-group",
-            "default",
-            default_profiles(),
-            sample_groups(),
-        );
-        dialog.handle_key(key(KeyCode::Tab)); // Focus group field
-        dialog.handle_key(ctrl_p()); // Open picker
-
-        // Navigate down to second item ("work/frontend")
-        dialog.handle_key(key(KeyCode::Down));
-        dialog.handle_key(key(KeyCode::Enter));
-        assert_eq!(dialog.new_group.value(), "work/frontend");
-    }
-
-    #[test]
-    fn test_group_picker_selected_value_submits_correctly() {
-        let mut dialog = RenameDialog::new(
-            "Test",
-            "old-group",
-            "default",
-            default_profiles(),
-            sample_groups(),
-        );
-        dialog.handle_key(key(KeyCode::Tab)); // Focus group field
-        dialog.handle_key(ctrl_p()); // Open picker
-        dialog.handle_key(key(KeyCode::Enter)); // Select "work"
-
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        match result {
-            DialogResult::Submit(data) => {
-                assert_eq!(data.group, Some("work".to_string()));
-            }
-            _ => panic!("Expected Submit"),
-        }
-    }
-
-    // --- Group ghost autocomplete tests ---
-
-    #[test]
-    fn test_group_ghost_appears_on_typing() {
-        let mut dialog =
-            RenameDialog::new("Test", "", "default", default_profiles(), sample_groups());
-        dialog.handle_key(key(KeyCode::Tab)); // Focus group field
-        dialog.handle_key(key(KeyCode::Char('p')));
-        assert_eq!(dialog.group_ghost_text(), Some("ersonal"));
-    }
-
-    #[test]
-    fn test_group_ghost_none_when_no_match() {
-        let mut dialog =
-            RenameDialog::new("Test", "", "default", default_profiles(), sample_groups());
-        dialog.handle_key(key(KeyCode::Tab));
-        dialog.handle_key(key(KeyCode::Char('z')));
-        assert!(dialog.group_ghost_text().is_none());
-    }
-
-    #[test]
-    fn test_group_ghost_accept_with_right_arrow() {
-        let mut dialog =
-            RenameDialog::new("Test", "", "default", default_profiles(), sample_groups());
-        dialog.handle_key(key(KeyCode::Tab));
-        dialog.handle_key(key(KeyCode::Char('p')));
-        assert!(dialog.group_ghost_text().is_some());
-
-        dialog.handle_key(key(KeyCode::Right));
-        assert_eq!(dialog.new_group.value(), "personal");
-    }
-
-    #[test]
-    fn test_group_ghost_accept_with_end_key() {
-        let mut dialog =
-            RenameDialog::new("Test", "", "default", default_profiles(), sample_groups());
-        dialog.handle_key(key(KeyCode::Tab));
-        dialog.handle_key(key(KeyCode::Char('p')));
-        assert!(dialog.group_ghost_text().is_some());
-
-        dialog.handle_key(key(KeyCode::End));
-        assert_eq!(dialog.new_group.value(), "personal");
-    }
-
-    #[test]
-    fn test_group_ghost_cleared_on_field_switch() {
-        let mut dialog =
-            RenameDialog::new("Test", "", "default", default_profiles(), sample_groups());
-        dialog.handle_key(key(KeyCode::Tab)); // Focus group field
-        dialog.handle_key(key(KeyCode::Char('p')));
-        assert!(dialog.group_ghost_text().is_some());
-
-        dialog.handle_key(key(KeyCode::Tab)); // Move to profile field
-        assert!(dialog.group_ghost_text().is_none());
-    }
-
-    #[test]
-    fn test_group_ghost_common_prefix_for_multiple_matches() {
-        let mut dialog =
-            RenameDialog::new("Test", "", "default", default_profiles(), sample_groups());
-        dialog.handle_key(key(KeyCode::Tab));
-        dialog.handle_key(key(KeyCode::Char('w')));
-        // "work" and "work/frontend" share common prefix "work"
-        // Ghost should show "ork" (common prefix minus typed "w")
-        assert_eq!(dialog.group_ghost_text(), Some("ork"));
-    }
-
-    #[test]
-    fn test_group_ghost_cleared_on_picker_select() {
-        let mut dialog =
-            RenameDialog::new("Test", "", "default", default_profiles(), sample_groups());
-        dialog.handle_key(key(KeyCode::Tab));
-        dialog.handle_key(key(KeyCode::Char('w')));
-        assert!(dialog.group_ghost_text().is_some());
-
-        dialog.handle_key(ctrl_p()); // Open picker
-        dialog.handle_key(key(KeyCode::Enter)); // Select "work"
-        assert!(dialog.group_ghost_text().is_none());
-        assert_eq!(dialog.new_group.value(), "work");
-    }
-
-    // --- Group rename duplicate validation tests ---
-
-    fn existing_groups_with_personal() -> Vec<String> {
-        vec![
-            "work".to_string(),
-            "personal".to_string(),
-            "work/frontend".to_string(),
-        ]
-    }
-
-    #[test]
-    fn test_group_rename_duplicate_shows_error() {
-        let mut dialog = RenameDialog::new_for_group(
-            "work",
-            "default",
-            default_profiles(),
-            existing_groups_with_personal(),
-        );
-
-        // Clear the pre-filled group name and type an existing group name
-        for _ in 0..4 {
-            dialog.handle_key(key(KeyCode::Backspace));
-        }
-        for ch in "personal".chars() {
-            dialog.handle_key(key(KeyCode::Char(ch)));
-        }
-
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        assert!(
-            matches!(result, DialogResult::Continue),
-            "should not submit when duplicate name"
-        );
-        assert!(
-            dialog.validation_error.is_some(),
-            "validation_error should be set"
-        );
-    }
-
-    #[test]
-    fn test_group_rename_error_clears_on_edit() {
-        let mut dialog = RenameDialog::new_for_group(
-            "work",
-            "default",
-            default_profiles(),
-            existing_groups_with_personal(),
-        );
-
-        for _ in 0..4 {
-            dialog.handle_key(key(KeyCode::Backspace));
-        }
-        for ch in "personal".chars() {
-            dialog.handle_key(key(KeyCode::Char(ch)));
-        }
-        dialog.handle_key(key(KeyCode::Enter));
-        assert!(dialog.validation_error.is_some());
-
-        // Any keystroke on the group field should clear the error
-        dialog.handle_key(key(KeyCode::Backspace));
-        assert!(
-            dialog.validation_error.is_none(),
-            "validation_error should clear on edit"
-        );
-    }
-
-    #[test]
-    fn test_group_rename_allows_own_name() {
-        let mut dialog = RenameDialog::new_for_group(
-            "work",
-            "default",
-            default_profiles(),
-            existing_groups_with_personal(),
-        );
-
-        // Submitting the unchanged name should cancel (nothing changed), not error
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        assert!(
-            matches!(result, DialogResult::Cancel),
-            "unchanged name should cancel, not show duplicate error"
-        );
-        assert!(
-            dialog.validation_error.is_none(),
-            "no validation error for own name"
-        );
-    }
-
-    // --- Branch-rename toggle (tied worktree) tests ---
-
-    fn tied_dialog(upstream: Option<&str>) -> RenameDialog {
-        RenameDialog::new("hi", "", "default", default_profiles(), Vec::new())
+    fn tied(upstream: Option<&str>) -> RenameDialog {
+        dlg("hi", "", "default", ONE_PROFILE, &[])
             .with_worktree_branch("thing", upstream.map(|s| s.to_string()))
     }
 
-    #[test]
-    fn test_branch_toggle_absent_without_worktree_context() {
-        // A plain session (no with_worktree_branch) has no 4th field and
-        // never emits rename_branch=true.
-        let mut dialog = RenameDialog::new("hi", "", "default", default_profiles(), Vec::new());
-        assert_eq!(dialog.field_count(), 3);
-        assert!(!dialog.shows_branch_toggle());
-        dialog.handle_key(key(KeyCode::Char('x')));
-        match dialog.handle_key(key(KeyCode::Enter)) {
-            DialogResult::Submit(data) => assert!(!data.rename_branch),
-            _ => panic!("expected submit"),
+    fn type_str(d: &mut RenameDialog, text: &str) {
+        for c in text.chars() {
+            d.handle_key(key(KeyCode::Char(c)));
+        }
+    }
+
+    fn press(d: &mut RenameDialog, code: KeyCode, times: usize) {
+        for _ in 0..times {
+            d.handle_key(key(code));
+        }
+    }
+
+    /// Focus the group field, clear its pre-filled value and type `text`.
+    fn retype_group(d: &mut RenameDialog, text: &str) {
+        d.handle_key(key(KeyCode::Tab));
+        press(d, KeyCode::Backspace, "old-group".len());
+        type_str(d, text);
+    }
+
+    fn submitted(result: DialogResult<RenameData>) -> RenameData {
+        match result {
+            DialogResult::Submit(data) => data,
+            _ => panic!("expected Submit"),
         }
     }
 
     #[test]
-    fn test_branch_toggle_present_for_tied_worktree() {
-        let dialog = tied_dialog(Some("origin/thing"));
-        assert!(dialog.shows_branch_toggle());
-        assert_eq!(dialog.field_count(), 4);
+    fn new_seeds_current_values_and_prefills_group() {
+        let d = dlg("Original", "work/frontend", "default", ONE_PROFILE, &[]);
+        assert_eq!(d.current_title, "Original");
+        assert_eq!(d.current_group, "work/frontend");
+        assert_eq!(d.current_profile, "default");
+        assert_eq!(d.new_title.value(), "");
+        assert_eq!(d.new_group.value(), "work/frontend");
+        assert_eq!((d.profile_index, d.focused_field), (0, 0));
+
+        assert_eq!(dlg("t", "", "default", ONE_PROFILE, &[]).current_group, "");
+        assert_eq!(dlg("t", "g", "work", MULTI_PROFILES, &[]).profile_index, 1);
     }
 
     #[test]
-    fn test_branch_toggle_defaults_off_and_flips_with_space() {
-        let mut dialog = tied_dialog(None);
-        // Tab title -> group -> profile -> toggle (index 3).
-        dialog.handle_key(key(KeyCode::Tab));
-        dialog.handle_key(key(KeyCode::Tab));
-        dialog.handle_key(key(KeyCode::Tab));
-        assert!(dialog.is_branch_toggle_field());
-        assert!(!dialog.rename_branch);
-        dialog.handle_key(key(KeyCode::Char(' ')));
-        assert!(dialog.rename_branch);
-        // Space again toggles back off.
-        dialog.handle_key(key(KeyCode::Char(' ')));
-        assert!(!dialog.rename_branch);
+    fn submit_reports_only_changed_fields() {
+        type Edit = fn(&mut RenameDialog);
+        let cases: &[(&str, Edit, (&str, Option<&str>, Option<&str>))] = &[
+            ("title only", |d| type_str(d, "New"), ("New", None, None)),
+            (
+                "group only",
+                |d| retype_group(d, "new-group"),
+                ("", Some("new-group"), None),
+            ),
+            (
+                "title and group",
+                |d| {
+                    type_str(d, "New Title");
+                    retype_group(d, "new-group");
+                },
+                ("New Title", Some("new-group"), None),
+            ),
+            (
+                "cleared group ungroups",
+                |d| retype_group(d, ""),
+                ("", Some(""), None),
+            ),
+            (
+                "profile only",
+                |d| {
+                    press(d, KeyCode::Tab, 2);
+                    d.handle_key(key(KeyCode::Right));
+                },
+                ("", None, Some("work")),
+            ),
+            (
+                "all three",
+                |d| {
+                    type_str(d, "New Title");
+                    retype_group(d, "new-group");
+                    d.handle_key(key(KeyCode::Tab));
+                    d.handle_key(key(KeyCode::Right));
+                },
+                ("New Title", Some("new-group"), Some("work")),
+            ),
+            (
+                "values are trimmed",
+                |d| {
+                    type_str(d, "  New Title  ");
+                    retype_group(d, "  new-group  ");
+                },
+                ("New Title", Some("new-group"), None),
+            ),
+        ];
+
+        for (name, edit, (title, group, profile)) in cases {
+            let mut d = fixture();
+            edit(&mut d);
+            let data = submitted(d.handle_key(key(KeyCode::Enter)));
+            assert_eq!(data.title, *title, "{name}");
+            assert_eq!(data.group.as_deref(), *group, "{name}");
+            assert_eq!(data.profile.as_deref(), *profile, "{name}");
+            assert!(!data.rename_branch, "{name}");
+        }
+
+        // An unchanged profile stays None even when it is not the first one.
+        let mut d = dlg("t", "g", "work", MULTI_PROFILES, &[]);
+        type_str(&mut d, "X");
+        assert_eq!(submitted(d.handle_key(key(KeyCode::Enter))).profile, None);
     }
 
     #[test]
-    fn test_branch_toggle_emitted_in_submit() {
-        let mut dialog = tied_dialog(Some("origin/thing"));
-        // Change the title so submit is not a no-op, then arm the toggle.
-        dialog.handle_key(key(KeyCode::Char('x')));
-        dialog.handle_key(key(KeyCode::Tab)); // group
-        dialog.handle_key(key(KeyCode::Tab)); // profile
-        dialog.handle_key(key(KeyCode::Tab)); // toggle
-        dialog.handle_key(key(KeyCode::Char(' ')));
-        match dialog.handle_key(key(KeyCode::Enter)) {
-            DialogResult::Submit(data) => {
-                assert_eq!(data.title, "x");
-                assert!(data.rename_branch);
+    fn esc_cancels_and_unchanged_enter_cancels() {
+        let mut d = fixture();
+        type_str(&mut d, "New");
+        assert!(matches!(
+            d.handle_key(key(KeyCode::Esc)),
+            DialogResult::Cancel
+        ));
+
+        let mut d = fixture();
+        assert!(matches!(
+            d.handle_key(key(KeyCode::Enter)),
+            DialogResult::Cancel
+        ));
+        // Current values survive editing without submitting.
+        assert_eq!(d.current_title, "Old Title");
+        assert_eq!(d.current_group, "old-group");
+    }
+
+    #[test]
+    fn tab_and_arrows_cycle_focus() {
+        let mut d = fixture();
+        for expected in [1, 2, 0] {
+            d.handle_key(key(KeyCode::Tab));
+            assert_eq!(d.focused_field, expected);
+        }
+        for expected in [2, 1, 0] {
+            d.handle_key(shift_key(KeyCode::Tab));
+            assert_eq!(d.focused_field, expected);
+        }
+        for expected in [1, 2] {
+            d.handle_key(key(KeyCode::Down));
+            assert_eq!(d.focused_field, expected);
+        }
+        for expected in [1, 0] {
+            d.handle_key(key(KeyCode::Up));
+            assert_eq!(d.focused_field, expected);
+        }
+    }
+
+    #[test]
+    fn text_keys_edit_the_focused_field_only() {
+        let mut d = fixture();
+        type_str(&mut d, "abc");
+        d.handle_key(key(KeyCode::Backspace));
+        assert_eq!(d.new_title.value(), "ab");
+        assert_eq!(d.new_group.value(), "old-group");
+
+        // Left moves the cursor inside the focused input.
+        d.handle_key(key(KeyCode::Left));
+        d.handle_key(key(KeyCode::Char('X')));
+        assert_eq!(d.new_title.value(), "aXb");
+
+        // Group field appends to its pre-filled value.
+        d.handle_key(key(KeyCode::Tab));
+        d.handle_key(key(KeyCode::Char('z')));
+        assert_eq!(d.new_group.value(), "old-groupz");
+
+        // The profile chip takes no text.
+        d.handle_key(key(KeyCode::Tab));
+        d.handle_key(key(KeyCode::Char('q')));
+        assert_eq!(d.new_title.value(), "aXb");
+        assert_eq!(d.new_group.value(), "old-groupz");
+        assert_eq!(d.profile_index, 0);
+    }
+
+    #[test]
+    fn profile_chip_cycles_both_ways_and_wraps() {
+        for code in [KeyCode::Right, KeyCode::Char(' ')] {
+            let mut d = fixture();
+            d.focused_field = 2;
+            for expected in ["work", "personal", "default"] {
+                d.handle_key(key(code));
+                assert_eq!(d.selected_profile(), expected);
             }
-            _ => panic!("expected submit"),
         }
+
+        let mut d = fixture();
+        d.focused_field = 2;
+        for expected in ["personal", "work", "default"] {
+            d.handle_key(key(KeyCode::Left));
+            assert_eq!(d.selected_profile(), expected);
+        }
+
+        // Arrows on a text field move the cursor instead of the chip.
+        let mut d = fixture();
+        type_str(&mut d, "ab");
+        d.handle_key(key(KeyCode::Right));
+        assert_eq!(d.profile_index, 0);
     }
 
     #[test]
-    fn test_branch_toggle_can_rename_branch_without_title_change() {
-        // The toggle must be usable to bring a drifted branch in line with
-        // the title even when the title itself is unchanged: arming it makes
-        // the dialog submit (not cancel) so the rename flow runs.
-        let mut dialog = tied_dialog(None);
-        dialog.handle_key(key(KeyCode::Tab)); // group
-        dialog.handle_key(key(KeyCode::Tab)); // profile
-        dialog.handle_key(key(KeyCode::Tab)); // toggle
-        dialog.handle_key(key(KeyCode::Char(' ')));
-        match dialog.handle_key(key(KeyCode::Enter)) {
-            DialogResult::Submit(data) => {
-                assert_eq!(data.title, ""); // title unchanged
-                assert!(data.rename_branch);
-            }
-            _ => panic!("expected submit even with no title change"),
-        }
+    fn group_picker_opens_on_the_group_field_only() {
+        let mut d = dlg("t", "old-group", "default", ONE_PROFILE, GROUPS);
+        d.handle_key(ctrl_key(KeyCode::Char('p')));
+        assert!(!d.group_picker.is_active(), "title field");
+        d.focused_field = 2;
+        d.handle_key(ctrl_key(KeyCode::Char('p')));
+        assert!(!d.group_picker.is_active(), "profile field");
+
+        let mut d = dlg("t", "old-group", "default", ONE_PROFILE, &[]);
+        d.handle_key(key(KeyCode::Tab));
+        d.handle_key(ctrl_key(KeyCode::Char('p')));
+        assert!(!d.group_picker.is_active(), "no groups to pick");
     }
 
     #[test]
-    fn test_space_still_cycles_profile_not_branch_toggle() {
-        // The branch-toggle space handler must not steal space from the
-        // profile chip.
-        let mut dialog = RenameDialog::new("hi", "", "default", multi_profiles(), Vec::new())
-            .with_worktree_branch("thing", None);
-        dialog.handle_key(key(KeyCode::Tab)); // group
-        dialog.handle_key(key(KeyCode::Tab)); // profile
-        assert!(dialog.is_profile_field());
-        dialog.handle_key(key(KeyCode::Char(' '))); // cycle profile
-        assert_eq!(dialog.profile_index, 1);
-        assert!(!dialog.rename_branch);
+    fn group_picker_selection_fills_the_group_field() {
+        let open = || {
+            let mut d = dlg("t", "old-group", "default", ONE_PROFILE, GROUPS);
+            d.handle_key(key(KeyCode::Tab));
+            d.handle_key(ctrl_key(KeyCode::Char('p')));
+            assert!(d.group_picker.is_active());
+            d
+        };
+
+        let mut d = open();
+        d.handle_key(key(KeyCode::Esc));
+        assert!(!d.group_picker.is_active());
+        assert_eq!(d.new_group.value(), "old-group");
+
+        let mut d = open();
+        d.handle_key(key(KeyCode::Down));
+        d.handle_key(key(KeyCode::Enter));
+        assert_eq!(d.new_group.value(), "work/frontend");
+
+        let mut d = open();
+        d.handle_key(key(KeyCode::Enter));
+        assert!(!d.group_picker.is_active());
+        assert_eq!(d.new_group.value(), "work");
+        let data = submitted(d.handle_key(key(KeyCode::Enter)));
+        assert_eq!(data.group.as_deref(), Some("work"));
     }
 
     #[test]
-    fn test_group_rename_submit_new_unique_name() {
-        let mut dialog = RenameDialog::new_for_group(
-            "work",
-            "default",
-            default_profiles(),
-            existing_groups_with_personal(),
-        );
+    fn group_ghost_completes_the_typed_prefix() {
+        let typed = |text: &str| {
+            let mut d = dlg("t", "", "default", ONE_PROFILE, GROUPS);
+            d.handle_key(key(KeyCode::Tab));
+            type_str(&mut d, text);
+            d
+        };
 
-        for _ in 0..4 {
-            dialog.handle_key(key(KeyCode::Backspace));
-        }
-        for ch in "projects".chars() {
-            dialog.handle_key(key(KeyCode::Char(ch)));
+        assert_eq!(typed("p").group_ghost_text(), Some("ersonal"));
+        assert!(typed("z").group_ghost_text().is_none());
+        // "work" and "work/frontend" share the prefix "work".
+        assert_eq!(typed("w").group_ghost_text(), Some("ork"));
+
+        for accept in [KeyCode::Right, KeyCode::End] {
+            let mut d = typed("p");
+            d.handle_key(key(accept));
+            assert_eq!(d.new_group.value(), "personal");
         }
 
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        assert!(
-            matches!(result, DialogResult::Submit(_)),
-            "unique name should submit"
-        );
-        assert!(dialog.validation_error.is_none());
+        let mut d = typed("p");
+        d.handle_key(key(KeyCode::Tab));
+        assert!(d.group_ghost_text().is_none(), "cleared on field switch");
+
+        let mut d = typed("w");
+        d.handle_key(ctrl_key(KeyCode::Char('p')));
+        d.handle_key(key(KeyCode::Enter));
+        assert!(d.group_ghost_text().is_none(), "cleared on picker select");
+        assert_eq!(d.new_group.value(), "work");
+    }
+
+    #[test]
+    fn group_rename_rejects_a_duplicate_name() {
+        let retype = |text: &str| {
+            let mut d = group_dlg();
+            press(&mut d, KeyCode::Backspace, "work".len());
+            type_str(&mut d, text);
+            d
+        };
+
+        let mut d = retype("personal");
+        assert!(matches!(
+            d.handle_key(key(KeyCode::Enter)),
+            DialogResult::Continue
+        ));
+        assert!(d.validation_error.is_some());
+        // Editing the field clears the error.
+        d.handle_key(key(KeyCode::Backspace));
+        assert!(d.validation_error.is_none());
+
+        let mut d = retype("projects");
+        assert!(matches!(
+            d.handle_key(key(KeyCode::Enter)),
+            DialogResult::Submit(_)
+        ));
+        assert!(d.validation_error.is_none());
+
+        // The group's own name is not a duplicate; unchanged just cancels.
+        let mut d = group_dlg();
+        assert!(matches!(
+            d.handle_key(key(KeyCode::Enter)),
+            DialogResult::Cancel
+        ));
+        assert!(d.validation_error.is_none());
+    }
+
+    #[test]
+    fn branch_toggle_exists_only_for_a_tied_worktree() {
+        let mut d = dlg("hi", "", "default", ONE_PROFILE, &[]);
+        assert!(!d.shows_branch_toggle());
+        assert_eq!(d.field_count(), 3);
+        type_str(&mut d, "x");
+        assert!(!submitted(d.handle_key(key(KeyCode::Enter))).rename_branch);
+
+        let d = tied(Some("origin/thing"));
+        assert!(d.shows_branch_toggle());
+        assert_eq!(d.field_count(), 4);
+    }
+
+    #[test]
+    fn branch_toggle_flips_with_space_and_rides_along_on_submit() {
+        let mut d = tied(None);
+        press(&mut d, KeyCode::Tab, 3);
+        assert!(d.is_branch_toggle_field());
+        assert!(!d.rename_branch);
+        d.handle_key(key(KeyCode::Char(' ')));
+        assert!(d.rename_branch);
+        d.handle_key(key(KeyCode::Char(' ')));
+        assert!(!d.rename_branch);
+
+        // Arming the toggle alone submits, so a drifted branch can be brought
+        // in line with an unchanged title.
+        d.handle_key(key(KeyCode::Char(' ')));
+        let data = submitted(d.handle_key(key(KeyCode::Enter)));
+        assert_eq!(data.title, "");
+        assert!(data.rename_branch);
+
+        let mut d = tied(Some("origin/thing"));
+        type_str(&mut d, "x");
+        press(&mut d, KeyCode::Tab, 3);
+        d.handle_key(key(KeyCode::Char(' ')));
+        let data = submitted(d.handle_key(key(KeyCode::Enter)));
+        assert_eq!(data.title, "x");
+        assert!(data.rename_branch);
+
+        // Space on the profile chip still cycles it.
+        let mut d =
+            dlg("hi", "", "default", MULTI_PROFILES, &[]).with_worktree_branch("thing", None);
+        press(&mut d, KeyCode::Tab, 2);
+        assert!(d.is_profile_field());
+        d.handle_key(key(KeyCode::Char(' ')));
+        assert_eq!(d.profile_index, 1);
+        assert!(!d.rename_branch);
     }
 }

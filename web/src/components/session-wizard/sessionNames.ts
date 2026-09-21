@@ -1,8 +1,4 @@
-// Mirror of `branch_name_from_title` in src/session/builder.rs: titles
-// flow through this when the wizard auto-fills the branch field so the
-// user sees the kebab-case slug git will accept rather than the raw
-// title (which often contains spaces and would otherwise be rejected
-// by libgit2 with an opaque InvalidSpec error).
+// Mirror of `branch_name_from_title` in src/session/builder.rs.
 const LIGATURES: Record<string, string> = {
   ß: "ss",
   æ: "ae",
@@ -41,34 +37,4 @@ export function slugifyBranch(title: string): string {
   }
   while (out.endsWith("-")) out = out.slice(0, -1);
   return out.length === 0 ? "session" : out;
-}
-
-export function applyBranchOverride(
-  _title: string,
-  worktreeBranch: string,
-): {
-  worktreeBranch: string;
-  worktreeBranchDirty: boolean;
-} {
-  // Any direct edit on the branch field, including clearing it, marks it
-  // dirty so the title-to-branch mirror stops overwriting the user's input on
-  // the next keystroke. Empty is a valid UI state; the submit path omits
-  // worktree_branch so the server derives it from the resolved title.
-  return {
-    worktreeBranch,
-    worktreeBranchDirty: true,
-  };
-}
-
-export function getReviewSummary(
-  title: string,
-  worktreeBranch: string,
-): {
-  title: string;
-  branch: string;
-} {
-  return {
-    title: title || worktreeBranch || "Auto-generated",
-    branch: worktreeBranch || title || "Auto-generated",
-  };
 }

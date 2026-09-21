@@ -1,11 +1,4 @@
 //! Plugin registry: the compiled-in first-party plugins, the externally
-//! installed ones, and each plugin's enabled / granted state.
-//!
-//! Builtin plugins are embedded from `plugins/` in this repository and are
-//! fully trusted: their capabilities are auto-granted. External plugins are
-//! loaded from `<app_dir>/plugins/<id>/`; they are community-trusted, so their
-//! contributions go live only once the user has granted the capability set the
-//! installed manifest declares (the grant is pinned to the manifest hash).
 
 use std::path::{Path, PathBuf};
 
@@ -15,28 +8,11 @@ use super::featured::FeaturedIndex;
 use super::integrity;
 use crate::session::{CapabilityGrant, Config};
 
-/// How an installed plugin was validated, the finer provenance the surfaces
-/// show. `TrustLevel` (builtin vs community) stays the coarse capability-policy
-/// axis; this is the user-facing "is this safe" label.
-///
-/// `Featured` is re-derived live from the embedded index and the on-disk tree
-/// hash, never trusted from the (user-writable) lockfile: that derivation also
-/// gates the reserved-namespace lift, so it must not rest on data an attacker
-/// could edit. A featured plugin cannot ship a release-binary, so its installed
-/// tree equals its source tree and the recompute reproduces the pinned hash; it
-/// is also only run for the handful of ids the index actually names. The
-/// manifest-hash grant check still deactivates a community plugin whose
-/// manifest is tampered after install.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValidationState {
-    /// Compiled into the binary.
     Builtin,
-    /// External, installed from a featured-verified source (matched the curated
-    /// pin at install).
     Featured,
-    /// External GitHub install, not in the featured index.
     Community,
-    /// External local-directory install.
     Local,
 }
 
@@ -51,25 +27,17 @@ impl ValidationState {
     }
 }
 
-/// A plugin compiled into the aoe binary.
 pub struct BuiltinPlugin {
     pub manifest_toml: &'static str,
 }
 
-/// First-party plugins bundled with the binary. Deliberately minimal while the
-/// system is proven out: just the `aoe.web` dashboard marker (under `web`).
-/// More land as each piece is verified.
 pub static BUILTINS: &[BuiltinPlugin] = &[
-    // The dashboard's management marker is present whenever the bundle is
-    // compiled in, so release builds always surface aoe.web; a build without
-    // `web` has an empty builtin set.
     #[cfg(feature = "web")]
     BuiltinPlugin {
         manifest_toml: include_str!("../../plugins/aoe-web/aoe-plugin.toml"),
     },
 ];
 
-/// Whether `id` belongs to a compiled-in builtin plugin.
 pub fn is_builtin_id(id: &str) -> bool {
     BUILTINS.iter().any(|b| {
         PluginManifest::from_toml_str(b.manifest_toml)
@@ -78,24 +46,14 @@ pub fn is_builtin_id(id: &str) -> bool {
     })
 }
 
-/// One loaded plugin: its manifest, trust, and enabled / granted state.
 pub struct LoadedPlugin {
     pub manifest: PluginManifest,
-    /// Resolved from `Config.plugins`; defaults on.
     pub enabled: bool,
-    /// Builtin (auto-granted) or community (capabilities gated).
     pub trust: TrustLevel,
-    /// Finer provenance for display (builtin / featured / community / local).
     pub validation: ValidationState,
-    /// Install source for an external plugin; `None` for builtins.
     pub source: Option<String>,
-    /// On-disk directory for an external plugin; `None` for builtins.
     pub dir: Option<PathBuf>,
-    /// `sha256:<hex>` of the installed manifest bytes (builtins: of the embedded
-    /// TOML). A grant must be pinned to this exact hash to count.
     pub manifest_hash: String,
-    /// Whether the user's grant covers the installed manifest's capability set.
-    /// Always true for builtins.
     pub granted: bool,
 }
 
@@ -108,22 +66,15 @@ impl LoadedPlugin {
         matches!(self.trust, TrustLevel::Builtin)
     }
 
-    /// Whether the plugin's contributions are live: enabled, and (for community
-    /// plugins) granted against the installed manifest. An ungranted or
-    /// stale-grant community plugin contributes nothing until re-approved.
     pub fn active(&self) -> bool {
         self.enabled && self.granted
     }
 
-    /// A community plugin whose grant does not cover the installed manifest:
-    /// installed but inactive, awaiting `aoe plugin update` / re-approval.
     pub fn needs_reapproval(&self) -> bool {
         !self.builtin() && !self.granted
     }
 }
 
-/// Whether a stored grant covers the installed manifest: it must be pinned to
-/// the same manifest hash and include every capability the manifest declares.
 fn grant_covers(grant: &CapabilityGrant, manifest: &PluginManifest, manifest_hash: &str) -> bool {
     grant.manifest_hash == manifest_hash
         && manifest
@@ -132,7 +83,6 @@ fn grant_covers(grant: &CapabilityGrant, manifest: &PluginManifest, manifest_has
             .all(|c| grant.capabilities.iter().any(|g| g == c.as_str()))
 }
 
-/// The set of plugins loaded for a config, plus any load problems.
 pub struct PluginRegistry {
     plugins: Vec<LoadedPlugin>,
     load_errors: Vec<String>,
@@ -165,7 +115,6 @@ impl PluginRegistry {
                     });
                 }
                 Err(e) => {
-                    // A broken builtin manifest is a build defect; tested in CI.
                     load_errors.push(format!("builtin manifest invalid: {e}"));
                 }
             }
@@ -183,12 +132,10 @@ impl PluginRegistry {
         }
     }
 
-    /// Every loaded plugin.
     pub fn all(&self) -> &[LoadedPlugin] {
         &self.plugins
     }
 
-    /// Plugins whose contributions are live (enabled and granted).
     pub fn active(&self) -> impl Iterator<Item = &LoadedPlugin> {
         self.plugins.iter().filter(|p| p.active())
     }
@@ -202,13 +149,8 @@ impl PluginRegistry {
     }
 }
 
-/// Load external plugins from `<app_dir>/plugins/<id>/aoe-plugin.toml`. Each
-/// problem is collected as a non-fatal load error rather than aborting the set.
-/// The display provenance for an external plugin. `Featured` is verified live:
-/// the id must be in the embedded index and the on-disk tree must hash to the
-/// pin. The source-slug match is enforced at install (where the slug is
-/// canonical); here the content hash is the gate, since it is the strong check
-/// and avoids depending on how a persisted source string was canonicalized.
+/// `Featured` is re-derived from the embedded index and tree hash, never trusted from the
+/// user-writable lockfile, because it also lifts the reserved-namespace gate.
 fn validation_for(
     featured: &FeaturedIndex,
     id: &str,
@@ -241,7 +183,6 @@ fn load_external(
     };
     let entries = match std::fs::read_dir(&root) {
         Ok(entries) => entries,
-        // No plugins dir yet is normal; anything else is worth surfacing.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
         Err(e) => {
             load_errors.push(format!("reading {}: {e}", root.display()));
@@ -260,15 +201,12 @@ fn load_external(
         let dir = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        // Skip the staging scratch dirs and other dotfiles.
         if name.starts_with('.') || !dir.is_dir() {
             continue;
         }
         let manifest_path = dir.join("aoe-plugin.toml");
         let bytes = match std::fs::read(&manifest_path) {
             Ok(bytes) => bytes,
-            // A directory without a manifest is simply not a plugin; anything
-            // else (a permission error, a short read) is worth surfacing.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 load_errors.push(format!("reading {}: {e}", manifest_path.display()));
@@ -287,11 +225,7 @@ fn load_external(
         };
         let id = manifest.id.as_str().to_string();
 
-        // Skip a plugin the running aoe is too old/new for. Unlike install, a
-        // load-time mismatch must not be fatal: an aoe upgrade can move the host
-        // outside a still-installed plugin's range, and bailing would brick
-        // startup. Report it and carry on. Builtins never reach here (they load
-        // from the embedded BUILTINS set, not this directory scan).
+        // Non-fatal at load: an aoe upgrade must not brick startup.
         if let Err(msg) = manifest.host_compat(env!("CARGO_PKG_VERSION")) {
             load_errors.push(format!("plugin {id:?} at {}: {msg}", dir.display()));
             continue;
@@ -301,9 +235,6 @@ fn load_external(
         let source = plugin_config.and_then(|p| p.source.clone());
         let validation = validation_for(featured, &id, &dir, source.as_deref());
 
-        // A reserved namespace is only allowed for a live featured-verified
-        // plugin; this is the load-time twin of the install gate, and it
-        // re-derives featured status rather than trusting the lockfile.
         if manifest.id.is_reserved_namespace() && validation != ValidationState::Featured {
             load_errors.push(format!(
                 "plugin {id:?} at {} uses a reserved namespace and was skipped",
@@ -378,14 +309,12 @@ capabilities = ["net", "fs.read"]
         };
         assert!(grant_covers(&full, &manifest, hash));
 
-        // Wrong hash (manifest changed since the grant): not covered.
         let stale = CapabilityGrant {
             manifest_hash: "sha256:old".to_string(),
             ..full.clone()
         };
         assert!(!grant_covers(&stale, &manifest, hash));
 
-        // Missing a capability: not covered.
         let partial = CapabilityGrant {
             manifest_hash: hash.to_string(),
             capabilities: vec!["net".into()],

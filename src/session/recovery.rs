@@ -1,51 +1,4 @@
 //! Startup auto-recovery for AI agent sessions.
-//!
-//! After a system reboot, tmux loses all its sessions. AoE sessions with a
-//! stored conversation ID and a non-`Unsupported` resume strategy can be
-//! transparently recreated by replaying the resume cascade in
-//! `start_with_resume_fallback`. This module centralises
-//! the candidate selection and the cross-process exclusion needed to make
-//! that safe when both the TUI (`aoe`) and the daemon (`aoe serve`) are
-//! running.
-//!
-//! The recovery cascade itself lives in `instance::start_with_resume_fallback`;
-//! this module is the policy layer (who runs it, when, with what serialization)
-//! that the TUI and daemon entry points share.
-//!
-//! # Cross-process exclusion
-//!
-//! Both the TUI and the daemon may attempt recovery on startup. To avoid
-//! duplicate cascades against the same `(profile, id)` (which would race on
-//! `tmux new-session` and on `sessions.json`), we acquire a non-blocking
-//! exclusive `flock` on a marker file in the app data directory. The losing
-//! party skips recovery entirely and lets the winner proceed. The file lock
-//! is held for the entire recovery pass so that:
-//!
-//! - A late-starting daemon cannot duplicate a TUI's in-flight workers.
-//! - A late-starting TUI cannot duplicate a daemon's in-flight workers.
-//!
-//! `daemon_pid()` alone is not sufficient because the daemon writes its PID
-//! file *after* fork+exec, leaving a tens-to-hundreds-of-millisecond window
-//! where both sides observe "no daemon running" and both decide they own
-//! recovery.
-//!
-//! # Bounded on_launch hook execution
-//!
-//! Recovery installs a [`HookTimeoutScope`] before entering the cascade.
-//! `repo_config::run_hooks_captured` reads the scope and bounds each
-//! `on_launch` command by [`RECOVERY_HOOK_TIMEOUT`] (30 s, debug-overridable
-//! via `AOE_RECOVERY_HOOK_TIMEOUT_MS`); on expiry the child tree is killed
-//! through [`crate::process::kill_process_tree`] (SIGTERM, 100 ms grace,
-//! then SIGKILL). An `N`-command list releases the lock within
-//! `N * (RECOVERY_HOOK_TIMEOUT + kill_grace)` per worker, with up to
-//! [`STARTUP_RECOVERY_CONCURRENCY`] workers concurrent.
-//!
-//! Caveats: `execute_hooks_in_container` kills the host-side
-//! `docker`/`podman exec` child, not the in-container process; signal
-//! propagation depends on the runtime. Hooks that daemonize (own `setsid`
-//! plus reparent to PID 1) escape `kill_process_tree`'s descendant walk;
-//! the lock still releases when the direct child exits, but the orphan is
-//! the operator's to reap.
 
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
@@ -58,34 +11,21 @@ use fs2::FileExt;
 
 use super::{Instance, StartOutcome};
 
-/// File-system claim that the holder is the sole recovery owner for this
-/// machine. Dropped automatically (releases the `flock`) when the holder goes
-/// out of scope.
+/// File-system claim that the holder is the sole recovery owner for this machine.
 pub struct RecoveryLock {
     _file: std::fs::File,
 }
 
 /// Try to acquire the cross-process recovery lock without blocking.
-///
-/// Returns `Some(RecoveryLock)` if this process is now the recovery owner;
-/// `None` if another process (TUI or daemon) already holds it. The lock is
-/// released when the returned guard is dropped.
-///
-/// The lock file lives at `<app_dir>/.recovery.lock`. It is created if
-/// missing and never deleted (the lock is on the file, not its existence).
 pub fn try_acquire_recovery_lock() -> Result<Option<RecoveryLock>> {
     try_acquire_recovery_lock_at(&recovery_lock_path()?)
 }
 
-/// Inner helper that takes the lock-file path directly. Split out so tests
-/// can exercise the flock logic without depending on the env-var-driven
-/// `get_app_dir()` resolution, which races with non-`#[serial]` readers of
-/// `HOME` / `XDG_CONFIG_HOME` elsewhere in the suite.
+/// Inner helper that takes the lock-file path directly.
 fn try_acquire_recovery_lock_at(path: &Path) -> Result<Option<RecoveryLock>> {
     if let Some(parent) = path.parent() {
-        // Propagate so an unwritable app dir surfaces here with the real
-        // OS error (e.g. EACCES, EROFS) rather than as a confusing
-        // ENOENT from the subsequent `open()`.
+        // Propagate so an unwritable app dir surfaces here with the real OS error (e.g. EACCES,
+        // EROFS) rather than as a confusing ENOENT from the subsequent `open()`.
         std::fs::create_dir_all(parent)?;
     }
     let file = std::fs::OpenOptions::new()
@@ -105,22 +45,7 @@ fn recovery_lock_path() -> Result<PathBuf> {
     Ok(super::get_app_dir()?.join(".recovery.lock"))
 }
 
-/// Pure predicate: should this instance go through the startup recovery
-/// cascade? Excludes structured view-mode sessions (handled by `acp_reconciler`),
-/// sessions whose agent has `ResumeStrategy::Unsupported`, sessions without
-/// a valid `agent_session_id`, and sunk rows (archived, currently snoozed, or
-/// explicitly stopped). Live tmux panes are filtered separately by the caller,
-/// from one batched tmux observation.
-///
-/// Archive, snooze, and stop are explicit "leave this session alone" signals;
-/// each of them kills the tmux pane, so without this guard the next TUI
-/// launch (or daemon startup) would observe a dead pane on a resumable agent
-/// and respawn the row the user just dismissed. Snooze flips back to
-/// recoverable on its own schedule (`is_snoozed()` returns false once the
-/// timer expires). Stop only flips back to recoverable when the user
-/// explicitly reopens the session (Enter / send-message / live-send), which
-/// transitions `Status::Stopped` to `Status::Starting` before recovery is
-/// consulted.
+/// Pure predicate: should this instance go through the startup recovery cascade?
 pub fn is_recovery_candidate(inst: &Instance) -> bool {
     let resumable_id = inst
         .agent_session_id
@@ -136,38 +61,25 @@ pub fn is_recovery_candidate(inst: &Instance) -> bool {
         && resumable_id
 }
 
-/// Minimum `agent_session_id` length before it is trusted as a process-argv
-/// needle. This fallback signal is used only for non-hook agents (hook agents
-/// match on the anchored `AOE_INSTANCE_ID` env entry instead). Real sids are
-/// long (16 hex for claude, 36 for a UUID); refusing shorter ids keeps a
-/// pathological 1-3 char id from matching an unrelated command line.
+/// Minimum `agent_session_id` length before it is trusted as a process-argv needle.
 const ORPHAN_SCAN_MIN_SID_LEN: usize = 8;
 
-/// True when aoe injects `AOE_INSTANCE_ID` into this agent's environment. Gated
-/// on the same hook presence as `status_hook_env_prefix`, so it tracks exactly
-/// the agents whose live process carries the anchored env marker.
+/// True when aoe injects `AOE_INSTANCE_ID` into this agent's environment.
 fn agent_injects_instance_id_env(inst: &Instance) -> bool {
     inst.resolved_agent()
         .is_some_and(|agent| agent.hook_config.is_some() || agent.sidecar_hooks.is_some())
 }
 
 /// The identity needles used to detect a live agent process for `inst`.
-///
-/// Hook agents use the exact instance environment marker plus the token the
-/// launch actually runs. The conversation id is mutable after `/clear`,
-/// `/new`, or a first hook publication, and a `--fork-session` child carries
-/// its *parent's* sid in argv, so a bare-sid match would let a fork child
-/// suppress the parent's recovery (#3006). Non-hook agents have no marker and
-/// fall back to that sid anyway, which is why the two arms differ.
 pub fn orphan_needles(inst: &Instance) -> (String, Option<String>, Option<String>) {
     if agent_injects_instance_id_env(inst) {
         if inst.id.is_empty() {
             return (String::new(), None, None);
         }
         let env = format!("{}={}", crate::tmux::env::AOE_INSTANCE_ID_KEY, inst.id);
-        // The wrapper's own name when the launch renames the agent: the
-        // marker is injected on hook presence alone, so a wrapper carries it
-        // and must be matched by the token its process really shows.
+        // The wrapper's own name when the launch renames the agent: the marker is injected on hook
+        // presence alone, so a wrapper carries it and must be matched by the token its process
+        // really shows.
         let executable = inst.launch_executable_token();
         return (env, None, executable);
     }
@@ -182,11 +94,8 @@ pub fn orphan_needles(inst: &Instance) -> (String, Option<String>, Option<String
     (String::new(), cmdline, None)
 }
 
-/// Batched orphan check: one process-table walk deciding, for each instance,
-/// whether a live agent process belongs to it. See [`orphaned_agent_process_alive`]
-/// for the rationale; this is the form the recovery paths use so N candidates
-/// cost one `/proc` walk (or one `ps` fork), and the callers wrap it in
-/// `tokio::task::spawn_blocking`.
+/// Batched orphan check: one process-table walk deciding, for each instance, whether a live agent
+/// process belongs to it.
 pub fn orphaned_agents_alive(insts: &[Instance]) -> Vec<bool> {
     if insts.is_empty() {
         return Vec::new();
@@ -203,30 +112,7 @@ pub fn orphaned_agents_alive(insts: &[Instance]) -> Vec<bool> {
     crate::process::processes_matching(&env, &cmdline, &executable)
 }
 
-/// Defense-in-depth guard against the sequential-recovery duplication in #2994.
-///
-/// A prior recovery pass may have resumed this instance on a tmux server that
-/// this process can no longer see: on a mid-crash `/tmp` wipe (WSL2) the
-/// server's socket file is unlinked, orphaning the still-running server, and a
-/// later pass resolving a fresh default socket observes the session as
-/// "missing" (no live pane carries its id) and would recreate it,
-/// orphaning the first batch's agent processes. After a socket loss the OS
-/// process table is the *only* source of truth that survives (the socket file,
-/// and therefore any `tmux` query, is gone), and it is host-local, so unlike a
-/// persisted PID it is safe under a `sessions.json` synced across hosts.
-///
-/// A match means the agent is alive on a tmux server we cannot see, so recovery
-/// skips it rather than duplicate it. Returns `false` (allow recovery) when no
-/// live process matches, including the genuine post-reboot case where the agent
-/// processes are gone. This positively identifies live orphans; the boot-scoped
-/// [`mark_recovery_attempted`] ledger is the deterministic backstop that also
-/// covers agents with no usable identity needle.
-///
-/// Callers on an async runtime must invoke this inside `spawn_blocking`: it
-/// walks the process table and would otherwise stall the executor.
-///
-/// The TUI path scans in a batch via [`orphaned_agents_alive`]; this
-/// single-instance convenience serves the daemon's Phase B re-check.
+/// Defense-in-depth guard against the sequential-recovery duplication in.
 pub fn orphaned_agent_process_alive(inst: &Instance) -> bool {
     orphaned_agents_alive(std::slice::from_ref(inst))
         .first()
@@ -263,11 +149,7 @@ fn recovery_ledger_path() -> Option<PathBuf> {
     Some(dir.join(safe))
 }
 
-/// Instance ids for which a startup-recovery attempt has already been recorded
-/// this boot. Recovery filters these out so a session is attempted at most once
-/// per boot, which deterministically prevents the #2994 sequential duplication
-/// for *every* agent (including those with no usable process-scan needle).
-/// Empty when the ledger is unavailable or unreadable (fail open to the scan).
+/// Instance ids for which a startup-recovery attempt has already been recorded this boot.
 pub fn recovery_attempted_this_boot() -> std::collections::HashSet<String> {
     let mut set = std::collections::HashSet::new();
     if let Some(path) = recovery_ledger_path() {
@@ -283,11 +165,7 @@ pub fn recovery_attempted_this_boot() -> std::collections::HashSet<String> {
     set
 }
 
-/// Record that a startup-recovery attempt is being made for each id in `ids`,
-/// this boot. Called *before* the cascade creates any tmux session, so a
-/// mid-pass crash fails toward "already attempted, do not duplicate" rather
-/// than "no record, recreate". Best-effort (an unwritable app dir is ignored);
-/// also GCs ledgers from prior boots so the directory stays bounded.
+/// Record that a startup-recovery attempt is being made for each id in `ids`, this boot.
 pub fn mark_recovery_attempted(ids: &[String]) {
     if ids.is_empty() {
         return;
@@ -323,56 +201,22 @@ fn gc_stale_boot_ledgers(dir: &Path, keep: Option<&std::ffi::OsStr>) {
     }
 }
 
-/// Warm up the tmux server so that the first concurrent `new-session` from
-/// recovery workers does not race the server's cold start. On macOS post-reboot,
-/// tmux is not running until the first client connects; without this warm-up,
-/// three workers calling `new-session` simultaneously can hit a connect-race
-/// window where the socket file exists but no listener accepts yet.
-///
-/// Best-effort: `tmux start-server` is idempotent; if tmux is unavailable the
-/// caller will fail downstream with a more specific error.
+/// Warm up the tmux server so that the first concurrent `new-session` from recovery workers does
+/// not race the server's cold start.
 pub fn warm_tmux_server() {
     let _ = crate::tmux::tmux_command().arg("start-server").status();
 }
 
-/// Maximum number of recovery workers running concurrently. Sized to cover
-/// the typical case (a handful of resume-capable sessions surviving a
-/// daemon restart) without thundering-herd-ing tmux at server warm-up.
-/// Shared between the TUI standalone path and the daemon path so both sides
-/// behave identically when run separately. Users with more than this many
-/// simultaneously-missing sessions will see the 4th+ candidate enter its
-/// cascade after `RECENTLY_RESTARTED_TTL` has expired for it, producing a
-/// brief `Starting -> Error` blip before completion; raising both this
-/// constant and the TTL together is the right knob if telemetry warrants.
+/// Maximum number of recovery workers running concurrently.
 pub const STARTUP_RECOVERY_CONCURRENCY: usize = 3;
 
-/// Time-to-live entries in the `recently_restarted` map remain authoritative
-/// for. Sized to cover the typical worst-case cascade latency
-/// (`RESUME_PROBE_MAX` ~3s × 2 tiers + kill_clean grace ~150ms ≈ 6.15s) plus
-/// a ~1.85s margin for slow cold-start agents (opencode importing on a cold
-/// cache). Lower values cause spurious `Status::Error` chips on still-starting
-/// sessions; higher values delay the first real status update past the user's
-/// patience window.
-///
-/// The absolute worst case (both tiers running the full
-/// `RESUME_PROBE_POST_SHELL_GRACE` of 2s on top of `RESUME_PROBE_MAX`) would
-/// reach ~10s and exceed this TTL. In practice the cascade aborts early on a
-/// confirmed-Dead pane, so the typical bound holds; if production telemetry
-/// shows the absolute case occurring, raise this to 11s rather than relying
-/// on early abort.
+/// Time-to-live entries in the `recently_restarted` map remain authoritative for.
 pub const RECENTLY_RESTARTED_TTL: Duration = Duration::from_secs(8);
 
-/// Periodic GC interval for `recently_restarted`. Long-running daemons may
-/// accumulate thousands of entries over a session if they never GC; the TTL
-/// check on read filters but does not remove. Sweeping every 60s keeps the
-/// map bounded by `O(recoveries_in_last_60s)` rather than total uptime.
+/// Periodic GC interval for `recently_restarted`.
 pub const RECENTLY_RESTARTED_GC_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Shared `recently_restarted` map: instance id → time of last successful
-/// recovery start. Status pollers consult this to suppress the
-/// `Status::Error` transition while a freshly-restarted agent is still
-/// settling. Entries older than `RECENTLY_RESTARTED_TTL` are ignored on read
-/// and removed by the GC task.
+/// Shared `recently_restarted` map: instance id → time of last successful recovery start.
 pub type RecentlyRestarted = Arc<std::sync::RwLock<std::collections::HashMap<String, Instant>>>;
 
 /// Construct an empty `recently_restarted` map.
@@ -380,13 +224,7 @@ pub fn new_recently_restarted() -> RecentlyRestarted {
     Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()))
 }
 
-/// Tick-local snapshot of the suppression set, capturing every id whose
-/// mark is currently fresh. `status_poll_loop` takes this snapshot once
-/// per tick *before* `batch_pane_metadata()` runs, then uses it for the
-/// `Status::Starting` decision so that a worker which unmarks mid-tick
-/// (after the pane scrape, before the decision) cannot combine stale
-/// pane-missing metadata with a cleared mark and re-emit the phantom
-/// `Status::Error` the suppression is there to prevent.
+/// Tick-local snapshot of the suppression set, capturing every id whose mark is currently fresh.
 pub fn snapshot_recently_restarted(map: &RecentlyRestarted) -> std::collections::HashSet<String> {
     let guard = match map.read() {
         Ok(g) => g,
@@ -405,19 +243,14 @@ pub fn mark_recently_restarted(map: &RecentlyRestarted, id: &str) {
     }
 }
 
-/// Inverse of `mark_recently_restarted`. Called when a pre-marked
-/// candidate turns out not to need recovery (post-lock re-check fails),
-/// to avoid suppressing the real status for the full TTL.
+/// Inverse of `mark_recently_restarted`.
 pub fn unmark_recently_restarted(map: &RecentlyRestarted, id: &str) {
     if let Ok(mut guard) = map.write() {
         guard.remove(id);
     }
 }
 
-/// Remove entries older than `2 × RECENTLY_RESTARTED_TTL`. The 2x factor
-/// avoids a tight read-vs-GC race where a reader observes an entry just
-/// before GC removes it; with 2x, a reader that saw the entry at age T has
-/// at least T more time before GC reaps it.
+/// Remove entries older than `2 × RECENTLY_RESTARTED_TTL`.
 pub fn gc_recently_restarted(map: &RecentlyRestarted) {
     let cutoff = RECENTLY_RESTARTED_TTL * 2;
     if let Ok(mut guard) = map.write() {
@@ -425,15 +258,7 @@ pub fn gc_recently_restarted(map: &RecentlyRestarted) {
     }
 }
 
-/// Set of instance ids whose startup-recovery cascade has been scheduled
-/// but not yet completed. Populated by Phase A (`daemon_startup_recovery_mark`)
-/// for every candidate; each Phase B worker drains its own id when its
-/// cascade terminates (success, skip, error, or panic). The background
-/// refresher walks this set every `RECENTLY_RESTARTED_TTL / 2` and re-stamps
-/// each member in `recently_restarted`, so a candidate that sits in the
-/// `STARTUP_RECOVERY_CONCURRENCY` semaphore queue past the TTL does not age
-/// out of suppression and trip a phantom `Status::Error` before its worker
-/// even begins.
+/// Set of instance ids whose startup-recovery cascade has been scheduled but not yet completed.
 pub type RecoveryPending = Arc<std::sync::RwLock<std::collections::HashSet<String>>>;
 
 /// Construct an empty `recovery_pending` set.
@@ -441,9 +266,7 @@ pub fn new_recovery_pending() -> RecoveryPending {
     Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()))
 }
 
-/// Seed the pending set with every scheduled candidate id. Called by Phase A
-/// alongside the initial `mark_recently_restarted` so the refresher has the
-/// full work set before the cascade (and the refresher) start.
+/// Seed the pending set with every scheduled candidate id.
 pub fn seed_recovery_pending(pending: &RecoveryPending, ids: impl IntoIterator<Item = String>) {
     if let Ok(mut guard) = pending.write() {
         guard.extend(ids);
@@ -451,17 +274,6 @@ pub fn seed_recovery_pending(pending: &RecoveryPending, ids: impl IntoIterator<I
 }
 
 /// One refresher tick: re-stamp every still-pending id in `recently_restarted`.
-/// Returns `false` once the pending set is empty so the caller can stop
-/// ticking (the cascade is done).
-///
-/// Lock order is `R(pending)` → `W(recently_restarted)`, with the marking
-/// performed *inside* the `pending` read-lock scope. That is the load-bearing
-/// detail: a concurrent [`drain_recovery_pending`] takes `W(pending)` first,
-/// so it cannot interleave between this function observing an id and stamping
-/// it. Either the drain wins the write lock before this read (the id is gone,
-/// never re-stamped) or it blocks until this read releases (its later unmark
-/// strictly succeeds this stamp). No mark-after-unmark resurrection is
-/// possible. See [`drain_recovery_pending`].
 pub fn refresh_recovery_pending(
     pending: &RecoveryPending,
     recently_restarted: &RecentlyRestarted,
@@ -485,10 +297,8 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Worker-completion drain: remove `id` from the pending set so the refresher
-/// stops re-stamping it, *then* clear its suppression mark. The ordering
-/// (`W(pending)` before unmarking `recently_restarted`) is what makes the
-/// unmark stick against a racing refresher; see [`refresh_recovery_pending`].
+/// Worker-completion drain: remove `id` from the pending set so the refresher stops re-stamping it,
+/// *then* clear its suppression mark.
 pub fn drain_recovery_pending(
     pending: &RecoveryPending,
     recently_restarted: &RecentlyRestarted,
@@ -510,22 +320,7 @@ pub fn drain_recovery_pending(
     unmark_recently_restarted(recently_restarted, id);
 }
 
-/// Run the recovery cascade for one instance. Wraps
-/// `restart_with_size_opts(None, false)` in a [`HookTimeoutScope`] so a
-/// hung `on_launch` hook cannot pin the recovery lock (#1265).
-///
-/// `skip_on_launch=false` is mandatory: hooks must run on the first start
-/// after a reboot. Ambiguous resume-probe failures return `ResumeFailed`
-/// instead of launching fresh, so hooks are not double-fired on that path.
-///
-/// On failure, stamps `Status::Error`, `last_error`, and `last_error_check`
-/// on the instance before propagating the error so daemon and TUI workers
-/// share the same translation. The `last_error` for hook-timeout failures
-/// is `"on_launch hook timed out after Ns: <cmd>"` (#1889); generic cascade
-/// failures keep the historical `"recovery cascade: <e>"` shape.
-///
-/// Blocks; callers must invoke it off the main event-loop thread. Worst
-/// case is `N_hooks * RECOVERY_HOOK_TIMEOUT + ~4 s` resume-probe latency.
+/// Run the recovery cascade for one instance.
 pub fn run_recovery_for_instance(inst: &mut Instance) -> Result<StartOutcome> {
     let _scope = HookTimeoutScope::new(recovery_hook_timeout());
     let result = inst.restart_with_size_opts(None, false);
@@ -541,17 +336,7 @@ fn stamp_recovery_error(inst: &mut Instance, e: &anyhow::Error) {
     inst.last_error_check = Some(std::time::Instant::now());
 }
 
-/// Project a cascade `anyhow::Error` onto the operator-facing `last_error`
-/// string. A `HookTimeout` carried in the error chain produces the exact
-/// `"on_launch hook timed out after Ns: <cmd>"` shape called out by #1889;
-/// every other error keeps the daemon's historical `"recovery cascade: <e>"`
-/// wrapping so non-timeout failures stay unambiguously cascade-attributed.
-///
-/// Walks the full chain (not just the root) so that a future `.context(...)`
-/// wrap somewhere in the cascade does not silently regress the timeout
-/// classification. Replacing `.context()` with `anyhow!("...: {e}")` would
-/// detach the source and is the only way to defeat this; the `HookTimeout`
-/// type's docstring calls that pattern out.
+/// Project a cascade `anyhow::Error` onto the operator-facing `last_error` string.
 fn format_recovery_last_error(e: &anyhow::Error) -> String {
     if let Some(t) = e
         .chain()
@@ -566,8 +351,7 @@ fn format_recovery_last_error(e: &anyhow::Error) -> String {
     }
 }
 
-/// 30 s default; the operational guidance for non-interactive on_launch
-/// hooks (#1265).
+/// 30 s default; the operational guidance for non-interactive on_launch hooks.
 pub const RECOVERY_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Lower bound on `AOE_RECOVERY_HOOK_TIMEOUT_MS` so a misconfigured test
@@ -575,9 +359,7 @@ pub const RECOVERY_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(debug_assertions)]
 const RECOVERY_HOOK_TIMEOUT_FLOOR: Duration = Duration::from_millis(50);
 
-/// Resolve the recovery hook timeout. Release builds always return
-/// [`RECOVERY_HOOK_TIMEOUT`]; debug builds honor `AOE_RECOVERY_HOOK_TIMEOUT_MS`
-/// for tests, clamped to [`RECOVERY_HOOK_TIMEOUT_FLOOR`].
+/// Resolve the recovery hook timeout.
 pub fn recovery_hook_timeout() -> Duration {
     #[cfg(debug_assertions)]
     if let Ok(raw) = std::env::var("AOE_RECOVERY_HOOK_TIMEOUT_MS") {
@@ -599,9 +381,8 @@ pub(crate) fn current_hook_timeout() -> Option<Duration> {
 
 /// RAII guard for the per-thread on_launch hook deadline. Restores the
 /// previous value on drop, so nested scopes behave LIFO.
-// Save/restore covers LIFO nesting only; production installs at most one scope
-// per thread (recovery, or a bounded `perform_restart`), so out-of-order drops
-// never occur.
+// Save/restore covers LIFO nesting only; production installs at most one scope per thread
+// (recovery, or a bounded `perform_restart`), so out-of-order drops never occur.
 pub struct HookTimeoutScope {
     previous: Option<Duration>,
 }
@@ -662,23 +443,16 @@ mod tests {
         assert!(g.contains_key("fresh"));
     }
 
-    /// Regression for the queued-candidate TTL race (#1264): the background
-    /// refresher must not resurrect a mark that a completed worker has just
-    /// cleared. The worker drains its id from `recovery_pending` *before*
-    /// unmarking; a subsequent refresher tick sees an empty (for that id)
-    /// pending set and leaves `recently_restarted` clear. Without the drain,
-    /// the refresher would re-stamp the id forever and suppress its real
-    /// status for the rest of the cascade.
+    // Regression for the queued-candidate TTL race: the background refresher must not resurrect a
+    // mark that a completed worker has just cleared.
     #[test]
     fn refresher_does_not_resurrect_drained_worker_mark() {
         let recently = new_recently_restarted();
         let pending = new_recovery_pending();
 
-        // Phase A: schedule the candidate and stamp its initial mark.
         seed_recovery_pending(&pending, ["abc".to_string()]);
         mark_recently_restarted(&recently, "abc");
 
-        // A refresher tick while the worker is still queued keeps it fresh.
         assert!(
             refresh_recovery_pending(&pending, &recently),
             "non-empty pending set should keep ticking",
@@ -688,15 +462,12 @@ mod tests {
             "refresher must keep a queued candidate's mark fresh",
         );
 
-        // Worker completes: drain from pending, then unmark.
         drain_recovery_pending(&pending, &recently, "abc");
         assert!(
             !recently.read().unwrap().contains_key("abc"),
             "drain must clear the suppression mark",
         );
 
-        // A later refresher tick must not bring the mark back, and reports
-        // the set as drained so the loop can exit.
         assert!(
             !refresh_recovery_pending(&pending, &recently),
             "empty pending set signals the refresher to stop",
@@ -707,15 +478,12 @@ mod tests {
         );
     }
 
-    /// The refresher keeps a still-queued candidate marked while a *different*
-    /// candidate finishes. Draining one id must not stop refreshing the rest.
     #[test]
     fn refresher_keeps_remaining_candidates_after_partial_drain() {
         let recently = new_recently_restarted();
         let pending = new_recovery_pending();
         seed_recovery_pending(&pending, ["done".to_string(), "queued".to_string()]);
 
-        // First worker finishes; the second is still waiting on a permit.
         drain_recovery_pending(&pending, &recently, "done");
 
         assert!(
@@ -732,7 +500,6 @@ mod tests {
         );
     }
 
-    // Stamp only after the real write lock has refused the drainer.
     #[test]
     fn refresher_mark_loses_to_concurrent_drain_under_lock_overlap() {
         let recently = new_recently_restarted();
@@ -774,11 +541,8 @@ mod tests {
         inst.command = "/opt/wrappers/claude".to_string();
         assert!(!is_recovery_candidate(&inst));
     }
-    /// Regression: archiving a session kills its tmux pane, so the next
-    /// startup observes a dead pane on a resume-capable agent. Without an
-    /// archive guard on `is_recovery_candidate`, the cascade respawns the
-    /// row the user just dismissed (reported: "archive a session, leave
-    /// and re-enter the TUI, it restarts").
+    // Regression: archiving a session kills its tmux pane, so the next startup observes a dead pane
+    // on a resume-capable agent.
     #[test]
     fn archived_instance_is_not_recovery_candidate() {
         let mut inst = Instance::new("archived", "/tmp/test");
@@ -799,13 +563,8 @@ mod tests {
         );
     }
 
-    /// Regression for #1583: pressing `x` in the session picker stops a
-    /// session, which sets `Status::Stopped` and kills the tmux pane. The
-    /// next TUI launch (or daemon startup) sees a dead pane on a resume-
-    /// capable agent; without a Stopped guard, the cascade respawns the row
-    /// the user just stopped. Only an explicit user action (Enter / send /
-    /// live-send) transitions Stopped to Starting, which is consulted before
-    /// recovery runs.
+    // Regression for: pressing `x` in the session picker stops a session, which sets
+    // `Status::Stopped` and kills the tmux pane.
     #[test]
     fn stopped_instance_is_not_recovery_candidate() {
         let mut inst = Instance::new("stopped", "/tmp/test");
@@ -826,10 +585,6 @@ mod tests {
         );
     }
 
-    /// Snooze is the temporary sibling of archive. While the timer is in
-    /// the future, the row sits in tier 99 and must not be revived by a
-    /// pane-dead probe; once the timer expires, `is_snoozed()` flips to
-    /// false and the row naturally rejoins the recovery set.
     #[test]
     fn snoozed_instance_is_not_recovery_candidate_until_expiry() {
         let mut inst = Instance::new("snoozed", "/tmp/test");
@@ -846,50 +601,30 @@ mod tests {
         );
     }
 
-    /// A valid, long session id that no live process carries returns `false`
-    /// (the genuine post-reboot case: the agent processes are gone). Also
-    /// covers the no-sid path, where only the `AOE_INSTANCE_ID` env needle is
-    /// scanned and no live process carries this synthetic id.
     #[test]
-    fn orphaned_agent_process_alive_false_when_no_process_matches() {
+    fn orphaned_agent_process_alive_is_false_without_a_matching_live_process() {
+        let pid = std::process::id();
         let mut inst = Instance::new("absent", "/tmp/test");
-        inst.id = format!("absent{:012}", std::process::id());
-        inst.agent_session_id = None;
-        assert!(
-            !orphaned_agent_process_alive(&inst),
-            "no matching live process (no sid) must allow recovery",
-        );
-
-        // Non-hook agent so the sid needle is actually built and tested absent.
+        inst.id = format!("absent{pid:012}");
         inst.tool = "opencode".to_string();
-        inst.agent_session_id = Some(format!(
-            "11111111-1111-4111-8111-{:012}",
-            std::process::id()
-        ));
-        assert!(
-            !orphaned_agent_process_alive(&inst),
-            "no matching live process must allow recovery",
-        );
+        // (case, agent session id)
+        for (case, sid) in [
+            ("no sid at all", None),
+            (
+                "a sid no process carries",
+                Some(format!("11111111-1111-4111-8111-{pid:012}")),
+            ),
+            // Too short to trust as a cmdline needle, and nothing carries the env id either.
+            (
+                "a sub-ORPHAN_SCAN_MIN_SID_LEN sid",
+                Some("short".to_string()),
+            ),
+        ] {
+            inst.agent_session_id = sid;
+            assert!(!orphaned_agent_process_alive(&inst), "{case}");
+        }
     }
 
-    /// A too-short session id is not trusted as a cmdline needle; with no live
-    /// process carrying the env id either, the guard returns `false`. Uses a
-    /// non-hook agent so the sid path (not the env marker) is exercised.
-    #[test]
-    fn orphaned_agent_process_alive_ignores_short_sid() {
-        let mut inst = Instance::new("short-sid", "/tmp/test");
-        inst.id = format!("shortsid{:012}", std::process::id());
-        inst.tool = "opencode".to_string();
-        inst.agent_session_id = Some("short".into());
-        assert!(
-            !orphaned_agent_process_alive(&inst),
-            "a sub-{ORPHAN_SCAN_MIN_SID_LEN}-char sid must not be trusted, and nothing else matches",
-        );
-    }
-
-    /// End-to-end #2994: a *non-hook* agent still alive off-socket, detected by
-    /// the `agent_session_id` in a live process's argv (hook agents match on
-    /// the env marker instead; see the fork-collision rationale).
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn orphaned_agent_process_alive_detects_live_agent_by_sid() {
@@ -899,9 +634,6 @@ mod tests {
         inst.tool = "opencode".to_string();
         inst.agent_session_id = Some(sid.clone());
 
-        // Stand in for the orphaned `<agent> --resume <sid>` child: the sid
-        // rides as `$0` of a compound-list `sh` so it stays alive with the id
-        // in argv.
         let mut child = std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg("sleep 30; true")
@@ -930,9 +662,6 @@ mod tests {
         );
     }
 
-    /// A helper process can outlive the agent while inheriting its environment.
-    /// The marker alone must not suppress recovery once no matching agent
-    /// executable remains.
     #[cfg(target_os = "linux")]
     #[test]
     fn orphaned_agent_process_ignores_env_only_descendant() {
@@ -973,11 +702,6 @@ mod tests {
         let _ = child.wait();
     }
 
-    /// A renamed wrapper still carries the pane's marker, because
-    /// `status_hook_env_prefix` injects it on hook presence alone. Its needles
-    /// must therefore stay on the env-plus-executable pair. Falling back to
-    /// the sid would let a `--fork-session` child, which carries its parent's
-    /// sid in argv, suppress the parent's recovery (#3006).
     #[test]
     fn wrapper_hook_agent_keeps_the_env_marker_and_never_matches_on_sid() {
         const PROFILE: &str = "orphan-wrapper-needles";
@@ -1014,22 +738,10 @@ mod tests {
     fn orphaned_hook_agent_requires_env_and_executable_not_captured_sid() {
         let mut inst = Instance::new("orphan-env-agent", "/tmp/test");
         inst.id = format!("orphanboth{:012}", std::process::id());
-        // Model a first hook publication or a later native rotation: this id is
-        // deliberately absent from the live agent's argv.
         inst.agent_session_id = Some("66666666-7777-4888-8999-000000000000".to_string());
         let bin = tempfile::tempdir().unwrap();
         let agent = bin.path().join("claude");
-        // A stub, not a symlink to the system `sleep`: a multi-call coreutils
-        // (the Ubuntu 25.10 default) dispatches on argv[0] and exits at once
-        // under any other name, so the stand-in would die before the scan. The
-        // sleep is short because it outlives the killed shell.
         std::fs::write(&agent, "#!/bin/sh\nsleep 10\n").unwrap();
-        // The stub runs under `sh` so nothing execs it directly: a concurrent
-        // spawn in this binary can fork between the write's open and close and
-        // hold a writable copy, which fails execve with ETXTBSY (#3861). `sh`
-        // opens it for reading only. A shebang exec is rewritten by the kernel
-        // into this same argv, so the executable needle still matches the
-        // `claude` token and the stub needs no exec bit.
         let mut child = std::process::Command::new("/bin/sh")
             .arg(&agent)
             .env(crate::tmux::env::AOE_INSTANCE_ID_KEY, &inst.id)
@@ -1056,10 +768,6 @@ mod tests {
         );
     }
 
-    /// The boot-scoped ledger round-trips: a marked id is reported attempted,
-    /// an unmarked id is not. Isolated to a tempdir via the env override so it
-    /// never touches real user state. `#[serial]` because the override is a
-    /// process-global env var.
     #[test]
     #[serial_test::serial]
     fn recovery_attempt_ledger_roundtrips() {
@@ -1108,22 +816,6 @@ mod tests {
         );
     }
 
-    /// Cross-process exclusion is a POSIX `flock(2)` guarantee, not
-    /// something this unit test can verify (BSD flock and Linux flock
-    /// both treat all fds in the same process as one holder; only a
-    /// distinct process would be locked out). This test only verifies
-    /// the wrapper successfully creates the lock file and acquires/
-    /// releases the lock without erroring. The cross-process behavior
-    /// is exercised by the e2e suite (TUI + daemon spawned together).
-    ///
-    /// Driven through `try_acquire_recovery_lock_at` rather than the
-    /// public entry point so the lock path is fixed and independent of
-    /// `HOME` / `XDG_CONFIG_HOME`. The public function reads those env
-    /// vars via `dirs::config_dir()`; `getenv` and `setenv` are not
-    /// thread-safe, and non-`#[serial]` HOME readers elsewhere in the
-    /// suite have been observed to race a `set_var` from another test
-    /// and resolve the lock path under the wrong sandbox, surfacing as
-    /// a flaky "re-acquisition after drop" failure on CI.
     #[test]
     fn recovery_lock_acquires_and_releases() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -1133,10 +825,6 @@ mod tests {
         assert!(first.is_some(), "acquisition should succeed");
         drop(first);
 
-        // flock release lands inside drop()'s close(2), but under
-        // heavy parallel-test-thread contention on CI macOS runners a
-        // reacquire attempted in the same instant has been observed to lose
-        // the race (#1413). Retry briefly instead of asserting on one shot.
         let mut second = try_acquire_recovery_lock_at(&path).unwrap();
         for _ in 0..20 {
             if second.is_some() {
@@ -1148,18 +836,29 @@ mod tests {
         assert!(second.is_some(), "re-acquisition after drop should succeed");
     }
 
-    /// `HookTimeout` carries the lifecycle-agnostic shape; the helper adds the
-    /// `on_launch` framing that the recovery cascade is the only producer of
-    /// today. AC #3 of #1889 specifies the exact `last_error` text.
+    fn hook_timeout(cmd: &str, timeout_secs: u64) -> anyhow::Error {
+        anyhow::Error::new(super::super::config::repo_config::HookTimeout {
+            cmd: cmd.to_string(),
+            timeout_secs,
+        })
+    }
+
     #[test]
-    fn format_recovery_last_error_renders_hook_timeout_with_on_launch_prefix() {
-        let err = anyhow::Error::new(super::super::config::repo_config::HookTimeout {
-            cmd: "sleep 60".to_string(),
-            timeout_secs: 30,
-        });
+    fn format_recovery_last_error_classifies_a_hook_timeout_anywhere_in_the_chain() {
         assert_eq!(
-            format_recovery_last_error(&err),
+            format_recovery_last_error(&hook_timeout("sleep 60", 30)),
             "on_launch hook timed out after 30s: sleep 60",
+        );
+        assert_eq!(
+            format_recovery_last_error(
+                &hook_timeout("echo hi && sleep 60", 12).context("recovery cascade tier 1")
+            ),
+            "on_launch hook timed out after 12s: echo hi && sleep 60",
+            "a later `.context(..)` wrap must not hide the timeout",
+        );
+        assert_eq!(
+            format_recovery_last_error(&anyhow::anyhow!("tmux session is gone")),
+            "recovery cascade: tmux session is gone",
         );
     }
 
@@ -1167,12 +866,8 @@ mod tests {
     fn stamp_recovery_error_sets_error_status_and_operator_fields() {
         let mut inst = Instance::new("timeout", "/tmp/test");
         let before = std::time::Instant::now();
-        let err = anyhow::Error::new(super::super::config::repo_config::HookTimeout {
-            cmd: "sleep 60".to_string(),
-            timeout_secs: 30,
-        });
 
-        stamp_recovery_error(&mut inst, &err);
+        stamp_recovery_error(&mut inst, &hook_timeout("sleep 60", 30));
 
         assert_eq!(inst.status, super::super::Status::Error);
         assert_eq!(
@@ -1183,34 +878,6 @@ mod tests {
             inst.last_error_check
                 .is_some_and(|checked| checked >= before),
             "last_error_check must arm sticky error handling",
-        );
-    }
-
-    /// Non-timeout cascade failures keep the historical wrapper so they stay
-    /// unambiguously cascade-attributed in operator logs.
-    #[test]
-    fn format_recovery_last_error_falls_back_to_recovery_cascade_wrapper() {
-        let err = anyhow::anyhow!("tmux session is gone");
-        assert_eq!(
-            format_recovery_last_error(&err),
-            "recovery cascade: tmux session is gone",
-        );
-    }
-
-    /// A future `.context("...")` wrap somewhere in the cascade must not
-    /// regress the timeout classification: the helper walks the full chain,
-    /// not just the root, so a contextualized `HookTimeout` still produces
-    /// the timeout-shaped message.
-    #[test]
-    fn format_recovery_last_error_walks_chain_through_context() {
-        let err = anyhow::Error::new(super::super::config::repo_config::HookTimeout {
-            cmd: "echo hi && sleep 60".to_string(),
-            timeout_secs: 12,
-        })
-        .context("recovery cascade tier 1");
-        assert_eq!(
-            format_recovery_last_error(&err),
-            "on_launch hook timed out after 12s: echo hi && sleep 60",
         );
     }
 }

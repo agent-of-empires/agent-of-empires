@@ -8,8 +8,8 @@
 //! (empty still resolves to the fallback, which is now `zinc`). Idempotent: a
 //! config that doesn't pin `default` is left untouched.
 
-use anyhow::{Context, Result};
-use std::fs;
+use super::config_file;
+use anyhow::Result;
 use std::path::Path;
 use tracing::info;
 
@@ -19,30 +19,23 @@ pub fn run() -> Result<()> {
 }
 
 fn rename_theme(path: &Path) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    let content = fs::read_to_string(path)?;
-    let mut doc: toml::Table = content
-        .parse()
-        .with_context(|| format!("Failed to parse {} during v014 migration", path.display()))?;
-
-    let Some(theme) = doc.get_mut("theme").and_then(|t| t.as_table_mut()) else {
-        return Ok(());
-    };
-    if theme.get("name").and_then(|v| v.as_str()) != Some("default") {
-        return Ok(());
-    }
-    theme.insert("name".into(), toml::Value::String("zinc".into()));
-
-    info!("Renaming theme 'default' -> 'zinc' in {}", path.display());
-    crate::session::atomic_write(path, toml::to_string_pretty(&doc)?.as_bytes())?;
-    Ok(())
+    config_file::rewrite_strict(path, "v014", |doc| {
+        let Some(theme) = doc.get_mut("theme").and_then(|t| t.as_table_mut()) else {
+            return false;
+        };
+        if theme.get("name").and_then(|v| v.as_str()) != Some("default") {
+            return false;
+        }
+        theme.insert("name".into(), toml::Value::String("zinc".into()));
+        info!("Renaming theme 'default' -> 'zinc' in {}", path.display());
+        true
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn write(content: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::TempDir::new().unwrap();

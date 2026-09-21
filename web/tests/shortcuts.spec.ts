@@ -1,14 +1,8 @@
-// Keyboard-shortcut stories ported from the live suite (#1419 era
-// acp-stories): Cmd/Ctrl+B toggles the workspace sidebar, Shift+D
-// toggles the diff pane specifically, and Cmd/Ctrl+Alt+B collapses or
-// restores the whole right dock via the chord binding. All flip App.tsx
-// state through useKeyboardShortcuts; the chords bind on e.code === "KeyB"
-// so Mac layouts where Option+B emits "∫" still match.
-//
-// These need a mounted session view. The whole-dock toggle is observed via
-// ContentSplit's drag handle (data-testid="content-split-resize-handle",
-// present only when a session is open and the right dock has panes); the
-// per-pane diff toggle is observed via its activity-bar button's aria-pressed.
+// Keyboard shortcuts through useKeyboardShortcuts: Cmd/Ctrl+B toggles the
+// sidebar, Shift+D the diff pane, Cmd/Ctrl+Alt+B the whole right dock. The
+// chords bind on `e.code === "KeyB"` so Mac layouts emitting "∫" still match.
+// The dock toggle is observed via ContentSplit's drag handle, which exists only
+// with a session open and panes docked.
 
 import { test, expect } from "./helpers/mockedTest";
 import type { Page } from "@playwright/test";

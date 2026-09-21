@@ -1,14 +1,7 @@
-// Mocked port of the live acp-config-pickers-ui spec: browser-driven
-// user stories for the structured view model + reasoning effort pickers
-// (#1403), replaying canned ConfigOptionsUpdated frames instead of a
-// real daemon. The live acp-config-pickers spec (KEPT) pins the HTTP /
-// replay wire shape against the real backend; this one drives the
-// actual React surface: click the chip, pick a value, watch the chip
-// reflect the adapter's confirming snapshot.
-//
-// The UI is pessimistic: the chip only moves once the confirming
-// `ConfigOptionsUpdated` frame lands, so each test's `onConfigOption`
-// handler plays the adapter's confirmation (or rejection).
+// #1403: the structured-view model and reasoning-effort pickers, replaying
+// canned ConfigOptionsUpdated frames. The UI is pessimistic, so the chip only
+// moves once the confirming frame lands and each test's `onConfigOption` plays
+// the adapter's confirmation or rejection. The live spec pins the wire shape.
 
 import { test, expect } from "./helpers/mockedTest";
 import {

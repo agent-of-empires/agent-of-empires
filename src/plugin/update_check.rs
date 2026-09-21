@@ -1,46 +1,25 @@
 //! Update-availability checks for installed external plugins.
-//!
-//! An explicit action (CLI `aoe plugin outdated`, TUI `c`, the dashboard
-//! `GET /api/plugins/updates`), never run during the registry's offline load
-//! path. For a GitHub source it compares the lockfile's resolved commit against
-//! `git ls-remote` of the requested ref (no clone, no REST rate limit); for a
-//! local source it re-hashes the source directory against the lockfile tree
-//! hash. Builtins have nothing to update and are skipped.
-//!
-//! Limitation: a `release-binary` plugin whose GitHub release asset is replaced
-//! without a source-commit change is not detected here; `ls-remote` only sees
-//! the source tree. That asset drift is out of scope for #2365.
 
 use serde::Serialize;
 
 use super::lockfile::Lockfile;
 use super::source::PluginSource;
 
-/// One plugin's update status, rendered identically by CLI / TUI / web.
 #[derive(Debug, Clone, Serialize)]
 pub struct UpdateStatus {
     pub id: String,
     pub source: String,
-    /// The currently installed marker: a short commit (GitHub) or `local`.
     pub current: String,
-    /// The newer marker when an update exists: a short commit for GitHub. `None`
-    /// for a changed local tree (there is no commit to name) or when current.
     pub available: Option<String>,
     pub needs_update: bool,
-    /// Why the check could not run for this plugin (missing lock, git absent,
-    /// dead remote). Never silently treated as up-to-date.
     pub error: Option<String>,
 }
 
-/// One installed external plugin's identity, pulled off the registry before any
-/// blocking work so nothing non-`Send` is held across an await.
 struct Target {
     id: String,
     source: String,
 }
 
-/// Check every installed external plugin for an available update. Results are
-/// sorted by id; per-plugin failures land in `error`, not as a hard error.
 pub async fn outdated() -> Vec<UpdateStatus> {
     let targets: Vec<Target> = super::registry()
         .all()
@@ -75,8 +54,6 @@ async fn check_one(target: &Target, lock: Result<&Lockfile, &anyhow::Error>) -> 
 
     let lock = match lock {
         Ok(lock) => lock,
-        // A corrupt or unreadable plugins.lock must surface as itself, not be
-        // misreported as a missing entry across every plugin.
         Err(e) => return err(format!("reading plugins.lock: {e:#}")),
     };
     let Some(locked) = lock.get(&target.id) else {
@@ -94,10 +71,6 @@ async fn check_one(target: &Target, lock: Result<&Lockfile, &anyhow::Error>) -> 
             let Some(current_commit) = locked.resolved_commit.clone() else {
                 return err("lockfile has no resolved commit".to_string());
             };
-            // A no-`@ref` install tracks the latest-release channel, so compare
-            // against the latest release tag rather than the moving default
-            // branch HEAD. An explicit `@ref` is compared as-is. A no-`@ref`
-            // source whose repo has no release has nothing to update to.
             let reference = match source.reference() {
                 Some(r) => Some(r.to_string()),
                 None => match resolve_latest_release(&source).await {
@@ -145,8 +118,6 @@ async fn check_one(target: &Target, lock: Result<&Lockfile, &anyhow::Error>) -> 
     }
 }
 
-/// The latest stable release tag for a GitHub source, or `None` when the repo
-/// has none. Non-GitHub sources never reach this.
 async fn resolve_latest_release(source: &PluginSource) -> anyhow::Result<Option<String>> {
     match source {
         PluginSource::Github { owner, repo, .. } => {

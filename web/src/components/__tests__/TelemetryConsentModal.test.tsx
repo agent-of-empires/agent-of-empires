@@ -1,7 +1,4 @@
 // @vitest-environment jsdom
-//
-// Contract test for the first-load telemetry consent modal: each button
-// reports the user's choice through onChoose so the parent can persist it.
 
 import { describe, expect, it, vi } from "vitest";
 import { fireEvent, render } from "@testing-library/react";

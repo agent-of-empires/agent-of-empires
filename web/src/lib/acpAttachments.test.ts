@@ -1,12 +1,3 @@
-// Reducer tests for structured view attachment support (#1000 / #965).
-//
-// Cover the wire-protocol contract the composer and replay depend on:
-// the PromptCapabilities event drives the composer's attachment gate,
-// and a UserPromptSent carrying attachment refs maps each ref to a
-// render-ready attachment backed by the replay GET endpoint. If either
-// regresses, the paperclip silently disables or replayed screenshots
-// fail to render.
-
 import { describe, expect, it } from "vitest";
 
 import { applyEvent, emptyAcpState, transcriptRowToActivity, type AcpFrame } from "./acpTypes";
@@ -65,9 +56,6 @@ describe("structured view attachments reducer", () => {
   });
 
   it("maps server attachment refs to a GET-backed url on the transcript row", () => {
-    // The transcript is server-owned (Tier 4): the daemon carries attachment
-    // refs on the `user_prompt` TranscriptRow, and the client maps each to a
-    // replay-GET-backed AcpAttachment via `transcriptRowToActivity`.
     const row = transcriptRowToActivity(
       {
         id: "user-seq-5",

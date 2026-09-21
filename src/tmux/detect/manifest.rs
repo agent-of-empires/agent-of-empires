@@ -1,92 +1,64 @@
 //! Manifest schema, compilation, and evaluation.
-//!
-//! A manifest is one agent's detection rules as data. Each rule names the
-//! state it asserts, the [`Region`] it looks at, a priority, and a matcher.
-//! Every rule that matches is collected and the highest priority wins, so
-//! adding a case means adding a row rather than threading another branch
-//! through a chain of detectors.
 
 use serde::Deserialize;
 
 use super::region::{Marker, Region, Screen};
 use crate::session::Status;
 
-/// A rule as written in TOML.
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct RawRule {
     /// Empty for a shared template, which is named by its table key.
     #[serde(default)]
     pub(super) id: String,
-    /// A template in `manifests/shared.toml` to build on. Scalars set here win
-    /// over the template's; list fields concatenate, so an agent adds its own
-    /// phrases to the shared ones rather than restating them.
+    /// A `shared.toml` template: scalars here win, lists concatenate.
     #[serde(default)]
     pub(super) extends: Option<String>,
-    /// Omitted by rules that only carry `skip_state_update`.
     #[serde(default)]
     pub(super) state: Option<String>,
-    /// Templates carry no priority: each agent ranks the shape itself.
     #[serde(default)]
     pub(super) priority: i32,
     #[serde(default)]
     pub(super) region: Option<String>,
-    /// The pane visibly shows this state's own chrome, as opposed to the state
-    /// being inferred. The poller uses it to publish a transition immediately
-    /// instead of waiting for a second agreeing poll.
+    /// Read off the state's own chrome; published without waiting for a second poll.
     #[serde(default)]
     pub(super) visible: bool,
-    /// The screen is an agent-owned viewer (a transcript pager, a model
-    /// picker) that shows history rather than live state, so the last known
-    /// status must stand.
+    /// An agent-owned viewer (pager, picker): the last known status stands.
     #[serde(default)]
     pub(super) skip_state_update: bool,
-    /// Freshness bound for a `hook` rule: past it the rule cannot fire and
-    /// lower-priority evidence decides.
+    /// For `hook` rules: past this age the rule cannot fire.
     #[serde(default)]
     pub(super) max_age_secs: Option<u64>,
-    /// Arbitrate this rule against its priority peers by where it matches
-    /// rather than by rank: of the positional rules sharing a priority, the
-    /// one matching lowest on screen wins. Some agents stack their state
-    /// markers, so the bottom-most one is the current one and a fixed ranking
-    /// cannot express it.
+    /// Among positional peers of equal priority, the lowest match on screen wins
+    /// (for agents whose markers stack).
     #[serde(default)]
     pub(super) positional: bool,
-    /// Match against the join of up to this many consecutive lines, for a
-    /// marker a narrow pane wraps. Positional rules only.
+    /// Join up to this many lines, for a marker a narrow pane wraps.
     #[serde(default = "one")]
     pub(super) wrap: usize,
-    /// How far above the bottom the match may sit. A wrapped rule needs a
-    /// region one line deeper than its real window so the joined lines are
-    /// available; this keeps the match itself inside the window.
+    /// How far above the bottom the match may sit, for wrapped rules whose region
+    /// is one line deeper.
     #[serde(default)]
     pub(super) max_position: Option<usize>,
     #[serde(flatten)]
     pub(super) matcher: RawMatcher,
 }
 
-/// The match forms a rule (or a nested clause) may carry. Several may be set
-/// at once, in which case all of them must hold.
+/// Match forms; all that are set must hold.
 #[derive(Debug, Default, Clone, Deserialize)]
 pub(super) struct RawMatcher {
     /// Case-insensitive substrings, all of which must appear.
     #[serde(default)]
     pub(super) contains: Vec<String>,
-    /// Case-insensitive substrings, at least one of which must appear. The
-    /// common shape by far, and `any` with one `contains` per clause said the
-    /// same thing five times as long.
+    /// Case-insensitive substrings, at least one of which must appear.
     #[serde(default)]
     pub(super) contains_any: Vec<String>,
     /// Regexes over the region text, all of which must match.
     #[serde(default)]
     pub(super) regex: Vec<String>,
-    /// Regexes tested per line; each must match at least one line, not
-    /// necessarily the same one.
+    /// Per-line regexes; each must match some line.
     #[serde(default)]
     pub(super) line_regex: Vec<String>,
-    /// One line that matches every `regex` and none of `not_regex`. The
-    /// per-line negation is what `not` cannot express: a rule that fires on a
-    /// live activity line must not be silenced by a *different* line that
-    /// happens to report a finished one.
+    /// One line matching every `regex` and no `not_regex`.
     #[serde(default)]
     pub(super) line: Option<RawLineClause>,
     /// At least one clause must match.
@@ -101,9 +73,7 @@ pub(super) struct RawMatcher {
     /// For `region = "hook"`: the status the hook file must carry.
     #[serde(default)]
     pub(super) hook_status: Option<String>,
-    /// Evaluate this clause (and anything nested in it) against a different
-    /// region than the rule's own. A prompt whose evidence spans two places on
-    /// screen, like Codex's plan dialog, cannot be written any other way.
+    /// Evaluate this clause against a different region than the rule's own.
     #[serde(default)]
     pub(super) region: Option<String>,
     /// The `line_regex` patterns must match at least this many distinct lines.
@@ -144,20 +114,15 @@ fn one() -> usize {
 #[derive(Debug, Deserialize)]
 struct RawManifest {
     id: String,
-    /// Landmark lines the rules scope themselves to; see [`Marker`].
     #[serde(default)]
     markers: std::collections::HashMap<String, RawMarker>,
-    /// Lines that mark the start of the agent's live area, so rules can name
-    /// it (`from_prompt_marker`) instead of matching against a transcript that
-    /// still holds the previous turn's chrome.
+    /// Lines starting the agent's live area (`from_prompt_marker`).
     #[serde(default)]
     prompt_marker: Vec<String>,
     rules: Vec<RawRule>,
 }
 
-/// A compiled matcher. Regexes are compiled once at startup; substrings are
-/// pre-lowered, so evaluation is substring and regex work only.
-/// What a nested clause needs to resolve a region of its own.
+/// A compiled matcher: regexes compiled once, substrings pre-lowered.
 pub(super) struct MatchContext<'a> {
     pub(super) screen: &'a Screen<'a>,
     pub(super) prompt_marker: &'a [regex::Regex],
@@ -190,8 +155,6 @@ pub(super) struct Rule {
     pub(super) skip_state_update: bool,
     pub(super) max_age: Option<std::time::Duration>,
     matcher: Matcher,
-    /// `region = "hook"` is not a slice of the screen, so it is kept out of
-    /// [`Region`] and flagged here.
     pub(super) is_hook: bool,
 }
 
@@ -203,7 +166,6 @@ pub(super) struct Manifest {
     pub(super) rules: Vec<Rule>,
 }
 
-/// What the hook file says, when a session has one.
 #[derive(Debug, Clone, Copy)]
 pub struct HookObservation {
     pub status: Status,
@@ -275,10 +237,6 @@ impl Matcher {
         })
     }
 
-    /// Whether every form this matcher carries holds. `text`/`lower` are the
-    /// enclosing region; a clause naming its own `region` re-slices the screen
-    /// instead. An empty matcher matches, which is what lets a rule be pure
-    /// `not` clauses.
     fn matches(&self, text: &str, lower: &str, ctx: &MatchContext) -> bool {
         match self.region {
             Some(region) => {
@@ -372,21 +330,13 @@ impl Rule {
             if self.matcher.hook_status != Some(hook.status) {
                 return false;
             }
-            // A hook write nobody has refreshed within the bound is not
-            // evidence of anything: the agent's terminating hook can be lost
-            // (a turn that ends on a tool result fires none), and without a
-            // bound that lost write outranks the screen indefinitely.
+            // A stale hook write is not evidence: the terminating hook can be lost.
             let fresh = match (self.max_age, hook.age) {
                 (Some(max), Some(age)) => age < max,
-                // An unreadable mtime is missing evidence, not evidence of
-                // staleness, so the bound does not fire on it.
+                // An unreadable mtime is missing evidence, not staleness.
                 (Some(_), None) => true,
                 (None, _) => true,
             };
-            // A hook rule's clauses still apply, and they carry their own
-            // regions: `hook` is a source of evidence rather than a slice of
-            // screen, so there is no text to match here beyond what a clause
-            // asks for itself.
             return fresh && self.matcher.matches("", "", &ctx);
         }
         let text = screen.region_text(self.region, prompt_marker, markers);
@@ -398,7 +348,6 @@ impl Rule {
     }
 }
 
-/// Rule templates shared across manifests, keyed by name.
 const SHARED_TEMPLATES: &str = include_str!("manifests/shared.toml");
 
 #[derive(Debug, Deserialize)]
@@ -407,9 +356,7 @@ struct RawTemplates {
 }
 
 impl RawRule {
-    /// Fold a template into this rule: scalars already set here win, lists
-    /// concatenate so an agent extends the shared phrases rather than
-    /// restating them.
+    /// Fold a template in: scalars set here win, lists concatenate.
     fn inherit(&mut self, base: &RawRule) {
         self.state = self.state.take().or_else(|| base.state.clone());
         self.region = self.region.take().or_else(|| base.region.clone());
@@ -442,11 +389,8 @@ impl RawMatcher {
     }
 }
 
-/// The hook rules every agent shares, so ten manifests do not carry ten
-/// copies of the same five rows. They rank below the screen rules that read
-/// state off live chrome and above the ones that only guess, which is the
-/// arrangement the whole design turns on. A manifest that needs different
-/// bounds declares its own rule with the same id and wins.
+/// Hook rules shared by every agent. They rank below live-chrome screen rules
+/// and above guesses; a manifest overrides one by reusing its id.
 const SHARED_HOOK_RULES: &str = r#"
 # A `waiting` write speaks only for a capture with nothing in it.
 #
@@ -506,8 +450,7 @@ hook_status = "error"
 "#;
 
 impl Rule {
-    /// How far above the bottom of its region this rule matches, counting the
-    /// bottom line as 1. `None` when it does not match at all.
+    /// Match height above the region's bottom (bottom line = 1).
     fn match_position(
         &self,
         screen: &Screen,
@@ -523,9 +466,7 @@ impl Rule {
         };
         (0..lines.len()).rev().find_map(|idx| {
             let start = idx + 1 - self.wrap.min(idx + 1);
-            // Joined with newlines so a rule can still speak about the
-            // individual lines of a wrapped match: `line_regex` tests each,
-            // and `\s` in a plain regex spans the break.
+            // Newline-joined so `line_regex` still sees individual lines.
             let window = lines[start..=idx].join("\n");
             let lower = window.to_lowercase();
             let position = lines.len() - idx;
@@ -622,12 +563,8 @@ impl Manifest {
             .is_some_and(|r| r.matches(screen, hook, &self.prompt_marker, &self.markers))
     }
 
-    /// The rule that decides, if any.
-    ///
-    /// Rules are tried in descending priority. Positional rules sharing a
-    /// priority are one group: every member is evaluated and the one matching
-    /// lowest on screen wins, since for those agents the bottom-most marker is
-    /// the current one.
+    /// The deciding rule: descending priority; positional peers of equal priority
+    /// are evaluated together and the lowest match wins.
     pub(super) fn evaluate(&self, screen: &Screen, hook: Option<HookObservation>) -> Option<&Rule> {
         let mut i = 0;
         while i < self.rules.len() {

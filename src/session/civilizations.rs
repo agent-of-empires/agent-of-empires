@@ -136,13 +136,9 @@ where
     None
 }
 
-/// True when `title` is one this module could have produced via
-/// [`generate_random_title`]: a bare civilization name, or a civilization
-/// followed by a Roman-numeral suffix (`Britons II`) or a numeric timestamp
-/// suffix (`Britons 1700000000`). Civilization names are all single words, so
-/// the split on the last space is unambiguous. Used by `session::smart_rename`
-/// to decide whether a session still carries its auto-generated name and is
-/// therefore eligible for an automatic rename.
+/// True when `title` is one this module could have produced via [`generate_random_title`]: a bare
+/// civilization name, or a civilization followed by a Roman-numeral suffix (`Britons II`) or a
+/// numeric timestamp suffix (`Britons 1700000000`).
 pub fn is_default_civ_name(title: &str) -> bool {
     let t = title.trim();
     if CIVILIZATIONS.contains(&t) {
@@ -150,10 +146,8 @@ pub fn is_default_civ_name(title: &str) -> bool {
     }
     if let Some((base, suffix)) = t.rsplit_once(' ') {
         if CIVILIZATIONS.contains(&base) && !suffix.is_empty() {
-            // Match only the exact suffixes generate_random_title emits: a Roman
-            // numeral in 2..=1000, or a timestamp (Unix seconds, >= 9 digits).
-            // A looser check (any IVXLCDM run, any digits) would treat
-            // user-chosen titles like "Vikings 2" or "Britons IM" as default.
+            // Match only the exact suffixes generate_random_title emits: a Roman numeral in
+            // 2..=1000, or a timestamp (Unix seconds, >= 9 digits).
             let is_roman = (2..=1000).any(|n| to_roman(n) == suffix);
             let is_timestamp = suffix.len() >= 9 && suffix.chars().all(|c| c.is_ascii_digit());
             return is_roman || is_timestamp;
@@ -167,81 +161,57 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_to_roman() {
-        assert_eq!(to_roman(1), "I");
-        assert_eq!(to_roman(2), "II");
-        assert_eq!(to_roman(3), "III");
-        assert_eq!(to_roman(4), "IV");
-        assert_eq!(to_roman(5), "V");
-        assert_eq!(to_roman(9), "IX");
-        assert_eq!(to_roman(10), "X");
-        assert_eq!(to_roman(49), "XLIX");
-        assert_eq!(to_roman(50), "L");
-        assert_eq!(to_roman(100), "C");
-        assert_eq!(to_roman(500), "D");
-        assert_eq!(to_roman(1000), "M");
+    fn to_roman_cases() {
+        for (n, want) in [
+            (1, "I"),
+            (4, "IV"),
+            (9, "IX"),
+            (49, "XLIX"),
+            (50, "L"),
+            (100, "C"),
+            (500, "D"),
+            (1000, "M"),
+        ] {
+            assert_eq!(to_roman(n), want);
+        }
     }
 
     #[test]
-    fn test_generate_random_title_returns_civ() {
+    fn generated_titles_avoid_taken_names_then_fall_back_to_suffixes() {
         let title = generate_random_title(&[]);
         assert!(CIVILIZATIONS.contains(&title.as_str()));
-    }
 
-    #[test]
-    fn test_generate_random_title_avoids_existing() {
         let existing = vec!["Britons", "Franks", "Vikings"];
-        let title = generate_random_title(&existing);
-        assert!(!existing.contains(&title.as_str()));
-    }
+        assert!(!existing.contains(&generate_random_title(&existing).as_str()));
 
-    #[test]
-    fn test_generate_random_title_with_all_taken_uses_roman_numerals() {
-        let existing: Vec<&str> = CIVILIZATIONS.to_vec();
-        let title = generate_random_title(&existing);
-        assert!(title.contains(" II"));
-    }
+        let all: Vec<&str> = CIVILIZATIONS.to_vec();
+        assert!(generate_random_title(&all).contains(" II"));
 
-    #[test]
-    fn test_generate_random_title_filtered_skips_unavailable_civ() {
-        let existing: Vec<&str> = CIVILIZATIONS
+        let all_but_tatars: Vec<&str> = CIVILIZATIONS
             .iter()
             .copied()
             .filter(|civ| *civ != "Tatars")
             .collect();
+        let filtered = generate_random_title_filtered(&all_but_tatars, |c| c == "Tatars")
+            .expect("a suffixed civilization is still available");
+        assert_ne!(filtered, "Tatars");
+        assert!(filtered.contains(" II"), "got: {filtered}");
 
-        let title = generate_random_title_filtered(&existing, |candidate| candidate == "Tatars")
-            .expect("filtered title should fall back to a suffixed civilization");
-
-        assert_ne!(title, "Tatars");
-        assert!(
-            title.contains(" II"),
-            "expected suffixed fallback after the only bare civ was filtered, got: {title}"
-        );
+        assert!(generate_random_title_filtered(&[], |_| true).is_none());
     }
 
     #[test]
-    fn test_generate_random_title_filtered_returns_none_when_exhausted() {
-        let title = generate_random_title_filtered(&[], |_| true);
-
-        assert!(title.is_none());
-    }
-
-    #[test]
-    fn test_is_default_civ_name() {
-        // Bare civ names and every shape generate_random_title can emit.
+    fn is_default_civ_name_cases() {
         assert!(is_default_civ_name("Vikings"));
         assert!(is_default_civ_name("  Vikings  "));
         assert!(is_default_civ_name("Britons II"));
         assert!(is_default_civ_name("Franks XLIX"));
         assert!(is_default_civ_name("Mongols 1700000000"));
-        // Not default: user-chosen titles, even ones embedding a civ word.
         assert!(!is_default_civ_name("Fix login bug"));
         assert!(!is_default_civ_name("My Vikings"));
         assert!(!is_default_civ_name("Vikings raid plan"));
         assert!(!is_default_civ_name("Vikings 2.0"));
         assert!(!is_default_civ_name("Notaciv II"));
-        // Suffixes generate_random_title can never emit: invalid roman, short numeric.
         assert!(!is_default_civ_name("Britons IM"));
         assert!(!is_default_civ_name("Vikings 2"));
         assert!(!is_default_civ_name(""));

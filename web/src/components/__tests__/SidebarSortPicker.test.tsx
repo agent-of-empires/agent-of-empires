@@ -1,66 +1,36 @@
 // @vitest-environment jsdom
-//
-// Tests for SidebarSortPicker: the labeled dropdown that selects one of the
-// three sidebar sort modes (#1640). Cover the open/close toggle, selecting
-// each mode (and the callback payload), the no-op when re-selecting the
-// active mode, the brand tint for non-manual modes, and outside-click /
-// Escape close.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import { SidebarSortPicker } from "../SidebarSortPicker";
 import type { SidebarSortMode } from "../../lib/sidebarSort";
 
 function setup(sortMode: SidebarSortMode = "manual") {
   const onSortModeChange = vi.fn();
-  const utils = render(<SidebarSortPicker sortMode={sortMode} onSortModeChange={onSortModeChange} />);
-  return { ...utils, onSortModeChange };
+  render(<SidebarSortPicker sortMode={sortMode} onSortModeChange={onSortModeChange} />);
+  return onSortModeChange;
 }
+const trigger = () => screen.getByTestId("sidebar-sort-toggle");
+const menu = () => screen.queryByTestId("sidebar-sort-menu");
+const option = (mode: string) => screen.getByTestId(`sidebar-sort-option-${mode}`);
 
-function toggle(container: HTMLElement): HTMLButtonElement {
-  return container.querySelector<HTMLButtonElement>('[data-testid="sidebar-sort-toggle"]')!;
-}
-
-afterEach(() => {
-  cleanup();
-});
+afterEach(cleanup);
 
 describe("SidebarSortPicker", () => {
-  it("renders the trigger reflecting the active mode and starts closed", () => {
-    const { container } = setup("lastActivity");
-    const trigger = toggle(container);
-    expect(trigger.getAttribute("data-sort-mode")).toBe("lastActivity");
-    expect(trigger.getAttribute("aria-expanded")).toBe("false");
-    expect(trigger.getAttribute("aria-label")).toBe("Sort sessions, current: Last activity");
-    expect(container.querySelector('[data-testid="sidebar-sort-menu"]')).toBeNull();
-  });
-
-  it("opens the menu on trigger click and lists all three modes", () => {
-    const { container } = setup("manual");
-    fireEvent.click(toggle(container));
-    expect(toggle(container).getAttribute("aria-expanded")).toBe("true");
-    expect(container.querySelector('[data-testid="sidebar-sort-menu"]')).toBeTruthy();
-    expect(container.querySelector('[data-testid="sidebar-sort-option-manual"]')).toBeTruthy();
-    expect(container.querySelector('[data-testid="sidebar-sort-option-lastActivity"]')).toBeTruthy();
-    expect(container.querySelector('[data-testid="sidebar-sort-option-attention"]')).toBeTruthy();
-  });
-
-  it("marks the active option as checked", () => {
-    const { container } = setup("attention");
-    fireEvent.click(toggle(container));
-    const attention = container.querySelector('[data-testid="sidebar-sort-option-attention"]')!;
-    expect(attention.getAttribute("aria-checked")).toBe("true");
-    const manual = container.querySelector('[data-testid="sidebar-sort-option-manual"]')!;
-    expect(manual.getAttribute("aria-checked")).toBe("false");
-  });
-
-  it("clicking a toggle a second time closes the menu", () => {
-    const { container } = setup();
-    fireEvent.click(toggle(container));
-    expect(container.querySelector('[data-testid="sidebar-sort-menu"]')).toBeTruthy();
-    fireEvent.click(toggle(container));
-    expect(container.querySelector('[data-testid="sidebar-sort-menu"]')).toBeNull();
+  it("starts closed with a trigger reflecting the mode, and toggles the menu", () => {
+    setup("lastActivity");
+    expect(trigger().getAttribute("data-sort-mode")).toBe("lastActivity");
+    expect(trigger().getAttribute("aria-label")).toBe("Sort sessions, current: Last activity");
+    expect(trigger().getAttribute("aria-expanded")).toBe("false");
+    expect(menu()).toBeNull();
+    fireEvent.click(trigger());
+    expect(trigger().getAttribute("aria-expanded")).toBe("true");
+    expect(option("lastActivity").getAttribute("aria-checked")).toBe("true");
+    expect(option("manual").getAttribute("aria-checked")).toBe("false");
+    expect(option("attention")).not.toBeNull();
+    fireEvent.click(trigger());
+    expect(menu()).toBeNull();
   });
 
   it.each<[SidebarSortMode, SidebarSortMode]>([
@@ -70,58 +40,41 @@ describe("SidebarSortPicker", () => {
     ["lastActivity", "attention"],
     ["attention", "manual"],
     ["attention", "lastActivity"],
-  ])("from %s selecting %s fires onSortModeChange and closes the menu", (current, next) => {
-    const { container, onSortModeChange } = setup(current);
-    fireEvent.click(toggle(container));
-    fireEvent.click(container.querySelector(`[data-testid="sidebar-sort-option-${next}"]`)!);
-    expect(onSortModeChange).toHaveBeenCalledTimes(1);
-    expect(onSortModeChange).toHaveBeenCalledWith(next);
-    expect(container.querySelector('[data-testid="sidebar-sort-menu"]')).toBeNull();
+  ])("from %s selecting %s fires onSortModeChange and closes", (current, next) => {
+    const onChange = setup(current);
+    fireEvent.click(trigger());
+    fireEvent.click(option(next));
+    expect(onChange.mock.calls).toEqual([[next]]);
+    expect(menu()).toBeNull();
   });
 
-  it("re-selecting the already-active mode closes the menu without firing the callback", () => {
-    const { container, onSortModeChange } = setup("lastActivity");
-    fireEvent.click(toggle(container));
-    fireEvent.click(container.querySelector('[data-testid="sidebar-sort-option-lastActivity"]')!);
-    expect(onSortModeChange).not.toHaveBeenCalled();
-    expect(container.querySelector('[data-testid="sidebar-sort-menu"]')).toBeNull();
+  it("re-selecting the active mode closes without firing", () => {
+    const onChange = setup("lastActivity");
+    fireEvent.click(trigger());
+    fireEvent.click(option("lastActivity"));
+    expect(onChange).not.toHaveBeenCalled();
+    expect(menu()).toBeNull();
   });
 
   it("dims the trigger in manual mode", () => {
-    // Only the manual-mode dim is asserted; the non-manual chrome color is
-    // left to the design system (brand amber is reserved for cursor / active
-    // border / focus rings, not general chrome), so it is not pinned here.
-    const { container: manualC } = setup("manual");
-    expect(toggle(manualC).className).toContain("text-text-dim");
+    setup("manual");
+    expect(trigger().className).toContain("text-text-dim");
   });
 
-  it("closes on an outside mousedown", () => {
-    const { container } = setup();
-    fireEvent.click(toggle(container));
-    expect(container.querySelector('[data-testid="sidebar-sort-menu"]')).toBeTruthy();
+  it("closes on an outside mousedown or Escape, not an inside mousedown", () => {
+    setup();
+    fireEvent.click(trigger());
+    fireEvent.mouseDown(menu()!);
+    expect(menu()).not.toBeNull();
     fireEvent.mouseDown(document.body);
-    expect(container.querySelector('[data-testid="sidebar-sort-menu"]')).toBeNull();
-  });
-
-  it("does not close on a mousedown inside the component", () => {
-    const { container } = setup();
-    fireEvent.click(toggle(container));
-    fireEvent.mouseDown(container.querySelector('[data-testid="sidebar-sort-menu"]')!);
-    expect(container.querySelector('[data-testid="sidebar-sort-menu"]')).toBeTruthy();
-  });
-
-  it("closes on Escape", () => {
-    const { container } = setup();
-    fireEvent.click(toggle(container));
-    expect(container.querySelector('[data-testid="sidebar-sort-menu"]')).toBeTruthy();
+    expect(menu()).toBeNull();
+    fireEvent.click(trigger());
     fireEvent.keyDown(document, { key: "Escape" });
-    expect(container.querySelector('[data-testid="sidebar-sort-menu"]')).toBeNull();
+    expect(menu()).toBeNull();
   });
 
-  it("falls back to the Manual spec for an unknown sort mode", () => {
-    // The component guards with `?? MODES[0]`; an off-spec value should not crash
-    // and should render the manual trigger label.
-    const { container } = setup("bogus" as SidebarSortMode);
-    expect(toggle(container).getAttribute("aria-label")).toBe("Sort sessions, current: Manual");
+  it("falls back to Manual for an unknown mode", () => {
+    setup("bogus" as SidebarSortMode);
+    expect(trigger().getAttribute("aria-label")).toBe("Sort sessions, current: Manual");
   });
 });

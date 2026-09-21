@@ -35,7 +35,6 @@ describe("autoLoadDecision", () => {
   });
 
   it("never fires (and arms) when the transcript does not overflow", () => {
-    // scrollHeight within clientHeight + preload: nothing to scroll up.
     expect(autoLoadDecision({ ...base, scrollHeight: base.clientHeight + HISTORY_PRELOAD_PX })).toEqual({
       armed: true,
       fire: false,
@@ -62,7 +61,6 @@ describe("isPinnedToBottom", () => {
   it("treats exact-bottom and within-slop positions as pinned, and further up as not", () => {
     const clientHeight = 500;
     const scrollHeight = 5000;
-    // (scrollTop, expected pinned)
     const cases: [number, boolean][] = [
       [4500, true], // exact bottom: 4500 + 500 === 5000
       [4500 - PINNED_BOTTOM_SLOP_PX, true], // within slop
@@ -113,7 +111,6 @@ describe("earlierAction / canOfferEarlier", () => {
 
 describe("anchorIsStale", () => {
   it("is stale when settled with no growth", () => {
-    // load done, anchor still equals current scrollHeight => nothing grew.
     expect(anchorIsStale(false, 1000, 1000)).toBe(true);
   });
   it("is not stale while a fetch is in flight", () => {

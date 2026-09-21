@@ -1,22 +1,6 @@
-//! On-disk registry of detached structured view worker processes.
-//!
-//! Each running structured view worker has a JSON file at
-//! `<app_dir>/acp-workers/<session_id>.json` describing how to dial it
-//! and who owns the process. The directory is the source of truth across
-//! `aoe serve` restarts: when serve starts, it scans the directory, dials
-//! every live worker, and only spawns a fresh worker for sessions that
-//! have no registry entry (or a dead one).
-//!
-//! The worker process itself (the `aoe __acp-runner` shim) writes the
-//! file on startup and removes it on graceful exit; `Supervisor::shutdown`
-//! and the stale-sweep on serve startup remove it for crashed runners.
-//!
-//! File mode is 0600 because `provider_env_keys` and `socket_path` may
-//! leak metadata about which agents/providers a user runs.
-//!
-//! Layout note: the runner and daemon both mutate entries. Writes and owned
-//! deletion serialize on a per-session lock so a superseded runner cannot
-//! unlink a replacement record between its ownership check and cleanup.
+//! On-disk registry of detached ACP workers at `<app_dir>/acp-workers/<session_id>.json` (mode 0600).
+//! Writes and owned deletes serialize on a per-session lock so a superseded runner cannot
+//! unlink its replacement's record.
 
 use std::path::{Path, PathBuf};
 
@@ -27,78 +11,35 @@ use tracing::{debug, warn};
 
 use crate::util::now_secs;
 
-// Generic worker-subprocess plumbing now lives in `process::worker`; the
-// registry is the ACP consumer of it. Re-exported so the names referenced
-// across the ACP code (and its tests) keep resolving here.
 pub use crate::process::worker::{is_pid_alive, validate_id as validate_session_id};
 
-/// Generation of the runner protocol and ownership semantics this daemon speaks.
-/// Generation 4 announces authoritative native session identity before callbacks.
-/// Generation 3 introduced control-only ACP, but lacks this admission prerequisite.
-/// The control wire version remains 3; earlier runner generations cannot attach safely.
-///
-/// This is deliberately separate from `is_record_live`: a wrong-generation
-/// process is still live and must be reaped before its replacement starts.
-/// Build-stale workers of the current generation remain attachable and may
-/// drain an in-flight turn before replacement.
+/// Runner protocol generation. Generation 4 announces authoritative native session identity
+/// before callbacks; the control wire version stays 3. Separate from liveness: a
+/// wrong-generation process is live and must be reaped before its replacement starts.
 pub const RUNNER_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerRecord {
     pub runner_version: u32,
-    /// Binary build identity (`build_info::BUILD_VERSION`) of the
-    /// `aoe __acp-runner` process that wrote this record, e.g.
-    /// `"1.9.5+g7f31a9c42e01"`. Distinct from `runner_version`, which is
-    /// the runner's protocol/topology generation (#2977): two runners on the
-    /// same generation can differ in build and vice versa, so the daemon
-    /// tracks them as independent staleness axes. The daemon compares this
-    /// against its own `BUILD_VERSION` to detect a worker left running on an
-    /// older binary after `aoe update` and respawn it (see #1754). Defaulted
-    /// on load for legacy records that pre-date this field; the empty string
-    /// compares unequal to any current build, forcing a one-time respawn.
+    /// Build identity of the runner that wrote the record; independent of `runner_version`.
+    /// Legacy records default to "", which forces a one-time respawn.
     #[serde(default)]
     pub build_version: String,
     pub session_id: String,
-    /// PID of the `aoe __acp-runner` process. Used by the stale-sweep
-    /// to decide whether the registry entry corresponds to a live owner.
     pub pid: u32,
     pub socket_path: PathBuf,
-    /// Binary command name that the runner was invoked with
-    /// (e.g. `"claude-agent-acp"`, `"codex-acp"`). Surfaced in
-    /// `aoe acp ps`, logs, and the doctor's install-hint lookup.
-    /// NOT the registry key; use `agent_key` to resolve a profile.
+    /// Not the registry key; use `agent_key` to resolve a profile.
     pub agent_name: String,
-    /// Registry key for the agent (e.g. `"claude"`, `"codex"`,
-    /// `"opencode"`). Drives `acp::agent_profiles::resolve` and any
-    /// other per-agent gate keyed on the registry name. Defaulted on
-    /// load for legacy records that pre-date this field; the empty
-    /// string falls back to `DEFAULT_AGENT_PROFILE` at the call site,
-    /// which is the safest behavior for an unknown agent.
     #[serde(default)]
     pub agent_key: String,
     pub cwd: PathBuf,
     pub model: Option<String>,
     pub additional_dirs: Vec<PathBuf>,
-    /// Keys (not values) of provider_env passed through at spawn. Lets
-    /// the reconciler observe which provider auth was configured for the
-    /// session without re-reading every entry on every tick.
     pub provider_env_keys: Vec<String>,
-    /// Cached ACP session id assigned by the agent on first `session/new`.
-    /// On reattach, the daemon sends `session/load <stored_acp_session_id>`
-    /// to resume the agent-side transcript.
     pub stored_acp_session_id: Option<String>,
-    /// Profile the session was created under. Persisted so reattach can
-    /// re-resolve sandbox env (`terminal/create` env entries) against the
-    /// same profile the session originally used, instead of silently
-    /// falling back to the global default profile. Defaulted on load for
-    /// legacy records that pre-date this field; an absent value falls
-    /// back to the default profile, matching pre-persistence behavior.
     #[serde(default)]
     pub source_profile: Option<String>,
-    /// Lifecycle epoch the daemon minted for this runner (see
-    /// `acp::runner_lifecycle`). Together with `pid` it identifies the
-    /// exact process a lease holder may signal or clean up. Records from
-    /// older binaries default to 0, which matches on pid alone.
+    /// Together with `pid`, identifies the exact runner process. Older records default to 0.
     #[serde(default)]
     pub generation: u64,
     pub started_at: u64,
@@ -148,49 +89,30 @@ impl WorkerRecord {
     }
 }
 
-/// Directory holding worker JSON files, log files, and the per-session
-/// unix sockets. Auto-created on first access.
 pub fn workers_dir() -> Result<PathBuf> {
     let dir = crate::session::get_app_dir()?.join("acp-workers");
     crate::process::worker::ensure_dir(&dir)?;
     Ok(dir)
 }
 
-/// `<workers_dir>/<session_id>.json`.
 pub fn record_path(session_id: &str) -> Result<PathBuf> {
     crate::process::worker::record_path(&workers_dir()?, session_id)
 }
 
-/// `<workers_dir>/<session_id>.sock`. Caller computes this once and threads
-/// the same path into both the runner spawn and the daemon connect.
 pub fn socket_path_for(session_id: &str) -> Result<PathBuf> {
     crate::process::worker::socket_path(&workers_dir()?, session_id)
 }
 
-/// `<workers_dir>/<session_id>.log` is the runner-side stderr drain
-/// consumed by `aoe acp logs --session <id>`.
 pub fn log_path_for(session_id: &str) -> Result<PathBuf> {
     crate::process::worker::log_path(&workers_dir()?, session_id)
 }
 
-/// Sentinel file `<workers_dir>/<session_id>.restart`. Written by
-/// `aoe acp restart` BEFORE the registry delete + SIGTERM so the
-/// daemon's reaper can distinguish a restart-driven teardown from
-/// `aoe acp stop|kill` and:
-///   - emit `Stopped { reason: "restart_pending" }` instead of
-///     `user_stopped` so the UI shows a "Restarting…" banner without
-///     the "Reconnect" button (the daemon will respawn shortly);
-///   - signal the reconciler to clear the `attempted` set for this id
-///     so the next 2s tick actually spawns a fresh worker.
-///
-/// The file holds the generation of the runner being restarted, so the
-/// authority it grants is bound to that runner: a marker for any other
-/// generation is stale and is discarded wherever it is observed.
+/// Written by `aoe acp restart` before the delete and SIGTERM so the daemon treats the
+/// teardown as a pending restart. Holds the restarted runner's generation.
 pub fn restart_marker_path(session_id: &str) -> Result<PathBuf> {
     crate::process::worker::restart_marker_path(&workers_dir()?, session_id)
 }
 
-/// Best-effort write of a restart-pending marker for `generation`.
 pub fn mark_restart_pending(session_id: &str, generation: u64) {
     let Ok(path) = restart_marker_path(session_id) else {
         return;
@@ -210,18 +132,13 @@ pub fn mark_restart_pending(session_id: &str, generation: u64) {
     }
 }
 
-/// Generation named by the marker, without consuming it. `None` when
-/// there is no marker or it names no generation.
 pub fn peek_restart_marker(session_id: &str) -> Option<u64> {
     let path = restart_marker_path(session_id).ok()?;
     crate::process::worker::read_restart_marker(&path)
 }
 
-/// Consume the marker atomically: it is renamed aside before it is read,
-/// so a marker written for a newer runner between the read and the delete
-/// is left for its own consumer instead of being erased. `None` when
-/// there was no marker; `Some(None)` for one that names no generation. One
-/// failed rename for the reconciler's per-tick probe of pinned sessions.
+/// Renamed aside before reading, so a marker for a newer runner written in between survives.
+/// `None` when absent; `Some(None)` when it names no generation.
 pub fn claim_restart_marker(session_id: &str) -> Option<Option<u64>> {
     let path = restart_marker_path(session_id).ok()?;
     let claim = path.with_extension(format!("restart.claim-{}", std::process::id()));
@@ -231,11 +148,7 @@ pub fn claim_restart_marker(session_id: &str) -> Option<Option<u64>> {
     Some(generation)
 }
 
-/// Consume the marker. Returns `true` only when it named `generation`; a
-/// zero marker matches only a zero (pre-generation) identity, so a runner
-/// started by an older build keeps its restart authority across the
-/// upgrade. The file is removed either way so a stale marker cannot poison
-/// a later stop.
+/// A zero marker matches only a zero identity. The file is removed either way.
 pub fn take_restart_marker(session_id: &str, generation: u64) -> bool {
     claim_restart_marker(session_id).flatten() == Some(generation)
 }
@@ -246,8 +159,6 @@ pub fn clear_restart_marker(session_id: &str) {
     }
 }
 
-/// Atomic write (temp + rename) with 0600 perms. The per-session lock also
-/// prevents an ownership-checked cleanup from racing the final rename.
 pub fn save(record: &WorkerRecord) -> Result<()> {
     with_registry_lock(&record.session_id, || save_unlocked(record))
 }
@@ -356,8 +267,6 @@ pub fn list() -> Result<Vec<WorkerRecord>> {
     Ok(out)
 }
 
-/// Remove the JSON entry and runner sockets. Non-empty logs remain available
-/// for post-mortem inspection; empty logs are swept.
 pub fn delete(session_id: &str) -> Result<()> {
     with_registry_lock(session_id, || delete_unlocked(session_id))
 }
@@ -377,9 +286,7 @@ fn delete_unlocked(session_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Atomically delete registry artifacts only while the record names owner_pid.
-/// A replacement save uses the same lock, so it either lands before this check
-/// and is preserved or lands after cleanup and remains.
+/// A replacement save uses the same lock, so it lands either before the check or after cleanup.
 pub fn delete_if_owned(session_id: &str, owner_pid: u32) -> Result<bool> {
     with_registry_lock(session_id, || match load_strict_unlocked(session_id)? {
         Some(record) if record.pid == owner_pid => {
@@ -428,8 +335,6 @@ fn delete_if_absent(session_id: &str) -> Result<bool> {
     })
 }
 
-/// Update the `last_attached_at` field in place while the caller owns
-/// the record. Best-effort because the timestamp is only observability data.
 pub fn mark_attached(session_id: &str, owner_pid: u32) {
     if let Err(error) = update_if_owned(session_id, owner_pid, |record| {
         record.last_attached_at = Some(now_secs());
@@ -455,8 +360,6 @@ pub fn mark_detached(session_id: &str, owner_pid: u32) {
     }
 }
 
-/// Durably update the ACP session id while `owner_pid` still owns the
-/// record. The runner calls this before exposing session establishment.
 pub fn update_stored_acp_session_id(session_id: &str, owner_pid: u32, acp_id: &str) -> Result<()> {
     anyhow::ensure!(!acp_id.is_empty(), "ACP session id must not be empty");
     let updated = update_if_owned(session_id, owner_pid, |record| {
@@ -466,28 +369,11 @@ pub fn update_stored_acp_session_id(session_id: &str, owner_pid: u32, acp_id: &s
     Ok(())
 }
 
-/// Probe the recorded socket path. A worker registry entry is "live"
-/// only if both the PID is alive AND the socket file still exists; a
-/// stale entry where the runner died before deleting its files would
-/// otherwise let attach hang on a missing socket.
-///
-/// Defense-in-depth for PID reuse: it's possible (though rare) for a
-/// runner to die uncleanly, leave the socket file behind, and have its
-/// PID immediately recycled by an unrelated process. The (pid_alive +
-/// socket_exists) pair survives that case in almost all scenarios
-/// because the unrelated process is exceedingly unlikely to be
-/// listening on the same socket path. As a third layer, the daemon's
-/// attach handshake (`AcpClient::attach` -> `initialize`) rejects any
-/// peer that doesn't speak ACP within the 3s reconciler timeout, so a
-/// truly unlucky PID/socket collision still falls back to a fresh
-/// spawn rather than wedging the session.
+/// Live requires both a live pid and the socket file, which guards against pid reuse.
 pub fn is_record_live(rec: &WorkerRecord) -> bool {
     is_pid_alive(rec.pid) && socket_exists(&expected_socket(rec))
 }
 
-/// The socket a record of this generation actually binds. Generation 1 used
-/// the legacy raw relay path; generation 2 and later use the typed control
-/// sibling. The base path remains in the record for stable path derivation.
 fn expected_socket(rec: &WorkerRecord) -> std::path::PathBuf {
     if rec.runner_version >= 2 {
         crate::process::worker::control_socket_sibling(&rec.socket_path)
@@ -496,11 +382,6 @@ fn expected_socket(rec: &WorkerRecord) -> std::path::PathBuf {
     }
 }
 
-/// Remove the current control socket and the legacy raw relay path.
-///
-/// One helper rather than the same two lines at each teardown site, so
-/// "which sockets does a runner of generation N own" has a single answer to
-/// update when a future generation changes the set.
 pub(crate) fn remove_runner_sockets(socket_path: &Path) {
     for path in [
         socket_path.to_path_buf(),
@@ -510,9 +391,6 @@ pub(crate) fn remove_runner_sockets(socket_path: &Path) {
     }
 }
 
-/// Create the socket file a record of the CURRENT generation must have for
-/// [`is_record_live`] to see it, so a fixture does not have to know which
-/// path that is. Test-only: production runners bind a real listener.
 #[cfg(test)]
 pub(crate) fn touch_live_socket(socket_path: &Path) {
     let rec_shaped = WorkerRecord {
@@ -535,30 +413,15 @@ pub(crate) fn touch_live_socket(socket_path: &Path) {
     std::fs::write(expected_socket(&rec_shaped), b"").expect("touch live socket");
 }
 
-/// Whether the worker generation is attach-compatible with this daemon. A
-/// mismatch is live but incompatible: reap it before starting a replacement.
 pub fn is_runner_current(rec: &WorkerRecord) -> bool {
     rec.runner_version == RUNNER_VERSION
 }
 
-/// Whether the worker's recorded binary build matches the running
-/// daemon's. A live-but-stale worker (this returns `false`) is still
-/// "live" by `is_record_live`; the reconciler keeps it for any in-flight
-/// turn and respawns it on the current binary at the next idle boundary,
-/// rather than treating a version mismatch as death. See #1754.
-///
-/// Build identity is NOT folded into `is_record_live` on purpose: doing
-/// so would make a busy stale worker look dead and push the reconciler
-/// toward orphaning its in-flight turn.
+/// Not folded into `is_record_live`: a busy stale worker must not look dead.
 pub fn is_build_current(rec: &WorkerRecord) -> bool {
     rec.build_version == crate::build_info::BUILD_VERSION
 }
 
-/// The ACP worker state ladder shared by `aoe ps --acp` and the deprecated
-/// `aoe acp ps`: `dead` when the runner is not live; `detached` when it has
-/// detached and has not re-attached since; `attached` otherwise. `live` is
-/// the caller's [`is_record_live`] result, threaded in so a caller that
-/// already computed it does not probe the socket twice.
 pub(crate) fn worker_state_label(rec: &WorkerRecord, live: bool) -> &'static str {
     if !live {
         "dead"
@@ -580,16 +443,7 @@ fn socket_exists(path: &Path) -> bool {
     }
 }
 
-/// Resolve the runner's PID from whichever source is still legible: the
-/// on-disk record first, then (only when `load` returns `Err`, not when
-/// it returns `Ok(None)`) `SO_PEERCRED` on the live socket. The
-/// distinction matters: `Ok(None)` means the runner is already gone, so
-/// falling through to the socket would just probe a stale inode; `Err`
-/// means we lost the primary channel and must reach for the secondary
-/// before the runner escapes both SIGTERM and the shutdown wait. `load`
-/// returns `Err` only for true I/O failures (permissions, wrong file
-/// type, transient); JSON parse errors are coerced to `Ok(None)`
-/// upstream. See #2102.
+/// Falls back to `SO_PEERCRED` only when `load` errors; `Ok(None)` means the runner is gone.
 pub fn pid_source_for(session_id: &str) -> Option<u32> {
     match load(session_id) {
         Ok(Some(record)) => (record.pid > 0).then_some(record.pid),
@@ -617,18 +471,7 @@ pub fn pid_source_for(session_id: &str) -> Option<u32> {
     }
 }
 
-/// Reap the runner for `session_id`: resolve its PID via `pid_source_for`
-/// (on-disk record, or `SO_PEERCRED` on the live socket when the record is
-/// unreadable; see #2102), SIGTERM its whole process group, then remove
-/// the registry entry and socket.
-///
-/// The canonical teardown used by the supervisor's shutdown paths and by a
-/// fresh spawn that supersedes a stale runner, so no prior agent tree is
-/// left orphaned. When a PID is resolved, the signal targets the whole
-/// process group (`killpg`) rather than the leader alone: the group can
-/// outlive its leader pid, so gating on leader liveness would skip the
-/// killpg and leak surviving descendants. `killpg` ignores ESRCH, so an
-/// already-empty group is a harmless no-op. See #1689.
+/// Signals the whole process group, since it can outlive its leader.
 pub fn terminate(session_id: &str) {
     let terminated_pid = pid_source_for(session_id);
     if let Some(pid) = terminated_pid {
@@ -638,9 +481,7 @@ pub fn terminate(session_id: &str) {
         delete_if_absent(session_id).ok();
     }
 }
-/// Stop a runner and wait through escalation before allowing a replacement to
-/// bind its paths. This closes the window where the old process can perform
-/// final cleanup after the new process has published its record.
+/// Waits through escalation so the old process cannot clean up after the new one publishes.
 pub async fn terminate_and_wait(session_id: &str) {
     let terminated_pid = pid_source_for(session_id);
     if let Some(pid) = terminated_pid {
@@ -659,9 +500,6 @@ pub async fn terminate_and_wait(session_id: &str) {
     }
 }
 
-/// Remove the record and sockets only while they still describe the runner
-/// `(pid, generation)`; a record a replacement runner has since written is
-/// left alone. Returns whether the registry is settled for that runner.
 pub fn delete_if_owned_by(session_id: &str, pid: u32, generation: u64) -> bool {
     let identity = crate::acp::runner_lifecycle::RunnerIdentity { pid, generation };
     with_registry_lock(session_id, || match load_strict_unlocked(session_id)? {
@@ -701,23 +539,33 @@ mod tests {
         f();
     }
 
+    /// A minimal record; tests that care about other fields set them on the result.
+    fn new_record(session_id: &str, pid: u32, socket: impl Into<PathBuf>) -> WorkerRecord {
+        WorkerRecord::new(
+            session_id.into(),
+            pid,
+            socket.into(),
+            "aoe-agent".into(),
+            "aoe-agent".into(),
+            PathBuf::from("/repo"),
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        )
+    }
+
     #[test]
     #[serial]
     fn roundtrip_save_load() {
         with_temp_home(|| {
-            let rec = WorkerRecord::new(
-                "sess-abc".into(),
-                42,
-                PathBuf::from("/tmp/sock"),
-                "claude-agent-acp".into(),
-                "claude".into(),
-                PathBuf::from("/repo"),
-                Some("claude-opus-4-7".into()),
-                vec![],
-                vec!["ANTHROPIC_API_KEY".into()],
-                None,
-                Some("personal".into()),
-            );
+            let mut rec = new_record("sess-abc", 42, "/tmp/sock");
+            rec.agent_name = "claude-agent-acp".into();
+            rec.agent_key = "claude".into();
+            rec.model = Some("claude-opus-4-7".into());
+            rec.provider_env_keys = vec!["ANTHROPIC_API_KEY".into()];
+            rec.source_profile = Some("personal".into());
             save(&rec).unwrap();
             let loaded = load("sess-abc").unwrap().unwrap();
             assert_eq!(loaded.session_id, "sess-abc");
@@ -728,27 +576,11 @@ mod tests {
         });
     }
 
-    /// A fresh record is stamped with this binary's build identity and
-    /// reports as current; the empty-string legacy default reports stale.
-    /// This is the gate the reconciler uses to respawn workers left on an
-    /// old binary after `aoe update`. See #1754.
     #[test]
     #[serial]
     fn build_version_stamped_and_current() {
         with_temp_home(|| {
-            let rec = WorkerRecord::new(
-                "sess-bv".into(),
-                1,
-                PathBuf::from("/tmp/sess-bv.sock"),
-                "aoe-agent".into(),
-                "aoe-agent".into(),
-                PathBuf::from("/repo"),
-                None,
-                vec![],
-                vec![],
-                None,
-                None,
-            );
+            let rec = new_record("sess-bv", 1, "/tmp/sess-bv.sock");
             assert_eq!(rec.build_version, crate::build_info::BUILD_VERSION);
             assert!(is_build_current(&rec));
 
@@ -764,134 +596,58 @@ mod tests {
         });
     }
 
-    /// Legacy records written before `build_version` existed must load
-    /// with the empty-string default (and thus read as build-stale), not
-    /// fail to deserialize.
     #[test]
     #[serial]
-    fn load_legacy_record_without_build_version() {
+    fn load_fills_defaults_for_fields_legacy_records_lack() {
         with_temp_home(|| {
-            let dir = workers_dir().unwrap();
-            let legacy = serde_json::json!({
-                "runner_version": RUNNER_VERSION,
-                "session_id": "legacy-bv-1",
-                "pid": 7,
-                "socket_path": "/tmp/legacy-bv.sock",
-                "agent_name": "claude-agent-acp",
-                "agent_key": "claude",
-                "cwd": "/repo",
-                "model": null,
-                "additional_dirs": [],
-                "provider_env_keys": [],
-                "stored_acp_session_id": null,
-                "source_profile": null,
-                "started_at": 0,
-                "last_attached_at": null,
-                "detached_at": null
-            });
-            std::fs::write(
-                dir.join("legacy-bv-1.json"),
-                serde_json::to_string(&legacy).unwrap(),
-            )
-            .unwrap();
-            let loaded = load("legacy-bv-1").unwrap().unwrap();
-            assert_eq!(loaded.build_version, "");
-            assert!(!is_build_current(&loaded));
+            let cases: [(&str, &[&str], fn(&WorkerRecord)); 3] = [
+                ("legacy-bv", &["build_version"], |rec| {
+                    assert_eq!(rec.build_version, "");
+                    assert!(!is_build_current(rec));
+                }),
+                ("legacy-ak", &["agent_key"], |rec| {
+                    assert_eq!(rec.agent_name, "claude-agent-acp");
+                    assert_eq!(rec.agent_key, "");
+                }),
+                ("legacy-sp", &["source_profile"], |rec| {
+                    assert_eq!(rec.source_profile, None);
+                }),
+            ];
+            for (session_id, dropped, check) in cases {
+                let mut legacy = serde_json::json!({
+                    "runner_version": RUNNER_VERSION,
+                    "build_version": crate::build_info::BUILD_VERSION,
+                    "session_id": session_id,
+                    "pid": 7,
+                    "socket_path": format!("/tmp/{session_id}.sock"),
+                    "agent_name": "claude-agent-acp",
+                    "agent_key": "claude",
+                    "cwd": "/repo",
+                    "model": null,
+                    "additional_dirs": [],
+                    "provider_env_keys": [],
+                    "stored_acp_session_id": null,
+                    "source_profile": null,
+                    "started_at": 0,
+                    "last_attached_at": null,
+                    "detached_at": null
+                });
+                for field in dropped {
+                    legacy.as_object_mut().unwrap().remove(*field);
+                }
+                let path = workers_dir().unwrap().join(format!("{session_id}.json"));
+                std::fs::write(&path, serde_json::to_string(&legacy).unwrap()).unwrap();
+                check(&load(session_id).unwrap().unwrap());
+            }
         });
     }
 
-    /// Legacy records written before the `agent_key` field existed
-    /// must still load without surfacing a deserialization error;
-    /// `serde(default)` fills in the empty string and call sites are
-    /// responsible for falling back to `agent_name` or a default
-    /// profile. See `Supervisor::agent_key_for_session`.
-    #[test]
-    #[serial]
-    fn load_legacy_record_without_agent_key() {
-        with_temp_home(|| {
-            let dir = workers_dir().unwrap();
-            // Hand-craft a record missing `agent_key` to simulate a
-            // file written by an older daemon.
-            let legacy = serde_json::json!({
-                "runner_version": RUNNER_VERSION,
-                "session_id": "legacy-1",
-                "pid": 99,
-                "socket_path": "/tmp/legacy.sock",
-                "agent_name": "claude-agent-acp",
-                "cwd": "/repo",
-                "model": null,
-                "additional_dirs": [],
-                "provider_env_keys": [],
-                "stored_acp_session_id": null,
-                "started_at": 0,
-                "last_attached_at": null,
-                "detached_at": null
-            });
-            std::fs::write(
-                dir.join("legacy-1.json"),
-                serde_json::to_string(&legacy).unwrap(),
-            )
-            .unwrap();
-            let loaded = load("legacy-1").unwrap().unwrap();
-            assert_eq!(loaded.agent_name, "claude-agent-acp");
-            assert_eq!(loaded.agent_key, "");
-        });
-    }
-
-    /// Same legacy-record guarantee for `source_profile`: records written
-    /// before the field existed must load with `None` (the documented
-    /// fallback), not surface a deserialization error.
-    #[test]
-    #[serial]
-    fn load_legacy_record_without_source_profile() {
-        with_temp_home(|| {
-            let dir = workers_dir().unwrap();
-            let legacy = serde_json::json!({
-                "runner_version": RUNNER_VERSION,
-                "session_id": "legacy-sp-1",
-                "pid": 7,
-                "socket_path": "/tmp/legacy-sp.sock",
-                "agent_name": "claude-agent-acp",
-                "agent_key": "claude",
-                "cwd": "/repo",
-                "model": null,
-                "additional_dirs": [],
-                "provider_env_keys": [],
-                "stored_acp_session_id": null,
-                "started_at": 0,
-                "last_attached_at": null,
-                "detached_at": null
-            });
-            std::fs::write(
-                dir.join("legacy-sp-1.json"),
-                serde_json::to_string(&legacy).unwrap(),
-            )
-            .unwrap();
-            let loaded = load("legacy-sp-1").unwrap().unwrap();
-            assert_eq!(loaded.source_profile, None);
-        });
-    }
-
-    /// Fresh records carry `source_profile` end-to-end (write + read).
-    /// The roundtrip case is covered above; this asserts the field
-    /// specifically because the reattach path depends on it.
     #[test]
     #[serial]
     fn source_profile_roundtrips() {
         with_temp_home(|| {
-            let rec = WorkerRecord::new(
-                "sess-sp".into(),
-                1,
-                PathBuf::from("/tmp/sess-sp.sock"),
-                "aoe-agent".into(),
-                "aoe-agent".into(),
-                PathBuf::from("/repo"),
-                None,
-                vec![],
-                vec![],
-                None,
-                Some("personal".into()),
-            );
+            let mut rec = new_record("sess-sp", 1, "/tmp/sess-sp.sock");
+            rec.source_profile = Some("personal".into());
             save(&rec).unwrap();
             let loaded = load("sess-sp").unwrap().unwrap();
             assert_eq!(loaded.source_profile.as_deref(), Some("personal"));
@@ -902,19 +658,8 @@ mod tests {
     #[serial]
     fn empty_stored_acp_session_id_is_rejected_without_data_loss() {
         with_temp_home(|| {
-            let rec = WorkerRecord::new(
-                "sess-empty-acp".into(),
-                1,
-                PathBuf::from("/tmp/sess-empty-acp.sock"),
-                "aoe-agent".into(),
-                "aoe-agent".into(),
-                PathBuf::from("/repo"),
-                None,
-                vec![],
-                vec![],
-                Some("initial-acp".into()),
-                None,
-            );
+            let mut rec = new_record("sess-empty-acp", 1, "/tmp/sess-empty-acp.sock");
+            rec.stored_acp_session_id = Some("initial-acp".into());
             save(&rec).unwrap();
             let error = update_stored_acp_session_id("sess-empty-acp", 1, "")
                 .expect_err("empty session ids are invalid");
@@ -931,19 +676,7 @@ mod tests {
             let dir = workers_dir().unwrap();
             std::fs::write(dir.join("not-json.json"), b"this isn't json").unwrap();
             std::fs::write(dir.join("ignored.txt"), b"{}").unwrap();
-            let rec = WorkerRecord::new(
-                "live".into(),
-                1,
-                PathBuf::from("/tmp/sock-live"),
-                "aoe-agent".into(),
-                "aoe-agent".into(),
-                PathBuf::from("/repo"),
-                None,
-                vec![],
-                vec![],
-                None,
-                None,
-            );
+            let rec = new_record("live", 1, "/tmp/sock-live");
             save(&rec).unwrap();
             let all = list().unwrap();
             assert_eq!(all.len(), 1);
@@ -958,19 +691,7 @@ mod tests {
             let dir = workers_dir().unwrap();
             let socket = dir.join("sess.sock");
             touch_live_socket(&socket);
-            let rec = WorkerRecord::new(
-                "sess".into(),
-                1,
-                socket.clone(),
-                "aoe-agent".into(),
-                "aoe-agent".into(),
-                PathBuf::from("/repo"),
-                None,
-                vec![],
-                vec![],
-                None,
-                None,
-            );
+            let rec = new_record("sess", 1, socket.clone());
             save(&rec).unwrap();
             let control = crate::process::worker::control_socket_sibling(&socket);
             assert!(record_path("sess").unwrap().exists());
@@ -989,19 +710,7 @@ mod tests {
             let socket = socket_path_for(session_id).unwrap();
             touch_live_socket(&socket);
             let replacement_control = crate::process::worker::control_socket_sibling(&socket);
-            let mut record = WorkerRecord::new(
-                session_id.into(),
-                111,
-                socket,
-                "aoe-agent".into(),
-                "aoe-agent".into(),
-                PathBuf::from("/repo"),
-                None,
-                vec![],
-                vec![],
-                None,
-                None,
-            );
+            let mut record = new_record(session_id, 111, socket);
             save(&record).unwrap();
             record.pid = 222;
             save(&record).unwrap();
@@ -1042,19 +751,7 @@ mod tests {
     #[serial]
     fn mark_attached_clears_detached() {
         with_temp_home(|| {
-            let mut rec = WorkerRecord::new(
-                "x".into(),
-                1,
-                PathBuf::from("/tmp/x.sock"),
-                "aoe-agent".into(),
-                "aoe-agent".into(),
-                PathBuf::from("/repo"),
-                None,
-                vec![],
-                vec![],
-                None,
-                None,
-            );
+            let mut rec = new_record("x", 1, "/tmp/x.sock");
             rec.detached_at = Some(100);
             save(&rec).unwrap();
             mark_attached("x", 1);
@@ -1076,21 +773,7 @@ mod tests {
     #[serial]
     fn terminate_deletes_entry_for_dead_pid() {
         with_temp_home(|| {
-            // 2e9 is not a live pid (see is_pid_alive_unlikely_pid), so
-            // terminate sends no signal and just clears the stale entry.
-            let rec = WorkerRecord::new(
-                "term-dead".into(),
-                2_000_000_000,
-                PathBuf::from("/tmp/term-dead.sock"),
-                "aoe-agent".into(),
-                "aoe-agent".into(),
-                PathBuf::from("/repo"),
-                None,
-                vec![],
-                vec![],
-                None,
-                None,
-            );
+            let rec = new_record("term-dead", 2_000_000_000, "/tmp/term-dead.sock");
             save(&rec).unwrap();
             assert!(record_path("term-dead").unwrap().exists());
             terminate("term-dead");
@@ -1098,16 +781,6 @@ mod tests {
         });
     }
 
-    /// The upgrade path #2977 introduced, over a genuinely live process: a
-    /// `runner_version: 1` or `3` record left by a previous daemon.
-    ///
-    /// The chain that matters is classification then reaping. A live legacy runner
-    /// must read as LIVE (so nothing deletes its record while its PID is the
-    /// only copy of where the process is), as NOT runner-current (so the
-    /// reconciler replaces it), and `terminate` must actually signal it. Get
-    /// the first wrong and the record is dropped with the PID still in it,
-    /// which strands the runner and its whole agent subtree with no daemon
-    /// able to find them again.
     #[test]
     #[serial]
     #[cfg(unix)]
@@ -1116,8 +789,8 @@ mod tests {
 
         with_temp_home(|| {
             for version in [1, 3] {
-                // Its own process group, so the killpg lands on it alone rather
-                // than on the test runner.
+                // Its own process group, so the killpg lands on it alone rather than on
+                // the test runner.
                 let mut victim = KillOnDrop(
                     std::process::Command::new("sleep")
                         .arg("60")
@@ -1125,31 +798,18 @@ mod tests {
                         .spawn()
                         .expect("spawn stand-in runner"),
                 );
-                let dir = workers_dir().unwrap();
                 let session_id = format!("v{version}sess");
-                let sock = dir.join(format!("{session_id}.sock"));
-                let mut rec = WorkerRecord::new(
-                    session_id.clone(),
-                    victim.0.id(),
-                    sock.clone(),
-                    "aoe-agent".into(),
-                    "aoe-agent".into(),
-                    PathBuf::from("/repo"),
-                    None,
-                    vec![],
-                    vec![],
-                    None,
-                    None,
-                );
+                let sock = workers_dir().unwrap().join(format!("{session_id}.sock"));
+                let mut rec = new_record(&session_id, victim.0.id(), sock);
                 rec.runner_version = version;
                 // Legacy relay and control-only runners use different socket paths.
                 std::fs::write(expected_socket(&rec), b"").unwrap();
                 save(&rec).unwrap();
 
                 assert!(
-                is_record_live(&rec),
-                "a live legacy runner must not read as dead: its record holds the only copy of the pid"
-            );
+                    is_record_live(&rec),
+                    "a live legacy runner must not read as dead: its record holds the only copy of the pid"
+                );
                 assert!(
                     !is_runner_current(&rec),
                     "a legacy runner is a generation behind, so the reconciler must replace it"
@@ -1178,7 +838,6 @@ mod tests {
     #[serial]
     fn terminate_missing_entry_is_noop() {
         with_temp_home(|| {
-            // No entry, no panic, nothing to delete.
             terminate("does-not-exist");
             assert!(!record_path("does-not-exist").unwrap().exists());
         });
@@ -1186,19 +845,7 @@ mod tests {
 
     #[test]
     fn worker_state_ladder() {
-        let mut rec = WorkerRecord::new(
-            "s".into(),
-            1,
-            PathBuf::from("/tmp/s.sock"),
-            "claude-agent-acp".into(),
-            "claude".into(),
-            PathBuf::from("/repo"),
-            None,
-            vec![],
-            vec![],
-            None,
-            None,
-        );
+        let mut rec = new_record("s", 1, "/tmp/s.sock");
         assert_eq!(worker_state_label(&rec, false), "dead");
         assert_eq!(worker_state_label(&rec, true), "attached");
         rec.detached_at = Some(100);
@@ -1206,76 +853,12 @@ mod tests {
         assert_eq!(worker_state_label(&rec, true), "detached");
         rec.last_attached_at = Some(150);
         assert_eq!(worker_state_label(&rec, true), "attached");
-        // detached with no prior attach: last_attached_at None is treated as 0,
-        // so 0 <= detached_at keeps it detached.
         rec.last_attached_at = None;
         assert_eq!(worker_state_label(&rec, true), "detached");
     }
 
     #[test]
-    fn is_pid_alive_self() {
-        let pid = std::process::id();
-        assert!(is_pid_alive(pid));
-    }
-
-    #[test]
-    fn is_pid_alive_unlikely_pid() {
-        // PID 0 is the kernel scheduler / swapper; kill(0, 0) targets the
-        // *process group*, not a real process. Use a very high value that
-        // won't realistically be allocated.
-        assert!(!is_pid_alive(2_000_000_000));
-    }
-
-    #[test]
-    fn validate_session_id_accepts_uuids_and_test_ids() {
-        // Production format: UUID v4 with hyphens.
-        assert!(
-            validate_session_id("550e8400-e29b-41d4-a716-446655440000").is_ok(),
-            "must accept UUID v4 (the production session_id shape)"
-        );
-        // Test-prefixed ids with underscores and digits.
-        assert!(validate_session_id("test_session_42").is_ok());
-        assert!(validate_session_id("a").is_ok());
-        assert!(validate_session_id("Z-0").is_ok());
-    }
-
-    #[test]
-    fn validate_session_id_rejects_path_traversal_and_separators() {
-        // The whole point of this check: don't let a CLI invocation of
-        // `aoe __acp-runner --session-id "<evil>"` write files
-        // outside the workers dir.
-        for bad in [
-            "",
-            "..",
-            "../../etc/passwd",
-            "foo/bar",
-            "foo\\bar",
-            ".hidden",
-            "with space",
-            "with\0null",
-            "trailing.",
-            "good-then/../bad",
-        ] {
-            assert!(
-                validate_session_id(bad).is_err(),
-                "expected rejection for {bad:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn validate_session_id_rejects_overlong() {
-        let long = "a".repeat(129);
-        assert!(validate_session_id(&long).is_err());
-        let ok = "a".repeat(128);
-        assert!(validate_session_id(&ok).is_ok());
-    }
-
-    #[test]
     fn path_builders_propagate_validation_error() {
-        // Defense-in-depth: even if some future caller forgets to
-        // validate at the trust boundary, the path builders themselves
-        // catch a bad id.
         assert!(record_path("../escape").is_err());
         assert!(socket_path_for("foo/bar").is_err());
         assert!(log_path_for("").is_err());
@@ -1286,19 +869,7 @@ mod tests {
     #[serial]
     fn pid_source_for_prefers_record_pid_when_load_ok_some() {
         with_temp_home(|| {
-            let rec = WorkerRecord::new(
-                "sess-ok-some".into(),
-                4242,
-                PathBuf::from("/tmp/unused"),
-                "claude-agent-acp".into(),
-                "claude".into(),
-                PathBuf::from("/repo"),
-                None,
-                vec![],
-                vec![],
-                None,
-                None,
-            );
+            let rec = new_record("sess-ok-some", 4242, "/tmp/unused");
             save(&rec).unwrap();
             assert_eq!(pid_source_for("sess-ok-some"), Some(4242));
         });
@@ -1312,32 +883,16 @@ mod tests {
         });
     }
 
-    /// If a corrupt record forces peer probing, current runners expose their
-    /// PID on the control socket. The retired raw socket is only a final legacy
-    /// fallback.
     #[cfg(unix)]
     #[test]
     #[serial]
     fn pid_source_for_falls_back_to_control_socket_on_load_err() {
         with_temp_home(|| {
             let session_id = "sess-load-err";
-            let rec = WorkerRecord::new(
-                session_id.into(),
-                4242,
-                socket_path_for(session_id).unwrap(),
-                "claude-agent-acp".into(),
-                "claude".into(),
-                PathBuf::from("/repo"),
-                None,
-                vec![],
-                vec![],
-                None,
-                None,
-            );
+            let rec = new_record(session_id, 4242, socket_path_for(session_id).unwrap());
             save(&rec).unwrap();
             let rec_path = record_path(session_id).unwrap();
-            // Force load() -> Err: a directory keeps path.exists() true while
-            // std::fs::read fails for every user, root included.
+            // A directory keeps path.exists() true while std::fs::read fails, even for root.
             std::fs::remove_file(&rec_path).unwrap();
             std::fs::create_dir(&rec_path).unwrap();
             assert!(
@@ -1395,8 +950,6 @@ mod tests {
             assert!(!path.exists(), "a claim leaves nothing behind");
             assert_eq!(claim_restart_marker("m"), None, "nothing left to claim");
 
-            // A marker written after a claim is a newer runner's authority
-            // and survives it.
             mark_restart_pending("m", 8);
             let claimed = claim_restart_marker("m");
             mark_restart_pending("m", 9);
@@ -1421,20 +974,7 @@ mod tests {
     fn delete_if_owned_by_leaves_a_replacement_record() {
         with_temp_home(|| {
             let socket = workers_dir().unwrap().join("g.sock");
-            let rec = WorkerRecord::new(
-                "g".into(),
-                41,
-                socket,
-                "claude-agent-acp".into(),
-                "claude".into(),
-                PathBuf::from("/repo"),
-                None,
-                vec![],
-                vec![],
-                None,
-                None,
-            )
-            .with_generation(3);
+            let rec = new_record("g", 41, socket).with_generation(3);
             save(&rec).unwrap();
             assert!(
                 delete_if_owned_by("g", 40, 3),

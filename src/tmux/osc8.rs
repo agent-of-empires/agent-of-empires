@@ -1,61 +1,39 @@
-//! OSC 8 hyperlink extraction from a pane's byte stream.
-//!
-//! A hyperlink target cannot ride along with the text it wraps: `vt100` routes
-//! OSC 8 to its unhandled-sequence hook and drops it, and a ratatui cell has no
-//! attribute to hold a URI. So the targets are kept beside the grid instead,
-//! paired with the visible text they wrapped, and the TUI re-finds that text on
-//! the rendered row to decide what a click opens.
+//! OSC 8 hyperlink extraction. `vt100` drops OSC 8, so targets are kept beside
+//! the grid, paired with the visible text they wrapped.
 
-/// A hyperlink the pane advertised via OSC 8.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PaneLink {
-    /// Visible text between the opening and closing sequence, with styling
-    /// escapes removed so it matches the rendered row cell for cell.
+    /// Styling escapes removed so it matches the rendered row cell for cell.
     pub(crate) text: String,
     pub(crate) uri: String,
 }
 
 const OSC8_OPEN: &[u8] = b"\x1b]8;";
 
-/// Ceiling on the links one pane is resolved against. Every visible row is
-/// searched for each of them on every frame, so an unbounded table turns a
-/// link-dense scrollback into frame time. Shared by the channel's table and the
-/// capture path's, which must not drift apart.
+/// Every visible row is searched for each link on every frame.
 pub(crate) const MAX_PANE_LINKS: usize = 64;
 
-/// Cap on the bytes held while a sequence or its link text is still
-/// incomplete. Bounds what a truncated or malformed sequence can accumulate.
 const MAX_PENDING: usize = 8192;
 
-/// Cap on one target's length. Anything longer is not a URL anyone typed.
 const MAX_URI: usize = 2048;
 
-/// Whether a parsed target is safe to keep. Only `http`/`https` reach a
-/// browser opener, and a control byte inside one is never legitimate: it would
-/// terminate a re-emitted sequence early and let pane output inject escapes
-/// into aoe's own stream.
+/// Only http(s) reaches a browser; a control byte could inject escapes.
 fn usable_uri(uri: &str) -> bool {
     crate::util::is_http_url(uri) && !uri.chars().any(char::is_control)
 }
 
-/// Incremental OSC 8 extractor for the raw pane stream.
-///
-/// The stream arrives in arbitrary read-sized chunks, so the scanner keeps the
-/// bytes of any sequence (or link text) it has not resolved yet and resumes on
-/// the next [`feed`](Self::feed). Modeled on `Osc52Scanner` in `vt.rs`, which
-/// taps the same stream for clipboard writes.
 pub(crate) struct Osc8Scanner {
     buf: Vec<u8>,
 }
 
-/// One `ESC ] 8 ;` sequence parsed off the head of a buffer.
 enum Seq {
-    /// The sequence has not fully arrived.
     Incomplete,
-    /// `consumed` leading bytes are unusable; skip them.
     Skip(usize),
     /// A complete sequence. An empty `uri` is the closing form (`ESC ] 8 ; ; ST`).
-    Found { uri: String, consumed: usize },
+    Found {
+        uri: String,
+        consumed: usize,
+    },
 }
 
 impl Osc8Scanner {
@@ -63,13 +41,11 @@ impl Osc8Scanner {
         Self { buf: Vec::new() }
     }
 
-    /// Scan one chunk, returning every hyperlink completed by it.
     pub(crate) fn feed(&mut self, chunk: &[u8]) -> Vec<PaneLink> {
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
         loop {
             let Some(start) = find(&self.buf, OSC8_OPEN) else {
-                // Nothing pending but a possible split `ESC ] 8` prefix.
                 let keep = self.buf.len().min(OSC8_OPEN.len() - 1);
                 self.buf.drain(..self.buf.len() - keep);
                 break;
@@ -89,17 +65,12 @@ impl Osc8Scanner {
                 Seq::Found { uri, consumed } => (uri, consumed),
             };
             if uri.is_empty() {
-                // A close with no open ahead of it (the text was already
-                // emitted, or the open predates this scanner).
                 self.buf.drain(..consumed);
                 continue;
             }
-            // The link text runs to whatever OSC 8 comes next: its own close,
-            // or the open of a link that followed without one.
+            // The link text runs to the next OSC 8: its own close or the next open.
             let Some(next) = find(&self.buf[consumed..], OSC8_OPEN) else {
                 if self.buf.len() - consumed > MAX_PENDING {
-                    // The close is never coming; drop the open and let the
-                    // next pass discard the text it was holding.
                     self.buf.drain(..consumed);
                     continue;
                 }
@@ -116,9 +87,7 @@ impl Osc8Scanner {
         out
     }
 
-    /// Emit a link whose closing sequence never arrived, using the text held so
-    /// far. For the one-shot string path, where the capture simply ends after
-    /// the link text; the streaming path keeps waiting instead.
+    /// Emit a link whose close never arrived, for one-shot (non-streaming) input.
     pub(crate) fn finish(&mut self) -> Option<PaneLink> {
         let start = find(&self.buf, OSC8_OPEN)?;
         self.buf.drain(..start);
@@ -134,9 +103,6 @@ impl Osc8Scanner {
     }
 }
 
-/// Extract every hyperlink in a complete capture. One-shot form of
-/// [`Osc8Scanner`], for content that arrives whole (a frame, a `capture-pane`
-/// seed) rather than as a stream.
 pub(crate) fn extract_links(content: &[u8]) -> Vec<PaneLink> {
     let mut scanner = Osc8Scanner::new();
     let mut out = scanner.feed(content);
@@ -144,26 +110,19 @@ pub(crate) fn extract_links(content: &[u8]) -> Vec<PaneLink> {
     out
 }
 
-/// Whether `content` holds anything that opens an OSC 8 sequence. Distinguishes
-/// "the pane advertised no hyperlink" from "one was advertised and did not
-/// parse", which the caller logs.
+/// Distinguishes "no hyperlink advertised" from "one did not parse".
 pub(crate) fn has_hyperlink(content: &[u8]) -> bool {
     find(content, OSC8_OPEN).is_some()
 }
 
-/// Parse the sequence at the head of `buf`, which starts with `ESC ] 8 ;`.
 fn parse_seq(buf: &[u8]) -> Seq {
     let body = &buf[OSC8_OPEN.len()..];
     let (payload_len, seq_len) = match terminator(body) {
         Some(Some(pair)) => pair,
-        // A stray ESC inside the payload: not this sequence's terminator, so
-        // resume scanning from it.
         Some(None) => return Seq::Skip(OSC8_OPEN.len()),
         None => return Seq::Incomplete,
     };
     let consumed = OSC8_OPEN.len() + seq_len;
-    // `8 ; <params> ; <uri>`. Params carry an optional `id=`; nothing here
-    // needs them.
     let Some(sep) = body[..payload_len].iter().position(|&b| b == b';') else {
         return Seq::Skip(consumed);
     };
@@ -180,9 +139,8 @@ fn parse_seq(buf: &[u8]) -> Seq {
     }
 }
 
-/// Locate the OSC terminator in `body`, returning `(payload length, sequence
-/// length)`. `None` means it has not arrived; `Some(None)` means the payload
-/// holds an ESC that does not open one.
+/// `(payload length, sequence length)`; `None` = not arrived yet, `Some(None)` =
+/// an ESC in the payload that does not open a terminator.
 fn terminator(body: &[u8]) -> Option<Option<(usize, usize)>> {
     for (i, &b) in body.iter().enumerate() {
         if b == 0x07 {
@@ -205,9 +163,6 @@ fn terminator(body: &[u8]) -> Option<Option<(usize, usize)>> {
     None
 }
 
-/// Anchor on the leading ESC before comparing. Every capture runs through this
-/// on each content change and almost none hold a hyperlink, so the scan wants
-/// to be a byte search rather than a sliding window compare.
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     let mut from = 0;
     while let Some(offset) = haystack[from..].iter().position(|b| *b == needle[0]) {
@@ -242,49 +197,38 @@ mod tests {
     #[test]
     fn extracts_across_forms_and_neighbours() {
         let cases: Vec<(&str, Vec<PaneLink>)> = vec![
-            // Surrounding text is not part of the link.
             (
                 "before \x1b]8;;https://a.com\x1b\\text\x1b]8;;\x1b\\ after",
                 vec![link("text", "https://a.com")],
             ),
-            // Two links on one row.
             (
                 "\x1b]8;;https://a.com\x1b\\A\x1b]8;;\x1b\\ and \x1b]8;;https://b.com\x1b\\B\x1b]8;;\x1b\\",
                 vec![link("A", "https://a.com"), link("B", "https://b.com")],
             ),
-            // An `id=` param is ignored.
             (
                 "\x1b]8;id=abc;https://a.com\x1b\\A\x1b]8;;\x1b\\",
                 vec![link("A", "https://a.com")],
             ),
-            // BEL terminates the sequence too.
             (
                 "\x1b]8;;https://a.com\x07A\x1b]8;;\x07",
                 vec![link("A", "https://a.com")],
             ),
-            // Styling inside the link text is stripped, so the text matches the
-            // row as rendered.
             (
                 "\x1b]8;;https://a.com\x1b\\\x1b[32mgreen\x1b[0m\x1b]8;;\x1b\\",
                 vec![link("green", "https://a.com")],
             ),
-            // A link left open when the next one starts still resolves.
             (
                 "\x1b]8;;https://a.com\x1b\\A\x1b]8;;https://b.com\x1b\\B\x1b]8;;\x1b\\",
                 vec![link("A", "https://a.com"), link("B", "https://b.com")],
             ),
-            // Non-http targets never reach the browser opener.
             ("\x1b]8;;file:///etc/passwd\x1b\\pw\x1b]8;;\x1b\\", vec![]),
             (
                 "\x1b]8;;javascript:alert(1)\x1b\\click\x1b]8;;\x1b\\",
                 vec![],
             ),
-            // An empty link text has nothing to anchor to on the row.
             ("\x1b]8;;https://a.com\x1b\\\x1b]8;;\x1b\\", vec![]),
-            // A close with no open is not a link.
             ("\x1b]8;;\x1b\\plain", vec![]),
             ("no links here", vec![]),
-            // Other OSC sequences are left alone.
             ("\x1b]0;Window Title\x07text", vec![]),
         ];
         for (input, expected) in cases {
@@ -292,15 +236,9 @@ mod tests {
         }
     }
 
-    /// Rows copied verbatim from a real Claude Code pane (v2.1.260). It wraps
-    /// the target in an `id=` param and closes the run with the color reset
-    /// INSIDE the hyperlink, so the captured text carries an SGR the rendered
-    /// row does not.
     #[test]
     fn extracts_real_claude_code_hyperlinks() {
         let cases = [
-            // A markdown link in message text: the issue's own repro, printed
-            // by asking the agent for `[the AoE repo](https://github.com/...)`.
             (
                 concat!(
                     "\x1b[38;5;231m\x1b[49m\u{25cf}\x1b[39m \x1b[94m",
@@ -312,7 +250,6 @@ mod tests {
                     "https://github.com/agent-of-empires/agent-of-empires",
                 ),
             ),
-            // Claude Code's own UI chrome, from its workspace-trust prompt.
             (
                 concat!(
                     " \x1b[38;5;246m\x1b]8;id=zaxmda;https://code.claude.com/docs/en/security\x1b\\",
@@ -347,7 +284,6 @@ mod tests {
             extract_links(b"\x1b]8;;https://example.com\x1b\\Click Here"),
             vec![link("Click Here", "https://example.com")]
         );
-        // An unterminated opening sequence carries no target at all.
         assert_eq!(extract_links(b"\x1b]8;;https://example.com"), vec![]);
     }
 

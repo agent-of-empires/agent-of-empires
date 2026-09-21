@@ -25,9 +25,8 @@ use super::pending::{
 use super::tool_context::{permission_raw_input_with_context, ToolContextCache};
 use super::tool_output::{preview_optional_args, tool_kind_str};
 
-/// Normalize the agent's option list for the approval card. Unknown
-/// future kinds are dropped rather than guessed at, so a client never
-/// offers a button whose meaning we cannot map back.
+/// A kind we cannot map back is dropped rather than guessed at, so no client
+/// offers a button whose meaning is unknown.
 pub(super) fn approval_options(
     options: &[agent_client_protocol::schema::v1::PermissionOption],
 ) -> Vec<ApprovalOption> {
@@ -50,15 +49,10 @@ pub(super) fn approval_options(
         .collect()
 }
 
-/// Translate the user's decision into the matching option_id from the
-/// list the agent offered.
-///
-/// `requested` is an `option_id` the client picked off the agent's own
-/// labels (`is_choice_list`). It is authoritative: an id matching
-/// nothing means a stale card, and answering it by kind would send an
-/// option the user did not pick, so it resolves to `None` and the caller
-/// cancels. Without one, the decision picks by kind, falling back
-/// gracefully if the agent didn't offer the preferred kind.
+/// `requested` is an `option_id` the client picked off the agent's own labels
+/// and is authoritative: an id matching nothing is a stale card, and answering
+/// by kind would send an option the user never picked, so it resolves to
+/// `None` and the caller cancels. Without one, the decision picks by kind.
 pub(super) fn pick_option_id(
     options: &[agent_client_protocol::schema::v1::PermissionOption],
     decision: ApprovalDecision,
@@ -83,10 +77,8 @@ pub(super) fn pick_option_id(
             PermissionOptionKind::RejectOnce,
             PermissionOptionKind::RejectAlways,
         ][..],
-        // Synthetic decision emitted by the daemon-restart rehydration
-        // sweep. Has no agent option to map to (the agent never sees
-        // it); the caller falls through to `RequestPermissionOutcome::
-        // Cancelled` when this returns None.
+        // Synthetic, from the daemon-restart rehydration sweep: the agent
+        // never sees it, so the caller falls through to `Cancelled`.
         ApprovalDecision::Cancelled => &[][..],
     };
     for kind in preferred_kinds {
@@ -97,11 +89,10 @@ pub(super) fn pick_option_id(
     None
 }
 
-/// The decision an option actually stands for. A card that answered by
-/// `option_id` sends an allow-shaped decision alongside it, so without
-/// this a reject-kind option would be recorded (and broadcast) as an
-/// allow and leave the tool card running. Returns `None` for a kind the
-/// protocol added after us; the caller then keeps the client's decision.
+/// What an option actually stands for. A card answering by `option_id` sends
+/// an allow-shaped decision alongside it, so without this a reject-kind option
+/// would broadcast as an allow and leave the tool card running. `None` for a
+/// kind newer than this build, which keeps the client's decision.
 fn decision_for_option(
     options: &[agent_client_protocol::schema::v1::PermissionOption],
     option_id: &agent_client_protocol::schema::v1::PermissionOptionId,
@@ -117,10 +108,8 @@ fn decision_for_option(
     }
 }
 
-/// Close a permission-request tool card with a terminal error row when
-/// the user denies (or no compatible option exists). Pairs the start
-/// frame emitted in `handle_permission_request`; without it a denied tool
-/// hangs on "running" until the turn ends. See #1713.
+/// Pairs the start frame `handle_permission_request` emits; without it a
+/// denied tool hangs on "running" until the turn ends (#1713).
 pub(super) async fn emit_permission_denied(
     event_tx: &mpsc::Sender<Event>,
     tool_call_id: &str,
@@ -136,6 +125,19 @@ pub(super) async fn emit_permission_denied(
             async_subagent: false,
         })
         .await;
+}
+
+/// Clear the approval card and close the start frame `handle_permission_request`
+/// emitted. Neither a cancel nor an unmatched option produces an agent
+/// completion, so nothing else would terminate the tool card (#1713).
+async fn cancel_approval(event_tx: &mpsc::Sender<Event>, nonce: &Nonce, tool_call_id: &str) {
+    let _ = event_tx
+        .send(Event::ApprovalResolved {
+            nonce: nonce.clone(),
+            decision: ApprovalDecision::Cancelled,
+        })
+        .await;
+    emit_permission_denied(event_tx, tool_call_id, "permission cancelled").await;
 }
 
 pub(super) async fn handle_permission_request(
@@ -154,7 +156,6 @@ pub(super) async fn handle_permission_request(
         enter_ns,
         "ACP request handler entered"
     );
-    // Build our structured view-side approval card.
     let title = request
         .tool_call
         .fields
@@ -165,11 +166,9 @@ pub(super) async fn handle_permission_request(
         .lock()
         .expect("tool context cache mutex poisoned")
         .get(&tool_call_id);
-    // Empty (not the literal "null") when neither the permission request nor a
-    // previously forwarded tool update has raw_input. Gemini's confirm-required
-    // tools routinely do this. See #1713. opencode sometimes sends an
-    // external_directory permission reusing a tool_call_id whose earlier tool
-    // update had the command, so merge that context before emitting events.
+    // Gemini's confirm-required tools routinely carry no raw_input (#1713), and
+    // opencode reuses a tool_call_id whose earlier update had the command, so
+    // merge the cached context before emitting events.
     let enriched_raw_input = permission_raw_input_with_context(
         request.tool_call.fields.raw_input.as_ref(),
         cached_raw_input.as_ref(),
@@ -191,23 +190,18 @@ pub(super) async fn handle_permission_request(
         memory_recall: None,
         diffs: Vec::new(),
     };
-    // Gemini's confirm-required tools never send a standalone `tool_call`
-    // start frame (only requestPermission, then a completion update), so
-    // without this the approved tool would have no transcript card and
-    // its later completion would render nothing. Emit a start frame from
-    // the ToolCall we just built; the reducer dedupes tool_start by id,
-    // so a later real start frame merges in place rather than doubling
-    // the card. See #1713.
+    // Gemini sends no standalone `tool_call` start frame, so without this the
+    // approved tool would have no transcript card. The reducer dedupes
+    // tool_start by id, so a later real start frame merges in place (#1713).
     let _ = event_tx
         .send(Event::ToolCallStarted {
             tool_call: tool_call.clone(),
         })
         .await;
     let offered = approval_options(&request.options);
-    // A choice list (pi's `ask_user_question`: N same-kind options) must
-    // never be answered by kind: generic clients send no option id because
-    // they never rendered the labels, so by-kind selection would answer the
-    // agent's first option as if the user picked it. See #3741.
+    // A choice list (N same-kind options) must never be answered by kind: a
+    // generic client rendered no labels and sent no option id, so by-kind
+    // selection would answer the agent's first option for the user (#3741).
     let choice_list = is_choice_list(&offered);
     let approval = build_approval(tool_call, offered);
     let nonce = approval.nonce.clone();
@@ -241,10 +235,8 @@ pub(super) async fn handle_permission_request(
         ));
     }
 
-    // Issue #1147: this `await` is the suspected serializer for the user-felt
-    // slowness. Log the moment we begin awaiting so a wall-clock comparison
-    // with later "responding to permission request" emissions exposes how
-    // approval blocked the agent's turn.
+    // #1147: comparing this against the exit trace shows how long approval
+    // blocked the agent's turn.
     let await_enter_ns = enter_timestamp_ns();
     trace!(
         target: "acp.protocol.tool_dispatch",
@@ -262,10 +254,9 @@ pub(super) async fn handle_permission_request(
             decision,
             option_id: requested,
         }) => {
-            // A decision without a picked option id (the generic allow/deny
-            // dialogs) cannot answer a choice list: by-kind selection would
-            // send the agent's first option as the user's answer. Cancel so
-            // the user picks where the labels are rendered.
+            // The generic allow/deny dialogs send no option id, so they cannot
+            // answer a choice list; cancel so the user picks where the labels
+            // are rendered.
             let choice_list_unanswered = requested.is_none() && choice_list;
             if let Some(option_id) =
                 pick_option_id(&request.options, decision, requested.as_deref())
@@ -279,17 +270,13 @@ pub(super) async fn handle_permission_request(
                     }
                     None => decision,
                 };
-                // Surface the resolution to UI clients via the typed event channel.
                 let _ = event_tx
                     .send(Event::ApprovalResolved {
                         nonce: nonce.clone(),
                         decision,
                     })
                     .await;
-                // A denied tool will not run, so the start frame emitted
-                // above would otherwise hang on "running" until the turn
-                // ends. Close it immediately with a terminal error row.
-                // See #1713.
+                // A denied tool never runs, so close its start frame (#1713).
                 if matches!(decision, ApprovalDecision::Deny) {
                     emit_permission_denied(&event_tx, &tool_call_id, "permission denied").await;
                 }
@@ -303,30 +290,13 @@ pub(super) async fn handle_permission_request(
                     choice_list = choice_list_unanswered,
                     "no option matched (decision {decision:?}, requested {requested:?}); cancelling"
                 );
-                // No compatible option: the agent gets Cancelled, but the
-                // user still acted, so clear the approval card and close
-                // the hanging start frame. See #1713.
-                let _ = event_tx
-                    .send(Event::ApprovalResolved {
-                        nonce: nonce.clone(),
-                        decision: ApprovalDecision::Cancelled,
-                    })
-                    .await;
-                emit_permission_denied(&event_tx, &tool_call_id, "permission cancelled").await;
+                cancel_approval(&event_tx, &nonce, &tool_call_id).await;
                 (RequestPermissionOutcome::Cancelled, "cancelled")
             }
         }
+        // An explicit cancel_permission, or the resolver dropped on teardown.
         Ok(ApprovalResolutionMessage::Cancelled) | Err(_) => {
-            // Cancellation (explicit cancel_permission, or the resolver
-            // dropped on teardown) emits no agent completion, so close the
-            // start frame and clear the approval here too. See #1713.
-            let _ = event_tx
-                .send(Event::ApprovalResolved {
-                    nonce: nonce.clone(),
-                    decision: ApprovalDecision::Cancelled,
-                })
-                .await;
-            emit_permission_denied(&event_tx, &tool_call_id, "permission cancelled").await;
+            cancel_approval(&event_tx, &nonce, &tool_call_id).await;
             (RequestPermissionOutcome::Cancelled, "cancelled")
         }
     };
@@ -344,13 +314,9 @@ pub(super) async fn handle_permission_request(
     Ok(RequestPermissionResponse::new(outcome))
 }
 
-/// Handle an `elicitation/create` request (claude-agent-acp's
-/// `AskUserQuestion`, surfaced because we advertise `elicitation.form`).
-/// Mirrors `handle_permission_request`: normalize the form, park a
-/// resolver under a fresh nonce, broadcast the card, await the user's
-/// answer, then respond to the agent. Cancellation (resolver dropped on
-/// teardown) and an unparseable schema both fall back to a graceful
-/// response so the agent's turn never hangs.
+/// `elicitation/create`, surfaced because we advertise `elicitation.form`.
+/// Mirrors `handle_permission_request`. A cancel and an unparseable schema
+/// both fall back to a graceful response so the agent's turn never hangs.
 pub(super) async fn handle_elicitation_request(
     request: CreateElicitationRequest,
     event_tx: mpsc::Sender<Event>,
@@ -360,12 +326,8 @@ pub(super) async fn handle_elicitation_request(
     let elicitation = match parse_elicitation(nonce.clone(), &request, chrono::Utc::now()) {
         Ok(elicitation) => elicitation,
         Err(e) => {
-            // A schema we can't render (URL mode, or an MCP-server form
-            // with number/boolean fields). Cancel rather than Decline: the
-            // question was never shown, so "user skipped" (Decline, empty
-            // answer) would misrepresent it; Cancel tells the agent the
-            // request could not be presented. Either way the turn does not
-            // hang on a card we'll never show.
+            // Cancel, not Decline: the question was never shown, so "user
+            // skipped" would misrepresent it.
             warn!(target: "acp.protocol", "unsupported elicitation, cancelling: {e}");
             return Ok(CreateElicitationResponse::new(ElicitationAction::Cancel));
         }
@@ -393,10 +355,8 @@ pub(super) async fn handle_elicitation_request(
         return Ok(CreateElicitationResponse::new(ElicitationAction::Cancel));
     }
 
-    // Await the user's answer. `resolve_elicitation` validates server-side
-    // before sending, so whatever arrives here is already a built, valid
-    // response. A dropped resolver (daemon teardown, agent cancel) cancels
-    // the tool call.
+    // `resolve_elicitation` validates before sending, so what arrives is
+    // already a valid response. A dropped resolver cancels the tool call.
     let ElicitationResolutionMessage {
         response,
         outcome,
@@ -423,54 +383,43 @@ pub(super) async fn handle_elicitation_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_client_protocol::schema::v1::{PermissionOption, PermissionOptionId};
 
-    #[test]
-    fn pick_option_id_finds_allow_once() {
-        use agent_client_protocol::schema::v1::{PermissionOption, PermissionOptionId};
-        let options = vec![
-            PermissionOption::new(
-                PermissionOptionId::new("yes"),
-                "Allow this once",
-                PermissionOptionKind::AllowOnce,
-            ),
-            PermissionOption::new(
-                PermissionOptionId::new("no"),
-                "Reject",
-                PermissionOptionKind::RejectOnce,
-            ),
-        ];
-        let id = pick_option_id(&options, ApprovalDecision::Allow, None).unwrap();
-        assert_eq!(id.0.as_ref(), "yes");
+    fn option(id: &str, name: &str, kind: PermissionOptionKind) -> PermissionOption {
+        PermissionOption::new(PermissionOptionId::new(id), name, kind)
     }
 
+    /// Without a picked id the decision selects by kind, falling back to a
+    /// kind the agent did offer.
     #[test]
-    fn pick_option_id_falls_back() {
-        use agent_client_protocol::schema::v1::{PermissionOption, PermissionOptionId};
-        let options = vec![PermissionOption::new(
-            PermissionOptionId::new("always"),
+    fn pick_option_id_selects_by_kind() {
+        let both = vec![
+            option("yes", "Allow this once", PermissionOptionKind::AllowOnce),
+            option("no", "Reject", PermissionOptionKind::RejectOnce),
+        ];
+        let always_only = vec![option(
+            "always",
             "Always",
             PermissionOptionKind::AllowAlways,
         )];
-        // We asked for Allow (prefers AllowOnce); the agent only offered
-        // AllowAlways. Falls back gracefully.
-        let id = pick_option_id(&options, ApprovalDecision::Allow, None).unwrap();
-        assert_eq!(id.0.as_ref(), "always");
+        for (options, want) in [(&both, "yes"), (&always_only, "always")] {
+            let id = pick_option_id(options, ApprovalDecision::Allow, None).unwrap();
+            assert_eq!(id.0.as_ref(), want);
+        }
     }
 
-    /// A question option list (pi's `ask_user_question`): every option is
-    /// `allow_once`, so answering by kind would always send the first
-    /// one. The client's picked id wins, and an id that belongs to no
-    /// option resolves to nothing rather than to a guess. See #3741.
+    /// In a question list every option is `allow_once`, so answering by kind
+    /// would always send the first. The client's picked id wins, and an id
+    /// belonging to no option resolves to nothing rather than a guess (#3741).
     #[test]
     fn requested_option_id_wins_over_kind_order() {
-        use agent_client_protocol::schema::v1::{PermissionOption, PermissionOptionId};
         let options: Vec<_> = ["Alpha", "Bravo", "Charlie", "Delta"]
             .iter()
             .enumerate()
             .map(|(i, name)| {
-                PermissionOption::new(
-                    PermissionOptionId::new(format!("choice-{i}")),
-                    *name,
+                option(
+                    &format!("choice-{i}"),
+                    name,
                     PermissionOptionKind::AllowOnce,
                 )
             })
@@ -479,23 +428,18 @@ mod tests {
         let picked =
             pick_option_id(&options, ApprovalDecision::Allow, Some("choice-2")).expect("picked");
         assert_eq!(picked.0.as_ref(), "choice-2");
-
         assert!(pick_option_id(&options, ApprovalDecision::Allow, Some("choice-9")).is_none());
-
-        // Without a picked id the kind-order fallback still answers with
-        // the first allow_once, which is the bug the picker avoids.
+        // The kind-order fallback picks the first allow_once, the bug above.
         let fallback = pick_option_id(&options, ApprovalDecision::Allow, None).expect("fallback");
         assert_eq!(fallback.0.as_ref(), "choice-0");
     }
 
-    /// A choice list answered through the generic flow (no option id) must
-    /// be cancelled, never answered with the agent's first option. The
-    /// guard lives in `handle_permission_request` because by-kind selection
-    /// happens there; this drives the whole handler. See #3741.
+    /// The generic allow/deny flow sends no option id, so a choice list must
+    /// cancel rather than answer with the agent's first option. The guard is in
+    /// `handle_permission_request`, so this drives the whole handler (#3741).
     #[tokio::test]
     async fn choice_list_with_no_picked_option_cancels_instead_of_picking_the_first() {
         use agent_client_protocol::schema::v1::{
-            PermissionOption, PermissionOptionId, PermissionOptionKind, RequestPermissionOutcome,
             RequestPermissionRequest, ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
         };
         use std::collections::HashMap;
@@ -508,19 +452,10 @@ mod tests {
             "s-choice",
             ToolCallUpdate::new(ToolCallId::new("t1"), ToolCallUpdateFields::default()),
             vec![
-                PermissionOption::new(
-                    PermissionOptionId::new("choice-0"),
-                    "First",
-                    PermissionOptionKind::AllowOnce,
-                ),
-                PermissionOption::new(
-                    PermissionOptionId::new("choice-1"),
-                    "Second",
-                    PermissionOptionKind::AllowOnce,
-                ),
+                option("choice-0", "First", PermissionOptionKind::AllowOnce),
+                option("choice-1", "Second", PermissionOptionKind::AllowOnce),
             ],
         );
-        let profile = &crate::acp::agent_profiles::GEMINI;
         let cache: crate::acp::acp_client::tool_context::ToolContextCache =
             Arc::new(std::sync::Mutex::new(
                 crate::acp::acp_client::tool_context::ToolCallContextCache::default(),
@@ -529,14 +464,12 @@ mod tests {
             request,
             event_tx,
             pending.clone(),
-            profile,
+            &crate::acp::agent_profiles::GEMINI,
             cache,
         ));
-        // The nonce arrives with the ApprovalRequested event.
         let nonce = loop {
-            match event_rx.recv().await.expect("events") {
-                Event::ApprovalRequested { approval } => break approval.nonce,
-                _ => continue,
+            if let Event::ApprovalRequested { approval } = event_rx.recv().await.expect("events") {
+                break approval.nonce;
             }
         };
         // Generic answer: Allow with no option id, as the home dialog sends.
@@ -557,37 +490,23 @@ mod tests {
         );
         // The card closes on Cancelled, never on an Allow.
         loop {
-            match event_rx.recv().await.expect("resolution event") {
-                Event::ApprovalResolved { decision, .. } => {
-                    assert_eq!(decision, ApprovalDecision::Cancelled);
-                    break;
-                }
-                _ => continue,
+            if let Event::ApprovalResolved { decision, .. } =
+                event_rx.recv().await.expect("resolution event")
+            {
+                assert_eq!(decision, ApprovalDecision::Cancelled);
+                break;
             }
         }
     }
 
-    /// The card sends an allow-shaped decision beside the option id, so
-    /// the recorded decision has to come from the option itself.
+    /// The card sends an allow-shaped decision beside the option id, so the
+    /// recorded decision has to come from the option itself.
     #[test]
     fn decision_follows_the_picked_option_not_the_sent_decision() {
-        use agent_client_protocol::schema::v1::{PermissionOption, PermissionOptionId};
         let options = vec![
-            PermissionOption::new(
-                PermissionOptionId::new("yes"),
-                "Yes",
-                PermissionOptionKind::AllowOnce,
-            ),
-            PermissionOption::new(
-                PermissionOptionId::new("forever"),
-                "Always",
-                PermissionOptionKind::AllowAlways,
-            ),
-            PermissionOption::new(
-                PermissionOptionId::new("no"),
-                "No",
-                PermissionOptionKind::RejectOnce,
-            ),
+            option("yes", "Yes", PermissionOptionKind::AllowOnce),
+            option("forever", "Always", PermissionOptionKind::AllowAlways),
+            option("no", "No", PermissionOptionKind::RejectOnce),
         ];
         for (id, expected) in [
             ("yes", ApprovalDecision::Allow),
@@ -607,22 +526,12 @@ mod tests {
 
     #[test]
     fn approval_options_normalize_kinds_in_order() {
-        use agent_client_protocol::schema::v1::{PermissionOption, PermissionOptionId};
         let options = vec![
-            PermissionOption::new(
-                PermissionOptionId::new("yes"),
-                "Yes",
-                PermissionOptionKind::AllowOnce,
-            ),
-            PermissionOption::new(
-                PermissionOptionId::new("no"),
-                "No",
-                PermissionOptionKind::RejectOnce,
-            ),
+            option("yes", "Yes", PermissionOptionKind::AllowOnce),
+            option("no", "No", PermissionOptionKind::RejectOnce),
         ];
-        let normalized = approval_options(&options);
         assert_eq!(
-            normalized,
+            approval_options(&options),
             vec![
                 ApprovalOption {
                     option_id: "yes".into(),

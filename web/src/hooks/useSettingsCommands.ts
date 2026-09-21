@@ -5,49 +5,23 @@ import type { CommandAction } from "../components/command-palette/types";
 import type { SettingsFieldDescriptor } from "../lib/types";
 
 interface Args {
-  /** Palette open state. Schema + values are (re)fetched on the rising edge so
-   *  toggle subtitles reflect the latest saved state without a global cache. */
   open: boolean;
-  /** Read-only servers 403 every write, so every entry becomes a jump. */
   readOnly: boolean;
-  /** Jump to a settings tab (e.g. `/settings/sandbox`). */
   onOpenSettingsTab: (tab: string) => void;
 }
 
-/** Most schema sections render under a same-named settings tab; these two are
- *  the only exceptions in SettingsView's tab layout. */
 function sectionToTab(section: string): string {
   if (section === "web") return "notifications";
   if (section === "acp") return "structured-view";
   return section;
 }
 
-/**
- * Per-setting command-palette entries (#2108) built from the settings schema
- * (single source of truth, #1692).
- *
- * Writable `toggle` fields flip inline (pessimistic PATCH + toast); every other
- * widget, plus elevation-gated toggles and everything in read-only mode, jumps
- * to its settings tab. `local_only` fields are omitted because the server PATCH
- * rejects them.
- *
- * Inline writes target the default profile, the same path SettingsView takes
- * when its profile picker sits on the default, so there is no new write
- * behavior. The write scope is named in the subtitle and toast rather than left
- * implicit: a `profile_overridable` flip names the profile, a global-only flip
- * reads "Global".
- */
 export function useSettingsCommands({ open, readOnly, onOpenSettingsTab }: Args): CommandAction[] {
   const [schema, setSchema] = useState<SettingsFieldDescriptor[]>([]);
   const [values, setValues] = useState<Record<string, unknown>>({});
   const [defaultProfile, setDefaultProfile] = useState("default");
-  // Bumped after an inline flip to re-run the load effect, so a toggle's
-  // subtitle reflects the value it was just set to.
   const [reloadNonce, setReloadNonce] = useState(0);
 
-  // The palette stays mounted, so it must (re)fetch each time it becomes
-  // visible: this keeps toggle subtitles fresh and, on a login-required
-  // server, picks up data that was 401-empty before sign-in.
   useEffect(() => {
     if (!open) return;
     let cancelled = false;

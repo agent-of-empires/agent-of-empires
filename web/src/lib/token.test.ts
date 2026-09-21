@@ -42,8 +42,6 @@ describe("token helpers", () => {
     expect(getToken()).toBeNull();
   });
 
-  // The catch paths exist so a blocked / quota-exceeded localStorage never
-  // locks the user out: reads degrade to null and writes are best-effort.
   it("getToken returns null when localStorage throws", () => {
     const spy = vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
       throw new Error("blocked");

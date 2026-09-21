@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
-use super::{centered_rect, DialogResult};
+use super::DialogResult;
 use crate::session::config::ToolSessionConfig;
 use crate::tui::styles::Theme;
 
@@ -42,26 +42,11 @@ impl ToolPickerDialog {
         }
     }
 
-    fn row_to_idx(&self, col: u16, row: u16) -> Option<usize> {
-        let pos = ratatui::layout::Position::from((col, row));
-        if !self.list_area.contains(pos) {
-            return None;
-        }
-        let row_in_list = (row - self.list_area.y) as usize;
-        if row_in_list >= self.items.len() {
-            return None;
-        }
-        Some(row_in_list)
-    }
-
     pub fn handle_click(&mut self, col: u16, row: u16) -> DialogResult<String> {
-        if !self
-            .dialog_area
-            .contains(ratatui::layout::Position::from((col, row)))
-        {
+        if !super::contains(self.dialog_area, col, row) {
             return DialogResult::Cancel;
         }
-        let Some(idx) = self.row_to_idx(col, row) else {
+        let Some(idx) = super::row_index(self.list_area, col, row, self.items.len()) else {
             return DialogResult::Continue;
         };
         self.cursor = idx;
@@ -69,14 +54,8 @@ impl ToolPickerDialog {
     }
 
     pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
-        let Some(idx) = self.row_to_idx(col, row) else {
-            return false;
-        };
-        if self.cursor == idx {
-            return false;
-        }
-        self.cursor = idx;
-        true
+        let hovered = super::row_index(self.list_area, col, row, self.items.len());
+        super::hover_select(&mut self.cursor, hovered)
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<String> {
@@ -89,48 +68,24 @@ impl ToolPickerDialog {
                     DialogResult::Cancel
                 }
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                if self.cursor > 0 {
-                    self.cursor -= 1;
-                }
+            code => {
+                super::navigate_list(&mut self.cursor, self.items.len(), code);
                 DialogResult::Continue
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.cursor + 1 < self.items.len() {
-                    self.cursor += 1;
-                }
-                DialogResult::Continue
-            }
-            KeyCode::Home => {
-                self.cursor = 0;
-                DialogResult::Continue
-            }
-            KeyCode::End => {
-                self.cursor = self.items.len().saturating_sub(1);
-                DialogResult::Continue
-            }
-            _ => DialogResult::Continue,
         }
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let width = 50u16.min(area.width.saturating_sub(4));
-        // +2 for borders, +1 for the footer hint row.
         let height = (self.items.len() as u16 + 3).min(area.height.saturating_sub(4));
-        let dialog_area = centered_rect(area, width, height);
-        self.dialog_area = dialog_area;
-
-        frame.render_widget(Clear, dialog_area);
-
         let block = Block::default()
             .title(" Tool Sessions ")
             .title_style(Style::default().fg(theme.title))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.accent))
             .style(Style::default().bg(theme.background));
-
-        let inner = block.inner(dialog_area);
-        frame.render_widget(block, dialog_area);
+        let (dialog_area, inner) = super::render_dialog_frame(frame, area, width, height, block);
+        self.dialog_area = dialog_area;
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -181,14 +136,10 @@ impl ToolPickerDialog {
         state.select(Some(self.cursor));
         frame.render_stateful_widget(list, list_area, &mut state);
 
-        let footer = Line::from(vec![
-            Span::styled("↑↓", Style::default().fg(theme.hint)),
-            Span::raw(" navigate  "),
-            Span::styled("Enter", Style::default().fg(theme.hint)),
-            Span::raw(" open  "),
-            Span::styled("Esc", Style::default().fg(theme.hint)),
-            Span::raw(" close"),
-        ]);
+        let footer = super::hint_line(
+            theme,
+            &[("↑↓", "navigate"), ("Enter", "open"), ("Esc", "close")],
+        );
         frame.render_widget(Paragraph::new(footer), footer_area);
     }
 }

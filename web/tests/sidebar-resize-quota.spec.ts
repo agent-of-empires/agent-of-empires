@@ -1,16 +1,11 @@
-// Regression for #1345: clicking the sidebar resize bar (mousedown + mouseup,
-// no drag) used to crash the whole app when localStorage was full because
-// localStorage.setItem ran unguarded inside a React setState updater. The
-// throw surfaced through the commit phase and blanked the dashboard.
-//
-// This spec stubs localStorage.setItem to throw QuotaExceededError for the
-// sidebar width key only, then drives the exact click sequence the user
-// reported. The app must stay mounted; the header must remain visible.
-//
-// The stub is enabled via a flag flipped just before the gesture so it does
-// not interfere with page-load writes to unrelated keys.
+// #1345: clicking the sidebar resize bar with no drag crashed the app when
+// localStorage was full, because setItem ran unguarded inside a React setState
+// updater and the throw blanked the dashboard through the commit phase. The stub
+// throws only for the sidebar width key, and only once the gesture starts, so
+// page-load writes to other keys are unaffected.
 
 import { test, expect } from "./helpers/mockedTest";
+import { mockStaticApis } from "./helpers/apiMocks";
 import type { Page } from "@playwright/test";
 
 const SIDEBAR_WIDTH_KEY = "aoe-sidebar-width";
@@ -45,11 +40,8 @@ async function enableThrow(page: Page, key: string) {
 }
 
 async function mockApis(page: Page) {
-  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
+  await mockStaticApis(page);
   await page.route("**/api/sessions", (r) => r.fulfill({ json: { sessions: [], workspace_ordering: [] } }));
-  for (const path of ["settings", "themes", "agents", "profiles", "groups", "devices", "docker/status", "about"]) {
-    await page.route(`**/api/${path}`, (r) => r.fulfill({ json: path === "docker/status" ? {} : [] }));
-  }
 }
 
 test.describe("#1345 localStorage QuotaExceeded crash regression", () => {

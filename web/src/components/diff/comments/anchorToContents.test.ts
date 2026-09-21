@@ -23,13 +23,6 @@ describe("anchorCommentsToContents", () => {
   it("marks an in-bounds comment active", () => {
     const out = anchorCommentsToContents([comment({})], "a.ts", undefined, OLD, NEW);
     expect(out[0]?.status).toBe("active");
-    expect(out[0]?.contentChanged).toBe(false);
-  });
-
-  it("flags contentChanged when the snippet drifted", () => {
-    const out = anchorCommentsToContents([comment({ capturedSnippet: "stale text" })], "a.ts", undefined, OLD, NEW);
-    expect(out[0]?.status).toBe("active");
-    expect(out[0]?.contentChanged).toBe(true);
   });
 
   it("marks an out-of-bounds range stale", () => {

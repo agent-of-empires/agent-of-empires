@@ -1,43 +1,28 @@
-// Pure helpers for the structured-view "load earlier" affordance and its
-// scroll-up auto-load. Kept DOM-free so the decision logic is unit-tested
-// directly; StructuredView / AcpRuntime wire them to refs and the
-// viewport. See #2236.
+// Pure helpers for the structured view's "load earlier" and scroll-up auto-load.
 
-/** Distance from the top (px) at which scrolling up should pull older
- *  history, and the floor of overflow before auto-load is meaningful. */
+/** Distance from the top that triggers a preload, and the minimum overflow for auto-load. */
 export const HISTORY_PRELOAD_PX = 200;
 
-/** Minimum gap between auto-loads. The position restore nudges scrollTop
- *  back near the top after each load, and clicking the top-anchored "Load
- *  earlier" button scrolls it into view there too; without a cooldown the
- *  trigger re-fires every frame and the button never settles. */
+/** Without a cooldown, restoring scroll near the top re-fires the load every frame. */
 export const HISTORY_AUTOLOAD_COOLDOWN_MS = 500;
 
 export interface AutoLoadInput {
   scrollTop: number;
   clientHeight: number;
   scrollHeight: number;
-  /** Whether a fresh trigger is armed (re-armed once the user scrolls
-   *  away from the top). */
+  /** Re-armed once the user scrolls away from the top. */
   armed: boolean;
-  /** Whether there is any older history left to load. */
   canLoadEarlier: boolean;
   now: number;
-  /** Timestamp of the last load (button or auto). */
   lastLoadAt: number;
 }
 
 export interface AutoLoadDecision {
-  /** Armed state to carry forward. */
   armed: boolean;
-  /** True when a load should fire now. */
   fire: boolean;
 }
 
-/** Decide whether reaching the top should trigger a load. Only meaningful
- *  once the transcript overflows (otherwise there is nothing to scroll up
- *  through and a mount at scrollTop 0 would auto-load spuriously); fires at
- *  most once per arming and once per cooldown window. */
+/** Fires only when the transcript overflows, once per arming and cooldown window. */
 export function autoLoadDecision(i: AutoLoadInput): AutoLoadDecision {
   const overflowing = i.scrollHeight > i.clientHeight + HISTORY_PRELOAD_PX;
   if (!overflowing || i.scrollTop > HISTORY_PRELOAD_PX) {
@@ -49,14 +34,9 @@ export function autoLoadDecision(i: AutoLoadInput): AutoLoadDecision {
   return { armed: i.armed, fire: false };
 }
 
-/** Pixels of slop for the "pinned to the bottom" test. Sub-pixel rounding and
- *  momentary content reflows otherwise drop us out of the pinned state for one
- *  frame; assistant-ui's own stick-to-bottom uses a similar tolerance. */
+/** Absorbs sub-pixel rounding and reflows. */
 export const PINNED_BOTTOM_SLOP_PX = 16;
 
-/** Whether the scroll viewport is at (or within `slop` of) the bottom. Drives
- *  both the composer-grow re-pin sampling and the mobile jump-to-bottom
- *  button's visibility, so it lives here as one tested threshold. */
 export function isPinnedToBottom(
   scrollTop: number,
   clientHeight: number,
@@ -66,9 +46,7 @@ export function isPinnedToBottom(
   return scrollTop + clientHeight >= scrollHeight - slop;
 }
 
-/** Scroll delta to add after older rows grow the transcript at the top so
- *  the read position is frozen. 0 when pinned to the bottom (live appends
- *  keep their stick-to-bottom) or when nothing grew. */
+/** Keeps the read position after older rows grow the top; 0 when pinned to the bottom. */
 export function scrollRestoreDelta(prevScrollHeight: number, nextScrollHeight: number, atBottom: boolean): number {
   if (atBottom) return 0;
   const delta = nextScrollHeight - prevScrollHeight;
@@ -77,24 +55,18 @@ export function scrollRestoreDelta(prevScrollHeight: number, nextScrollHeight: n
 
 export type EarlierAction = "reveal" | "fetch" | "none";
 
-/** Two-stage "load earlier": reveal rows already in the reducer first,
- *  then fetch the next-older page from the server once those run out. */
+/** Reveal already-loaded rows first, then fetch an older page. */
 export function earlierAction(canRevealLoaded: boolean, hasMoreOlder: boolean): EarlierAction {
   if (canRevealLoaded) return "reveal";
   if (hasMoreOlder) return "fetch";
   return "none";
 }
 
-/** Whether the "Load earlier" control should be offered at all. */
 export function canOfferEarlier(canRevealLoaded: boolean, hasMoreOlder: boolean): boolean {
   return canRevealLoaded || hasMoreOlder;
 }
 
-/** A pending scroll anchor is stale when a load has settled (nothing in
- *  flight) but the transcript never grew (anchor still equals the current
- *  scrollHeight): an empty/failed page or a no-op reveal. Left set, it
- *  would latch onto the next unrelated growth (a live append while
- *  scrolled up) and jump the viewport, so the caller drops it. See #2236. */
+/** A settled load that didn't grow the transcript; left set it would jump the viewport on the next live append. */
 export function anchorIsStale(loading: boolean, anchor: number | null, scrollHeight: number): boolean {
   return !loading && anchor != null && anchor === scrollHeight;
 }

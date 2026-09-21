@@ -13,7 +13,14 @@ type Params = {
   sessionsLoaded: boolean;
 };
 
-function setup(initialEntry: string, initialProps: Params) {
+const params = (over: Partial<Params> = {}): Params => ({
+  activeSessionId: null,
+  sessions: [{ id: "s1" }],
+  sessionsLoaded: true,
+  ...over,
+});
+
+function setup(initialEntry: string, initialProps: Params = params()) {
   const wrapper = ({ children }: { children: ReactNode }) => (
     <MemoryRouter initialEntries={[initialEntry]}>{children}</MemoryRouter>
   );
@@ -28,15 +35,10 @@ function setup(initialEntry: string, initialProps: Params) {
   );
 }
 
-/** Drive the `(display-mode: standalone)` check `isStandalone()` reads.
- *  Defaults to not-standalone (a plain browser tab) when never called. */
 function stubStandalone(standalone: boolean) {
   vi.stubGlobal(
     "matchMedia",
-    vi.fn((query: string) => {
-      const matches = query === "(display-mode: standalone)" && standalone;
-      return { matches, media: query } as MediaQueryList;
-    }),
+    vi.fn((query: string) => ({ matches: query === "(display-mode: standalone)" && standalone, media: query })),
   );
 }
 
@@ -48,51 +50,31 @@ afterEach(() => {
 
 describe("useLastSessionRestore", () => {
   it("persists the active session id", async () => {
-    setup("/session/s1", { activeSessionId: "s1", sessions: [{ id: "s1" }], sessionsLoaded: true });
+    setup("/session/s1", params({ activeSessionId: "s1" }));
     await waitFor(() => expect(localStorage.getItem(LAST_SESSION_KEY)).toBe("s1"));
   });
 
-  it("restores the stored session on a standalone PWA cold launch to the dashboard root", async () => {
-    stubStandalone(true);
+  // Only a standalone PWA cold launch resumes; a browser tab stays on the dashboard.
+  it.each([
+    [true, "/session/s1"],
+    [false, "/"],
+  ])("standalone=%s restores a stored session to %s", async (standalone, pathname) => {
+    stubStandalone(standalone);
     localStorage.setItem(LAST_SESSION_KEY, "s1");
-    const { result } = setup("/", {
-      activeSessionId: null,
-      sessions: [{ id: "s1" }],
-      sessionsLoaded: true,
-    });
-    await waitFor(() => expect(result.current.location.pathname).toBe("/session/s1"));
-  });
-
-  it("stays on the dashboard on a plain browser tab cold launch, even with a stored session id", async () => {
-    stubStandalone(false);
-    localStorage.setItem(LAST_SESSION_KEY, "s1");
-    const { result } = setup("/", {
-      activeSessionId: null,
-      sessions: [{ id: "s1" }],
-      sessionsLoaded: true,
-    });
-    await waitFor(() => expect(result.current.location.pathname).toBe("/"));
+    const { result } = setup("/");
+    await waitFor(() => expect(result.current.location.pathname).toBe(pathname));
   });
 
   it("drops a stored id that no longer matches a loaded session", async () => {
     stubStandalone(true);
     localStorage.setItem(LAST_SESSION_KEY, "gone");
-    const { result } = setup("/", {
-      activeSessionId: null,
-      sessions: [{ id: "s1" }],
-      sessionsLoaded: true,
-    });
+    const { result } = setup("/");
     await waitFor(() => expect(localStorage.getItem(LAST_SESSION_KEY)).toBeNull());
     expect(result.current.location.pathname).toBe("/");
   });
 
   it("does nothing on a cold launch with no stored session", async () => {
-    const { result } = setup("/", {
-      activeSessionId: null,
-      sessions: [{ id: "s1" }],
-      sessionsLoaded: true,
-    });
-    // Give effects a tick; the dashboard stays put and no key is written.
+    const { result } = setup("/");
     await waitFor(() => expect(result.current.location.pathname).toBe("/"));
     expect(localStorage.getItem(LAST_SESSION_KEY)).toBeNull();
   });
@@ -100,38 +82,28 @@ describe("useLastSessionRestore", () => {
   it("waits for the sessions list before restoring", async () => {
     stubStandalone(true);
     localStorage.setItem(LAST_SESSION_KEY, "s1");
-    const { result, rerender } = setup("/", {
-      activeSessionId: null,
-      sessions: [],
-      sessionsLoaded: false,
-    });
-    // Not loaded yet: no redirect.
+    const { result, rerender } = setup("/", params({ sessions: [], sessionsLoaded: false }));
     expect(result.current.location.pathname).toBe("/");
-    rerender({ activeSessionId: null, sessions: [{ id: "s1" }], sessionsLoaded: true });
+    rerender(params());
     await waitFor(() => expect(result.current.location.pathname).toBe("/session/s1"));
   });
 
   it("does not override a deep link to a session", async () => {
     localStorage.setItem(LAST_SESSION_KEY, "s1");
-    const { result } = setup("/session/other", {
-      activeSessionId: "other",
-      sessions: [{ id: "s1" }, { id: "other" }],
-      sessionsLoaded: true,
-    });
+    const { result } = setup(
+      "/session/other",
+      params({ activeSessionId: "other", sessions: [{ id: "s1" }, { id: "other" }] }),
+    );
     await waitFor(() => expect(localStorage.getItem(LAST_SESSION_KEY)).toBe("other"));
     expect(result.current.location.pathname).toBe("/session/other");
   });
 
   it("clears the stored session on an in-app return to the dashboard", async () => {
-    const { result, rerender } = setup("/session/s1", {
-      activeSessionId: "s1",
-      sessions: [{ id: "s1" }],
-      sessionsLoaded: true,
-    });
+    const { result, rerender } = setup("/session/s1", params({ activeSessionId: "s1" }));
     await waitFor(() => expect(localStorage.getItem(LAST_SESSION_KEY)).toBe("s1"));
 
     act(() => result.current.navigate("/"));
-    rerender({ activeSessionId: null, sessions: [{ id: "s1" }], sessionsLoaded: true });
+    rerender(params());
 
     await waitFor(() => expect(localStorage.getItem(LAST_SESSION_KEY)).toBeNull());
     expect(result.current.location.pathname).toBe("/");

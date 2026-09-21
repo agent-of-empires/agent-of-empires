@@ -1,15 +1,9 @@
 // @vitest-environment jsdom
-//
-// Contract test for PairedShellPane's "Starting session..." placeholder and
-// shell-mode controls. The full mounted-terminal path is exercised by the
-// Playwright suites; this renders the early branches and asserts the loading
-// copy and shell picker are present. PairedShellPane is the body of the
-// "terminal" dock pane (previously the lower half of RightPanel).
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 
-import type { SessionResponse } from "../../lib/types";
+import { makeSession as baseSession } from "./fixtures";
 
 const ensureTerminal = vi.fn();
 vi.mock("../../lib/api", () => ({
@@ -51,27 +45,8 @@ vi.mock("../../hooks/useMobileKeyboard", () => ({
 
 import { PairedShellPane } from "../PairedTerminal";
 
-function makeSession(): SessionResponse {
-  return {
-    id: "sess-rp-1",
-    title: "rp-test",
-    project_path: "/tmp/test",
-    group_path: "/tmp",
-    tool: "claude",
-    status: "Running",
-    yolo_mode: false,
-    created_at: new Date().toISOString(),
-    last_accessed_at: null,
-    last_error: null,
-    branch: null,
-    main_repo_path: null,
-    is_sandboxed: false,
-    has_terminal: true,
-    profile: "default",
-    workspace_repos: [],
-    claude_fullscreen: false,
-  } as SessionResponse;
-}
+const makeSession = () =>
+  baseSession({ id: "sess-rp-1", title: "rp-test", project_path: "/tmp/test", status: "Running" });
 
 afterEach(() => {
   ensureTerminal.mockReset();

@@ -7,54 +7,30 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use serde_json::Value;
 use serial_test::parallel;
 
-use crate::harness::{app_dir_in, require_tmux, TuiTestHarness};
+use crate::harness::{require_tmux, wait_until, write_executable, TuiTestHarness};
 
-fn new_harness(name: &str) -> TuiTestHarness {
-    #[cfg(unix)]
-    {
-        TuiTestHarness::new_in_tmp(name)
-    }
-    #[cfg(not(unix))]
-    {
-        TuiTestHarness::new(name)
-    }
-}
-
-fn sessions_path(h: &TuiTestHarness) -> PathBuf {
-    app_dir_in(h.home_path()).join("profiles/default/sessions.json")
+/// A string field of the session titled `title`.
+fn session_field(h: &TuiTestHarness, title: &str, field: &str) -> Option<String> {
+    h.try_read_sessions()
+        .as_array()?
+        .iter()
+        .find(|s| s["title"].as_str() == Some(title))?
+        .get(field)?
+        .as_str()
+        .map(str::to_owned)
 }
 
 fn agent_session_id(h: &TuiTestHarness, title: &str) -> Option<String> {
-    let content = fs::read_to_string(sessions_path(h)).ok()?;
-    let sessions: Value = serde_json::from_str(&content).ok()?;
-    sessions
-        .as_array()?
-        .iter()
-        .find(|s| s["title"].as_str() == Some(title))?
-        .get("agent_session_id")?
-        .as_str()
-        .map(str::to_owned)
+    session_field(h, title, "agent_session_id")
 }
 
-fn omp_capture_generation(h: &TuiTestHarness, title: &str) -> Option<String> {
-    let content = fs::read_to_string(sessions_path(h)).ok()?;
-    let sessions: Value = serde_json::from_str(&content).ok()?;
-    sessions
-        .as_array()?
-        .iter()
-        .find(|s| s["title"].as_str() == Some(title))?
-        .get("omp_capture_generation")?
-        .as_str()
-        .map(str::to_owned)
-}
 fn clear_omp_capture_generation(h: &TuiTestHarness, title: &str) {
-    let path = sessions_path(h);
-    let mut sessions: Value =
-        serde_json::from_str(&fs::read_to_string(&path).expect("read sessions")).unwrap();
+    let path = h.sessions_path();
+    let mut sessions = h.read_sessions();
     let session = sessions
         .as_array_mut()
         .and_then(|rows| {
@@ -88,14 +64,7 @@ impl Drop for StopSessionOnDrop<'_> {
     }
 }
 fn configure_fresh_restart_capture(h: &TuiTestHarness) {
-    let config = app_dir_in(h.home_path()).join("config.toml");
-    let mut doc = fs::read_to_string(&config)
-        .unwrap_or_default()
-        .parse::<toml_edit::DocumentMut>()
-        .expect("parse config.toml");
-    doc["session"]["auto_resume_on_restart"] = toml_edit::value(false);
-    doc["session"]["restart_wake_message"] = toml_edit::value("");
-    fs::write(&config, doc.to_string()).expect("write config.toml");
+    h.append_config("[session]\nauto_resume_on_restart = false\nrestart_wake_message = \"\"");
 }
 
 const OMP_TITLE_FIRST: &str = "CliSidOmpFirstE2E";
@@ -122,26 +91,18 @@ fn write_project_omp_dotenv(project: &Path, store: &Path) {
 
 fn install_path_preserving_test_shell(h: &mut TuiTestHarness, path_bin: &Path) {
     let shell = h.home_path().join("omp-test-shell");
-    fs::write(
+    write_executable(
         &shell,
-        format!(
+        &format!(
             "#!/bin/sh\n[ \"${{1-}}\" = -l ] && shift\nexport PATH={}:\"$PATH\"\nexec /bin/sh \"$@\"\n",
             sh_quote(path_bin)
         ),
-    )
-    .expect("write OMP test shell");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&shell, fs::Permissions::from_mode(0o755))
-            .expect("chmod OMP test shell");
-    }
+    );
     h.set_env("SHELL", shell.to_str().expect("UTF-8 OMP test shell"));
 }
 
 fn launched_tmux_name(h: &TuiTestHarness, title: &str) -> String {
-    let content = fs::read_to_string(sessions_path(h)).expect("read sessions.json");
-    let sessions: Value = serde_json::from_str(&content).expect("parse sessions.json");
+    let sessions = h.read_sessions();
     let id = sessions
         .as_array()
         .and_then(|rows| rows.iter().find(|row| row["title"].as_str() == Some(title)))
@@ -150,62 +111,44 @@ fn launched_tmux_name(h: &TuiTestHarness, title: &str) -> String {
     agent_of_empires::tmux::Session::generate_name(id, title)
 }
 
-fn tmux_environment_contains(h: &TuiTestHarness, title: &str, key: &str) -> bool {
-    let output = std::process::Command::new("tmux")
-        .arg("-S")
-        .arg(h.home_path().join("tmux.sock"))
-        .args([
-            "show-environment",
-            "-h",
-            "-t",
-            &launched_tmux_name(h, title),
-        ])
+/// Run `tmux <args>` against the session's pane and return stdout.
+fn tmux_query(h: &TuiTestHarness, title: &str, args: &[&str]) -> String {
+    let name = launched_tmux_name(h, title);
+    let output = h
+        .tmux()
+        .arg(args[0])
+        .args(["-t", &name])
+        .args(&args[1..])
         .output()
-        .expect("show tmux environment");
+        .expect("tmux query");
     assert!(
         output.status.success(),
-        "tmux show-environment failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let prefix = format!("{key}=");
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .any(|line| line.starts_with(&prefix))
-}
-
-fn tmux_pane_start_command(h: &TuiTestHarness, title: &str) -> String {
-    let output = std::process::Command::new("tmux")
-        .arg("-S")
-        .arg(h.home_path().join("tmux.sock"))
-        .args([
-            "display-message",
-            "-p",
-            "-t",
-            &launched_tmux_name(h, title),
-            "#{pane_start_command}",
-        ])
-        .output()
-        .expect("read tmux pane start command");
-    assert!(
-        output.status.success(),
-        "tmux display-message failed: {}",
+        "tmux {args:?} failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+fn tmux_environment_contains(h: &TuiTestHarness, title: &str, key: &str) -> bool {
+    let prefix = format!("{key}=");
+    tmux_query(h, title, &["show-environment", "-h"])
+        .lines()
+        .any(|line| line.starts_with(&prefix))
+}
+
+fn tmux_pane_start_command(h: &TuiTestHarness, title: &str) -> String {
+    tmux_query(
+        h,
+        title,
+        &["display-message", "-p", "#{pane_start_command}"],
+    )
+}
+
 fn unset_tmux_environment(h: &TuiTestHarness, title: &str, key: &str) {
-    let output = std::process::Command::new("tmux")
-        .arg("-S")
-        .arg(h.home_path().join("tmux.sock"))
-        .args([
-            "set-environment",
-            "-h",
-            "-u",
-            "-t",
-            &launched_tmux_name(h, title),
-            key,
-        ])
+    let name = launched_tmux_name(h, title);
+    let output = h
+        .tmux()
+        .args(["set-environment", "-h", "-u", "-t", &name, key])
         .output()
         .expect("unset tmux environment");
     assert!(
@@ -216,69 +159,38 @@ fn unset_tmux_environment(h: &TuiTestHarness, title: &str, key: &str) {
 }
 
 fn wait_past_tmux_creation_second(h: &TuiTestHarness, title: &str) {
-    let output = std::process::Command::new("tmux")
-        .arg("-S")
-        .arg(h.home_path().join("tmux.sock"))
-        .args([
-            "display-message",
-            "-p",
-            "-t",
-            &launched_tmux_name(h, title),
-            "#{session_created}",
-        ])
-        .output()
-        .expect("read tmux session creation time");
-    assert!(
-        output.status.success(),
-        "tmux display-message failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let created_secs: u64 = String::from_utf8_lossy(&output.stdout)
+    let created_secs: u64 = tmux_query(h, title, &["display-message", "-p", "#{session_created}"])
         .trim()
         .parse()
         .expect("tmux session_created must be epoch seconds");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
+    wait_until(Duration::from_secs(2), Duration::from_millis(10), || {
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock before Unix epoch")
             .as_secs();
-        if now_secs > created_secs {
-            return;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "timed out waiting past tmux creation second {created_secs}"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+        (now_secs > created_secs)
+            .then_some(())
+            .ok_or_else(|| format!("still inside tmux creation second {created_secs}"))
+    });
 }
 
 fn wait_for_path(path: &Path) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !path.exists() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "timed out waiting for {}",
-            path.display()
-        );
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+    wait_until(Duration::from_secs(10), Duration::from_millis(50), || {
+        path.exists()
+            .then_some(())
+            .ok_or_else(|| format!("{} does not exist", path.display()))
+    });
 }
 
 fn wait_for_agent_session_id(h: &TuiTestHarness, title: &str, expected: &str) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    loop {
+    wait_until(Duration::from_secs(15), Duration::from_millis(100), || {
         let actual = agent_session_id(h, title);
         if actual.as_deref() == Some(expected) {
-            return;
+            Ok(())
+        } else {
+            Err(format!("{title:?} has {actual:?}, want {expected}"))
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "timed out waiting for {title:?} to capture {expected}; last value was {actual:?}"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+    });
 }
 
 fn install_toggling_fake_omp(h: &mut TuiTestHarness, project: &Path, omp_store: &Path) -> PathBuf {
@@ -319,13 +231,7 @@ fn install_toggling_fake_omp(h: &mut TuiTestHarness, project: &Path, omp_store: 
         cwd = sh_quote(project),
         store = sh_quote(omp_store),
     );
-    let script_path = bin.join("omp");
-    fs::write(&script_path, script).expect("write fake omp");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).expect("chmod omp");
-    }
+    write_executable(&bin.join("omp"), &script);
     control
 }
 
@@ -403,20 +309,14 @@ fn install_reconstructing_fake_omp(
         old_cwd = sh_quote(old_project),
         cwd = sh_quote(project),
     );
-    let script_path = bin.join("omp");
-    fs::write(&script_path, script).expect("write reconstructing fake omp");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).expect("chmod omp");
-    }
+    write_executable(&bin.join("omp"), &script);
 }
 
 #[test]
 #[parallel]
 fn omp_routing_restart_generation_and_same_cwd_pane_attribution_are_preserved() {
     require_tmux!();
-    let mut h = new_harness("cli_sid_omp_terminal");
+    let mut h = TuiTestHarness::new_in_tmp("cli_sid_omp_terminal");
     let project = h.project_path();
     let omp_store = h.home_path().join("dotenv-omp-store");
     fs::create_dir_all(omp_store.join("sessions/decoy")).expect("create OMP store");
@@ -437,7 +337,7 @@ fn omp_routing_restart_generation_and_same_cwd_pane_attribution_are_preserved() 
     .expect("write OMP decoy");
 
     for title in [OMP_TITLE_FIRST, OMP_TITLE_SECOND] {
-        let add = h.run_cli(&[
+        h.run_cli_ok(&[
             "add",
             project.to_str().unwrap(),
             "-c",
@@ -446,11 +346,6 @@ fn omp_routing_restart_generation_and_same_cwd_pane_attribution_are_preserved() 
             title,
             "--extra-args=--thinking low",
         ]);
-        assert!(
-            add.status.success(),
-            "add failed: {}",
-            String::from_utf8_lossy(&add.stderr)
-        );
     }
     let _stop_first = StopSessionOnDrop {
         h: &h,
@@ -467,12 +362,7 @@ fn omp_routing_restart_generation_and_same_cwd_pane_attribution_are_preserved() 
         ("restart", OMP_TITLE_FIRST, "second", OMP_SID_SECOND),
         ("start", OMP_TITLE_SECOND, "third", OMP_SID_THIRD),
     ] {
-        let output = h.run_cli(&["session", operation, title]);
-        assert!(
-            output.status.success(),
-            "{operation} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        h.run_cli_ok(&["session", operation, title]);
         wait_for_path(&control.join(format!("ready-{slot}")));
         assert_eq!(
             fs::read_to_string(control.join(format!("pi-dir-{slot}")))
@@ -497,7 +387,7 @@ fn omp_routing_restart_generation_and_same_cwd_pane_attribution_are_preserved() 
             "the benign extra_args must reach OMP unchanged"
         );
         wait_for_agent_session_id(&h, title, expected);
-        let generation = omp_capture_generation(&h, title)
+        let generation = session_field(&h, title, "omp_capture_generation")
             .unwrap_or_else(|| panic!("{operation} must persist an OMP capture generation"));
         generations.push(generation);
     }
@@ -520,7 +410,7 @@ fn omp_routing_restart_generation_and_same_cwd_pane_attribution_are_preserved() 
 #[parallel]
 fn omp_reconstruction_rejects_prelaunch_then_accepts_cross_project_and_backfills_legacy() {
     require_tmux!();
-    let mut h = new_harness("cli_sid_omp_reconstruction");
+    let mut h = TuiTestHarness::new_in_tmp("cli_sid_omp_reconstruction");
     let project = h.project_path();
     let old_project = h.home_path().join("unrelated-old-project");
     fs::create_dir_all(&old_project).expect("create unrelated old project");
@@ -538,20 +428,10 @@ fn omp_reconstruction_rejects_prelaunch_then_accepts_cross_project_and_backfills
     let metadata_title = "CliSidOmpMetadataReconstructionE2E";
     let legacy_title = "CliSidOmpLegacyReconstructionE2E";
     for title in [metadata_title, legacy_title] {
-        let add = h.run_cli(&["add", project.to_str().unwrap(), "-c", "omp", "-t", title]);
-        assert!(
-            add.status.success(),
-            "add failed: {}",
-            String::from_utf8_lossy(&add.stderr)
-        );
+        h.run_cli_ok(&["add", project.to_str().unwrap(), "-c", "omp", "-t", title]);
     }
 
-    let metadata_start = h.run_cli(&["session", "start", metadata_title]);
-    assert!(
-        metadata_start.status.success(),
-        "metadata start failed: {}",
-        String::from_utf8_lossy(&metadata_start.stderr)
-    );
+    h.run_cli_ok(&["session", "start", metadata_title]);
     let control = h.home_path().join("omp-control");
     wait_for_path(&control.join("ready-metadata"));
     assert_eq!(
@@ -577,12 +457,7 @@ fn omp_reconstruction_rejects_prelaunch_then_accepts_cross_project_and_backfills
     );
 
     write_project_omp_dotenv(&project, &legacy_store);
-    let legacy_start = h.run_cli(&["session", "start", legacy_title]);
-    assert!(
-        legacy_start.status.success(),
-        "legacy start failed: {}",
-        String::from_utf8_lossy(&legacy_start.stderr)
-    );
+    h.run_cli_ok(&["session", "start", legacy_title]);
     wait_for_path(&control.join("ready-legacy"));
     assert_eq!(
         fs::read_to_string(control.join("pi-dir-legacy")).expect("read legacy PI_CODING_AGENT_DIR"),

@@ -6,28 +6,18 @@ import { SchemaSection } from "./SchemaSection";
 const PLUGIN_PREFIX = "plugin:";
 
 interface Props {
-  /** Full schema descriptor list (`GET /api/settings/schema`), including the
-   *  virtual `plugin:<id>` sections of active plugins. */
+  /** Includes the virtual `plugin:<id>` sections. */
   schema: SettingsFieldDescriptor[];
-  /** The loaded global settings object (`GET /api/settings`). */
   settings: Record<string, unknown> | null;
-  /** Re-fetch settings after a successful save, so the new value round-trips. */
   onSaved: () => void;
 }
 
-/** Stored value table for a plugin's settings: `plugins.<id>.settings`. */
 function storedSettings(settings: Record<string, unknown> | null, id: string): Record<string, unknown> {
   const plugins = (settings?.plugins ?? {}) as Record<string, { settings?: Record<string, unknown> }>;
   return plugins[id]?.settings ?? {};
 }
 
-/**
- * Settings for active plugins, rendered through the same generic SchemaSection
- * as core settings, one block per `plugin:<id>` section. Plugin settings are
- * global-only at Tier 0, so saves go through the global `PATCH /api/settings`
- * (the server folds `plugin:<id>` into `plugins.<id>.settings`); the manifest's
- * declared default is shown until a value is stored.
- */
+/** One SchemaSection per active plugin; plugin settings are global, saved via `PATCH /api/settings`. */
 export function PluginSettingsSections({ schema, settings, onSaved }: Props) {
   const sections = useMemo(() => {
     const seen = new Set<string>();

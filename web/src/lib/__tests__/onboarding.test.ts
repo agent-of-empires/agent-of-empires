@@ -41,7 +41,6 @@ describe("shouldShowWelcome", () => {
   });
 
   it("ignores pointer type: shows on touch (unlike the tour auto-launch)", () => {
-    // No isDesktop input by design; the predicate has no pointer clause.
     expect(shouldShowWelcome(base)).toBe(true);
   });
 });

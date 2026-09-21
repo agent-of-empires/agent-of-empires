@@ -20,20 +20,15 @@ use crate::tui::components::hover::paint_hover_bg;
 use crate::tui::components::{set_input_cursor_position, truncate_to_width};
 use crate::tui::styles::Theme;
 
-/// Detect if we're running over SSH
 fn is_ssh_session() -> bool {
     std::env::var("SSH_CONNECTION").is_ok()
         || std::env::var("SSH_CLIENT").is_ok()
         || std::env::var("SSH_TTY").is_ok()
 }
 
-/// Word-wrap `text` to a maximum display width, collapsing runs of
-/// whitespace so the multi-line `\`-continued descriptions in
-/// `fields.rs` (which preserve indentation on each source line) render
-/// without runs of extra spaces. Returns at least one line so callers
-/// can use `lines.len()` as a height directly. A word wider than
-/// `width` is left on its own line and will overflow; descriptions are
-/// natural prose so this isn't a real-world case.
+/// Word-wrap `text`, collapsing whitespace runs so the `\`-continued
+/// descriptions in `fields.rs` do not render their source indentation.
+/// Always returns at least one line, so callers can use it as a height.
 pub(super) fn wrap_description_lines(text: &str, width: u16) -> Vec<String> {
     if text.is_empty() {
         return Vec::new();
@@ -70,33 +65,26 @@ pub(super) fn wrap_description_lines(text: &str, width: u16) -> Vec<String> {
 }
 
 /// Line count of [`wrap_description_lines`], used by `field_height`.
-// ponytail: allocates the wrapped Vec just to count it; settings render is
-// not hot enough to warrant a second copy of the wrap algorithm.
 pub(super) fn wrap_description_height(text: &str, width: u16) -> u16 {
     wrap_description_lines(text, width).len() as u16
 }
 
 impl SettingsView {
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        // Rebuilt every frame: scope tabs, category rows, and visible
-        // field rows all shift when the layout changes (scope switch,
-        // category resort, scroll), so stale rects from the prior
-        // frame would point at the wrong cells.
+        // Rebuilt every frame: a stale rect points at the wrong cell.
         self.scope_tab_rects.clear();
         self.category_rects.clear();
         self.field_rects.clear();
         self.search_hit_rows.clear();
         self.search_popup_area = Rect::default();
-        // Repopulated below only when the fields panel overflows; a zero
-        // rect means "no bar to grab" for the mouse hit test.
+        // Repopulated below only when the panel overflows; a zero rect means
+        // "no bar to grab".
         self.scrollbar_area = Rect::default();
 
-        // Clear the area
         frame.render_widget(Clear, area);
 
-        // Main layout: title bar, the permanent search bar, content,
-        // footer. The bar always renders (a placeholder when idle) so
-        // the search affordance is visible without knowing the hotkey.
+        // The search bar always renders, placeholder when idle, so the
+        // affordance is visible without knowing the hotkey.
         let layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -113,31 +101,23 @@ impl SettingsView {
         self.render_content(frame, layout[2], theme);
         self.render_footer(frame, layout[3], theme);
 
-        // Render custom instruction dialog overlay if active
         if let Some(ref dialog) = self.custom_instruction_dialog {
             dialog.render(frame, area, theme);
         }
 
-        // Render help overlay on top
         if self.show_help {
             self.render_help_overlay(frame, area, theme);
         }
 
-        // The jump popup paints last so it drops over the panels (and
-        // any overlay beneath), anchored under the bar like a
-        // command-palette dropdown. Key dispatch is already gated on
-        // `search_input.is_some()`; painting last makes that gate
-        // visible too.
+        // Painted last so it drops over the panels and any overlay beneath.
         if self.search_input.is_some() {
             let content_area = layout[2];
             self.render_search_dropdown(frame, layout[1], content_area, theme);
         }
     }
 
-    /// The permanent settings search bar between the header and the
-    /// panels (issue #2932). Idle, it shows a placeholder advertising
-    /// `/`; active, it is the query input for the jump popup below,
-    /// with the hit count right-aligned.
+    /// The permanent search bar: a placeholder advertising `/` when idle, the
+    /// query input with a right-aligned hit count when active.
     fn render_search_bar(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let Some(input) = self.search_input.as_ref() else {
             let block = Block::default()
@@ -201,10 +181,8 @@ impl SettingsView {
         }
     }
 
-    /// The jump popup: a dropdown of ranked hits anchored under the
-    /// search bar, command-palette style. Each row shows the hit's
-    /// category, label, and current value (truncated); Enter jumps to
-    /// the highlighted hit in its category.
+    /// The ranked-hit dropdown under the search bar. Enter jumps to the
+    /// highlighted hit in its category.
     fn render_search_dropdown(
         &mut self,
         frame: &mut Frame,
@@ -215,8 +193,6 @@ impl SettingsView {
         let width = bar_area.width.saturating_sub(4).max(20);
         let x = bar_area.x + 2;
         let y = content_area.y;
-        // Rows + borders, capped to the content area so the footer
-        // hints stay visible.
         let height = (self.search_hits.len().max(1) as u16 + 2).min(content_area.height);
         let dialog_area = Rect {
             x,
@@ -250,8 +226,7 @@ impl SettingsView {
             .search_selected
             .saturating_sub(visible.saturating_sub(1));
         let mut lines: Vec<Line> = Vec::new();
-        // Screen row per visible hit, for click + hover routing (the
-        // command palette's visible_item_rows pattern).
+        // Screen row per visible hit, for click and hover routing.
         let mut hit_rows: Vec<(u16, usize)> = Vec::new();
         for (i, hit) in self
             .search_hits
@@ -278,9 +253,6 @@ impl SettingsView {
                 ),
                 Span::styled(hit.field_label.clone(), label_style),
             ];
-            // The current value renders dimmed after the label so the
-            // popup doubles as a settings review surface, truncated to
-            // what fits on the row.
             if !hit.value_display.is_empty() {
                 let used = 2 + hit.category_label.width() + 3 + hit.field_label.width();
                 let budget = (inner.width as usize).saturating_sub(used + 2);
@@ -328,10 +300,8 @@ impl SettingsView {
                 format!("Profile: {}", self.profile)
             };
 
-        // Pre-compute the rect for each `[ <Scope> ]` chip so clicks can
-        // switch scope. The widths must stay in sync with the spans
-        // pushed just below; the layout is deterministic enough to
-        // mirror it inline without re-querying the paragraph.
+        // Rect per `[ <Scope> ]` chip so clicks can switch scope. Widths must
+        // stay in sync with the spans pushed below.
         let chip_y = inner.y;
         let chip_height: u16 = 1;
         let global_chip_width: u16 = 2 + 6 + 2; // "[ Global ]"
@@ -381,10 +351,8 @@ impl SettingsView {
 
         frame.render_widget(Paragraph::new(Line::from(spans)), inner);
 
-        // Hover overlay: paint a dim bg over the chip the mouse is on,
-        // unless it's already the active scope (whose accent fg is its
-        // own indicator). Resolved after the paragraph paints so the
-        // chip text remains readable on top.
+        // Dim bg over the hovered chip, unless it is the active scope, whose
+        // accent fg is its own indicator. After the paragraph, to stay legible.
         if let Some(scope) = self.hovered_scope() {
             if scope != self.scope {
                 if let Some((_, rect)) = self
@@ -400,7 +368,6 @@ impl SettingsView {
     }
 
     fn render_content(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        // Split into categories (left) and fields (right)
         let layout = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -410,18 +377,11 @@ impl SettingsView {
             .split(area);
 
         self.render_categories(frame, layout[0], theme);
-        // The Plugins category hosts the embedded plugin manager in the right
-        // pane; every other category renders the normal field list.
         if self.current_category() == SettingsCategory::Plugins {
             let focused = self.focus == SettingsFocus::Fields;
-            // Master-detail: the manager list on top, sized to its rows, and
-            // the SELECTED plugin's editable settings beneath it (the same
-            // generic field list every other category renders;
-            // `rebuild_fields` filters it to the selection). Tab moves the
-            // sub-focus between the panes. While the manager captures input
-            // (discover mode, an open consent/progress popup) it owns the
-            // whole pane: those surfaces need the space, and popups center
-            // within its rect.
+            // Master-detail: the manager list on top, the selected plugin's
+            // fields beneath. While the manager captures input (discover mode,
+            // a popup) it owns the whole pane: those surfaces need the space.
             self.plugin_manager
                 .set_has_settings_pane(!self.fields.is_empty());
             if self.fields.is_empty() || self.plugin_manager.captures_input() {
@@ -484,23 +444,16 @@ impl SettingsView {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        // Categories panel: sections render as dimmed, non-selectable
-        // dividers; tabs render with the existing "> "/"  " prefix and
-        // selection highlight. The first tab in each section is
-        // visually indented by the prefix already; sections take the
-        // same horizontal slot so the eye reads the group label as a
-        // heading above the tabs that follow.
+        // Sections are non-selectable dividers sharing the tabs' horizontal
+        // slot, so they read as headings above the tabs that follow.
         let items: Vec<ListItem> = self
             .categories
             .iter()
             .enumerate()
             .map(|(i, row)| match row {
                 CategoryRow::Section(label) => {
-                    // Bumped from `theme.dimmed` to `theme.text` so the
-                    // section dividers read as headings rather than as
-                    // faded background. Bold helps them anchor the
-                    // group visually without competing with the accent
-                    // color used for the active tab.
+                    // `theme.text`, not dimmed, so dividers read as headings
+                    // without competing with the active tab's accent.
                     let style = Style::default().fg(theme.text).add_modifier(Modifier::BOLD);
                     ListItem::new(*label).style(style)
                 }
@@ -526,10 +479,8 @@ impl SettingsView {
             })
             .collect();
 
-        // Capture hit rect per Tab row (Section dividers are skipped).
-        // The List renders rows top-down starting at `inner.y`. We
-        // mirror that layout here so each rect points at the same row
-        // the user sees.
+        // Hit rect per Tab row, mirroring the List's top-down layout from
+        // `inner.y`. Section dividers are skipped.
         for (i, row) in self.categories.iter().enumerate() {
             if matches!(row, CategoryRow::Tab(_)) && (i as u16) < inner.height {
                 self.category_rects
@@ -540,9 +491,7 @@ impl SettingsView {
         let list = List::new(items);
         frame.render_widget(list, inner);
 
-        // Hover overlay: dim bg on whichever category row the mouse
-        // sits over, suppressed when that row is already the selected
-        // category (selection wins, same rule as the sidebar).
+        // Dim bg on the hovered category row; selection wins over hover.
         if let Some(idx) = self.hovered_category() {
             if idx != self.selected_category {
                 if let Some((_, rect)) =
@@ -593,7 +542,6 @@ impl SettingsView {
             return;
         }
 
-        // Show SSH warning for Sound category
         let current_category = self.current_category();
         let warning_offset = if current_category == SettingsCategory::Sound && is_ssh_session() {
             let warning = vec![
@@ -623,13 +571,9 @@ impl SettingsView {
             0u16
         };
 
-        // Status messages render in the footer status row (see
-        // `render_footer`), not over the fields, so the fields panel keeps its
-        // full height and nothing has to be reserved here.
         let fields_viewport_height = inner.height.saturating_sub(warning_offset);
         self.fields_viewport_height = fields_viewport_height;
 
-        // Calculate total content height
         let mut total_content_height = 0u16;
         for (i, field) in self.fields.iter().enumerate() {
             if i > 0 {
@@ -640,20 +584,17 @@ impl SettingsView {
 
         let scroll_offset = self.fields_scroll_offset;
 
-        // Render fields with scroll offset applied
         let mut y_pos = 0u16; // absolute position in content space
         for (i, field) in self.fields.iter().enumerate() {
             let field_h = self.field_height(field, i);
             let field_top = y_pos;
             let field_bottom = y_pos + field_h;
 
-            // Skip fields entirely above the viewport
             if field_bottom <= scroll_offset {
                 y_pos += field_h + 1;
                 continue;
             }
 
-            // Stop if we're past the viewport
             if field_top >= scroll_offset + fields_viewport_height {
                 break;
             }
@@ -668,19 +609,15 @@ impl SettingsView {
             };
 
             self.render_field(frame, field_area, field, i, is_selected, theme);
-            // SectionHeader rows are non-interactive dividers; skipping
-            // them matches the keyboard navigation that hops over them.
+            // Dividers are non-interactive, as keyboard navigation reflects.
             if !matches!(field.value, FieldValue::SectionHeader) {
                 self.field_rects.push((i, field_area));
             }
             y_pos += field_h + 1; // +1 for spacing
         }
 
-        // Hover overlay: dim bg on whichever field the mouse sits over.
-        // Suppressed when that field is the selected one; the selected
-        // styling is already brighter and should win. Routed after the
-        // whole field loop so SectionHeader rows can't bleed an
-        // overlay on themselves (they never make it into field_rects).
+        // Dim bg on the hovered field; selection wins. After the field loop,
+        // so divider rows cannot bleed an overlay on themselves.
         if let Some(idx) = self.hovered_field() {
             let suppress = is_focused && idx == self.selected_field;
             if !suppress {
@@ -690,7 +627,6 @@ impl SettingsView {
             }
         }
 
-        // Render scrollbar if content overflows
         if total_content_height > fields_viewport_height {
             let scrollbar_area = Rect {
                 x: area.x + area.width - 1,
@@ -698,8 +634,7 @@ impl SettingsView {
                 width: 1,
                 height: area.height.saturating_sub(2),
             };
-            // Captured for the mouse hit test so a grab-drag on the bar
-            // can move the viewport (input handlers run between frames).
+            // Captured so a grab-drag on the bar can move the viewport.
             self.scrollbar_area = scrollbar_area;
 
             let mut scrollbar_state = ScrollbarState::new(
@@ -734,9 +669,8 @@ impl SettingsView {
         }
     }
 
-    /// Height in rows of a field's description after word-wrapping to
-    /// the fields panel width. Empty descriptions reserve zero rows so
-    /// section headers without a subtitle don't waste a blank line.
+    /// Wrapped height of a field's description; zero when it is empty, so a
+    /// subtitle-less section header wastes no line.
     pub(super) fn description_height(&self, description: &str) -> u16 {
         wrap_description_height(description, self.fields_content_width.max(1))
     }
@@ -750,13 +684,8 @@ impl SettingsView {
         is_selected: bool,
         theme: &Theme,
     ) {
-        // Section headers are non-interactive group dividers (e.g.
-        // "Advanced" inside Acp). Render as a styled heading with
-        // a dimmed subtitle. They never appear "selected" because the
-        // input handler skips navigation past them. Label uses
-        // `theme.text` (not dimmed) so it matches the categories-panel
-        // section dividers and reads as a heading rather than fading
-        // into the background.
+        // A styled heading with a dimmed subtitle, never selected because
+        // navigation skips it. `theme.text` matches the categories panel.
         if matches!(field.value, FieldValue::SectionHeader) {
             let heading = Line::from(vec![
                 Span::styled("── ", Style::default().fg(theme.border)),
@@ -769,11 +698,8 @@ impl SettingsView {
             frame.render_widget(Paragraph::new(heading), area);
             if !field.description.is_empty() {
                 let wrapped = wrap_description_lines(&field.description, area.width);
-                // Clamp the subtitle to the slice of `area` left below the
-                // heading. When the header sits at the bottom of the viewport
-                // `area` is clipped to fewer rows than the header's natural
-                // height, and an unclamped subtitle would paint past the panel,
-                // over its bottom border (issue #2083).
+                // `area` is clipped when the header sits at the bottom of the
+                // viewport, so an unclamped subtitle paints over the border.
                 let subtitle_height = (wrapped.len() as u16).min(area.height.saturating_sub(1));
                 if subtitle_height > 0 {
                     let subtitle_area = Rect {
@@ -822,10 +748,8 @@ impl SettingsView {
 
         frame.render_widget(Paragraph::new(label), area);
 
-        // `area` is clipped to the field's visible slice when the field sits at
-        // the bottom of the viewport. Bound the description and value to that
-        // slice so neither bleeds past the panel, over its bottom border or
-        // into the footer below (issue #2083).
+        // `area` is the field's visible slice: bound description and value to
+        // it so neither bleeds over the border or into the footer.
         let wrapped_desc = wrap_description_lines(&field.description, area.width);
         let desc_height = wrapped_desc.len() as u16;
         let desc_visible = desc_height.min(area.height.saturating_sub(1));
@@ -843,13 +767,9 @@ impl SettingsView {
             frame.render_widget(Paragraph::new(desc_lines), description_area);
         }
 
-        // Inner value renderers paint at `value_area.y + 1`, so shift
-        // by the wrapped description height to keep the value aligned
-        // directly under the (potentially multi-line) description. Skip the
-        // value entirely when that row falls outside the clipped slice rather
-        // than letting it spill past the field. The value occupies the row at
-        // `desc_height + 1` within the field, so it fits only when the clipped
-        // height leaves room for it.
+        // Inner renderers paint at `value_area.y + 1`, so shift by the wrapped
+        // description height. The value sits at row `desc_height + 1`, so it is
+        // skipped when the clipped slice leaves no room for it.
         if desc_height.saturating_add(1) >= area.height {
             return;
         }
@@ -872,9 +792,8 @@ impl SettingsView {
                             .chars()
                             .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
                             .collect();
-                        // Truncate on a char boundary: `&collapsed[..47]`
-                        // panics when a multi-byte char spans byte 47 of a
-                        // long custom instruction.
+                        // Truncate on a char boundary: byte slicing panics
+                        // when a multi-byte char spans the cut.
                         match collapsed.char_indices().nth(47) {
                             Some((cut, _)) => format!("{}...", &collapsed[..cut]),
                             None => collapsed,
@@ -895,9 +814,7 @@ impl SettingsView {
                 self.render_list_field(frame, value_area, items, index, is_selected, theme);
             }
             FieldValue::SectionHeader => {
-                // Already handled by the early return at the top of
-                // render_field; reaching this arm would mean the early
-                // return was bypassed, which is a programmer bug.
+                // Handled by the early return at the top of `render_field`.
             }
         }
     }
@@ -951,7 +868,6 @@ impl SettingsView {
         let is_editing = self.editing_input.is_some() && index == self.selected_field;
 
         if is_editing {
-            // Render with inverse-video cursor
             let input = self.editing_input.as_ref().unwrap();
             self.render_input_with_cursor(frame, value_area, input, theme);
         } else {
@@ -971,7 +887,6 @@ impl SettingsView {
         }
     }
 
-    /// Build spans for text with an inverse-video cursor at the given position
     fn build_cursor_spans(value: &str, cursor_pos: usize, theme: &Theme) -> Vec<Span<'static>> {
         let value_style = Style::default().fg(theme.accent);
         let cursor_style = Style::default().fg(theme.background).bg(theme.accent);
@@ -995,7 +910,6 @@ impl SettingsView {
         spans
     }
 
-    /// Render an Input with inverse-video cursor styling
     fn render_input_with_cursor(
         &self,
         frame: &mut Frame,
@@ -1010,7 +924,6 @@ impl SettingsView {
         }
     }
 
-    /// Render a list item with prefix and inverse-video cursor
     fn render_list_item_with_cursor(
         &self,
         frame: &mut Frame,
@@ -1055,7 +968,6 @@ impl SettingsView {
         let is_editing = self.editing_input.is_some() && index == self.selected_field;
 
         if is_editing {
-            // Render with inverse-video cursor
             let input = self.editing_input.as_ref().unwrap();
             self.render_input_with_cursor(frame, value_area, input, theme);
         } else {
@@ -1111,7 +1023,6 @@ impl SettingsView {
         let is_expanded = self.list_edit_state.is_some() && index == self.selected_field;
 
         if !is_expanded {
-            // Collapsed view - show count
             let value_area = Rect {
                 x: area.x,
                 y: area.y + 1,
@@ -1498,95 +1409,52 @@ impl SettingsView {
 mod tests {
     use super::{wrap_description_height, wrap_description_lines};
 
-    #[test]
-    fn wrap_description_lines_returns_empty_for_empty_input() {
-        assert!(wrap_description_lines("", 40).is_empty());
-    }
+    /// Approximates the Interaction tab's description, which is long enough
+    /// to wrap at any panel width.
+    const LONG: &str = "What Enter (and double-click) does on a session row in \
+                        the Structured view: attach to tmux (default, historical \
+                        behavior) or enter live-send mode so the home list stays \
+                        visible and keystrokes pipe through to the agent.";
 
     #[test]
-    fn wrap_description_lines_fits_short_text_on_one_line() {
-        let lines = wrap_description_lines("short text", 40);
-        assert_eq!(lines, vec!["short text".to_string()]);
-    }
+    fn descriptions_wrap_on_word_boundaries_and_collapse_whitespace() {
+        // (text, width, wrapped lines)
+        let cases: &[(&str, u16, &[&str])] = &[
+            ("", 40, &[]),
+            ("short text", 40, &["short text"]),
+            ("one two three four", 8, &["one two", "three", "four"]),
+            // The `\`-continued descriptions in fields.rs carry their source
+            // indentation, so runs of spaces collapse.
+            ("hello      world      again", 40, &["hello world again"]),
+            ("anything", 0, &["anything"]),
+        ];
+        for (text, width, want) in cases {
+            assert_eq!(wrap_description_lines(text, *width), *want, "{text:?}");
+        }
 
-    #[test]
-    fn wrap_description_lines_breaks_at_word_boundaries() {
-        let lines = wrap_description_lines("one two three four", 8);
-        // "one two" fits (7 chars), "three" needs new line, "four" fits with "three"
-        assert_eq!(
-            lines,
-            vec![
-                "one two".to_string(),
-                "three".to_string(),
-                "four".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn wrap_description_lines_collapses_runs_of_whitespace() {
-        // Mimics the multi-line `\`-continued descriptions in fields.rs
-        // where the continuation indentation produces runs of spaces.
-        let text = "hello      world      again";
-        let lines = wrap_description_lines(text, 40);
-        assert_eq!(lines, vec!["hello world again".to_string()]);
-    }
-
-    #[test]
-    fn wrap_description_lines_handles_long_setting_description() {
-        // Approximation of the Interaction tab description that
-        // triggered the cutoff bug at narrow widths (issue #1551).
-        let text = "What Enter (and double-click) does on a session row in \
-                    the Structured view: attach to tmux (default, historical \
-                    behavior) or enter live-send mode so the home list stays \
-                    visible and keystrokes pipe through to the agent. \
-                    Terminal/Tool views and structured-view sessions ignore this \
-                    setting.";
-        // At a 120-col-wide settings panel none of the wrapped lines
-        // should exceed the available width.
-        let lines = wrap_description_lines(text, 120);
-        assert!(lines.len() > 1, "long text should wrap to multiple lines");
+        let lines = wrap_description_lines(LONG, 120);
+        assert!(lines.len() > 1, "long text should wrap");
         for line in &lines {
-            assert!(
-                line.chars().count() <= 120,
-                "wrapped line {line:?} exceeds width"
-            );
+            assert!(line.chars().count() <= 120, "{line:?} exceeds the width");
         }
     }
 
+    /// The two must agree for every input, or `field_height` paints values
+    /// over the description in a real render.
     #[test]
-    fn wrap_description_lines_zero_width_returns_single_line() {
-        let lines = wrap_description_lines("anything", 0);
-        assert_eq!(lines, vec!["anything".to_string()]);
-    }
-
-    /// `wrap_description_height` must agree with `wrap_description_lines().len()`
-    /// for every input; it now delegates to `wrap_description_lines`, so this
-    /// guards against the delegation regressing. If they ever drift,
-    /// `field_height` will paint values on top of (or below) the description
-    /// in real renders.
-    #[test]
-    fn wrap_description_height_matches_wrap_description_lines() {
-        let cases: &[(&str, u16)] = &[
+    fn wrap_description_height_matches_the_line_count() {
+        for (text, width) in [
             ("", 40),
             ("short text", 40),
             ("one two three four", 8),
             ("hello      world      again", 40),
             ("anything", 0),
-            (
-                "What Enter (and double-click) does on a session row in \
-                 the Structured view: attach to tmux (default, historical \
-                 behavior) or enter live-send mode so the home list stays \
-                 visible and keystrokes pipe through to the agent.",
-                40,
-            ),
-        ];
-        for (text, width) in cases {
-            let expected = wrap_description_lines(text, *width).len() as u16;
-            let actual = wrap_description_height(text, *width);
+            (LONG, 40),
+        ] {
             assert_eq!(
-                actual, expected,
-                "height mismatch for text {text:?} width {width}"
+                wrap_description_height(text, width),
+                wrap_description_lines(text, width).len() as u16,
+                "{text:?} at width {width}"
             );
         }
     }
@@ -1599,11 +1467,8 @@ mod field_height_tests {
     use super::super::{FieldValue, SettingField, SettingsCategory};
     use serial_test::serial;
 
-    /// At a normal panel width, a short description fits on one row, so
-    /// `field_height` returns the historical `1 + 1 + 1`. At a width
-    /// narrow enough to force two wrap lines, the height grows by exactly
-    /// the extra row. Locks the contract between `description_height`
-    /// (consumed by the scroll math) and what the render pass paints.
+    /// Locks the contract between the height the scroll math uses and what
+    /// the render pass paints: a narrower panel grows it by the extra rows.
     #[test]
     #[serial]
     fn field_height_grows_with_wrapped_description() {
@@ -1626,8 +1491,7 @@ mod field_height_tests {
             "wide panel: label + 1-line desc + value"
         );
 
-        // Width that fits "alpha beta" (10) but not "alpha beta gamma" (16),
-        // forcing two wrap lines.
+        // Fits "alpha beta" but not "alpha beta gamma", so it wraps twice.
         view.fields_content_width = 12;
         assert_eq!(
             view.field_height(&field, 0),
@@ -1636,9 +1500,8 @@ mod field_height_tests {
         );
     }
 
-    /// Section headers have no value row. When the subtitle wraps, the
-    /// reported height must still match `1 + wrapped_subtitle_lines` so
-    /// the surrounding scroll math doesn't drift.
+    /// A section header has no value row, so its height is the label plus
+    /// the wrapped subtitle.
     #[test]
     #[serial]
     fn field_height_section_header_tracks_wrapped_subtitle() {
@@ -1702,21 +1565,16 @@ mod status_message_tests {
         }
     }
 
-    /// A field clipped to a partial row at the bottom of the fields panel must
-    /// not paint its description or value past the panel, over its bottom
-    /// border or into the footer below it (issue #2083). The status message no
-    /// longer lives in the panel, so the only thing that can spill is field
-    /// content, and the clamps must stop it.
+    /// A field clipped to a partial row at the bottom of the panel must not
+    /// paint past it, over the border or into the footer.
     #[test]
     #[serial]
     fn clipped_bottom_field_does_not_spill_below_panel() {
         let (_temp, _guard, mut view) = fresh_view();
         let theme = load_theme("empire");
 
-        // FieldA fits fully; FieldB lands at the bottom clipped to ~2 rows even
-        // though its wrapped description plus value need five. Its value
-        // ("SPILLVALUE") and the lower description lines would, before the fix,
-        // paint over the panel's bottom border and onto the blank rows beneath.
+        // FieldB lands at the bottom clipped to about two rows, though its
+        // wrapped description plus value need five.
         view.fields = vec![
             bool_field("FieldA", "alpha"),
             SettingField {
@@ -1729,8 +1587,7 @@ mod status_message_tests {
         ];
         view.fields_scroll_offset = 0;
 
-        // 8-row panel inside a 12-row buffer: rows 8..11 sit below the panel, so
-        // any spill is visible (not clipped off-screen) and readable.
+        // An 8-row panel in a 12-row buffer, so a spill is visible below it.
         let area = Rect::new(0, 0, 30, 8);
         let mut terminal = Terminal::new(TestBackend::new(30, 12)).unwrap();
         terminal
@@ -1747,8 +1604,7 @@ mod status_message_tests {
             !all.contains("SPILLVALUE"),
             "the clipped field's value must not render past its slice, got:\n{all}"
         );
-        // The panel's bottom border row (y = 7) must stay border-only; before
-        // the fix a wrapped description line painted letters over it.
+        // The panel's bottom border row must stay border-only.
         let border_row = row_text(&buf, 7);
         assert!(
             !border_row.chars().any(|c| c.is_ascii_alphabetic()),
@@ -1756,9 +1612,8 @@ mod status_message_tests {
         );
     }
 
-    /// The save/error status renders on its own footer row beneath the key
-    /// hints, colouring only its text, so it never collides with field content
-    /// (issue #2083).
+    /// The status has its own footer row beneath the key hints, so it can
+    /// never collide with field content.
     #[test]
     #[serial]
     fn footer_shows_status_below_hints() {
@@ -1766,7 +1621,6 @@ mod status_message_tests {
         let theme = load_theme("empire");
         let area = Rect::new(0, 0, 100, 3);
 
-        // Success toast: green, on the second inner row (y = 2), hints on y = 1.
         view.success_message = Some("Settings saved".to_string());
         let mut terminal = Terminal::new(TestBackend::new(100, 3)).unwrap();
         terminal
@@ -1788,7 +1642,6 @@ mod status_message_tests {
             "the success toast should use the running (green) colour"
         );
 
-        // Error: red, same row, sticky.
         view.success_message = None;
         view.error_message = Some("Memory Limit: expected a string".to_string());
         let mut terminal = Terminal::new(TestBackend::new(100, 3)).unwrap();
@@ -1808,14 +1661,12 @@ mod status_message_tests {
         );
     }
 
-    /// The "Settings saved" toast auto-dismisses once its window passes, while
-    /// a sticky error is left untouched (issue #2083).
+    /// The toast auto-dismisses once its window passes; an error is sticky.
     #[test]
     #[serial]
     fn tick_status_expires_success_but_keeps_error() {
         let (_temp, _guard, mut view) = fresh_view();
 
-        // Expired success toast: cleared, and the tick reports a redraw.
         view.success_message = Some("Settings saved".to_string());
         view.success_message_expires_at = Instant::now().checked_sub(Duration::from_secs(1));
         assert!(
@@ -1827,13 +1678,11 @@ mod status_message_tests {
             "the toast should be cleared"
         );
 
-        // Sticky error with no expiry: untouched.
         view.error_message = Some("Memory Limit: expected a string".to_string());
         view.success_message_expires_at = None;
         assert!(!view.tick_status(), "a sticky error should not tick away");
         assert!(view.error_message.is_some(), "the error should persist");
 
-        // Unexpired toast: left in place.
         view.success_message = Some("Settings saved".to_string());
         view.success_message_expires_at = Some(Instant::now() + Duration::from_secs(60));
         assert!(!view.tick_status(), "an unexpired toast should stay");
@@ -1848,8 +1697,8 @@ mod status_message_tests {
     #[serial]
     fn save_arms_the_success_toast_timer() {
         let (_temp, _guard, mut view) = fresh_view();
-        // Profile scope avoids the Global telemetry side effect; no fields means
-        // validation passes straight through to a real write.
+        // Profile scope avoids the Global telemetry side effect, and no fields
+        // means validation passes straight through to a real write.
         view.scope = SettingsScope::Profile;
         view.fields = Vec::new();
 
@@ -1862,9 +1711,8 @@ mod status_message_tests {
         );
     }
 
-    /// The `/` search is the fastest way around a settings surface with this
-    /// many fields, so normal mode must advertise it in the footer instead of
-    /// hiding it in the `?` help overlay (issue #2932).
+    /// Search is the fastest way around this many fields, so the footer
+    /// advertises it rather than the `?` overlay hiding it.
     #[test]
     #[serial]
     fn footer_advertises_search_in_normal_mode() {
@@ -1883,10 +1731,8 @@ mod status_message_tests {
         );
     }
 
-    /// While a list item is being typed, Enter confirms the item and Esc
-    /// cancels it. The footer must say so; the old hints (add / delete /
-    /// close list) described keys that do something else entirely in that
-    /// sub-mode (issue #2932).
+    /// While an item is being typed, Enter confirms and Esc cancels, so the
+    /// footer must not keep advertising the list-navigation keys.
     #[test]
     #[serial]
     fn footer_shows_item_edit_hints_while_typing_a_list_item() {
@@ -1894,7 +1740,6 @@ mod status_message_tests {
         let theme = load_theme("empire");
         let area = Rect::new(0, 0, 100, 3);
 
-        // Adding a new item: Enter adds, Esc cancels.
         view.list_edit_state = Some(super::super::ListEditState {
             selected_index: 0,
             editing_item: Some(tui_input::Input::new("FOO=bar".to_string())),
@@ -1914,7 +1759,6 @@ mod status_message_tests {
             "add-item footer must not show list-navigation hints, got {hints:?}"
         );
 
-        // Editing an existing item: Enter confirms the edit.
         view.list_edit_state = Some(super::super::ListEditState {
             selected_index: 0,
             editing_item: Some(tui_input::Input::new("FOO=bar".to_string())),
@@ -1930,8 +1774,7 @@ mod status_message_tests {
             "edit-item footer should show confirm/cancel hints, got {hints:?}"
         );
 
-        // Navigating the expanded list (no item being typed): the
-        // list-navigation hints remain.
+        // With no item being typed, the list-navigation hints remain.
         view.list_edit_state = Some(super::super::ListEditState::default());
         let mut terminal = Terminal::new(TestBackend::new(100, 3)).unwrap();
         terminal
@@ -1944,8 +1787,7 @@ mod status_message_tests {
         );
     }
 
-    /// An expanded empty list must tell the user how to add the first item
-    /// instead of rendering blank rows (issue #2932).
+    /// An expanded empty list says how to add the first item.
     #[test]
     #[serial]
     fn expanded_empty_list_shows_add_hint() {
@@ -1976,10 +1818,8 @@ mod status_message_tests {
         );
     }
 
-    /// With search active, the full render shows the bar as the query
-    /// input with the hit count, and the jump popup drops below it
-    /// listing `[Category] Label  value` rows with long values
-    /// truncated (issue #2932).
+    /// With search active the bar is the query input with a hit count, and
+    /// the popup below lists `[Category] Label  value` rows, truncated.
     #[test]
     #[serial]
     fn search_popup_renders_hits_with_values() {
@@ -2041,8 +1881,7 @@ mod status_message_tests {
         );
     }
 
-    /// The search bar is permanent: idle it advertises `/` with a
-    /// placeholder instead of disappearing (issue #2932 review).
+    /// The bar is permanent: idle, it advertises `/`.
     #[test]
     #[serial]
     fn idle_search_bar_shows_placeholder() {
@@ -2059,9 +1898,8 @@ mod status_message_tests {
         );
     }
 
-    /// While the add prompt is open, the previously selected list item
-    /// must not keep its `>` marker; two cursors at once made the add
-    /// flow read as messy (issue #2932).
+    /// The add prompt owns the only cursor, so the previously selected item
+    /// drops its `>` marker.
     #[test]
     #[serial]
     fn add_prompt_suppresses_the_item_cursor() {
@@ -2110,16 +1948,13 @@ mod status_message_tests {
         );
     }
 
-    /// A validation failure on save names the offending field so the user can
-    /// find it, instead of surfacing a bare reason like "expected a string"
-    /// (issue #2083).
+    /// A validation failure names the offending field, not just the reason.
     #[test]
     #[serial]
     fn save_error_names_the_field() {
         let (_temp, _guard, mut view) = fresh_view();
 
-        // A set-but-invalid value (not a cleared one, which now validates as
-        // unset) so validation genuinely fails and we can check the prefix.
+        // Set-but-invalid, since a cleared value validates as unset.
         view.fields = vec![SettingField {
             kind: FieldKind::Schema {
                 section: "sandbox".to_string(),

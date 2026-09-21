@@ -1,31 +1,21 @@
-//! Finding the links on a rendered preview row.
+//! Finding the links on a rendered preview row: the OSC 8 targets the pane
+//! advertised, then plain URLs in the row's own text. An advertised target wins
+//! wherever the two overlap, since a bare match is only inference.
 //!
-//! Two sources, checked in that order:
+//! Neither the vt100 grid nor a ratatui cell can carry a hyperlink, so OSC 8
+//! targets ride alongside the text (`PreviewCache::links`) and are re-anchored
+//! here to the row showing them.
 //!
-//! 1. **OSC 8 targets** the pane advertised. Neither the vt100 grid nor a
-//!    ratatui cell can carry a hyperlink, so these ride alongside the text
-//!    (`PreviewCache::links`) and are re-anchored here to the row showing them.
-//! 2. **Plain URLs in the row's own text**, which carry no sequence at all and
-//!    would otherwise be reachable only through the host terminal's own URL
-//!    matching, and then only with a modifier because aoe holds the mouse.
+//! Matching on text has a known limit: the pane's table outlives the row that
+//! filled it, so a link once printed as `[docs](x)` makes every later standalone
+//! `docs` on screen resolve to `x`. `MIN_LINK_TEXT` and word alignment rule out
+//! the worst of it, but not a common word. Hovering shows the target first and
+//! only http/https ever opens, which keeps this misleading rather than
+//! dangerous; removing it needs per-cell positions `vt100` does not keep.
 //!
-//! An OSC 8 target wins wherever the two overlap: it is what the pane actually
-//! said the text points at, while a bare match is inference.
-//!
-//! Known limit of matching on text: the pane's table outlives the row that
-//! filled it, so a link once printed as `[docs](x)` makes every later
-//! standalone `docs` on screen resolve to `x`, on rows that carried no
-//! sequence. `MIN_LINK_TEXT` and word alignment rule out the worst of it, but
-//! not a common word. Hovering shows the target before the click, and only
-//! http/https is ever opened, which is what keeps this misleading rather than
-//! dangerous. Removing it needs positions the emulator does not keep: `vt100`
-//! models no hyperlink per cell, and positions do not survive a reseed.
-//!
-//! The result never overlaps itself. Text matching can hand the same cell to
-//! several candidates (an agent that prints `[docs](A)` then `[docs](B)`, or a
-//! short link text occurring inside a longer one), and the painter and the
-//! click hit-test must agree about which one owns that cell, or the terminal
-//! advertises one target on hover while a click opens another.
+//! The result never overlaps itself: the painter and the click hit-test must
+//! agree about which candidate owns a cell, or the terminal advertises one
+//! target on hover while a click opens another.
 
 use crate::tui::components::text::line_columns;
 
@@ -46,10 +36,9 @@ const TRAILING_TRIM: &[char] = &['.', ',', ';', ':', '!', '?', '\'', '"', '>', '
 
 /// Find where `links` and any bare URLs sit on one rendered row.
 ///
-/// Matching on text is what makes the OSC 8 half survive the grid scrolling,
-/// being reseeded from `capture-pane`, or the sequence itself having left the
-/// stream long ago; none of those preserve cell positions. A link whose text
-/// wraps across two rows matches on neither.
+/// Matching on text is what makes the OSC 8 half survive scrolling, a reseed
+/// from `capture-pane`, or the sequence having left the stream: none of those
+/// preserve cell positions. A link whose text wraps two rows matches on neither.
 pub(crate) fn link_spans_for_line(
     line: &ratatui::text::Line,
     width: u16,
@@ -59,14 +48,11 @@ pub(crate) fn link_spans_for_line(
         return Vec::new();
     }
     // Cheap reject before building the column map, which allocates a scratch
-    // buffer per row. Every visible row is scanned every frame, and almost none
-    // hold a link, so this tests both sources against the line's own text
-    // first: painting only truncates, so a needle absent from the raw text
-    // cannot appear in the painted row.
+    // buffer per row. Almost no row holds a link, and painting only truncates, so
+    // a needle absent from the raw text cannot appear in the painted row.
+    // `matchable` rejects empty needles, which `contains("")` would match on every
+    // row, defeating the reject entirely.
     let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-    // A needle rejected by `matchable` is empty, and `contains("")` is true for
-    // every row, so one short link in the table would defeat the reject
-    // entirely and put a scratch buffer back on every row of every frame.
     let usable: Vec<&crate::tmux::osc8::PaneLink> = links
         .iter()
         .filter(|l| {
@@ -105,20 +91,14 @@ pub(crate) fn link_spans_for_line(
 
     for (start, end) in bare_url_ranges(&columns.text) {
         let end_column = columns.column_at(end);
-        // `columns.text` is the row as painted, so it stops where the pane
-        // does. A URL running to that boundary may be a prefix of the real one,
-        // and opening `https://example.com/log` for a link that reads
-        // `https://example.com/logout` is a wrong action, not a missing one.
-        //
-        // The boundary is not always `width`: a wide grapheme that does not fit
-        // leaves the text one column short, which is how
-        // `https://example.com/日本` at width 25 used to hand back
-        // `https://example.com/` as if it were whole. Refuse anything reaching
-        // the end of a clipped row, and anything reaching the pane edge.
-        //
-        // An advertised target cannot hit this: a truncated label simply fails
-        // to match. Rows wider than the pane show up when scrollback was
-        // captured at an older geometry, or mid-resize.
+        // `columns.text` is the row as painted, so it stops where the pane does.
+        // A URL running to that boundary may be a prefix of the real one, and
+        // opening `https://example.com/log` for `https://example.com/logout` is a
+        // wrong action, not a missing one. The boundary is not always `width`: a
+        // wide grapheme that does not fit leaves the text a column short. Refuse
+        // anything reaching the end of a clipped row or the pane edge. An
+        // advertised target cannot hit this; a truncated label simply fails to
+        // match.
         if end_column >= width || (columns.is_clipped() && end == columns.text.len()) {
             continue;
         }
@@ -148,10 +128,8 @@ struct Candidate {
 /// Reduce candidates to a set that never overlaps itself, so the painter, the
 /// OSC 8 emission and the click hit-test cannot disagree about a cell.
 ///
-/// Precedence: an advertised target over an inferred one, then the longer span
-/// (a link text occurring inside another's belongs to the enclosing one), then
-/// the more recently printed. Ties beyond that fall to the leftmost span, which
-/// makes the result independent of iteration order.
+/// Precedence: advertised over inferred, then the longer span, then the more
+/// recently printed, then the leftmost, so the result is order-independent.
 fn resolve_overlaps(mut candidates: Vec<Candidate>) -> Vec<LinkSpan> {
     candidates.sort_by(|a, b| {
         b.advertised
@@ -219,11 +197,9 @@ fn holds_scheme(text: &str) -> bool {
 }
 
 /// Byte ranges of the bare `http(s)://` URLs in `text`.
-///
-/// Deliberately simple: a scheme, then everything up to whitespace, then
-/// trailing punctuation trimmed off. A row of terminal output is not a document
-/// and the payoff for a stricter grammar is small, while the cost of matching
-/// too little is a link the user can see and cannot click.
+/// Deliberately simple: a scheme, then everything up to whitespace, with
+/// trailing punctuation trimmed. Matching too little costs the user a link they
+/// can see and cannot click.
 fn bare_url_ranges(text: &str) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let lower = text.to_ascii_lowercase();

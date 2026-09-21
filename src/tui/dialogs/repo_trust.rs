@@ -1,10 +1,8 @@
-//! Trust confirmation dialog for repository hooks and project-local MCP servers.
+//! Trust confirmation for repository hooks and project-local MCP servers.
 //!
-//! A repo's `.agent-of-empires/config.toml` hooks and its `.mcp.json` MCP
-//! servers both run code on the user's behalf (a stdio MCP server launches its
-//! `command` when a session spawns), so both sit behind one approval (#1985).
-//! The dialog displays whichever surfaces are present, redacting MCP env and
-//! header VALUES (names only), and records trust for each on approval.
+//! Both run code on the user's behalf, so they sit behind one approval. The
+//! dialog shows whichever surfaces are present, redacting MCP env and header
+//! values, and records trust for each on approval.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
@@ -18,17 +16,14 @@ use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::styles::Theme;
 
 pub struct RepoTrustDialog {
-    /// Final merged hook set (repo hooks overlaid on global/profile) shown to
-    /// the user. Empty when the repo defines no hooks.
+    /// Repo hooks overlaid on global and profile, as shown to the user.
     merged_hooks: HooksConfig,
     /// Repo-only hooks, used to label each displayed hook by source.
     repo_hooks: HooksConfig,
-    /// Project MCP servers to display (redacted). Empty when no `.mcp.json`.
+    /// Redacted project MCP servers; empty when there is no `.mcp.json`.
     mcp_servers: Vec<ProjectMcpServer>,
-    /// Precomputed merged hooks to run if the user trusts.
     hooks_on_trust: Option<HooksConfig>,
-    /// Precomputed merged hooks to run if the user skips (already-trusted hooks
-    /// still run; newly-prompted hooks are dropped).
+    /// Hooks to run on a skip: already-trusted ones only.
     hooks_on_skip: Option<HooksConfig>,
     /// Hashes to record on approval; `Some` only for a surface needing trust.
     hooks_hash: Option<String>,
@@ -39,22 +34,20 @@ pub struct RepoTrustDialog {
     trust_button_area: Rect,
     skip_button_area: Rect,
     cancel_button_area: Rect,
-    /// Which button the mouse is over, for the hover highlight. Visual only;
-    /// never changes `selected`.
+    /// The hovered button. Visual only; never changes `selected`.
     hover: HoverState,
 }
 
-/// Result from the repo trust dialog.
 pub enum RepoTrustAction {
-    /// User trusts the repo; record the surface hashes and run `hooks`.
     Trust {
         hooks_hash: Option<String>,
         mcp_hash: Option<String>,
         project_path: String,
         hooks: Option<HooksConfig>,
     },
-    /// User declined; create the session running only `hooks` (the skip set).
-    Skip { hooks: Option<HooksConfig> },
+    Skip {
+        hooks: Option<HooksConfig>,
+    },
 }
 
 impl RepoTrustDialog {
@@ -172,8 +165,8 @@ impl RepoTrustDialog {
     fn build_lines(&self) -> Vec<Line<'_>> {
         let mut lines = Vec::new();
 
-        // Hooks section: merged set with per-type source labels, sharing the
-        // grouping logic with the CLI trust prompt.
+        // Merged hooks with per-type source labels, grouped as the CLI prompt
+        // groups them.
         let groups = repo_config::hook_display_groups(&self.merged_hooks, &self.repo_hooks, true);
         if !groups.is_empty() {
             lines.push(Line::from(Span::styled(
@@ -191,7 +184,6 @@ impl RepoTrustDialog {
             }
         }
 
-        // Project MCP section: redacted (env / header VALUES never shown).
         if !self.mcp_servers.is_empty() {
             if !lines.is_empty() {
                 lines.push(Line::from(""));
@@ -214,19 +206,9 @@ impl RepoTrustDialog {
 
         let dialog_width = 64.min(area.width.saturating_sub(4));
         let dialog_height = (content_height + 6).min(area.height.saturating_sub(4));
-        let dialog_area = super::centered_rect(area, dialog_width, dialog_height);
-
-        frame.render_widget(Clear, dialog_area);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.accent))
-            .title(" Repository Trust ")
-            .title_style(Style::default().fg(theme.accent).bold());
-
-        let inner = block.inner(dialog_area);
-        frame.render_widget(block, dialog_area);
+        let block = super::toned_dialog_block(" Repository Trust ", theme.accent, theme.accent);
+        let (_, inner) =
+            super::render_dialog_frame(frame, area, dialog_width, dialog_height, block);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)

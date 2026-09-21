@@ -13,8 +13,6 @@ use crate::session::{
     GroupTree, Instance, SandboxInfo, Storage,
 };
 
-/// Parse one `--repo-base <repo>=<branch>` pair. Split on the first `=` so a
-/// branch containing one still parses.
 fn parse_repo_base(raw: &str) -> Result<(String, String), String> {
     let (repo, branch) = raw
         .split_once('=')
@@ -171,21 +169,12 @@ pub struct AddArgs {
 
 #[tracing::instrument(target = "cli.add", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
-    // Fail fast before any filesystem side effects: --interactive must
-    // have a real terminal to read the name from, otherwise the prompt
-    // would block on EOF or a PTY harness would hang.
     if args.interactive && !std::io::stdin().is_terminal() {
         bail!("--interactive requires a terminal; pass --title for non-interactive naming");
     }
 
-    // `add` files the session under `profile` and would create its
-    // directory; refuse an unknown name before anything else (#148).
     crate::session::require_known_profile(profile)?;
 
-    // Scratch sessions have no project path; the scratch directory is
-    // provisioned below once we know the instance id. Reject an
-    // explicitly-passed path loudly so `aoe add /some/repo --scratch` does
-    // not silently drop the path arg.
     if args.scratch && args.path.is_some() {
         bail!(
             "Cannot specify a project path with --scratch\nTip: drop the path argument, the session runs in a fresh scratch directory"
@@ -193,8 +182,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     }
 
     let mut path = if args.scratch {
-        // Placeholder; the real path is set after `Instance::new` runs and
-        // `scratch::provision_scratch_dir` returns a fresh scratch dir.
         PathBuf::new()
     } else {
         let raw = args.path.clone().unwrap_or_else(|| PathBuf::from("."));
@@ -235,56 +222,23 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     all_extra_repos.extend(args.extra_repos.iter().cloned());
     all_extra_repos.extend(resolved_project_paths);
 
-    // Scratch sessions have no project repo, so repo-scoped config
-    // overrides have nothing to anchor on. Resolving the repo-aware
-    // variant against the launch directory would silently pick up
-    // `.agent-of-empires/config.toml` from whatever folder the user
-    // happened to run `aoe add --scratch` in, which breaks the
-    // project-less contract. Fall back to the profile-only resolver.
     let config = if args.scratch {
         crate::session::config::profile_config::resolve_config_or_warn(profile)
     } else {
         repo_config::resolve_config_with_repo_or_warn(profile, &path)
     };
 
-    // Preserve the original project path for hook trust checking.
-    // `path` gets reassigned to the worktree/workspace directory below,
-    // but hooks are defined in the original repo's `.agent-of-empires/config.toml`.
     let original_project_path = path.clone();
 
     let mut worktree_info_opt = None;
     let mut workspace_info_opt = None;
 
-    // Phase 1 (unlocked): pre-flight read of the current persisted state to
-    // resolve `--parent`, generate a non-colliding title, and make best-effort
-    // duplicate / parent decisions before any side effects. Final duplicate
-    // enforcement happens under the flock in phase 3.
-    //
-    // The title is resolved here, before worktree creation, so a tied worktree
-    // session (`session.tie_workdir_to_name`) can seed its directory leaf from
-    // the title and start out aligned (#1927). The path-dependent duplicate
-    // check still runs later, once `path` points at the worktree.
     let storage = Storage::new_unwatched(profile)?;
     let (instances, _groups) = storage.load_with_groups()?;
     let final_title = resolve_session_title(&args, &instances)?;
 
-    // Resolve the agent tool now, before any worktree/scratch side effects.
-    // The fork-eligibility gate keys off the resolved tool (and the source
-    // session's captured agent id), and both are knowable here: resolving and
-    // validating before resource creation means an unforkable agent or a
-    // parent with no captured session bails without orphaning a worktree or
-    // scratch directory. The instance does not exist yet, so the seed is held
-    // and applied once the instance is built.
-    // `mut` because a `--fork-from` with no explicit `--tool`/`--cmd` inherits
-    // the parent's agent below.
     let mut resolved_tool = resolve_tool_for_add(&args, &config)?;
 
-    // `--fork-from` performs a TERMINAL fork (it seeds `agent_session_id` + a
-    // one-shot Fork resume intent). Pairing it with a structured-view request
-    // would write that terminal state onto a structured session, which is
-    // incoherent: structured fork is its own flow (ACP `session/fork`) and is
-    // offered from the web dashboard, not here. Reject it here, before any
-    // worktree or scratch directory is created, so the refusal leaks nothing.
     let wants_structured = args.structured_view || args.agent.is_some();
     if args.fork_from.is_some() && wants_structured {
         bail!(
@@ -293,14 +247,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         );
     }
 
-    // A terminal fork resumes the parent's captured conversation in place: the
-    // agent finds that conversation by session id under the SAME working
-    // directory and filesystem view. Flags that move the cwd (`--worktree` /
-    // `--new-branch` / `--scratch`) or swap the filesystem (`--sandbox` /
-    // `--sandbox-image`) silently break that lookup, and a user-supplied launch
-    // command carrying its own resume/fork flags collides with the ones the
-    // Fork intent appends. Reject these up front (before any resource creation)
-    // rather than launch a fork that can't find its parent. See PR review.
     if args.fork_from.is_some() {
         if explicit_worktree_branch(&args).is_some() || args.create_branch {
             bail!(
@@ -320,25 +266,12 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                  changes the agent's filesystem view and breaks the resumed conversation."
             );
         }
-        // --cmd-override swaps the launched binary out from under the tool: the
-        // Fork intent builds its resume+fork flags for `instance.tool`, but the
-        // override binary may be a different agent that rejects them (or, worse,
-        // a different agent handed the parent's agent-shaped id). Reject the
-        // pair rather than launch a cross-agent fork the tool check can't see.
         if args.cmd_override.is_some() {
             bail!(
                 "`--fork-from` cannot be combined with --cmd-override: overriding the agent binary \
                  decouples it from the parent's agent, so the fork's resume flags may not apply."
             );
         }
-        // The Fork intent appends the agent's own resume+fork flags: claude
-        // `--resume`/`--session-id`/`--fork-session`, opencode `--session`/
-        // `--fork`, codex `resume`/`fork` subcommands. A launch command that
-        // already carries any of them produces a duplicate/conflicting
-        // invocation. Match at WORD granularity (not raw substring) so a path
-        // or unrelated arg containing "fork"/"resume" (e.g. `--model resume-v2`
-        // or `/src/fork-utils`) doesn't false-trip, while `--session=ID` and the
-        // codex `fork`/`resume` subcommands still do.
         let collides_with_fork_flags = |cmd: &str| {
             cmd.split_whitespace().any(|w| {
                 w == "resume"
@@ -362,17 +295,8 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         }
     }
 
-    // Validate fork eligibility eagerly and produce the one-shot seed. This is
-    // a pure decision (source-session lookup over the already-loaded
-    // `instances`, plus `terminal_fork_seed`, which only consults the agent's
-    // static fork strategy), so it is safe to run before resource creation.
     let fork_seed: Option<crate::session::ForkSeed> = if let Some(fork_ref) = &args.fork_from {
         let source = super::resolve_session(fork_ref, &instances)?;
-        // A source that was itself created as a fork and has not launched yet
-        // still carries a one-shot Fork intent, and its `agent_session_id` is a
-        // pre-pinned child id that no agent has written to disk. Forking from it
-        // would resume a conversation that does not exist. Refuse until the
-        // child has run once and owns a real captured id.
         if matches!(
             source.resume_intent,
             crate::session::ResumeIntent::Fork { .. }
@@ -382,12 +306,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 source.title
             );
         }
-        // The child must fork the SAME agent as the parent: a captured id is
-        // agent-shaped (a Claude UUID resumes only under Claude, etc.), so
-        // handing it to a different agent's `--resume` fails or resumes garbage.
-        // When the user did not explicitly choose a tool (`--tool`/`--cmd`),
-        // inherit the parent's; when they did and it differs, reject rather than
-        // launch a cross-agent fork.
         let user_chose_tool = args.tool.is_some() || args.command.is_some();
         if user_chose_tool && resolved_tool != source.tool {
             bail!(
@@ -445,15 +363,10 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 builder::resolve_base_branch(session_base, project, global_default)
             };
 
-            // An explicit `--repo-base` for a repo outranks every shared layer,
-            // so one repo can fork from develop while others fork from their
-            // own epic branches. See #3329.
             let mut all_paths = vec![path.clone()];
             all_paths.extend(all_extra_repos.iter().cloned());
             let per_repo = builder::resolve_repo_base_selectors(&all_paths, &args.repo_bases)?;
 
-            // The launch repo never consults the per-project layer: explicit
-            // session base, then the global/profile default.
             let primary = builder::WorkspaceRepoSpec {
                 base_branch: per_repo
                     .get(&path)
@@ -494,7 +407,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
 
             println!("✓ Workspace created successfully");
         } else {
-            // Single worktree mode (existing logic)
             if !GitWorktree::is_git_repo(&path) {
                 bail!(
                     "Worktree mode requires a git repository, but this path is not one: {}\n\
@@ -508,10 +420,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             let git_wt =
                 GitWorktree::new(main_repo_path.clone())?.with_init_submodules(init_submodules);
 
-            // Attach mode: when `-b` is not passed, mirror the TUI's "Attach
-            // to existing branch" behavior. If a worktree already exists
-            // for this branch, point the session at it instead of bailing.
-            // This closes the CLI half of #969 / matches builder.rs.
             let attach_existing = !args.create_branch;
             let existing_match = if attach_existing {
                 git_wt.list_worktrees().ok().and_then(|wts| {
@@ -539,16 +447,11 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 let session_id = uuid::Uuid::new_v4().to_string();
                 let session_id_short = &session_id[..8];
 
-                // Choose appropriate template based on repo type (bare vs regular)
-                // Use main_repo_path (not path) to correctly detect bare repos when running from a worktree
                 let template = if GitWorktree::is_bare_repo(&main_repo_path) {
                     &config.worktree.bare_repo_path_template
                 } else {
                     &config.worktree.path_template
                 };
-                // Tied sessions name the directory after the title, not the
-                // branch, so the two cannot drift. The branch still creates the
-                // worktree below; only the path leaf changes. (#1927)
                 let leaf_seed_owned;
                 let leaf_seed = if config.session.tie_workdir_to_name {
                     leaf_seed_owned =
@@ -568,17 +471,10 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 }
 
                 println!("Creating worktree at: {}", worktree_path.display());
-                // One repo, so a `--repo-base` can only name this one. Resolved
-                // rather than ignored, so a typo'd selector fails loudly. Keyed
-                // by the repo root, not the launch path: launching from a
-                // subdirectory would otherwise only match that subdirectory's
-                // name, and the documented selector is the repo's own name.
                 let per_repo = builder::resolve_repo_base_selectors(
                     std::slice::from_ref(&main_repo_path),
                     &args.repo_bases,
                 )?;
-                // Single-repo sessions only have the launch repo, so fall back
-                // from the explicit session base to the global/profile default.
                 let base = if args.create_branch {
                     per_repo.get(&main_repo_path).cloned().or_else(|| {
                         builder::resolve_base_branch(
@@ -616,7 +512,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         }
     }
 
-    // Resolve parent session if specified
     let mut group_path = args.group.clone();
     let parent_id = if let Some(parent_ref) = &args.parent {
         let parent = super::resolve_session(parent_ref, &instances)?;
@@ -629,9 +524,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         None
     };
 
-    // The title was resolved before worktree creation (so a tied session could
-    // seed its directory leaf from it); run the path-dependent duplicate check
-    // now that `path` points at the final worktree/workspace directory.
     if is_duplicate_session(&instances, &final_title, path.to_str().unwrap_or(""), None) {
         cleanup_partial_session(
             &path,
@@ -647,9 +539,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     let mut instance = Instance::new(&final_title, path.to_str().unwrap_or(""));
     instance.source_profile = profile.to_string();
 
-    // Scratch sessions: provision a fresh scratch directory keyed on the
-    // freshly-generated instance id. The session layer owns the location
-    // (`<app_dir>/scratch/<id>/`) and the deletion guard.
     if args.scratch {
         let dir = crate::session::scratch::provision_scratch_dir(&instance.id)?;
         path = dir;
@@ -665,19 +554,13 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         instance.parent_session_id = Some(parent);
     }
 
-    // Tool name was resolved before worktree/scratch creation (so the fork
-    // gate could bail early without orphaning resources); assign it here.
     instance.tool = resolved_tool;
-    // Only store a custom command when the user passed extra args via --cmd
-    // (e.g. "claude --resume xyz"). A bare tool name/alias should resolve
-    // through the agent definition so the correct binary is used.
     if let Some(cmd) = &args.command {
         if cmd.trim().contains(' ') {
             instance.command = cmd.clone();
         }
     }
 
-    // Set detect_as for status detection (resolved once, avoids config load in poll loop)
     instance.detect_as = config
         .session
         .agent_detect_as
@@ -685,7 +568,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         .cloned()
         .unwrap_or_default();
 
-    // Apply set_default_command for agents that need it (e.g., opencode, codex)
     if instance.command.is_empty() {
         instance.command = crate::agents::get_agent(&instance.tool)
             .filter(|a| a.set_default_command)
@@ -703,7 +585,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
 
     instance.yolo_mode = args.yolo || config.session.yolo_mode_default;
 
-    // Apply extra_args and command override: CLI flags take priority, then config defaults
     if let Some(ref extra) = args.extra_args {
         instance.extra_args = extra.clone();
     } else if let Some(extra) = config.session.agent_extra_args.get(&instance.tool) {
@@ -721,19 +602,8 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         }
     }
 
-    // View selection. The terminal view (raw tmux/PTY) is the default so the
-    // CLI matches the TUI; the web wizard is the surface that defaults to
-    // structured. `--structured-view` (or `--agent`, which names a specific
-    // ACP agent) opts into the structured rendering; a non-ACP tool always
-    // runs in the terminal view.
-    // `--agent` is an explicit structured-view choice: the user named a
-    // specific ACP agent, so a missing adapter is a hard error rather
-    // than a silent downgrade.
     let user_picked_agent = args.agent.is_some();
     let user_wants_structured = args.structured_view || user_picked_agent;
-    // The `--fork-from` + structured-view refusal is hoisted above
-    // worktree/scratch creation (see the early fork-validation block) so it
-    // leaks no resources; nothing to re-check here.
     instance.agent_name = args.agent.clone();
     instance.agent_model = args.model.clone();
 
@@ -745,26 +615,17 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         &instance.tool,
         instance.agent_name.as_deref(),
     );
-    // Capability is judged against the explicit `--agent` (or, with none,
-    // the tool itself), NOT `pick_acp_agent_name`'s default-agent fallback:
-    // otherwise every tool would look ACP-capable via that default and
-    // `--structured-view` could never be rejected for a non-ACP tool (it
-    // would silently substitute the default). Mirrors the server create
-    // path in `src/server/api/sessions/create.rs`.
     let capability_key = instance
         .agent_name
         .as_deref()
         .unwrap_or(instance.tool.as_str());
     let acp_capable = registry.get(capability_key).is_some()
-            || config.session.agent_acp_cmd.contains_key(capability_key)
-            || config.session.agent_acp_cmd.contains_key(&instance.tool)
-            // A custom agent inheriting a registry-backed base via
-            // `agent_detect_as` (e.g. a Claude wrapper) runs in structured view
-            // through the base adapter.
-            || crate::acp::inherited_acp_base(capability_key, &config.session.agent_detect_as)
-                .is_some()
-            || crate::acp::inherited_acp_base(&instance.tool, &config.session.agent_detect_as)
-                .is_some();
+        || config.session.agent_acp_cmd.contains_key(capability_key)
+        || config.session.agent_acp_cmd.contains_key(&instance.tool)
+        || crate::acp::inherited_acp_base(capability_key, &config.session.agent_detect_as)
+            .is_some()
+        || crate::acp::inherited_acp_base(&instance.tool, &config.session.agent_detect_as)
+            .is_some();
 
     if user_picked_agent && !acp_capable {
         bail!(
@@ -790,12 +651,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         crate::session::View::Terminal
     };
 
-    // Precondition: the structured view needs the resolved ACP adapter
-    // binary on PATH. A missing adapter would otherwise surface as a
-    // silent 404 on the first prompt. When the user explicitly named
-    // an agent (--agent) we bail; otherwise (the default path) we fall
-    // back to the terminal view with a warning so `aoe add` still
-    // succeeds on a machine without the adapter installed.
     if instance.is_structured() {
         let (mut spec, spec_from_registry) = match registry.get(&agent_name) {
             Some(spec) => (spec.clone(), true),
@@ -811,13 +666,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                             .map_err(|e| anyhow::anyhow!(e))?,
                         false,
                     ),
-                    // A custom agent inheriting a registry-backed base runs
-                    // that base's adapter; check that binary is on PATH.
-                    // Resolve inheritance from the same keys the capability
-                    // check accepted (`capability_key` for an explicit
-                    // --agent wrapper, else the tool), so `--tool X --agent
-                    // <wrapper>` where only the wrapper inherits does not
-                    // fall through to `unreachable!`.
                     None => match crate::acp::inherited_acp_base(
                         capability_key,
                         &config.session.agent_detect_as,
@@ -836,10 +684,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 },
             },
         };
-        // Overlay session.agent_command_override the same way the agent
-        // spawn path does, so the precondition checks the binary that
-        // will actually launch (e.g. opencode-plannotator), not the
-        // bare registry binary. See #1910.
         if let Some(ovr) = crate::server::acp_reconciler::command_override_for_spawn(
             &instance.tool,
             &instance.command,
@@ -874,15 +718,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         }
     }
 
-    // Pin the structured-view model AFTER the adapter check above, which may
-    // have downgraded the session to terminal. Only a session that stays
-    // structured persists the per-agent default: agent_model is ACP-only, so
-    // a terminal fallback must not retain an ACP-derived default. Routed
-    // through the shared resolver so an explicit --model wins and is trimmed
-    // identically to the web create path; an explicit --model on a
-    // downgraded session is left untouched. `agent_name` is the same key the
-    // spawn resolves defaults against (see pick_agent_for_tool). Effort has
-    // no Instance field, so the spawn path resolves the default effort.
     if instance.is_structured() {
         let defaults = config.acp.acp_defaults_for(&agent_name);
         instance.agent_model = crate::session::config::resolve_spawn_model_effort(
@@ -893,10 +728,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         .0;
     }
 
-    // Apply the fork seed validated earlier (before worktree/scratch creation):
-    // pre-pin the child agent id and set the one-shot Fork intent, mirroring the
-    // builder's Terminal arm. Validating up front and mutating here keeps the
-    // eligibility error from orphaning a worktree or scratch dir.
     if let Some(seed) = fork_seed {
         match seed {
             crate::session::ForkSeed::Terminal {
@@ -908,13 +739,10 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                     from: parent_agent_session_id,
                 };
             }
-            crate::session::ForkSeed::Structured { .. } => {
-                // Terminal fork only from the CLI; nothing to apply.
-            }
+            crate::session::ForkSeed::Structured { .. } => {}
         }
     }
 
-    // Handle sandbox setup
     let use_sandbox = args.sandbox || args.sandbox_image.is_some();
 
     let runtime = containers::get_container_runtime();
@@ -928,9 +756,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 );
             }
         } else {
-            // Surface env-resolution warnings before container creation so
-            // typos and missing host vars don't silently produce empty
-            // values inside the sandbox. Same source the TUI path uses.
             for w in crate::session::validate_env_entries(&config.sandbox.environment) {
                 eprintln!("⚠ {}", w);
             }
@@ -954,24 +779,10 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         }
     }
 
-    // Check for repository hooks.
-    // Use the original project path for trust checking (not the worktree/workspace
-    // path, which won't contain `.agent-of-empires/config.toml`).
     let hook_result: Result<()> = (|| {
         let resolved_hooks: Option<crate::session::HooksConfig> = if args.scratch {
-            // Scratch sessions never have a `.agent-of-empires/config.toml`
-            // anchored on `original_project_path` (the path is either
-            // empty or the scratch dir itself). Skip the repo hook
-            // trust prompt entirely and fall back to profile-level
-            // hooks so the project-less contract stays intact.
             repo_config::resolve_global_profile_hooks(profile)
         } else {
-            // Repo trust now covers two surfaces: lifecycle hooks and project
-            // MCP servers (#1985). Hooks run here at create time; project MCP is
-            // forwarded later by the daemon, but its trust is recorded through
-            // the same single approval so an untrusted repo's `.mcp.json` is
-            // never forwarded. Hooks are resolved independently of MCP so an
-            // unapproved (or absent) MCP file never suppresses trusted hooks.
             use repo_config::TrustSurface;
             match repo_config::check_repo_trust(&original_project_path) {
                 Ok(trust) => {
@@ -1046,8 +857,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                         println!(
                             "Skipped (session created without trusting repo hooks or project MCP)"
                         );
-                        // Already-trusted hooks still run; only newly-prompted
-                        // surfaces are declined.
                         match &trust.hooks {
                             TrustSurface::Trusted(h) => {
                                 repo_config::merge_hooks_with_config(profile, h.clone())
@@ -1068,9 +877,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
 
         if let Some(hooks) = resolved_hooks {
             if !hooks.on_create.is_empty() {
-                // Show the final merged hook list (repo hooks override global/profile
-                // per type) so the user can see exactly what runs, especially when
-                // `--trust-hooks` skipped the interactive approval prompt (#596).
                 println!("Running on_create hooks:");
                 for cmd in &hooks.on_create {
                     println!("  {}", cmd);
@@ -1112,9 +918,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         return Err(e);
     }
 
-    // Hooks and all slow preparation are complete. Serialize only the final
-    // authoritative identity check and insert so a concurrent add or rename
-    // cannot commit the same `(title, project_path)` pair.
     let _identity_lock = match acquire_session_identity_lock() {
         Ok(lock) => lock,
         Err(error) => {
@@ -1216,12 +1019,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     let is_acp = instance.is_structured();
 
     if is_acp {
-        // Acp sessions aren't backed by tmux: their ACP worker is
-        // owned by `aoe serve`'s supervisor, which the
-        // status_poll_loop reconciler auto-spawns within ~2s of the
-        // session appearing on disk. `--launch` and the
-        // `aoe session start` next-step would both no-op (or now
-        // bail), so route the user to the dashboard instead.
         println!();
         println!("Next steps:");
         println!("  aoe serve                   # Start the dashboard (worker auto-spawns)");
@@ -1234,8 +1031,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             );
         }
     } else if args.launch {
-        // Persist Status::Error + last_error on launch failure rather than
-        // cleanup_partial_session: row is committed; surface as broken.
         let id = instance.id.clone();
         match instance.start_with_size(crate::terminal::get_size()) {
             Ok(()) => {
@@ -1263,12 +1058,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
                     tmux_session.attach()?;
                 } else {
-                    // No controlling terminal (LaunchAgent, cron, or any
-                    // other headless caller): `tmux attach-session` needs a
-                    // TTY on both ends and would fail even though the
-                    // session above started fine. Skip the attach instead
-                    // of letting that failure roll a successful launch back
-                    // to an error.
                     println!(
                         "(no controlling terminal; session started without attaching. \
                          Use `aoe -p {} session attach {}` to view it.)",
@@ -1277,10 +1066,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                     );
                 }
 
-                // The poller ran throughout the attach (or the launch above,
-                // headless) but the CLI never drained it, dropping the
-                // observed id. Drain it now (short bound: it is almost
-                // always already queued).
                 let file_watch = crate::file_watch::FileWatchService::noop();
                 crate::session::sync::capture_launched_session_id_blocking(
                     &mut instance,
@@ -1323,17 +1108,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     Ok(())
 }
 
-/// Prompt for a session title on stderr, mirroring the TUI `n` flow's
-/// "auto-generates if empty" field. Empty input or EOF keeps
-/// `default_title`; a non-empty line is trimmed and used. Only reached in
-/// `--interactive` mode, which already verified stdin is a terminal.
-/// Resolve the session title string (no path-dependent duplicate check).
-///
-/// `--title` wins; otherwise the default is the worktree branch name, or a
-/// random civilization name for non-worktree sessions. `--interactive` prompts
-/// with that default prefilled. Resolved before worktree creation so a tied
-/// session can derive its directory leaf from the title (#1927); the duplicate
-/// check runs later once the worktree path is known.
 fn resolve_session_title(args: &AddArgs, instances: &[Instance]) -> Result<String> {
     if let Some(title) = &args.title {
         return Ok(title.trim().to_string());
@@ -1386,10 +1160,6 @@ fn cleanup_partial_session(
     scratch_dir: Option<&std::path::Path>,
     container_session_id: Option<&str>,
 ) {
-    // Tear down the sandbox container first so its bind mount releases the
-    // worktree before the git removal below. Best-effort and idempotent: a
-    // container that was never started yields ContainerNotFound, which is not
-    // an error. `Some` only when the session is sandboxed.
     if let Some(session_id) = container_session_id {
         let container = crate::containers::DockerContainer::from_session_id(session_id);
         if let crate::containers::Teardown::Failed(e) = container.teardown(session_id) {
@@ -1424,9 +1194,6 @@ fn cleanup_partial_session(
         }
         let _ = std::fs::remove_dir_all(&ws.workspace_dir);
     }
-    // Remove the scratch directory provisioned earlier in this run.
-    // Guarded by `is_scratch_path` (same check the deletion path uses),
-    // so a tampered or unexpected `project_path` is a no-op.
     if let Some(scratch) = scratch_dir {
         if crate::session::scratch::is_scratch_path(scratch) {
             let _ = std::fs::remove_dir_all(scratch);
@@ -1434,14 +1201,6 @@ fn cleanup_partial_session(
     }
 }
 
-/// Resolve the agent tool name a new session will run, performing the same
-/// PATH-availability and conflict checks the create flow needs, with no
-/// filesystem side effects. Resolved before worktree/scratch creation so the
-/// fork-eligibility gate can bail early without leaving an orphaned worktree
-/// or scratch dir behind; the resolved name is then assigned to the instance.
-///
-/// Precedence mirrors the inline create flow: explicit `--tool`, then
-/// `--cmd`, then the resolved config default / first available tool / claude.
 fn resolve_tool_for_add(args: &AddArgs, config: &crate::session::Config) -> Result<String> {
     let tool_name = if let Some(tool) = &args.tool {
         let selection = resolve_named_tool(tool, config)?;
@@ -1451,18 +1210,8 @@ fn resolve_tool_for_add(args: &AddArgs, config: &crate::session::Config) -> Resu
         selection.name().to_string()
     } else if let Some(cmd) = &args.command {
         let tool_name = detect_tool(cmd)?;
-        // Verify the binary that will actually launch is on PATH before
-        // creating the session. A configured session.agent_command_override
-        // (or custom_agents) entry replaces the built-in binary, so check the
-        // resolved command, not the built-in name, otherwise --cmd opencode
-        // falsely bails when only the override binary (e.g.
-        // opencode-plannotator) is installed. See #1910.
         match override_launch_binary(&tool_name, &config.session) {
             Some(bin) => {
-                // Use the same detection as tmux (login-shell PATH fallback
-                // included) so an override binary visible only after shell
-                // init isn't rejected here while the non-override path accepts
-                // it. See #1910.
                 if !crate::tmux::is_binary_on_path(&bin) {
                     bail!(
                         "'{}' (from session.agent_command_override) is not installed or not on $PATH.\n\
@@ -1487,10 +1236,6 @@ fn resolve_tool_for_add(args: &AddArgs, config: &crate::session::Config) -> Resu
         }
         tool_name
     } else {
-        // Use default_tool from resolved config, then first available tool,
-        // then "claude". Check custom_agents first (exact match) before
-        // resolve_tool_name (substring match), so names like "lenovo-claude"
-        // resolve as the custom agent, not built-in "claude".
         let available_tools = crate::tmux::AvailableTools::detect();
         let tools_list = available_tools.available_list();
         config
@@ -1509,9 +1254,6 @@ fn resolve_tool_for_add(args: &AddArgs, config: &crate::session::Config) -> Resu
             .to_string()
     };
 
-    // One post-resolution emission point covers explicit tools, --cmd with
-    // or without a command override, and configured/default detection. A
-    // custom agent has no AgentDef and therefore never receives this warning.
     if let Some(notice) =
         crate::agents::get_agent(&tool_name).and_then(crate::agents::AgentDef::lifecycle_notice)
     {
@@ -1534,15 +1276,6 @@ fn detect_tool(cmd: &str) -> Result<String> {
         })
 }
 
-/// The binary `aoe add` must verify is on PATH for a `--cmd <tool>`
-/// selection when `session.agent_command_override` (or `custom_agents`)
-/// remaps the built-in to a different command. Returns the resolved
-/// command's first word, or `None` when no override applies (the caller
-/// then falls back to the built-in agent's own detection). See #1910.
-///
-/// Parsed with `shell_words` so a quoted path (e.g.
-/// `"/opt/My Wrapper/opencode" --mode plan`) yields the real binary, matching
-/// how `apply_agent_command_override` splits the command at spawn time.
 fn override_launch_binary(
     tool: &str,
     session: &crate::session::config::SessionConfig,
@@ -1631,13 +1364,6 @@ fn resolve_named_tool(tool: &str, config: &crate::session::Config) -> Result<Nam
     )
 }
 
-/// Resolve the sandbox image for a new session.
-///
-/// Precedence: the explicit `--sandbox-image` flag, then the merged
-/// `[sandbox] default_image` from `config` (which `resolve_config_with_repo_or_warn`
-/// already layers repo over profile/global, see #1651), then the runtime's
-/// hardcoded default. The merged value already carries the global config, so
-/// there is no need to reload it from disk for the empty-fallback case.
 fn resolve_sandbox_image(
     flag: Option<&str>,
     merged_default: &str,
@@ -1663,7 +1389,6 @@ mod tests {
     fn parse_repo_base_splits_on_the_first_equals() {
         let ok = [
             ("api=develop", ("api", "develop")),
-            // A path selector, and a branch containing '=' (rare but legal).
             ("/src/api=epic/a=b", ("/src/api", "epic/a=b")),
             (" api = develop ", ("api", "develop")),
         ];
@@ -1687,9 +1412,6 @@ mod tests {
         session
             .agent_command_override
             .insert("opencode".to_string(), "opencode-plannotator".to_string());
-        // The gate must verify the override binary, not the built-in
-        // `opencode`, so `--cmd opencode` works when only the wrapper is
-        // installed. See #1910.
         assert_eq!(
             override_launch_binary("opencode", &session).as_deref(),
             Some("opencode-plannotator")
@@ -1715,8 +1437,6 @@ mod tests {
             "opencode".to_string(),
             "\"/opt/My Wrapper/opencode\" --mode plan".to_string(),
         );
-        // shell_words keeps the quoted path intact instead of splitting on
-        // the space, so preflight checks the real binary.
         assert_eq!(
             override_launch_binary("opencode", &session).as_deref(),
             Some("/opt/My Wrapper/opencode")
@@ -1753,7 +1473,6 @@ mod tests {
         assert_eq!(image, HARDCODED);
     }
 
-    /// Argument-level coverage of the #148 guard on `add`.
     mod profile_guard {
         use crate::cli::{Cli, Commands};
         use clap::Parser;
@@ -1775,8 +1494,6 @@ mod tests {
             let profiles = crate::session::get_app_dir().unwrap().join("profiles");
             std::fs::create_dir_all(profiles.join("real")).unwrap();
 
-            // The missing path keeps the run short of tmux; the assertion is
-            // on which error answers first.
             let (profile, args) = dispatch_argv(&[
                 "aoe",
                 "add",

@@ -1,11 +1,8 @@
 import { useEffect, useState } from "react";
 import { onServerDownChange, isServerDown } from "../lib/connectionState";
+import { StrokeIcon } from "./icons";
 
-/**
- * Full-width banner shown when the backend server is unreachable. Replaces the
- * repeated "network error" toast spam with a single persistent notification
- * that auto-dismisses when the connection recovers.
- */
+/** Full-width banner shown when the backend server is unreachable. */
 export function DisconnectBanner() {
   const [down, setDown] = useState(isServerDown);
   const [reconnected, setReconnected] = useState(false);
@@ -30,18 +27,9 @@ export function DisconnectBanner() {
         role="status"
         className="bg-status-running/10 border-b border-status-running/30 px-4 py-2 flex items-center justify-center gap-2 text-xs font-mono text-status-running animate-fade-in"
       >
-        <svg
-          width="14"
-          height="14"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        >
+        <StrokeIcon size={14} strokeWidth="2">
           <polyline points="20 6 9 17 4 12" />
-        </svg>
+        </StrokeIcon>
         Reconnected
       </div>
     );

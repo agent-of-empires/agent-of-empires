@@ -4,93 +4,36 @@ use std::collections::HashSet;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Upper bound on a single `docker pull`. `docker pull` has no overall timeout
-/// of its own, so a stalled registry connection blocks the caller forever
-/// (observed as the TUI freezing mid-pull on a sandbox restart). Sized
-/// generously so a genuinely large
-/// image on a slow link still completes; it only fires on a wedged pull.
+/// `docker pull` has no timeout of its own; this only fires on a wedged pull.
 const PULL_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// Upper bound on a single short-lived container-runtime control command
-/// (inspect, start, stop, rm, volume ls/rm) issued through
-/// [`RuntimeBase::probe_output`]. Unlike an image pull, these are local
-/// control-plane round-trips that return in well under a second against a
-/// healthy Docker, Podman, or Apple Container runtime; the only way one blocks
-/// is a wedged daemon or a `stop`/`rm -f` whose target ignores SIGTERM through
-/// its grace period. Sized above the default 10s stop grace so a legitimate
-/// slow stop still completes, yet bounded so a hung runtime cannot park a
-/// caller forever.
+/// Sized above the default 10s stop grace so a slow but legitimate stop completes.
 const RUNTIME_CMD_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Upper bound for arbitrary commands executed inside a container. The only
-/// direct caller deletes a sandbox worktree tree, which can legitimately take
-/// much longer than a local control-plane probe but must not hang forever.
 const RUNTIME_EXEC_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// Shared implementation for container runtimes.
-///
-/// Captures the behavioral differences between runtimes (Docker, Apple Container, etc.)
-/// as configuration, then provides a single implementation of all the shared logic.
-/// Runtime-specific methods (like container existence checks or running state detection)
-/// remain in the individual runtime impls.
 pub(crate) struct RuntimeBase {
-    /// CLI binary name (e.g., "docker", "container")
     pub binary: &'static str,
-    /// Human-readable name for log messages (e.g., "Docker", "Apple Container")
     pub name: &'static str,
-    /// Args to check if daemon is running (e.g., ["info"] or ["system", "status"])
     pub daemon_check_args: &'static [&'static str],
-    /// Args preceding the image name when pulling (e.g., ["pull"] or ["image", "pull"])
     pub pull_prefix: &'static [&'static str],
-    /// Subcommand for removing containers (e.g., "rm" or "delete")
     pub remove_subcommand: &'static str,
-    /// Whether this runtime supports the `:ro` read-only volume flag
     pub supports_read_only_volumes: bool,
-    /// Whether this runtime supports `-v` on remove to clean up anonymous volumes
     pub supports_remove_volumes: bool,
-    /// Whether this runtime supports `volume ls` / `volume rm` for named volumes
     pub supports_named_volumes: bool,
-    /// Whether this runtime supports the `:z`/`:Z` SELinux relabel volume flag
-    /// (Docker and Podman do; Apple Container does not).
     pub supports_selinux_relabel: bool,
-    /// Whether this runtime supports Docker-style `--network <mode>` (`none`,
-    /// `bridge`, or a named network). Docker and Podman do; Apple Container's
-    /// `run` does not take these modes, so a configured `sandbox.network` is
-    /// skipped with a warning there rather than emitting a flag that fails.
+    /// Apple Container's `run` has no Docker-style `--network` modes.
     pub supports_network_mode: bool,
-    /// Whether `run --label key=value` and label inspection are supported.
     pub supports_labels: bool,
-    /// Which Docker-style `run` flags this runtime accepts (see [`RunFlag`]).
     pub supported_run_flags: &'static [RunFlag],
-    /// Case-insensitive stderr substrings that identify a "container does not
-    /// exist" error for this runtime. Each runtime words it differently (Docker
-    /// "No such container", Apple Container "notFound … not found"), so the
-    /// markers are per-runtime rather than a single shared string.
+    /// Case-insensitive stderr substrings for "container does not exist".
     pub not_found_markers: &'static [&'static str],
-    /// Case-sensitive stderr substrings that identify a "daemon is not
-    /// reachable" error for this runtime. Structural parallel to
-    /// `not_found_markers`: keeping this per-runtime prevents cross-runtime
-    /// substring bleed and lets `classify_probe_failure` surface an
-    /// actionable [`DockerError::DaemonNotRunning`] at the fail-closed gate
-    /// sites (#2596 follow-up). Case sensitivity is intentional; every
-    /// runtime's daemon-down message has stable capitalization at the source.
+    /// Case-sensitive stderr substrings for "daemon is not reachable".
     pub daemon_down_markers: &'static [&'static str],
-    /// Case-insensitive stderr substrings that identify a "permission
-    /// denied" error (typically Linux docker/podman socket without
-    /// docker-group membership). Structural parallel to `not_found_markers`
-    /// and `daemon_down_markers` (#2656 follow-up to #2596). Isolation is
-    /// intentionally asymmetric: Docker's marker is tightly scoped to the
-    /// canonical "docker daemon socket" wording, so cross-runtime bleed is
-    /// prevented by construction there; Podman and Apple use the broad
-    /// "permission denied" placeholder pending real-fixture capture, which
-    /// does bleed across runtimes but preserves pre-#2656 behavior. Case
-    /// handling mirrors [`Self::is_not_found`]: OS-emitted "permission
-    /// denied" strings vary in capitalization across kernel versions and
-    /// locales, so case-fold matching is safest.
+    /// Case-insensitive stderr substrings for socket permission errors.
     pub permission_denied_markers: &'static [&'static str],
 }
 
-/// Docker-style run flags supported by Docker and Podman.
 const ALL_RUN_FLAGS: &[RunFlag] = &[
     RunFlag::Privileged,
     RunFlag::CapAdd,
@@ -113,16 +56,8 @@ impl RuntimeBase {
         supports_labels: true,
         supported_run_flags: ALL_RUN_FLAGS,
         not_found_markers: &["no such container"],
-        // moby/moby client/errors.go connectionFailed() is the single source
-        // of this message across every Docker OS variant (macOS Desktop, Linux
-        // CE, Windows Desktop).
         daemon_down_markers: &["Cannot connect to the Docker daemon"],
-        // Docker's canonical Linux socket-permission wording, per the
-        // post-install docs: "Got permission denied while trying to connect
-        // to the Docker daemon socket at unix:///var/run/docker.sock ...".
-        // The "docker daemon socket" clause is specific enough to exclude
-        // unrelated permission errors (image policy, volume mount, registry
-        // auth) that a broad "permission denied" match would misclassify.
+        // Scoped to "docker daemon socket" so unrelated permission errors are not misclassified.
         permission_denied_markers: &[
             "permission denied while trying to connect to the docker daemon socket",
         ],
@@ -140,45 +75,17 @@ impl RuntimeBase {
         supports_selinux_relabel: false,
         supports_network_mode: false,
         supports_labels: true,
-        // `--cap-add`/`--cap-drop` exist since container 0.12; there is no
-        // `--privileged` or `--security-opt`.
         supported_run_flags: &[RunFlag::CapAdd, RunFlag::CapDrop],
-        // Apple Container surfaces a missing container with two distinct
-        // wordings depending on the subcommand:
-        // - `container delete`/`container logs`: `notFound: "container with
-        //   ID <id> not found"`.
-        // - `container inspect`: `Error: container not found: <name>`.
-        // The bare "not found" substring would be dangerously broad; a
-        // plausible daemon-connectivity error containing "socket not found"
-        // or "endpoint not found" would misclassify as absent and silently
-        // reintroduce #2596 on this runtime. Both entries below are
-        // container-not-found-specific substrings with no known collision
-        // risk between each other or with daemon-connectivity wording, so a
-        // single shared list is intentional: `classify_probe_failure` reads
-        // from it for both the running-state (inspect) and existence
-        // (logs/delete) surfaces. Entries are lowercase to align with
-        // is_not_found's case-fold.
+        // Avoid bare "not found": daemon errors like "socket not found" would read as absent.
         not_found_markers: &["container with id", "container not found"],
-        // Placeholder: Apple's `container` CLI daemon-down wording is not
-        // captured in this repo. The fallback to InspectFailed still fails
-        // closed at gate sites, so an unmatched real message only degrades
-        // log actionability, not correctness. Replace with a captured
-        // fixture when available.
+        // Placeholder: wording not yet captured from a real Apple daemon-down.
         daemon_down_markers: &["connect to container daemon"],
-        // Placeholder: Apple's `container` CLI permission-denied wording is
-        // not captured in this repo. The bare "permission denied" match
-        // preserves the pre-#2656 broad-inline-substring behavior for this
-        // runtime; tighten to an Apple-specific pattern once captured to
-        // prevent future cross-runtime substring bleed.
         permission_denied_markers: &["permission denied"],
     };
 
     pub const PODMAN: Self = Self {
         binary: "podman",
         name: "Podman",
-        // Podman is daemonless, but `podman info` succeeds when the local
-        // engine (and its rootless/rootful storage) is healthy, mirroring
-        // the Docker daemon-running probe.
         daemon_check_args: &["info"],
         pull_prefix: &["pull"],
         remove_subcommand: "rm",
@@ -190,33 +97,15 @@ impl RuntimeBase {
         supports_labels: true,
         supported_run_flags: ALL_RUN_FLAGS,
         not_found_markers: &["no such container"],
-        // Two distinct daemon-down wordings observed in real Podman output:
-        // - "connect to Podman socket" fires on Linux socket mode
-        //   (libpod service unavailable, "unable to connect to Podman
-        //   socket: Connection refused").
-        // - "Cannot connect to Podman." fires on Podman Desktop / machine
-        //   mode (macOS / Windows), when the VM is stopped.
         daemon_down_markers: &["connect to Podman socket", "Cannot connect to Podman."],
-        // Placeholder: Podman's socket-permission wording is not captured
-        // in this repo. In practice Podman surfaces the underlying Linux
-        // socket permission error, which contains "permission denied" (e.g.
-        // "unable to connect to Podman socket: dial unix ...: connect:
-        // permission denied"). Matches the pre-#2656 broad-inline-substring
-        // behavior; tighten to a Podman-specific pattern once captured.
+        // Placeholder: Podman surfaces the OS socket error, which contains this.
         permission_denied_markers: &["permission denied"],
     };
 
-    /// Whether `stderr` from a container inspect indicates the runtime's
-    /// daemon (or equivalent local engine) is unreachable. Case-sensitive,
-    /// per-runtime; see [`Self::daemon_down_markers`] rationale.
     pub fn is_daemon_down(&self, stderr: &str) -> bool {
         self.daemon_down_markers.iter().any(|m| stderr.contains(m))
     }
 
-    /// Whether `stderr` indicates a permission-denied error for this
-    /// runtime's socket / daemon. Case-insensitive to tolerate wording
-    /// drift across kernel versions and locales, per
-    /// [`Self::permission_denied_markers`] rationale.
     pub fn is_permission_denied(&self, stderr: &str) -> bool {
         let lower = stderr.to_lowercase();
         self.permission_denied_markers
@@ -224,62 +113,18 @@ impl RuntimeBase {
             .any(|m| lower.contains(m))
     }
 
-    /// Whether `stderr` from a remove/stop indicates the container did not
-    /// exist. Case-insensitive to tolerate wording drift across CLI versions
-    /// (e.g. capitalization changes between Docker releases). Contrast
-    /// [`Self::is_daemon_down`], which is case-sensitive because daemon-down
-    /// stderr wording is stable at each runtime's source.
     pub fn is_not_found(&self, stderr: &str) -> bool {
         let lower = stderr.to_lowercase();
         self.not_found_markers.iter().any(|m| lower.contains(m))
     }
 
-    /// Classify a non-success container-state probe stderr into either a
-    /// definitive "not running" / "absent" (container missing, matches
-    /// `is_not_found`) or a genuine runtime failure (daemon down / 500 / any
-    /// other transient) that must surface to the caller.
-    ///
-    /// Without this split, `ContainerRuntime::is_container_running`
-    /// collapses BOTH failure modes into `Ok(false)`, and every fail-closed
-    /// probe site silently swallows the daemon-down signal as
-    /// `Probe::NotRunning`: the same swallowing-existence-probe class
-    /// fixed on the removal path by #2576 and on the discard path by
-    /// #2596.
-    ///
-    /// Both probe surfaces funnel through this one classifier: the
-    /// running-state probe (`is_container_running`) and the existence probe
-    /// (`does_container_exist`, `container inspect` on Docker/Podman, `logs`
-    /// on Apple). Keeping the order-of-checks priority (permission-denied
-    /// before daemon-down) authoritative in one place closes the
-    /// swallowing-existence-probe class of bug (#2596 / #2652 / #2654) on both
-    /// surfaces, following #2652 which closed it on the running-state surface.
-    ///
-    /// `stderr` is decoded upstream via `String::from_utf8_lossy`, which
-    /// replaces invalid bytes with U+FFFD (the replacement character). The
-    /// markers matched below (`not_found_markers` / `daemon_down_markers` /
-    /// `permission_denied_markers`) are all ASCII, and Docker / Podman /
-    /// Apple emit English ASCII stderr, so a U+FFFD substitution on a
-    /// mangled-encoding host cannot spuriously match a marker; classification
-    /// is safe over the lossily-decoded string despite not being byte-exact.
+    /// Splits a failed state probe into definitive absence (`Ok(false)`) or a runtime failure
+    /// that must surface, so fail-closed gates do not swallow a daemon-down signal.
     pub fn classify_probe_failure(&self, stderr: &str) -> Result<bool> {
         if self.is_not_found(stderr) {
             return Ok(false);
         }
-        // Mirror run_create's daemon-down / permission-denied sniff so the
-        // Probe::Unknown(e) warn logs at gate sites show the actionable
-        // DaemonNotRunning / PermissionDenied Display messages rather than
-        // a raw stderr wrapped in InspectFailed. Markers live per-runtime on
-        // Self (parallel to `not_found_markers`): daemon-down is fully
-        // isolated across runtimes by construction, permission-denied is
-        // asymmetric because Podman and Apple placeholders intentionally
-        // bleed pending real-fixture capture (see field docs for details).
-        //
-        // Order matters: permission-denied is checked BEFORE daemon-down
-        // because Podman's socket-permission stderr ("unable to connect to
-        // Podman socket: ... connect: permission denied") also matches
-        // Podman's daemon_down_markers ("connect to Podman socket"). The
-        // permission-denied path is the more specific classification, so it
-        // must win when both markers match the same stderr.
+        // Permission-denied first: Podman's socket-permission stderr also matches its daemon-down marker.
         if self.is_permission_denied(stderr) {
             return Err(DockerError::PermissionDenied);
         }
@@ -293,26 +138,7 @@ impl RuntimeBase {
         Command::new(self.binary)
     }
 
-    /// Run `cmd` under `RUNTIME_CMD_TIMEOUT` and capture its output, mapping a
-    /// missing-binary spawn failure to the actionable [`DockerError::NotInstalled`]
-    /// and a timeout to a single-line [`DockerError::IoError`].
-    ///
-    /// `cmd.spawn()` short-circuits with `io::ErrorKind::NotFound` when the
-    /// runtime binary is not on `PATH`. The bare `?` conversion routes that
-    /// through `#[from] std::io::Error` into the opaque [`DockerError::IoError`],
-    /// hiding the one variant whose Display tells the operator how to fix it
-    /// ("Docker is not installed or not in PATH. Install: ..."). Every call site
-    /// that propagates its error goes through this wrapper so the not-installed
-    /// case surfaces with its remediation intact; all other IO errors propagate
-    /// unchanged.
-    ///
-    /// The timeout is what makes every short container-runtime control command
-    /// (inspect, start, stop, rm, volume ls/rm) bounded: a wedged runtime is
-    /// killed at the deadline instead of blocking the caller forever. A timed-out
-    /// probe surfaces as an `Err`, which the running-state gate treats
-    /// conservatively as [`super::Probe::Unknown`] (fail-closed), and a timed-out
-    /// removal as [`super::Teardown::Failed`]. Stdin is closed so a child that
-    /// unexpectedly reads never blocks on the parent terminal.
+    /// Maps a missing binary to `NotInstalled` and a timeout to an `IoError`.
     pub fn probe_output(&self, cmd: &mut Command) -> Result<std::process::Output> {
         self.probe_output_with_timeout(cmd, RUNTIME_CMD_TIMEOUT)
     }
@@ -338,28 +164,23 @@ impl RuntimeBase {
         }
     }
 
-    pub fn is_available(&self) -> bool {
+    fn probe_succeeds(&self, args: &[&str]) -> bool {
         let mut cmd = self.command();
-        cmd.arg("--version");
+        cmd.args(args);
         self.probe_output(&mut cmd)
-            .map(|output| output.status.success())
-            .unwrap_or(false)
+            .is_ok_and(|output| output.status.success())
+    }
+
+    pub fn is_available(&self) -> bool {
+        self.probe_succeeds(&["--version"])
     }
 
     pub fn is_daemon_running(&self) -> bool {
-        let mut cmd = self.command();
-        cmd.args(self.daemon_check_args);
-        self.probe_output(&mut cmd)
-            .map(|output| output.status.success())
-            .unwrap_or(false)
+        self.probe_succeeds(self.daemon_check_args)
     }
 
     pub fn image_exists_locally(&self, image: &str) -> bool {
-        let mut cmd = self.command();
-        cmd.args(["image", "inspect", image]);
-        self.probe_output(&mut cmd)
-            .map(|output| output.status.success())
-            .unwrap_or(false)
+        self.probe_succeeds(&["image", "inspect", image])
     }
 
     pub fn pull_image(&self, image: &str) -> Result<()> {
@@ -453,29 +274,39 @@ impl RuntimeBase {
             config.working_dir.clone(),
         ];
 
+        let mut push = |flag: &str, value: String| {
+            args.push(flag.to_string());
+            args.push(value);
+        };
         if self.supports_labels {
-            args.push("--label".to_string());
-            args.push("com.agent-of-empires.sandbox-store-generation=2".to_string());
-            args.push("--label".to_string());
-            args.push(format!(
-                "com.agent-of-empires.mount-fingerprint={}",
-                config.mount_fingerprint()
-            ));
+            use crate::containers::container_interface::{
+                AGENT_TOOL_LABEL, SHARED_CREDENTIAL_MOUNTS_LABEL,
+            };
+            push(
+                "--label",
+                "com.agent-of-empires.sandbox-store-generation=2".to_string(),
+            );
+            push(
+                "--label",
+                format!(
+                    "com.agent-of-empires.mount-fingerprint={}",
+                    config.mount_fingerprint()
+                ),
+            );
             if !config.shared_credential_mounts.is_empty() {
-                args.push("--label".to_string());
-                args.push(format!(
-                    "{}={}",
-                    crate::containers::container_interface::SHARED_CREDENTIAL_MOUNTS_LABEL,
-                    config.shared_credential_label()
-                ));
+                push(
+                    "--label",
+                    format!(
+                        "{SHARED_CREDENTIAL_MOUNTS_LABEL}={}",
+                        config.shared_credential_label()
+                    ),
+                );
             }
             if !config.agent_tool.is_empty() {
-                args.push("--label".to_string());
-                args.push(format!(
-                    "{}={}",
-                    crate::containers::container_interface::AGENT_TOOL_LABEL,
-                    config.agent_tool
-                ));
+                push(
+                    "--label",
+                    format!("{AGENT_TOOL_LABEL}={}", config.agent_tool),
+                );
             }
         }
 
@@ -492,54 +323,38 @@ impl RuntimeBase {
                 opts.push("ro");
             }
             if config.selinux_relabel && self.supports_selinux_relabel {
-                // `:z` (shared) relabels the host path to a container-accessible
-                // SELinux type. Shared rather than `:Z` because aoe mounts the
-                // credential dir into multiple sandbox containers.
+                // `:z` (shared), not `:Z`: the credential dir is mounted into several sandbox containers.
                 opts.push("z");
             }
-            let mount = if opts.is_empty() {
-                format!("{}:{}", vol.host_path, vol.container_path)
-            } else {
-                format!(
-                    "{}:{}:{}",
-                    vol.host_path,
-                    vol.container_path,
-                    opts.join(",")
-                )
-            };
-            args.push("-v".to_string());
-            args.push(mount);
+            let mut mount = format!("{}:{}", vol.host_path, vol.container_path);
+            if !opts.is_empty() {
+                mount = format!("{mount}:{}", opts.join(","));
+            }
+            push("-v", mount);
         }
 
         for path in &config.anonymous_volumes {
-            args.push("-v".to_string());
-            args.push(path.clone());
+            push("-v", path.clone());
         }
 
-        if self.supports_named_volumes {
-            for nv in &config.named_ignore_volumes {
-                args.push("-v".to_string());
-                args.push(format!("{}:{}", nv.volume_name, nv.container_path));
-            }
-        } else if !config.named_ignore_volumes.is_empty() {
-            // Apple Container doesn't support named volumes; fall back to anonymous behavior.
+        if !self.supports_named_volumes && !config.named_ignore_volumes.is_empty() {
             tracing::warn!(
                 target: "containers.runtime",
                 runtime = %self.name,
                 "named volume_ignores_strategy is not supported; falling back to anonymous volumes"
             );
-            for nv in &config.named_ignore_volumes {
-                args.push("-v".to_string());
-                args.push(nv.container_path.clone());
+        }
+        for nv in &config.named_ignore_volumes {
+            if self.supports_named_volumes {
+                push("-v", format!("{}:{}", nv.volume_name, nv.container_path));
+            } else {
+                push("-v", nv.container_path.clone());
             }
         }
 
         let (env_argv, _inherit) = docker_env_args(&config.environment);
         args.extend(env_argv);
 
-        // Apple Container's `run` doesn't take Docker-style `--network` modes,
-        // so a configured network is skipped there with a warning rather than
-        // emitting a flag that fails container creation.
         let network = match config.network.as_deref() {
             Some(n) if !self.supports_network_mode => {
                 tracing::warn!(
@@ -558,9 +373,7 @@ impl RuntimeBase {
             args.push(network.to_string());
         }
 
-        // Publishing ports requires a network; the runtime errors out if `-p`
-        // is combined with `--network none`, so drop the mappings and warn
-        // rather than fail container creation.
+        // `-p` fails with `--network none`, so the mappings are dropped with a warning.
         if network_none && !config.port_mappings.is_empty() {
             tracing::warn!(
                 target: "containers.runtime",
@@ -636,15 +449,13 @@ impl RuntimeBase {
         args
     }
 
-    /// Run the container creation command (after existence has already been checked by the caller).
     pub fn run_create(&self, name: &str, image: &str, config: &ContainerConfig) -> Result<String> {
         let args = self.build_create_args(name, image, config);
         tracing::debug!(target: "containers.runtime", "{} create args: {}", self.name, args.join(" "));
 
         let mut cmd = self.command();
         cmd.args(&args);
-        // Set inherited env vars on the child process so docker can read them
-        // via `-e KEY` without the values appearing in argv
+        // Inherited values reach docker via the child env, keeping them out of argv.
         let (_, inherit) = docker_env_args(&config.environment);
         for (key, value) in inherit {
             cmd.env(key, value);
@@ -707,8 +518,7 @@ impl RuntimeBase {
             args.push("-f".to_string());
         }
         if self.supports_remove_volumes {
-            // Remove anonymous volumes with the container to prevent orphaned volume buildup.
-            // This does NOT affect named volumes (like auth volumes).
+            // Removes anonymous volumes only; named volumes survive.
             args.push("-v".to_string());
         }
         args.push(name.to_string());
@@ -729,23 +539,11 @@ impl RuntimeBase {
         Ok(())
     }
 
-    /// Remove all named ignore volumes whose names start with the given prefix.
-    ///
-    /// Used to clean up volumes created with `volume_ignores_strategy = "named"` after
-    /// a session container is deleted. Volumes can outlive the container, so this must
-    /// be called even when the container is already gone.
-    ///
-    /// This is a no-op on runtimes that don't support named volumes (e.g. Apple Container).
+    /// Volumes outlive the container, so call this even when it is already gone.
     pub fn remove_named_ignore_volumes(&self, prefix: &str) -> Result<()> {
         self.remove_named_ignore_volumes_where(prefix, |_| true)
     }
 
-    /// Remove the named ignore volumes under `prefix` that are in `names`.
-    ///
-    /// The targeted counterpart to [`Self::remove_named_ignore_volumes`], for reclaiming
-    /// the volumes a worktree move stranded. `names` is an allowlist, so a volume the
-    /// caller did not name is never touched; see
-    /// [`DockerContainer::remove_stranded_named_ignore_volumes`](crate::containers::DockerContainer::remove_stranded_named_ignore_volumes).
     pub fn remove_named_ignore_volumes_in(
         &self,
         prefix: &str,
@@ -763,7 +561,6 @@ impl RuntimeBase {
             return Ok(());
         }
 
-        // List volumes whose names start with the prefix.
         let mut list_cmd = self.command();
         list_cmd.args([
             "volume",
@@ -803,23 +600,15 @@ impl RuntimeBase {
     }
 
     pub fn exec_command(&self, name: &str, options: Option<&str>, cmd: &str) -> String {
-        if let Some(opt_str) = options {
-            [self.binary, "exec", "-it", opt_str, name, cmd].join(" ")
-        } else {
-            [self.binary, "exec", "-it", name, cmd].join(" ")
-        }
+        [self.binary, "exec", "-it"]
+            .into_iter()
+            .chain(options)
+            .chain([name, cmd])
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
-    /// Argv for a non-interactive `exec` of `cmd` in `name`, for a caller that
-    /// spawns the process itself (smart rename hands this to
-    /// `session::smart_rename::run_oneshot`, which owns the timeout and output
-    /// capture).
-    ///
-    /// Deliberately unlike [`Self::exec_command`]: no `-it`, because the caller
-    /// pipes stdout with stdin closed and a TTY request would fail or hang, and
-    /// argv rather than a shell string, so an untrusted argument (the title
-    /// prompt) is never shell-parsed. An empty `workdir` omits `-w` instead of
-    /// passing a blank value.
+    /// No `-it` (stdout is piped, stdin closed) and argv, not a shell string, so the prompt is never shell-parsed.
     pub fn build_exec_argv(&self, name: &str, workdir: &str, cmd: &[String]) -> Vec<String> {
         let mut argv = vec![self.binary.to_string(), "exec".to_string()];
         if !workdir.is_empty() {
@@ -841,10 +630,7 @@ impl RuntimeBase {
     }
 }
 
-/// Pick the volumes to remove out of a `volume ls -q` listing.
-///
-/// Re-filters on the prefix in Rust because docker's `--filter name=` is a substring
-/// match, so `aoe-vi-sess1-` also lists `aoe-vi-sess10-...`.
+/// Re-filter on the prefix: docker's `--filter name=` is a substring match.
 fn selected_named_ignore_volumes<'a>(
     listing: &'a str,
     prefix: &str,
@@ -860,477 +646,175 @@ fn selected_named_ignore_volumes<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::containers::container_interface::{EnvEntry, RunPolicy, VolumeMount};
+    use crate::containers::container_interface::{
+        EnvEntry, NamedVolumeMount, RunPolicy, VolumeMount,
+    };
 
-    // Real stderr captured from `<runtime> rm/delete <missing>` on 2026-07-01.
-    // These pin the per-runtime not-found classification that `remove()` and
-    // `stop_container()` rely on to stay idempotent.
+    const DOCKER: RuntimeBase = RuntimeBase::DOCKER;
+    const PODMAN: RuntimeBase = RuntimeBase::PODMAN;
+    const APPLE: RuntimeBase = RuntimeBase::APPLE_CONTAINER;
+
+    // Real stderr captured from `<runtime> rm/delete <missing>`.
     const DOCKER_MISSING: &str =
         "Error response from daemon: No such container: aoe-sandbox-abc123";
     const APPLE_MISSING: &str = "Error: internalError: \"failed to delete container\" (cause: \"notFound: \"container with ID aoe-sandbox-abc123 not found\"\")";
-    // Real stderr captured from `container inspect <missing>` on Apple
-    // Container CLI v1.1.0 (2026-07-21). Distinct wording from APPLE_MISSING
-    // (delete/logs); pins the specific not-found classification that
-    // is_container_running()'s inspect path relies on. Regression fixture for
-    // the brand-new-session first-start failure this marker gap caused.
     const APPLE_INSPECT_MISSING: &str = "Error: container not found: aoe-sandbox-abc123";
-    // Podman not installed locally; representative of its documented output.
     const PODMAN_MISSING: &str =
         "Error: no container with name or ID \"aoe-sandbox-abc123\" found: no such container";
 
-    // Daemon-unreachable stderr fixtures, shared between the running-state and
-    // existence suites so both probe surfaces stay pinned to byte-identical
-    // wording (previously inlined copies kept in sync by hand). Each matches
-    // only its own runtime's `daemon_down_markers`; no cross-runtime bleed by
-    // construction.
-    const DOCKER_DAEMON_DOWN: &str =
-        "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. \
-         Is the docker daemon running?";
-    // Podman socket mode (Linux): libpod service unavailable.
-    const PODMAN_SOCKET_DOWN: &str =
-        "Error: unable to connect to Podman socket: Connection refused";
-    // Podman Desktop / machine mode (macOS / Windows): VM stopped.
-    const PODMAN_DESKTOP_DOWN: &str = "Cannot connect to Podman. \
-         Please verify your connection to the Linux system using \
-         `podman system connection list`, or try `podman machine init` \
-         and `podman machine start` to manage a new Linux VM";
-    // Apple placeholder: real `container` CLI daemon-down wording is not
-    // captured in this repo; the marker match is by construction.
-    const APPLE_DAEMON_DOWN: &str =
-        "Error: internalError: \"failed to connect to container daemon\" (cause: \"transient\")";
-
-    // Permission-denied stderr fixtures, likewise shared between both suites.
-    // Docker's canonical Linux socket-permission wording; Podman and Apple use
-    // broader placeholders pending real-fixture capture.
-    const DOCKER_PERMISSION_DENIED: &str =
-        "Got permission denied while trying to connect to the Docker daemon socket \
-                             at unix:///var/run/docker.sock";
-    const PODMAN_PERMISSION_DENIED: &str = "Error: unable to connect to Podman socket: dial unix \
-                             /run/user/1000/podman/podman.sock: connect: permission denied";
-    const APPLE_PERMISSION_DENIED: &str = "Error: permission denied accessing container socket";
-
-    #[test]
-    fn docker_not_found_stderr_classifies() {
-        assert!(RuntimeBase::DOCKER.is_not_found(DOCKER_MISSING));
+    fn probe_kind(result: Result<bool>) -> String {
+        match result {
+            Ok(present) => format!("ok:{present}"),
+            Err(DockerError::DaemonNotRunning) => "daemon_down".into(),
+            Err(DockerError::PermissionDenied) => "permission_denied".into(),
+            Err(DockerError::InspectFailed(stderr)) => format!("inspect_failed:{stderr}"),
+            Err(other) => format!("other:{other}"),
+        }
     }
 
     #[test]
-    fn apple_not_found_stderr_classifies() {
-        assert!(RuntimeBase::APPLE_CONTAINER.is_not_found(APPLE_MISSING));
-    }
-
-    #[test]
-    fn apple_inspect_not_found_stderr_classifies() {
-        // The `inspect` shape ("container not found: <name>") is distinct
-        // from the `delete`/`logs` shape (APPLE_MISSING) and was not
-        // originally covered by not_found_markers, causing every
-        // brand-new Apple-Container-sandboxed session to fail its first
-        // start with a surfaced InspectFailed instead of Ok(false).
-        assert!(RuntimeBase::APPLE_CONTAINER.is_not_found(APPLE_INSPECT_MISSING));
-    }
-
-    #[test]
-    fn podman_not_found_stderr_classifies() {
-        assert!(RuntimeBase::PODMAN.is_not_found(PODMAN_MISSING));
-    }
-
-    #[test]
-    fn genuine_failure_is_not_classified_as_not_found() {
-        // A real removal failure must NOT be mistaken for "already gone",
-        // which would re-introduce the silent-orphan bug.
-        let busy = "Error response from daemon: container is running: stop it first";
-        assert!(!RuntimeBase::DOCKER.is_not_found(busy));
-        assert!(!RuntimeBase::APPLE_CONTAINER.is_not_found(
+    fn classify_probe_failure_per_runtime() {
+        let cases = [
+            (&DOCKER, DOCKER_MISSING, "ok:false"),
+            (&APPLE, APPLE_MISSING, "ok:false"),
+            // Regression: this inspect shape once failed every new Apple sandbox's first start.
+            (&APPLE, APPLE_INSPECT_MISSING, "ok:false"),
+            (&PODMAN, PODMAN_MISSING, "ok:false"),
+            (
+                &DOCKER,
+                "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. \
+                 Is the docker daemon running?",
+                "daemon_down",
+            ),
+            (
+                &PODMAN,
+                "Error: unable to connect to Podman socket: Connection refused",
+                "daemon_down",
+            ),
+            (
+                &PODMAN,
+                "Cannot connect to Podman. Please verify your connection to the Linux system",
+                "daemon_down",
+            ),
+            (
+                &APPLE,
+                "Error: internalError: \"failed to connect to container daemon\" (cause: \"transient\")",
+                "daemon_down",
+            ),
+            (
+                &DOCKER,
+                "Got permission denied while trying to connect to the Docker daemon socket \
+                 at unix:///var/run/docker.sock",
+                "permission_denied",
+            ),
+            (
+                &PODMAN,
+                "Error: unable to connect to Podman socket: dial unix \
+                 /run/user/1000/podman/podman.sock: connect: permission denied",
+                "permission_denied",
+            ),
+            (
+                &APPLE,
+                "Error: permission denied accessing container socket",
+                "permission_denied",
+            ),
+            (
+                &DOCKER,
+                "Error response from daemon: internal server error 500",
+                "inspect_failed:Error response from daemon: internal server error 500",
+            ),
+            (&DOCKER, "", "inspect_failed:<no stderr>"),
+        ];
+        for (base, stderr, expected) in cases {
+            assert_eq!(
+                probe_kind(base.classify_probe_failure(stderr)),
+                expected,
+                "{}: {stderr}",
+                base.name
+            );
+        }
+        assert!(
+            !DOCKER.is_not_found("Error response from daemon: container is running: stop it first")
+        );
+        assert!(!APPLE.is_not_found(
             "Error: internalError: \"failed to delete container\" (cause: \"resource busy\")"
         ));
     }
 
     #[test]
-    fn inspect_not_found_stderr_collapses_to_ok_false() {
-        // Absent-container stderr from `<runtime> inspect <missing>` must map
-        // to Ok(false), so Probe::NotRunning fires and callers can proceed.
-        // The three fixture strings are the same as remove/stop uses; sharing
-        // the classifier keeps the not-running vs absent collapse consistent
-        // across all state-probe paths.
-        assert!(matches!(
-            RuntimeBase::DOCKER.classify_probe_failure(DOCKER_MISSING),
-            Ok(false)
-        ));
-        assert!(matches!(
-            RuntimeBase::APPLE_CONTAINER.classify_probe_failure(APPLE_MISSING),
-            Ok(false)
-        ));
-        assert!(matches!(
-            RuntimeBase::PODMAN.classify_probe_failure(PODMAN_MISSING),
-            Ok(false)
-        ));
-        // The real `container inspect <missing>` shape must also collapse
-        // to Ok(false); this is the shape is_container_running() actually
-        // sees, distinct from the delete/logs shape covered above.
-        assert!(matches!(
-            RuntimeBase::APPLE_CONTAINER.classify_probe_failure(APPLE_INSPECT_MISSING),
-            Ok(false)
-        ));
-    }
+    fn stderr_markers_do_not_bleed_across_runtimes() {
+        let runtimes = [&DOCKER, &PODMAN, &APPLE];
+        let daemon_down = [
+            "Cannot connect to the Docker daemon at ...",
+            "Error: unable to connect to Podman socket: ...",
+            "Error: internalError: \"failed to connect to container daemon\"",
+        ];
+        for (owner, stderr) in daemon_down.iter().enumerate() {
+            for (i, base) in runtimes.iter().enumerate() {
+                assert_eq!(
+                    base.is_daemon_down(stderr),
+                    i == owner,
+                    "{}: {stderr}",
+                    base.name
+                );
+            }
+        }
 
-    #[test]
-    fn inspect_daemon_down_stderr_maps_to_daemon_not_running() {
-        // Daemon-unreachable stderr must NOT collapse to Ok(false): that is
-        // the exact swallowing-existence-probe failure mode #2596 fixed on
-        // the discard path. Surfacing as Err lets classify_running_probe
-        // map it to Probe::Unknown so gates fail closed.
-        //
-        // We route these to DaemonNotRunning (not the generic InspectFailed)
-        // because the enum's Display for DaemonNotRunning carries the
-        // actionable "Start Docker Desktop or run: sudo systemctl start docker"
-        // hint. Mirrors run_create's stderr sniff at the create path.
-        //
-        // Markers now live in `daemon_down_markers` per-runtime (parallel to
-        // `not_found_markers`), so each runtime only matches its own
-        // wording; no cross-runtime bleed by construction.
-        assert!(matches!(
-            RuntimeBase::DOCKER.classify_probe_failure(DOCKER_DAEMON_DOWN),
-            Err(DockerError::DaemonNotRunning)
-        ));
-
-        assert!(matches!(
-            RuntimeBase::PODMAN.classify_probe_failure(PODMAN_SOCKET_DOWN),
-            Err(DockerError::DaemonNotRunning)
-        ));
-
-        assert!(matches!(
-            RuntimeBase::PODMAN.classify_probe_failure(PODMAN_DESKTOP_DOWN),
-            Err(DockerError::DaemonNotRunning)
-        ));
-
-        assert!(matches!(
-            RuntimeBase::APPLE_CONTAINER.classify_probe_failure(APPLE_DAEMON_DOWN),
-            Err(DockerError::DaemonNotRunning)
-        ));
-    }
-
-    #[test]
-    fn is_daemon_down_is_cross_runtime_isolated() {
-        // Cross-runtime bleed regression guard: Docker's daemon-down stderr
-        // must NOT match Podman's or Apple's markers, and vice versa. This
-        // is what the daemon_down_markers-per-runtime refactor buys us over
-        // the earlier inline-substring implementation.
-        let docker_down = "Cannot connect to the Docker daemon at ...";
-        assert!(RuntimeBase::DOCKER.is_daemon_down(docker_down));
-        assert!(!RuntimeBase::PODMAN.is_daemon_down(docker_down));
-        assert!(!RuntimeBase::APPLE_CONTAINER.is_daemon_down(docker_down));
-
-        let podman_down = "Error: unable to connect to Podman socket: ...";
-        assert!(RuntimeBase::PODMAN.is_daemon_down(podman_down));
-        assert!(!RuntimeBase::DOCKER.is_daemon_down(podman_down));
-        assert!(!RuntimeBase::APPLE_CONTAINER.is_daemon_down(podman_down));
-
-        let apple_down =
-            "Error: internalError: \"failed to connect to container daemon\" (cause: \"transient\")";
-        assert!(RuntimeBase::APPLE_CONTAINER.is_daemon_down(apple_down));
-        assert!(!RuntimeBase::DOCKER.is_daemon_down(apple_down));
-        assert!(!RuntimeBase::PODMAN.is_daemon_down(apple_down));
-    }
-
-    #[test]
-    fn inspect_permission_denied_stderr_maps_to_permission_denied() {
-        // Docker's canonical Linux socket-permission wording ("Got permission
-        // denied while trying to connect to the Docker daemon socket") surfaces
-        // the actionable PermissionDenied variant on all three runtimes via
-        // per-runtime `permission_denied_markers`. Podman and Apple use the
-        // broader "permission denied" placeholder pending real-fixture capture,
-        // so the OS-level socket error text matches on those runtimes too.
-        assert!(matches!(
-            RuntimeBase::DOCKER.classify_probe_failure(DOCKER_PERMISSION_DENIED),
-            Err(DockerError::PermissionDenied)
-        ));
-
-        assert!(matches!(
-            RuntimeBase::PODMAN.classify_probe_failure(PODMAN_PERMISSION_DENIED),
-            Err(DockerError::PermissionDenied)
-        ));
-
-        // Apple placeholder: no captured wording, but the broad marker still
-        // routes generic Linux socket permission errors to PermissionDenied.
-        // TODO: replace with captured Apple `container` CLI permission
-        // stderr once a real macOS 26 fixture is available (cf. #2655 for
-        // the parallel Apple daemon-down fixture follow-up).
-        assert!(matches!(
-            RuntimeBase::APPLE_CONTAINER.classify_probe_failure(APPLE_PERMISSION_DENIED),
-            Err(DockerError::PermissionDenied)
-        ));
-    }
-
-    #[test]
-    fn is_permission_denied_cross_runtime_isolation_is_asymmetric() {
-        // Companion to is_daemon_down_is_cross_runtime_isolated, but the
-        // invariant tested here is asymmetric by design: Docker's marker is
-        // tightened to the canonical "docker daemon socket" clause, so it
-        // isolates cleanly; Podman and Apple use the broad "permission
-        // denied" placeholder pending real-fixture capture and thus stay
-        // permissive. The asymmetric name flags that this test does NOT
-        // assert full three-way isolation like its daemon-down sibling.
+        // Podman and Apple keep broad placeholders; Docker's marker is tightly scoped.
         let docker_pd = "Got permission denied while trying to connect to the Docker daemon socket";
-        assert!(RuntimeBase::DOCKER.is_permission_denied(docker_pd));
-        // Podman and Apple ALSO match "permission denied" (their broader
-        // placeholders): this is the pre-#2656 behavior preserved intentionally.
-        assert!(RuntimeBase::PODMAN.is_permission_denied(docker_pd));
-        assert!(RuntimeBase::APPLE_CONTAINER.is_permission_denied(docker_pd));
-
-        // Conversely, a Podman-only wording that lacks Docker's specific
-        // clause MUST NOT match Docker's tight marker.
+        assert!(runtimes
+            .iter()
+            .all(|base| base.is_permission_denied(docker_pd)));
         let podman_only = "Error: unable to connect to Podman socket: connect: permission denied";
-        assert!(!RuntimeBase::DOCKER.is_permission_denied(podman_only));
-        assert!(RuntimeBase::PODMAN.is_permission_denied(podman_only));
-
-        // Docker's tightening promise: unrelated "permission denied" errors
-        // (image policy, registry auth, volume mount) that a broad substring
-        // match would misclassify MUST be rejected. Locks the tightening
-        // against future regressions ("just one more case, it will be fine").
-        let policy_denied =
-            "docker: Error response from daemon: pull access denied: permission denied by policy";
-        assert!(!RuntimeBase::DOCKER.is_permission_denied(policy_denied));
-    }
-
-    #[test]
-    fn probe_output_maps_missing_binary_to_not_installed() {
-        // A runtime binary absent from PATH makes `Command::output()` fail
-        // with io::ErrorKind::NotFound. probe_output must translate that into
-        // the actionable NotInstalled variant rather than the opaque IoError
-        // the bare `?` conversion would surface at gate sites.
-        let mut cmd = Command::new("aoe-nonexistent-runtime-binary-zzz");
-        cmd.arg("--version");
-        assert!(matches!(
-            RuntimeBase::DOCKER.probe_output(&mut cmd),
-            Err(DockerError::NotInstalled)
+        assert!(!DOCKER.is_permission_denied(podman_only));
+        assert!(PODMAN.is_permission_denied(podman_only));
+        assert!(!DOCKER.is_permission_denied(
+            "docker: Error response from daemon: pull access denied: permission denied by policy"
         ));
     }
 
     #[cfg(unix)]
     #[test]
-    fn probe_output_maps_timeout_to_timed_out_io_error() {
-        assert!(
-            RUNTIME_EXEC_TIMEOUT > RUNTIME_CMD_TIMEOUT,
-            "arbitrary container work must have a wider bound than control probes"
-        );
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", "sleep 5"]);
-        let result =
-            RuntimeBase::DOCKER.probe_output_with_timeout(&mut cmd, Duration::from_millis(10));
+    fn probe_output_maps_spawn_failures_and_timeouts() {
+        let mut missing = Command::new("aoe-nonexistent-runtime-binary-zzz");
         assert!(matches!(
-            &result,
-            Err(DockerError::IoError(error))
-                if error.kind() == std::io::ErrorKind::TimedOut
+            DOCKER.probe_output(&mut missing),
+            Err(DockerError::NotInstalled)
         ));
-    }
 
-    #[test]
-    fn probe_output_returns_ok_for_a_spawnable_binary() {
-        // A binary that exists but exits non-zero must NOT be misclassified as
-        // NotInstalled: probe_output only remaps the missing-binary NotFound
-        // spawn error, and lets a real (non-success) run return Ok(output).
-        // `false` exits 1 on every Unix; skip where it is not on PATH.
-        let mut probe = Command::new("false");
-        if probe.output().is_err() {
-            return;
-        }
-        let mut cmd = Command::new("false");
-        let output = RuntimeBase::DOCKER
-            .probe_output(&mut cmd)
-            .expect("spawnable binary must not map to a DockerError");
+        let output = DOCKER
+            .probe_output(&mut Command::new("false"))
+            .expect("a spawnable binary must not map to a DockerError");
         assert!(!output.status.success());
+
+        assert!(RUNTIME_EXEC_TIMEOUT > RUNTIME_CMD_TIMEOUT);
+        let mut slow = Command::new("sh");
+        slow.args(["-c", "sleep 5"]);
+        assert!(matches!(
+            &DOCKER.probe_output_with_timeout(&mut slow, Duration::from_millis(10)),
+            Err(DockerError::IoError(error)) if error.kind() == std::io::ErrorKind::TimedOut
+        ));
     }
 
-    #[test]
-    fn inspect_generic_transient_maps_to_inspect_failed() {
-        // Any non-not-found, non-daemon-down, non-permission-denied stderr
-        // falls through to InspectFailed carrying the raw stderr. This is
-        // the generic Probe::Unknown route for "something else went wrong
-        // during inspect": the operator sees the underlying runtime message
-        // via the warn's error field.
-        let stderr = "Error response from daemon: internal server error 500";
-        // Assert the sanitized stderr is carried in the payload (not just the
-        // variant): the `_` discard would pass even if sanitize_stderr dropped
-        // the operator-facing content.
-        match RuntimeBase::DOCKER.classify_probe_failure(stderr) {
-            Err(DockerError::InspectFailed(s)) => assert!(
-                s.contains("500"),
-                "InspectFailed payload should carry the fixture stderr, got: {s:?}"
-            ),
-            other => panic!("expected Err(InspectFailed), got {other:?}"),
+    fn create_args(base: &RuntimeBase, config: ContainerConfig) -> Vec<String> {
+        base.build_create_args(
+            "c",
+            "alpine:latest",
+            &ContainerConfig {
+                working_dir: "/workspace".to_string(),
+                ..config
+            },
+        )
+    }
+
+    fn mount(host: &str, container: &str, read_only: bool) -> VolumeMount {
+        VolumeMount {
+            host_path: host.to_string(),
+            container_path: container.to_string(),
+            read_only,
         }
     }
 
-    #[test]
-    fn inspect_empty_stderr_maps_to_inspect_failed_with_sentinel() {
-        // A runtime that exits non-zero without writing stderr must still
-        // surface an actionable Display: the terminal InspectFailed arm runs
-        // stderr through sanitize_stderr, which substitutes the `<no stderr>`
-        // sentinel so the operator never sees a dangling "Failed to inspect
-        // container: ".
-        match RuntimeBase::DOCKER.classify_probe_failure("") {
-            Err(DockerError::InspectFailed(msg)) => assert_eq!(msg, "<no stderr>"),
-            other => panic!("expected InspectFailed(<no stderr>), got {other:?}"),
-        }
-    }
-
-    // Existence-surface test triples: parallel to the running-state triples
-    // above, verifying the existence surface (used by `does_container_exist`)
-    // shares the same `classify_probe_failure` classification. Both surfaces
-    // now funnel through the one classifier, so these exercise the same code
-    // path with the existence-surface fixtures. Closes the
-    // swallowing-existence-probe class of bug (#2596) on the existence
-    // surface, following #2652 which closed it on the running-state surface.
-    // Absent-container, daemon-down, and permission-denied fixture bytes are
-    // all shared with the running-state suite via the module-scope constants
-    // (`_MISSING`, `_DAEMON_DOWN` / `_SOCKET_DOWN` / `_DESKTOP_DOWN`,
-    // `_PERMISSION_DENIED`), so the two probe surfaces cannot drift apart.
-
-    #[test]
-    fn exists_not_found_stderr_collapses_to_ok_false() {
-        // Absent-container stderr (from `<runtime> container inspect
-        // <missing>` on Docker/Podman, or `<runtime> logs <missing>` on
-        // Apple) must map to Ok(false), so `does_container_exist` returns a
-        // definitive "absent" instead of surfacing the missing container as
-        // an Err.
-        assert!(matches!(
-            RuntimeBase::DOCKER.classify_probe_failure(DOCKER_MISSING),
-            Ok(false)
-        ));
-        assert!(matches!(
-            RuntimeBase::APPLE_CONTAINER.classify_probe_failure(APPLE_MISSING),
-            Ok(false)
-        ));
-        assert!(matches!(
-            RuntimeBase::PODMAN.classify_probe_failure(PODMAN_MISSING),
-            Ok(false)
-        ));
-    }
-
-    #[test]
-    fn exists_daemon_down_stderr_maps_to_daemon_not_running() {
-        // Daemon-unreachable stderr on the existence surface must NOT
-        // collapse to Ok(false): that is the exact swallowing-existence-probe
-        // failure mode this fix closes. Surfacing as Err lets the
-        // create-path and future fail-closed gates route the daemon-down
-        // signal to the actionable DaemonNotRunning Display message.
-        assert!(matches!(
-            RuntimeBase::DOCKER.classify_probe_failure(DOCKER_DAEMON_DOWN),
-            Err(DockerError::DaemonNotRunning)
-        ));
-
-        assert!(matches!(
-            RuntimeBase::PODMAN.classify_probe_failure(PODMAN_SOCKET_DOWN),
-            Err(DockerError::DaemonNotRunning)
-        ));
-
-        assert!(matches!(
-            RuntimeBase::PODMAN.classify_probe_failure(PODMAN_DESKTOP_DOWN),
-            Err(DockerError::DaemonNotRunning)
-        ));
-
-        // Apple placeholder: real `container` CLI daemon-down wording is not
-        // captured in this repo; marker match is by construction, same
-        // caveat as classify_probe_failure's Apple daemon-down test.
-        assert!(matches!(
-            RuntimeBase::APPLE_CONTAINER.classify_probe_failure(APPLE_DAEMON_DOWN),
-            Err(DockerError::DaemonNotRunning)
-        ));
-    }
-
-    #[test]
-    fn exists_permission_denied_stderr_maps_to_permission_denied() {
-        // Same PermissionDenied classification as classify_probe_failure:
-        // Docker's tight marker isolates cleanly; Podman and Apple use the
-        // broader "permission denied" placeholder pending real-fixture
-        // capture (same caveat documented on classify_probe_failure).
-        assert!(matches!(
-            RuntimeBase::DOCKER.classify_probe_failure(DOCKER_PERMISSION_DENIED),
-            Err(DockerError::PermissionDenied)
-        ));
-
-        assert!(matches!(
-            RuntimeBase::PODMAN.classify_probe_failure(PODMAN_PERMISSION_DENIED),
-            Err(DockerError::PermissionDenied)
-        ));
-
-        assert!(matches!(
-            RuntimeBase::APPLE_CONTAINER.classify_probe_failure(APPLE_PERMISSION_DENIED),
-            Err(DockerError::PermissionDenied)
-        ));
-    }
-
-    #[test]
-    fn exists_generic_transient_maps_to_inspect_failed() {
-        // The terminal-else on the existence surface reuses InspectFailed
-        // rather than introducing a parallel ExistenceCheckFailed variant:
-        // the classification rules and single-line Display contract are
-        // identical, and operators read the raw stderr via the error field
-        // regardless of which argv produced it.
-        let stderr = "Error response from daemon: internal server error 500";
-        // As with the inspect sibling, assert the payload carries the fixture
-        // content, not merely the InspectFailed variant.
-        match RuntimeBase::DOCKER.classify_probe_failure(stderr) {
-            Err(DockerError::InspectFailed(s)) => assert!(
-                s.contains("500"),
-                "InspectFailed payload should carry the fixture stderr, got: {s:?}"
-            ),
-            other => panic!("expected Err(InspectFailed), got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_build_create_args_read_only_supported() {
-        let base = RuntimeBase::DOCKER;
-        let config = ContainerConfig {
-            working_dir: "/workspace/project".to_string(),
-            volumes: vec![VolumeMount {
-                host_path: "/host/path".to_string(),
-                container_path: "/container/path".to_string(),
-                read_only: true,
-            }],
-            anonymous_volumes: vec![],
-            named_ignore_volumes: vec![],
-            environment: vec![],
-            cpu_limit: None,
-            memory_limit: None,
-            port_mappings: vec![],
-            ..Default::default()
-        };
-
-        let args = base.build_create_args("test-container", "alpine:latest", &config);
-
-        // Should include :ro suffix
-        assert!(args.contains(&"/host/path:/container/path:ro".to_string()));
-    }
-
-    #[test]
-    fn test_build_create_args_read_only_not_supported() {
-        let base = RuntimeBase::APPLE_CONTAINER;
-        let config = ContainerConfig {
-            working_dir: "/workspace/project".to_string(),
-            volumes: vec![VolumeMount {
-                host_path: "/host/path".to_string(),
-                container_path: "/container/path".to_string(),
-                read_only: true,
-            }],
-            anonymous_volumes: vec![],
-            named_ignore_volumes: vec![],
-            environment: vec![],
-            cpu_limit: None,
-            memory_limit: None,
-            port_mappings: vec![],
-            ..Default::default()
-        };
-
-        let args = base.build_create_args("test-container", "alpine:latest", &config);
-
-        // Should NOT include :ro suffix (Apple Container doesn't support it)
-        assert!(args.contains(&"/host/path:/container/path".to_string()));
-        assert!(!args.iter().any(|a| a.ends_with(":ro")));
-    }
-
-    /// The value immediately following `flag` in an arg list, if present.
     fn arg_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
         args.iter()
             .position(|a| a == flag)
@@ -1338,149 +822,107 @@ mod tests {
             .map(String::as_str)
     }
 
-    #[test]
-    fn test_build_create_args_no_network_flag_by_default() {
-        let base = RuntimeBase::DOCKER;
-        let config = ContainerConfig {
-            working_dir: "/workspace/project".to_string(),
-            ..Default::default()
-        };
+    fn values_of<'a>(args: &'a [String], flag: &str) -> Vec<&'a str> {
+        args.windows(2)
+            .filter(|pair| pair[0] == flag)
+            .map(|pair| pair[1].as_str())
+            .collect()
+    }
 
-        let args = base.build_create_args("c", "alpine:latest", &config);
-
-        assert!(!args.iter().any(|a| a == "--network"));
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| v.to_string()).collect()
     }
 
     #[test]
-    fn test_build_create_args_named_network_emitted() {
-        let base = RuntimeBase::DOCKER;
-        let config = ContainerConfig {
-            working_dir: "/workspace/project".to_string(),
-            network: Some("egress-proxy".to_string()),
+    fn create_args_render_mount_options_per_runtime() {
+        let volumes = vec![
+            mount("/host/rw", "/container/rw", false),
+            mount("/host/ro", "/container/ro", true),
+        ];
+        let named = || {
+            vec![NamedVolumeMount {
+                volume_name: "aoe-vi-sess1-workspace-node_modules-abc123".to_string(),
+                container_path: "/workspace/node_modules".to_string(),
+            }]
+        };
+        let config = || ContainerConfig {
+            volumes: volumes.clone(),
+            anonymous_volumes: vec!["/tmp/cache".to_string()],
+            named_ignore_volumes: named(),
             ..Default::default()
         };
+        assert_eq!(
+            values_of(&create_args(&DOCKER, config()), "-v"),
+            [
+                "/host/rw:/container/rw",
+                "/host/ro:/container/ro:ro",
+                "/tmp/cache",
+                "aoe-vi-sess1-workspace-node_modules-abc123:/workspace/node_modules",
+            ]
+        );
+        let relabeled = ContainerConfig {
+            selinux_relabel: true,
+            ..config()
+        };
+        assert_eq!(
+            values_of(&create_args(&PODMAN, relabeled), "-v")[..2],
+            ["/host/rw:/container/rw:z", "/host/ro:/container/ro:ro,z"]
+        );
+        let relabeled = ContainerConfig {
+            selinux_relabel: true,
+            ..config()
+        };
+        assert_eq!(
+            values_of(&create_args(&APPLE, relabeled), "-v"),
+            [
+                "/host/rw:/container/rw",
+                "/host/ro:/container/ro",
+                "/tmp/cache",
+                "/workspace/node_modules",
+            ]
+        );
+    }
 
-        let args = base.build_create_args("c", "alpine:latest", &config);
+    #[test]
+    fn create_args_network_and_ports() {
+        let with = |network: Option<&str>| ContainerConfig {
+            network: network.map(str::to_string),
+            port_mappings: strings(&["3000:3000", "5432:5432"]),
+            ..Default::default()
+        };
+        let args = create_args(&DOCKER, with(None));
+        assert_eq!(arg_after(&args, "--network"), None);
+        assert_eq!(values_of(&args, "-p"), ["3000:3000", "5432:5432"]);
 
+        let args = create_args(&DOCKER, with(Some("egress-proxy")));
         assert_eq!(arg_after(&args, "--network"), Some("egress-proxy"));
-    }
+        assert_eq!(values_of(&args, "-p"), ["3000:3000", "5432:5432"]);
 
-    #[test]
-    fn test_build_create_args_network_none_drops_port_mappings() {
-        let base = RuntimeBase::DOCKER;
-        let config = ContainerConfig {
-            working_dir: "/workspace/project".to_string(),
-            network: Some("none".to_string()),
-            port_mappings: vec!["3000:3000".to_string()],
-            ..Default::default()
-        };
-
-        let args = base.build_create_args("c", "alpine:latest", &config);
-
+        let args = create_args(&DOCKER, with(Some("none")));
         assert_eq!(arg_after(&args, "--network"), Some("none"));
-        // `-p` conflicts with `--network none`, so it must be dropped.
-        assert!(!args.iter().any(|a| a == "-p"));
+        assert!(values_of(&args, "-p").is_empty());
+
+        let args = create_args(&APPLE, with(Some("none")));
+        assert_eq!(arg_after(&args, "--network"), None);
+        assert_eq!(values_of(&args, "-p"), ["3000:3000", "5432:5432"]);
     }
 
     #[test]
-    fn test_build_create_args_network_skipped_on_unsupported_runtime() {
-        let base = RuntimeBase::APPLE_CONTAINER;
-        let config = ContainerConfig {
-            working_dir: "/workspace/project".to_string(),
-            network: Some("none".to_string()),
-            port_mappings: vec!["3000:3000".to_string()],
-            ..Default::default()
+    fn create_args_run_policy_respects_runtime_support() {
+        let policy = || RunPolicy {
+            privileged: true,
+            cap_add: strings(&["SYS_ADMIN"]),
+            cap_drop: strings(&["NET_RAW"]),
+            security_opt: strings(&["seccomp=unconfined"]),
+            extra_run_args: strings(&["--isolation", "chroot"]),
         };
-
-        let args = base.build_create_args("c", "alpine:latest", &config);
-
-        // Apple Container gets no --network flag, and because it wasn't applied
-        // the port mappings are still emitted.
-        assert!(!args.iter().any(|a| a == "--network"));
-        assert_eq!(arg_after(&args, "-p"), Some("3000:3000"));
-    }
-
-    #[test]
-    fn test_build_create_args_ports_kept_with_named_network() {
-        let base = RuntimeBase::DOCKER;
-        let config = ContainerConfig {
-            working_dir: "/workspace/project".to_string(),
-            network: Some("egress-proxy".to_string()),
-            port_mappings: vec!["3000:3000".to_string()],
-            ..Default::default()
-        };
-
-        let args = base.build_create_args("c", "alpine:latest", &config);
-
-        assert_eq!(arg_after(&args, "-p"), Some("3000:3000"));
-    }
-
-    #[test]
-    fn test_build_create_args_selinux_relabel() {
-        let base = RuntimeBase::PODMAN;
-        let config = ContainerConfig {
-            working_dir: "/workspace/project".to_string(),
-            volumes: vec![
-                VolumeMount {
-                    host_path: "/host/rw".to_string(),
-                    container_path: "/container/rw".to_string(),
-                    read_only: false,
-                },
-                VolumeMount {
-                    host_path: "/host/ro".to_string(),
-                    container_path: "/container/ro".to_string(),
-                    read_only: true,
-                },
-            ],
-            selinux_relabel: true,
-            ..Default::default()
-        };
-
-        let args = base.build_create_args("test-container", "alpine:latest", &config);
-
-        // Read-write mount gets :z; read-only gets :ro,z.
-        assert!(args.contains(&"/host/rw:/container/rw:z".to_string()));
-        assert!(args.contains(&"/host/ro:/container/ro:ro,z".to_string()));
-    }
-
-    #[test]
-    fn test_build_create_args_selinux_relabel_unsupported_runtime() {
-        let base = RuntimeBase::APPLE_CONTAINER;
-        let config = ContainerConfig {
-            working_dir: "/workspace/project".to_string(),
-            volumes: vec![VolumeMount {
-                host_path: "/host/path".to_string(),
-                container_path: "/container/path".to_string(),
-                read_only: false,
-            }],
-            selinux_relabel: true,
-            ..Default::default()
-        };
-
-        let args = base.build_create_args("test-container", "alpine:latest", &config);
-
-        // Apple Container doesn't support :z; the mount stays plain.
-        assert!(args.contains(&"/host/path:/container/path".to_string()));
-        assert!(!args.iter().any(|a| a.contains(":z")));
-    }
-
-    #[test]
-    fn test_build_create_args_run_policy_flags() {
-        let base = RuntimeBase::DOCKER;
-        let config = ContainerConfig {
-            working_dir: "/workspace/project".to_string(),
-            run_policy: RunPolicy {
-                privileged: true,
-                cap_add: vec!["SYS_ADMIN".to_string()],
-                cap_drop: vec!["NET_RAW".to_string()],
-                security_opt: vec!["seccomp=unconfined".to_string()],
-                extra_run_args: vec!["--isolation".to_string(), "chroot".to_string()],
+        let args = create_args(
+            &DOCKER,
+            ContainerConfig {
+                run_policy: policy(),
+                ..Default::default()
             },
-            ..Default::default()
-        };
-
-        let args = base.build_create_args("c", "alpine:latest", &config);
-
+        );
         assert!(args.contains(&"--privileged".to_string()));
         assert_eq!(arg_after(&args, "--cap-add"), Some("SYS_ADMIN"));
         assert_eq!(arg_after(&args, "--cap-drop"), Some("NET_RAW"));
@@ -1488,228 +930,88 @@ mod tests {
             arg_after(&args, "--security-opt"),
             Some("seccomp=unconfined")
         );
-        let isolation = args.iter().position(|a| a == "--isolation").unwrap();
-        let image = args.iter().position(|a| a == "alpine:latest").unwrap();
-        assert_eq!(args[isolation + 1], "chroot");
-        assert_eq!(isolation + 2, image);
-    }
+        assert!(args.ends_with(&strings(&[
+            "--isolation",
+            "chroot",
+            "alpine:latest",
+            "sleep",
+            "infinity"
+        ])));
 
-    #[test]
-    fn test_build_create_args_run_policy_skipped_on_unsupported_runtime() {
-        let base = RuntimeBase::APPLE_CONTAINER;
-        let config = ContainerConfig {
-            working_dir: "/workspace/project".to_string(),
-            run_policy: RunPolicy {
-                privileged: true,
-                cap_add: vec!["SYS_ADMIN".to_string()],
-                cap_drop: vec!["ALL".to_string()],
-                security_opt: vec!["seccomp=unconfined".to_string()],
-                extra_run_args: vec!["--virtiofs".to_string()],
+        let args = create_args(
+            &APPLE,
+            ContainerConfig {
+                run_policy: policy(),
+                ..Default::default()
             },
-            ..Default::default()
-        };
-
-        let args = base.build_create_args("c", "alpine:latest", &config);
-
-        for flag in ["--privileged", "--security-opt"] {
-            assert!(!args.contains(&flag.to_string()), "unexpected {flag}");
-        }
+        );
+        assert!(!args.contains(&"--privileged".to_string()));
+        assert!(!args.contains(&"--security-opt".to_string()));
         assert_eq!(arg_after(&args, "--cap-add"), Some("SYS_ADMIN"));
-        assert_eq!(arg_after(&args, "--cap-drop"), Some("ALL"));
-        assert!(args.contains(&"--virtiofs".to_string()));
-    }
+        assert!(args.contains(&"--isolation".to_string()));
 
-    #[test]
-    fn test_build_create_args_no_run_policy_by_default() {
-        let base = RuntimeBase::DOCKER;
-        let config = ContainerConfig {
-            working_dir: "/workspace/project".to_string(),
-            ..Default::default()
-        };
-
-        let args = base.build_create_args("c", "alpine:latest", &config);
-
+        let args = create_args(&DOCKER, ContainerConfig::default());
         for flag in ["--privileged", "--cap-add", "--cap-drop", "--security-opt"] {
             assert!(!args.contains(&flag.to_string()), "unexpected {flag}");
         }
     }
 
     #[test]
-    fn test_exec_command_with_options() {
-        let base = RuntimeBase::DOCKER;
-        let cmd = base.exec_command("my-container", Some("-w /workspace"), "my-agent");
-        assert_eq!(cmd, "docker exec -it -w /workspace my-container my-agent");
-    }
-
-    #[test]
-    fn test_exec_command_without_options() {
-        let base = RuntimeBase::DOCKER;
-        let cmd = base.exec_command("my-container", None, "my-agent");
-        assert_eq!(cmd, "docker exec -it my-container my-agent");
-    }
-
-    #[test]
-    fn test_exec_command_apple_container() {
-        let base = RuntimeBase::APPLE_CONTAINER;
-        let cmd = base.exec_command("my-container", None, "my-agent");
-        assert_eq!(cmd, "container exec -it my-container my-agent");
-    }
-
-    #[test]
-    fn test_build_create_args_full_config() {
-        let base = RuntimeBase::DOCKER;
-        let config = ContainerConfig {
-            working_dir: "/workspace/project".to_string(),
-            volumes: vec![VolumeMount {
-                host_path: "/src".to_string(),
-                container_path: "/dst".to_string(),
-                read_only: false,
-            }],
-            anonymous_volumes: vec!["/tmp/cache".to_string()],
-            named_ignore_volumes: vec![],
-            environment: vec![EnvEntry::Literal {
-                key: "KEY".to_string(),
-                value: "VALUE".to_string(),
-            }],
-            cpu_limit: Some("2".to_string()),
-            memory_limit: Some("4g".to_string()),
-            port_mappings: vec!["3000:3000".to_string()],
-            ..Default::default()
-        };
-
-        let args = base.build_create_args("test", "ubuntu:latest", &config);
-
-        assert!(args.contains(&"run".to_string()));
-        assert!(args.contains(&"-d".to_string()));
-        assert!(args.contains(&"--name".to_string()));
-        assert!(args.contains(&"test".to_string()));
-        assert!(args.contains(&"-w".to_string()));
-        assert!(args.contains(&"/workspace/project".to_string()));
-        assert!(args.contains(&"/src:/dst".to_string()));
-        assert!(args.contains(&"/tmp/cache".to_string()));
-        assert!(args.contains(&"KEY=VALUE".to_string()));
-        assert!(args.contains(&"--cpus".to_string()));
-        assert!(args.contains(&"2".to_string()));
-        assert!(args.contains(&"-m".to_string()));
-        assert!(args.contains(&"4g".to_string()));
-        assert!(args.contains(&"-p".to_string()));
-        assert!(args.contains(&"3000:3000".to_string()));
-        assert!(args.contains(&"ubuntu:latest".to_string()));
-        assert!(args.contains(&"sleep".to_string()));
-        assert!(args.contains(&"infinity".to_string()));
-    }
-
-    #[test]
-    fn test_build_create_args_inherit_env_no_value_in_argv() {
-        let base = RuntimeBase::DOCKER;
-        let config = ContainerConfig {
-            working_dir: "/workspace".to_string(),
-            volumes: vec![],
-            anonymous_volumes: vec![],
-            named_ignore_volumes: vec![],
-            environment: vec![EnvEntry::Inherit {
-                key: "GH_TOKEN".to_string(),
-                value: "ghp_secret123".to_string(),
-            }],
-            cpu_limit: None,
-            memory_limit: None,
-            port_mappings: vec![],
-            ..Default::default()
-        };
-
-        let args = base.build_create_args("test", "alpine:latest", &config);
-
-        // Should contain just the key, not the value
-        assert!(args.contains(&"GH_TOKEN".to_string()));
+    fn create_args_base_limits_and_env() {
+        let args = create_args(
+            &DOCKER,
+            ContainerConfig {
+                environment: vec![
+                    EnvEntry::Inherit {
+                        key: "GH_TOKEN".to_string(),
+                        value: "ghp_secret123".to_string(),
+                    },
+                    EnvEntry::Literal {
+                        key: "TERM".to_string(),
+                        value: "xterm".to_string(),
+                    },
+                ],
+                cpu_limit: Some("2".to_string()),
+                memory_limit: Some("4g".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            args[..6],
+            strings(&["run", "-d", "--name", "c", "-w", "/workspace"])
+        );
+        assert_eq!(values_of(&args, "-e"), ["GH_TOKEN", "TERM=xterm"]);
         assert!(!args.iter().any(|a| a.contains("ghp_secret123")));
+        assert_eq!(arg_after(&args, "--cpus"), Some("2"));
+        assert_eq!(arg_after(&args, "-m"), Some("4g"));
     }
 
     #[test]
-    fn test_build_create_args_mixed_env_entries() {
-        let base = RuntimeBase::DOCKER;
-        let config = ContainerConfig {
-            working_dir: "/workspace".to_string(),
-            volumes: vec![],
-            anonymous_volumes: vec![],
-            named_ignore_volumes: vec![],
-            environment: vec![
-                EnvEntry::Inherit {
-                    key: "SECRET".to_string(),
-                    value: "s3cr3t".to_string(),
-                },
-                EnvEntry::Literal {
-                    key: "TERM".to_string(),
-                    value: "xterm".to_string(),
-                },
-            ],
-            cpu_limit: None,
-            memory_limit: None,
-            port_mappings: vec![],
-            ..Default::default()
-        };
-
-        let args = base.build_create_args("test", "alpine:latest", &config);
-
-        // Inherit: just the key
-        assert!(args.contains(&"SECRET".to_string()));
-        assert!(!args.iter().any(|a| a.contains("s3cr3t")));
-        // Literal: key=value
-        assert!(args.contains(&"TERM=xterm".to_string()));
-    }
-
-    #[test]
-    fn test_build_create_args_port_mappings() {
-        let base = RuntimeBase::DOCKER;
-        let config = ContainerConfig {
-            working_dir: "/workspace".to_string(),
-            volumes: vec![],
-            anonymous_volumes: vec![],
-            named_ignore_volumes: vec![],
-            environment: vec![],
-            cpu_limit: None,
-            memory_limit: None,
-            port_mappings: vec!["3000:3000".to_string(), "5432:5432".to_string()],
-            ..Default::default()
-        };
-
-        let args = base.build_create_args("test", "alpine:latest", &config);
-
-        // Both port mappings should appear with -p flags
-        let p_indices: Vec<usize> = args
-            .iter()
-            .enumerate()
-            .filter(|(_, a)| *a == "-p")
-            .map(|(i, _)| i)
-            .collect();
-        assert_eq!(p_indices.len(), 2);
-        assert_eq!(args[p_indices[0] + 1], "3000:3000");
-        assert_eq!(args[p_indices[1] + 1], "5432:5432");
+    fn exec_command_formats() {
+        assert_eq!(
+            DOCKER.exec_command("my-container", Some("-w /workspace"), "my-agent"),
+            "docker exec -it -w /workspace my-container my-agent"
+        );
+        assert_eq!(
+            APPLE.exec_command("my-container", None, "my-agent"),
+            "container exec -it my-container my-agent"
+        );
     }
 
     #[test]
     fn selected_named_ignore_volumes_never_reaches_outside_the_prefix() {
-        // The reporter's own listing (#3742): a sibling-worktree layout whose
-        // session moved from otari-worktrees/905 to otari-worktrees/rev-912.
-        // The hash suffixes are real `named_volume_for` output, kept literal on
-        // purpose: `DefaultHasher` is not stable across Rust releases, and a bump
-        // that changed it would orphan every existing named volume, so these
-        // constants are the canary for that.
+        // Real `named_volume_for` output: `DefaultHasher` drift would orphan existing named volumes.
         const MAIN: &str = "aoe-vi-sess1-workspace-otari-target-8ec07926d6b0";
         const PRE_MOVE: &str = "aoe-vi-sess1-workspace-otari-worktrees-905-target-31ddd0322290";
         const POST_MOVE: &str =
             "aoe-vi-sess1-workspace-otari-worktrees-rev-912-target-873cf2685e47";
 
         let moved = format!("{MAIN}\n{PRE_MOVE}\n{POST_MOVE}\n");
-        // docker's `--filter name=` is a substring match, so a listing under
-        // `aoe-vi-sess1-` can carry a longer session id this prefix must not claim.
         let other_session =
             format!("{PRE_MOVE}\naoe-vi-sess10-workspace-a-target-c8c9b4754ab1\n\n");
 
-        // `None` selects everything, the shape the session-deletion sweep uses.
         let cases = [
             (
-                // The reclaim: only the name the caller computed for the moved path,
-                // never the main repo's volume or the one the new container mounts.
                 "an allowlist of one stranded name",
                 moved.as_str(),
                 Some(HashSet::from([PRE_MOVE])),
@@ -1738,120 +1040,27 @@ mod tests {
     }
 
     #[test]
-    fn test_named_ignore_volumes_rendered_as_name_colon_path_on_docker() {
-        use crate::containers::container_interface::NamedVolumeMount;
-        let base = RuntimeBase::DOCKER;
-        let config = ContainerConfig {
-            working_dir: "/workspace".to_string(),
-            volumes: vec![],
-            anonymous_volumes: vec![],
-            named_ignore_volumes: vec![NamedVolumeMount {
-                volume_name: "aoe-vi-sess1-workspace-node_modules-abc123def456".to_string(),
-                container_path: "/workspace/node_modules".to_string(),
-            }],
-            environment: vec![],
-            cpu_limit: None,
-            memory_limit: None,
-            port_mappings: vec![],
-            ..Default::default()
-        };
-
-        let args = base.build_create_args("test", "alpine:latest", &config);
-
-        let v_positions: Vec<usize> = args
-            .iter()
-            .enumerate()
-            .filter(|(_, a)| *a == "-v")
-            .map(|(i, _)| i)
-            .collect();
-        let volume_args: Vec<&str> = v_positions.iter().map(|&i| args[i + 1].as_str()).collect();
-
-        assert!(
-            volume_args.contains(
-                &"aoe-vi-sess1-workspace-node_modules-abc123def456:/workspace/node_modules"
-            ),
-            "Named volume must render as name:/path, got: {:?}",
-            volume_args
-        );
-    }
-
-    #[test]
-    fn test_named_ignore_volumes_fall_back_to_anonymous_on_apple_container() {
-        use crate::containers::container_interface::NamedVolumeMount;
-        let base = RuntimeBase::APPLE_CONTAINER;
-        let config = ContainerConfig {
-            working_dir: "/workspace".to_string(),
-            volumes: vec![],
-            anonymous_volumes: vec![],
-            named_ignore_volumes: vec![NamedVolumeMount {
-                volume_name: "aoe-vi-sess1-workspace-node_modules-abc123".to_string(),
-                container_path: "/workspace/node_modules".to_string(),
-            }],
-            environment: vec![],
-            cpu_limit: None,
-            memory_limit: None,
-            port_mappings: vec![],
-            ..Default::default()
-        };
-
-        let args = base.build_create_args("test", "alpine:latest", &config);
-
-        let v_positions: Vec<usize> = args
-            .iter()
-            .enumerate()
-            .filter(|(_, a)| *a == "-v")
-            .map(|(i, _)| i)
-            .collect();
-        let volume_args: Vec<&str> = v_positions.iter().map(|&i| args[i + 1].as_str()).collect();
-
-        // Apple Container must use bare path, not name:path
-        assert!(
-            volume_args.contains(&"/workspace/node_modules"),
-            "Apple Container fallback must use bare container path, got: {:?}",
-            volume_args
-        );
-        assert!(
-            !volume_args.iter().any(|a| a.contains("aoe-vi-")),
-            "Apple Container must not use the volume name in -v args"
-        );
-    }
-
-    #[test]
     fn store_generation_label_is_emitted_by_supported_runtimes() {
-        let config = ContainerConfig::default();
-        let shared = ContainerConfig {
+        let shared = || ContainerConfig {
             shared_credential_mounts: vec!["/root/.claude/.credentials.json".to_string()],
             agent_tool: "claude".to_string(),
             ..Default::default()
         };
-        let credential_label = [
-            "--label",
-            "com.agent-of-empires.shared-credential-mounts=/root/.claude/.credentials.json",
-        ];
-        let tool_label = ["--label", "com.agent-of-empires.agent-tool=claude"];
-        for base in [
-            RuntimeBase::DOCKER,
-            RuntimeBase::PODMAN,
-            RuntimeBase::APPLE_CONTAINER,
-        ] {
-            let args = base.build_create_args("c", "image", &config);
-            assert!(args.windows(2).any(|pair| {
-                pair == ["--label", "com.agent-of-empires.sandbox-store-generation=2"]
-            }));
-            assert!(!args.windows(2).any(|pair| pair == credential_label));
-            assert!(!args
-                .iter()
-                .any(|arg| arg.starts_with("com.agent-of-empires.agent-tool")));
-            let args = base.build_create_args("c", "image", &shared);
-            assert!(args.windows(2).any(|pair| pair == credential_label));
-            assert!(args.windows(2).any(|pair| pair == tool_label));
+        for base in [&DOCKER, &PODMAN, &APPLE] {
+            let args = create_args(base, ContainerConfig::default());
+            let labels = values_of(&args, "--label");
+            assert_eq!(labels[0], "com.agent-of-empires.sandbox-store-generation=2");
+            assert!(labels[1].starts_with("com.agent-of-empires.mount-fingerprint="));
+            assert_eq!(labels.len(), 2);
+            let shared_args = create_args(base, shared());
+            let labels = values_of(&shared_args, "--label");
+            assert_eq!(
+                labels[2..],
+                [
+                    "com.agent-of-empires.shared-credential-mounts=/root/.claude/.credentials.json",
+                    "com.agent-of-empires.agent-tool=claude",
+                ]
+            );
         }
-    }
-
-    #[test]
-    fn test_supports_named_volumes_flags() {
-        const { assert!(RuntimeBase::DOCKER.supports_named_volumes) };
-        const { assert!(RuntimeBase::PODMAN.supports_named_volumes) };
-        const { assert!(!RuntimeBase::APPLE_CONTAINER.supports_named_volumes) };
     }
 }

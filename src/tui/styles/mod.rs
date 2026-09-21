@@ -1,11 +1,7 @@
-//! TUI theme and styling.
-//!
-//! The module is split into:
-//!   - `themes`: the `Theme` struct, its `Default` (Empire mirror), and palette downsampling
-//!   - `palette`: 24-bit RGB -> xterm-256 downsampling for `palette_mode`
-//!   - this file: builtin TOML embedding, custom theme discovery, load/serialize glue
-//!
-//! Public surface is re-exported here so callers keep `crate::tui::styles::*`.
+//! TUI theme and styling: builtin TOML embedding, custom theme discovery, and
+//! load/serialize glue. `themes` holds the `Theme` struct and its Empire-mirror
+//! `Default`; `palette` does the 24-bit to xterm-256 downsampling. The public
+//! surface is re-exported here so callers keep `crate::tui::styles::*`.
 
 mod contrast;
 mod palette;
@@ -20,9 +16,8 @@ pub use themes::{idle_decay_window, Theme};
 use std::path::PathBuf;
 use tracing::{debug, warn};
 
-/// One built-in theme. `source` is the TOML body embedded at compile time
-/// via `include_str!`. Adding a new builtin is: drop `themes/builtin/X.toml`
-/// + add one entry here.
+/// One built-in theme, its `source` the TOML body embedded via `include_str!`.
+/// Adding a builtin is `themes/builtin/X.toml` plus one entry here.
 pub struct BuiltinTheme {
     pub name: &'static str,
     pub source: &'static str,
@@ -63,17 +58,14 @@ pub const BUILTIN_THEMES: &[BuiltinTheme] = &[
     },
 ];
 
-/// Iterator over builtin theme names, in declared order.
 pub fn builtin_theme_names() -> impl Iterator<Item = &'static str> {
     BUILTIN_THEMES.iter().map(|b| b.name)
 }
 
-/// Whether `name` refers to a builtin theme.
 pub fn is_builtin_theme(name: &str) -> bool {
     BUILTIN_THEMES.iter().any(|b| b.name == name)
 }
 
-/// Return the directory where custom theme TOML files are stored.
 pub fn custom_themes_dir() -> Option<PathBuf> {
     crate::session::get_app_dir().ok().map(|d| d.join("themes"))
 }
@@ -109,17 +101,15 @@ pub fn discover_custom_themes() -> Vec<(String, PathBuf)> {
 }
 
 /// Themes contributed by active plugins, as (name, path) pairs. Layered below
-/// builtins and user custom themes: a plugin cannot shadow a builtin or a theme
-/// the user dropped in their own themes dir. Names already claimed by a builtin
-/// or a user theme are filtered out.
+/// builtins and user themes, which a plugin cannot shadow; already-claimed names
+/// are filtered out.
 pub fn discover_plugin_themes() -> Vec<(String, PathBuf)> {
     let mut claimed: std::collections::HashSet<String> = builtin_theme_names()
         .map(|s| s.to_string())
         .chain(discover_custom_themes().into_iter().map(|(n, _)| n))
         .collect();
-    // De-dup across plugins too: two plugins contributing the same name would
-    // otherwise show as indistinguishable picker entries, and load_theme can
-    // only resolve the first. First active plugin to claim a name wins.
+    // De-dup across plugins: two contributing the same name would be
+    // indistinguishable in the picker, and `load_theme` resolves only the first.
     let mut out = Vec::new();
     for (name, path) in crate::plugin::active_plugin_themes() {
         if claimed.insert(name.clone()) {
@@ -142,7 +132,6 @@ pub fn available_themes() -> Vec<String> {
     names
 }
 
-/// Load a custom theme from a TOML file.
 fn load_custom_theme(path: &std::path::Path) -> Option<Theme> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
@@ -162,10 +151,9 @@ fn load_custom_theme(path: &std::path::Path) -> Option<Theme> {
 }
 
 /// A theme TOML that omits `unread` should inherit that theme's own `accent`,
-/// not Empire's default blue. The container `#[serde(default)]` seeds every
-/// omitted field from `Theme::default()` (= Empire), and serde can't tell an
-/// omitted key from one explicitly set to Empire's value, so we detect the
-/// omission from the raw table and fall back to the parsed theme's accent.
+/// not Empire's blue. The container `#[serde(default)]` seeds omitted fields from
+/// Empire and serde cannot tell an omission from an explicit match, so detect the
+/// omission from the raw table.
 fn fill_unread_from_accent(content: &str, mut theme: Theme) -> Theme {
     let omitted = content
         .parse::<toml::Table>()
@@ -177,16 +165,14 @@ fn fill_unread_from_accent(content: &str, mut theme: Theme) -> Theme {
     theme
 }
 
-/// Parse a builtin's embedded TOML. Builtin TOMLs are committed to the repo
-/// and embedded at build time; a parse failure here is a developer bug, not
-/// user input. The `all_builtins_parse_with_expected_anchors` test guards
-/// against that landing in main.
+/// Parse a builtin's embedded TOML. These are committed and embedded at build
+/// time, so a parse failure is a developer bug; the
+/// `all_builtins_parse_with_expected_anchors` test guards it.
 fn parse_builtin(builtin: &BuiltinTheme) -> Theme {
     let theme = toml::from_str(builtin.source)
         .unwrap_or_else(|e| panic!("builtin theme '{}' failed to parse: {}", builtin.name, e));
-    // All builtins define `unread`, so this is a no-op for them today, but
-    // keep the same fallback as custom themes so a future builtin that omits
-    // it inherits its own accent rather than Empire's.
+    // All builtins define `unread` today; keep the custom-theme fallback so a
+    // future one that omits it inherits its own accent rather than Empire's.
     fill_unread_from_accent(builtin.source, theme)
 }
 
@@ -222,9 +208,8 @@ pub fn load_theme(name: &str) -> Theme {
         }
     }
     warn!("Unknown theme '{}', falling back to zinc", name);
-    // Inline the default fallback rather than recursing through `load_theme`,
-    // so a future rename or removal of the fallback builtin would surface
-    // as a clear panic here instead of looping. `zinc` is the default theme.
+    // Inline the default fallback rather than recursing through `load_theme`, so
+    // a rename or removal of the `zinc` default panics clearly instead of looping.
     let default = BUILTIN_THEMES
         .iter()
         .find(|b| b.name == "zinc")
@@ -233,11 +218,8 @@ pub fn load_theme(name: &str) -> Theme {
 }
 
 /// Load a theme and, when `palette_mode` is true, convert every `Color::Rgb`
-/// field to `Color::Indexed` (nearest xterm-256 index). Use this from callers
-/// that have access to `ThemeConfig::color_mode`. Hex strings in the embedded
-/// and custom TOMLs deserialize to `Color::Rgb`; `palette_mode` consumers need
-/// xterm-256 `Color::Indexed`, so the downsample runs at the `Theme` level
-/// after parsing.
+/// field to the nearest xterm-256 `Color::Indexed`. Hex strings parse to `Rgb`,
+/// so the downsample runs at the `Theme` level after parsing.
 pub fn load_theme_with_mode(name: &str, palette_mode: bool) -> Theme {
     let mut theme = load_theme(name);
     if palette_mode {
@@ -246,7 +228,6 @@ pub fn load_theme_with_mode(name: &str, palette_mode: bool) -> Theme {
     theme
 }
 
-/// Export a theme as a TOML string.
 pub fn export_theme_toml(theme: &Theme) -> Result<String, toml::ser::Error> {
     toml::to_string_pretty(theme)
 }
@@ -293,13 +274,11 @@ mod tests {
         assert!(matches!(theme.title, Color::Rgb(_, _, _)));
     }
 
-    /// Anchor colors for the builtin themes. Each row is
-    /// `(name, background, title)`. The structural test
-    /// `all_builtins_parse_with_expected_anchors` walks the list and asserts
-    /// every embedded TOML deserializes to the expected hex on both anchors.
-    /// Two anchors per theme is the minimum that catches a typo anywhere
-    /// other than the anchors themselves; cross-field rendering tests cover
-    /// the rest. Adding a new builtin requires one row here.
+    /// Anchor colors for the builtin themes, `(name, background, title)`.
+    /// `all_builtins_parse_with_expected_anchors` walks the list and asserts every
+    /// embedded TOML deserializes to the expected hex on both anchors: the minimum
+    /// that catches a typo anywhere but the anchors themselves. A new builtin needs
+    /// a row here.
     const BUILTIN_COLOR_ANCHORS: &[(&str, Color, Color)] = &[
         (
             "zinc",
@@ -372,13 +351,10 @@ mod tests {
 
     #[test]
     fn default_matches_empire_toml() {
-        // Drift guard: every color field in `impl Default for Theme`
-        // (which serde's container `#[serde(default)]` uses as the
-        // fallback for partial custom TOMLs) must match the corresponding
-        // hex in `themes/builtin/empire.toml`. A future Empire palette
-        // tweak that updates the TOML but not the hand-mirrored Default
-        // would otherwise leave partial custom TOMLs inheriting stale
-        // colors silently. Per the review on PR #1197.
+        // Drift guard: every color field in `impl Default for Theme` (serde's
+        // fallback for partial custom TOMLs) must match the corresponding hex in
+        // `themes/builtin/empire.toml`, or a palette tweak that updates only the
+        // TOML leaves partial custom TOMLs inheriting stale colors.
         let defaulted = Theme::default();
         let from_toml = load_theme("empire");
         assert_eq!(
@@ -407,11 +383,9 @@ mod tests {
 
     #[test]
     fn all_builtins_parse_with_expected_anchors() {
-        // Mandatory parse-all guard: every entry in BUILTIN_THEMES must
-        // deserialize cleanly from its embedded TOML and match the expected
-        // background and title hex. Without this, a typo in a builtin TOML
-        // would only show up at first runtime load via load_theme's panic
-        // message.
+        // Every entry in BUILTIN_THEMES must deserialize cleanly and match the
+        // expected background and title hex; otherwise a typo surfaces only at the
+        // first runtime load.
         for (name, expected_bg, expected_title) in BUILTIN_COLOR_ANCHORS {
             let theme = load_theme(name);
             assert_eq!(
@@ -469,11 +443,9 @@ mod tests {
 
     #[test]
     fn partial_custom_theme_does_not_inherit_metadata() {
-        // Container-level #[serde(default)] would otherwise have a
-        // missing `appearance` fall back to Empire's `Dark`. The
-        // per-field #[serde(default)] on Option<ThemeAppearance> /
-        // ThemeSyntax must override that so absent metadata resolves
-        // to None / empty.
+        // Container-level `#[serde(default)]` would have a missing `appearance`
+        // fall back to Empire's `Dark`; the per-field defaults must override that
+        // so absent metadata resolves to None / empty.
         let toml_str = r##"
 background = "#1a1b26"
 border = "#414868"
@@ -580,8 +552,7 @@ border = "#414868"
         // Write a non-toml file (should be ignored)
         std::fs::write(themes_dir.join("readme.txt"), "not a theme").unwrap();
 
-        // Can't easily test discover_custom_themes() since it uses get_app_dir(),
-        // but we can test the file parsing directly
+        // `discover_custom_themes` uses get_app_dir(), so test the file parsing.
         let loaded = load_custom_theme(&themes_dir.join("my-dark.toml"));
         assert!(loaded.is_some());
     }

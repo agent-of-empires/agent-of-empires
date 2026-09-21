@@ -16,9 +16,8 @@ use crate::tui::styles::Theme;
 const HEALTH_FIXED_ROWS: u16 = 6;
 const AGENT_TABLE_HEADER_ROWS: u16 = 1;
 /// Display width of the fixed metric block on the agent table, identical on the
-/// header (`{:>7} {:>9} {:>6}`) and on each row (` {cpu:>6} {:>9} {:>6}`). The
-/// name column takes whatever is left, so both lines must derive it the same
-/// way or the columns drift apart.
+/// header and on each row. The name column takes what is left, so both lines
+/// must derive it the same way or the columns drift apart.
 const AGENT_METRICS_WIDTH: usize = 24;
 
 pub(crate) fn agent_table_visible_rows(preview_height: u16) -> usize {
@@ -28,11 +27,10 @@ pub(crate) fn agent_table_visible_rows(preview_height: u16) -> usize {
         .saturating_sub(AGENT_TABLE_HEADER_ROWS) as usize
 }
 
-/// Gutter between the pane border and its contents, widening as the pane does.
-/// The agent table stretches its name column to whatever it is given, so at one
-/// column of padding a wide pane reads as pinned to its edges; a narrow one
-/// needs the width for the columns more than it needs the gutter. `width` is
-/// the outer pane width, borders included.
+/// Gutter between the pane border and its contents, widening with the pane: the
+/// name column stretches, so a wide pane otherwise reads as pinned to its edges,
+/// while a narrow one needs the width more than the gutter. `width` is the outer
+/// pane width, borders included.
 fn health_padding(width: u16) -> u16 {
     match width {
         0..=47 => 1,
@@ -50,9 +48,8 @@ fn agent_name_width(table_width: u16) -> usize {
 /// Marker on a sandboxed row, matching the session list's `[container]` badge.
 const CONTAINER_BADGE: &str = " [container]";
 
-/// The name cell: the agent title, plus the container marker when the row's
-/// figures come from a sandbox rather than a host process tree (its memory
-/// figure is the container's usage, not an RSS sum). The spans always total
+/// The name cell: the agent title, plus the container marker when the figures
+/// come from a sandbox rather than a host process tree. The spans always total
 /// `width`, so the metric columns stay under their headers.
 fn agent_name_spans<'a>(agent: &AgentMetric, width: usize, theme: &Theme) -> Vec<Span<'a>> {
     // Below this the badge would crowd out the name; the row keeps its

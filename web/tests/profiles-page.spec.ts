@@ -1,17 +1,11 @@
-// Profiles settings tab (/settings/profiles): CRUD + set-default + description
-// round-trips, the deep-link into other Settings tabs (?profile=), the retired
-// /profiles redirect, the absence of the old sidebar button, the read-only
-// mode, and the hooks panel invariant. Ported from live to the mocked suite: a
-// stateful in-route profile store stands in for the backend, so "persists"
-// assertions check the store and the post-reload UI rather than a real config
-// file.
-//
-// Component-level handler details (the hooks-never-PATCHed invariant across
-// every interaction, the in-flight description edit race) are pinned in
-// ProfilesSection.test.tsx; this spec covers the app-level wiring: routing,
-// the /api/about read_only flag, and the dropdown/rail refresh loops.
+// Profiles settings tab (/settings/profiles): CRUD, set-default, descriptions,
+// the `?profile=` deep link, the retired /profiles redirect, read-only mode, and
+// the hooks panel. A stateful in-route store stands in for the backend, so
+// "persists" means the store plus the post-reload UI. Component-level handler
+// details are pinned in ProfilesSection.test.tsx.
 
 import { test, expect } from "./helpers/mockedTest";
+import { mockSettingsApis } from "./helpers/apiMocks";
 import type { Page } from "@playwright/test";
 
 interface ProfileState {
@@ -42,27 +36,12 @@ async function installProfilesPageMocks(
     readOnly: !!opts.readOnly,
   };
 
-  await page.route(
-    (url) => url.pathname === "/api/sessions",
-    (r) => r.fulfill({ json: { sessions: [], workspace_ordering: [] } }),
-  );
-  await page.route(
-    (url) => url.pathname === "/api/about",
-    (r) =>
-      r.fulfill({
-        json: { read_only: handle.readOnly, auth_mode: "none", behind_tunnel: false, profile: "main" },
-      }),
-  );
-  await page.route(
-    (url) => url.pathname === "/api/settings/schema",
-    (r) => r.fulfill({ json: [] }),
-  );
-  // Global settings: ProfilesPage reads `hooks` from here to build the
-  // inherited rows of the read-only hooks panel.
-  await page.route(
-    (url) => url.pathname === "/api/settings",
-    (r) => r.fulfill({ json: { hooks: { on_launch: ["echo global-hook"] } } }),
-  );
+  // ProfilesPage reads `hooks` from global settings to build the inherited rows
+  // of the read-only hooks panel.
+  await mockSettingsApis(page, {
+    about: () => ({ read_only: handle.readOnly }),
+    settings: () => ({ hooks: { on_launch: ["echo global-hook"] } }),
+  });
 
   await page.route(
     (url) => url.pathname === "/api/profiles",

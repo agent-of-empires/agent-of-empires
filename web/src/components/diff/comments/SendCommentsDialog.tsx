@@ -9,11 +9,9 @@ interface Props {
   sessionId: string;
   comments: DiffComment[];
   isMultiRepo: boolean;
-  /** Same gate as the banner Send button. Reflects
-   *  `structured_view && !trashed`. False disables the Send button so
-   *  prompts don't sink into a session the reconciler never resumes. */
+  /** False when the session cannot drain a prompt (not structured view, or trashed). */
   sendEnabled: boolean;
-  /** Required, and phrased as cause + remedy. See `CommentsBanner`. */
+  /** Cause plus remedy. */
   sendDisabledReason: string;
   introDraft: string;
   outroDraft: string;
@@ -25,11 +23,7 @@ interface Props {
   onSent: () => void;
 }
 
-/** Three-piece compose dialog: editable intro textarea, read-only
- *  preview of the assembled comments markdown, editable outro
- *  textarea. The final prompt is composed at send time so the user's
- *  intro/outro edits don't fall out of sync if comments change
- *  underneath. */
+/** Intro, read-only comments preview, and outro; the prompt is built at send time. */
 export function SendCommentsDialog({
   sessionId,
   comments,
@@ -59,8 +53,7 @@ export function SendCommentsDialog({
   const preview = useMemo(() => buildCommentsMarkdown(comments, { isMultiRepo }), [comments, isMultiRepo]);
 
   const sendBlocked = busy || comments.length === 0 || !sendEnabled;
-  // One tooltip covering every reason Send can be disabled, so it never
-  // explains the wrong one.
+  // One tooltip covers every disabled reason so it never explains the wrong one.
   const sendTooltip = !sendEnabled
     ? sendDisabledReason
     : comments.length === 0
@@ -89,8 +82,7 @@ export function SendCommentsDialog({
         }
         return;
       }
-      // Count each successful diff-comments send (a low-frequency action, so a
-      // count is more useful than a boolean). Only on a confirmed 2xx.
+      // Counted only on a confirmed 2xx.
       reportTelemetrySeen("diff_comments");
       onSent();
     } catch (e) {
@@ -105,9 +97,7 @@ export function SendCommentsDialog({
     }
   }, [busy, comments, introDraft, outroDraft, isMultiRepo, sendEnabled, sessionId, onSent]);
 
-  // Trap Esc/Cmd+Enter at the document level so editing in the textareas
-  // doesn't intercept the dialog hotkeys. Esc is blocked while a send
-  // is in flight so the user doesn't dismiss a request mid-flight.
+  // Document-level so textareas do not swallow the hotkeys; Esc is ignored mid-send.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {

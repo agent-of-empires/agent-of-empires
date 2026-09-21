@@ -1,41 +1,15 @@
 // @vitest-environment jsdom
-//
-// Android IME word handling in the live terminal (#3746). SwiftKey spells a
-// word out as plain `insertText` edits and then, when space is pressed, wraps
-// that same word in a composition after the fact, so `compositionend` carries
-// it a second time and "test" reached the pane as "testtest". The traced
-// sequence from the reporter's device is the first case below. Only the part
-// of the composed word the pane has not already seen may be sent, and typing
-// without a composition must be untouched.
+// Android IME word handling (#3746): SwiftKey re-wraps an already typed word in a composition, so only the
+// part the pane has not seen may be sent.
 
-import { createRef } from "react";
-import { describe, expect, it, vi, beforeAll } from "vitest";
-import { fireEvent, render } from "@testing-library/react";
-import { MobileLiveTerminal } from "../MobileLiveTerminal";
-import type { LiveFrame } from "../../hooks/useLiveTerminal";
+import { describe, expect, it, vi } from "vitest";
+import { fireEvent } from "@testing-library/react";
+import { installResizeObserver, renderLiveTerminal } from "./liveTerminalHarness";
 
 vi.mock("../../hooks/useWebSettings", () => ({
   useWebSettings: () => ({ settings: { mobileFontSize: 14, desktopFontSize: 14 }, update: vi.fn() }),
 }));
-
-beforeAll(() => {
-  globalThis.ResizeObserver = class {
-    observe() {}
-    unobserve() {}
-    disconnect() {}
-  } as unknown as typeof ResizeObserver;
-});
-
-const frame: LiveFrame = {
-  content: "$ \n",
-  rows: 3,
-  history: 1000,
-  cursor: null,
-  altScreen: false,
-  mouse: false,
-  mouseSgr: false,
-  pane0: null,
-};
+installResizeObserver();
 
 interface Term {
   /** Plain edits, one per character, as a soft keyboard sends them. */
@@ -55,39 +29,13 @@ interface Term {
 // `accepted` models useLiveTerminal.sendData's contract: false is a keystroke
 // the pane never receives (a confirmed non-owner, or a full pending queue).
 function renderTerm(accepted = true): Term {
-  const inputRef = createRef<HTMLTextAreaElement>();
-  // The hook clears the shared word on every write; that is what makes a
-  // toolbar button invalidate the run this component is tracking.
+  // The hook clears the shared word on every write; that is what makes a toolbar button invalidate the run.
   const typedWordRef = { current: "" };
   const sendData = vi.fn((_data: string) => {
     typedWordRef.current = "";
     return accepted;
   });
-  render(
-    <MobileLiveTerminal
-      frame={frame}
-      connected
-      active
-      reading={false}
-      sendResize={vi.fn()}
-      setWindow={vi.fn()}
-      setCadence={vi.fn()}
-      enterReading={vi.fn()}
-      returnToLive={vi.fn()}
-      sendData={sendData}
-      typedWordRef={typedWordRef}
-      uploadPastedImage={vi.fn().mockResolvedValue(null)}
-      forwardWheel={vi.fn()}
-      forwardButton={vi.fn()}
-      ctrlActiveRef={createRef<boolean>() as React.RefObject<boolean>}
-      clearCtrl={vi.fn()}
-      inputRef={inputRef}
-      onInputFocusChange={vi.fn()}
-      bottomAlign
-      keyboardOpen={false}
-    />,
-  );
-  const input = inputRef.current!;
+  const input = renderLiveTerminal({ sendData, typedWordRef }).input();
   const beforeInput = (inputType: string, data: string | null) =>
     input.dispatchEvent(new InputEvent("beforeinput", { inputType, data, bubbles: true, cancelable: true }));
   return {
@@ -205,9 +153,8 @@ describe("MobileLiveTerminal Android IME word commits", () => {
       sent: ["a", "android"],
     },
     {
-      // A suggestion tap corrects the word in the same breath as adopting it,
-      // so the first update carries more than the run. Pins the classifier to
-      // a prefix test: an equality test would send the whole word again.
+      // A suggestion tap corrects the word in the same breath as adopting it, so the first update carries more
+      // than the run.
       name: "strips an adopting composition that corrects as it takes over",
       run: (t) => {
         t.type("tes");
@@ -240,9 +187,8 @@ describe("MobileLiveTerminal Android IME word commits", () => {
       sent: ["日本"],
     },
     {
-      // A composition that stood on its own is not a typed word under the
-      // caret, so the next one must reach the pane whole even when it repeats
-      // it. Samsung's trace on #3746 composes every word this way.
+      // A composition that stood on its own is not a typed word under the caret, so the next one must reach the
+      // pane whole even when it repeats it.
       name: "sends a character composed twice in a row",
       run: (t) => {
         t.composeUpdating("a", "a");

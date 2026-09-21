@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-//
-// Render-time half of the tour drift guard: the static guard proves the anchor
-// constant is wired in source, but not that it actually paints under a given
-// state. The dashboard new-session anchor is conditionally rendered (hidden in
-// read-only mode), so assert it resolves exactly once when writable and is gone
-// when read-only, matching the step's `writableOnly` metadata.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render } from "@testing-library/react";
 

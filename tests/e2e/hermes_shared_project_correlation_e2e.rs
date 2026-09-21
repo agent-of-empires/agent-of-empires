@@ -4,13 +4,11 @@
 //! database. Host launches must ignore both and leave agent_session_id empty;
 //! managed sandbox stores are covered by unit tests in src/session/capture/mod.rs.
 
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
 use serial_test::parallel;
 
-use crate::harness::{app_dir_in, require_tmux, TuiTestHarness};
+use crate::harness::{agent_session_id_of, require_tmux, write_executable, TuiTestHarness};
 
 // Seeded Hermes conversation ids, one per project. The global most-recent
 // conversation under a reverted fix is B (higher started_at).
@@ -22,19 +20,9 @@ const SHIM_DEADLINE: Duration = Duration::from_secs(10);
 const SHIM_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const FAIL_CLOSED_OBSERVATION: Duration = Duration::from_secs(5);
 
-/// Parse the `  ID:      <id>` line that `aoe add` prints on success.
-fn parse_session_id(add_stdout: &str) -> String {
-    add_stdout
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("ID:"))
-        .map(|rest| rest.trim().to_string())
-        .unwrap_or_else(|| panic!("could not find session ID in `aoe add` output:\n{add_stdout}"))
-}
-
-/// Seed the fake Hermes state.db with two active CLI conversations, one per
-/// project. Uses the full schema (cwd + git_repo_root) and a post-seed
-/// self-check: if the columns are missing the e2e would silently become a
-/// false negative, so the seed fails loudly instead.
+/// Seed the fake Hermes state.db with one active CLI conversation per project.
+/// The post-seed column check keeps a schema drift from turning this into a
+/// false negative.
 fn seed_hermes_state_db(h: &TuiTestHarness, proj_a: &std::path::Path, proj_b: &std::path::Path) {
     let canon_a = std::fs::canonicalize(proj_a).expect("canonicalize proj-a");
     let canon_b = std::fs::canonicalize(proj_b).expect("canonicalize proj-b");
@@ -65,9 +53,8 @@ fn seed_hermes_state_db(h: &TuiTestHarness, proj_a: &std::path::Path, proj_b: &s
     );
 }
 
-/// Install a `hermes` shim on PATH that stays alive (`exec sleep 600`) so the
-/// pane stays live for the poller host and `build_exclusion_set`'s peer scan.
-/// The uuid-map marker proves the launch env carried `AOE_INSTANCE_ID`.
+/// A `hermes` shim that stays alive so the pane stays live for the poller host,
+/// and whose uuid-map marker proves the launch env carried `AOE_INSTANCE_ID`.
 fn install_hermes_shim(h: &mut TuiTestHarness) {
     let bin = h.install_path_command("hermes");
     let script = r#"#!/bin/sh
@@ -79,30 +66,7 @@ mkdir -p "$HOME/uuid-map"
 printf '%s' "$AOE_INSTANCE_ID" > "$HOME/uuid-map/$AOE_INSTANCE_ID"
 exec sleep 600
 "#;
-    let path = bin.join("hermes");
-    std::fs::write(&path, script).expect("write hermes shim");
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod shim");
-}
-
-fn sessions_path(h: &TuiTestHarness) -> PathBuf {
-    app_dir_in(h.home_path()).join("profiles/default/sessions.json")
-}
-
-/// Read sessions.json, tolerating a missing or mid-write file (returns Null).
-fn read_sessions(h: &TuiTestHarness) -> Value {
-    let content = std::fs::read_to_string(sessions_path(h)).unwrap_or_default();
-    serde_json::from_str(&content).unwrap_or(Value::Null)
-}
-
-fn agent_session_id_of(sessions: &Value, instance_id: &str) -> Option<String> {
-    sessions
-        .as_array()?
-        .iter()
-        .find(|r| r["id"].as_str() == Some(instance_id))?
-        .get("agent_session_id")?
-        .as_str()
-        .map(str::to_owned)
+    write_executable(&bin.join("hermes"), script);
 }
 
 /// Block until the shim for `instance_id` recorded its uuid-map marker.
@@ -118,36 +82,6 @@ fn wait_for_shim(h: &TuiTestHarness, instance_id: &str) {
     panic!(
         "shim for {instance_id} never wrote its uuid-map entry within {SHIM_DEADLINE:?} \
          (AOE_INSTANCE_ID-missing marker: {missing_inst})"
-    );
-}
-
-/// Create a session with `aoe add` (no launch); returns the instance id.
-fn add_session(h: &TuiTestHarness, project: &std::path::Path, title: &str) -> String {
-    let add = h.run_cli(&[
-        "add",
-        project.to_str().expect("utf8 project"),
-        "-t",
-        title,
-        "-c",
-        "hermes",
-    ]);
-    assert!(
-        add.status.success(),
-        "aoe add {title} failed.\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&add.stdout),
-        String::from_utf8_lossy(&add.stderr),
-    );
-    parse_session_id(&String::from_utf8_lossy(&add.stdout))
-}
-
-/// Launch a session and wait for the blocking host capture phase to finish.
-fn launch_session(h: &TuiTestHarness, instance_id: &str) {
-    let start = h.run_cli(&["session", "start", instance_id]);
-    assert!(
-        start.status.success(),
-        "aoe session start {instance_id} failed.\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&start.stdout),
-        String::from_utf8_lossy(&start.stderr),
     );
 }
 
@@ -167,10 +101,11 @@ fn hermes_host_capture_fails_closed() {
     std::fs::create_dir_all(&proj_b).expect("mkdir proj-b");
     seed_hermes_state_db(&h, &proj_a, &proj_b);
 
-    let id_a = add_session(&h, &proj_a, "hermes-A");
-    let id_b = add_session(&h, &proj_b, "hermes-B");
-    launch_session(&h, &id_a);
-    launch_session(&h, &id_b);
+    let id_a = h.add_session(&[proj_a.to_str().unwrap(), "-t", "hermes-A", "-c", "hermes"]);
+    let id_b = h.add_session(&[proj_b.to_str().unwrap(), "-t", "hermes-B", "-c", "hermes"]);
+    // `session start` is a blocking launch, so host capture has finished.
+    h.run_cli_ok(&["session", "start", &id_a]);
+    h.run_cli_ok(&["session", "start", &id_b]);
     wait_for_shim(&h, &id_a);
     wait_for_shim(&h, &id_b);
 
@@ -179,7 +114,7 @@ fn hermes_host_capture_fails_closed() {
 
     let deadline = Instant::now() + FAIL_CLOSED_OBSERVATION;
     loop {
-        let sessions = read_sessions(&h);
+        let sessions = h.try_read_sessions();
         assert_eq!(
             agent_session_id_of(&sessions, &id_a),
             None,

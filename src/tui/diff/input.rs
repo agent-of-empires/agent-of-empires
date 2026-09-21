@@ -7,18 +7,13 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use super::DiffView;
 use crate::tui::dialogs::DialogResult;
 
-/// Result of handling a key event in the diff view
 pub enum DiffAction {
-    /// Continue showing the diff view
     Continue,
-    /// Close the diff view
     Close,
-    /// Launch external editor for a file
     EditFile(PathBuf),
 }
 
 impl DiffView {
-    /// Handle a key event
     pub fn handle_key(&mut self, key: KeyEvent) -> DiffAction {
         // Handle warning dialog first (modal)
         if let Some(ref mut dialog) = self.warning_dialog {

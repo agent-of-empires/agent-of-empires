@@ -1,7 +1,5 @@
-//! Wheel events are confined to whichever pane the mouse is over.
-//! In particular, a wheel over the preview pane never moves the list
-//! cursor: not when the preview is at its scroll boundary, and not
-//! when no session is selected. See issue #1361.
+//! Wheel events stay confined to the pane the mouse is over: a wheel over the preview
+//! never moves the list cursor, at a scroll boundary or with nothing selected (#1361).
 
 use super::*;
 use ratatui::layout::Rect;
@@ -11,9 +9,8 @@ fn setup_panes(env: &mut TestEnv) {
     env.view.preview_area = Rect::new(30, 0, 100, 40);
 }
 
-/// Build a live-send env whose preview-capture worker reports the
-/// given cursor, so the alternate-screen wheel-forwarding branch can
-/// be exercised without a real full-screen pane.
+/// A live-send env whose preview-capture worker reports the given cursor, so the
+/// alternate-screen wheel-forwarding branch runs without a real full-screen pane.
 fn live_env_with_cursor(cursor: crate::tmux::PaneCursor) -> TestEnv {
     use crate::tui::home::live_send::{LiveSendState, LiveSendTarget, LiveSendWorker};
     let mut env = create_test_env_with_sessions(3);
@@ -47,11 +44,9 @@ fn live_env_with_cursor(cursor: crate::tmux::PaneCursor) -> TestEnv {
     env
 }
 
-/// Like `live_env_with_cursor` but WITHOUT entering live-send: the
-/// session is merely previewed (the common "hover the preview" case).
-/// No `live_send` / `live_send_worker`; the capture worker and its
-/// target are set so `forward_wheel_to_preview` can take the passive
-/// one-shot path.
+/// Like `live_env_with_cursor` but without entering live-send: the session is merely
+/// previewed, with the capture worker and target set so `forward_wheel_to_preview` takes
+/// the passive one-shot path.
 fn passive_env_with_cursor(cursor: crate::tmux::PaneCursor) -> TestEnv {
     let mut env = create_test_env_with_sessions(3);
     setup_panes(&mut env);
@@ -95,11 +90,9 @@ fn alt_screen_cursor(
     }
 }
 
-/// Live-send target is a full-screen app with SGR mouse tracking on:
-/// the wheel is forwarded to the app (returns to the live edge) instead
-/// of growing the useless normal-buffer capture window. This is the fix
-/// for the "scroll up a little then snap to the very first part of the
-/// session" report on alternate-screen agents.
+/// A full-screen live-send target with SGR mouse tracking gets the wheel forwarded to it
+/// (returning to the live edge) instead of growing the useless normal-buffer capture
+/// window, which is what made scrolling snap to the start of the session.
 #[test]
 #[serial]
 fn wheel_over_alt_screen_sgr_mouse_pane_forwards_instead_of_scrollback() {
@@ -118,11 +111,9 @@ fn wheel_over_alt_screen_sgr_mouse_pane_forwards_instead_of_scrollback() {
     assert_eq!(env.view.preview_scroll_offset, 0);
 }
 
-/// A full-screen app WITHOUT mouse tracking (e.g. Claude Code's
-/// fullscreen renderer: `1049h` + `1007h`, no mouse) does not scroll on
-/// arrow keys (it reads them as cursor / input-history navigation), so we
-/// forward `PageUp`/`PageDown` named keys instead and pin the preview to
-/// the live edge, just like the mouse-tracking case. Regression for #2407.
+/// A full-screen app without mouse tracking reads arrows as cursor navigation rather than
+/// scroll, so `PageUp`/`PageDown` are forwarded and the preview pins to the live edge, like
+/// the mouse-tracking case. Regression for #2407.
 #[test]
 #[serial]
 fn wheel_over_alt_screen_without_mouse_forwards_page_keys() {
@@ -141,12 +132,9 @@ fn wheel_over_alt_screen_without_mouse_forwards_page_keys() {
     assert_eq!(env.view.preview_scroll_offset, 0);
 }
 
-/// Passive preview (NOT live-send) over a full-screen agent must ALSO
-/// forward the wheel. The alternate screen has no scrollback, so the
-/// capture-window scroll is inert; without forwarding, "hover the
-/// preview and scroll" does literally nothing (the reported regression
-/// after Claude Code's fullscreen renderer landed). Forwarding pins the
-/// preview to the live edge, exactly like the live-send path.
+/// Passive preview over a full-screen agent must also forward the wheel: the alternate
+/// screen has no scrollback, so the capture-window scroll is inert and hovering the preview
+/// to scroll did nothing. Forwarding pins the preview to the live edge.
 #[test]
 #[serial]
 fn wheel_over_alt_screen_passive_preview_forwards() {
@@ -172,9 +160,8 @@ fn wheel_over_alt_screen_passive_preview_forwards() {
     assert_eq!(env.view.preview_scroll_offset, 0);
 }
 
-/// In live-send over a mouse-tracking agent, a plain (no-Shift) left
-/// press/release is forwarded to the agent and consumed, and the held
-/// button is tracked so its release can't be stranded.
+/// In live-send over a mouse-tracking agent a plain left press/release is forwarded and
+/// consumed, and the held button is tracked so its release can't be stranded.
 #[test]
 #[serial]
 fn forward_mouse_to_preview_left_click_forwards() {
@@ -199,10 +186,9 @@ fn forward_mouse_to_preview_left_click_forwards() {
     assert!(env.view.preview_selection.is_none());
 }
 
-/// Passive preview (NOT live-send) over a mouse-tracking agent ALSO forwards
-/// a plain press/drag/release, so hovering an agent and dragging drives its
-/// native selection / scroll, exactly like the live-send case (and like the
-/// passive wheel path). The one-shot send carries it with no live worker.
+/// Passive preview over a mouse-tracking agent also forwards press/drag/release, so
+/// hovering and dragging drives its native selection, like the live-send and passive wheel
+/// paths. The one-shot send carries it with no live worker.
 #[test]
 #[serial]
 fn forward_mouse_to_preview_passive_preview_forwards() {
@@ -237,10 +223,8 @@ fn forward_mouse_to_preview_passive_preview_forwards() {
     assert!(env.view.preview_selection.is_none());
 }
 
-/// Bare motion over the preview is forwarded to an any-event-tracking
-/// (1003) agent so its hover UI (Claude Code's expandable-block
-/// highlight) works in live mode, deduped per pane cell, and re-armed
-/// when the pointer leaves the preview and comes back.
+/// Bare motion is forwarded to an any-event-tracking (1003) agent so its hover UI works in
+/// live mode, deduped per pane cell and re-armed when the pointer leaves and returns.
 #[test]
 #[serial]
 fn forward_hover_to_preview_reports_once_per_cell() {
@@ -310,9 +294,8 @@ fn forward_mouse_to_preview_non_mouse_agent_falls_through() {
     ));
 }
 
-/// Once a press is forwarded, its drag and release keep forwarding even
-/// after the pointer leaves the preview rect, so the agent always sees the
-/// release (no stuck button).
+/// Once a press is forwarded, its drag and release keep forwarding after the pointer leaves
+/// the preview rect, so the agent always sees the release.
 #[test]
 #[serial]
 fn forward_mouse_to_preview_drag_and_release_track_button() {
@@ -363,16 +346,14 @@ fn forward_mouse_to_preview_orphan_drag_ignored() {
     assert_eq!(env.view.mouse_forward_btn, None);
 }
 
-/// Stage an in-flight Shift-selection drag held at the preview's top
-/// (`row == pane.y`) or bottom edge, plus a capture window with NO aoe-side
-/// scrollback, so `tick_preview_autoscroll` exercises the agent
+/// Stage an in-flight Shift-selection drag held at the preview's top or bottom edge, plus a
+/// capture window with no aoe-side scrollback, so `tick_preview_autoscroll` takes the agent
 /// scroll-forward fallback rather than the capture-window line scroll.
 fn stage_edge_drag_no_scrollback(env: &mut TestEnv, at_top: bool) {
     use crate::tui::home::PreviewTextView;
-    // Visible == captured: `scroll_preview_offset` has nowhere to go, the
-    // alternate-screen reality the fallback exists for. The clamp reads
-    // `preview_visible_rows`, so pin it to the captured-line count to make
-    // the max offset zero (no scrollback to move into).
+    // Visible == captured: `scroll_preview_offset` has nowhere to go, the alternate-screen
+    // reality the fallback exists for. The clamp reads `preview_visible_rows`, so pin it to
+    // the captured-line count to make the max offset zero.
     env.view.preview_cache.captured_lines = 23;
     env.view.preview_visible_rows = 23;
     env.view.preview_cache.dimensions = (80, 24);
@@ -389,14 +370,10 @@ fn stage_edge_drag_no_scrollback(env: &mut TestEnv, at_top: bool) {
     assert!(env.view.handle_drag_move(40, edge_row));
 }
 
-/// Over a full-screen mouse-tracking agent the capture window has no
-/// scrollback, so an edge-held selection forwards the same scroll input the
-/// wheel does (a wheel-up/down mouse report, NOT PageUp, since the agent
-/// owns the mouse) to scroll its own transcript instead of moving the inert
-/// offset. The fallback delegates to `wheel_forward_key`, whose byte output
-/// per branch is asserted in `wheel_forward_key_*`; here we verify the tick
-/// forwards and pins the offset. Regression for the "autoscroll does nothing
-/// over a mouse-tracking agent" report (PageUp was a no-op there).
+/// Over a full-screen mouse-tracking agent the capture window has no scrollback, so an
+/// edge-held selection forwards the same input the wheel does (a mouse report, not PageUp,
+/// since the agent owns the mouse) to scroll its own transcript. The byte output per branch
+/// is asserted in `wheel_forward_key_*`; here the tick must forward and pin the offset.
 #[test]
 #[serial]
 fn autoscroll_forwards_scroll_to_mouse_tracking_agent_at_top_edge() {
@@ -423,8 +400,7 @@ fn autoscroll_forwards_scroll_to_mouse_tracking_agent_at_bottom_edge() {
     assert_eq!(env.view.preview_scroll_offset, 0);
 }
 
-/// A full-screen agent WITHOUT mouse tracking (Claude Code's fullscreen
-/// renderer: `1049h`, no mouse) gets `PageUp`/`PageDown` from the fallback
+/// A full-screen agent without mouse tracking gets `PageUp`/`PageDown` from the fallback
 /// instead, matching the wheel path's no-mouse branch.
 #[test]
 #[serial]
@@ -438,9 +414,8 @@ fn autoscroll_forwards_page_keys_to_no_mouse_agent_at_top_edge() {
     assert_eq!(env.view.preview_scroll_offset, 0);
 }
 
-/// A normal-buffer pane (NOT alternate-screen) that has merely bottomed out
-/// its scrollback must NOT get scroll input injected into its shell: the
-/// tick is a no-op there.
+/// A normal-buffer pane that has merely bottomed out its scrollback must not get scroll
+/// input injected into its shell: the tick is a no-op there.
 #[test]
 #[serial]
 fn autoscroll_does_not_forward_to_normal_pane() {
@@ -453,10 +428,9 @@ fn autoscroll_does_not_forward_to_normal_pane() {
     assert_eq!(env.view.preview_scroll_offset, 0);
 }
 
-/// A full-screen app with mouse tracking but in the LEGACY (non-SGR)
-/// encoding is still forwarded; the byte builder emits X10-encoded
-/// bytes for it instead of SGR (see `wheel_mouse_bytes_legacy_encodes_x10`).
-/// Forwarding pins the preview to the live edge like the SGR case.
+/// A mouse-tracking app in the legacy (non-SGR) encoding is still forwarded, with
+/// X10-encoded bytes (see `wheel_mouse_bytes_legacy_encodes_x10`), pinning the preview to
+/// the live edge like the SGR case.
 #[test]
 #[serial]
 fn wheel_over_alt_screen_legacy_mouse_forwards() {
@@ -470,9 +444,8 @@ fn wheel_over_alt_screen_legacy_mouse_forwards() {
     );
 }
 
-/// And a normal-screen agent (no alternate screen) keeps the capture
-/// scroll even if it happens to have SGR mouse on: the preview's
-/// scrollback is genuinely useful there.
+/// A normal-screen agent keeps the capture scroll even with SGR mouse on: its scrollback is
+/// genuinely useful.
 #[test]
 #[serial]
 fn wheel_over_normal_screen_pane_uses_capture_scroll() {
@@ -601,10 +574,9 @@ fn wheel_over_list_still_moves_list_cursor() {
     assert_eq!(env.view.cursor, 0, "wheel over list should retreat cursor");
 }
 
-/// Live-send mode is meant to feel like an attach — users still need
-/// to scroll the preview to read agent history without exiting. The
-/// has_dialog() gate would otherwise swallow these events because
-/// live_send.is_some() participates in that predicate.
+/// Live-send is meant to feel like an attach, so the preview still scrolls to read agent
+/// history without exiting; the has_dialog() gate would otherwise swallow these events,
+/// since live_send.is_some() participates in it.
 #[test]
 #[serial]
 fn wheel_over_preview_in_live_mode_scrolls_preview() {
@@ -616,9 +588,8 @@ fn wheel_over_preview_in_live_mode_scrolls_preview() {
     env.view.preview_cache.dimensions = (80, 24);
     env.view.preview_cache.captured_lines = 200;
     env.view.preview_scroll_offset = 10;
-    // Install live state directly so we don't have to stand up a
-    // tmux session; the scroll handler only cares about
-    // live_send.is_some().
+    // Install live state directly rather than standing up a tmux session: the scroll
+    // handler only cares that live_send is set.
     env.view.live_send = Some(LiveSendState {
         session_id: "fake".to_string(),
         title: "fake".to_string(),
@@ -640,9 +611,8 @@ fn wheel_over_preview_in_live_mode_scrolls_preview() {
     assert!(env.view.live_send.is_some());
 }
 
-/// List-pane wheel scroll stays suppressed in live mode: changing
-/// the selection mid-session would silently aim the next keystroke
-/// at a different pane than the preview is showing.
+/// List-pane wheel scroll stays suppressed in live mode: changing the selection would
+/// silently aim the next keystroke at a different pane than the preview shows.
 #[test]
 #[serial]
 fn wheel_over_list_in_live_mode_does_not_change_selection() {
@@ -667,9 +637,8 @@ fn wheel_over_list_in_live_mode_does_not_change_selection() {
     assert_eq!(env.view.cursor, 1, "selection must not change in live mode");
 }
 
-/// Build a live-send env with the default Ctrl+B leader armed and the
-/// cursor on a real session, so leader-menu keys route through
-/// `handle_live_send_key`.
+/// A live-send env with the default Ctrl+B leader armed and the cursor on a real session,
+/// so leader-menu keys route through `handle_live_send_key`.
 fn live_env_with_leader() -> TestEnv {
     use crate::tui::home::live_send::LiveSendState;
     let mut env = create_test_env_with_sessions(3);
@@ -743,9 +712,8 @@ fn live_leader_k_opens_palette() {
     assert!(env.view.live_send.is_some());
 }
 
-/// Leader + q exits live mode and disarms the leader menu. The sidebar
-/// collapse is now a persisted general state, so exiting live mode
-/// deliberately leaves it as the user set it (no force-reveal).
+/// Leader + q exits live mode and disarms the leader menu. The sidebar collapse is
+/// persisted general state, so exiting leaves it as the user set it.
 #[test]
 #[serial]
 fn live_leader_q_exits() {
@@ -761,9 +729,8 @@ fn live_leader_q_exits() {
     assert!(!env.view.live_send_pending_leader);
 }
 
-/// An unbound key after the leader cancels the menu without exiting,
-/// toggling, or opening anything (it does not fall through to the
-/// agent either: the leader already swallowed it).
+/// An unbound key after the leader cancels the menu without exiting, toggling or opening
+/// anything, and does not fall through to the agent: the leader swallowed it.
 #[test]
 #[serial]
 fn live_leader_unknown_key_cancels_menu() {
@@ -790,10 +757,9 @@ fn live_ctrl_q_still_one_press_exit() {
     assert!(!env.view.live_send_pending_leader);
 }
 
-/// A modified key after the leader (e.g. Ctrl+K) cancels the menu
-/// rather than firing a command: only the leader-again passthrough
-/// claims a modified form, so the user can't accidentally trigger the
-/// palette by holding Ctrl out of muscle memory.
+/// A modified key after the leader cancels the menu rather than firing a command: only the
+/// leader-again passthrough claims a modified form, so holding Ctrl can't trigger the
+/// palette by accident.
 #[test]
 #[serial]
 fn live_leader_then_modified_key_cancels() {
@@ -808,10 +774,9 @@ fn live_leader_then_modified_key_cancels() {
     assert!(env.view.live_send.is_some(), "still live");
 }
 
-/// Committing a palette command while live (here a jump) exits live
-/// mode first, so the preview can never show one session while
-/// keystrokes target another. Cancelling the palette is covered
-/// separately and must stay live.
+/// Committing a palette command while live exits live mode first, so the preview can never
+/// show one session while keystrokes target another. Cancelling is covered separately and
+/// must stay live.
 #[test]
 #[serial]
 fn palette_command_while_live_exits_live() {
@@ -839,9 +804,8 @@ fn palette_command_while_live_exits_live() {
     );
 }
 
-/// Collapsing the sidebar in live mode hands the preview the full
-/// width: the preview sub-rect grows past the normal side-by-side
-/// width, and rendering the which-key banner doesn't panic.
+/// Collapsing the sidebar in live mode hands the preview the full width: the sub-rect grows
+/// past the side-by-side width and the which-key banner still renders.
 #[test]
 #[serial]
 fn collapsed_sidebar_gives_preview_full_width() {
@@ -869,9 +833,8 @@ fn collapsed_sidebar_gives_preview_full_width() {
         full_width > split_width,
         "collapsed sidebar should widen the preview ({full_width} vs {split_width})"
     );
-    // The list isn't drawn while collapsed, so its hit-test rects must
-    // be cleared or a click in the preview area could resolve to a
-    // hidden list row.
+    // The list isn't drawn while collapsed, so its hit-test rects must be cleared or a
+    // click in the preview area could resolve to a hidden list row.
     assert!(
         env.view.list_inner_area.width == 0 && env.view.list_inner_area.height == 0,
         "collapsed sidebar must clear the list hit-test rect"
@@ -886,10 +849,8 @@ fn collapsed_sidebar_gives_preview_full_width() {
     let _ = render(&mut env);
 }
 
-/// The collapse button (expanded) and the strip (collapsed) are
-/// click-toggle affordances: clicking the button collapses, clicking
-/// the strip re-expands, and each reports its hit rect while the other
-/// is cleared.
+/// The collapse button and the strip are click-toggle affordances: the button collapses,
+/// the strip re-expands, and each reports its hit rect while the other is cleared.
 #[test]
 #[serial]
 fn sidebar_collapse_button_and_strip_toggle() {
@@ -951,11 +912,9 @@ fn sidebar_collapse_button_and_strip_toggle() {
     );
 }
 
-/// A takeover view (settings/diff/serve) returns early in `render`
-/// before the home-view paths run, so the collapse/expand and footer
-/// hit rects must be cleared up front. Otherwise a stale rect from the
-/// prior home frame could swallow a click on the takeover surface (the
-/// collapse handler runs ahead of `hit_diff`).
+/// A takeover view returns early in `render` before the home paths run, so the collapse and
+/// footer hit rects are cleared up front; otherwise a stale rect could swallow a click on
+/// the takeover surface, since the collapse handler runs ahead of `hit_diff`.
 #[test]
 #[serial]
 fn takeover_view_clears_sidebar_hit_rects() {

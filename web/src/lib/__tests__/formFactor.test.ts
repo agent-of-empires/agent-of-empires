@@ -4,9 +4,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { clientFormFactor } from "../formFactor";
 
-/** Drive the three media-query primitives `clientFormFactor` reads by query
- *  string, plus the iOS `navigator.standalone` flag. Every query the helper
- *  does not set is reported as not-matching. */
 function stubClient(opts: {
   standalone?: boolean; // display-mode: standalone
   iosStandalone?: boolean; // navigator.standalone
@@ -55,15 +52,11 @@ describe("clientFormFactor", () => {
   });
 
   it("keeps a wide coarse-pointer touch laptop on desktop", () => {
-    // Coarse pointer alone must not flip to mobile: a touch laptop stays
-    // desktop because the viewport is wide.
     stubClient({ wide: true, coarse: true });
     expect(clientFormFactor()).toBe("desktop");
   });
 
   it("keeps a narrow fine-pointer desktop window on desktop", () => {
-    // A narrow viewport alone must not flip to mobile: a small desktop window
-    // has a fine pointer.
     stubClient({ wide: false, coarse: false });
     expect(clientFormFactor()).toBe("desktop");
   });

@@ -1,4 +1,5 @@
 import { test, expect, waitForResponseBody, observeFor } from "./helpers/mockedTest";
+import { mockStaticApis } from "./helpers/apiMocks";
 import { Page } from "@playwright/test";
 
 interface UpdateStatusFixture {
@@ -14,11 +15,8 @@ interface UpdateStatusFixture {
 }
 
 async function mockBase(page: Page) {
-  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
+  await mockStaticApis(page);
   await page.route("**/api/sessions", (r) => r.fulfill({ json: { sessions: [], workspace_ordering: [] } }));
-  for (const path of ["settings", "themes", "agents", "profiles", "groups", "devices", "docker/status", "about"]) {
-    await page.route(`**/api/${path}`, (r) => r.fulfill({ json: path === "docker/status" ? {} : [] }));
-  }
 }
 
 async function mock(page: Page, status: UpdateStatusFixture) {

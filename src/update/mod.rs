@@ -1,4 +1,4 @@
-//! Update check functionality
+//! Update check functionality.
 
 pub mod install;
 
@@ -13,23 +13,14 @@ use crate::session::{get_app_dir, get_update_settings};
 const GITHUB_OWNER: &str = "agent-of-empires";
 const GITHUB_REPO: &str = "agent-of-empires";
 
-/// How long a cached update check stays fresh, and how often long-lived
-/// processes (the TUI) re-check. Daily is frequent enough for a banner;
-/// `update_check_mode = "off"` disables checks entirely.
 pub const UPDATE_CHECK_INTERVAL_HOURS: u64 = 24;
 
-/// Resolve the GitHub API base URL, honoring `AOE_UPDATE_API_BASE` for
-/// hermetic tests. The override mirrors `AOE_UPDATE_BASE_URL` (which
-/// covers tarball downloads); tests that need to exercise the CLI
-/// without rate-limiting GitHub set both.
+/// `AOE_UPDATE_API_BASE` overrides the GitHub API base for hermetic tests.
 fn github_api_base() -> String {
     std::env::var("AOE_UPDATE_API_BASE")
         .unwrap_or_else(|_| crate::github::DEFAULT_GITHUB_API_BASE.to_string())
 }
 
-/// Public release-page URL for a given version tag. Stable enough to
-/// hardcode (GitHub redirects from `/releases/tag/vX.Y.Z` even when the
-/// release is later edited). Used by the web update banner. See #984.
 pub fn release_page_url(version: &str) -> String {
     let tag = if version.starts_with('v') {
         version.to_string()
@@ -49,39 +40,24 @@ pub struct UpdateInfo {
     pub latest_version: String,
 }
 
-/// Coarse update-staleness signal by semver distance, derived from the cached
-/// update check. Carries no raw version string, only the magnitude of the gap,
-/// so telemetry can answer "are installs on patched/recent versions" without
-/// leaking which version anyone runs. See `crate::telemetry`.
+/// Semver distance only, never a version string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UpdateStatus {
-    /// No usable cache (never checked, or a malformed/unparsable cached latest).
     Unknown,
-    /// The cached latest is not newer than the running build.
     Current,
-    /// Behind by a patch only (major and minor match).
     PatchBehind,
-    /// Behind by a minor (major matches).
     MinorBehind,
-    /// Behind by a major.
     MajorBehind,
 }
 
-/// Coarse "how many releases behind" signal, counted from the cached release
-/// list. Complements [`UpdateStatus`]: a `major_behind` + `one_behind` pair
-/// reveals a thin/fallback cache that only fetched the latest release, while
-/// `minor_behind` + `several_behind` is a genuinely lagging install.
+/// Complements `UpdateStatus`: `major_behind` with `one_behind` reveals a thin fallback cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReleasesBehind {
-    /// No cache to count from.
     Unknown,
-    /// On the cached latest.
     Current,
-    /// Exactly one cached release is newer (or the cache only knows the latest).
     OneBehind,
-    /// Two or more cached releases are newer.
     SeveralBehind,
 }
 
@@ -121,8 +97,6 @@ fn save_cache(cache: &UpdateCache) -> Result<()> {
 pub async fn check_for_update(current_version: &str, force: bool) -> Result<UpdateInfo> {
     let settings = get_update_settings();
 
-    // Mode=off skips network entirely; return a "no update" stub so callers
-    // can keep their unconditional shape without branching on the mode.
     if !settings.update_check_mode.is_enabled() {
         return Ok(UpdateInfo {
             available: false,
@@ -136,8 +110,7 @@ pub async fn check_for_update(current_version: &str, force: bool) -> Result<Upda
             let age = chrono::Utc::now() - cache.checked_at;
             let max_age = chrono::Duration::hours(UPDATE_CHECK_INTERVAL_HOURS as i64);
 
-            // Invalidate cache if current version is newer than cached latest
-            // (user upgraded and cache is stale)
+            // The user upgraded past the cached latest, so the cache is stale.
             let current_is_newer = is_newer_version(current_version, &cache.latest_version);
 
             if age < max_age && !current_is_newer {
@@ -169,7 +142,6 @@ pub async fn check_for_update(current_version: &str, force: bool) -> Result<Upda
         timeout: std::time::Duration::from_secs(5),
     })?;
 
-    // Fetch all releases (includes body/release notes)
     let releases = match fetch_releases(&client).await {
         Ok(r) => r,
         Err(e) => {
@@ -184,7 +156,6 @@ pub async fn check_for_update(current_version: &str, force: bool) -> Result<Upda
         .unwrap_or_default();
 
     if latest_version.is_empty() {
-        // Fall back to the latest-release endpoint if the releases list failed.
         let release = client.latest_release(GITHUB_OWNER, GITHUB_REPO).await?;
         let release_info = release_info_from(release);
         let version = release_info.version.clone();
@@ -244,8 +215,6 @@ fn release_info_from(release: crate::github::GitHubRelease) -> ReleaseInfo {
     }
 }
 
-/// Get cached release notes, filtered to show only releases newer than from_version.
-/// Returns releases in newest-first order.
 pub fn get_cached_releases(from_version: Option<&str>) -> Vec<ReleaseInfo> {
     let cache = match load_cache() {
         Some(c) => c,
@@ -286,10 +255,7 @@ fn version_parts(v: &str) -> Vec<u32> {
     v.split('.').filter_map(|s| s.parse().ok()).collect()
 }
 
-/// Classify the semver distance between the running build and a cached latest.
-/// Pure (no I/O) so the bucketing is unit-testable without app-dir/env coupling.
-/// An empty or unparsable cached latest is [`UpdateStatus::Unknown`], never
-/// silently treated as `Current`.
+/// An empty or unparsable latest is `Unknown`, never `Current`.
 fn classify_update_status(current: &str, cached_latest: Option<&str>) -> UpdateStatus {
     let Some(latest) = cached_latest.map(str::trim).filter(|s| !s.is_empty()) else {
         return UpdateStatus::Unknown;
@@ -312,10 +278,7 @@ fn classify_update_status(current: &str, cached_latest: Option<&str>) -> UpdateS
     }
 }
 
-/// Classify how many cached releases are newer than the running build. Pure (no
-/// I/O). When the cached latest is newer but the release list does not enumerate
-/// it (an old or fallback cache that only stored the latest), reports the
-/// conservative [`ReleasesBehind::OneBehind`] rather than overstating the depth.
+/// A newer latest missing from the list reports `OneBehind` rather than overstating.
 fn classify_releases_behind(
     current: &str,
     cached_latest: Option<&str>,
@@ -341,9 +304,6 @@ fn classify_releases_behind(
     }
 }
 
-/// Read the cached update check (no network) and classify both version-health
-/// signals in one pass. Returns [`UpdateStatus::Unknown`] / [`ReleasesBehind::Unknown`]
-/// when no cache exists. Used by telemetry; the opt-in gate is the caller's job.
 pub fn cached_version_health(current: &str) -> (UpdateStatus, ReleasesBehind) {
     let cache = load_cache();
     let latest = cache.as_ref().map(|c| c.latest_version.as_str());
@@ -356,7 +316,6 @@ pub fn cached_version_health(current: &str) -> (UpdateStatus, ReleasesBehind) {
 
 pub async fn print_update_notice() {
     let settings = get_update_settings();
-    // CLI nag fires only when the global mode allows notifications.
     if !settings.update_check_mode.notifies() {
         return;
     }
@@ -378,36 +337,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_version_comparison() {
-        assert!(is_newer_version("1.0.1", "1.0.0"));
-        assert!(is_newer_version("1.1.0", "1.0.9"));
-        assert!(is_newer_version("2.0.0", "1.9.9"));
-        assert!(!is_newer_version("1.0.0", "1.0.0"));
-        assert!(!is_newer_version("1.0.0", "1.0.1"));
-    }
-
-    #[test]
-    fn test_cache_should_invalidate_when_current_newer_than_cached() {
-        // When user upgrades to a version newer than cached latest,
-        // the cache should be invalidated to fetch fresh release notes.
-        // This test documents the version comparison used for cache invalidation.
-        let cached_latest = "0.4.5";
-        let current_version = "0.5.0";
-
-        // current > cached means cache is stale
-        let current_is_newer = is_newer_version(current_version, cached_latest);
-        assert!(current_is_newer, "0.5.0 should be newer than 0.4.5");
-
-        // Same version means cache is valid
-        let same_version = is_newer_version("0.4.5", "0.4.5");
-        assert!(
-            !same_version,
-            "same version should not trigger invalidation"
-        );
-
-        // Older current version (downgrade) should not invalidate
-        let downgrade = is_newer_version("0.4.0", "0.4.5");
-        assert!(!downgrade, "downgrade should not trigger invalidation");
+    fn is_newer_version_is_strict_so_a_rerun_never_invalidates_the_cache() {
+        for (candidate, baseline, newer) in [
+            ("1.0.1", "1.0.0", true),
+            ("1.1.0", "1.0.9", true),
+            ("2.0.0", "1.9.9", true),
+            ("0.5.0", "0.4.5", true),
+            ("1.0.0", "1.0.0", false),
+            ("0.4.5", "0.4.5", false),
+            ("1.0.0", "1.0.1", false),
+            ("0.4.0", "0.4.5", false),
+        ] {
+            assert_eq!(
+                is_newer_version(candidate, baseline),
+                newer,
+                "{candidate} vs {baseline}"
+            );
+        }
     }
 
     fn make_release(version: &str) -> ReleaseInfo {
@@ -419,66 +365,36 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_releases_returns_all_when_no_filter() {
-        let releases = vec![
-            make_release("0.5.0"),
-            make_release("0.4.3"),
-            make_release("0.4.2"),
+    fn filter_releases_keeps_only_what_is_newer_than_from_version() {
+        let all = ["0.5.0", "0.4.3", "0.4.2", "0.4.1"];
+        // (available versions, from_version, versions the caller should see)
+        let cases: [(&[&str], Option<&str>, &[&str]); 6] = [
+            (&all[..3], None, &["0.5.0", "0.4.3", "0.4.2"]),
+            (&all, Some("0.4.3"), &["0.5.0"]),
+            (&all[..2], Some("0.5.0"), &[]),
+            (&all[..2], Some("0.3.0"), &["0.5.0", "0.4.3"]),
+            (&[], Some("0.4.3"), &[]),
+            (&[], None, &[]),
         ];
-
-        let filtered = filter_releases(releases.clone(), None);
-
-        assert_eq!(filtered.len(), 3);
-        assert_eq!(filtered[0].version, "0.5.0");
-        assert_eq!(filtered[1].version, "0.4.3");
-        assert_eq!(filtered[2].version, "0.4.2");
-    }
-
-    #[test]
-    fn test_filter_releases_stops_at_from_version() {
-        let releases = vec![
-            make_release("0.5.0"),
-            make_release("0.4.3"),
-            make_release("0.4.2"),
-            make_release("0.4.1"),
-        ];
-
-        let filtered = filter_releases(releases, Some("0.4.3"));
-
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].version, "0.5.0");
-    }
-
-    #[test]
-    fn test_filter_releases_returns_empty_when_from_version_is_latest() {
-        let releases = vec![make_release("0.5.0"), make_release("0.4.3")];
-
-        let filtered = filter_releases(releases, Some("0.5.0"));
-
-        assert!(filtered.is_empty());
-    }
-
-    #[test]
-    fn test_filter_releases_returns_all_when_from_version_not_found() {
-        let releases = vec![make_release("0.5.0"), make_release("0.4.3")];
-
-        let filtered = filter_releases(releases.clone(), Some("0.3.0"));
-
-        assert_eq!(filtered.len(), 2);
+        for (available, from_version, expected) in cases {
+            let releases = available.iter().map(|v| make_release(v)).collect();
+            let versions: Vec<String> = filter_releases(releases, from_version)
+                .into_iter()
+                .map(|r| r.version)
+                .collect();
+            assert_eq!(versions, expected, "{available:?} from {from_version:?}");
+        }
     }
 
     #[test]
     fn test_classify_update_status_buckets_by_semver_distance() {
         use UpdateStatus::*;
-        // No cache / empty / unparsable latest => Unknown, never Current.
         assert_eq!(classify_update_status("1.2.3", None), Unknown);
         assert_eq!(classify_update_status("1.2.3", Some("")), Unknown);
         assert_eq!(classify_update_status("1.2.3", Some("   ")), Unknown);
         assert_eq!(classify_update_status("1.2.3", Some("garbage")), Unknown);
-        // Latest not newer => Current.
         assert_eq!(classify_update_status("1.2.3", Some("1.2.3")), Current);
         assert_eq!(classify_update_status("1.2.3", Some("1.2.0")), Current);
-        // Distance buckets.
         assert_eq!(classify_update_status("1.2.3", Some("1.2.4")), PatchBehind);
         assert_eq!(classify_update_status("1.2.3", Some("1.3.0")), MinorBehind);
         assert_eq!(classify_update_status("1.2.3", Some("2.0.0")), MajorBehind);
@@ -493,39 +409,22 @@ mod tests {
             make_release("1.2.3"),
             make_release("1.2.0"),
         ];
-        // No cache => Unknown.
         assert_eq!(classify_releases_behind("1.2.3", None, &[]), Unknown);
-        // Latest not newer => Current.
         assert_eq!(
             classify_releases_behind("1.3.0", Some("1.3.0"), &releases),
             Current
         );
-        // Two cached releases newer than 1.2.3 (1.3.0, 1.2.5) => SeveralBehind.
         assert_eq!(
             classify_releases_behind("1.2.3", Some("1.3.0"), &releases),
             SeveralBehind
         );
-        // Exactly one newer => OneBehind.
         assert_eq!(
             classify_releases_behind("1.2.5", Some("1.3.0"), &releases),
             OneBehind
         );
-        // Thin/fallback cache: latest newer but list does not enumerate it =>
-        // conservative OneBehind, not overstated.
         assert_eq!(
             classify_releases_behind("1.2.3", Some("9.9.9"), &[]),
             OneBehind
         );
-    }
-
-    #[test]
-    fn test_filter_releases_handles_empty_list() {
-        let releases: Vec<ReleaseInfo> = vec![];
-
-        let filtered = filter_releases(releases.clone(), Some("0.4.3"));
-        assert!(filtered.is_empty());
-
-        let filtered = filter_releases(releases, None);
-        assert!(filtered.is_empty());
     }
 }

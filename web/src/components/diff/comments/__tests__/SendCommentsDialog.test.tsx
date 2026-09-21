@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-//
-// Tests for SendCommentsDialog: the three-piece compose dialog that
-// forwards diff review comments to the ACP worker. Cover compose/submit
-// (asserting the POST payload), the empty/disabled state, cancel, the
-// Cmd+Enter / Escape hotkeys, and the failure path.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
@@ -84,18 +79,12 @@ afterEach(() => {
 });
 
 describe("SendCommentsDialog", () => {
-  it("renders the comment count and a preview of the assembled markdown", () => {
-    const { container } = setup({ comments: [comment({ body: "Rename this" })] });
-    expect(container.textContent).toContain("Send diff comments");
-    expect(container.textContent).toContain("1 comment");
-    expect(container.textContent).toContain("Rename this");
-  });
-
-  it("pluralizes the comment count", () => {
-    const { container } = setup({
-      comments: [comment({ id: "a" }), comment({ id: "b", startLine: 20, endLine: 20 })],
-    });
-    expect(container.textContent).toContain("2 comments");
+  it.each([
+    [[comment({ body: "Rename this" })], ["1 comment", "Rename this", "Send diff comments"]],
+    [[comment({ id: "a" }), comment({ id: "b", startLine: 20, endLine: 20 })], ["2 comments"]],
+  ])("renders the count and preview", (comments, texts) => {
+    const { container } = setup({ comments });
+    for (const t of texts) expect(container.textContent).toContain(t);
   });
 
   it("shows the empty-state preview and disables Send when there are no comments", () => {
@@ -107,9 +96,7 @@ describe("SendCommentsDialog", () => {
   it("disables Send and exposes the reason to pointer and keyboard when sendEnabled is false", async () => {
     const { container } = setup({ sendEnabled: false, sendDisabledReason: "session is trashed" });
     const btn = sendButton(container);
-    // `aria-disabled`, not `disabled`: a natively disabled button is not
-    // focusable and gets no pointer events, so neither a hover nor a keyboard
-    // user could ever reach the explanation.
+    // aria-disabled keeps the reason reachable by hover and keyboard.
     expect(btn.getAttribute("aria-disabled")).toBe("true");
     expect(btn.disabled).toBe(false);
 
@@ -119,7 +106,6 @@ describe("SendCommentsDialog", () => {
     fireEvent.mouseLeave(wrapper);
     await waitFor(() => expect(document.body.textContent).not.toContain("session is trashed"));
 
-    // Tabbing to the button surfaces the same reason.
     btn.focus();
     fireEvent.focus(btn);
     await waitFor(() => expect(document.body.textContent).toContain("session is trashed"));
@@ -145,12 +131,10 @@ describe("SendCommentsDialog", () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, init] = fetchMock.mock.calls[0];
-    // sessionId is URL-encoded.
     expect(url).toBe("/api/sessions/sess%201/acp/prompt/diff-comments");
     expect(init.method).toBe("POST");
     expect(init.headers["Content-Type"]).toBe("application/json");
     const body = JSON.parse(init.body);
-    // Intro is trimmed; blank outro falls back to the default.
     expect(body.intro).toBe("hello");
     expect(body.outro).toBe("Please address these comments.");
     expect(body.isMultiRepo).toBe(false);
@@ -174,30 +158,17 @@ describe("SendCommentsDialog", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("Escape closes the dialog", () => {
-    const { onClose } = setup();
-    fireEvent.keyDown(document, { key: "Escape" });
-    expect(onClose).toHaveBeenCalledTimes(1);
-  });
-
-  it("Cancel button closes the dialog", () => {
+  it.each<[string, (c: HTMLElement) => void]>([
+    ["Escape", () => fireEvent.keyDown(document, { key: "Escape" })],
+    [
+      "Cancel",
+      (c) => fireEvent.click(Array.from(c.querySelectorAll("button")).find((b) => b.textContent?.trim() === "Cancel")!),
+    ],
+    ["the close button", (c) => fireEvent.click(c.querySelector('button[aria-label="Close"]')!)],
+    ["the backdrop", (c) => fireEvent.mouseDown(c.querySelector(".fixed.inset-0")!)],
+  ])("closes via %s", (_, act) => {
     const { container, onClose } = setup();
-    const cancelBtn = Array.from(container.querySelectorAll("button")).find((b) => b.textContent?.trim() === "Cancel")!;
-    fireEvent.click(cancelBtn);
-    expect(onClose).toHaveBeenCalledTimes(1);
-  });
-
-  it("close (×) button closes the dialog", () => {
-    const { container, onClose } = setup();
-    const closeBtn = container.querySelector<HTMLButtonElement>('button[aria-label="Close"]')!;
-    fireEvent.click(closeBtn);
-    expect(onClose).toHaveBeenCalledTimes(1);
-  });
-
-  it("clicking the backdrop closes the dialog", () => {
-    const { container, onClose } = setup();
-    const backdrop = container.querySelector(".fixed.inset-0") as HTMLElement;
-    fireEvent.mouseDown(backdrop);
+    act(container);
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
@@ -213,71 +184,41 @@ describe("SendCommentsDialog", () => {
     expect(onChangeClearAfterSend).toHaveBeenCalledWith(true);
   });
 
-  it("reflects controlled draft values on the textareas", () => {
-    const { container } = setup({ introDraft: "intro text", outroDraft: "outro text" });
+  it("reflects controlled drafts and the clearAfterSend checkbox", () => {
+    const { container } = setup({ introDraft: "intro text", outroDraft: "outro text", clearAfterSend: true });
     const textareas = container.querySelectorAll("textarea");
-    expect((textareas[0] as HTMLTextAreaElement).value).toBe("intro text");
-    expect((textareas[1] as HTMLTextAreaElement).value).toBe("outro text");
+    expect([textareas[0]!.value, textareas[1]!.value]).toEqual(["intro text", "outro text"]);
+    expect(container.querySelector<HTMLInputElement>('input[type="checkbox"]')!.checked).toBe(true);
   });
 
-  it("reflects the controlled clearAfterSend checkbox state", () => {
-    const { container } = setup({ clearAfterSend: true });
-    const checkbox = container.querySelector<HTMLInputElement>('input[type="checkbox"]')!;
-    expect(checkbox.checked).toBe(true);
-  });
-
-  it("shows an error and does not fire onSent when the server returns non-ok", async () => {
-    fetchMock.mockResolvedValue({
-      ok: false,
-      status: 500,
-      text: () => Promise.resolve("boom"),
-    });
+  it.each<[string, () => void, string[]]>([
+    [
+      "a non-ok response",
+      () => fetchMock.mockResolvedValue({ ok: false, status: 500, text: () => Promise.resolve("boom") }),
+      ["Failed to send (500)", "boom"],
+    ],
+    ["a network rejection", () => fetchMock.mockRejectedValue(new Error("offline")), ["Failed to send: offline"]],
+  ])("shows an error for %s without onSent or telemetry", async (_, seed, texts) => {
+    seed();
     const { container, onSent } = setup();
     fireEvent.click(sendButton(container));
-    await waitFor(() => expect(container.textContent).toContain("Failed to send (500)"));
-    expect(container.textContent).toContain("boom");
+    await waitFor(() => expect(container.textContent).toContain(texts[0]));
+    for (const t of texts) expect(container.textContent).toContain(t);
     expect(onSent).not.toHaveBeenCalled();
     expect(reportTelemetrySeen).not.toHaveBeenCalled();
   });
 
-  it("shows an error on a network rejection", async () => {
-    fetchMock.mockRejectedValue(new Error("offline"));
-    const { container, onSent } = setup();
-    fireEvent.click(sendButton(container));
-    await waitFor(() => expect(container.textContent).toContain("Failed to send: offline"));
-    expect(onSent).not.toHaveBeenCalled();
-  });
-
-  it("shows the Sending... label and ignores a second click while in flight", async () => {
-    let resolveFetch: ((v: { ok: boolean }) => void) | null = null;
-    fetchMock.mockReturnValue(
-      new Promise((resolve) => {
-        resolveFetch = resolve;
-      }),
-    );
-    const { container, onSent } = setup();
+  it("while sending, shows Sending..., ignores a second click and Escape", async () => {
+    let resolveFetch: (v: { ok: boolean }) => void = () => {};
+    fetchMock.mockReturnValue(new Promise((resolve) => (resolveFetch = resolve)));
+    const { container, onSent, onClose } = setup();
     fireEvent.click(sendButton(container));
     await waitFor(() => expect(sendButton(container).textContent?.trim()).toBe("Sending..."));
-    // A second click while busy must not start another request.
     fireEvent.click(sendButton(container));
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-
-    resolveFetch!({ ok: true });
-    await waitFor(() => expect(onSent).toHaveBeenCalledTimes(1));
-  });
-
-  it("Escape is blocked while a send is in flight", async () => {
-    let resolveFetch: ((v: { ok: boolean }) => void) | null = null;
-    fetchMock.mockReturnValue(
-      new Promise((resolve) => {
-        resolveFetch = resolve;
-      }),
-    );
-    const { container, onClose } = setup();
-    fireEvent.click(sendButton(container));
-    await waitFor(() => expect(sendButton(container).textContent?.trim()).toBe("Sending..."));
     fireEvent.keyDown(document, { key: "Escape" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(onClose).not.toHaveBeenCalled();
-    resolveFetch!({ ok: true });
+    resolveFetch({ ok: true });
+    await waitFor(() => expect(onSent).toHaveBeenCalledTimes(1));
   });
 });

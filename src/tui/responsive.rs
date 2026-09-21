@@ -1,31 +1,19 @@
 //! Viewport breakpoints and layout helpers for narrow terminals.
 //!
-//! aoe runs over Mosh on phones and tablets where the viewport can be
-//! anywhere from ~26 cols (iPhone-portrait Mosh, soft keyboard up) to
-//! ~250 cols (full-screen desktop). All width/height-driven layout
-//! decisions live here so the device-class assumptions are visible in
-//! one file rather than scattered as magic numbers across render code.
-//!
-//! Why named constants and not raw ratios?
-//! - ratatui's `Constraint::Length` is the right tool for fixed-cost
-//!   chrome (borders, footers, status bar). A "70% border" is nonsense.
-//! - Ratios are right for content panes but only above a usability
-//!   floor: 33% of 30 cols is 10 cols, which can't render a tmux
-//!   capture. Each constant below has a "below this it stops working"
-//!   reason in its doc comment.
-//! - The bug pattern these replace was *unnamed* hard numbers in render
-//!   code, not the use of fixed sizes per se.
+//! aoe runs over Mosh on phones where the viewport can be ~26 cols, and on
+//! full-screen desktops at ~250. Every width/height-driven decision lives here
+//! so the device-class assumptions are visible in one file rather than as magic
+//! numbers across render code. Fixed sizes suit chrome (borders, footers) and
+//! ratios suit content panes, but only above a usability floor: each constant
+//! documents the width below which it stops working.
 
-/// Below this width, the home view switches from side-by-side
-/// (list | preview) to stacked (list above preview), and the preview
-/// pane drops its info header in favor of just the session title +
-/// status icon in the outer block title.
+/// Below this width the home view stacks (list above preview) instead of
+/// side-by-side, and the preview drops its info header for the session title +
+/// status icon in the block title.
 ///
-/// 80 is the conventional "narrow terminal" boundary: at default
-/// list_width (35), side-by-side preview at viewport 80 is 45 cols,
-/// barely usable; below that the floor binds and both panes lose. A
-/// full-width stacked preview reads better than a 45-col side-by-side
-/// one, and phone widths (Mosh landscape, Termius) live in this range.
+/// 80 is the conventional narrow-terminal boundary: at the default list_width
+/// of 35 a side-by-side preview there is 45 cols, and a full-width stacked one
+/// reads better. Phone widths live in this range.
 pub const STACKED_BREAKPOINT: u16 = 80;
 
 /// Minimum width the preview pane needs to render a tmux capture
@@ -55,20 +43,16 @@ pub const STACKED_PREVIEW_MIN: u16 = 8;
 /// Send-message dialog targets this percentage of viewport width.
 pub const DIALOG_TARGET_PCT: u16 = 80;
 
-/// Below this width, the dialog takes the full viewport (truncates but
-/// stays visible). The 26-col floor is the width of the title hints
-/// (" Enter send Esc cancel " plus rounded borders); below that the
-/// hints disappear regardless of clamp choice, so taking the full
-/// viewport at least preserves the message area.
+/// Below this width the dialog takes the full viewport. The 26-col floor is the
+/// width of the title hints; below that they disappear whatever the clamp, so
+/// taking the full viewport at least preserves the message area.
 pub const DIALOG_MIN_WIDTH: u16 = 26;
 
 /// Cap on dialog width so it doesn't sprawl across wide desktops.
 pub const DIALOG_MAX_WIDTH: u16 = 80;
 
-/// Compute send-message dialog width for a given viewport width.
-///
-/// Below [`DIALOG_MIN_WIDTH`], take the full viewport.
-/// Otherwise target [`DIALOG_TARGET_PCT`] of viewport, clamped to
+/// Compute send-message dialog width: the full viewport below
+/// [`DIALOG_MIN_WIDTH`], otherwise [`DIALOG_TARGET_PCT`] of it clamped to
 /// `[DIALOG_MIN_WIDTH, DIALOG_MAX_WIDTH]`.
 pub fn dialog_width(viewport_width: u16) -> u16 {
     if viewport_width <= DIALOG_MIN_WIDTH {
@@ -80,7 +64,6 @@ pub fn dialog_width(viewport_width: u16) -> u16 {
     }
 }
 
-/// Compute stacked-mode list pane height for a given main-region height.
 pub fn stacked_list_height(main_height: u16) -> u16 {
     (main_height / STACKED_LIST_HEIGHT_FRACTION)
         .clamp(STACKED_LIST_HEIGHT_MIN, STACKED_LIST_HEIGHT_MAX)

@@ -29,9 +29,6 @@ function hashContent(content: string): string {
  * highlighter and one theme path. Line numbers come from the renderer; the
  * library handles an unresolved grammar as plain text itself, so no local
  * fallback or stale-markup guard is needed here.
- *
- * Continues the consolidation in #3913: #3958 moved highlighting onto this
- * library, this moves whole-file rendering.
  */
 export function FullFileViewer({ content, filePath }: Props) {
   const { theme } = useShikiTheme();

@@ -6,16 +6,7 @@ export type ThemeSelectResult = { ok: true } | { ok: false; error: string };
 
 const SAVE_ERROR = "Could not save theme. Please try again.";
 
-/**
- * Persist a theme selection and repaint, used by the first-run theme welcome
- * modal. The theme is a global preference, so this writes the global config
- * (PATCH /api/theme), not a profile override; writing it per-profile let a
- * stale override shadow the TUI's global pick and flip the theme on every
- * Settings open/close. Persist-then-paint: the dashboard only repaints after
- * the PATCH lands (via dispatchThemePickerChanged, which routes through
- * useResolvedTheme's single apply path), so a failed save never leaves the
- * applied/cached theme ahead of what is on disk (the #1510 bug class).
- */
+// Writes the global theme, then repaints only after the PATCH lands so a failed save never applies.
 export function useThemeMutation(): {
   select: (name: string) => Promise<ThemeSelectResult>;
   pending: boolean;

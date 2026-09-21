@@ -1,31 +1,10 @@
-//! Migration v008: lock in the implicit "default" profile for existing
-//! installs.
+//! Migration v008: write `default_profile = "default"` into the global config
+//! for installs that have a `profiles/default/` directory and no explicit
+//! choice (empty counts as none).
 //!
-//! Before this version the serde default for `Config.default_profile` was
-//! `"default"`, so any user who had never explicitly set the field still
-//! resolved to a profile named `default`. The same field now defaults to
-//! the empty string and resolution falls through to "first sorted profile
-//! directory", which can change which profile the TUI opens dialogs and
-//! settings against for users whose profile directories sort before
-//! `default` (e.g. `alpha`, `client-a`, `_dev`).
-//!
-//! For those users the change is non-destructive but visible: new-session
-//! dialogs, the settings view, theme reloads, and status hooks all seed
-//! from a different profile until the user picks one explicitly. This
-//! migration eliminates the surprise by writing `default_profile = "default"`
-//! into the global config whenever the install has a `profiles/default/`
-//! directory and no explicit override. Fresh installs (no `default`
-//! directory) are left alone so the PR's new bootstrap to `main` still
-//! takes effect.
-//!
-//! Skip conditions:
-//! - `profiles/default/` does not exist: nothing to preserve.
-//! - `default_profile` is already set to a non-empty value: user has
-//!   chosen explicitly, do not override.
-//!
-//! Empty-string values are treated the same as missing: pre-PR an empty
-//! string fell through to `"default"`, so locking it in matches old
-//! behavior.
+//! The field no longer defaults to `"default"`; resolution now falls through
+//! to the first sorted profile directory, which would silently retarget those
+//! installs. A fresh install has no `default` directory and is left alone.
 
 use anyhow::Result;
 use std::fs;
