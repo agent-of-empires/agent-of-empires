@@ -45,6 +45,8 @@ mod acp_session_delete;
 
 mod acp_effort_respawn;
 
+mod acp_model_respawn;
+
 #[cfg(debug_assertions)]
 mod acp_midturn_resume;
 

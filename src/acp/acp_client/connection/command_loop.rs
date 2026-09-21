@@ -21,7 +21,8 @@ use crate::acp::acp_client::between_prompt::{
 use crate::acp::acp_client::commands::ClientCmd;
 use crate::acp::acp_client::config_options::{
     config_options_event, dispatch_set_config_option, dispatch_set_mode, mode_config_id,
-    modes_available_event, thought_level_config_id, ConfigOptionDispatchPurpose, SessionChannels,
+    model_config_id, modes_available_event, thought_level_config_id, ConfigOptionDispatchPurpose,
+    SessionChannels,
 };
 use crate::acp::acp_client::control::DaemonControlClient;
 use crate::acp::acp_client::delete::handle_delete_session_cmd;
@@ -47,6 +48,7 @@ pub(super) struct Session {
     pub(super) source_profile: Option<String>,
     pub(super) default_effort: Option<String>,
     pub(super) default_mode: Option<String>,
+    pub(super) default_model: Option<String>,
     pub(super) agent_cwd: PathBuf,
     /// Capability-filtered servers, forwarded again by a driven reset.
     pub(super) mcp_servers: Vec<McpServer>,
@@ -353,8 +355,8 @@ impl Session {
         Ok(())
     }
 
-    /// The fresh session starts on adapter defaults, so configured effort and
-    /// mode are re-sent, best-effort, within the reset deadline.
+    /// The fresh session starts on adapter defaults, so configured model,
+    /// effort and mode are re-sent, best-effort, within the reset deadline.
     async fn reapply_defaults(
         &self,
         new_id: &SessionId,
@@ -363,6 +365,10 @@ impl Session {
     ) {
         let label = &self.shared.session_label;
         for (value, config_id) in [
+            (
+                self.default_model.as_deref(),
+                options.and_then(model_config_id),
+            ),
             (
                 self.default_effort.as_deref(),
                 options.and_then(thought_level_config_id),

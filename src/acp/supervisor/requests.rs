@@ -5,8 +5,10 @@ use std::time::{Duration, Instant};
 
 use tracing::info;
 
-use super::launch::apply_mode;
-use super::{lock_recover, BroadcastSink, Supervisor, SupervisorError, WORKER_READY_TIMEOUT};
+use super::launch::{apply_mode, set_spawn_model};
+use super::{
+    lock_recover, BroadcastSink, Supervisor, SupervisorError, WorkerKind, WORKER_READY_TIMEOUT,
+};
 use crate::acp::acp_client::{AcpClient, AcpError, ResetSessionOutcome};
 use crate::acp::approvals::{ApprovalDecision, Nonce};
 use crate::acp::elicitations::ElicitationResolution;
@@ -168,6 +170,19 @@ impl<S: BroadcastSink> Supervisor<S> {
     ) -> Result<(), SupervisorError> {
         let client = self.ready_client(session_id).await?;
         client.set_config_option(config_id, value).await?;
+        // A watchdog respawn clones the cached config, which the daemon's
+        // persisted pick never reaches; keyed on `model` like that persistence.
+        if config_id == "model" {
+            if let Some(WorkerKind::Runner { spawn_config }) = self
+                .workers
+                .lock()
+                .await
+                .get_mut(session_id)
+                .map(|h| &mut h.kind)
+            {
+                set_spawn_model(spawn_config, Some(value.to_string()));
+            }
+        }
         Ok(())
     }
 

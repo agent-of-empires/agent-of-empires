@@ -123,11 +123,25 @@ async function handleDeleteSession(params) {
   return {};
 }
 
-// SHIM_THOUGHT_LEVEL=1 advertises one thought-level select.
+// SHIM_THOUGHT_LEVEL=1 advertises one thought-level select. SHIM_MODEL_OPTION=1
+// adds a `category:"model"` picker that rejects unknown values.
+let model = "default";
+const MODEL_VALUES = ["default", "opus", "sonnet"];
+
 function configOptions() {
-  if (process.env.SHIM_THOUGHT_LEVEL !== "1") return undefined;
-  return [
-    {
+  const options = [];
+  if (process.env.SHIM_MODEL_OPTION === "1") {
+    options.push({
+      id: "model",
+      name: "Model",
+      category: "model",
+      type: "select",
+      currentValue: model,
+      options: MODEL_VALUES.map((value) => ({ value, name: value })),
+    });
+  }
+  if (process.env.SHIM_THOUGHT_LEVEL === "1") {
+    options.push({
       id: "thought_level",
       name: "Thinking",
       category: "thought_level",
@@ -137,14 +151,19 @@ function configOptions() {
         { value: "medium", name: "Medium" },
         { value: "high", name: "High" },
       ],
-    },
-  ];
+    });
+  }
+  return options.length > 0 ? options : undefined;
 }
 
 // SHIM_CONFIG_OPTION_RECORD_FILE records `<configId>=<value>` per call.
 async function handleSetConfigOption(params) {
   await record("SHIM_CONFIG_OPTION_RECORD_FILE", `${params.configId}=${params.value}\n`);
   if (params.configId === "thought_level") thoughtLevel = params.value;
+  if (params.configId === "model") {
+    if (!MODEL_VALUES.includes(params.value)) throw new Error(`unknown model ${params.value}`);
+    model = params.value;
+  }
   return { configOptions: configOptions() ?? [] };
 }
 

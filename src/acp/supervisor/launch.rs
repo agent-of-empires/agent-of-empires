@@ -249,7 +249,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
 
         let mut provider_env = req.provider_env.clone();
-        if let Some(model) = model {
+        if let Some(model) = model.clone() {
             provider_env.push(("AOE_AGENT_MODEL".into(), model));
         }
         // Every worker runs through `aoe __acp-runner` so it survives `aoe serve --stop`.
@@ -277,6 +277,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             default_effort: effort,
             default_effort_explicit: req.effort_explicit,
             default_mode: acp_defaults.and_then(|defaults| defaults.mode()),
+            default_model: model,
             socket_path: Some(socket_path),
             stored_acp_session_id: req.stored_acp_session_id.clone(),
             fork_from: req.fork_from.clone(),
@@ -690,13 +691,19 @@ pub(super) fn refresh_spawn_model_effort(
     };
     let (model, effort) =
         crate::session::config::resolve_spawn_model_effort(defaults, cached_model, explicit_effort);
+    set_spawn_model(config, model);
+    config.default_effort = effort;
+}
+
+/// Point both model channels of a cached respawn config at `model`.
+pub(super) fn set_spawn_model(config: &mut SpawnConfig, model: Option<String>) {
     config
         .provider_env
         .retain(|(key, _)| key != "AOE_AGENT_MODEL");
-    if let Some(model) = model {
+    if let Some(model) = model.clone() {
         config.provider_env.push(("AOE_AGENT_MODEL".into(), model));
     }
-    config.default_effort = effort;
+    config.default_model = model;
 }
 
 #[cfg(test)]

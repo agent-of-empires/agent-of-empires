@@ -24,7 +24,7 @@ use super::ReadyTx;
 use crate::acp::acp_client::commands::{ClientCmd, ConnectMode};
 use crate::acp::acp_client::config_options::{
     apply_config_default, config_options_event, mode_config_id, modes_available_event,
-    SessionChannels,
+    thought_level_config_id, SessionChannels,
 };
 use crate::acp::acp_client::control::{establish_session_v3, DaemonControlClient};
 use crate::acp::acp_client::errors::{acp_internal_error, AcpError, IncompatibleAgentError};
@@ -56,6 +56,7 @@ pub(super) struct EstablishCtx {
     pub(super) mcp_servers: Vec<McpServer>,
     pub(super) default_effort: Option<String>,
     pub(super) default_mode: Option<String>,
+    pub(super) default_model: Option<String>,
     pub(super) source_profile: Option<String>,
     pub(super) agent_cwd: PathBuf,
     pub(super) cmd_rx: mpsc::Receiver<ClientCmd>,
@@ -166,6 +167,7 @@ pub(super) async fn establish(
         source_profile: ctx.source_profile,
         default_effort: ctx.default_effort,
         default_mode: ctx.default_mode,
+        default_model: ctx.default_model,
         agent_cwd: ctx.agent_cwd,
         mcp_servers: mcp_servers.clone(),
         cmd_rx: ctx.cmd_rx,
@@ -192,6 +194,7 @@ pub(super) async fn establish(
                 .await?
         }
     };
+    session.apply_default_model().await;
     session.apply_default_effort().await;
     if arm_resume_watchdog {
         spawn_resume_idle_watchdog(shared);
@@ -512,7 +515,7 @@ impl Session {
                         mode,
                         &label,
                     )
-                    .await
+                    .await;
                 }
                 None => debug!(
                     target: "acp.protocol",
@@ -522,6 +525,45 @@ impl Session {
             }
         }
         Ok(id)
+    }
+
+    /// The persisted model pick, re-asserted after any establish path because
+    /// claude-agent-acp ignores `AOE_AGENT_MODEL` and re-applies its settings
+    /// pin inside `session/load`. Runs before the effort: a model switch
+    /// rebuilds the option set, so the effort's option id is re-read.
+    async fn apply_default_model(&mut self) {
+        let Some(model) = self.default_model.as_deref() else {
+            return;
+        };
+        let label = &self.shared.session_label;
+        match &self.channels.model_config_option {
+            Some((_, current)) if current == model => debug!(
+                target: "acp.protocol",
+                session = %label,
+                model,
+                "structured view model already current"
+            ),
+            Some((config_id, _)) => {
+                let options = apply_config_default(
+                    &self.connection,
+                    &self.shared.event_tx,
+                    self.acp_session_id.clone(),
+                    SessionConfigId::new(config_id.clone()),
+                    model,
+                    label,
+                )
+                .await;
+                if let Some(options) = options {
+                    self.channels.thought_level_config_option_id =
+                        thought_level_config_id(&options).map(|id| id.0.to_string());
+                }
+            }
+            None => debug!(
+                target: "acp.protocol",
+                session = %label,
+                "structured view model skipped; no model option"
+            ),
+        }
     }
 
     /// Effort is a pin carried across respawns, which resume via load or fork,
@@ -540,7 +582,7 @@ impl Session {
                     effort,
                     &self.shared.session_label,
                 )
-                .await
+                .await;
             }
             None => debug!(
                 target: "acp.protocol",

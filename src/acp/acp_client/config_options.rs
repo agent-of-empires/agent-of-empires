@@ -42,6 +42,8 @@ pub(super) struct SessionChannels {
     pub(super) available_mode_ids: Option<Vec<String>>,
     pub(super) mode_config_option_id: Option<String>,
     pub(super) thought_level_config_option_id: Option<String>,
+    /// The model option's id and the value the agent reports for it.
+    pub(super) model_config_option: Option<(String, String)>,
 }
 
 impl SessionChannels {
@@ -60,6 +62,7 @@ impl SessionChannels {
             thought_level_config_option_id: options
                 .and_then(thought_level_config_id)
                 .map(|id| id.0.to_string()),
+            model_config_option: options.and_then(model_config_option),
         }
     }
 }
@@ -142,6 +145,7 @@ pub(super) fn dispatch_set_config_option(
 
 /// Best-effort application of a configured default. A value the agent no
 /// longer advertises is rejected and warned, never failing the caller.
+/// Returns the option list the agent answered with.
 pub(super) async fn apply_config_default(
     connection: &ConnectionTo<Agent>,
     event_tx: &mpsc::Sender<Event>,
@@ -149,7 +153,7 @@ pub(super) async fn apply_config_default(
     config_id: SessionConfigId,
     value: &str,
     session_label: &str,
-) {
+) -> Option<Vec<SessionConfigOption>> {
     info!(
         target: "acp.protocol",
         session = %session_label,
@@ -164,15 +168,19 @@ pub(super) async fn apply_config_default(
     );
     match connection.send_request(request).block_task().await {
         Ok(resp) => {
-            if let Some(event) = config_options_event(Some(resp.config_options)) {
+            if let Some(event) = config_options_event(Some(resp.config_options.clone())) {
                 let _ = event_tx.send(event).await;
             }
+            Some(resp.config_options)
         }
-        Err(e) => warn!(
-            target: "acp.protocol",
-            session = %session_label,
-            "structured view default failed: {e}"
-        ),
+        Err(e) => {
+            warn!(
+                target: "acp.protocol",
+                session = %session_label,
+                "structured view default failed: {e}"
+            );
+            None
+        }
     }
 }
 
@@ -195,6 +203,22 @@ pub(super) fn thought_level_config_id(options: &[SessionConfigOption]) -> Option
 
 pub(super) fn mode_config_id(options: &[SessionConfigOption]) -> Option<SessionConfigId> {
     select_config_id(options, SessionConfigOptionCategory::Mode)
+}
+
+pub(super) fn model_config_id(options: &[SessionConfigOption]) -> Option<SessionConfigId> {
+    select_config_id(options, SessionConfigOptionCategory::Model)
+}
+
+/// The model option's id and current value.
+fn model_config_option(options: &[SessionConfigOption]) -> Option<(String, String)> {
+    options.iter().find_map(|o| match &o.kind {
+        SessionConfigKind::Select(select)
+            if o.category == Some(SessionConfigOptionCategory::Model) =>
+        {
+            Some((o.id.0.to_string(), select.current_value.0.to_string()))
+        }
+        _ => None,
+    })
 }
 
 /// `None` for kinds the structured view does not render (all but `Select`).
