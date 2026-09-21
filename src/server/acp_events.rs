@@ -314,8 +314,72 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             continue;
         }
 
-        // Acquire `instances` once for both branches.
-        let (profile_to_save, unread_profile) = {
+        if acp_change.is_some() {
+            let lock = state.instance_lock(&frame.session_id).await;
+            let _identity_guard = lock.lock().await;
+            let profile = {
+                let instances = state.instances.read().await;
+                let Some(inst) = instances
+                    .iter()
+                    .find(|inst| inst.id == frame.session_id && inst.is_structured())
+                else {
+                    continue;
+                };
+                inst.source_profile.clone()
+            };
+            let session_id = frame.session_id.clone();
+            let change = acp_change.clone();
+            let file_watch = state.file_watch.clone();
+            let saved = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                let storage = crate::session::Storage::new(&profile, file_watch)?;
+                storage.update(|all, _| {
+                    let Some(inst) = all
+                        .iter_mut()
+                        .find(|inst| inst.id == session_id && inst.is_structured())
+                    else {
+                        return Ok(None);
+                    };
+                    apply_acp_session_change(inst, &session_id, change.as_ref());
+                    Ok(Some((
+                        inst.acp_session_id.clone(),
+                        inst.idle_dormant_since,
+                        inst.import_pending,
+                        inst.fork_pending.clone(),
+                    )))
+                })
+            })
+            .await;
+            match saved {
+                Ok(Ok(Some((sid, dormant, import, fork)))) => {
+                    let mut instances = state.instances.write().await;
+                    if let Some(inst) = instances
+                        .iter_mut()
+                        .find(|inst| inst.id == frame.session_id && inst.is_structured())
+                    {
+                        inst.acp_session_id = sid;
+                        inst.idle_dormant_since = dormant;
+                        inst.import_pending = import;
+                        inst.fork_pending = fork;
+                        state
+                            .mutation_epoch
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(error)) => tracing::warn!(
+                    target: "acp.event_listener",
+                    "ACP identity was not saved for {}: {error}",
+                    frame.session_id
+                ),
+                Err(error) => tracing::warn!(
+                    target: "acp.event_listener",
+                    "ACP identity save task failed for {}: {error}",
+                    frame.session_id
+                ),
+            }
+        }
+
+        let unread_profile = {
             let mut instances = state.instances.write().await;
             let Some(inst) = instances.iter_mut().find(|i| i.id == frame.session_id) else {
                 continue;
@@ -323,7 +387,6 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             if !inst.is_structured() {
                 continue;
             }
-            // Check while holding the instance lock.
             if let Some((capable, generation)) = load_session_capability {
                 if state
                     .acp_supervisor
@@ -333,22 +396,12 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                     inst.acp_load_session_capable = Some(capable);
                 }
             }
-
-            // Snapshotting around the call is exactly "the transition `apply_status_intent`
-            // actually applied".
             let old_status = inst.status;
             apply_status_intent(inst, status_intent, &state.status_tx);
-            let unread_profile =
-                should_mark_acp_unread(inst, old_status, crate::session::unread_enabled())
-                    .then(|| inst.source_profile.clone());
-
-            (
-                apply_acp_session_change(inst, &frame.session_id, acp_change.as_ref()),
-                unread_profile,
-            )
+            should_mark_acp_unread(inst, old_status, crate::session::unread_enabled())
+                .then(|| inst.source_profile.clone())
         };
 
-        // The turn just finished, so the row takes the automatic unread mark.
         if let Some(profile) = unread_profile {
             let lock = state.instance_lock(&frame.session_id).await;
             persist_and_mirror_unread(
@@ -359,47 +412,6 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                 profile,
             )
             .await;
-        }
-
-        // Persist `acp_session_id` to disk if the field changed.
-        if let Some(profile) = profile_to_save {
-            let session_id_for_log = frame.session_id.clone();
-            let session_id_for_save = frame.session_id.clone();
-            let profile_for_save = profile.clone();
-            let acp_change_for_save = acp_change.clone();
-            let file_watch = state.file_watch.clone();
-            let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                let storage = crate::session::Storage::new(&profile_for_save, file_watch)?;
-                storage.update(|all, _groups| {
-                    if let Some(inst) = all.iter_mut().find(|i| i.id == session_id_for_save) {
-                        apply_acp_session_change(
-                            inst,
-                            &session_id_for_save,
-                            acp_change_for_save.as_ref(),
-                        );
-                    }
-                    Ok(())
-                })?;
-                Ok(())
-            })
-            .await;
-            match save_result {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                        target: "acp.event_listener",
-                        session = %session_id_for_log,
-                        "save after acp_session_id update: {e}"
-                    );
-                }
-                Err(join_err) => {
-                    tracing::warn!(
-                        target: "acp.event_listener",
-                        session = %session_id_for_log,
-                        "spawn_blocking join error during acp_session_id save: {join_err}"
-                    );
-                }
-            }
         }
     }
 }
@@ -647,6 +659,9 @@ pub(super) fn apply_acp_session_change(
     session_id: &str,
     change: Option<&AcpSessionChange>,
 ) -> Option<String> {
+    if !inst.is_structured() {
+        return None;
+    }
     match change? {
         AcpSessionChange::Assigned(new_id) => {
             // A worker just initialized (session/new or session/load), so the session is by
@@ -1378,9 +1393,17 @@ mod tests {
     async fn acp_event_listener_tracks_load_session_capability_updates() {
         let _app_dir = crate::session::test_support::isolate_app_dir();
         let mut inst = Instance::new("acp-session", "/tmp/acp");
+        inst.source_profile = "listener-capability".into();
         inst.view = crate::session::View::Structured;
         inst.acp_session_id = Some("same-acp-id".to_string());
         let id = inst.id.clone();
+        crate::session::Storage::new_unwatched(&inst.source_profile)
+            .unwrap()
+            .update(|rows, _| {
+                rows.push(inst.clone());
+                Ok(())
+            })
+            .unwrap();
         let state = test_support::build_test_app_state(vec![inst]);
         let first_generation = state.acp_supervisor.test_insert_worker(&id).await;
         let listener = tokio::spawn(acp_event_listener(state.clone()));
@@ -1895,6 +1918,24 @@ mod tests {
             want(None, None, None, true),
             "a clear forces a restart into a clean session/new"
         );
+    }
+    #[test]
+    fn acp_session_changes_do_not_mutate_terminal_conversations() {
+        let mut inst = Instance::new("terminal", "/tmp/terminal");
+        inst.view = crate::session::View::Terminal;
+        inst.resume_intent = crate::session::ResumeIntent::Use("native-id".into());
+        let expected = inst.conversation_state();
+
+        assert_eq!(
+            apply_acp_session_change(
+                &mut inst,
+                "terminal",
+                Some(&AcpSessionChange::Assigned("acp-id".into())),
+            ),
+            None
+        );
+        assert!(expected.matches(&inst));
+        assert_eq!(inst.acp_session_id, None);
     }
 
     #[test]

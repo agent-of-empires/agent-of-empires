@@ -505,19 +505,6 @@ pub(crate) fn resolved_sandbox_config(
     super::config::repo_config::resolve_config_with_repo_or_warn(&resolved, project_path).sandbox
 }
 
-/// Resolve the complete environment inherited by an in-container agent.
-pub(crate) fn resolved_sandbox_environment(
-    profile: &str,
-    sandbox: &SandboxInfo,
-    project_path: &std::path::Path,
-) -> Vec<(String, String)> {
-    let sandbox_config = resolved_sandbox_config(profile, project_path);
-    collect_environment(&sandbox_config, sandbox)
-        .into_iter()
-        .map(|entry| (entry.key().to_string(), entry.value().to_string()))
-        .collect()
-}
-
 /// Environment transport for a sandboxed `docker exec` pane.
 pub(crate) struct DockerExecEnv {
     /// Runtime arguments naming the inherited env-file descriptor.
@@ -549,15 +536,21 @@ pub(crate) fn build_docker_env_args_with_managed_codex_home(
     managed_codex_home: Option<&str>,
 ) -> DockerExecEnv {
     let sandbox_config = resolved_sandbox_config(profile, project_path);
+    docker_exec_environment(sandbox, &sandbox_config, managed_codex_home)
+}
 
+pub(crate) fn docker_exec_environment(
+    sandbox: &SandboxInfo,
+    sandbox_config: &SandboxConfig,
+    managed_codex_home: Option<&str>,
+) -> DockerExecEnv {
     tracing::debug!(target: "session.create",
-        "build_docker_env_args: profile={:?}, configured_entries={}, extra_entries={}",
-        profile,
+        "build_docker_env_args: configured_entries={}, extra_entries={}",
         sandbox_config.environment.len(),
         sandbox.extra_env.as_ref().map_or(0, Vec::len)
     );
 
-    let mut env_entries = collect_environment(&sandbox_config, sandbox);
+    let mut env_entries = collect_environment(sandbox_config, sandbox);
     if let Some(codex_home) = managed_codex_home {
         if !env_entries.iter().any(|entry| entry.key() == "CODEX_HOME") {
             env_entries.push(EnvEntry::Literal {
@@ -771,10 +764,6 @@ mod tests {
             assert_eq!(result.docker_args, "--env-file /dev/fd/9");
             let expected = ("GH_TOKEN".to_string(), token.to_string());
             assert!(result.env.contains(&expected), "{profile:?}");
-            assert!(
-                resolved_sandbox_environment(profile, &sandbox, &project_path).contains(&expected),
-                "capture metadata must see the exec-only sandbox value"
-            );
         }
     }
 

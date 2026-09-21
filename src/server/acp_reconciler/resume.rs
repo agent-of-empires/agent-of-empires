@@ -297,7 +297,7 @@ async fn build_spawn_request(
     // Re-read under the session lock: a worktree rename holds it across the
     // move, so a snapshotted path could be stale (#2260). Released before
     // ensure_container, which takes the same lock.
-    let (cwd, seed_history_replay, fork_from, acp_mode_id, acp_effort) = {
+    let (cwd, seed_history_replay, fork_from, acp_mode_id, acp_effort, claude_store_pin) = {
         let _guard = inst_lock.lock().await;
         let instances = service.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == target.id) else {
@@ -309,6 +309,8 @@ async fn build_spawn_request(
             inst.fork_pending.clone(),
             inst.acp_mode_id.clone(),
             inst.acp_effort.clone(),
+            inst.selected_claude_conversation()
+                .and_then(|(_, execution)| execution.stores.first().cloned()),
         )
     };
     let agent = supervisor
@@ -355,6 +357,7 @@ async fn build_spawn_request(
         acp_mode_id,
         agent_command_override: command_override_for_spawn(&target.tool, &target.command),
         seed_history_replay,
+        claude_store_pin,
     })
 }
 

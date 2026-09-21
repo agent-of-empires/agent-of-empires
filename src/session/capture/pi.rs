@@ -11,7 +11,7 @@ pub(super) const PI_HEADER_SCAN_LINES: usize = 8;
 pub(super) const PI_HEADER_SCAN_BYTES: usize = 64 * 1024;
 
 /// `(id, cwd)` from the first session header line, opened without following symlinks.
-pub(super) fn extract_pi_header_fields(path: &Path) -> Option<(Option<String>, Option<String>)> {
+pub(crate) fn extract_pi_header_fields(path: &Path) -> Option<(Option<String>, Option<String>)> {
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -74,38 +74,115 @@ pub(super) fn extract_pi_uuid_from_filename(path: &Path) -> Option<String> {
     Some(uuid_part.to_string())
 }
 
-/// Polls the sidecar Pi's AoE extension writes for the pane's own conversation.
-/// The caller supplies where the pane publishes; a wrong source silently never observes.
+pub(crate) fn read_pi_session_observation(
+    instance_id: &str,
+    source: &crate::session::instance::SessionSidecarSource,
+    active: Option<&crate::session::instance::ActiveExecution>,
+    any_age: bool,
+) -> Option<crate::session::poller::SessionIdObservation> {
+    use crate::session::instance::{CaptureContext, SessionSidecarSource};
+    crate::session::validate_instance_id(instance_id).ok()?;
+    let (sid_leaf, path_leaf) = if let Some(active) = active {
+        let Some(CaptureContext::Pi {
+            source: expected, ..
+        }) = &active.capture
+        else {
+            return None;
+        };
+        if expected != source || active.binding.agent != "pi" {
+            return None;
+        }
+        (
+            crate::hooks::session_id_leaf(Some(&active.launch_id)).ok()?,
+            std::borrow::Cow::Owned(format!("session_path.{}", active.launch_id)),
+        )
+    } else {
+        (
+            std::borrow::Cow::Borrowed("session_id"),
+            std::borrow::Cow::Borrowed("session_path"),
+        )
+    };
+    let read = |leaf: &str, fresh: bool| {
+        source.read_file(
+            instance_id,
+            leaf,
+            4096,
+            fresh.then_some(crate::hooks::SESSION_ID_SIDECAR_MAX_AGE),
+        )
+    };
+    let id_bytes = read(&sid_leaf, !any_age)?;
+    let sid = std::str::from_utf8(&id_bytes).ok()?.trim();
+    Uuid::parse_str(sid).ok()?;
+    let path_bytes = read(&path_leaf, false)?;
+    let path = Path::new(std::str::from_utf8(&path_bytes).ok()?.trim());
+    if !path.is_absolute() || crate::git::template::lexical_normalize(path) != path {
+        return None;
+    }
+    let native = match active.and_then(|active| active.container.as_ref()) {
+        Some(container) => container.runtime.canonical_path(&container.id, path).ok()?,
+        None if matches!(source, SessionSidecarSource::HostHooks(_)) => {
+            super::canonicalize_or_raw(path.to_str()?)
+        }
+        None => path.to_path_buf(),
+    };
+    let physical = if let Some(active) = active {
+        let Some(CaptureContext::Pi { root, .. }) = &active.capture else {
+            return None;
+        };
+        if !native.starts_with(root) || native == *root {
+            return None;
+        }
+        match &active.container {
+            Some(container) => container.host_path(&native, true)?,
+            None => native.clone(),
+        }
+    } else {
+        match source {
+            SessionSidecarSource::HostHooks(_) => native.clone(),
+            SessionSidecarSource::SandboxDir(directory) => directory
+                .parent()?
+                .parent()?
+                .join(native.strip_prefix("/root/.pi").ok()?),
+        }
+    };
+    let parent = physical.parent()?;
+    let root = crate::session::AnchoredDir::open(parent).ok()?;
+    let leaf = Path::new(physical.file_name()?);
+    match root.regular_lookup(leaf).ok()? {
+        Some(true) => {
+            if extract_pi_header_fields(&physical)?.0.as_deref() != Some(sid) {
+                return None;
+            }
+        }
+        None => {
+            if leaf.to_str()?.rsplit_once('_')?.1.strip_suffix(".jsonl")? != sid {
+                return None;
+            }
+        }
+        Some(false) => return None,
+    }
+    if read(&sid_leaf, !any_age)? != id_bytes {
+        return None;
+    }
+    let mut observation =
+        crate::session::poller::SessionIdObservation::instance_sidecar(sid.to_owned());
+    observation.pi_session_path = Some(native.to_str()?.to_owned());
+    if let Some(active) = active {
+        let mut binding = active.binding.clone();
+        binding.stores = vec![parent.to_path_buf()];
+        observation.execution = Some(active.clone());
+        observation.source = Some(binding);
+        observation.transcript_path = Some(physical);
+    }
+    Some(observation)
+}
+
 pub(crate) fn pi_sidecar_poll_fn(
     instance_id: String,
     source: crate::session::instance::SessionSidecarSource,
+    active: Option<crate::session::instance::ActiveExecution>,
 ) -> impl Fn() -> Option<crate::session::poller::SessionIdObservation> + Send + 'static {
-    move || {
-        use crate::session::instance::SessionSidecarSource;
-        let id = match source {
-            SessionSidecarSource::SandboxDir(ref dir) => dir
-                .parent()
-                .and_then(Path::parent)
-                .filter(|root| root.join("aoe-session").join(&instance_id) == *dir)
-                .and_then(|root| crate::session::AnchoredDir::open(root).ok())
-                .and_then(|root| {
-                    root.read_regular(
-                        &Path::new("aoe-session")
-                            .join(&instance_id)
-                            .join("session_id"),
-                        4096,
-                    )
-                    .ok()
-                    .flatten()
-                })
-                .and_then(|raw| String::from_utf8(raw).ok())
-                .map(|raw| raw.trim().to_string())
-                .filter(|id| Uuid::parse_str(id).is_ok()),
-            SessionSidecarSource::HostHooks => crate::hooks::read_hook_session_id(&instance_id),
-        };
-        id.and_then(super::validated_session_id)
-            .map(crate::session::poller::SessionIdObservation::instance_sidecar)
-    }
+    move || read_pi_session_observation(&instance_id, &source, active.as_ref(), false)
 }
 
 #[cfg(test)]

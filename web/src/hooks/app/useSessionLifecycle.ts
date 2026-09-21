@@ -160,11 +160,18 @@ export function useSessionLifecycle({
   const confirmSwitchView = useCallback(async () => {
     if (!switchViewTarget) return;
     const { sessionId, toStructured } = switchViewTarget;
-    const result = toStructured ? await acpEnable(sessionId) : await acpDisable(sessionId);
-    setSwitchViewTarget(null);
     const target = toStructured ? "structured view" : "terminal";
-    if (result) toastBus.handler?.info(`Switched to ${target}`);
-    else toastBus.handler?.error(`Failed to switch to ${target}`);
+    if (toStructured) {
+      const result = await acpEnable(sessionId);
+      setSwitchViewTarget(null);
+      if (result) toastBus.handler?.info("Switched to " + target);
+      else toastBus.handler?.error("Failed to switch to " + target);
+      return;
+    }
+    const result = await acpDisable(sessionId);
+    setSwitchViewTarget(null);
+    if (result.ok) toastBus.handler?.info("Switched to " + target);
+    else toastBus.handler?.error(result.message ?? "Failed to switch to " + target);
   }, [switchViewTarget]);
 
   return {

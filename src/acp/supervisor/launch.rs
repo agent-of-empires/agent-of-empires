@@ -248,6 +248,17 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
         }
 
+        let claude_store_pin = req.claude_store_pin.clone().filter(|_| {
+            req.sandbox_info.is_none() && matches!(req.agent.as_str(), "claude" | "claude-code")
+        });
+        if let Some(store) = &claude_store_pin {
+            host_environment.retain(|(key, _)| key != "CLAUDE_CONFIG_DIR");
+            host_environment.push((
+                "CLAUDE_CONFIG_DIR".into(),
+                store.to_string_lossy().to_string(),
+            ));
+        }
+
         let mut provider_env = req.provider_env.clone();
         if let Some(model) = model {
             provider_env.push(("AOE_AGENT_MODEL".into(), model));
@@ -287,6 +298,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             artifact_dir: crate::session::artifacts::session_artifact_dir(&req.session_id).ok(),
             wrapper_substitution,
             generation,
+            claude_store_pin,
         })
     }
 
@@ -332,6 +344,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             session_id.to_string(),
             WorkerHandle {
                 client: Arc::clone(&client),
+                native_session_id: None,
                 drain_task,
                 restart_history: vec![],
                 kind,

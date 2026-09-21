@@ -478,12 +478,16 @@ pub(crate) fn remove_stores_for(
         return Ok((Vec::new(), 0));
     }
     let home = dirs::home_dir().context("home directory unavailable for store removal")?;
-    let Some(agent) = instance.resolved_agent() else {
-        return Ok((Vec::new(), 0));
-    };
     let config = crate::session::config::profile_config::resolve_config_or_warn(
         &instance.effective_profile(),
     );
+    let Some(agent) = crate::session::config::container_config::resolve_active_agent(
+        &instance.tool,
+        Some(instance.get_tool_command()),
+        &config.session,
+    ) else {
+        return Ok((Vec::new(), 0));
+    };
     let declared = config.session.agent_config_dir_for(&instance.tool, &home);
     let mut removed = Vec::new();
     let mut freed = 0;
@@ -840,13 +844,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
-    fn purging_never_follows_a_symlinked_store() {
+    fn purging_wrapper_store_removes_owned_data_without_following_symlinks() {
         let dir = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(dir.path());
         let target = dir.path().join("elsewhere");
         fs::create_dir_all(&target).unwrap();
         fs::write(target.join("keep"), b"keep").unwrap();
         let mut instance = crate::session::Instance::new("t", "/tmp/p");
+        instance.command = "claude-wrapper".into();
         let root = dir.path().join(".claude").join("sandbox-v2");
         fs::create_dir_all(&root).unwrap();
         let link = root.join(&instance.id);
@@ -863,6 +868,13 @@ mod tests {
             target.join("keep").exists(),
             "the symlink target was followed"
         );
+        fs::remove_file(&link).unwrap();
+        fs::create_dir(&link).unwrap();
+        fs::write(link.join("owned"), b"owned").unwrap();
+        let (removed, _) = remove_stores_for(&instance).unwrap();
+        assert_eq!(removed, vec![link.clone()]);
+        assert!(!link.exists());
+        assert_eq!(fs::read(target.join("keep")).unwrap(), b"keep");
     }
 
     #[cfg(unix)]

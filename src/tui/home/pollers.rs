@@ -339,6 +339,13 @@ impl HomeView {
                                 "resume failed; sid preserved for explicit retry",
                             );
                         }
+                        Ok(crate::session::StartOutcome::FreshAfterUnavailableResume {
+                            notice,
+                            ..
+                        }) => {
+                            self.info_dialog =
+                                Some(InfoDialog::new("Started fresh", &notice.warning_message()));
+                        }
                         Ok(crate::session::StartOutcome::Fresh) => {}
                         Ok(crate::session::StartOutcome::FreshAfterFailedResume { sid }) => {
                             tracing::info!(
@@ -447,6 +454,13 @@ impl HomeView {
                                      own resume/history picker."
                                 ),
                             ));
+                        }
+                        Ok(crate::session::StartOutcome::FreshAfterUnavailableResume {
+                            notice,
+                            ..
+                        }) => {
+                            self.info_dialog =
+                                Some(InfoDialog::new("Started fresh", &notice.warning_message()));
                         }
                         Ok(_) => {}
                         Err(e) => {

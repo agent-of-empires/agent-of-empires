@@ -2336,7 +2336,12 @@
       "kind": "mocked-playwright",
       "risk": "medium",
       "specs": ["tests/sidebar-context-menu.spec.ts", "src/components/__tests__/SwitchViewDialog.test.tsx"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/SwitchViewDialog.tsx"]
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/SwitchViewDialog.tsx",
+        "web/src/App.tsx",
+        "web/src/hooks/app/useSessionLifecycle.ts"
+      ]
     },
     {
       "id": "acp.switch-view-api",
@@ -2704,7 +2709,12 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/session-lifecycle.spec.ts"],
-      "components": []
+      "components": [
+        "web/src/lib/api.ts",
+        "web/src/components/LiveTerminalView.tsx",
+        "web/src/App.tsx",
+        "web/src/lib/types.ts"
+      ]
     },
     {
       "id": "modals",

@@ -258,21 +258,49 @@ pub(crate) fn open_instance_dir(instance_id: &str) -> Result<OwnedFd> {
 pub(crate) fn open_instance_dir_read_only(instance_id: &str) -> Result<Option<OwnedFd>> {
     crate::session::validate_instance_id(instance_id)?;
     with_hook_base(|base| {
-        match openat(
-            base,
-            instance_id,
-            OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
-            Mode::empty(),
-        ) {
-            Ok(fd) => {
-                let label = hook_base_path().join(instance_id);
-                verify_dir_metadata(&fd, &label)?;
-                Ok(Some(fd))
-            }
-            Err(Errno::ENOENT) | Err(Errno::ELOOP) => Ok(None),
-            Err(e) => Err(e).with_context(|| format!("openat instance subdir {instance_id}")),
-        }
+        open_instance_child(base, instance_id, &hook_base_path().join(instance_id))
     })
+}
+
+pub(crate) fn open_recorded_instance_dir(
+    instance_id: &str,
+    directory: &std::path::Path,
+) -> Result<Option<OwnedFd>> {
+    crate::session::validate_instance_id(instance_id)?;
+    anyhow::ensure!(
+        directory.file_name() == Some(std::ffi::OsStr::new(instance_id)),
+        "recorded hook directory does not belong to this instance"
+    );
+    let parent = directory
+        .parent()
+        .context("recorded hook directory has no parent")?;
+    let base = open(
+        parent,
+        OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
+        Mode::empty(),
+    )?;
+    verify_dir_metadata(&base, parent)?;
+    open_instance_child(base.as_fd(), instance_id, directory)
+}
+
+fn open_instance_child(
+    base: BorrowedFd<'_>,
+    instance_id: &str,
+    label: &std::path::Path,
+) -> Result<Option<OwnedFd>> {
+    match openat(
+        base,
+        instance_id,
+        OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
+        Mode::empty(),
+    ) {
+        Ok(fd) => {
+            verify_dir_metadata(&fd, label)?;
+            Ok(Some(fd))
+        }
+        Err(Errno::ENOENT) | Err(Errno::ELOOP) => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("openat instance subdir {instance_id}")),
+    }
 }
 
 // Per-file I/O.
@@ -306,7 +334,7 @@ pub(crate) fn read_file_at(
     let fd = match openat(
         dir,
         name,
-        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
         Mode::empty(),
     ) {
         Ok(fd) => fd,
@@ -330,7 +358,7 @@ pub(crate) fn metadata_at(dir: BorrowedFd<'_>, name: &str) -> Result<Option<Meta
     let fd = match openat(
         dir,
         name,
-        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
         Mode::empty(),
     ) {
         Ok(fd) => fd,
@@ -407,11 +435,27 @@ pub(crate) fn write_atomic(dir: BorrowedFd<'_>, name: &str, bytes: &[u8]) -> Res
     Ok(())
 }
 
-/// For `aoe __extract-session-id`: validate the instance id, open its dir
-/// under `dir_guard` discipline, and atomically write the sidecar.
-pub(crate) fn write_session_id_via_guard(instance_id: &str, session_id: &str) -> Result<()> {
+pub(crate) fn session_id_leaf(source: Option<&str>) -> Result<std::borrow::Cow<'static, str>> {
+    let Some(source) = source else {
+        return Ok(std::borrow::Cow::Borrowed("session_id"));
+    };
+    let uuid = uuid::Uuid::parse_str(source).context("invalid session source UUID")?;
+    let mut canonical = [0; 36];
+    anyhow::ensure!(
+        uuid.hyphenated().encode_lower(&mut canonical) == source,
+        "session source UUID is not canonical"
+    );
+    Ok(std::borrow::Cow::Owned(format!("session_id.{source}")))
+}
+
+pub(crate) fn write_session_id_via_guard(
+    instance_id: &str,
+    session_id: &str,
+    source: Option<&str>,
+) -> Result<()> {
+    let leaf = session_id_leaf(source)?;
     let dir = open_instance_dir(instance_id)?;
-    write_atomic(dir.as_fd(), "session_id", session_id.as_bytes())
+    write_atomic(dir.as_fd(), &leaf, session_id.as_bytes())
 }
 
 /// Delete the `session_id` sidecar with `unlinkat` against a verified

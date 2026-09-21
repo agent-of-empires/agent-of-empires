@@ -16,90 +16,214 @@ const CLAUDE_SELECTORS: &[&str] = &[
     "--fork-session",
 ];
 
+pub(super) fn read_session_settings(
+    path: &Path,
+) -> anyhow::Result<Option<serde_json::Map<String, serde_json::Value>>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("settings path has no parent"))?;
+    let leaf = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("settings path has no file name"))?;
+    let root = crate::session::AnchoredDir::open(parent)?;
+    let Some(bytes) = root.read_regular(Path::new(leaf), 64 * 1024)? else {
+        anyhow::bail!("settings are not a bounded regular file");
+    };
+    Ok(serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&bytes).ok())
+}
+
 impl Instance {
     /// Returns `(session_id, is_existing)`. Explicit intents win; default intent
     /// keeps a stored id unless the pane's own backend proves it rotated, and
     /// otherwise captures only from a live pane through the declared backend.
-    pub fn acquire_session_id(&mut self) -> (Option<String>, bool) {
-        // Decided here so the config read and binary probe stay off other launches.
-        let preassign = self.resolved_capture_backend() == Some(SessionCaptureBackend::OpenCode)
-            && self.opencode_preassign_enabled();
-        let pin_pi = self.pi_session_id_pinnable();
-        let preassign_environment = preassign.then(|| self.resolved_host_environment());
-        self.acquire_session_id_with(&|path| {
+    fn acquire_session_id(
+        &mut self,
+        execution: Option<&super::execution::NativeExecution>,
+    ) -> (Option<String>, bool) {
+        let backend = execution.map_or_else(
+            || self.resolved_capture_backend(),
+            |execution| {
+                execution
+                    .agent
+                    .session_support
+                    .as_ref()
+                    .and_then(|support| support.capture.as_ref())
+                    .map(|capture| capture.backend)
+            },
+        );
+        let preassign = backend == Some(crate::agents::SessionCaptureBackend::OpenCode)
+            && execution.map_or_else(
+                || self.opencode_preassign_enabled(),
+                |execution| execution.opencode_preassign,
+            );
+        let pin_pi = execution.map_or_else(
+            || self.pi_session_id_pinnable(),
+            |execution| execution.pi_pinnable,
+        );
+        let environment =
+            (preassign && execution.is_none()).then(|| self.resolved_host_environment());
+        let native_created = std::cell::Cell::new(false);
+        let result = self.acquire_session_id_with(execution, &|path| {
             if pin_pi {
-                return Some(generate_session_uuid());
+                return Some(crate::session::capture::generate_session_uuid());
             }
-            preassign_environment.as_deref().and_then(|environment| {
-                crate::session::capture::preassign_opencode_session_id(path, environment)
-            })
-        })
+            if !preassign {
+                return None;
+            }
+            let mut command = std::process::Command::new(
+                execution.map_or(std::path::Path::new("opencode"), |execution| {
+                    execution.program.as_path()
+                }),
+            );
+            let cwd = if let Some(execution) = execution {
+                command.env_clear().envs(&execution.inputs.environment);
+                for (key, value) in &execution.routing {
+                    if let Some(value) = value {
+                        command.env(key, value);
+                    } else {
+                        command.env_remove(key);
+                    }
+                }
+                execution.inputs.cwd.to_str()?
+            } else {
+                command.envs(crate::session::environment::resolve_host_environment_pairs(
+                    environment.as_deref()?,
+                ));
+                path
+            };
+            let sid = crate::session::capture::preassign_opencode_session_id(cwd, command);
+            native_created.set(sid.is_some());
+            sid
+        });
+        if native_created.get() {
+            if let (Some(execution), Some(sid)) = (execution, result.0.as_ref()) {
+                self.set_agent_conversation(
+                    Some(sid.clone()),
+                    Some(ConversationBinding {
+                        session_id: sid.clone(),
+                        execution: Some(execution.binding.clone()),
+                        provenance: ConversationProvenance::Observed,
+                        transcript_path: None,
+                    }),
+                    None,
+                );
+            }
+        }
+        result
     }
 
-    /// `mint_fresh_id` is the pre-mint seam for OpenCode preassignment and Pi pins.
+    /// Session-id acquisition with the pre-mint step injected as a seam, so
+    /// tests can drive the fresh-launch arms without a real opencode binary,
+    /// network, or installed pi. Production wraps this with the live preassign
+    /// helper and the Pi pin.
     pub(super) fn acquire_session_id_with(
         &mut self,
+        execution: Option<&super::execution::NativeExecution>,
         mint_fresh_id: &dyn Fn(&str) -> Option<String>,
     ) -> (Option<String>, bool) {
+        let backend = execution.map_or_else(
+            || self.resolved_capture_backend(),
+            |execution| {
+                execution
+                    .agent
+                    .session_support
+                    .as_ref()
+                    .and_then(|support| support.capture.as_ref())
+                    .map(|capture| capture.backend)
+            },
+        );
         match self.resume_intent.clone() {
             ResumeIntent::Use(sid) => {
-                self.agent_session_id = Some(sid.clone());
+                let path = (self.agent_session_id.as_ref() == Some(&sid))
+                    .then(|| self.pi_session_path.clone())
+                    .flatten();
+                self.set_agent_conversation(Some(sid.clone()), self.resume_binding.clone(), path);
                 return (Some(sid), true);
             }
             ResumeIntent::Cleared => {
-                self.agent_session_id = None;
+                self.set_agent_conversation(None, None, None);
                 self.resume_probe_failed_sid = None;
-                self.pi_session_path = None;
-                let session_id = self.fresh_launch_session_id(mint_fresh_id);
-                if session_id.is_some() {
-                    self.agent_session_id = session_id.clone();
-                }
+                let session_id = self.fresh_launch_session_id(backend, mint_fresh_id);
+                self.set_agent_conversation(session_id.clone(), None, None);
                 return (session_id, false);
             }
-            // The pre-pinned child id; a fork starts a new session.
-            ResumeIntent::Fork { .. } => return (self.agent_session_id.clone(), false),
+            ResumeIntent::Fork { .. } => {
+                // The child id was pre-generated and stored in
+                // agent_session_id at creation. acquire returns it as the
+                // session this instance owns; the actual fork flags
+                // (--resume <parent> --fork-session --session-id <child>) are
+                // emitted by apply_session_flags, which reads the parent off
+                // the Fork intent. Report `false` (not an in-place resume): a
+                // fork starts a new session.
+                return (self.agent_session_id.clone(), false);
+            }
             ResumeIntent::Default => {}
         }
 
-        match self.attributable_prime_root() {
-            Some(Some(id)) => {
-                self.agent_session_id = Some(id.clone());
+        match self.prime_root_publication() {
+            Some(PrimeRootPublication::Ready(id))
+                if !self.is_capture_excluded(
+                    &id,
+                    self.active_execution.as_ref().map(|active| &active.binding),
+                ) =>
+            {
+                let binding = self
+                    .prime_root_observation(id.clone())
+                    .conversation_binding();
+                self.set_agent_conversation(Some(id.clone()), binding, None);
                 return (Some(id), true);
             }
-            Some(None) => {
-                self.agent_session_id = None;
+            Some(PrimeRootPublication::Pending(id))
+                if !self.is_capture_excluded(
+                    &id,
+                    self.active_execution.as_ref().map(|active| &active.binding),
+                ) =>
+            {
+                self.set_agent_conversation(None, None, None);
                 self.resume_probe_failed_sid = None;
                 return (None, false);
             }
-            None => {}
+            _ => {}
         }
 
         if let Some(stored) = self.agent_session_id.clone() {
-            let stored = match self.capture_freshest_session_id() {
-                Some(fresh) => {
-                    tracing::info!(
-                        target: "session.store",
-                        stale = %stored,
-                        fresh = %fresh,
-                        tool = %self.tool,
-                        "Replacing stored session id with fresher live observation"
-                    );
-                    self.agent_session_id = Some(fresh.clone());
-                    fresh
+            let stored = match self.capture_freshest_conversation() {
+                Some(observation) => {
+                    tracing::info!(target: "session.store", stale = %stored, fresh = %observation.sid, tool = %self.tool,
+                        "Replacing stored conversation with fresher live observation");
+                    self.apply_conversation_observation(&observation);
+                    observation.sid
                 }
                 None => stored,
             };
-            // A host Claude sid with no transcript was never written, so `--resume`
-            // is certain to fail; relaunch it pinned with `--session-id` instead.
-            if self.resolved_capture_backend() == Some(SessionCaptureBackend::Claude)
-                && !self.is_sandboxed()
-                && crate::session::capture::claude_host_transcript_confirmed_absent(
-                    &self.project_path,
-                    &stored,
-                    &self.resolved_host_environment(),
-                    self.declared_agent_config_dir_for(&self.tool).as_deref(),
+            // An unwritten Claude pin can be created under the same ID. Uncertain reads preserve resume.
+            let absent = backend == Some(crate::agents::SessionCaptureBackend::Claude)
+                && execution.map_or_else(
+                    || !self.is_sandboxed(),
+                    |execution| execution.inputs.container.is_none(),
                 )
-            {
+                && match execution {
+                    Some(execution) => execution.binding.stores.first().is_some_and(|root| {
+                        crate::session::capture::claude_host_transcript_confirmed_absent(
+                            execution.inputs.cwd.to_str().unwrap_or(&self.project_path),
+                            &stored,
+                            &[],
+                            Some(root),
+                        )
+                    }),
+                    None => crate::session::capture::claude_host_transcript_confirmed_absent(
+                        &self.project_path,
+                        &stored,
+                        &self.resolved_host_environment(),
+                        self.declared_agent_config_dir_for(&self.tool).as_deref(),
+                    ),
+                };
+            if absent {
                 tracing::info!(
                     target: "session.store",
                     sid = %stored,
@@ -112,39 +236,46 @@ impl Instance {
             return (Some(stored), true);
         }
 
-        if self.tmux_session().is_ok_and(|s| s.exists()) {
-            if let Some(id) = self.try_retroactive_capture() {
+        let tmux_exists = self.tmux_session().is_ok_and(|s| s.exists());
+        if tmux_exists {
+            if let Some(observation) = self.try_retroactive_capture() {
                 tracing::info!(target: "session.store",
-                    "Retroactive capture found session ID for {}: {}", self.tool, id);
-                self.agent_session_id = Some(id);
+                    "Retroactive capture found session ID for {}: {}",
+                    self.tool,
+                    observation.sid
+                );
+                self.apply_conversation_observation(&observation);
                 return (self.agent_session_id.clone(), true);
             }
         }
 
-        let session_id = self.fresh_launch_session_id(mint_fresh_id);
+        let session_id = self.fresh_launch_session_id(backend, mint_fresh_id);
+
         if let Some(ref id) = session_id {
             tracing::debug!(target: "session.store", "Session ID for {}: {}", self.tool, id);
-            self.agent_session_id = session_id.clone();
+            self.set_agent_conversation(session_id.clone(), None, None);
         }
+
         (session_id, false)
     }
 
-    /// Claude pins a UUID; OpenCode and Pi use the mint seam, whose failure
-    /// returns no id rather than a guess. Other backends capture after launch.
+    /// Mint the session id for a brand-new launch. Claude and eligible Pi
+    /// launches pin a UUID. Direct host OpenCode launches pre-create a session
+    /// automatically. A preassign failure returns no id rather than guessing
+    /// from the shared store. Other supported backends capture after launch.
     fn fresh_launch_session_id(
         &self,
+        backend: Option<crate::agents::SessionCaptureBackend>,
         mint_fresh_id: &dyn Fn(&str) -> Option<String>,
     ) -> Option<String> {
-        match self.resolved_capture_backend()? {
-            SessionCaptureBackend::Claude => Some(generate_session_uuid()),
-            SessionCaptureBackend::OpenCode | SessionCaptureBackend::Pi => {
-                mint_fresh_id(&self.project_path)
-            }
+        match backend? {
+            crate::agents::SessionCaptureBackend::Claude => Some(generate_session_uuid()),
+            crate::agents::SessionCaptureBackend::OpenCode
+            | crate::agents::SessionCaptureBackend::Pi => mint_fresh_id(&self.project_path),
             _ => None,
         }
     }
 
-    /// Opt-in, host-only, and only for a launch the ephemeral `opencode serve`
     /// mirrors with the same binary.
     fn opencode_preassign_enabled(&self) -> bool {
         !self.is_sandboxed()
@@ -209,10 +340,11 @@ impl Instance {
         let Ok((storage, _lifecycle_lock, generation)) = ownership else {
             return;
         };
+        let expected = self.conversation_state();
         let captured = self.try_retroactive_capture();
         let applied = captured.as_ref().is_some_and(|captured| {
-            self.resume_probe_failed_sid.as_deref() != Some(captured.as_str())
-                && persist_session_to_storage(profile, &self.id, captured, None, &file_watch)
+            self.resume_probe_failed_sid.as_deref() != Some(captured.sid.as_str())
+                && persist_session_to_storage(profile, &self.id, captured, &expected, &file_watch)
                     == SidWrite::Applied
         });
         let released = storage.update(|instances, _groups| {
@@ -233,7 +365,9 @@ impl Instance {
         self.lifecycle_generation = generation;
         self.lifecycle_reservation = None;
         if applied {
-            self.agent_session_id = captured;
+            if let Some(observation) = captured {
+                self.apply_conversation_observation(&observation);
+            }
             self.resume_probe_failed_sid = None;
             tracing::info!(
                 target: "session.store",
@@ -245,27 +379,32 @@ impl Instance {
         }
     }
 
-    /// A newly observed native id, only from a source that attributes it to this
-    /// pane: the Pi or Prime publication, the hook sidecar, or the managed store.
-    pub(crate) fn capture_freshest_session_id(&self) -> Option<String> {
-        let authoritative = match self.resolved_capture_backend()? {
-            SessionCaptureBackend::Pi => self.pi_published_session_id(false)?,
-            SessionCaptureBackend::PrimeAgent => match self.prime_root_publication()? {
-                PrimeRootPublication::Ready(id) => id,
-                PrimeRootPublication::Pending(_) => return None,
-            },
+    /// A newly observed native conversation attributed to this execution.
+    pub(crate) fn capture_freshest_conversation(
+        &self,
+    ) -> Option<crate::session::poller::SessionIdObservation> {
+        let observation = match self.source_capture_backend()? {
+            SessionCaptureBackend::Pi => self.pi_published_conversation(false)?,
+            SessionCaptureBackend::PrimeAgent => self.prime_published_conversation()?,
             SessionCaptureBackend::Claude | SessionCaptureBackend::HookSidecar => {
-                crate::hooks::read_hook_session_id_any_age(&self.id)?
+                super::execution::hook_session_observation(
+                    &self.id,
+                    self.active_execution.as_ref(),
+                    None,
+                )?
             }
-            _ => {
-                let live = self.try_retroactive_capture()?;
-                return override_if_distinct(self.agent_session_id.as_deref(), live);
-            }
+            _ => self.try_retroactive_capture()?,
         };
-        if self.retroactive_capture_excludes.contains(&authoritative) {
+        if self.is_capture_excluded(&observation.sid, observation.source.as_ref()) {
             return None;
         }
-        override_if_distinct(self.agent_session_id.as_deref(), authoritative)
+        if self.agent_session_id.as_ref() == Some(&observation.sid)
+            && self.agent_session_binding == observation.conversation_binding()
+            && self.pi_session_path == observation.pi_session_path
+        {
+            return None;
+        }
+        Some(observation)
     }
 
     /// Whether to emit the `existing` resume arm. A Pi id AoE minted takes the
@@ -273,13 +412,16 @@ impl Instance {
     /// that `--session` would exit 1 on. User pins keep `--session`.
     pub(super) fn resume_flag_arm_is_existing(
         &self,
+        execution: Option<&super::execution::NativeExecution>,
         is_existing: bool,
         pi_pinnable: bool,
         session_id: Option<&str>,
         explicitly_pinned: bool,
     ) -> bool {
-        let takes_pinning_arm = self.resolved_capture_backend() == Some(SessionCaptureBackend::Pi)
-            && pi_pinnable
+        let takes_pinning_arm = execution.map_or_else(
+            || self.resolved_capture_backend() == Some(SessionCaptureBackend::Pi),
+            |execution| execution.agent.name == "pi",
+        ) && pi_pinnable
             && !explicitly_pinned
             && session_id.is_some_and(|sid| Uuid::parse_str(sid).is_ok());
         is_existing && !takes_pinning_arm
@@ -393,11 +535,22 @@ impl Instance {
     }
 
     /// Splice resume or fork flags into `cmd`; returns whether this launch resumes.
-    pub(super) fn apply_session_flags(&mut self, cmd: &mut String, context: &str) -> Result<bool> {
+    pub(super) fn apply_session_flags(
+        &mut self,
+        cmd: &mut String,
+        context: &str,
+        agent: Option<&'static crate::agents::AgentDef>,
+        execution: Option<&super::execution::NativeExecution>,
+    ) -> Result<bool> {
+        let agent = execution.map(|execution| execution.agent).or(agent);
         let Some(parsed_command) = parse_launch_command(cmd) else {
             return Ok(false);
         };
-        if let Some(selector) = self.existing_session_selector(&parsed_command.words) {
+        if let Some(selector) = execution
+            .is_none()
+            .then(|| self.existing_session_selector(&parsed_command.words))
+            .flatten()
+        {
             let aoe_has_state = self.agent_session_id.is_some()
                 || matches!(
                     self.resume_intent,
@@ -412,55 +565,82 @@ impl Instance {
                 "command supplies its own native session selector; skipping AoE session injection");
             return Ok(false);
         }
-        if !self.supports_native_resume() {
+        if execution.is_none() && !self.supports_native_resume() {
+            anyhow::ensure!(
+                !matches!(
+                    self.resume_intent,
+                    ResumeIntent::Use(_) | ResumeIntent::Fork { .. }
+                ),
+                "explicit conversation operation is unsupported by this launch"
+            );
             return Ok(false);
         }
-        let resume_tool = self
-            .resolved_agent()
-            .map_or(self.tool.clone(), |agent| agent.name.to_string());
-        if let ResumeIntent::Fork { from } = self.resume_intent.clone() {
-            if let Some(child_id) = self.agent_session_id.as_deref() {
-                let fork_part = build_fork_flags(&resume_tool, &from, child_id);
-                if !fork_part.is_empty() {
-                    // Codex forks with a subcommand that must follow the binary.
-                    let is_subcommand = matches!(
-                        self.resolved_agent().map(|agent| &agent.fork_strategy),
-                        Some(crate::agents::ForkStrategy::CodexFork)
-                    );
-                    splice_subcommand_or_append(
-                        cmd,
-                        &fork_part,
-                        is_subcommand.then_some(parsed_command.executable_end),
-                    );
-                }
+        if let Some(execution) = execution {
+            if !execution.namespace_arguments.is_empty() {
+                cmd.push(' ');
+                cmd.push_str(&shell_words::join(&execution.namespace_arguments));
             }
+        }
+        if let ResumeIntent::Fork { from } = self.resume_intent.clone() {
+            let agent = agent.context("fork execution adapter is unavailable")?;
+            let child_id = self
+                .agent_session_id
+                .as_deref()
+                .context("fork child seed is missing")?;
+            let fork_part = build_fork_flags(agent.name, &from, child_id);
+            anyhow::ensure!(
+                !fork_part.is_empty(),
+                "native agent cannot execute this fork"
+            );
+            let is_subcommand =
+                matches!(agent.fork_strategy, crate::agents::ForkStrategy::CodexFork);
+            splice_subcommand_or_append(
+                cmd,
+                &fork_part,
+                is_subcommand.then_some(parsed_command.executable_end),
+            );
             return Ok(false);
         }
         let explicitly_pinned = matches!(self.resume_intent, ResumeIntent::Use(_));
-        self.absorb_published_pi_session();
-        let (mut session_id, is_existing) = self.acquire_session_id();
+        let (mut session_id, is_existing) = self.acquire_session_id(execution);
+        if let Some(path) = execution.and_then(|execution| execution.pi_transcript_path.as_ref()) {
+            self.set_agent_conversation(
+                session_id.clone(),
+                self.agent_session_binding.clone(),
+                Some(path.clone()),
+            );
+            let flags = format!("--session {}", shell_escape(path));
+            splice_subcommand_or_append(cmd, &flags, None);
+            return Ok(true);
+        }
         let flag_arm_is_existing = self.resume_flag_arm_is_existing(
+            execution,
             is_existing,
-            self.pi_session_id_pinnable(),
+            execution.map_or_else(
+                || self.pi_session_id_pinnable(),
+                |execution| execution.pi_pinnable,
+            ),
             session_id.as_deref(),
             explicitly_pinned,
         );
-        // `build_resume_flags` already refuses unsupported agents and invalid ids.
-        match self.terminal_resume_static_unavailable() {
-            Some(ResumeStaticUnavailable::Command) => {
-                tracing::warn!(target: "session.store",
-                    tool = %self.tool,
-                    command = %self.command,
-                    "resume selectors need the agent's own argv and this command hides it behind a launcher; starting fresh"
-                );
-                session_id = None;
-            }
-            Some(ResumeStaticUnavailable::Sandbox) => session_id = None,
-            _ => {}
+        let static_unavailable = execution
+            .is_none()
+            .then(|| self.terminal_resume_static_unavailable())
+            .flatten();
+        if matches!(static_unavailable, Some(ResumeStaticUnavailable::Command)) {
+            tracing::warn!(target: "session.store",
+                tool = self.tool.as_str(),
+                command = self.command.as_str(),
+                "resume selectors need the agent's own argv and this command hides it behind a launcher; starting fresh"
+            );
         }
-        // A published transcript path resolves wherever the conversation started,
-        // surviving a worktree move; never over an explicit pin.
-        if is_existing && !explicitly_pinned && session_id.is_some() {
+        if matches!(
+            static_unavailable,
+            Some(ResumeStaticUnavailable::Sandbox | ResumeStaticUnavailable::Command)
+        ) {
+            session_id = None;
+        }
+        if execution.is_none() && is_existing && !explicitly_pinned && session_id.is_some() {
             if let Some(path) = self.pi_resumable_transcript() {
                 let flags = format!("--session {}", shell_escape(&path));
                 splice_subcommand_or_append(cmd, &flags, None);
@@ -468,17 +648,21 @@ impl Instance {
                 return Ok(true);
             }
         }
-        // Pi's `--session` exits 1 on a conversation with no transcript, and the
-        // dead pane would read as a failed resume; start fresh unless user-pinned.
         if flag_arm_is_existing
             && !explicitly_pinned
             && session_id.is_some()
-            && self.resolved_capture_backend() == Some(SessionCaptureBackend::Pi)
-            && self.pi_recorded_transcript_missing()
+            && execution.map_or_else(
+                || {
+                    self.resolved_capture_backend()
+                        == Some(crate::agents::SessionCaptureBackend::Pi)
+                        && self.pi_recorded_transcript_missing()
+                },
+                |execution| execution.agent.name == "pi" && execution.pi_transcript_path.is_none(),
+            )
         {
             tracing::info!(
                 target: "session.store",
-                instance = %self.id,
+                instance = self.id.as_str(),
                 sid = ?session_id,
                 "the conversation this Pi session owns has no transcript; \
                  starting fresh rather than failing the launch on `--session`. \
@@ -486,13 +670,18 @@ impl Instance {
             );
             session_id = None;
         }
+        let resume_tool = agent.map_or(self.tool.as_str(), |agent| agent.name);
         let emitted = append_resume_flags(
-            &resume_tool,
+            resume_tool,
             session_id.as_deref(),
             flag_arm_is_existing,
             cmd,
             parsed_command.executable_end,
             context,
+        );
+        anyhow::ensure!(
+            !matches!(self.resume_intent, ResumeIntent::Use(_)) || emitted,
+            "explicit resume did not produce a native resume selector"
         );
         Ok(is_existing && emitted)
     }
@@ -531,7 +720,7 @@ impl Instance {
         });
 
         match outcome {
-            Ok(write @ (SidWrite::Applied | SidWrite::Skipped)) => {
+            Ok(write @ (SidWrite::Applied | SidWrite::Skipped | SidWrite::PinnedForeign)) => {
                 if let Some(disk) = storage
                     .load()
                     .ok()
@@ -593,7 +782,7 @@ mod tests {
             inst.agent_session_id = stored.map(str::to_string);
             inst.resume_intent = intent;
             assert_eq!(
-                inst.acquire_session_id(),
+                inst.acquire_session_id(None),
                 (Some(expected.to_string()), true),
                 "{tool}"
             );
@@ -623,7 +812,9 @@ mod tests {
             from: parent.to_string(),
         };
         let mut cmd = "claude".to_string();
-        assert!(!inst.apply_session_flags(&mut cmd, "test").unwrap());
+        assert!(!inst
+            .apply_session_flags(&mut cmd, "test", crate::agents::get_agent("claude"), None,)
+            .unwrap());
         assert_eq!(
             cmd,
             format!("claude --resume {parent} --fork-session --session-id {child}")
@@ -634,18 +825,22 @@ mod tests {
     #[test]
     fn fresh_claude_launch_mints_a_stable_pinned_id() {
         let mut inst = tool_instance("claude", "/tmp/test");
-        let (first, first_existing) = inst.acquire_session_id();
+        let (first, first_existing) = inst.acquire_session_id(None);
         assert!(first.is_some() && !first_existing);
         assert_eq!(inst.agent_session_id, first);
         // With no transcript on disk the same id stays fresh-pinned.
-        assert_eq!(inst.acquire_session_id(), (first, false));
+        assert_eq!(inst.acquire_session_id(None), (first, false));
 
         let mut fresh = tool_instance("claude", "/tmp/test");
         let mut cmd = String::from("claude");
-        assert!(!fresh.apply_session_flags(&mut cmd, "test").unwrap());
+        assert!(!fresh
+            .apply_session_flags(&mut cmd, "test", None, None)
+            .unwrap());
         fresh.resume_intent = ResumeIntent::Use("019342ab-1234-7def-8901-abcdef012345".into());
         let mut cmd = String::from("claude");
-        assert!(fresh.apply_session_flags(&mut cmd, "test").unwrap());
+        assert!(fresh
+            .apply_session_flags(&mut cmd, "test", None, None)
+            .unwrap());
     }
 
     #[test]
@@ -653,7 +848,7 @@ mod tests {
         let mut claude = tool_instance("claude", "/tmp/x");
         claude.agent_session_id = Some("observed".to_string());
         claude.resume_intent = ResumeIntent::Cleared;
-        let (sid, is_existing) = claude.acquire_session_id();
+        let (sid, is_existing) = claude.acquire_session_id(None);
         assert!(sid.is_some() && !is_existing);
         assert_ne!(sid.as_deref(), Some("observed"));
         assert_eq!(claude.agent_session_id, sid);
@@ -661,7 +856,7 @@ mod tests {
         let mut opencode = tool_instance("opencode", "/tmp/x");
         opencode.agent_session_id = Some("observed".to_string());
         opencode.resume_intent = ResumeIntent::Cleared;
-        assert_eq!(opencode.acquire_session_id(), (None, false));
+        assert_eq!(opencode.acquire_session_id(None), (None, false));
         assert_eq!(opencode.agent_session_id, None);
     }
 
@@ -684,16 +879,17 @@ mod tests {
         ] {
             let mut inst = tool_instance(tool, "/tmp/test");
             inst.resume_intent = intent;
-            let result = inst.acquire_session_id_with(&|_| minted.map(str::to_string));
+            let result = inst.acquire_session_id_with(None, &|_| minted.map(str::to_string));
             assert_eq!(result, (expected.map(str::to_string), false));
             assert_eq!(inst.agent_session_id.as_deref(), expected);
         }
         let mut claude = tool_instance("claude", "/tmp/test");
-        let (claude_sid, _) = claude.acquire_session_id_with(&|_| panic!("seam ran for claude"));
+        let (claude_sid, _) =
+            claude.acquire_session_id_with(None, &|_| panic!("seam ran for claude"));
         assert!(claude_sid.is_some());
         let mut codex = tool_instance("codex", "/tmp/test");
         assert_eq!(
-            codex.acquire_session_id_with(&|_| panic!("seam ran for codex")),
+            codex.acquire_session_id_with(None, &|_| panic!("seam ran for codex")),
             (None, false)
         );
     }
@@ -768,7 +964,7 @@ mod tests {
         let json = serde_json::to_string(&inst).unwrap();
         let mut reloaded: Instance = serde_json::from_str(&json).unwrap();
 
-        let (session_id, is_existing) = reloaded.acquire_session_id();
+        let (session_id, is_existing) = reloaded.acquire_session_id(None);
         assert_eq!(session_id.as_deref(), Some(native_id));
         assert!(is_existing);
         assert_eq!(
@@ -796,7 +992,8 @@ mod tests {
             inst.sandbox_info = Some(test_sandbox("test", None));
             let mut cmd = tool.to_string();
             assert_eq!(
-                inst.apply_session_flags(&mut cmd, "test").unwrap(),
+                inst.apply_session_flags(&mut cmd, "test", crate::agents::get_agent(tool), None,)
+                    .unwrap(),
                 resumed,
                 "{tool}"
             );
@@ -809,7 +1006,7 @@ mod tests {
         automatic_copilot.sandbox_info = Some(test_sandbox("test", None));
         let mut automatic_cmd = "copilot".to_string();
         assert!(!automatic_copilot
-            .apply_session_flags(&mut automatic_cmd, "test")
+            .apply_session_flags(&mut automatic_cmd, "test", None, None)
             .unwrap());
         assert_eq!(automatic_cmd, "copilot");
 
@@ -817,7 +1014,9 @@ mod tests {
         host_prime.agent_session_id = Some(sid.to_string());
         host_prime.resume_intent = ResumeIntent::Use(sid.to_string());
         let mut cmd = "prime-agent".to_string();
-        assert!(host_prime.apply_session_flags(&mut cmd, "test").unwrap());
+        assert!(host_prime
+            .apply_session_flags(&mut cmd, "test", None, None)
+            .unwrap());
         assert_eq!(cmd, format!("prime-agent --resume {sid}"));
     }
 
@@ -851,120 +1050,105 @@ mod tests {
         }
     }
 
-    fn profiled(profile: &str, tool: &str, command: &str) -> Instance {
-        let mut inst = tool_instance(tool, "/tmp/profiled");
-        inst.source_profile = profile.to_string();
-        inst.command = command.to_string();
-        inst
-    }
-
     /// A resume subcommand must land right after the program the pane runs; a launcher or a
     /// path-qualified script hides it, while a bare renamed wrapper is that program (#3638).
     #[test]
     fn codex_wrapper_command_never_takes_a_spliced_subcommand() {
+        let home = tempfile::tempdir().unwrap();
+        let _isolation = crate::session::test_support::isolate_app_dir_at(home.path());
         const PROFILE: &str = "codex-wrapper-splice-test";
         let _registry = install_aliases(PROFILE, &[("codex-remote", "codex")]);
-        let sid = "11111111-2222-3333-4444-555555555555";
-        for (command, context, expected) in [
-            (
-                "ssh -t lenovo codex",
-                TerminalContextResume::CommandUnsupported,
-                None,
-            ),
-            (
-                "/opt/bin/mycodex",
-                TerminalContextResume::CommandUnsupported,
-                None,
-            ),
-            (
-                "codex --model o3",
-                TerminalContextResume::Available,
-                Some(format!("codex resume {sid} --model o3")),
-            ),
-            (
-                "mycodex",
-                TerminalContextResume::Available,
-                Some(format!("mycodex resume {sid}")),
-            ),
-            (
-                "codex-personal",
-                TerminalContextResume::Available,
-                Some(format!("codex-personal resume {sid}")),
-            ),
-        ] {
-            let mut inst = profiled(PROFILE, "codex-remote", command);
-            inst.agent_session_id = Some(sid.to_string());
-            inst.resume_intent = ResumeIntent::Use(sid.to_string());
-            assert_eq!(inst.terminal_context_resume_cached(), context, "{command}");
-            let mut cmd = command.to_string();
-            assert_eq!(
-                inst.apply_session_flags(&mut cmd, "test").unwrap(),
-                expected.is_some()
-            );
-            assert_eq!(
-                cmd,
-                expected.unwrap_or_else(|| command.to_string()),
-                "{command}"
-            );
-        }
-    }
-
-    /// A custom agent resolves capture and resume through its `detect_as` base (#3638).
-    #[test]
-    fn custom_agent_pins_and_resumes_through_its_detect_as_base() {
-        const PROFILE: &str = "custom-agent-resume-test";
-        let _registry = install_aliases(
+        crate::session::instance::test_helpers::declare_execution_aliases(
             PROFILE,
-            &[
-                ("claude-personal", "claude"),
-                ("copilot-personal", "copilot"),
-                ("droid-personal", "droid"),
-            ],
+            &[("codex-remote", "codex")],
+            home.path(),
+        );
+        let sid = "11111111-2222-3333-4444-555555555555";
+
+        // The documented custom-agent shape: a multi-token launcher.
+        let mut wrapped = Instance::new("wrapper", "/tmp/codex-splice");
+        wrapped.source_profile = PROFILE.to_string();
+        wrapped.tool = "codex-remote".to_string();
+        wrapped.command = "ssh -t lenovo codex".to_string();
+        wrapped.agent_session_id = Some(sid.to_string());
+        wrapped.resume_intent = ResumeIntent::Use(sid.to_string());
+        assert_eq!(
+            wrapped.terminal_context_resume_cached(),
+            TerminalContextResume::CommandUnsupported
+        );
+        let mut cmd = wrapped.command.clone();
+        assert!(wrapped
+            .apply_session_flags(&mut cmd, "test", wrapped.resolved_agent(), None)
+            .is_err());
+        assert_eq!(
+            cmd, "ssh -t lenovo codex",
+            "the resume token must not be spliced onto the launcher"
         );
 
-        let mut inst = profiled(PROFILE, "claude-personal", "claude-personal");
-        let mut fresh = "claude-personal".to_string();
-        assert!(!inst.apply_session_flags(&mut fresh, "test").unwrap());
-        let sid = inst
-            .agent_session_id
-            .clone()
-            .expect("a wrapper launch pins its conversation");
-        assert_eq!(fresh, format!("claude-personal --session-id {sid}"));
-
-        inst.resume_intent = ResumeIntent::Use(sid.clone());
+        // An override that does open with the binary keeps its resume.
+        let mut direct = Instance::new("direct", "/tmp/codex-splice");
+        direct.source_profile = PROFILE.to_string();
+        direct.tool = "codex-remote".to_string();
+        direct.command = "codex --model o3".to_string();
+        direct.agent_session_id = Some(sid.to_string());
+        direct.resume_intent = ResumeIntent::Use(sid.to_string());
         assert_eq!(
-            inst.terminal_context_resume_cached(),
+            direct.terminal_context_resume_cached(),
             TerminalContextResume::Available
         );
-        let mut restart = "claude-personal".to_string();
-        assert!(inst.apply_session_flags(&mut restart, "test").unwrap());
-        assert_eq!(restart, format!("claude-personal --resume {sid}"));
-        assert_eq!(inst.agent_session_id.as_deref(), Some(sid.as_str()));
+        let mut direct_cmd = direct.command.clone();
+        assert!(direct
+            .apply_session_flags(&mut direct_cmd, "test", direct.resolved_agent(), None)
+            .unwrap());
+        assert_eq!(direct_cmd, format!("codex resume {sid} --model o3"));
 
-        let mut unsupported = profiled(PROFILE, "droid-personal", "droid-personal");
-        unsupported.resume_intent = ResumeIntent::Use(sid.clone());
-        // Sandboxing applies the base agent's store rule: copilot has nothing to resume there.
-        let mut sandboxed = profiled(PROFILE, "copilot-personal", "copilot-personal");
-        sandboxed.agent_session_id = Some(sid);
-        sandboxed.sandbox_info = Some(test_sandbox("test", None));
-        for (mut inst, context) in [
-            (unsupported, TerminalContextResume::AgentUnsupported),
-            (sandboxed, TerminalContextResume::SandboxUnsupported),
-        ] {
-            assert_eq!(inst.terminal_context_resume_cached(), context);
-            let mut cmd = inst.command.clone();
-            assert!(!inst.apply_session_flags(&mut cmd, "test").unwrap());
-            assert_eq!(cmd, inst.command);
+        let mut qualified = Instance::new("qualified", "/tmp/codex-splice");
+        qualified.source_profile = "codex-wrapper-unproven".into();
+        qualified.tool = "codex-remote".to_string();
+        qualified.command = "/opt/bin/mycodex".to_string();
+        qualified.agent_session_id = Some(sid.to_string());
+        qualified.resume_intent = ResumeIntent::Use(sid.to_string());
+        assert_eq!(
+            qualified.terminal_context_resume_cached(),
+            TerminalContextResume::AgentUnsupported
+        );
+        let mut qualified_cmd = qualified.command.clone();
+        assert!(qualified
+            .apply_session_flags(&mut qualified_cmd, "test", qualified.resolved_agent(), None)
+            .is_err());
+        assert_eq!(qualified_cmd, "/opt/bin/mycodex");
+
+        for command in ["mycodex", "codex-personal"] {
+            let mut bare = Instance::new("bare", "/tmp/codex-splice");
+            bare.source_profile = PROFILE.to_string();
+            bare.tool = "codex-remote".to_string();
+            bare.command = command.to_string();
+            bare.agent_session_id = Some(sid.to_string());
+            bare.resume_intent = ResumeIntent::Use(sid.to_string());
+            assert_eq!(
+                bare.terminal_context_resume_cached(),
+                TerminalContextResume::Available,
+                "{command}"
+            );
+            let mut bare_cmd = bare.command.clone();
+            assert!(
+                bare.apply_session_flags(&mut bare_cmd, "test", bare.resolved_agent(), None)
+                    .unwrap(),
+                "{command}"
+            );
+            assert_eq!(bare_cmd, format!("{command} resume {sid}"));
         }
     }
 
     #[test]
     fn unsupported_context_without_identity_neither_resumes_nor_polls() {
         let mut inst = tool_instance("codex", "/tmp/test");
-        assert_eq!(inst.acquire_session_id_with(&|_| None), (None, false));
+        assert_eq!(inst.acquire_session_id_with(None, &|_| None), (None, false));
         assert_eq!(inst.agent_session_id, None);
         let mut cmd = String::from("codex");
-        assert!(!inst.apply_session_flags(&mut cmd, "test").unwrap());
+        assert!(!inst
+            .apply_session_flags(&mut cmd, "test", None, None)
+            .unwrap());
         assert_eq!(cmd, "codex");
         inst.capture_started_at = Some(std::time::SystemTime::now());
         inst.maybe_start_poller_since(None);
@@ -991,7 +1175,9 @@ mod tests {
         ] {
             let mut inst = tool_instance("claude", "/tmp/x");
             let mut actual = command.to_string();
-            assert!(!inst.apply_session_flags(&mut actual, "test").unwrap());
+            assert!(!inst
+                .apply_session_flags(&mut actual, "test", None, None)
+                .unwrap());
             assert_eq!(actual, command);
             assert!(inst.agent_session_id.is_none());
             for (stored, intent) in [
@@ -1008,7 +1194,7 @@ mod tests {
                 managed.agent_session_id = stored;
                 managed.resume_intent = intent;
                 let error = managed
-                    .apply_session_flags(&mut command.to_string(), "test")
+                    .apply_session_flags(&mut command.to_string(), "test", None, None)
                     .unwrap_err()
                     .to_string();
                 assert!(
@@ -1024,7 +1210,9 @@ mod tests {
     fn codex_selector_requires_subcommand_position_and_resolves_alias() {
         let mut external = tool_instance("codex", "/tmp/x");
         let mut command = "codex resume external".to_string();
-        assert!(!external.apply_session_flags(&mut command, "test").unwrap());
+        assert!(!external
+            .apply_session_flags(&mut command, "test", None, None)
+            .unwrap());
         assert_eq!(command, "codex resume external");
 
         let sid = "11111111-2222-3333-4444-555555555555";
@@ -1032,7 +1220,7 @@ mod tests {
         value_token.resume_intent = ResumeIntent::Use(sid.to_string());
         let mut command = "codex --model resume".to_string();
         assert!(value_token
-            .apply_session_flags(&mut command, "test")
+            .apply_session_flags(&mut command, "test", value_token.resolved_agent(), None)
             .unwrap());
         assert_eq!(command, format!("codex resume {sid} --model resume"));
 
@@ -1043,7 +1231,9 @@ mod tests {
         alias.tool = "work-claude".to_string();
         alias.command = "claude --resume external".to_string();
         let mut command = alias.command.clone();
-        assert!(!alias.apply_session_flags(&mut command, "test").unwrap());
+        assert!(!alias
+            .apply_session_flags(&mut command, "test", alias.resolved_agent(), None)
+            .unwrap());
         assert!(alias.agent_session_id.is_none());
     }
 
@@ -1095,7 +1285,9 @@ mod tests {
             TerminalContextResume::InvalidTarget
         );
         let mut command = "claude".to_string();
-        assert!(!inst.apply_session_flags(&mut command, "test").unwrap());
+        assert!(inst
+            .apply_session_flags(&mut command, "test", inst.resolved_agent(), None)
+            .is_err());
         assert_eq!(command, "claude");
         inst.resume_intent = ResumeIntent::Cleared;
         assert_eq!(
@@ -1134,7 +1326,9 @@ mod tests {
             "a pinned copilot conversation must still be attempted"
         );
         let mut pinned = "copilot".to_string();
-        assert!(inst.apply_session_flags(&mut pinned, "test").unwrap());
+        assert!(inst
+            .apply_session_flags(&mut pinned, "test", None, None)
+            .unwrap());
         assert_eq!(pinned, format!("copilot --session-id {sid}"));
 
         for tool in ["kimi", "prime-agent"] {
@@ -1290,7 +1484,7 @@ mod tests {
                     inst.sandbox_info = Some(test_sandbox("verify-sandbox", None));
                 }
                 let dir = sidecar.map(|sid| write_sidecar(&inst.id, sid));
-                let acquired = inst.acquire_session_id();
+                let acquired = inst.acquire_session_id(None);
                 if let Some(dir) = dir {
                     fs::remove_dir_all(dir).ok();
                 }
@@ -1308,23 +1502,27 @@ mod tests {
         fn idle_sidecar_still_overrides_stored_identity() {
             let temp = tempdir().unwrap();
             let _guard = claude_home_guard(&temp);
-            let mut inst = tool_instance("claude", "/tmp/idle-sidecar");
+            let mut inst = Instance::new("idle-sidecar", "/tmp/idle-sidecar");
+            inst.tool = "claude".to_string();
             inst.agent_session_id = Some("stored-old".to_string());
-            let dir = write_sidecar(&inst.id, "published-new");
-            fs::File::options()
+            inst.resume_intent = ResumeIntent::Default;
+
+            let dir = super::write_sidecar(&inst.id, "published-new");
+            let stale = SystemTime::now() - Duration::from_secs(10 * 60);
+            std::fs::File::options()
                 .write(true)
                 .open(dir.join("session_id"))
                 .unwrap()
-                .set_times(
-                    fs::FileTimes::new()
-                        .set_modified(SystemTime::now() - Duration::from_secs(10 * 60)),
-                )
+                .set_times(std::fs::FileTimes::new().set_modified(stale))
                 .unwrap();
+
             assert_eq!(
-                inst.capture_freshest_session_id().as_deref(),
+                inst.capture_freshest_conversation()
+                    .map(|observation| observation.sid)
+                    .as_deref(),
                 Some("published-new")
             );
-            fs::remove_dir_all(dir).ok();
+            std::fs::remove_dir_all(dir).ok();
         }
 
         /// Same-cwd sessions in profiles with different `CLAUDE_CONFIG_DIR`s each resume their
@@ -1364,7 +1562,7 @@ mod tests {
                         )]
                     })
                     .unwrap_or_default();
-                inst.acquire_session_id()
+                inst.acquire_session_id(None)
             };
             for (profile, sid) in cases {
                 assert_eq!(
@@ -1384,7 +1582,7 @@ mod tests {
         fn pi_fresh_launch_pins_the_minted_id() {
             let pinned = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
             let mut inst = tool_instance("pi", "/tmp/pi-fresh");
-            let acquired = inst.acquire_session_id_with(&|_| Some(pinned.to_string()));
+            let acquired = inst.acquire_session_id_with(None, &|_| Some(pinned.to_string()));
             assert_eq!(acquired, (Some(pinned.to_string()), false));
             assert_eq!(inst.agent_session_id.as_deref(), Some(pinned));
             assert_eq!(
@@ -1393,7 +1591,10 @@ mod tests {
             );
 
             let mut unpinnable = tool_instance("pi", "/tmp/pi-fresh");
-            assert_eq!(unpinnable.acquire_session_id_with(&|_| None), (None, false));
+            assert_eq!(
+                unpinnable.acquire_session_id_with(None, &|_| None),
+                (None, false)
+            );
             assert_eq!(unpinnable.agent_session_id, None);
         }
     }

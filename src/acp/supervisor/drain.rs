@@ -156,30 +156,42 @@ impl<S: BroadcastSink> Drain<S> {
                 Event::AgentStartupError { .. } if !established => end.startup_failed = true,
                 Event::AcpSessionAssigned { acp_session_id } => {
                     established = true;
-                    self.with_cached_config(|config| {
-                        info!(
-                            target: "acp.supervisor",
-                            session = %self.session_id,
-                            acp_session_id = %acp_session_id,
-                            "caching agent-assigned id for future respawn"
-                        );
-                        config.stored_acp_session_id = Some(acp_session_id.clone());
-                        config.seed_history_replay = false;
-                    })
-                    .await;
+                    let mut workers = self.workers.lock().await;
+                    if let Some(handle) = workers.get_mut(&self.session_id) {
+                        if handle.lease.epoch() != generation {
+                            continue;
+                        }
+                        handle.native_session_id = Some(acp_session_id.clone());
+                        if let WorkerKind::Runner { spawn_config } = &mut handle.kind {
+                            info!(
+                                target: "acp.supervisor",
+                                session = %self.session_id,
+                                acp_session_id = %acp_session_id,
+                                "caching agent-assigned id for future respawn"
+                            );
+                            spawn_config.stored_acp_session_id = Some(acp_session_id.clone());
+                            spawn_config.seed_history_replay = false;
+                        }
+                    }
                 }
                 Event::SessionContextReset { reason } => {
-                    self.with_cached_config(|config| {
-                        info!(
-                            target: "acp.supervisor",
-                            session = %self.session_id,
-                            %reason,
-                            "clearing cached id and any pending fork after a context reset"
-                        );
-                        config.stored_acp_session_id = None;
-                        config.fork_from = None;
-                    })
-                    .await;
+                    let mut workers = self.workers.lock().await;
+                    if let Some(handle) = workers.get_mut(&self.session_id) {
+                        if handle.lease.epoch() != generation {
+                            continue;
+                        }
+                        handle.native_session_id = None;
+                        if let WorkerKind::Runner { spawn_config } = &mut handle.kind {
+                            info!(
+                                target: "acp.supervisor",
+                                session = %self.session_id,
+                                %reason,
+                                "clearing cached id and any pending fork after a context reset"
+                            );
+                            spawn_config.stored_acp_session_id = None;
+                            spawn_config.fork_from = None;
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -189,15 +201,6 @@ impl<S: BroadcastSink> Drain<S> {
                 .publish_from_worker(&self.session_id, seq, &event, generation);
         }
         end
-    }
-
-    async fn with_cached_config(&self, f: impl FnOnce(&mut SpawnConfig)) {
-        let mut guard = self.workers.lock().await;
-        if let Some(WorkerKind::Runner { spawn_config }) =
-            guard.get_mut(&self.session_id).map(|h| &mut h.kind)
-        {
-            f(spawn_config);
-        }
     }
 
     /// Remove this epoch's handle; a no-op once a newer epoch replaced it.
@@ -319,6 +322,17 @@ impl<S: BroadcastSink> Drain<S> {
         }
 
         self.refresh_launch_env(&mut config).await;
+        if config.sandbox_info.is_none() {
+            if let Some(store) = &config.claude_store_pin {
+                config
+                    .host_environment
+                    .retain(|(key, _)| key != "CLAUDE_CONFIG_DIR");
+                config.host_environment.push((
+                    "CLAUDE_CONFIG_DIR".into(),
+                    store.to_string_lossy().to_string(),
+                ));
+            }
+        }
         if let Some((wrapper, base)) = &config.wrapper_substitution {
             log_wrapper_substitution(session_id, &config.tool, wrapper, base);
         }
@@ -355,6 +369,7 @@ impl<S: BroadcastSink> Drain<S> {
                     Some(handle) => {
                         handle.client = Arc::clone(&client);
                         handle.lease = respawn_lease.clone();
+                        handle.native_session_id = None;
                         None
                     }
                     None => Some(InstallError::Stale),

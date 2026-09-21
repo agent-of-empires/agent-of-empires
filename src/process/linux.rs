@@ -1,5 +1,6 @@
 //! Linux-specific process utilities.
 
+pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = false;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;

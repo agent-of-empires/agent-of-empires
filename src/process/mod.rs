@@ -33,6 +33,11 @@ mod platform {
     pub(super) fn terminate_process_group(_: &std::process::Child) {}
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use platform::HAS_CODEX_MANAGED_PREFERENCES;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = true;
+
 pub(crate) mod metrics;
 
 pub mod worker;

@@ -1,13 +1,13 @@
-// Publishes native conversation IDs and transcript paths for AoE.
-// Pi keeps its existing behavior; Prime publishes only depth-zero roots.
-// Publication does not imply that the transcript has been materialized.
+// Publish the native ID and transcript path without requiring a materialized file.
 import { mkdirSync, writeFileSync, renameSync, unlinkSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
 export default function (pi) {
   const idTarget = process.env.AOE_SESSION_ID_FILE;
   const rootOnly = process.env.AOE_SESSION_ROOT_ONLY === "1";
-
+  const source = process.env.AOE_SESSION_SOURCE;
+  if (!rootOnly && source !== undefined && !/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(source)) return;
+  const suffix = !rootOnly && source ? "." + source : "";
   const writeAtomic = (target, value) => {
     let tmp;
     try {
@@ -40,8 +40,8 @@ export default function (pi) {
           id, path: resolve(file), cwd: header.cwd, rlmDepth: header.rlmDepth,
         }));
       } else {
-        writeAtomic(idTarget, id);
-        if (file) writeAtomic(join(dirname(idTarget), "session_path"), file);
+        writeAtomic(idTarget + suffix, id);
+        if (file) writeAtomic(join(dirname(idTarget), "session_path" + suffix), file);
       }
     } catch {
       // never block the agent

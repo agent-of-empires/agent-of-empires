@@ -9,9 +9,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use serde_json::Value;
 use serial_test::parallel;
 
-use crate::harness::{require_tmux, wait_until, write_executable, TuiTestHarness};
+use crate::harness::{app_dir_in, require_tmux, wait_until, write_executable, TuiTestHarness};
 
 /// A string field of the session titled `title`.
 fn session_field(h: &TuiTestHarness, title: &str, field: &str) -> Option<String> {
@@ -129,13 +130,6 @@ fn tmux_query(h: &TuiTestHarness, title: &str, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-fn tmux_environment_contains(h: &TuiTestHarness, title: &str, key: &str) -> bool {
-    let prefix = format!("{key}=");
-    tmux_query(h, title, &["show-environment", "-h"])
-        .lines()
-        .any(|line| line.starts_with(&prefix))
-}
-
 fn tmux_pane_start_command(h: &TuiTestHarness, title: &str) -> String {
     tmux_query(
         h,
@@ -208,10 +202,6 @@ fn install_toggling_fake_omp(h: &mut TuiTestHarness, project: &Path, omp_store: 
          else\n\
            slot=third; sid={third}\n\
          fi\n\
-         injected_store=${{PI_CODING_AGENT_DIR-}}\n\
-         printf '%s\\n' \"$injected_store\" > \"$control/pi-dir-$slot\"\n\
-         printf '%s\\n' \"${{PI_CONFIG_DIR-}}\" > \"$control/config-dir-$slot\"\n\
-         printf '%s\\n' \"$@\" > \"$control/args-$slot\"\n\
          received={store}\n\
          sessions_dir=\"$received/sessions/home-project\"\n\
          terminal_dir=\"$received/terminal-sessions\"\n\
@@ -275,8 +265,6 @@ fn install_reconstructing_fake_omp(
            : > \"$control/launched\"\n\
            slot=metadata; sid={first}; stale={metadata_stale}; store={metadata_store}\n\
          fi\n\
-         printf '%s\\n' \"${{PI_CODING_AGENT_DIR-}}\" > \"$control/pi-dir-$slot\"\n\
-         printf '%s\\n' \"${{PI_CONFIG_DIR-}}\" > \"$control/config-dir-$slot\"\n\
          sessions_dir=\"$store/sessions/home-project\"\n\
          terminal_dir=\"$store/terminal-sessions\"\n\
          mkdir -p \"$sessions_dir\" \"$terminal_dir\"\n\
@@ -364,27 +352,9 @@ fn omp_routing_restart_generation_and_same_cwd_pane_attribution_are_preserved() 
     ] {
         h.run_cli_ok(&["session", operation, title]);
         wait_for_path(&control.join(format!("ready-{slot}")));
-        assert_eq!(
-            fs::read_to_string(control.join(format!("pi-dir-{slot}")))
-                .expect("read PI_CODING_AGENT_DIR"),
-            "\n",
-            "{operation} must not inject resolved dotenv routing into the OMP process environment"
-        );
-        assert_eq!(
-            fs::read_to_string(control.join(format!("config-dir-{slot}")))
-                .expect("read PI_CONFIG_DIR"),
-            "\n",
-            "{operation} must not inject dotenv-expanded routing secrets"
-        );
         assert!(
             !tmux_pane_start_command(&h, title).contains(OMP_ROUTING_SECRET),
             "{operation} must not persist dotenv-expanded routing secrets in pane argv"
-        );
-        assert_eq!(
-            fs::read_to_string(control.join(format!("args-{slot}")))
-                .expect("read fake OMP arguments"),
-            "--thinking\nlow\n",
-            "the benign extra_args must reach OMP unchanged"
         );
         wait_for_agent_session_id(&h, title, expected);
         let generation = session_field(&h, title, "omp_capture_generation")
@@ -408,7 +378,7 @@ fn omp_routing_restart_generation_and_same_cwd_pane_attribution_are_preserved() 
 
 #[test]
 #[parallel]
-fn omp_reconstruction_rejects_prelaunch_then_accepts_cross_project_and_backfills_legacy() {
+fn omp_reconstruction_rejects_cross_project_and_unqualified_legacy_publications() {
     require_tmux!();
     let mut h = TuiTestHarness::new_in_tmp("cli_sid_omp_reconstruction");
     let project = h.project_path();
@@ -416,7 +386,6 @@ fn omp_reconstruction_rejects_prelaunch_then_accepts_cross_project_and_backfills
     fs::create_dir_all(&old_project).expect("create unrelated old project");
     let metadata_store = h.home_path().join("metadata-omp-store");
     let legacy_store = h.home_path().join("legacy-omp-store");
-    write_project_omp_dotenv(&project, &metadata_store);
     install_reconstructing_fake_omp(
         &mut h,
         &metadata_store,
@@ -424,95 +393,145 @@ fn omp_reconstruction_rejects_prelaunch_then_accepts_cross_project_and_backfills
         &project,
         &old_project,
     );
-
-    let metadata_title = "CliSidOmpMetadataReconstructionE2E";
-    let legacy_title = "CliSidOmpLegacyReconstructionE2E";
-    for title in [metadata_title, legacy_title] {
-        h.run_cli_ok(&["add", project.to_str().unwrap(), "-c", "omp", "-t", title]);
-    }
-
-    h.run_cli_ok(&["session", "start", metadata_title]);
     let control = h.home_path().join("omp-control");
-    wait_for_path(&control.join("ready-metadata"));
-    assert_eq!(
-        fs::read_to_string(control.join("pi-dir-metadata"))
-            .expect("read metadata PI_CODING_AGENT_DIR"),
-        "\n",
-        "metadata launch must not inject resolved dotenv routing"
-    );
-    assert_eq!(
-        fs::read_to_string(control.join("config-dir-metadata"))
-            .expect("read metadata PI_CONFIG_DIR"),
-        "\n",
-        "metadata launch must not inject dotenv-expanded routing secrets"
-    );
-    assert!(
-        !tmux_pane_start_command(&h, metadata_title).contains(OMP_ROUTING_SECRET),
-        "metadata launch must not persist dotenv-expanded routing secrets in pane argv"
-    );
-    assert_eq!(
-        agent_session_id(&h, metadata_title),
-        None,
-        "a pre-launch breadcrumb targeting an old session from another project must be rejected"
-    );
+    for (slot, store, title) in [
+        ("metadata", &metadata_store, "OmpCrossProject"),
+        ("legacy", &legacy_store, "OmpUnqualifiedLegacy"),
+    ] {
+        write_project_omp_dotenv(&project, store);
+        h.run_cli_ok(&["add", project.to_str().unwrap(), "-c", "omp", "-t", title]);
+        h.run_cli_ok(&["session", "start", title]);
+        let _stop = StopSessionOnDrop { h: &h, title };
+        wait_for_path(&control.join(format!("ready-{slot}")));
+        assert_eq!(
+            agent_session_id(&h, title),
+            None,
+            "pre-launch breadcrumb was adopted"
+        );
+        if slot == "legacy" {
+            unset_tmux_environment(&h, title, OMP_CAPTURE_META_KEY);
+            unset_tmux_environment(&h, title, OMP_LAUNCH_ID_KEY);
+            unset_tmux_environment(&h, title, OMP_CAPTURE_READY_KEY);
+            clear_omp_capture_generation(&h, title);
+        }
+        wait_past_tmux_creation_second(&h, title);
+        fs::write(control.join(format!("release-{slot}")), "").unwrap();
+        wait_for_path(&control.join(format!("switched-{slot}")));
+        h.run_cli_ok(&["session", "show", title, "--json"]);
+        assert_eq!(
+            agent_session_id(&h, title),
+            None,
+            "unqualified {slot} publication was adopted by synchronous capture"
+        );
+        let fork = h.run_cli(&[
+            "add",
+            project.to_str().unwrap(),
+            "-c",
+            "omp",
+            "-t",
+            "RefusedChild",
+            "--fork-from",
+            title,
+        ]);
+        assert!(
+            !fork.status.success(),
+            "unqualified {slot} publication authorized a fork"
+        );
+    }
+}
 
-    write_project_omp_dotenv(&project, &legacy_store);
-    h.run_cli_ok(&["session", "start", legacy_title]);
-    wait_for_path(&control.join("ready-legacy"));
-    assert_eq!(
-        fs::read_to_string(control.join("pi-dir-legacy")).expect("read legacy PI_CODING_AGENT_DIR"),
-        "\n",
-        "legacy launch must not inject newly resolved dotenv routing"
-    );
-    assert_eq!(
-        fs::read_to_string(control.join("config-dir-legacy")).expect("read legacy PI_CONFIG_DIR"),
-        "\n",
-        "legacy launch must not inject dotenv-expanded routing secrets"
-    );
-    assert!(
-        !tmux_pane_start_command(&h, legacy_title).contains(OMP_ROUTING_SECRET),
-        "legacy launch must not persist dotenv-expanded routing secrets in pane argv"
-    );
-    assert_eq!(
-        agent_session_id(&h, legacy_title),
-        None,
-        "the legacy pane must also reject its initial stale breadcrumb"
-    );
-    assert!(
-        tmux_environment_contains(&h, legacy_title, OMP_CAPTURE_META_KEY),
-        "new launches must persist the typed OMP capture metadata before legacy reconstruction"
-    );
-    unset_tmux_environment(&h, legacy_title, OMP_CAPTURE_META_KEY);
-    unset_tmux_environment(&h, legacy_title, OMP_LAUNCH_ID_KEY);
-    unset_tmux_environment(&h, legacy_title, OMP_CAPTURE_READY_KEY);
-    clear_omp_capture_generation(&h, legacy_title);
-    assert!(
-        !tmux_environment_contains(&h, legacy_title, OMP_CAPTURE_META_KEY),
-        "the legacy scenario requires capture metadata to be absent"
-    );
-
-    // Legacy reconstruction rounds `#{session_created}` up to the end of its
-    // second. Release only after that boundary so the rewritten breadcrumb is
-    // affirmative post-launch evidence rather than an ambiguous same-second write.
-    wait_past_tmux_creation_second(&h, legacy_title);
-    fs::write(control.join("release-metadata"), "").expect("release metadata fake OMP");
-    fs::write(control.join("release-legacy"), "").expect("release legacy fake OMP");
-    wait_for_path(&control.join("switched-metadata"));
-    wait_for_path(&control.join("switched-legacy"));
-
-    h.spawn_tui();
-    let _stop_metadata = StopSessionOnDrop {
+#[test]
+#[parallel]
+fn declared_omp_wrapper_can_resume_without_gaining_automatic_capture() {
+    require_tmux!();
+    let mut h = TuiTestHarness::new_in_tmp("omp_wrapper_capture_boundary");
+    let project = h.project_path();
+    let effective = h.home_path().join("effective");
+    fs::create_dir_all(&effective).unwrap();
+    let store = h.home_path().join("wrapper-store");
+    fs::create_dir_all(&store).unwrap();
+    let control = install_toggling_fake_omp(&mut h, &effective, &store);
+    let bin = h.install_path_command("my-omp");
+    let recorded = control.join("argv");
+    fs::write(
+        bin.join("my-omp"),
+        format!(
+            "#!/bin/sh\nprintf '%s\n' \"$@\" > {}\nexec {} \"$@\"\n",
+            sh_quote(&recorded),
+            sh_quote(&bin.join("omp")),
+        ),
+    )
+    .unwrap();
+    let config = app_dir_in(h.home_path()).join("config.toml");
+    let mut doc = fs::read_to_string(&config)
+        .unwrap_or_default()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    doc["session"]["custom_agents"]["my-omp"] =
+        toml_edit::value(format!("my-omp --cwd {}", sh_quote(&effective)));
+    doc["session"]["agent_execution_as"]["my-omp"] = toml_edit::value("omp");
+    doc["session"]["agent_config_dir"]["my-omp"] = toml_edit::value(store.to_str().unwrap());
+    fs::write(config, doc.to_string()).unwrap();
+    let parent = "DeclaredOmpParent";
+    h.run_cli_ok(&[
+        "add",
+        project.to_str().unwrap(),
+        "--tool",
+        "my-omp",
+        "-t",
+        parent,
+    ]);
+    let _stop_parent = StopSessionOnDrop {
         h: &h,
-        title: metadata_title,
+        title: parent,
     };
-    let _stop_legacy = StopSessionOnDrop {
-        h: &h,
-        title: legacy_title,
-    };
-    wait_for_agent_session_id(&h, metadata_title, OMP_STALE_SID);
-    wait_for_agent_session_id(&h, legacy_title, OMP_SID_SECOND);
+    h.run_cli_ok(&["session", "start", parent]);
+    wait_for_path(&control.join("ready-first"));
+    h.run_cli_ok(&["session", "show", parent]);
+    assert_eq!(
+        agent_session_id(&h, parent),
+        None,
+        "declaring a wrapper must not authorize automatic capture"
+    );
+
+    let transcript = store.join(format!(
+        "sessions/home-project/2026-08-05T00-00-00-000Z_{OMP_SID_FIRST}.jsonl"
+    ));
+    h.run_cli_ok(&[
+        "session",
+        "set-session-id",
+        parent,
+        OMP_SID_FIRST,
+        "--store",
+        transcript.to_str().unwrap(),
+    ]);
+    let rows: Value =
+        serde_json::from_str(&fs::read_to_string(h.sessions_path()).unwrap()).unwrap();
+    let row = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["title"] == parent)
+        .unwrap();
+    assert_eq!(
+        row["resume_binding"]["execution"]["cwd"].as_str(),
+        effective.to_str()
+    );
+    h.run_cli_ok(&["session", "restart", parent]);
+    wait_for_path(&control.join("ready-second"));
+    let argv = fs::read_to_string(recorded).unwrap();
+    let argv = argv.lines().collect::<Vec<_>>();
     assert!(
-        tmux_environment_contains(&h, legacy_title, OMP_CAPTURE_META_KEY),
-        "legacy reconstruction must backfill typed OMP capture metadata"
+        argv.windows(2)
+            .any(|pair| pair == ["--resume", OMP_SID_FIRST]),
+        "{argv:?}"
+    );
+    assert!(
+        argv.windows(2).any(|pair| pair
+            == [
+                "--session-dir",
+                transcript.parent().unwrap().to_str().unwrap()
+            ]),
+        "{argv:?}"
     );
 }

@@ -3,21 +3,15 @@
 use super::*;
 
 impl Instance {
-    /// Persist the conversation Pi's extension last published, before the sidecar is cleaned up
-    /// with the rest of the instance dir.
-    fn persist_pi_session_path(&self, storage: &crate::session::storage::Storage) {
-        let Some(path) = self.pi_published_session_path() else {
-            return;
-        };
-        if self.pi_session_path.as_deref() == Some(path.as_str()) {
-            return;
-        }
-        self.store_pi_session_path(storage, &path);
-    }
-
-    /// Call [`Self::flush_pi_sidecar_conversation`] using this session's storage.
-    pub(super) fn flush_pi_sidecar_if_published(&mut self) {
-        if self.resolved_capture_backend() != Some(crate::agents::SessionCaptureBackend::Pi) {
+    pub(super) fn flush_published_if_present(&mut self) {
+        if !self.uses_pi_session_sidecar()
+            && !matches!(
+                self.active_execution
+                    .as_ref()
+                    .and_then(|active| active.capture.as_ref()),
+                Some(CaptureContext::Hooks(_))
+            )
+        {
             return;
         }
         let profile = self.effective_profile();
@@ -26,44 +20,86 @@ impl Instance {
         else {
             return;
         };
-        self.flush_pi_sidecar_conversation(&storage);
-        // Keep the in-memory row with disk: a restart reads it moments later.
+        if self.flush_published_conversation(&storage) == Some(SidWrite::Failed) {
+            tracing::warn!(target: "session.store", instance = %self.id, "could not persist final conversation publication");
+            return;
+        }
         if let Ok(instances) = storage.load() {
             if let Some(row) = instances.iter().find(|i| i.id == self.id) {
-                self.agent_session_id = row.agent_session_id.clone();
-                self.pi_session_path = row.pi_session_path.clone();
+                self.adopt_conversation_state(row.conversation_state());
             }
         }
     }
 
-    pub(super) fn flush_pi_sidecar_conversation(&self, storage: &crate::session::storage::Storage) {
-        if !self.uses_pi_session_sidecar() {
-            return;
+    pub(crate) fn flush_published_conversation(
+        &self,
+        storage: &crate::session::storage::Storage,
+    ) -> Option<SidWrite> {
+        let observation = self.final_publication_observation()?;
+        if self.is_capture_excluded(&observation.sid, observation.source.as_ref()) {
+            return None;
         }
-        // No freshness window here: this is the last read before the sidecar
-        // is deleted, and an idle pane's `/new` can be hours old.
-        let Some(published) = self.pi_published_session_id(true) else {
-            return;
+        let outcome = super::sid_persist::persist_session_with_storage(
+            storage,
+            &self.id,
+            &observation,
+            &self.conversation_state(),
+        );
+        if outcome != SidWrite::Skipped {
+            return Some(outcome);
+        }
+        // `Skipped` reports a peer write between the caller's read and the CAS.
+        // Retry once against the row as it now stands: a peer that committed
+        // the same final observation makes this publication durable, while a
+        // fork intent or another conversation skips again. The retry emits
+        // `PinnedForeign` itself when the pin is the cause, so no post-hoc
+        // inference is needed here: any remaining `Skipped` keeps the doubt.
+        // A retry that cannot read the row leaves the publication in doubt, so
+        // it must fail the flush: `None` would read as "nothing to publish" and
+        // let teardown delete the evidence.
+        let Ok(rows) = storage.load() else {
+            return Some(SidWrite::Failed);
         };
-        if self.agent_session_id.as_deref() == Some(published.as_str()) {
-            self.persist_pi_session_path(storage);
-            return;
-        }
-        let published_path = self.pi_published_session_path();
-        if let Err(error) = storage.update(|instances, _| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == self.id) {
-                inst.agent_session_id = Some(published.clone());
-                if published_path.is_some() {
-                    inst.pi_session_path = published_path.clone();
-                }
-            }
-            Ok(())
-        }) {
-            tracing::warn!(
-                target: "session.store",
-                instance = %self.id,
-                "could not persist the Pi conversation published at stop: {error}",
-            );
+        let Some(retry) = rows.into_iter().find(|row| row.id == self.id) else {
+            return Some(SidWrite::Failed);
+        };
+        Some(super::sid_persist::persist_session_with_storage(
+            storage,
+            &self.id,
+            &observation,
+            &retry.conversation_state(),
+        ))
+    }
+
+    /// The conversation this pane published last, for the final flush.
+    pub(super) fn final_publication_observation(
+        &self,
+    ) -> Option<crate::session::poller::SessionIdObservation> {
+        if matches!(
+            self.active_execution
+                .as_ref()
+                .and_then(|active| active.capture.as_ref()),
+            Some(CaptureContext::Hooks(_))
+        ) {
+            super::execution::hook_session_observation(
+                &self.id,
+                self.active_execution.as_ref(),
+                None,
+            )
+        } else if self.uses_pi_session_sidecar() {
+            self.pi_published_conversation(true)
+        } else if matches!(
+            self.active_execution
+                .as_ref()
+                .and_then(|active| active.capture.as_ref()),
+            Some(CaptureContext::Prime {
+                sidecar: Some(_),
+                ..
+            })
+        ) {
+            self.prime_published_conversation()
+        } else {
+            None
         }
     }
 
@@ -301,10 +337,41 @@ impl Instance {
         let _lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&self.id)
             .context("failed to acquire instance stop lock")?;
-        let mut lifecycle = self.clone();
+        let mut lifecycle = storage
+            .load()?
+            .into_iter()
+            .find(|row| row.id == self.id)
+            .context("session disappeared before stop")?;
+        lifecycle.source_profile = profile.clone();
         lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)?;
-        let teardown = self.kill_locked().and_then(|()| {
-            crate::session::worktree_edit::stop_sandbox_container(&self.id, self.is_sandboxed())
+        self.stop_poller();
+        let teardown = lifecycle.kill_locked().and_then(|()| {
+            let mut current = storage
+                .load()?
+                .into_iter()
+                .find(|row| row.id == self.id)
+                .context("session disappeared during stop")?;
+            current.source_profile = profile.clone();
+            let flushed = current.flush_published_conversation(&storage);
+            // A pinned-foreign publication is an explicit refusal, not a
+            // doubtful write: the user pinned another conversation and this
+            // pane's id must not overwrite it. Any other failure still keeps
+            // the hook evidence, but the sandbox container always stops: the
+            // store is a host bind, not container state.
+            let container_result = crate::session::worktree_edit::stop_sandbox_container(
+                &current.id,
+                current.is_sandboxed(),
+            );
+            match flushed {
+                Some(SidWrite::PinnedForeign) => container_result,
+                Some(SidWrite::Applied) | None => container_result,
+                Some(SidWrite::Failed) | Some(SidWrite::Skipped) => {
+                    container_result?;
+                    anyhow::bail!(
+                        "could not persist final conversation publication; hook evidence retained"
+                    )
+                }
+            }
         });
         match teardown {
             Ok(()) => {
@@ -313,7 +380,6 @@ impl Instance {
                     LifecycleOperation::Stop,
                     Status::Stopped,
                 )?;
-                self.flush_pi_sidecar_conversation(&storage);
                 crate::hooks::cleanup_hook_status_dir(&self.id);
                 Ok(())
             }
@@ -331,89 +397,6 @@ impl Instance {
 
 #[cfg(test)]
 mod tests {
-    /// The conversation a Pi pane published has to outlive its instance dir at stop: no poller
-    /// survives a CLI launch, and an idle pane's `/new` can be hours older than the freshness
-    /// window that guards a resume.
-    #[test]
-    #[serial_test::serial]
-    fn pi_stop_persists_the_published_conversation() {
-        // (label, tool, detect_as, published id, sidecar written hours ago, flush by intent)
-        let cases = [
-            (
-                "fresh",
-                "pi",
-                "pi",
-                "01a05234-8889-72e2-a7c9-7ebc27b25b78",
-                false,
-                false,
-            ),
-            (
-                "stale",
-                "pi",
-                "pi",
-                "01a0538e-5868-7c22-84bc-40cfd7a09ab1",
-                true,
-                false,
-            ),
-            ("alias", "company-pi", "pi", "published-id", false, true),
-        ];
-        for (label, tool, detect_as, published, stale, by_intent) in cases {
-            let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
-            let home = tempfile::tempdir().unwrap();
-            let _home_guard = crate::session::test_support::isolate_app_dir_at(home.path());
-
-            let profile = "pi-sidecar-flush";
-            let mut inst = Instance::new(label, "/tmp/pi");
-            inst.source_profile = profile.to_string();
-            inst.tool = tool.to_string();
-            inst.detect_as = detect_as.to_string();
-            if tool != detect_as {
-                inst.command = detect_as.to_string();
-            }
-            inst.agent_session_id = Some("22f13307-461c-4161-908e-95a247fac750".to_string());
-            inst.mark_pi_extension_launched_for_test();
-
-            let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
-            let seed = inst.clone();
-            storage
-                .update(|instances, _| {
-                    *instances = vec![seed.clone()];
-                    Ok(())
-                })
-                .unwrap();
-            crate::hooks::write_session_id_via_guard(&inst.id, published).unwrap();
-            if stale {
-                let sidecar = crate::hooks::ensure_instance_dir_path(&inst.id)
-                    .unwrap()
-                    .join("session_id");
-                let hours_ago =
-                    std::time::SystemTime::now() - std::time::Duration::from_secs(6 * 3600);
-                std::fs::File::options()
-                    .write(true)
-                    .open(&sidecar)
-                    .unwrap()
-                    .set_times(std::fs::FileTimes::new().set_modified(hours_ago))
-                    .unwrap();
-                assert_eq!(
-                    crate::hooks::read_hook_session_id(&inst.id),
-                    None,
-                    "the fixture must be past the freshness window"
-                );
-            }
-
-            if by_intent {
-                inst.flush_pi_sidecar_if_published();
-            } else {
-                inst.flush_pi_sidecar_conversation(&storage);
-            }
-
-            assert_eq!(
-                storage.load().unwrap()[0].agent_session_id.as_deref(),
-                Some(published),
-                "{label}"
-            );
-        }
-    }
 
     use super::*;
 

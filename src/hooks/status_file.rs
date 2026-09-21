@@ -118,7 +118,7 @@ pub fn session_id_sidecar_exists(instance_id: &str) -> bool {
 /// Returns `None` when the file is absent, malformed, too large, or older than
 /// `SESSION_ID_SIDECAR_MAX_AGE`.
 pub fn read_hook_session_id(instance_id: &str) -> Option<String> {
-    read_hook_session_id_within(instance_id, Some(SESSION_ID_SIDECAR_MAX_AGE))
+    read_hook_session_id_within(instance_id, "session_id", Some(SESSION_ID_SIDECAR_MAX_AGE))
 }
 
 /// [`read_hook_session_id`] without the freshness window.
@@ -129,15 +129,37 @@ pub fn read_hook_session_id(instance_id: &str) -> Option<String> {
 /// will, and the instance directory is about to be deleted. An idle pane whose
 /// `/new` is older than the window would otherwise lose it.
 pub fn read_hook_session_id_any_age(instance_id: &str) -> Option<String> {
-    read_hook_session_id_within(instance_id, None)
+    read_hook_session_id_within(instance_id, "session_id", None)
 }
 
-fn read_hook_session_id_within(
+pub(crate) fn read_hook_sidecar_at(
     instance_id: &str,
+    directory: &std::path::Path,
+    leaf: &str,
+    cap: usize,
+    max_age: Option<std::time::Duration>,
+) -> Option<Vec<u8>> {
+    let dir = dir_guard::open_recorded_instance_dir(instance_id, directory).ok()??;
+    let metadata = dir_guard::metadata_at(dir.as_fd(), leaf).ok()??;
+    if metadata.len() > cap as u64 {
+        return None;
+    }
+    if let Some(age) = max_age {
+        if metadata.modified().ok()?.elapsed().ok()? > age {
+            return None;
+        }
+    }
+    let bytes = dir_guard::read_file_at(dir.as_fd(), leaf, cap.saturating_add(1)).ok()??;
+    (bytes.len() <= cap).then_some(bytes)
+}
+
+pub(crate) fn read_hook_session_id_within(
+    instance_id: &str,
+    leaf: &str,
     max_age: Option<std::time::Duration>,
 ) -> Option<String> {
     let dir = dir_guard::open_instance_dir_read_only(instance_id).ok()??;
-    let meta = dir_guard::metadata_at(dir.as_fd(), "session_id").ok()??;
+    let meta = dir_guard::metadata_at(dir.as_fd(), leaf).ok()??;
     // The one extra byte permits a conventional trailing newline. Checking the
     // metadata before the bounded read prevents a longer valid prefix from
     // being accepted as a different, truncated identity.
@@ -150,8 +172,7 @@ fn read_hook_session_id_within(
             return None;
         }
     }
-    let bytes =
-        dir_guard::read_file_at(dir.as_fd(), "session_id", SESSION_ID_FILE_READ_CAP).ok()??;
+    let bytes = dir_guard::read_file_at(dir.as_fd(), leaf, SESSION_ID_FILE_READ_CAP).ok()??;
     // Recheck the opened file, not only the earlier path metadata: the hook
     // writer publishes by atomic rename, so the leaf can change between them.
     if bytes.len() > SESSION_ID_FILE_MAX_PAYLOAD {

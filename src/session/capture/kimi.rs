@@ -91,11 +91,12 @@ pub(crate) fn kimi_poll_fn_sandboxed_store(
     container_workdir: String,
     instance_id: String,
     launch_time_ms: f64,
-    extra_excludes: HashSet<String>,
+    extra_excludes: HashSet<crate::session::ConversationBinding>,
+    source: Option<crate::session::ExecutionBinding>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
         let root = AnchoredDir::open(&store).ok()?;
-        let exclusion = super::compose_exclusion(&instance_id, &extra_excludes);
+        let exclusion = super::compose_exclusion(&instance_id, &extra_excludes, source.as_ref());
         let sessions = read_kimi_session_index(&root, Path::new("session_index.jsonl")).ok()?;
         let canonical_match = canonicalize_or_raw(&container_workdir);
         sessions
@@ -130,6 +131,7 @@ mod tests {
             "current".to_string(),
             launch_ms,
             HashSet::new(),
+            None,
         )
     }
 

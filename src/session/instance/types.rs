@@ -121,6 +121,10 @@ pub(crate) struct PriorToolSession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) agent_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) agent_session_binding: Option<ConversationBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pi_session_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) acp_session_id: Option<String>,
 }
 
@@ -162,7 +166,7 @@ pub struct PluginCreateIdempotency {
     pub payload_hash: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PrimeAgentCapturePlan {
     pub(crate) store: PathBuf,
     pub(crate) session_dir: PathBuf,
@@ -170,12 +174,47 @@ pub(crate) struct PrimeAgentCapturePlan {
     pub(crate) container_cwd: String,
 }
 
-/// Where a Pi or Prime pane publishes its conversation. Distinct variants keep an
-/// unresolvable sandbox path from reading as "use the host one".
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The exact directory from which a pane publishes its conversation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum SessionSidecarSource {
-    HostHooks,
-    SandboxDir(std::path::PathBuf),
+    HostHooks(PathBuf),
+    SandboxDir(PathBuf),
+}
+
+impl SessionSidecarSource {
+    pub(crate) fn read_file(
+        &self,
+        instance_id: &str,
+        leaf: &str,
+        cap: usize,
+        max_age: Option<std::time::Duration>,
+    ) -> Option<Vec<u8>> {
+        crate::session::validate_instance_id(instance_id).ok()?;
+        match self {
+            Self::HostHooks(directory) => {
+                crate::hooks::read_hook_sidecar_at(instance_id, directory, leaf, cap, max_age)
+            }
+            Self::SandboxDir(directory) => {
+                let root = directory.parent()?.parent()?;
+                if root.join("aoe-session").join(instance_id) != *directory {
+                    return None;
+                }
+                crate::session::AnchoredDir::open(root)
+                    .ok()?
+                    .read_regular(&Path::new("aoe-session").join(instance_id).join(leaf), cap)
+                    .ok()?
+            }
+        }
+    }
+
+    pub(crate) fn host_hooks(instance_id: &str) -> Self {
+        let path = crate::hooks::hook_base_path().join(instance_id);
+        Self::HostHooks(path.canonicalize().unwrap_or(path))
+    }
+
+    pub(crate) fn matches_host_hooks(&self, instance_id: &str) -> bool {
+        *self == Self::host_hooks(instance_id)
+    }
 }
 
 #[cfg(test)]

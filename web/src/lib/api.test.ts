@@ -628,6 +628,11 @@ describe("ensureSession", () => {
   it.each([
     ["success", json({ status: "restarted" }), { ok: true, status: "restarted" }],
     [
+      "success warning",
+      json({ status: "restarted", message: "Started fresh after unavailable resume" }),
+      { ok: true, status: "restarted", message: "Started fresh after unavailable resume" },
+    ],
+    [
       "server error",
       json({ error: "boom", message: "no good" }, 500),
       { ok: false, error: "boom", message: "no good" },
@@ -644,6 +649,32 @@ describe("ensureSession", () => {
     expect(await api.ensureSession("s1")).toEqual({ ok: false, error: "aborted" });
     offline();
     expect(await api.ensureSession("s1")).toEqual({ ok: false, message: "offline" });
+  });
+});
+describe("acpDisable", () => {
+  it("returns the updated terminal view", async () => {
+    fetchSpy.mockResolvedValueOnce(json({ session_id: "s-1", view: "terminal" }));
+    expect(await api.acpDisable("s-1")).toEqual({
+      ok: true,
+      data: { session_id: "s-1", view: "terminal" },
+    });
+  });
+
+  it("surfaces recovery guidance from a refusal", async () => {
+    fetchSpy.mockResolvedValueOnce(
+      new Response("Run set-session-id --store /path to pin the native store", { status: 409 }),
+    );
+    expect(await api.acpDisable("s-1")).toEqual({
+      ok: false,
+      message: "Run set-session-id --store /path to pin the native store",
+    });
+  });
+
+  it("returns a message-less failure for an empty or unreachable response", async () => {
+    fetchSpy.mockResolvedValueOnce(empty(500));
+    expect(await api.acpDisable("s-1")).toEqual({ ok: false });
+    offline();
+    expect(await api.acpDisable("s-1")).toEqual({ ok: false });
   });
 });
 

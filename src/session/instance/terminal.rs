@@ -215,10 +215,9 @@ impl Instance {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("sandbox_info missing for sandboxed session"))?;
 
-        let detect_as = self.effective_detect_as().into_owned();
         let managed_codex_home = container_config::managed_codex_home(
             &self.tool,
-            Some(detect_as.as_str()),
+            Some(self.get_tool_command()),
             &self.source_profile,
             &self.id,
         )?;

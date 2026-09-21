@@ -139,6 +139,9 @@ pub async fn ensure_session(
                 crate::session::StartOutcome::FreshAfterFailedResume { .. } => {
                     "fresh_after_failed_resume"
                 }
+                crate::session::StartOutcome::FreshAfterUnavailableResume { .. } => {
+                    "fresh_after_unavailable_resume"
+                }
             };
             let mut body = serde_json::json!({
                 "status": "restarted",
@@ -159,6 +162,12 @@ pub async fn ensure_session(
                      The old conversation is still reachable via the agent's own \
                      resume/history picker."
                 ));
+                body["prior_session_id"] = serde_json::Value::String(sid.clone());
+            }
+            if let crate::session::StartOutcome::FreshAfterUnavailableResume { sid, notice } =
+                &outcome
+            {
+                body["message"] = serde_json::Value::String(notice.warning_message());
                 body["prior_session_id"] = serde_json::Value::String(sid.clone());
             }
             (StatusCode::OK, Json(body)).into_response()

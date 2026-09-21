@@ -43,6 +43,7 @@ pub(super) fn env_test_spawn_config(cwd: std::path::PathBuf) -> SpawnConfig {
         sandbox_info: None,
         source_profile: None,
         mcp_servers: Vec::new(),
+        claude_store_pin: None,
     }
 }
 
@@ -86,5 +87,6 @@ pub(super) fn reset_fake_spawn_config(
         sandbox_info: None,
         source_profile: None,
         mcp_servers: Vec::new(),
+        claude_store_pin: None,
     }
 }

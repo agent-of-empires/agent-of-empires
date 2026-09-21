@@ -1522,10 +1522,10 @@ fn compute_workspace_volume_paths(
 pub(crate) fn agent_shares_credential_file(
     profile: &str,
     tool: &str,
-    detect_as: Option<&str>,
+    command: Option<&str>,
 ) -> bool {
     let profile_config = super::profile_config::resolve_config_or_warn(profile);
-    resolve_active_agent(tool, detect_as, &profile_config.session)
+    resolve_active_agent(tool, command, &profile_config.session)
         .is_some_and(|agent| agent_mounts_share_credential_file(agent.name))
 }
 
@@ -1540,14 +1540,14 @@ pub(crate) fn refresh_agent_configs_for_instance(
     profile: &str,
     instance_id: &str,
     tool: &str,
-    detect_as: Option<&str>,
+    command: Option<&str>,
     fold: CredentialFold,
 ) {
     let Some(home) = dirs::home_dir() else {
         return;
     };
     let profile_config = super::profile_config::resolve_config_or_warn(profile);
-    let Some(agent) = resolve_active_agent(tool, detect_as, &profile_config.session) else {
+    let Some(agent) = resolve_active_agent(tool, command, &profile_config.session) else {
         return;
     };
     let declared = profile_config.session.agent_config_dir_for(tool, &home);
@@ -1679,7 +1679,7 @@ fn apply_folder_trust_config(
 
 pub(crate) fn ensure_folder_trust_config_for_active_agent(
     tool: &str,
-    detect_as: Option<&str>,
+    command: Option<&str>,
     profile: &str,
     instance_id: &str,
     container_workspace_path: &str,
@@ -1692,7 +1692,7 @@ pub(crate) fn ensure_folder_trust_config_for_active_agent(
     let resolved_profile = super::effective_profile(profile);
     let config = super::profile_config::resolve_config_or_warn(&resolved_profile);
     let session_config = config.session;
-    let active_agent = resolve_active_agent(tool, detect_as, &session_config);
+    let active_agent = resolve_active_agent(tool, command, &session_config);
     let config_tool = active_agent.map_or(tool, |agent| agent.name);
     // A session whose agent reads its own config dir (a wrapper exporting
     // CLAUDE_CONFIG_DIR, say) is seeded there instead: the staged directory
@@ -1741,22 +1741,26 @@ pub(crate) fn ensure_folder_trust_config_for_active_agent(
     }
 }
 
-fn resolve_active_agent(
+pub(crate) fn resolve_active_agent(
     tool: &str,
-    detect_as: Option<&str>,
+    command: Option<&str>,
     session_config: &super::SessionConfig,
 ) -> Option<&'static crate::agents::AgentDef> {
-    crate::agents::get_agent(tool)
+    let command = command
+        .or_else(|| session_config.custom_agents.get(tool).map(String::as_str))
+        .or_else(|| crate::agents::get_agent(tool).map(|agent| agent.binary))
+        .unwrap_or(tool);
+    crate::session::Instance::execution_agent_for(tool, command, session_config)
+        .ok()
         .or_else(|| {
-            detect_as
-                .filter(|name| !name.is_empty())
-                .and_then(crate::agents::get_agent)
-        })
-        .or_else(|| {
-            session_config
-                .agent_detect_as
-                .get(tool)
-                .and_then(|detect_as| crate::agents::get_agent(detect_as))
+            // Legacy status-only provisioning never grants native conversation authority.
+            if session_config.agent_execution_as.contains_key(tool) {
+                return None;
+            }
+            match session_config.agent_detect_as.get(tool) {
+                Some(name) => crate::agents::get_agent(name),
+                None => crate::agents::get_agent(tool),
+            }
         })
 }
 
@@ -1766,14 +1770,17 @@ fn resolve_active_agent(
 /// aliases, which would misread a valid container as built for another agent.
 pub(crate) fn container_agent_identity(
     tool: &str,
-    detect_as: Option<&str>,
+    command: Option<&str>,
     profile: &str,
 ) -> Result<String> {
     let resolved_profile = super::effective_profile(profile);
     let session_config = super::profile_config::resolve_config(&resolved_profile)?.session;
+    // A mount identity, never conversation authority: resolve the agent from
+    // the same inputs as the label writer in `build_container_config`, so a
+    // reused container is not rebuilt on every launch.
     Ok(agent_identity(
         tool,
-        resolve_active_agent(tool, detect_as, &session_config).map_or(tool, |a| a.name),
+        resolve_active_agent(tool, command, &session_config).map_or(tool, |a| a.name),
     ))
 }
 
@@ -1790,17 +1797,25 @@ fn agent_identity(tool: &str, config_tool: &str) -> String {
 /// containers use their private child directory without being recreated.
 pub(crate) fn managed_codex_home(
     tool: &str,
-    detect_as: Option<&str>,
+    command: Option<&str>,
     profile: &str,
+    instance_id: &str,
+) -> Result<Option<String>> {
+    let resolved_profile = super::effective_profile(profile);
+    let session_config = super::profile_config::resolve_config_or_warn(&resolved_profile).session;
+    managed_codex_home_from_config(tool, command, &session_config, instance_id)
+}
+
+pub(crate) fn managed_codex_home_from_config(
+    tool: &str,
+    command: Option<&str>,
+    session_config: &super::SessionConfig,
     instance_id: &str,
 ) -> Result<Option<String>> {
     crate::session::validate_instance_id(instance_id).map_err(|e| {
         anyhow::anyhow!("refusing to build Codex home for unsafe AOE_INSTANCE_ID: {e}")
     })?;
-    let resolved_profile = super::effective_profile(profile);
-    let session_config = super::profile_config::resolve_config_or_warn(&resolved_profile).session;
-    let config_tool =
-        resolve_active_agent(tool, detect_as, &session_config).map_or(tool, |a| a.name);
+    let config_tool = resolve_active_agent(tool, command, session_config).map_or(tool, |a| a.name);
     Ok((config_tool == "codex").then(|| format!("/root/.codex/{instance_id}")))
 }
 
@@ -1844,7 +1859,7 @@ fn agent_config_container_path(
 #[derive(Clone, Copy)]
 pub(crate) struct ContainerAgentSelection<'a> {
     tool: &'a str,
-    detect_as: Option<&'a str>,
+    command: Option<&'a str>,
     /// The agent name a user selected via the agent's selected-agent flag (e.g.
     /// Kiro's `--agent NAME`), if any. When set, sidecar status hooks are
     /// installed into that agent's sandbox config file rather than the
@@ -1857,10 +1872,10 @@ pub(crate) struct ContainerAgentSelection<'a> {
 }
 
 impl<'a> ContainerAgentSelection<'a> {
-    pub(crate) fn new(tool: &'a str, detect_as: Option<&'a str>) -> Self {
+    pub(crate) fn new(tool: &'a str, command: Option<&'a str>) -> Self {
         Self {
             tool,
-            detect_as,
+            command,
             selected_agent: None,
             credential_fold: CredentialFold::Freshest,
         }
@@ -2126,7 +2141,7 @@ pub(crate) fn build_container_config(
     let profile_session_config = &profile_config.session;
     let active_agent = resolve_active_agent(
         agent_selection.tool,
-        agent_selection.detect_as,
+        agent_selection.command,
         profile_session_config,
     );
     let config_tool = active_agent.map_or(agent_selection.tool, |agent| agent.name);
@@ -2193,7 +2208,7 @@ pub(crate) fn build_container_config(
     if !environment.iter().any(|entry| entry.key() == "CODEX_HOME") {
         if let Some(codex_home) = managed_codex_home(
             agent_selection.tool,
-            agent_selection.detect_as,
+            agent_selection.command,
             profile,
             instance_id,
         )? {
@@ -2567,7 +2582,7 @@ pub(crate) fn build_container_config(
     // prompts are approval gates and which merely block startup.
     ensure_folder_trust_config_for_active_agent(
         agent_selection.tool,
-        agent_selection.detect_as,
+        agent_selection.command,
         profile,
         instance_id,
         &workspace_path,

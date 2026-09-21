@@ -1,5 +1,6 @@
 pub mod container_interface;
 pub mod error;
+mod execution;
 pub mod image_update;
 mod runtime;
 pub(crate) mod runtime_base;
@@ -13,6 +14,7 @@ pub use container_interface::{
     ContainerConfig, EnvEntry, NamedVolumeMount, RunPolicy, VolumeMount,
 };
 use error::Result;
+pub(crate) use execution::{ContainerExecutionSnapshot, RuntimeExecutionSnapshot};
 pub use runtime::{ContainerRuntime, ContainerState};
 
 pub fn runtime_binary() -> &'static str {

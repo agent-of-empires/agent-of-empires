@@ -1228,7 +1228,15 @@ pub async fn start_session(
                 )
                     .into_response();
             }
-            (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+            let mut body = serde_json::json!(response);
+            if let crate::session::StartOutcome::FreshAfterUnavailableResume { sid, notice } =
+                &outcome
+            {
+                body["resume_outcome"] = serde_json::json!("fresh_after_unavailable_resume");
+                body["message"] = serde_json::Value::String(notice.warning_message());
+                body["prior_session_id"] = serde_json::Value::String(sid.clone());
+            }
+            (StatusCode::OK, Json(body)).into_response()
         }
         Ok(Err(boxed)) => {
             let (started, e) = *boxed;

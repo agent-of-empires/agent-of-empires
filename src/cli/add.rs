@@ -272,27 +272,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                  decouples it from the parent's agent, so the fork's resume flags may not apply."
             );
         }
-        let collides_with_fork_flags = |cmd: &str| {
-            cmd.split_whitespace().any(|w| {
-                w == "resume"
-                    || w == "fork"
-                    || w.starts_with("--resume")
-                    || w.starts_with("--session")
-                    || w.starts_with("--fork")
-            })
-        };
-        for input in [args.command.as_deref(), args.extra_args.as_deref()]
-            .into_iter()
-            .flatten()
-        {
-            if collides_with_fork_flags(input) {
-                bail!(
-                    "`--fork-from` cannot be combined with a launch command (--cmd or --extra-args) \
-                     that already contains a resume or fork flag/subcommand: the fork appends its \
-                     own resume flags, which would collide."
-                );
-            }
-        }
     }
 
     let fork_seed: Option<crate::session::ForkSeed> = if let Some(fork_ref) = &args.fork_from {
@@ -307,29 +286,22 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             );
         }
         let user_chose_tool = args.tool.is_some() || args.command.is_some();
-        if user_chose_tool && resolved_tool != source.tool {
-            bail!(
-                "Cannot fork session '{}' (agent '{}') as agent '{}': a fork must use the parent's \
-                 agent. Drop --tool/--cmd to inherit it, or fork a session created with '{}'.",
-                source.title,
-                source.tool,
-                resolved_tool,
-                resolved_tool
-            );
-        }
         if !user_chose_tool {
             resolved_tool = source.tool.clone();
         }
-        let parent_agent_session_id = source.agent_session_id.clone();
+        let parent_agent = source
+            .fork_parent_binding()
+            .and_then(|binding| binding.execution.as_ref())
+            .map(|execution| execution.agent.clone())
+            .unwrap_or_else(|| source.tool.clone());
         let seed = crate::session::fork::terminal_fork_seed(
-            &resolved_tool,
-            parent_agent_session_id.as_deref(),
+            source.fork_parent_binding(),
             crate::session::capture::generate_session_uuid(),
         )
         .map_err(|denied| match denied {
             crate::session::ForkDenied::AgentCannotFork => anyhow::anyhow!(
                 "Agent '{}' does not support forking. Forkable agents: claude, codex, opencode.",
-                resolved_tool
+                parent_agent
             ),
             crate::session::ForkDenied::NoParentSession => anyhow::anyhow!(
                 "Nothing to fork: session '{}' has no captured agent session yet. Start a conversation in it first.",
@@ -731,13 +703,14 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     if let Some(seed) = fork_seed {
         match seed {
             crate::session::ForkSeed::Terminal {
-                parent_agent_session_id,
+                parent,
                 child_session_id,
             } => {
                 instance.agent_session_id = Some(child_session_id);
                 instance.resume_intent = crate::session::ResumeIntent::Fork {
-                    from: parent_agent_session_id,
+                    from: parent.session_id.clone(),
                 };
+                instance.resume_binding = Some(parent);
             }
             crate::session::ForkSeed::Structured { .. } => {}
         }

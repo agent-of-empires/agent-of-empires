@@ -74,7 +74,8 @@ pub(crate) fn gemini_poll_fn_sandboxed_store(
     container_cwd: String,
     instance_id: String,
     capture_floor: SystemTime,
-    extra_excludes: HashSet<String>,
+    extra_excludes: HashSet<crate::session::ConversationBinding>,
+    source: Option<crate::session::ExecutionBinding>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     let expected_hash = project_hash(&container_cwd);
     move || {
@@ -100,7 +101,7 @@ pub(crate) fn gemini_poll_fn_sandboxed_store(
             })
             .collect::<Vec<_>>();
         candidates.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
-        let exclusion = super::compose_exclusion(&instance_id, &extra_excludes);
+        let exclusion = super::compose_exclusion(&instance_id, &extra_excludes, source.as_ref());
         candidates.into_iter().find_map(|(path, _)| {
             let (id, project_hash) = extract_gemini_fields_anchored(&root, &path)?;
             let id = id?;
@@ -123,6 +124,7 @@ mod tests {
             "current".to_string(),
             capture_floor(floor),
             HashSet::new(),
+            None,
         )
     }
 

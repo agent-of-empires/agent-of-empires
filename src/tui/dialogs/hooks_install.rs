@@ -201,6 +201,9 @@ impl HooksInstallDialog {
         for path in &self.settings_paths {
             lines.push(Line::from(format!("  {}", path)));
         }
+        lines.push(Line::from(
+            "  Also includes selected or recorded Claude conversation stores.",
+        ));
 
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(

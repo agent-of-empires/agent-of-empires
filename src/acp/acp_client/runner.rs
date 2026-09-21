@@ -53,7 +53,7 @@ pub(super) fn spawn_runner_detached(
     socket_path: &std::path::Path,
     session_id: String,
     session_sandbox: Option<&SessionSandbox>,
-) -> Result<u32, AcpError> {
+) -> Result<(u32, Option<crate::session::ExecutionBinding>), AcpError> {
     let current_exe =
         std::env::current_exe().map_err(|e| AcpError::Spawn(format!("current_exe: {e}")))?;
     let log_path = crate::process::worker_registry::log_path_for(&session_id)
@@ -255,6 +255,7 @@ pub(super) fn spawn_runner_detached(
         "spawning detached structured view runner"
     );
 
+    let native_store = super::spawn::native_store_snapshot(config, cmd.as_std(), &host_environment);
     let mut child = cmd.spawn().map_err(|e| {
         warn!(
             target: "acp.protocol.spawn",
@@ -271,5 +272,5 @@ pub(super) fn spawn_runner_detached(
     tokio::spawn(async move {
         let _ = child.wait().await;
     });
-    Ok(pid)
+    Ok((pid, native_store))
 }
