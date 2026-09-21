@@ -39,7 +39,7 @@ fn is_stuck_default(value: &str) -> bool {
 }
 
 fn migrate_config_file(path: &Path) -> Result<()> {
-    config_file::rewrite_strict(path, |doc| {
+    config_file::rewrite_strict(path, "v010", |doc| {
         let Some(session) = doc.get_mut("session").and_then(|s| s.as_table_mut()) else {
             return false;
         };

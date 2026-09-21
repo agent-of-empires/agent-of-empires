@@ -19,7 +19,7 @@ pub fn run() -> Result<()> {
 fn migrate_config_file(path: &Path) -> Result<()> {
     // Strict: skipping an unparseable config would bump the schema and lose a
     // user's opt-out for good, since serde never reads `check_enabled` again.
-    config_file::rewrite_strict(path, |doc| {
+    config_file::rewrite_strict(path, "v009", |doc| {
         let Some(updates) = doc.get_mut("updates").and_then(|u| u.as_table_mut()) else {
             return false;
         };

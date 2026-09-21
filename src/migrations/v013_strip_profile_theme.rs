@@ -22,7 +22,7 @@ pub fn run() -> Result<()> {
 const GLOBAL_THEME_KEYS: &[&str] = &["name", "color_mode"];
 
 fn strip_profile_theme(path: &Path) -> Result<()> {
-    config_file::rewrite_strict(path, |doc| {
+    config_file::rewrite_strict(path, "v013", |doc| {
         let Some(theme) = doc.get_mut("theme").and_then(|t| t.as_table_mut()) else {
             return false;
         };
