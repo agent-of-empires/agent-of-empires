@@ -3546,6 +3546,17 @@
       "components": ["web/src/App.tsx", "web/src/lib/api.ts", "web/src/hooks/useProjects.ts"]
     },
     {
+      "id": "sidebar.active-project-settings",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/sidebar-project-settings.spec.ts"],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/ProjectFormModal.tsx"
+      ]
+    },
+    {
       "id": "triage.archive-toggle",
       "kind": "live-playwright",
       "risk": "high",

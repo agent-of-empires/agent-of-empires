@@ -31,6 +31,7 @@ export interface ListContext {
   onUpdateAppearance: (repoId: string, update: RepoAppearanceUpdate) => void;
   onPinProject?: (repoPath: string) => void;
   onUnpinProject?: (group: SidebarGroup) => void;
+  onEditProjectSettings?: (group: SidebarGroup) => void;
   onArchiveGroup: (group: SidebarGroup) => void;
   rowProps: (v: SidebarWorkspaceView) => RowProps;
 }
@@ -67,6 +68,7 @@ function GroupHeader({
       onArchiveAll={locked ? undefined : () => ctx.onArchiveGroup(full)}
       onPin={locked || !pinnable ? undefined : ctx.onPinProject}
       onUnpin={locked || !pinnable ? undefined : ctx.onUnpinProject}
+      onEditProject={locked || !pinnable ? undefined : ctx.onEditProjectSettings}
       onNewSession={() =>
         createsInRepo && full.capabilities.create === "repo" && full.repoPath
           ? ctx.onCreateSession(full.repoPath)

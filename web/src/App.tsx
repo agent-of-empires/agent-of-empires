@@ -1292,6 +1292,8 @@ function AppContent({
       const latest = projectSessions[0];
       const profile = latest?.profile || requireProjectProfile();
       if (!profile) return;
+      const key = normalizeProjectPathKey(repoPath);
+      const registered = projects.find((project) => normalizeProjectPathKey(project.path) === key);
 
       setWizardPrefill({
         path: repoPath,
@@ -1300,10 +1302,11 @@ function AppContent({
         sandboxEnabled: latest?.is_sandboxed ?? false,
         profile,
         group: latest?.group_path || undefined,
+        worktreeEnabled: registered?.overrides?.worktree_enabled,
       });
       setShowSessionWizard(true);
     },
-    [sessions, requireProjectProfile],
+    [sessions, projects, requireProjectProfile],
   );
 
   const handlePinProject = useCallback(
@@ -1360,6 +1363,27 @@ function AppContent({
       if (profile && projects.includes(project)) setProjectForm({ editProject: project, profile });
     },
     [projects, requireProjectProfile],
+  );
+
+  const handleEditProjectSettings = useCallback(
+    async (group: SidebarGroup) => {
+      const profile = requireProjectProfile();
+      if (!profile) return;
+      const registered = group.registeredProjects.find((project) => projects.includes(project));
+      if (registered) {
+        setProjectForm({ editProject: registered, profile });
+        return;
+      }
+      if (!group.repoPath) return;
+      const result = await createProject({ path: group.repoPath, scope: "global", profile });
+      if (!result.ok || !result.project) {
+        toastBus.handler?.error(result.error ?? "Failed to register project");
+        return;
+      }
+      await refreshProjects();
+      setProjectForm({ editProject: result.project, profile });
+    },
+    [projects, refreshProjects, requireProjectProfile],
   );
 
   // Remove only the registrations captured by this sidebar row.
@@ -2288,6 +2312,7 @@ function AppContent({
               onCreateSession={handleCreateSession}
               onPinProject={projectsReady ? handlePinProject : undefined}
               onUnpinProject={projectsReady ? handleUnpinProject : undefined}
+              onEditProjectSettings={projectsReady ? handleEditProjectSettings : undefined}
               savedProjects={savedProjects}
               onAddProject={handleAddProject}
               onEditProject={handleEditProject}

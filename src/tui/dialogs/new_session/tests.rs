@@ -1092,3 +1092,85 @@ fn branch_picker_mouse_selection_routes_to_the_focused_field() {
         dialog.worktree_branch.value()
     );
 }
+
+#[test]
+#[serial_test::serial]
+fn test_reload_config_defaults_uses_project_worktree_override() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+
+    let repo = tempfile::tempdir().expect("temp repo");
+    crate::session::projects::add(
+        "default",
+        crate::session::ProjectScope::Global,
+        crate::session::Project::new(
+            "demo",
+            repo.path().to_string_lossy(),
+            crate::session::ProjectScope::Global,
+        ),
+        false,
+    )
+    .expect("register project");
+    crate::session::projects::update_overrides(
+        "default",
+        crate::session::ProjectScope::Global,
+        "demo",
+        |ov| ov.worktree_enabled = Some(true),
+    )
+    .expect("set override");
+
+    let mut dialog = single_tool_dialog();
+    dialog.path = Input::new(repo.path().to_string_lossy().to_string());
+    dialog.available_profiles = vec!["default".to_string()];
+    dialog.profile_descriptions = vec![None];
+    dialog.profile_index = 0;
+    // Global config's worktree.enabled defaults to false; the project's
+    // override should win.
+    dialog.reload_config_defaults();
+
+    assert!(
+        dialog.worktree_enabled,
+        "project override should win over the false global default"
+    );
+
+    // Browsing to the project applies its override without resetting other edits.
+    let mut dialog = multi_tool_dialog();
+    dialog.tool_index = 1;
+    dialog.yolo_mode = true;
+    dialog.focused_field = 0;
+    dialog.path = Input::new(repo.path().to_string_lossy().to_string());
+    dialog.handle_key(ctrl_key(KeyCode::Char('p')));
+    dialog.handle_key(key(KeyCode::Enter));
+    assert!(!dialog.dir_picker.is_active());
+    assert!(dialog.worktree_enabled);
+    assert_eq!((dialog.tool_index, dialog.yolo_mode), (1, true));
+
+    let pick = |dialog: &mut NewSessionDialog, path: &std::path::Path| {
+        dialog.focused_field = 0;
+        dialog.path = Input::new(path.to_string_lossy().to_string());
+        dialog.handle_key(ctrl_key(KeyCode::Char('p')));
+        dialog.handle_key(key(KeyCode::Enter));
+    };
+    // Leaving the project drops its override; a direct toggle then survives picks.
+    let unregistered = tempfile::tempdir().expect("unregistered dir");
+    pick(&mut dialog, unregistered.path());
+    assert!(!dialog.worktree_enabled);
+    dialog.focused_field = 4;
+    dialog.handle_key(key(KeyCode::Char(' ')));
+    assert!(dialog.worktree_enabled);
+    pick(&mut dialog, unregistered.path());
+    assert!(dialog.worktree_enabled);
+
+    // A typed path applies the override once focus leaves the field.
+    let mut dialog = single_tool_dialog();
+    dialog.path = Input::default();
+    type_str(&mut dialog, &repo.path().to_string_lossy());
+    dialog.handle_key(key(KeyCode::Tab));
+    assert!(dialog.worktree_enabled);
+
+    // Submitting straight from the path field applies it too.
+    let mut dialog = single_tool_dialog();
+    dialog.path = Input::default();
+    type_str(&mut dialog, &repo.path().to_string_lossy());
+    assert!(submitted(dialog.handle_key(key(KeyCode::Enter))).worktree_enabled);
+}

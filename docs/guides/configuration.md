@@ -10,6 +10,8 @@ Later layers override earlier ones. Only explicitly set fields override; unset f
 
 All settings below can also be edited from the TUI settings screen (press `s` or access via the menu).
 
+A project registry entry can override `worktree.enabled` and `session.smart_rename` for that project from the web Projects view or the TUI add-project form. Project overrides win over all three configuration layers. They live in the user's `projects.json`, not the repository, so they do not weaken either field's `repo = "deny"` policy.
+
 ## File Locations
 
 | Platform | Global Config |

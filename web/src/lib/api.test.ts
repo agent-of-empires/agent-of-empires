@@ -280,6 +280,27 @@ const requestCases: RequestCase[] = [
     { body: { default_base_branch: null }, respond: json({}) },
   ],
   [
+    "PATCH /api/projects/p?scope=global",
+    () =>
+      api.updateProject(
+        "p",
+        { scope: "global" },
+        {
+          default_base_branch: "develop",
+          overrides: { worktree_enabled: true, smart_rename: null },
+        },
+      ),
+    {
+      body: { default_base_branch: "develop", overrides: { worktree_enabled: true, smart_rename: null } },
+      respond: json({}),
+    },
+  ],
+  [
+    "POST /api/projects",
+    () => api.createProject({ path: "/p", overrides: { worktree_enabled: true } }),
+    { body: { path: "/p", overrides: { worktree_enabled: true } }, respond: json({}) },
+  ],
+  [
     "PATCH /api/projects/a%20b?scope=profile&profile=default",
     () => api.updateProject("a b", { scope: "profile", profile: "default" }, { pinned: true }),
     { body: { pinned: true }, respond: json({ pinned: true }), result: { ok: true, project: { pinned: true } } },

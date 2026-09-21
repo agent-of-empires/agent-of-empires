@@ -142,6 +142,11 @@ pub struct ProjectResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_base_branch: Option<String>,
     pub pinned: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::session::ProjectOverrides::is_empty"
+    )]
+    pub overrides: crate::session::ProjectOverrides,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

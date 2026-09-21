@@ -239,17 +239,15 @@ pub fn render_first_turn(user_prompt: &str, agent_prose: &str) -> String {
     }
 }
 
-/// Project a resolved [`SessionConfig`] into the three fields the smart-rename
-/// indicator (`list_sessions` in `src/server/api/sessions/list.rs`) and the runtime
-/// gate ([`try_smart_rename`]) both consume. Shared projection so the two
-/// call sites cannot drift on which fields count: each site fetches the
-/// resolved config via
-/// [`crate::session::config::repo_config::resolve_config_with_repo_or_warn`] and
-/// passes `.session` through this function. Returns borrowed refs so the
-/// sidebar's per-row call does not allocate. See #2603.
-pub fn resolve_smart_rename_config(session: &SessionConfig) -> SmartRenameConfig<'_> {
+/// Project a resolved [`SessionConfig`] into the fields the smart-rename
+/// indicator (`list_sessions` in `src/server/api/sessions/list.rs`) and runtime
+/// gates consume. The caller resolves the registered project override once.
+pub fn resolve_smart_rename_config(
+    session: &SessionConfig,
+    smart_rename_override: Option<bool>,
+) -> SmartRenameConfig<'_> {
     SmartRenameConfig {
-        setting_on: session.smart_rename,
+        setting_on: smart_rename_override.unwrap_or(session.smart_rename),
         rename_agent: &session.smart_rename_agent,
         overrides: &session.agent_command_override,
         rename_model: &session.smart_rename_model,
@@ -656,7 +654,12 @@ pub fn maybe_spawn_terminal_smart_rename(inst: &crate::session::instance::Instan
         &inst.source_profile,
         Path::new(&inst.project_path),
     );
-    let cfg = resolve_smart_rename_config(&resolved.session);
+    let smart_rename_override = crate::session::projects::find_by_canonical_path(
+        &inst.source_profile,
+        Path::new(inst.repo_path()),
+    )
+    .and_then(|project| project.overrides.smart_rename);
+    let cfg = resolve_smart_rename_config(&resolved.session, smart_rename_override);
     if check_eligible_resolved(
         true,
         cfg.setting_on,
@@ -1043,7 +1046,10 @@ fn prepare_terminal_rename(
         profile,
         Path::new(&instance.project_path),
     );
-    let cfg = resolve_smart_rename_config(&resolved.session);
+    let smart_rename_override =
+        crate::session::projects::find_by_canonical_path(profile, Path::new(instance.repo_path()))
+            .and_then(|project| project.overrides.smart_rename);
+    let cfg = resolve_smart_rename_config(&resolved.session, smart_rename_override);
     let sandboxed = instance.is_sandboxed();
     let agent = match check_eligible_resolved(
         true,
@@ -1276,6 +1282,7 @@ mod serve {
             tool,
             command,
             project_path,
+            repo_path,
             sandboxed,
             container_workdir,
             title,
@@ -1288,6 +1295,7 @@ mod serve {
                     i.tool.clone(),
                     i.command.clone(),
                     i.project_path.clone(),
+                    i.repo_path().to_string(),
                     i.is_sandboxed(),
                     i.container_workdir(),
                     i.title.clone(),
@@ -1303,7 +1311,10 @@ mod serve {
             &profile,
             Path::new(&project_path),
         );
-        let cfg = resolve_smart_rename_config(&resolved.session);
+        let smart_rename_override =
+            crate::session::projects::find_by_canonical_path(&profile, Path::new(&repo_path))
+                .and_then(|project| project.overrides.smart_rename);
+        let cfg = resolve_smart_rename_config(&resolved.session, smart_rename_override);
         let agent = match check_eligible_resolved(
             structured,
             cfg.setting_on || force,
@@ -2578,7 +2589,11 @@ claude = "repo-wrapper"
                 .map(String::as_str),
             Some("claude")
         );
-        let cfg = resolve_smart_rename_config(&resolved.session);
+        let cfg = resolve_smart_rename_config(
+            &resolved.session,
+            crate::session::projects::find_by_canonical_path("default", repo.path())
+                .and_then(|project| project.overrides.smart_rename),
+        );
         assert_eq!(
             cfg.rename_agent, "opencode",
             "the user's utility agent wins; a repo cannot redirect the one-shot"
@@ -2602,6 +2617,43 @@ claude = "repo-wrapper"
         )
         .expect("eligible");
         assert_eq!(agent.binary, "opencode");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_smart_rename_config_honors_project_override() {
+        let home = tempfile::tempdir().expect("tempdir HOME");
+        let _home_guard = crate::session::test_support::isolate_home(home.path());
+        let repo = tempfile::tempdir().expect("tempdir repo");
+        crate::session::projects::add(
+            "default",
+            crate::session::ProjectScope::Global,
+            crate::session::Project::new(
+                "demo",
+                repo.path().to_string_lossy(),
+                crate::session::ProjectScope::Global,
+            ),
+            false,
+        )
+        .expect("register project");
+        crate::session::projects::update_overrides(
+            "default",
+            crate::session::ProjectScope::Global,
+            "demo",
+            |overrides| overrides.smart_rename = Some(false),
+        )
+        .expect("set override");
+
+        let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+            "default",
+            repo.path(),
+        );
+        let cfg = resolve_smart_rename_config(
+            &resolved.session,
+            crate::session::projects::find_by_canonical_path("default", repo.path())
+                .and_then(|project| project.overrides.smart_rename),
+        );
+        assert!(!cfg.setting_on);
     }
 
     // ---- Terminal (non-ACP) smart rename ----

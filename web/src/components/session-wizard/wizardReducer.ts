@@ -7,6 +7,13 @@ export interface WizardData {
   worktreeBranch: string;
   worktreeBranchDirty: boolean;
   useWorktree: boolean;
+  /** Profile-resolved worktree default, independent of any project override. */
+  profileWorktreeDefault: boolean;
+  /** The selected saved project's worktree override; outranks `profileWorktreeDefault`. */
+  projectWorktreeOverride: boolean | undefined;
+  /** Set only by a direct `useWorktree` edit, so an unrelated profile-field edit does not block
+   *  a project override seed. */
+  worktreeDirty: boolean;
   /** Attach to an existing branch's worktree (`create_new_branch: false`). */
   attachExisting: boolean;
   /** Empty means the project's default branch. */
@@ -70,7 +77,9 @@ export type Action =
       agentEffort?: string;
       /** Mount-time seeding sets this so a late settings response cannot clobber user edits. */
       skipIfDirty?: boolean;
-    };
+    }
+  /** `path`, when set, drops the seed if the selected path has since changed. */
+  | { type: "SEED_PROJECT_WORKTREE_OVERRIDE"; override: boolean | undefined; path?: string };
 
 export const initialData: WizardData = {
   path: "",
@@ -79,6 +88,9 @@ export const initialData: WizardData = {
   worktreeBranchDirty: false,
   // Matches the backend `worktree.enabled` default; seeded from settings on mount.
   useWorktree: false,
+  profileWorktreeDefault: false,
+  projectWorktreeOverride: undefined,
+  worktreeDirty: false,
   attachExisting: false,
   baseBranch: "",
   group: "",
@@ -133,6 +145,7 @@ function setField(data: WizardData, field: string, value: unknown): WizardData {
   if (field === "path") next.pathIsGitRepo = true;
   if (field === "pathIsGitRepo" && value === false) next.useWorktree = false;
   if (PROFILE_FIELDS.includes(field)) next.profileDirty = true;
+  if (field === "useWorktree") next.worktreeDirty = true;
   return next;
 }
 
@@ -140,6 +153,22 @@ export function reducer(state: WizardState, action: Action): WizardState {
   switch (action.type) {
     case "SET_FIELD":
       return { ...state, data: setField(state.data, action.field, action.value), error: null };
+    case "SEED_PROJECT_WORKTREE_OVERRIDE": {
+      // A manual worktree toggle wins; still record the override for a later profile reset.
+      if (action.path !== undefined && action.path !== state.data.path) return state;
+      const projectWorktreeOverride = action.override;
+      if (state.data.worktreeDirty) {
+        return { ...state, data: { ...state.data, projectWorktreeOverride } };
+      }
+      const useWorktree =
+        state.data.scratch || state.data.pathIsGitRepo === false
+          ? false
+          : (projectWorktreeOverride ?? state.data.profileWorktreeDefault);
+      return {
+        ...state,
+        data: { ...state.data, projectWorktreeOverride, useWorktree },
+      };
+    }
     case "SUBMIT_START":
       return { ...state, isSubmitting: true, error: null };
     case "SUBMIT_ERROR":
@@ -156,25 +185,41 @@ export function reducer(state: WizardState, action: Action): WizardState {
       return { ...state, profiles: action.profiles };
     case "SET_DOCKER":
       return { ...state, dockerAvailable: action.available };
-    case "APPLY_PROFILE_DEFAULTS":
-      if (action.skipIfDirty && state.data.profileDirty) return state;
+    case "APPLY_PROFILE_DEFAULTS": {
+      // A remembered or prefilled path can resolve its repo probe before this arrives, so the
+      // seeded default must not flip a worktree back on for a scratch session or a non-repo path.
+      const resolvedUseWorktree = () =>
+        state.data.scratch || state.data.pathIsGitRepo === false
+          ? false
+          : (state.data.projectWorktreeOverride ?? action.worktreeEnabled);
+      if (action.skipIfDirty && state.data.profileDirty) {
+        // Still record the real default, or a later project with no override falls back to `false`.
+        return {
+          ...state,
+          data: {
+            ...state.data,
+            profileWorktreeDefault: action.worktreeEnabled,
+            useWorktree: state.data.worktreeDirty ? state.data.useWorktree : resolvedUseWorktree(),
+          },
+        };
+      }
       return {
         ...state,
         data: {
           ...state.data,
           yoloMode: action.yoloMode,
           sandboxEnabled: action.sandboxEnabled,
-          // A remembered or prefilled path can resolve its repo probe before
-          // this arrives, so the seeded default must not flip a worktree back
-          // on for a scratch session or a non-repo path.
-          useWorktree: state.data.scratch || state.data.pathIsGitRepo === false ? false : action.worktreeEnabled,
+          useWorktree: resolvedUseWorktree(),
+          profileWorktreeDefault: action.worktreeEnabled,
           tool: action.tool || state.data.tool,
           extraEnv: action.extraEnv,
           agentModel: action.agentModel ?? "",
           agentEffort: action.agentEffort ?? "",
           profileDirty: false,
+          worktreeDirty: false,
         },
       };
+    }
     default:
       return state;
   }

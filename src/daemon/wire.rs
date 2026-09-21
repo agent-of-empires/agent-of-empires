@@ -189,6 +189,11 @@ pub struct CreateProjectBody {
     pub default_base_branch: Option<String>,
     #[serde(default)]
     pub pinned: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::session::ProjectOverrides::is_empty"
+    )]
+    pub overrides: crate::session::ProjectOverrides,
 }
 
 #[derive(Serialize, Deserialize)]

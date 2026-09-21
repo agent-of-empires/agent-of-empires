@@ -25,6 +25,7 @@ impl From<Project> for ProjectResponse {
             scope: project.scope,
             default_base_branch: project.default_base_branch,
             pinned: project.pinned,
+            overrides: project.overrides,
         }
     }
 }
@@ -306,6 +307,7 @@ pub async fn create_project(
     let scope = body.scope;
     let allow_override = body.allow_override;
     let preflight = tokio::task::spawn_blocking(move || {
+        let profile = body.profile;
         let path = std::path::PathBuf::from(body.path);
         let canonical = path.canonicalize().unwrap_or(path);
         if !canonical.is_dir() {
@@ -315,16 +317,21 @@ pub async fn create_project(
                 "Path does not exist or is not a directory",
             ));
         }
-        let name = body.name.unwrap_or_else(|| {
-            canonical
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "project".to_owned())
-        });
+        let name = match body.name {
+            Some(name) => name,
+            None => {
+                let base = canonical
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "project".to_owned());
+                projects::unique_name(&profile, scope, &base)
+            }
+        };
         let project = Project::new(name, canonical.to_string_lossy(), scope)
             .with_base_branch(body.default_base_branch)
-            .with_pinned(body.pinned);
-        Ok((body.profile, project))
+            .with_pinned(body.pinned)
+            .with_overrides(body.overrides);
+        Ok((profile, project))
     })
     .await;
     let (profile, project) = match preflight {
@@ -380,6 +387,42 @@ pub async fn delete_project(
     )
     .await
 }
+#[derive(Default)]
+struct OverridesPatch {
+    worktree_enabled: Option<Option<bool>>,
+    smart_rename: Option<Option<bool>>,
+}
+
+fn parse_overrides_patch(
+    body: &serde_json::Value,
+) -> Result<OverridesPatch, (&'static str, &'static str)> {
+    let worktree_enabled = match body.get("worktree_enabled") {
+        None => None,
+        Some(serde_json::Value::Null) => Some(None),
+        Some(serde_json::Value::Bool(value)) => Some(Some(*value)),
+        Some(_) => {
+            return Err((
+                "bad_field",
+                "overrides.worktree_enabled must be a boolean or null",
+            ));
+        }
+    };
+    let smart_rename = match body.get("smart_rename") {
+        None => None,
+        Some(serde_json::Value::Null) => Some(None),
+        Some(serde_json::Value::Bool(value)) => Some(Some(*value)),
+        Some(_) => {
+            return Err((
+                "bad_field",
+                "overrides.smart_rename must be a boolean or null",
+            ));
+        }
+    };
+    Ok(OverridesPatch {
+        worktree_enabled,
+        smart_rename,
+    })
+}
 
 fn parse_project_patch(
     mut body: serde_json::Value,
@@ -398,15 +441,26 @@ fn parse_project_patch(
         Some(serde_json::Value::Bool(value)) => Some(*value),
         Some(_) => return Err(("bad_field", "pinned must be a boolean")),
     };
-    if base_branch.is_none() && pinned.is_none() {
+    let overrides = match body.get("overrides") {
+        None => OverridesPatch::default(),
+        Some(value @ serde_json::Value::Object(_)) => parse_overrides_patch(value)?,
+        Some(_) => return Err(("bad_field", "overrides must be an object")),
+    };
+    if base_branch.is_none()
+        && pinned.is_none()
+        && overrides.worktree_enabled.is_none()
+        && overrides.smart_rename.is_none()
+    {
         return Err((
             "no_fields",
-            "provide at least one of: default_base_branch, pinned",
+            "provide at least one of: default_base_branch, pinned, overrides",
         ));
     }
     Ok(ProjectPatch {
         base_branch,
         pinned,
+        worktree_enabled: overrides.worktree_enabled,
+        smart_rename: overrides.smart_rename,
     })
 }
 
@@ -589,7 +643,7 @@ mod tests {
                     .uri("/api/projects/target?scope=profile&profile=beta")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"pinned":true,"default_base_branch":" release "}"#,
+                        r#"{"pinned":true,"default_base_branch":" release ","overrides":{"worktree_enabled":true,"smart_rename":false}}"#,
                     ))?,
             )
             .await?;
@@ -629,6 +683,8 @@ mod tests {
             profile.projects[0].default_base_branch.as_deref(),
             Some("release")
         );
+        assert_eq!(profile.projects[0].overrides.worktree_enabled, Some(true));
+        assert_eq!(profile.projects[0].overrides.smart_rename, Some(false));
         projects::add(
             "beta",
             ProjectScope::Profile,
@@ -653,9 +709,10 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&bytes)?,
             serde_json::to_value(&profile.projects)?
         );
-        for (body, expected_base) in [
-            (r#"{"pinned":false}"#, Some("release")),
-            (r#"{"default_base_branch":null}"#, None),
+        for (body, expected_base, expected_smart_rename) in [
+            (r#"{"pinned":false}"#, Some("release"), Some(false)),
+            (r#"{"default_base_branch":null}"#, None, Some(false)),
+            (r#"{"overrides":{"smart_rename":null}}"#, None, None),
         ] {
             let response = router
                 .clone()
@@ -672,9 +729,16 @@ mod tests {
             let project: crate::daemon::ProjectResponse = serde_json::from_slice(&bytes)?;
             assert!(!project.pinned);
             assert_eq!(project.default_base_branch.as_deref(), expected_base);
+            assert_eq!(project.overrides.worktree_enabled, Some(true));
+            assert_eq!(project.overrides.smart_rename, expected_smart_rename);
         }
         let before = projects::load_profile("beta")?;
-        for body in [r#"{"default_base_branch":"trunk","pinned":"false"}"#, "{}"] {
+        for body in [
+            r#"{"default_base_branch":"trunk","pinned":"false"}"#,
+            r#"{"overrides":{"worktree_enabled":"yes"}}"#,
+            r#"{"overrides":"nope"}"#,
+            "{}",
+        ] {
             let rejected = router
                 .clone()
                 .oneshot(

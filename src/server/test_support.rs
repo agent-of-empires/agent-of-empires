@@ -184,6 +184,11 @@ fn build_test_app_state_impl(
     state
 }
 
+pub async fn refresh_canonical_metadata_for_test(state: &Arc<AppState>) {
+    let loaded = super::reload::load_all_profiles(&state.file_watch).expect("load profiles");
+    *state.canonical_metadata.write().await = loaded.metadata;
+}
+
 pub async fn drain_session_id_updates_for_test(state: &Arc<AppState>) {
     super::session_identity::drain_session_id_updates_in_state(state).await;
 }
