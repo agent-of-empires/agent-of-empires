@@ -11,29 +11,24 @@ use tracing::warn;
 
 use super::errors::AcpError;
 
-/// Whether to issue ACP `session/fork` on this connect: only when a fork was
-/// requested AND the agent advertised the (unstable) fork capability. Falls
-/// back to the normal new/load handshake otherwise (which, for a fork that
-/// can't run, surfaces as an empty new session rather than corrupting the
-/// parent).
+/// A fork needs both a requested parent and the agent's fork capability;
+/// otherwise the normal new/load handshake runs, which surfaces an unfulfilled
+/// fork as an empty session rather than corrupting the parent.
 pub(crate) fn should_fork(fork_from: Option<&str>, agent_advertises_fork: bool) -> bool {
     fork_from.is_some_and(|s| !s.is_empty()) && agent_advertises_fork
 }
 
-/// Build the ACP `initialize` request AoE sends to every agent adapter.
-/// `client_info` is mandatory here: strict agent backends (Mistral Vibe's
-/// `vibe-acp`) reject an initialize whose `client_name`/`client_version` are
-/// empty strings, which is what omitting it serializes to. See issue #2767.
+/// `client_info` is mandatory: a strict backend rejects the empty strings that
+/// omitting it serializes to (#2767).
 pub(super) fn build_initialize_request() -> InitializeRequest {
     let capabilities = ClientCapabilities::new()
         .fs(FileSystemCapabilities::new()
             .read_text_file(true)
             .write_text_file(true))
         .terminal(true)
-        // Advertise form-mode elicitation so claude-agent-acp
-        // (>=0.44) re-enables AskUserQuestion and routes it to us as
-        // an `elicitation/create` request. Without this the adapter
-        // unconditionally blacklists the tool. See handle_elicitation_request.
+        // Form-mode elicitation re-enables claude-agent-acp's AskUserQuestion,
+        // which it otherwise blacklists, and routes it to
+        // `handle_elicitation_request`.
         .elicitation(ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()));
     InitializeRequest::new(ProtocolVersion::V1)
         .client_capabilities(capabilities)
@@ -43,16 +38,9 @@ pub(super) fn build_initialize_request() -> InitializeRequest {
         )
 }
 
-/// Wait for the connection task to finish the ACP handshake (or fail).
-/// Bounds the wait so a wedged agent (the classic `npx -y` first-run
-/// download stall) returns a clear typed error instead of leaving the
-/// supervisor parked indefinitely. Also watches for early child exit
-/// and surfaces stderr in the message so callers see why it died.
-///
-/// `install_binary` is the binary name from `AgentSpec.command` so the
-/// timeout message points users at the right install command for the
-/// specific agent (codex-acp / opencode / gemini, not always
-/// claude-agent-acp).
+/// Bounded so a wedged agent (the `npx -y` first-run download stall) returns a
+/// typed error instead of parking the supervisor. `install_binary` points the
+/// timeout message at the configured agent's own install command.
 pub(super) async fn wait_for_handshake(
     session_label: &str,
     ready_rx: oneshot::Receiver<Result<(), AcpError>>,
@@ -108,11 +96,9 @@ pub(super) async fn collect_child_failure(child: Option<&Arc<Mutex<tokio::proces
 mod tests {
     use super::*;
 
+    /// #2767: a strict backend rejects an empty client_name/client_version.
     #[test]
     fn initialize_request_carries_non_empty_client_info() {
-        // Regression for #2767: strict agent backends (Mistral Vibe) reject an
-        // initialize whose client_name/client_version are empty. Our request
-        // must always send a populated client_info.
         let req = build_initialize_request();
         let info = req.client_info.expect("client_info must be set");
         assert_eq!(info.name, "agent-of-empires");
@@ -127,34 +113,22 @@ mod tests {
         assert!(!should_fork(Some(""), true));
     }
 
-    /// Pin the ACP fork wire shape our production path reads, against the
-    /// `agent_client_protocol` serde derives. `should_fork` keys off
-    /// `agent_capabilities.session_capabilities.fork.is_some()`, and the fork
-    /// response is read via `resp.session_id`. If upstream renames either key
-    /// (e.g. `fork` -> `session_fork`, or `sessionId` casing), these
-    /// deserializations flip: the capability would read absent (silent
-    /// `session/new` downgrade in production) or the response would fail to
-    /// parse. The fake agent (`web/tests/helpers/fakeAcpAgent.mjs`) sends these
-    /// exact keys, so pinning them here catches an upstream drift that the fake
-    /// would otherwise mask. See PR review.
+    /// Pins the fork wire keys against upstream serde drift. An upstream
+    /// rename would make the capability read absent (a silent `session/new`
+    /// downgrade) or fail the response parse, and the fake agent sends these
+    /// exact keys, so it would otherwise mask the drift.
     #[test]
     fn acp_fork_capability_and_response_wire_keys_are_stable() {
         use agent_client_protocol::schema::v1::{ForkSessionResponse, SessionCapabilities};
 
-        // The fork capability is advertised as a `"fork": {}` object nested in
-        // the session capabilities the agent returns from `initialize`.
         let caps: SessionCapabilities =
             serde_json::from_value(serde_json::json!({ "fork": {} })).expect("caps parse");
-        assert!(
-            caps.fork.is_some(),
-            "the `fork` capability key must deserialize into SessionCapabilities.fork"
-        );
-        // Absent/`null` fork must read as not-forkable (the resume-only shape).
+        assert!(caps.fork.is_some());
+        // Absent fork must read as not-forkable, the resume-only shape.
         let no_fork: SessionCapabilities =
             serde_json::from_value(serde_json::json!({})).expect("empty caps parse");
         assert!(no_fork.fork.is_none());
 
-        // The fork response identifies the child session under `sessionId`.
         let resp: ForkSessionResponse =
             serde_json::from_value(serde_json::json!({ "sessionId": "child-123" }))
                 .expect("fork response parse");

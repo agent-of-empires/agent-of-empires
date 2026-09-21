@@ -5,47 +5,18 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 use serial_test::parallel;
 
-use crate::harness::{require_tmux, TuiTestHarness};
+use crate::harness::{require_tmux, session_by_title, write_executable, TuiTestHarness};
 
 const TITLE: &str = "ResumeFallbackE2E";
 const FAKE_AGENT: &str = "claude";
 const STALE_SID: &str = "11111111-1111-4111-8111-111111111111";
 
-fn new_harness(test_name: &str) -> TuiTestHarness {
-    #[cfg(unix)]
-    {
-        TuiTestHarness::new_in_tmp(test_name)
-    }
-    #[cfg(not(unix))]
-    {
-        TuiTestHarness::new(test_name)
-    }
-}
-
-fn sessions_path(h: &TuiTestHarness) -> PathBuf {
-    crate::harness::app_dir_in(h.home_path()).join("profiles/default/sessions.json")
-}
-
-fn read_sessions(h: &TuiTestHarness) -> Value {
-    let path = sessions_path(h);
-    let content = fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {}", path.display(), e));
-    serde_json::from_str(&content).expect("invalid sessions JSON")
-}
-
-fn session_by_title<'a>(sessions: &'a Value, title: &str) -> &'a Value {
-    sessions
-        .as_array()
-        .and_then(|arr| arr.iter().find(|s| s["title"].as_str() == Some(title)))
-        .unwrap_or_else(|| panic!("no session titled '{title}' in sessions.json"))
-}
-
 fn patch_session<F>(h: &TuiTestHarness, title: &str, patch: F)
 where
     F: FnOnce(&mut Map<String, Value>),
 {
-    let path = sessions_path(h);
-    let mut sessions = read_sessions(h);
+    let path = h.sessions_path();
+    let mut sessions = h.read_sessions();
     let row = sessions
         .as_array_mut()
         .and_then(|arr| arr.iter_mut().find(|s| s["title"].as_str() == Some(title)))
@@ -72,14 +43,7 @@ fn install_fake_agent(h: &mut TuiTestHarness) -> PathBuf {
         sh_quote(&log),
         STALE_SID,
     );
-    let script_path = bin.join(FAKE_AGENT);
-    fs::write(&script_path, script).expect("write fake agent");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
-            .expect("chmod fake agent");
-    }
+    write_executable(&bin.join(FAKE_AGENT), &script);
     log
 }
 
@@ -105,14 +69,9 @@ fn read_log_lines(path: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Seed a Claude transcript on disk for `sid` so the Default resume path
-/// attempts `--resume <sid>` (and fires the settle probe) instead of the
-/// empty-thread fresh-pin shortcut from #2700, which launches fresh with
-/// `--session-id` and skips the probe entirely. Mirrors the host location
-/// `claude_host_transcript_confirmed_absent` checks: `$HOME/.claude/projects/
-/// <encoded-canonical-project-path>/<sid>.jsonl`, where the encoding maps every
-/// char that is not ASCII-alphanumeric or `-` to `-`. Models a real prior
-/// Claude session whose sid later fails to resume.
+/// Seed a Claude transcript at `$HOME/.claude/projects/<encoded project>/
+/// <sid>.jsonl` (every char outside `[A-Za-z0-9-]` maps to `-`) so the restart
+/// takes the `--resume <sid>` path instead of #2700's fresh-pin shortcut.
 fn seed_claude_transcript(h: &TuiTestHarness, project_path: &Path, sid: &str) {
     let canonical = fs::canonicalize(project_path).unwrap_or_else(|_| project_path.to_path_buf());
     let encoded: String = canonical
@@ -146,12 +105,12 @@ impl Drop for StopSessionOnDrop<'_> {
 fn stale_resume_failure_persists_loop_breaker_and_next_restart_starts_fresh() {
     require_tmux!();
 
-    let mut h = new_harness("resume_fallback_loop_breaker");
+    let mut h = TuiTestHarness::new_in_tmp("resume_fallback_loop_breaker");
     disable_restart_wake_message(&h);
     let log_path = install_fake_agent(&mut h);
     let project = h.project_path();
 
-    let add = h.run_cli(&[
+    h.run_cli_ok(&[
         "add",
         project.to_str().unwrap(),
         "--cmd",
@@ -159,11 +118,6 @@ fn stale_resume_failure_persists_loop_breaker_and_next_restart_starts_fresh() {
         "-t",
         TITLE,
     ]);
-    assert!(
-        add.status.success(),
-        "aoe add failed: {}",
-        String::from_utf8_lossy(&add.stderr)
-    );
     let _cleanup = StopSessionOnDrop { h: &h };
 
     patch_session(&h, TITLE, |row| {
@@ -178,18 +132,11 @@ fn stale_resume_failure_persists_loop_breaker_and_next_restart_starts_fresh() {
         row.remove("resume_intent");
     });
 
-    // Without a transcript on disk, #2700 launches a stale Claude sid fresh
-    // (`--session-id`, no probe), so the resume never fails and this test's
-    // premise collapses. Seed one so the restart takes the `--resume` path.
     seed_claude_transcript(&h, &project, STALE_SID);
 
-    let first = h.run_cli(&["session", "restart", TITLE]);
-    assert!(
-        !first.status.success(),
-        "first restart should fail after passing stale sid"
-    );
+    h.run_cli_err(&["session", "restart", TITLE]);
 
-    let sessions = read_sessions(&h);
+    let sessions = h.read_sessions();
     let row = session_by_title(&sessions, TITLE);
     assert_eq!(row["agent_session_id"].as_str(), Some(STALE_SID));
     assert_eq!(row["resume_probe_failed_sid"].as_str(), Some(STALE_SID));
@@ -202,14 +149,9 @@ fn stale_resume_failure_persists_loop_breaker_and_next_restart_starts_fresh() {
     );
 
     let before_second = first_lines.len();
-    let second = h.run_cli(&["session", "restart", TITLE]);
-    assert!(
-        second.status.success(),
-        "second restart should start fresh after loop-breaker: {}",
-        String::from_utf8_lossy(&second.stderr)
-    );
+    h.run_cli_ok(&["session", "restart", TITLE]);
 
-    let sessions = read_sessions(&h);
+    let sessions = h.read_sessions();
     let row = session_by_title(&sessions, TITLE);
     let fresh_sid = row["agent_session_id"]
         .as_str()

@@ -1,19 +1,4 @@
-// Storage layer for per-session structured view state. The structured view reducer state
-// is mirrored into localStorage under `aoe:acp-state:v1:<id>` by
-// useStructuredView's persistState so a reload rehydrates without replaying the
-// whole transcript (see useStructuredView.ts and #1132). This module owns the
-// key shape and TTL so both the writer (useStructuredView) and read-only
-// consumers (the sidebar queued-prompt badge) share one source of truth,
-// without the sidebar having to import the heavy structured view hook and its WS
-// machinery just to read a count.
-//
-// It also exposes a small pub/sub (mirroring acpDrafts.ts) plus an
-// in-memory queued-prompt count cache so the sidebar can render a live
-// "N queued" badge via useSyncExternalStore. The cache keeps a snapshot
-// read O(1) and avoids JSON.parsing the (potentially large) state blob
-// during render: persistState already holds queuedPrompts.length and
-// publishes it on every write, and cross-tab `storage` events parse the
-// new value exactly once.
+// Key shape and TTL for persisted structured view state (`aoe:acp-state:v1:<id>`), plus a queued-count cache and pub/sub so the sidebar badge avoids parsing state blobs or importing the view hook.
 
 import type { AcpState } from "./acpTypes";
 
@@ -34,17 +19,11 @@ function sessionIdFromKey(key: string): string | null {
   return key.slice(STORAGE_KEY_PREFIX.length);
 }
 
-// Queued-prompt count per session id, kept in sync by setQueueCount
-// (same-tab writes) and the cross-tab storage listener. A missing entry
-// means "not yet known this page load"; getQueuedCount lazily fills it
-// from localStorage on first read so inactive sessions (no mounted
-// structured view hook writing) still resolve a count.
+// Filled by same-tab writes and cross-tab events, or lazily from localStorage on first read.
 const queueCounts = new Map<string, number>();
 
 type Listener = () => void;
 
-// Each listener may register an optional id filter; null means "fire for
-// any acp-state change" (used for a cross-tab localStorage.clear()).
 const listeners = new Map<Listener, ReadonlySet<string> | null>();
 
 function notify(sessionId: string | null): void {
@@ -53,10 +32,7 @@ function notify(sessionId: string | null): void {
   }
 }
 
-// Parse a queued-prompt count out of a raw persisted entry, honoring the
-// TTL. Returns null when the entry is missing, expired, corrupt, or
-// structurally invalid so callers fall back to 0 without caching a bogus
-// value.
+// Null for a missing, expired, or invalid entry, so callers fall back to 0 without caching it.
 function parseQueuedCount(raw: string | null): number | null {
   if (raw === null) return null;
   try {
@@ -76,9 +52,7 @@ function parseQueuedCount(raw: string | null): number | null {
   }
 }
 
-// Parse the newest `queuedAt` (epoch ms) out of a raw persisted entry,
-// honoring the TTL. Returns null when the entry is missing, expired,
-// corrupt, has no queued rows, or carries no parseable timestamp.
+// Newest `queuedAt` in epoch ms, honoring the TTL; null when absent.
 function parseNewestQueuedAt(raw: string | null): number | null {
   if (raw === null) return null;
   try {
@@ -105,16 +79,11 @@ function parseNewestQueuedAt(raw: string | null): number | null {
   }
 }
 
-// Publish a session's current queued-prompt count. Called by useStructuredView's
-// persistState on every successful write; the length is already in hand
-// there, so no JSON parsing happens on the write hot path.
 export function setQueueCount(sessionId: string, count: number): void {
   queueCounts.set(sessionId, count);
   notify(sessionId);
 }
 
-// Drop a session's cached count (session delete / cache clear). With no
-// argument, clears the whole cache.
 export function clearQueueCount(sessionId?: string): void {
   if (sessionId === undefined) {
     queueCounts.clear();
@@ -125,11 +94,7 @@ export function clearQueueCount(sessionId?: string): void {
   notify(sessionId);
 }
 
-// Side-effect-free read of a session's queued-prompt count. Safe to call
-// from a useSyncExternalStore snapshot during render: it never mutates
-// localStorage (unlike useStructuredView's loadPersistedState, which prunes
-// expired entries) and returns a primitive. Reads the in-memory cache
-// first; on a miss it parses localStorage once and memoises the result.
+// Side-effect free, so safe in a useSyncExternalStore snapshot.
 export function getQueuedCount(sessionId: string): number {
   const cached = queueCounts.get(sessionId);
   if (cached !== undefined) return cached;
@@ -138,18 +103,14 @@ export function getQueuedCount(sessionId: string): number {
   try {
     count = parseQueuedCount(window.localStorage.getItem(storageKey(sessionId))) ?? 0;
   } catch {
-    // localStorage blocked/threw: don't memoise a transient failure.
+    // Don't memoise a transient failure.
     return 0;
   }
   queueCounts.set(sessionId, count);
   return count;
 }
 
-// Read the epoch-ms timestamp of the newest queued prompt persisted for
-// a session, or null when there is none. Used by the background drain
-// arming check to tell a queue this browser just parked from one
-// restored out of storage days later. Uncached: the arming check
-// memoises its own verdict and only asks once per session per page load.
+// Lets the background drain tell a just-parked queue from one restored days later. Uncached.
 export function getNewestQueuedAt(sessionId: string): number | null {
   if (typeof window === "undefined") return null;
   try {
@@ -159,15 +120,10 @@ export function getNewestQueuedAt(sessionId: string): number | null {
   }
 }
 
-// Subscribe to acp-state changes. `filter` scopes the listener to a
-// set of session ids; null receives every change. Fires for same-tab
-// writes (via the notify in setQueueCount) and cross-tab writes (storage
-// event). Returns an unsubscribe function. Mirrors subscribeDrafts.
 export function subscribeAcpState(cb: Listener, filter: ReadonlySet<string> | null = null): () => void {
   listeners.set(cb, filter);
   const onStorage = (e: StorageEvent) => {
-    // localStorage.clear() in another tab leaves e.key null; drop the
-    // whole count cache and fire unconditionally.
+    // A null key means localStorage.clear() in another tab.
     if (e.key === null) {
       queueCounts.clear();
       cb();
@@ -175,8 +131,6 @@ export function subscribeAcpState(cb: Listener, filter: ReadonlySet<string> | nu
     }
     const sid = sessionIdFromKey(e.key);
     if (sid === null) return;
-    // Refresh the cache from the cross-tab value (parsed once) so the next
-    // snapshot read is consistent, then notify if in scope.
     queueCounts.set(sid, parseQueuedCount(e.newValue) ?? 0);
     if (filter === null || filter.has(sid)) cb();
   };

@@ -2,17 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "re
 import { createPortal } from "react-dom";
 import { clampMenuPosition } from "../lib/menuPosition";
 
-// Shared hover tooltip used by the sidebar control row (grouping axis, filter,
-// new session) and the sort picker. Renders a custom styled span instead of
-// the native browser `title` so every control shares one look. Lives in its
-// own module so SidebarSortPicker can import it without a cycle back through
-// WorkspaceSidebar (which imports SidebarSortPicker).
-//
-// The popup is portaled to document.body and positioned `fixed`, so it escapes
-// any `overflow` ancestor that would otherwise clip it. The sidebar trigger
-// rows live inside an `overflow-x-hidden overflow-y-auto` scroller, so a span
-// nested under the trigger (the old approach) got cut off at the sidebar edge
-// regardless of z-index. See #2214.
+// Shared hover tooltip used by the sidebar control row (grouping axis, filter, new session) and the sort picker.
 export function Tooltip({
   text,
   children,
@@ -20,9 +10,7 @@ export function Tooltip({
 }: {
   text: string;
   children: ReactNode;
-  // Single-line callers (sidebar, sort picker) keep the default `whitespace-nowrap`
-  // pill. Set `multiline` for a sentence-length explanation that should wrap inside
-  // a width cap instead of stretching off-screen.
+  // Single-line callers (sidebar, sort picker) keep the default `whitespace-nowrap` pill.
   multiline?: boolean;
 }) {
   const triggerRef = useRef<HTMLSpanElement>(null);
@@ -39,10 +27,8 @@ export function Tooltip({
     setPos(null);
   };
 
-  // Measure the trigger and the tooltip after mount, center the tooltip below
-  // the trigger, and clamp it inside the viewport. Runs before paint so the
-  // tooltip never flashes at an unclamped spot; it stays `visibility: hidden`
-  // until `pos` is set.
+  // Measure the trigger and the tooltip after mount, center the tooltip below the trigger, and clamp it inside the
+  // viewport.
   useLayoutEffect(() => {
     if (!open || !triggerRef.current || !tipRef.current) return;
     const anchor = triggerRef.current.getBoundingClientRect();
@@ -59,9 +45,8 @@ export function Tooltip({
     );
   }, [open, text]);
 
-  // A fixed tooltip detaches from its trigger when an ancestor scrolls or the
-  // window resizes; dismiss it rather than tracking the moving anchor. Capture
-  // phase is needed because scroll events on the sidebar scroller do not bubble.
+  // A fixed tooltip detaches from its trigger when an ancestor scrolls or the window resizes; dismiss it rather
+  // than tracking the moving anchor.
   useEffect(() => {
     if (!open) return;
     window.addEventListener("scroll", hide, true);

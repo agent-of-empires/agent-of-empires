@@ -1,11 +1,8 @@
-//! Click-and-drag on the preview pane starts an in-app text
-//! selection whenever the pane is on screen (in or out of live
-//! mode). The selection is anchored to a distance from the newest
-//! line, so it survives a scroll (even as the captured window grows)
-//! and can span more than one page; the renderer re-derives the
-//! highlight rects each frame and release copies the full range
-//! through OSC 52. We need our own selection handler because the TUI
-//! captures mouse events to support wheel scroll, which keeps
+//! Click-and-drag on the preview starts an in-app text selection whenever the pane is on
+//! screen, in or out of live mode. The selection is anchored to a distance from the newest
+//! line, so it survives a scroll even as the captured window grows and can span more than
+//! one page; the renderer re-derives the highlight each frame and release copies the full
+//! range through OSC 52. The TUI captures mouse events for wheel scroll, which keeps
 //! terminal-native drag-select from reaching the preview.
 
 use super::*;
@@ -13,10 +10,8 @@ use crate::tui::home::{live_send::LiveSendState, DragKind, PreviewSelection, Pre
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Text};
 
-/// Absolute parsed-line index to the `from_bottom` distance the
-/// selection stores, for a pane of `total` lines. Tests express
-/// positions in absolute lines for readability and convert at the
-/// boundary.
+/// Absolute parsed-line index to the `from_bottom` distance the selection stores, for a
+/// pane of `total` lines. Tests express positions in absolute lines and convert here.
 fn fb(total: usize, abs: usize) -> usize {
     total - 1 - abs
 }
@@ -27,21 +22,18 @@ fn to_abs(total: usize, cell: (u16, usize)) -> (u16, usize) {
     (cell.0, total - 1 - cell.1)
 }
 
-/// Stage the output-pane text-view snapshot the render path would set,
-/// plus the backing parsed cache, so the drag handlers can map screen
-/// cells to content lines and the copy can read them back. The scroll
-/// offset is derived so it agrees with `first_line` (the auto-scroll
-/// path projects `first_line` from the live offset, so the two must
-/// line up for the staged state to be self-consistent).
+/// Stage the output-pane text-view snapshot the render path would set, plus the backing
+/// parsed cache, so the drag handlers can map screen cells to content lines. The scroll
+/// offset is derived so it agrees with `first_line`, which the auto-scroll path projects
+/// from the live offset.
 fn stage_text(env: &mut TestEnv, pane: Rect, first_line: usize, lines: &[&str]) {
     let text: Text<'static> = lines.iter().map(|l| Line::from(l.to_string())).collect();
     let total_lines = text.lines.len();
     env.view.preview_cache.parsed_text = Some(text);
     env.view.preview_cache.captured_lines = total_lines;
-    // `scroll_preview_offset` clamps the auto-scroll max offset against
-    // `preview_visible_rows` (the rendered output-body height, same as the
-    // per-frame `clamp_scroll_to_capture`); pin it to the pane height so the
-    // max offset matches what `first_line` implies.
+    // `scroll_preview_offset` clamps the auto-scroll max against `preview_visible_rows`,
+    // the rendered output-body height, so pin it to the pane height and the max offset
+    // matches what `first_line` implies.
     env.view.preview_visible_rows = pane.height as usize;
     env.view.preview_cache.dimensions = (pane.width, pane.height + 1);
     env.view.preview_area = pane;
@@ -64,9 +56,8 @@ fn stage_pane(env: &mut TestEnv, pane: Rect, first_line: usize, total_lines: usi
 }
 
 fn stage_live_send(env: &mut TestEnv) {
-    // Live-send state cares only about session_id + tmux_name for
-    // the parts of the home view these tests exercise (drag start
-    // gate, key dismissal). The exit-chord list is unused here.
+    // Live-send state matters here only for session_id and tmux_name (the drag-start gate
+    // and key dismissal); the exit-chord list is unused.
     env.view.live_send = Some(LiveSendState {
         session_id: "test-session".to_string(),
         title: "test".to_string(),
@@ -82,9 +73,8 @@ fn stage_live_send(env: &mut TestEnv) {
 fn drag_start_outside_live_mode_installs_selection() {
     let mut env = create_test_env_empty();
     stage_pane(&mut env, Rect::new(40, 0, 60, 20), 0, 100);
-    // No live_send: a press on the preview pane still seeds a
-    // PreviewSelect so users can copy from a regular session
-    // preview without first entering live mode.
+    // No live_send: a press on the preview still seeds a PreviewSelect, so users can copy
+    // from a regular session preview without entering live mode.
     assert!(env.view.handle_drag_start(50, 10));
     assert!(matches!(env.view.drag_state, Some(DragKind::PreviewSelect)));
     let sel = env.view.preview_selection.expect("selection installed");
@@ -123,9 +113,8 @@ fn drag_start_blocked_by_non_live_overlay() {
 #[test]
 #[serial]
 fn drag_start_on_empty_pane_is_noop() {
-    // A pane with no captured scrollback (total_lines == 0) has
-    // nothing to select, so a press there must not seed a phantom
-    // selection.
+    // A pane with no captured scrollback has nothing to select, so a press must not seed a
+    // phantom selection.
     let mut env = create_test_env_empty();
     env.view.preview_text_view = PreviewTextView {
         pane: Rect::new(40, 0, 60, 20),
@@ -140,9 +129,8 @@ fn drag_start_on_empty_pane_is_noop() {
 #[test]
 #[serial]
 fn drag_start_below_painted_content_is_noop() {
-    // Pane rows past the last painted line show no text, and
-    // `screen_to_content` would clamp them onto the last line, so a
-    // press there must not anchor a selection.
+    // Pane rows past the last painted line show no text and `screen_to_content` would clamp
+    // them onto the last line, so a press there must not anchor a selection.
     let mut env = create_test_env_empty();
     let pane = Rect::new(40, 0, 60, 20);
     // (first_line, total_lines, row, starts a selection)
@@ -154,9 +142,8 @@ fn drag_start_below_painted_content_is_noop() {
         // row is painted and the gate rejects nothing.
         (85, 105, 0, true),
         (85, 105, 19, true),
-        // A partly-painted window is geometry `compute_scroll` and
-        // `TranscriptGeometry` both clamp away; the gate stays right
-        // without leaning on that.
+        // A partly-painted window is geometry `compute_scroll` and `TranscriptGeometry`
+        // both clamp away; the gate stays right without leaning on that.
         (100, 105, 4, true),
         (100, 105, 5, false),
     ];
@@ -261,9 +248,8 @@ fn keypress_in_live_mode_dismisses_finalized_selection() {
     env.view.handle_drag_move(55, 10);
     env.view.handle_drag_end();
     assert!(env.view.preview_selection.is_some());
-    // Send a stray key through the live-send path. The session
-    // doesn't exist in tmux but the dismissal happens before the
-    // translate step.
+    // Send a stray key through the live-send path: the session doesn't exist in tmux, but
+    // the dismissal happens before the translate step.
     env.view.handle_key(key(KeyCode::Char('x')), None);
     assert!(env.view.preview_selection.is_none());
 }
@@ -271,9 +257,8 @@ fn keypress_in_live_mode_dismisses_finalized_selection() {
 #[test]
 #[serial]
 fn scroll_preserves_selection() {
-    // The selection is anchored to scrollback lines, so a scroll no
-    // longer drops it: the highlight tracks its text as the pane
-    // moves. This is what lets the user scroll to verify a copy.
+    // The selection is anchored to scrollback lines, so a scroll no longer drops it and the
+    // highlight tracks its text, which is what lets the user scroll to verify a copy.
     let mut env = create_test_env_empty();
     stage_pane(&mut env, Rect::new(40, 0, 60, 20), 0, 100);
     stage_live_send(&mut env);
@@ -291,10 +276,9 @@ fn scroll_preserves_selection() {
 #[test]
 #[serial]
 fn drag_move_to_bottom_edge_extends_without_scrolling() {
-    // The drag-move itself only records the edge position and extends
-    // to the last visible line; the scroll is the ticker's job (so a
-    // held-still cursor still advances). This keeps mouse movement
-    // from lurching the scroll one line per event.
+    // The drag-move only records the edge position and extends to the last visible line;
+    // scrolling is the ticker's job, so a held-still cursor still advances and mouse
+    // movement doesn't lurch the scroll one line per event.
     let mut env = create_test_env_empty();
     // 50 lines, 5 visible, started scrolled 10 back (showing 35..40).
     stage_pane(&mut env, Rect::new(0, 0, 10, 5), 35, 50);
@@ -317,9 +301,8 @@ fn drag_move_to_bottom_edge_extends_without_scrolling() {
 #[test]
 #[serial]
 fn autoscroll_tick_at_bottom_edge_scrolls_and_extends_without_new_events() {
-    // The core fix: with the cursor held at the bottom edge, plain
-    // ticker ticks (no further mouse events) keep scrolling toward
-    // newer output and growing the selection past one visible page.
+    // The core fix: with the cursor held at the bottom edge, plain ticker ticks keep
+    // scrolling toward newer output and growing the selection past one page.
     let mut env = create_test_env_empty();
     stage_pane(&mut env, Rect::new(0, 0, 10, 5), 35, 50);
     stage_live_send(&mut env);
@@ -337,9 +320,8 @@ fn autoscroll_tick_at_bottom_edge_scrolls_and_extends_without_new_events() {
         ),
         (0, 40)
     );
-    // Second tick, still no mouse event: advance again. (Clear the
-    // pacing gate so the back-to-back call isn't throttled; the gate's
-    // wall-clock interval is exercised in real use, not here.)
+    // Second tick with no mouse event must advance again. Clear the pacing gate so the
+    // back-to-back call isn't throttled; the wall-clock interval is exercised in real use.
     env.view.preview_autoscroll_at = None;
     assert!(env.view.tick_preview_autoscroll());
     assert_eq!(env.view.preview_scroll_offset, 8);
@@ -395,11 +377,10 @@ fn autoscroll_tick_is_noop_off_edge_and_without_drag() {
 #[test]
 #[serial]
 fn extract_stays_locked_to_lines_when_capture_window_grows() {
-    // Regression for the scroll-up-copies-wrong bug: live mode
-    // re-captures a LARGER window as the user scrolls back, which
-    // shifts every absolute line index. Because the selection is
-    // anchored to the newest line, growing the window must NOT change
-    // which physical lines the copy resolves to.
+    // Regression for the scroll-up-copies-wrong bug: live mode re-captures a larger window
+    // as the user scrolls back, shifting every absolute index, but the selection is anchored
+    // to the newest line, so growing the window must not change which lines the copy
+    // resolves to.
     let mut env = create_test_env_empty();
     // Small window: 6 lines, bottom two are E and F.
     stage_text(
@@ -419,9 +400,8 @@ fn extract_stays_locked_to_lines_when_capture_window_grows() {
         Some("EEEEE\nFFFFF")
     );
 
-    // The window grows by four older lines prepended at the top (a
-    // scroll-back re-capture); the same physical bottom lines are now
-    // at abs 8 and 9. The stored `from_bottom` distances are untouched.
+    // The window grows by four older lines prepended at the top, so the same physical
+    // bottom lines are now at abs 8 and 9 while the stored distances are untouched.
     stage_text(
         &mut env,
         Rect::new(0, 0, 5, 3),
@@ -441,10 +421,9 @@ fn extract_stays_locked_to_lines_when_capture_window_grows() {
 #[test]
 #[serial]
 fn extract_spans_full_scrollback_across_pages() {
-    // The core multi-page guarantee: a selection whose start has
-    // scrolled off the top of the visible window still copies the
-    // off-screen lines, because extraction reads the parsed cache,
-    // not the visible frame buffer.
+    // The multi-page guarantee: a selection whose start scrolled off the top still copies
+    // the off-screen lines, because extraction reads the parsed cache, not the frame
+    // buffer.
     let mut env = create_test_env_empty();
     // Pane shows 3 rows; first visible line is 3, so lines 1 and 2
     // are above the fold.
@@ -507,10 +486,9 @@ fn extract_returns_none_for_whitespace_only_selection() {
 #[test]
 #[serial]
 fn take_preview_copy_text_drains_once() {
-    // The app loop reads preview_copy_text after the post-drag
-    // draw; the field must yield Some once and None thereafter so
-    // a stable highlight doesn't write to the clipboard on every
-    // subsequent frame.
+    // The app loop reads preview_copy_text after the post-drag draw, so the field must
+    // yield Some once and None thereafter, or a stable highlight would rewrite the clipboard
+    // every frame.
     let mut env = create_test_env_empty();
     env.view.preview_copy_text = Some("clip me".to_string());
     assert_eq!(
@@ -523,11 +501,9 @@ fn take_preview_copy_text_drains_once() {
 #[test]
 #[serial]
 fn real_modal_during_preview_drag_cancels_selection() {
-    // Live-send counts as a dialog under has_dialog() and is what
-    // makes drag-select run in the first place; it must not cancel
-    // the drag. But a real modal (info / confirm / etc.) popping up
-    // mid-drag must drop the selection and stop mutating state
-    // behind the overlay.
+    // Live-send counts as a dialog under has_dialog() and is what makes drag-select run, so
+    // it must not cancel the drag. A real modal popping up mid-drag must drop the selection
+    // and stop mutating state behind the overlay.
     let mut env = create_test_env_empty();
     stage_pane(&mut env, Rect::new(40, 0, 60, 20), 0, 100);
     stage_live_send(&mut env);
@@ -550,9 +526,8 @@ fn real_modal_during_preview_drag_cancels_selection() {
 #[test]
 #[serial]
 fn clear_preview_selection_drops_pending_copy() {
-    // Dismissing the highlight before the render fires (e.g. a
-    // keystroke between Up(Left) and the next draw) must drop the
-    // pending capture so it doesn't leak into the next drag.
+    // Dismissing the highlight before the render fires must drop the pending capture so it
+    // doesn't leak into the next drag.
     let mut env = create_test_env_empty();
     stage_pane(&mut env, Rect::new(40, 0, 60, 20), 0, 100);
     stage_live_send(&mut env);
@@ -568,10 +543,9 @@ fn clear_preview_selection_drops_pending_copy() {
 #[test]
 #[serial]
 fn flow_extract_wraps_lines_with_partial_first_and_last_rows() {
-    // Tmux-style flow: anchor partway into line 0, extent partway
-    // into line 2. The middle line is pulled in full, the first from
-    // the anchor col onward, and the last from the left up through
-    // the extent col.
+    // Tmux-style flow: anchor partway into line 0, extent partway into line 2, so the middle
+    // line is pulled in full, the first from the anchor col onward, the last up to the
+    // extent col.
     let mut env = create_test_env_empty();
     stage_text(
         &mut env,
@@ -668,9 +642,8 @@ fn screen_flow_rects_three_rows_are_per_row_full_width_middles() {
 #[test]
 #[serial]
 fn screen_flow_rects_clips_rows_outside_visible_window() {
-    // Selection runs from above the fold to below it; only the rows
-    // inside the visible window paint, each full width since neither
-    // the start nor the end line is in view.
+    // The selection runs from above the fold to below it, so only the rows inside the
+    // visible window paint, each full width since neither end line is in view.
     let sel = PreviewSelection {
         anchor: (2, fb(100, 8)),
         extent: (7, fb(100, 20)),
@@ -700,10 +673,9 @@ fn screen_flow_rects_fully_offscreen_returns_empty() {
 #[test]
 #[serial]
 fn full_render_pipeline_captures_copy_text_after_finalize() {
-    // Drives the actual render path: render seeds the text-view
-    // snapshot, the drag handlers map against it, and
-    // paint_preview_selection captures the selected lines from the
-    // parsed cache into preview_copy_text for the app loop to drain.
+    // Drives the real render path: render seeds the text-view snapshot, the drag handlers
+    // map against it, and paint_preview_selection captures the lines from the parsed cache
+    // into preview_copy_text.
     use crate::tui::styles::load_theme;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;

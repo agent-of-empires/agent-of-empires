@@ -18,8 +18,7 @@ pub struct UpdateConfirmDialog {
     selected: bool, // true = Yes, false = No
     yes_button_area: Rect,
     no_button_area: Rect,
-    /// Which Yes/No button the mouse is over, for the hover highlight.
-    /// Visual only; never changes `selected`.
+    /// The hovered button. Visual only; never changes `selected`.
     hover: HoverState,
 }
 
@@ -59,9 +58,7 @@ impl UpdateConfirmDialog {
         None
     }
 
-    /// Highlight the Yes/No button under the cursor without changing
-    /// `selected`. See `ConfirmDialog::handle_hover` for the rationale.
-    /// Returns `true` when the highlighted button changed.
+    /// Highlight the button under the cursor without changing `selected`.
     pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
         self.hover
             .update(col, row, &[self.yes_button_area, self.no_button_area])
@@ -96,19 +93,8 @@ impl UpdateConfirmDialog {
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let height = if self.needs_sudo { 11 } else { 10 };
-        let dialog_area = super::centered_rect(area, 60, height);
-
-        frame.render_widget(Clear, dialog_area);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.waiting))
-            .title(" Update aoe ")
-            .title_style(Style::default().fg(theme.waiting).bold());
-
-        let inner = block.inner(dialog_area);
-        frame.render_widget(block, dialog_area);
+        let block = super::toned_dialog_block(" Update aoe ", theme.waiting, theme.waiting);
+        let (_, inner) = super::render_dialog_frame(frame, area, 60, height, block);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)

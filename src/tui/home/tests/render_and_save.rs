@@ -360,9 +360,8 @@ fn test_row_tag_branch_renders_workspace_branch_repo_count() {
     );
 }
 
-/// Legacy `Instance::new` left `source_profile` empty before the per-profile
-/// plumbing landed. The render branch must skip the tag entirely in that
-/// case rather than emit a literal `  []`.
+/// Legacy `Instance::new` left `source_profile` empty before the per-profile plumbing
+/// landed, so the render branch must skip the tag rather than emit a literal `  []`.
 #[test]
 #[serial]
 fn test_row_tag_auto_skips_for_empty_source_profile() {
@@ -677,12 +676,9 @@ fn test_delete_group_scoped_to_owning_profile() {
     );
 }
 
-/// Opening the group-delete dialog must scope its session count to the
-/// selected group's profile. Two profiles can own a same-named group; an
-/// empty group in one profile should open the simple confirm, not the
-/// "delete N sessions" options dialog driven by its populated twin in
-/// another profile. Regression for the group-key conflict where the empty
-/// group was not the one the delete modal acted on.
+/// The group-delete dialog must scope its session count to the selected group's profile:
+/// two profiles can own a same-named group, and an empty group should open the simple
+/// confirm rather than the "delete N sessions" dialog driven by its populated twin.
 #[test]
 #[serial]
 fn test_group_delete_dialog_scoped_to_owning_profile() {
@@ -754,12 +750,10 @@ fn test_group_delete_dialog_scoped_to_owning_profile() {
     );
 }
 
-// Four rename-collision behaviors (untied duplicate-pair reject, group-only
-// change allowed, tied derived-destination collision, cross-profile target
-// collision) share one test because they need the same `#[serial]`-forcing
-// setup: an isolated home, multiple `HomeView`/`Storage` instances, and a
-// process-global `tie_workdir_to_name` flip. Splitting would multiply that
-// setup and the serial critical-path time; each behavior asserts independently.
+// Four rename-collision behaviors (untied duplicate-pair reject, group-only change allowed,
+// tied derived-destination collision, cross-profile target collision) share one test because
+// they need the same `#[serial]`-forcing setup: an isolated home, several HomeView/Storage
+// instances, and a process-global `tie_workdir_to_name` flip. Each asserts independently.
 #[test]
 #[serial]
 fn test_rename_selected_rejects_all_identity_collisions_and_allows_group_only_change() {
@@ -899,10 +893,9 @@ fn test_rename_selected_rejects_all_identity_collisions_and_allows_group_only_ch
     assert_eq!(beta.load().unwrap().len(), 1);
 }
 
-/// Changing a session's profile via the rename dialog must transfer its group
-/// metadata in the same storage transaction. Otherwise the source can reload
-/// an empty duplicate while the target row renders under a separately-created
-/// group.
+/// Changing a session's profile via the rename dialog must transfer its group metadata in
+/// the same storage transaction, or the source reloads an empty duplicate while the target
+/// row renders under a separately created group.
 #[test]
 #[serial]
 fn test_rename_profile_change_prunes_source_group() {

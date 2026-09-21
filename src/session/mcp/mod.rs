@@ -1,6 +1,4 @@
-//! MCP server configuration: the layered resolver (`mcp_model`), global
-//! overrides file, native-agent reconciliation state, and per-project
-//! `.mcp.json` servers.
+//! MCP server configuration: layered resolver, global overrides, drift store, project `.mcp.json`.
 
 pub mod mcp_model;
 pub mod mcp_overrides;

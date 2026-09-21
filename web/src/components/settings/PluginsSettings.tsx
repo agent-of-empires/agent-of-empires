@@ -1,114 +1,36 @@
 import { useCallback, useEffect, useState } from "react";
 
 import {
-  applyPluginUpdate,
-  dismissPluginUpdate,
-  discoverPlugins,
-  fetchPluginUpdates,
   fetchPlugins,
-  previewPluginInstall,
-  previewPluginUpdate,
   setPluginEnabled,
-  startPluginInstall,
   startPluginUninstall,
-  type PluginDiscoveryResult,
-  type PluginInstallConsent,
   type PluginListResponse,
-  type PluginUpdateChangelog,
-  type PluginUpdateConsent,
-  type PluginUpdateStatus,
   type PluginView,
 } from "../../lib/api";
 import { reportInfo } from "../../lib/toastBus";
+import { PluginCard } from "./PluginCard";
 import { PluginDetailModal } from "./PluginDetailModal";
-import { PluginIdentityIcon } from "./PluginIdentityIcon";
 import { PluginInstallConsentModal } from "./PluginInstallConsentModal";
 import { PluginJobProgressModal } from "./PluginJobProgressModal";
+import { PluginMarketplace } from "./PluginMarketplace";
 import { PluginUpdateConsentModal } from "./PluginUpdateConsentModal";
+import { usePluginMarketplace, usePluginUpdates, type PluginJobRef } from "./pluginFlows";
 
-interface DetailTarget {
-  source: string;
-  title: string;
-  fallback?: {
-    version?: string;
-    description?: string;
-    capabilities?: string[];
-    ui_contributions?: { slot: string; id: string }[];
-    icon?: string | null;
-    icon_asset_url?: string | null;
-  };
-  installCommand?: string;
-}
+type DetailTarget = Pick<Parameters<typeof PluginDetailModal>[0], "source" | "title" | "fallback" | "installCommand">;
 
-/// Plugin management: list every known plugin (name, version, description,
-/// validation provenance, capabilities, and enabled / approval state), toggle
-/// it on or off, and run the lifecycle actions (install from the marketplace,
-/// update, uninstall) as host-side jobs with a live log tail. Install and
-/// uninstall still show the same capability disclosure the CLI prompts for. The
-/// mutations are host operations, so they need read-write mode and (when login
-/// is enabled) an elevated session. A `403 elevation_required` response pops the
-/// global passphrase prompt via the fetch interceptor, the same as any other
-/// elevated setting; other failures surface their message inline. `load_errors`
-/// are shown as a warning line.
+/** Plugin management: installed list with toggles and lifecycle jobs, plus the
+ *  marketplace. Mutations need an elevated session; the fetch interceptor
+ *  handles `403 elevation_required`. */
 export function PluginsSettings({ readOnly = false }: { readOnly?: boolean } = {}) {
   const [data, setData] = useState<PluginListResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-
-  // Update checks (on-demand, never auto). Keyed by plugin id.
-  const [updates, setUpdates] = useState<Record<string, PluginUpdateStatus>>({});
-  const [checkingUpdates, setCheckingUpdates] = useState(false);
-
-  // GitHub discovery (the marketplace tab; each result can install in-app).
-  const [discoverQuery, setDiscoverQuery] = useState("");
-  const [discoverResults, setDiscoverResults] = useState<PluginDiscoveryResult[] | null>(null);
-  const [discoverError, setDiscoverError] = useState<string | null>(null);
-  const [discovering, setDiscovering] = useState(false);
-
-  // The plugin whose detail modal is open (null = closed).
-  const [detail, setDetail] = useState<DetailTarget | null>(null);
-
-  // The in-app update flow: which plugin's Update button is previewing, and the
-  // review modal once the preview lands. Every update (safe or consent-required)
-  // goes through the one review modal, which always shows the changelog;
-  // `consent` is non-null only when the update also expands access.
-  const [updatingId, setUpdatingId] = useState<string | null>(null);
-  const [reviewModal, setReviewModal] = useState<{
-    plugin: PluginView;
-    fromVersion: string;
-    toVersion: string;
-    changelog: PluginUpdateChangelog;
-    consent: PluginUpdateConsent | null;
-    fingerprint: string;
-  } | null>(null);
-  const [consentBusy, setConsentBusy] = useState(false);
-  const [consentError, setConsentError] = useState<string | null>(null);
-
-  // The in-app install flow: which marketplace source is previewing, the
-  // consent modal once its disclosure is fetched, and busy/error while the
-  // install job is started.
-  const [previewingSource, setPreviewingSource] = useState<string | null>(null);
-  const [installConsent, setInstallConsent] = useState<PluginInstallConsent | null>(null);
-  const [installBusy, setInstallBusy] = useState(false);
-  const [installError, setInstallError] = useState<string | null>(null);
-
-  // An installed external plugin awaiting uninstall confirmation.
-  const [confirmUninstall, setConfirmUninstall] = useState<PluginView | null>(null);
-
-  // The active lifecycle job (install / update / uninstall) the progress modal
-  // is following; null when none is running.
-  const [job, setJob] = useState<{ id: string; title: string } | null>(null);
-
-  const clearUpdateBadge = (id: string) =>
-    setUpdates((u) => {
-      const next = { ...u };
-      delete next[id];
-      return next;
-    });
-
-  // Two tabs, JetBrains-style: manage installed plugins vs browse the
-  // marketplace (GitHub discovery).
   const [tab, setTab] = useState<"installed" | "marketplace">("installed");
+  const [detail, setDetail] = useState<DetailTarget | null>(null);
+  const [confirmUninstall, setConfirmUninstall] = useState<PluginView | null>(null);
+  const [job, setJob] = useState<PluginJobRef | null>(null);
+  const updates = usePluginUpdates(setError, setJob);
+  const market = usePluginMarketplace(setJob);
 
   const reload = useCallback(async () => {
     const next = await fetchPlugins();
@@ -121,8 +43,7 @@ export function PluginsSettings({ readOnly = false }: { readOnly?: boolean } = {
   }, []);
 
   useEffect(() => {
-    // Deferred a tick: the lint forbids synchronous setState chains inside
-    // an effect body (same pattern as SettingsView's schema load).
+    // Deferred so the effect body does not set state synchronously.
     const timer = setTimeout(() => {
       void reload();
     }, 0);
@@ -135,168 +56,16 @@ export function PluginsSettings({ readOnly = false }: { readOnly?: boolean } = {
     try {
       const result = await setPluginEnabled(plugin.id, enabled);
       if (result.kind === "ok") {
-        // The server returns the refreshed list, so adopt it directly.
         setData(result.data);
-        // The serve gate is startup-only: disabling aoe.web rewrites config
-        // but the running daemon keeps serving until it restarts. Say so,
-        // otherwise the toggle looks like a no-op (#2311 testing feedback).
+        // The serve gate is read at startup, so the dashboard keeps running.
         if (plugin.id === "aoe.web" && !enabled) {
           reportInfo("Web dashboard stays up until aoe serve is restarted.");
         }
       } else {
-        // The toggle did not take effect; the checkbox is controlled by the
-        // unchanged `plugin.enabled`, so the existing `data` already reflects
-        // the server. Just surface the message.
         setError(result.message);
       }
     } finally {
       setBusy(false);
-    }
-  };
-
-  const onCheckUpdates = async () => {
-    setCheckingUpdates(true);
-    setError(null);
-    try {
-      const res = await fetchPluginUpdates();
-      if (res.kind === "ok") {
-        const next: Record<string, PluginUpdateStatus> = {};
-        for (const s of res.updates) next[s.id] = s;
-        setUpdates(next);
-      } else {
-        // Clear stale badges and surface the failure, so the button is not a
-        // silent no-op.
-        setUpdates({});
-        setError(res.message);
-      }
-    } finally {
-      setCheckingUpdates(false);
-    }
-  };
-
-  // Drive an in-app update: preview first, then apply a safe update directly or
-  // open the consent modal when the fetched version expands access.
-  const onUpdate = async (plugin: PluginView) => {
-    setUpdatingId(plugin.id);
-    setError(null);
-    try {
-      const res = await previewPluginUpdate(plugin.id);
-      if (res.kind !== "ok") {
-        setError(res.message);
-        return;
-      }
-      const preview = res.preview;
-      setConsentError(null);
-      if (preview.kind === "no_update") {
-        reportInfo(`${plugin.name} is already up to date.`);
-        clearUpdateBadge(plugin.id);
-      } else if (preview.kind === "safe_update") {
-        // A safe version bump no longer auto-applies: show the changelog first
-        // so the user sees what they are pulling in, then confirm.
-        setReviewModal({
-          plugin,
-          fromVersion: plugin.version,
-          toVersion: preview.to_version,
-          changelog: preview.changelog,
-          consent: null,
-          fingerprint: preview.fingerprint,
-        });
-      } else {
-        setReviewModal({
-          plugin,
-          fromVersion: preview.consent.from_version,
-          toVersion: preview.consent.to_version,
-          changelog: preview.consent.changelog,
-          consent: preview.consent,
-          fingerprint: preview.consent.fingerprint,
-        });
-      }
-    } finally {
-      setUpdatingId(null);
-    }
-  };
-
-  const onApproveUpdate = async () => {
-    if (!reviewModal) return;
-    setConsentBusy(true);
-    setConsentError(null);
-    try {
-      const res = await applyPluginUpdate(reviewModal.plugin.id, reviewModal.fingerprint);
-      if (res.kind === "ok") {
-        clearUpdateBadge(reviewModal.plugin.id);
-        const name = reviewModal.plugin.name;
-        setReviewModal(null);
-        setJob({ id: res.jobId, title: `Updating ${name}` });
-      } else {
-        // Any failure keeps the modal open with the message; the user can close
-        // and re-Update to re-preview.
-        setConsentError(res.message);
-      }
-    } finally {
-      setConsentBusy(false);
-    }
-  };
-
-  // Consent mode only (the modal's Decline button). A safe update has nothing to
-  // dismiss; its Cancel button just closes the modal.
-  const onDeclineUpdate = async () => {
-    if (!reviewModal?.consent) return;
-    setConsentBusy(true);
-    setConsentError(null);
-    try {
-      // The current version stays active either way, but only clear local state
-      // once the backend actually recorded the decline; otherwise a failed
-      // dismiss would look persisted and the prompt would return on reload.
-      const res = await dismissPluginUpdate(reviewModal.plugin.id, reviewModal.consent.fingerprint);
-      if (res.kind === "ok") {
-        clearUpdateBadge(reviewModal.plugin.id);
-        setReviewModal(null);
-      } else {
-        setConsentError(res.message);
-      }
-    } finally {
-      setConsentBusy(false);
-    }
-  };
-
-  // The `gh:owner/repo` source to install, taken from the discovery row's copy
-  // command (`aoe plugin install gh:owner/repo`) so it always carries the `gh:`
-  // prefix the web install path requires.
-  const sourceFromCommand = (command: string) => command.replace(/^.*\binstall\s+/, "").trim();
-
-  // Marketplace install: preview the disclosure first, then open the consent
-  // modal. Nothing is installed until the user approves.
-  const onInstall = async (source: string) => {
-    setPreviewingSource(source);
-    setDiscoverError(null);
-    setInstallError(null);
-    try {
-      const res = await previewPluginInstall(source);
-      if (res.kind === "ok") {
-        setInstallConsent(res.consent);
-      } else {
-        setDiscoverError(res.message);
-      }
-    } finally {
-      setPreviewingSource(null);
-    }
-  };
-
-  const onApproveInstall = async () => {
-    if (!installConsent) return;
-    setInstallBusy(true);
-    setInstallError(null);
-    try {
-      const res = await startPluginInstall(installConsent.source, installConsent.fingerprint);
-      if (res.kind === "ok") {
-        const title = `Installing ${installConsent.id}`;
-        setInstallConsent(null);
-        setJob({ id: res.jobId, title });
-      } else {
-        setInstallError(res.message);
-      }
-    } finally {
-      setInstallBusy(false);
     }
   };
 
@@ -305,42 +74,18 @@ export function PluginsSettings({ readOnly = false }: { readOnly?: boolean } = {
     const plugin = confirmUninstall;
     setConfirmUninstall(null);
     const res = await startPluginUninstall(plugin.id);
-    if (res.kind === "ok") {
-      setJob({ id: res.jobId, title: `Uninstalling ${plugin.name}` });
-    } else {
-      setError(res.message);
-    }
-  };
-
-  // When a job modal closes (terminal state), refresh the list so the installed
-  // set, versions, and approval state reflect what the job did.
-  const onJobClose = async () => {
-    setJob(null);
-    await reload();
-  };
-
-  const onDiscover = async () => {
-    setDiscovering(true);
-    setDiscoverError(null);
-    const res = await discoverPlugins(discoverQuery);
-    if (res.kind === "ok") {
-      setDiscoverResults(res.results);
-    } else {
-      setDiscoverResults(null);
-      setDiscoverError(res.message);
-    }
-    setDiscovering(false);
+    if (res.kind === "ok") setJob({ id: res.jobId, title: `Uninstalling ${plugin.name}` });
+    else setError(res.message);
   };
 
   if (!data && !error) {
     return <p className="text-sm text-text-dim">Loading plugins…</p>;
   }
 
+  const review = updates.review;
   return (
     <div className="space-y-4">
-      {/* CityHall renders the Plugins tab read-only: the marketplace (install)
-          tab and every lifecycle control are hidden, leaving the installed list
-          as display only. The routes are also closed server-side. */}
+      {/* Read-only (CityHall) hides the marketplace and every lifecycle control. */}
       {!readOnly && (
         <div role="tablist" className="flex gap-1 border-b border-surface-700">
           {(["installed", "marketplace"] as const).map((t) => (
@@ -362,102 +107,11 @@ export function PluginsSettings({ readOnly = false }: { readOnly?: boolean } = {
       )}
 
       {tab === "marketplace" && (
-        <div className="space-y-2">
-          <div className="flex flex-wrap items-center gap-2">
-            <input
-              type="search"
-              value={discoverQuery}
-              onChange={(e) => setDiscoverQuery(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") void onDiscover();
-              }}
-              placeholder="Search GitHub (aoe-plugin topic)…"
-              className="min-w-0 flex-1 rounded border border-surface-700 bg-surface-850 px-2 py-1 text-xs"
-              data-testid="plugins-discover-query"
-            />
-            <button
-              type="button"
-              className="rounded border border-surface-700 px-2 py-1 text-xs hover:bg-surface-800 disabled:opacity-50"
-              disabled={discovering}
-              onClick={() => void onDiscover()}
-              data-testid="plugins-discover"
-            >
-              {discovering ? "Searching…" : "Search GitHub"}
-            </button>
-          </div>
-
-          {discoverError && (
-            <p className="text-xs text-status-error" data-testid="plugins-discover-error">
-              {discoverError}
-            </p>
-          )}
-
-          {discoverResults && (
-            <div className="space-y-2" data-testid="plugins-discover-results">
-              {discoverResults.length === 0 ? (
-                <p className="text-xs text-text-dim">No plugins found on the aoe-plugin topic.</p>
-              ) : (
-                discoverResults.map((r) => (
-                  <div
-                    key={r.slug}
-                    className="rounded border border-surface-700 bg-surface-850 p-2 text-xs"
-                    data-testid={`plugins-discover-result-${r.slug}`}
-                  >
-                    <div className="flex flex-wrap items-center gap-2">
-                      <img
-                        src={r.source_avatar_url}
-                        alt=""
-                        aria-hidden="true"
-                        className="size-4 shrink-0 rounded-full"
-                        data-testid={`plugins-discover-avatar-${r.slug}`}
-                        // A deleted or renamed GitHub account 404s; hide the
-                        // avatar rather than leave a broken-image icon.
-                        onError={(e) => {
-                          e.currentTarget.classList.add("hidden");
-                        }}
-                      />
-                      <button
-                        type="button"
-                        className="font-medium text-accent-500 hover:underline"
-                        onClick={() => setDetail({ source: r.slug, title: r.slug, installCommand: r.install_command })}
-                        data-testid={`plugins-discover-open-${r.slug}`}
-                      >
-                        {r.slug}
-                      </button>
-                      <span className="rounded bg-accent-500/20 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-accent-500">
-                        {r.badge}
-                      </span>
-                      <span className="text-text-dim">★ {r.stars}</span>
-                      <a href={r.html_url} target="_blank" rel="noreferrer" className="text-text-dim hover:underline">
-                        GitHub ↗
-                      </a>
-                    </div>
-                    {r.description && <p className="mt-1 text-text-dim">{r.description}</p>}
-                    <div className="mt-2 flex flex-wrap items-center gap-2">
-                      {r.badge === "installed" ||
-                      data?.plugins.some((p) => p.source === sourceFromCommand(r.install_command)) ? (
-                        <span className="text-text-dim">Installed.</span>
-                      ) : (
-                        <button
-                          type="button"
-                          className="rounded bg-brand-600 px-2 py-0.5 text-[11px] font-medium text-white hover:bg-brand-500 disabled:opacity-50"
-                          disabled={previewingSource !== null}
-                          onClick={() => void onInstall(sourceFromCommand(r.install_command))}
-                          data-testid={`plugins-install-${r.slug}`}
-                        >
-                          {previewingSource === sourceFromCommand(r.install_command) ? "Checking…" : "Install"}
-                        </button>
-                      )}
-                      <span className="text-text-dim">
-                        or in a terminal: <code>{r.install_command}</code>
-                      </span>
-                    </div>
-                  </div>
-                ))
-              )}
-            </div>
-          )}
-        </div>
+        <PluginMarketplace
+          market={market}
+          installedSources={new Set(data?.plugins.map((p) => p.source))}
+          onOpenDetail={setDetail}
+        />
       )}
 
       {tab === "installed" && (
@@ -477,11 +131,11 @@ export function PluginsSettings({ readOnly = false }: { readOnly?: boolean } = {
             <button
               type="button"
               className="rounded border border-surface-700 px-2 py-1 text-xs hover:bg-surface-800 disabled:opacity-50"
-              disabled={checkingUpdates}
-              onClick={() => void onCheckUpdates()}
+              disabled={updates.checking}
+              onClick={() => void updates.check()}
               data-testid="plugins-check-updates"
             >
-              {checkingUpdates ? "Checking…" : "Check for updates"}
+              {updates.checking ? "Checking…" : "Check for updates"}
             </button>
           )}
 
@@ -490,173 +144,62 @@ export function PluginsSettings({ readOnly = false }: { readOnly?: boolean } = {
               No plugins detected.
             </p>
           )}
-          {data?.plugins.map((plugin) => {
-            const update = updates[plugin.id];
-            return (
-              <div
-                key={plugin.id}
-                className="rounded border border-surface-700 bg-surface-850 p-3"
-                data-testid={`plugin-${plugin.id}`}
-              >
-                <div className="flex items-start justify-between gap-3">
-                  <div className="min-w-0">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <PluginIdentityIcon
-                        icon={plugin.icon}
-                        iconAssetUrl={plugin.icon_asset_url}
-                        testId={`plugin-icon-${plugin.id}`}
-                      />
-                      <button
-                        type="button"
-                        className="font-medium hover:underline"
-                        onClick={() =>
-                          setDetail({
-                            source: plugin.source ?? "",
-                            title: plugin.name,
-                            fallback: {
-                              version: plugin.version,
-                              description: plugin.description,
-                              capabilities: plugin.capabilities,
-                              ui_contributions: plugin.ui_contributions,
-                              icon: plugin.icon,
-                              icon_asset_url: plugin.icon_asset_url,
-                            },
-                          })
-                        }
-                        data-testid={`plugin-open-${plugin.id}`}
-                      >
-                        {plugin.name}
-                      </button>
-                      <span className="text-xs text-text-dim">v{plugin.version}</span>
-                      <span
-                        className="rounded bg-accent-500/20 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-accent-500"
-                        data-testid={`plugin-validation-${plugin.id}`}
-                      >
-                        {plugin.validation}
-                      </span>
-                      {plugin.needs_reapproval && (
-                        <span
-                          className="rounded bg-status-warning/20 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-status-warning"
-                          data-testid={`plugin-needs-approval-${plugin.id}`}
-                        >
-                          needs approval
-                        </span>
-                      )}
-                      {update?.needs_update && (
-                        <span
-                          className="rounded bg-accent-500/20 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-accent-500"
-                          data-testid={`plugin-update-available-${plugin.id}`}
-                        >
-                          update available
-                        </span>
-                      )}
-                    </div>
-                    <p className="mt-1 text-xs text-text-dim">{plugin.description}</p>
-                    {plugin.capabilities.length > 0 && (
-                      <p className="mt-1 text-[11px] text-text-dim">
-                        Capabilities: {plugin.capabilities.join(", ")}
-                        {plugin.granted ? "" : " (not granted)"}
-                      </p>
-                    )}
-                    {(plugin.ui_contributions ?? []).length > 0 && (
-                      <p className="mt-1 text-[11px] text-text-dim">
-                        UI: {[...new Set((plugin.ui_contributions ?? []).map((u) => u.slot))].join(", ")}
-                      </p>
-                    )}
-                    {plugin.needs_reapproval && (
-                      <p className="mt-1 text-[11px] text-status-warning">
-                        Installed but inactive. Re-approve with <code>aoe plugin update {plugin.id}</code>.
-                      </p>
-                    )}
-                    {update?.needs_update && (
-                      <div className="mt-1 flex flex-wrap items-center gap-2">
-                        <span className="text-[11px] text-text-dim">
-                          Update available ({update.current} → {update.available ?? "modified"}).
-                        </span>
-                        {!readOnly && (
-                          <button
-                            type="button"
-                            className="rounded border border-surface-700 px-2 py-0.5 text-[11px] hover:bg-surface-800 disabled:opacity-50"
-                            disabled={updatingId === plugin.id}
-                            onClick={() => void onUpdate(plugin)}
-                            data-testid={`plugin-update-${plugin.id}`}
-                          >
-                            {updatingId === plugin.id ? "Checking…" : "Update"}
-                          </button>
-                        )}
-                      </div>
-                    )}
-                    {update?.error && (
-                      <p className="mt-1 text-[11px] text-status-error">Update check failed: {update.error}</p>
-                    )}
-                  </div>
-                  {!readOnly && (
-                    <div className="flex shrink-0 flex-col items-end gap-2">
-                      <label className="flex items-center gap-1 text-xs">
-                        <input
-                          type="checkbox"
-                          role="switch"
-                          aria-label={`Enable ${plugin.name}`}
-                          checked={plugin.enabled}
-                          disabled={busy}
-                          onChange={(e) => void onToggle(plugin, e.target.checked)}
-                        />
-                        Enabled
-                      </label>
-                      {!plugin.builtin && plugin.source && (
-                        <button
-                          type="button"
-                          className="rounded border border-status-error/50 px-2 py-0.5 text-[11px] text-status-error hover:bg-status-error/10 disabled:opacity-50"
-                          onClick={() => setConfirmUninstall(plugin)}
-                          data-testid={`plugin-uninstall-${plugin.id}`}
-                        >
-                          Uninstall
-                        </button>
-                      )}
-                    </div>
-                  )}
-                </div>
-              </div>
-            );
-          })}
+          {data?.plugins.map((plugin) => (
+            <PluginCard
+              key={plugin.id}
+              plugin={plugin}
+              update={updates.updates[plugin.id]}
+              readOnly={readOnly}
+              toggleBusy={busy}
+              updating={updates.updatingId === plugin.id}
+              onOpen={() =>
+                setDetail({
+                  source: plugin.source ?? "",
+                  title: plugin.name,
+                  fallback: {
+                    version: plugin.version,
+                    description: plugin.description,
+                    capabilities: plugin.capabilities,
+                    ui_contributions: plugin.ui_contributions,
+                    icon: plugin.icon,
+                    icon_asset_url: plugin.icon_asset_url,
+                  },
+                })
+              }
+              onToggle={(enabled) => void onToggle(plugin, enabled)}
+              onUpdate={() => void updates.preview(plugin)}
+              onUninstall={() => setConfirmUninstall(plugin)}
+            />
+          ))}
         </div>
       )}
 
-      {detail && (
-        <PluginDetailModal
-          key={detail.source}
-          source={detail.source}
-          title={detail.title}
-          fallback={detail.fallback}
-          installCommand={detail.installCommand}
-          onClose={() => setDetail(null)}
-        />
-      )}
+      {detail && <PluginDetailModal key={detail.source} {...detail} onClose={() => setDetail(null)} />}
 
-      {reviewModal && (
+      {review && (
         <PluginUpdateConsentModal
-          key={reviewModal.plugin.id}
-          consent={reviewModal.consent}
-          name={reviewModal.plugin.name}
-          fromVersion={reviewModal.fromVersion}
-          toVersion={reviewModal.toVersion}
-          changelog={reviewModal.changelog}
-          busy={consentBusy}
-          error={consentError}
-          onApprove={() => void onApproveUpdate()}
-          onDecline={reviewModal.consent ? () => void onDeclineUpdate() : undefined}
-          onClose={() => setReviewModal(null)}
+          key={review.plugin.id}
+          consent={review.consent}
+          name={review.plugin.name}
+          fromVersion={review.fromVersion}
+          toVersion={review.toVersion}
+          changelog={review.changelog}
+          busy={updates.busy}
+          error={updates.reviewError}
+          onApprove={() => void updates.approve()}
+          onDecline={review.consent ? () => void updates.decline() : undefined}
+          onClose={updates.closeReview}
         />
       )}
 
-      {installConsent && (
+      {market.consent && (
         <PluginInstallConsentModal
-          key={installConsent.fingerprint}
-          consent={installConsent}
-          busy={installBusy}
-          error={installError}
-          onApprove={() => void onApproveInstall()}
-          onClose={() => setInstallConsent(null)}
+          key={market.consent.fingerprint}
+          consent={market.consent}
+          busy={market.installBusy}
+          error={market.installError}
+          onApprove={() => void market.approveInstall()}
+          onClose={market.closeConsent}
         />
       )}
 
@@ -700,7 +243,16 @@ export function PluginsSettings({ readOnly = false }: { readOnly?: boolean } = {
         </div>
       )}
 
-      {job && <PluginJobProgressModal jobId={job.id} title={job.title} onClose={() => void onJobClose()} />}
+      {job && (
+        <PluginJobProgressModal
+          jobId={job.id}
+          title={job.title}
+          onClose={() => {
+            setJob(null);
+            void reload();
+          }}
+        />
+      )}
     </div>
   );
 }

@@ -5,16 +5,12 @@ use agent_client_protocol::schema::v1::{ContentBlock, SessionId};
 use agent_client_protocol::JsonRpcRequest;
 use serde::{Deserialize, Serialize};
 
-/// Params for the `_session/steering` extension request: apply a
-/// follow-up message to the turn that is already running, rather than
-/// queuing it as a separate `session/prompt`. See #2805.
-///
-/// `_meta.steering.idleBehavior = "promptRequired"` is the opt-in added
-/// in claude-agent-acp 0.64.0 (upstream #903 / #919). Without it a steer
-/// that arrives after the turn settled starts a detached turn whose
-/// `PromptResponse` no request owns; with it the adapter leaves the
-/// content untouched and says so, and AoE resends it as a normal prompt.
-/// `agent_compat::supports_steering` is what guarantees the adapter
+/// Apply a follow-up to the turn already running rather than queuing it as a
+/// separate `session/prompt` (#2805). Without the
+/// `_meta.steering.idleBehavior = "promptRequired"` opt-in, a steer landing
+/// after the turn settled starts a detached turn no request owns; with it the
+/// adapter leaves the content alone and says so, and AoE resends it as a
+/// normal prompt. `agent_compat::supports_steering` guarantees the adapter
 /// honors the opt-in, so this always requests it.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
 #[request(method = "_session/steering", response = serde_json::Value)]
@@ -49,28 +45,21 @@ pub(super) fn first_text_block(blocks: &[ContentBlock]) -> String {
         .unwrap_or_default()
 }
 
-/// What the agent did with a steered message. Both success outcomes are
-/// normal: the adapter, not AoE, adjudicates whether a turn was still
-/// running when the steer landed.
+/// What the agent did with a steered message. The adapter, not AoE,
+/// adjudicates whether a turn was still running when the steer landed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SteerOutcome {
-    /// Delivered into the running turn. The message's own output streams
-    /// as ordinary `session/update` notifications and the turn's existing
-    /// `PromptResponse` still owns the terminal `Stopped`.
+    /// Delivered into the running turn, whose existing `PromptResponse` still
+    /// owns the terminal `Stopped`.
     Injected,
-    /// The turn settled before the steer was handled. The adapter
-    /// guarantees the content was neither queued nor consumed, so it is
-    /// safe (and required) to resend it as a normal `session/prompt`.
+    /// The turn settled first and the content was neither queued nor consumed,
+    /// so it must be resent as a normal `session/prompt`.
     PromptRequired,
-    /// The adapter ignored the `promptRequired` opt-in and started a
-    /// detached turn with the content anyway. Only reachable from an
-    /// adapter that clears `supports_steering` but does not honor the
-    /// contract, so it is a protocol violation rather than an expected
-    /// state. The content IS consumed, so it must not be resent.
+    /// The adapter ignored the opt-in and started a detached turn anyway: a
+    /// protocol violation, but the content IS consumed, so never resend it.
     StartedNewTurn,
-    /// An outcome string this build does not know. Treated like
-    /// `StartedNewTurn`: delivery is unproven either way, and resending
-    /// risks duplicating the user's message.
+    /// An outcome this build does not know. Delivery is unproven either way,
+    /// so it is treated like `StartedNewTurn` rather than risk a duplicate.
     Unknown,
 }
 
@@ -93,11 +82,8 @@ mod tests {
     use crate::acp::state::{AcpSessionId, Event};
     use agent_client_protocol::schema::v1::TextContent;
 
-    /// The steer wire contract (#2805). `sessionId` must be camelCase and
-    /// the `_meta` opt-in must be spelled exactly as the adapter reads it:
-    /// a typo in either silently degrades a racing steer back to
-    /// `startedNewTurn`, the detached-turn bug the version floor exists to
-    /// avoid, with no error to notice.
+    /// The wire contract (#2805): a typo in `sessionId` or the `_meta` opt-in
+    /// silently degrades a racing steer to `startedNewTurn`, with no error.
     #[test]
     fn steer_request_carries_the_prompt_required_opt_in() {
         let req = SteerRequest::new(
@@ -110,13 +96,11 @@ mod tests {
         assert_eq!(wire["prompt"][0]["text"], "also check the tests");
     }
 
-    /// An unrecognized outcome must land on `Unknown`, not on a success
-    /// arm: `Unknown` is treated as "consumed, do not resend", which is
-    /// the only safe reading when a future adapter adds an outcome this
-    /// build has never seen.
+    /// An outcome this build has never seen must land on `Unknown`, which
+    /// reads as "consumed, do not resend", never on a success arm.
     #[test]
     fn steer_outcome_maps_every_wire_form() {
-        let cases = [
+        for (value, expected) in [
             (
                 serde_json::json!({"outcome": "injected"}),
                 SteerOutcome::Injected,
@@ -137,18 +121,15 @@ mod tests {
             (serde_json::json!({"outcome": 7}), SteerOutcome::Unknown),
             (serde_json::json!({}), SteerOutcome::Unknown),
             (serde_json::json!(null), SteerOutcome::Unknown),
-        ];
-        for (value, expected) in cases {
+        ] {
             assert_eq!(SteerOutcome::from_response(&value), expected, "{value}");
         }
     }
 
-    /// A steering-capable fake that emits the `/compact` start marker and
-    /// then goes silent, mirroring what claude-agent-acp does for the 90
-    /// to 170 seconds it spends summarizing. It answers `_session/steering`
-    /// with the normal `Injected`-shaped success, so a daemon that DID
-    /// steer would look like it worked; the test proves the request was
-    /// never sent at all.
+    /// Emits the `/compact` start marker then goes silent, as
+    /// claude-agent-acp does while summarizing. It answers
+    /// `_session/steering` with a normal success, so a daemon that DID steer
+    /// would look like it worked; the test proves nothing was sent.
     #[cfg(unix)]
     fn write_compacting_fake_agent(
         dir: &std::path::Path,
@@ -185,18 +166,11 @@ done
         (script_path, capture)
     }
 
-    /// #3219: a `/compact` turn only summarizes context, so a follow-up
-    /// must not be steered into it. The adapter would answer `Injected`
-    /// and swallow the message into a turn that never replies, and that
-    /// outcome emits no Retry pill and re-dispatches nothing, so the
-    /// message is simply gone. Both composers park a mid-compaction send
-    /// locally; this covers the POST already in flight when the marker
-    /// landed, and direct API callers.
-    ///
-    /// Asserting through the live prompt loop rather than a unit test on
-    /// the predicate: the thing that can actually break is whether the
-    /// compaction latch is applied by the time the follow-up reaches the
-    /// `cmd_rx` arm, and only the real signal plumbing exercises that.
+    /// #3219: a `/compact` turn only summarizes, so a follow-up steered into
+    /// it is answered `Injected` and swallowed by a turn that never replies,
+    /// with no Retry pill and no re-dispatch. Driven through the live prompt
+    /// loop because what can break is whether the compaction latch is applied
+    /// by the time the follow-up reaches the `cmd_rx` arm.
     #[cfg(unix)]
     #[tokio::test]
     async fn follow_up_during_compaction_is_rejected_instead_of_steered() {
@@ -214,10 +188,8 @@ done
             .await
             .expect("send /compact");
 
-        // Wait for the typed start event, not just the chunk: it proves
-        // the lifecycle signal reached the watchdog and latched the
-        // compaction phase, so the follow-up below cannot race ahead of
-        // the latch and pass the steering gate for the wrong reason.
+        // The typed event, not just the chunk: it proves the latch is set, so
+        // the follow-up cannot pass the steering gate for the wrong reason.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             let ev = tokio::time::timeout_at(deadline, client.next_event())

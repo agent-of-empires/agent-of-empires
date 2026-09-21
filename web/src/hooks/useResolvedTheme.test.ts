@@ -35,6 +35,13 @@ function makeTheme(name: string, appearance: "dark" | "light"): ResolvedTheme {
   };
 }
 
+async function pick(name?: string) {
+  await act(async () => {
+    dispatchThemePickerChanged(name);
+    await Promise.resolve();
+  });
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
   vi.clearAllMocks();
@@ -54,31 +61,20 @@ describe("useResolvedTheme", () => {
     expect(result.current).toBe(cached);
   });
 
-  it("applies the dark theme fetched on mount", async () => {
-    const dark = makeTheme("empire", "dark");
-    fetchCurrentThemeMock.mockResolvedValue(dark);
+  it.each([makeTheme("empire", "dark"), makeTheme("daylight", "light")])(
+    "applies the $appearance theme fetched on mount",
+    async (theme) => {
+      fetchCurrentThemeMock.mockResolvedValue(theme);
+      const { result } = renderHook(() => useResolvedTheme());
+      await waitFor(() => expect(result.current).toBe(theme));
+      expect(fetchCurrentThemeMock).toHaveBeenCalledTimes(1);
+      expect(applyResolvedThemeMock).toHaveBeenCalledWith(theme);
+      expect(dispatchThemeChangedMock).toHaveBeenCalledWith(theme);
+    },
+  );
 
-    const { result } = renderHook(() => useResolvedTheme());
-
-    await waitFor(() => expect(result.current).toBe(dark));
-    expect(fetchCurrentThemeMock).toHaveBeenCalledTimes(1);
-    expect(applyResolvedThemeMock).toHaveBeenCalledWith(dark);
-    expect(dispatchThemeChangedMock).toHaveBeenCalledWith(dark);
-  });
-
-  it("applies a light theme just as well", async () => {
-    const light = makeTheme("daylight", "light");
-    fetchCurrentThemeMock.mockResolvedValue(light);
-
-    const { result } = renderHook(() => useResolvedTheme());
-
-    await waitFor(() => expect(result.current?.appearance).toBe("light"));
-    expect(applyResolvedThemeMock).toHaveBeenCalledWith(light);
-  });
-
-  it("does not apply anything when the mount fetch resolves to null (failure branch)", async () => {
+  it("does not apply anything when the mount fetch resolves to null", async () => {
     fetchCurrentThemeMock.mockResolvedValue(null);
-
     const { result } = renderHook(() => useResolvedTheme());
 
     await Promise.resolve();
@@ -88,25 +84,21 @@ describe("useResolvedTheme", () => {
     expect(dispatchThemeChangedMock).not.toHaveBeenCalled();
   });
 
-  it("refetches /api/theme/current on a picker event without a name", async () => {
+  it("a picker event without a name refetches the current theme", async () => {
     const initial = makeTheme("empire", "dark");
     const next = makeTheme("forest", "dark");
     fetchCurrentThemeMock.mockResolvedValueOnce(initial).mockResolvedValueOnce(next);
 
     const { result } = renderHook(() => useResolvedTheme());
     await waitFor(() => expect(result.current).toBe(initial));
-
-    await act(async () => {
-      window.dispatchEvent(new CustomEvent(THEME_PICKER_CHANGED_EVENT, { detail: {} }));
-      await Promise.resolve();
-    });
+    await pick();
 
     await waitFor(() => expect(result.current).toBe(next));
     expect(fetchCurrentThemeMock).toHaveBeenCalledTimes(2);
     expect(fetchResolvedThemeMock).not.toHaveBeenCalled();
   });
 
-  it("refetches /api/themes/:name on a picker event carrying a name", async () => {
+  it("a picker event carrying a name fetches that theme by name", async () => {
     const initial = makeTheme("empire", "dark");
     const named = makeTheme("ocean", "light");
     fetchCurrentThemeMock.mockResolvedValue(initial);
@@ -114,37 +106,27 @@ describe("useResolvedTheme", () => {
 
     const { result } = renderHook(() => useResolvedTheme());
     await waitFor(() => expect(result.current).toBe(initial));
-
-    await act(async () => {
-      dispatchThemePickerChanged("ocean");
-      await Promise.resolve();
-    });
+    await pick("ocean");
 
     await waitFor(() => expect(result.current).toBe(named));
     expect(fetchResolvedThemeMock).toHaveBeenCalledWith("ocean");
   });
 
-  it("ignores a stale fetch that lands after a newer one (sequence guard)", async () => {
+  it("ignores a stale fetch that lands after a newer one", async () => {
     const mountTheme = makeTheme("empire", "dark");
     const pickerTheme = makeTheme("ocean", "light");
-
     let resolveMount!: (t: ResolvedTheme) => void;
-    const slowMount = new Promise<ResolvedTheme>((r) => {
-      resolveMount = r;
-    });
-    fetchCurrentThemeMock.mockReturnValueOnce(slowMount);
+    fetchCurrentThemeMock.mockReturnValueOnce(
+      new Promise<ResolvedTheme>((r) => {
+        resolveMount = r;
+      }),
+    );
     fetchResolvedThemeMock.mockResolvedValue(pickerTheme);
 
     const { result } = renderHook(() => useResolvedTheme());
-
-    // Picker fetch (seq 2) resolves first and is applied.
-    await act(async () => {
-      dispatchThemePickerChanged("ocean");
-      await Promise.resolve();
-    });
+    await pick("ocean");
     await waitFor(() => expect(result.current).toBe(pickerTheme));
 
-    // Slow mount fetch (seq 1) lands later and must be dropped.
     await act(async () => {
       resolveMount(mountTheme);
       await Promise.resolve();
@@ -165,15 +147,10 @@ describe("useResolvedTheme", () => {
 
     applyResolvedThemeMock.mockClear();
     unmount();
-
     expect(removeSpy).toHaveBeenCalledWith(THEME_PICKER_CHANGED_EVENT, expect.any(Function));
 
-    // A picker event after unmount must not trigger any application.
     fetchResolvedThemeMock.mockResolvedValue(makeTheme("ocean", "light"));
-    await act(async () => {
-      dispatchThemePickerChanged("ocean");
-      await Promise.resolve();
-    });
+    await pick("ocean");
     expect(applyResolvedThemeMock).not.toHaveBeenCalled();
   });
 });

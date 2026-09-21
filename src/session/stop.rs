@@ -1,9 +1,4 @@
 //! Shared session stop logic.
-//!
-//! Stopping a session kills its tmux pane and, for sandboxed sessions, stops
-//! (but does not remove) the Docker container so it can be restarted on
-//! re-attach. `container.stop()` can block for up to the Docker stop grace
-//! period (~10s), so the TUI runs this off the UI thread via `StopPoller`.
 
 use crate::session::Instance;
 

@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-//
-// Coverage for DisconnectBanner: hidden when connected, an alert while the
-// server is down, and a transient "Reconnected" status that auto-dismisses
-// after the connection recovers. Drives state through the real
-// connectionState pub/sub rather than mocking it.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, render, screen } from "@testing-library/react";

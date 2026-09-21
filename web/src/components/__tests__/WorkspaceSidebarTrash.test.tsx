@@ -1,13 +1,4 @@
 // @vitest-environment jsdom
-//
-// Coverage for the WorkspaceSidebar Trash control (#2489, reworked in #2512):
-// a workspace whose sessions are all trashed is reachable from a labeled Trash
-// control in the sidebar footer next to Settings, which opens a wider panel
-// with Open / Restore / Delete actions. Trash is no longer an inline scrolling
-// section.
-// Also asserts the Projects section renders below "Snoozed & archived" (#2512).
-// Vitest (accurate per-file V8) rather than Playwright, whose bundle->source
-// remap is lossy for this large file.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
@@ -15,60 +6,32 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { WorkspaceSidebar } from "../WorkspaceSidebar";
 import { buildSessionGroups } from "../../lib/sidebarGroups";
 import type { SessionResponse, Workspace } from "../../lib/types";
+import { makeSession, makeWorkspace } from "./fixtures";
 
-function session(over: Partial<SessionResponse> = {}): SessionResponse {
-  return {
-    id: "s1",
-    title: "t",
-    project_path: "/repo-a",
-    group_path: "",
-    tool: "claude",
-    status: "Stopped",
-    yolo_mode: false,
-    created_at: "2025-01-01T00:00:00Z",
-    last_accessed_at: null,
-    idle_entered_at: null,
-    last_error: null,
-    branch: null,
-    main_repo_path: null,
-    is_sandboxed: false,
-    favorited: false,
-    has_managed_worktree: false,
-    has_terminal: true,
-    profile: "default",
-    cleanup_defaults: { delete_worktree: false, delete_branch: false, delete_sandbox: false },
-    remote_owner: null,
-    notify_on_waiting: null,
-    notify_on_idle: null,
-    notify_on_error: null,
-    claude_fullscreen: false,
-    workspace_repos: [],
-    scratch: false,
-    archived_at: null,
-    snoozed_until: null,
-    trashed_at: null,
-    ...over,
-  } as SessionResponse;
-}
-
-function workspace(id: string, sessions: SessionResponse[]): Workspace {
-  return {
-    id,
-    branch: null,
-    projectPath: "/repo-a",
-    displayName: id,
-    agents: ["claude"],
-    primaryAgent: "claude",
-    status: "idle",
-    sessions,
-  } as unknown as Workspace;
-}
-
+type Props = React.ComponentProps<typeof WorkspaceSidebar>;
 const noop = () => {};
+const TRASHED = "2026-01-01T00:00:00Z";
 
-function renderSidebar(over: Partial<React.ComponentProps<typeof WorkspaceSidebar>> = {}) {
-  const props: React.ComponentProps<typeof WorkspaceSidebar> = {
-    groups: buildSessionGroups([], { idleDecayWindowMs: 60_000, sortMode: "lastActivity", isCollapsed: () => false }),
+const workspace = (id: string, sessions: Partial<SessionResponse>[]) =>
+  makeWorkspace(
+    id,
+    sessions.map((s) => makeSession({ title: "t", project_path: "/repo-a", group_path: "", status: "Stopped", ...s })),
+    { projectPath: "/repo-a" },
+  );
+const trashed = (id: string, ...ids: string[]) =>
+  workspace(
+    id,
+    ids.map((sid) => ({ id: sid, trashed_at: TRASHED })),
+  );
+
+/** `groups` holds the workspaces for navigation; the Trash list is passed separately, as App computes it. */
+function renderSidebar(workspaces: Workspace[], over: Partial<Props> = {}) {
+  const props: Props = {
+    groups: buildSessionGroups(workspaces, {
+      idleDecayWindowMs: 60_000,
+      sortMode: "lastActivity",
+      isCollapsed: () => false,
+    }),
     nestedGroups: [],
     orgGroups: [],
     onToggleSubgroup: noop,
@@ -91,6 +54,7 @@ function renderSidebar(over: Partial<React.ComponentProps<typeof WorkspaceSideba
     onSettings: noop,
     onRestoreSession: vi.fn(),
     onDeleteSession: vi.fn(),
+    onEmptyTrash: vi.fn(),
     sortMode: "lastActivity",
     onSortModeChange: noop,
     pluginSortRef: null,
@@ -102,242 +66,115 @@ function renderSidebar(over: Partial<React.ComponentProps<typeof WorkspaceSideba
   render(<WorkspaceSidebar {...props} />);
   return props;
 }
+const withTrash = (over: Partial<Props> = {}) => {
+  const ws = trashed("trashed-ws", "s1");
+  return renderSidebar([ws], { trashedWorkspaces: [ws], ...over });
+};
+const click = (id: string) => fireEvent.click(screen.getByTestId(id));
+const query = (id: string) => screen.queryByTestId(id);
+const follows = (a: Node, b: Node) => !!(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
 
 afterEach(cleanup);
 
-describe("WorkspaceSidebar Trash control (#2489, #2512)", () => {
-  // The Trash list is owned by the parent (App computes it from the full,
-  // unsliced workspace set) and passed in as `trashedWorkspaces`; the sidebar
-  // no longer derives it from `groups`. See #2533. Tests pass both: `groups`
-  // so the workspace exists for navigation, `trashedWorkspaces` to populate
-  // the footer popover.
-  function trashedWorkspace(): Workspace {
-    return workspace("trashed-ws", [session({ id: "s1", trashed_at: "2026-01-01T00:00:00Z" })]);
-  }
-  function trashedGroups() {
-    return buildSessionGroups([trashedWorkspace()], {
-      idleDecayWindowMs: 60_000,
-      sortMode: "lastActivity",
-      isCollapsed: () => false,
-    });
-  }
-  function renderWithTrash(over: Partial<React.ComponentProps<typeof WorkspaceSidebar>> = {}) {
-    return renderSidebar({ groups: trashedGroups(), trashedWorkspaces: [trashedWorkspace()], ...over });
-  }
+describe("WorkspaceSidebar Trash control", () => {
+  it("opens from the footer and exposes Open, Restore, and Delete", () => {
+    const props = withTrash();
+    expect(query("sidebar-trash-menu")).toBeNull();
+    click("sidebar-trash-toggle");
+    expect(query("sidebar-trash-row")).not.toBeNull();
 
-  it("reaches a trashed workspace via the footer Trash panel and exposes its actions", () => {
-    const props = renderWithTrash();
-
-    // No inline section in the scrolling list; only the footer toggle.
-    expect(screen.queryByTestId("sidebar-trash-section")).toBeNull();
-    expect(screen.getByTestId("sidebar-trash-toggle").textContent).toContain("Trash");
-    // Closed by default: panel and rows hidden until the footer control is clicked.
-    expect(screen.queryByTestId("sidebar-trash-menu")).toBeNull();
-    expect(screen.queryByTestId("sidebar-trash-row")).toBeNull();
-
-    fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
-    expect(screen.getByTestId("sidebar-trash-menu")).toBeTruthy();
-    expect(screen.getByTestId("sidebar-trash-row")).toBeTruthy();
-    expect(screen.getByTestId("sidebar-trash-open").textContent).toContain("Open");
-    expect(screen.getByTestId("sidebar-trash-restore").textContent).toContain("Restore");
-    expect(screen.getByTestId("sidebar-trash-purge").textContent).toContain("Delete");
-
-    fireEvent.click(screen.getByTestId("sidebar-trash-open"));
+    click("sidebar-trash-open");
     expect(props.onSelect).toHaveBeenCalledWith("trashed-ws", "s1");
-    expect(screen.queryByTestId("sidebar-trash-menu")).toBeNull();
+    expect(query("sidebar-trash-menu")).toBeNull();
 
-    fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
-    fireEvent.click(screen.getByTestId("sidebar-trash-restore"));
+    click("sidebar-trash-toggle");
+    click("sidebar-trash-restore");
     expect(props.onRestoreSession).toHaveBeenCalledWith(["s1"]);
-
-    fireEvent.click(screen.getByTestId("sidebar-trash-purge"));
+    click("sidebar-trash-purge");
     expect(props.onDeleteSession).toHaveBeenCalledWith("trashed-ws");
   });
 
-  it("orders the Trash rows newest-trashed first", () => {
-    const older = workspace("older-ws", [session({ id: "o1", trashed_at: "2026-01-01T00:00:00Z" })]);
-    const newer = workspace("newer-ws", [session({ id: "n1", trashed_at: "2026-06-01T00:00:00Z" })]);
-    // Pass oldest-first to prove the panel re-sorts rather than echoing input order.
-    renderSidebar({
-      groups: buildSessionGroups([older, newer], {
-        idleDecayWindowMs: 60_000,
-        sortMode: "lastActivity",
-        isCollapsed: () => false,
-      }),
-      trashedWorkspaces: [older, newer],
-    });
-    fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
-    const rows = screen.getAllByTestId("sidebar-trash-row");
-    expect(rows[0].textContent).toContain("newer-ws");
-    expect(rows[1].textContent).toContain("older-ws");
+  it("orders rows newest-trashed first", () => {
+    const older = workspace("older-ws", [{ id: "o1", trashed_at: TRASHED }]);
+    const newer = workspace("newer-ws", [{ id: "n1", trashed_at: "2026-06-01T00:00:00Z" }]);
+    renderSidebar([older, newer], { trashedWorkspaces: [older, newer] });
+    click("sidebar-trash-toggle");
+    expect(screen.getAllByTestId("sidebar-trash-row").map((r) => r.textContent?.slice(0, 8))).toEqual([
+      "newer-ws",
+      "older-ws",
+    ]);
   });
 
-  it("renders the count badge next to the Trash icon, not against Settings (#2574)", () => {
-    // The badge must sit right after the Trash icon at the left of the control.
-    // A `flex-1` label that preceded the badge would shove the count to the
-    // button's right edge, where it reads as belonging to the Settings gear.
-    renderWithTrash();
+  it("puts the count right after the Trash icon, not against Settings (#2574)", () => {
+    withTrash();
     const toggle = screen.getByTestId("sidebar-trash-toggle");
     const badge = screen.getByTestId("sidebar-trash-count");
     expect(badge.textContent).toBe("1");
-    // Badge is inside the Trash control, not the Settings button.
     expect(toggle.contains(badge)).toBe(true);
-    // The "Trash" label follows the badge in DOM order; the badge is not the
-    // right-most child pushed up against Settings.
-    const label = Array.from(toggle.querySelectorAll("span")).find((s) => s.textContent === "Trash");
-    expect(label).toBeTruthy();
-    expect(badge.compareDocumentPosition(label!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    const label = Array.from(toggle.querySelectorAll("span")).find((s) => s.textContent === "Trash")!;
+    expect(follows(badge, label)).toBe(true);
   });
 
-  it("closes the Trash popover on Escape", () => {
-    renderWithTrash();
-    fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
-    expect(screen.getByTestId("sidebar-trash-menu")).toBeTruthy();
-    fireEvent.keyDown(document, { key: "Escape" });
-    expect(screen.queryByTestId("sidebar-trash-menu")).toBeNull();
+  it.each([
+    ["Escape", () => fireEvent.keyDown(document, { key: "Escape" })],
+    ["an outside click", () => fireEvent.mouseDown(document.body)],
+  ])("closes on %s", (_n, dismiss) => {
+    withTrash();
+    click("sidebar-trash-toggle");
+    dismiss();
+    expect(query("sidebar-trash-menu")).toBeNull();
   });
 
-  it("closes the Trash popover on outside click", () => {
-    renderWithTrash();
-    fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
-    expect(screen.getByTestId("sidebar-trash-menu")).toBeTruthy();
-    fireEvent.mouseDown(document.body);
-    expect(screen.queryByTestId("sidebar-trash-menu")).toBeNull();
-  });
-
-  it("keeps the Trash icon reachable while a filter hides every live row (#2512)", () => {
-    // Trash is a global recovery affordance: an active filter that matches no
-    // workspace must not strand trashed sessions by hiding the footer icon.
-    renderWithTrash();
+  it("stays reachable while a filter hides every live row (#2512)", () => {
+    withTrash();
     fireEvent.click(screen.getByLabelText("Filter sessions"));
     fireEvent.change(screen.getByTestId("sidebar-filter-input"), { target: { value: "zzz-no-match" } });
-    expect(screen.getByTestId("sidebar-trash-toggle").textContent).toContain("Trash");
-    fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
-    expect(screen.getByTestId("sidebar-trash-row")).toBeTruthy();
+    click("sidebar-trash-toggle");
+    expect(query("sidebar-trash-row")).not.toBeNull();
   });
 
-  it("hides Restore/Delete and Empty Trash actions in read-only mode", () => {
-    renderWithTrash({ readOnly: true });
-    fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
-    expect(screen.getByTestId("sidebar-trash-open")).toBeTruthy();
-    expect(screen.queryByTestId("sidebar-trash-restore")).toBeNull();
-    expect(screen.queryByTestId("sidebar-trash-purge")).toBeNull();
-    expect(screen.queryByTestId("sidebar-trash-empty")).toBeNull();
+  it("hides Restore, Delete, and Empty Trash when read-only", () => {
+    withTrash({ readOnly: true });
+    click("sidebar-trash-toggle");
+    expect(query("sidebar-trash-open")).not.toBeNull();
+    for (const id of ["restore", "purge", "empty"]) expect(query(`sidebar-trash-${id}`)).toBeNull();
   });
 
-  it("Empty Trash confirm counts trashed sessions, singular and plural (#3167)", () => {
-    // Pluralization is pure count logic (session vs sessions), so a table
-    // covers both in jsdom instead of a second Playwright render.
-    const cases: Array<{ count: number; expected: string }> = [
-      { count: 1, expected: "Permanently delete 1 trashed session? This cannot be undone." },
-      { count: 2, expected: "Permanently delete 2 trashed sessions? This cannot be undone." },
-    ];
-    for (const { count, expected } of cases) {
-      const sessions = Array.from({ length: count }, (_, i) =>
-        session({ id: `count-${count}-${i}`, trashed_at: "2026-01-01T00:00:00Z" }),
-      );
-      const ws = workspace(`count-${count}-ws`, sessions);
-      renderSidebar({
-        groups: buildSessionGroups([ws], {
-          idleDecayWindowMs: 60_000,
-          sortMode: "lastActivity",
-          isCollapsed: () => false,
-        }),
-        trashedWorkspaces: [ws],
-        onEmptyTrash: vi.fn(),
-      });
-      fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
-      fireEvent.click(screen.getByTestId("sidebar-trash-empty"));
-      expect(screen.getByTestId("empty-trash-dialog").textContent, `count ${count}`).toContain(expected);
-      cleanup();
-    }
+  it.each([
+    [["c1"], "Permanently delete 1 trashed session? This cannot be undone."],
+    [["c1", "c2"], "Permanently delete 2 trashed sessions? This cannot be undone."],
+  ])("Empty Trash confirm counts sessions %j (#3167)", (ids, expected) => {
+    const ws = trashed("multi-ws", ...ids);
+    renderSidebar([ws], { trashedWorkspaces: [ws] });
+    click("sidebar-trash-toggle");
+    click("sidebar-trash-empty");
+    expect(screen.getByTestId("empty-trash-dialog").textContent).toContain(expected);
   });
 
-  it("Empty Trash Cancel is inert and a single Confirm fires onEmptyTrash once (#3167)", () => {
-    // One workspace with two trashed sessions exercises the count path; here the
-    // focus is the confirm/cancel wiring, not the wording (covered above).
-    const twoSession = workspace("multi-ws", [
-      session({ id: "m1", trashed_at: "2026-01-01T00:00:00Z" }),
-      session({ id: "m2", trashed_at: "2026-01-01T00:00:00Z" }),
-    ]);
-    const onEmptyTrash = vi.fn();
-    renderSidebar({
-      groups: buildSessionGroups([twoSession], {
-        idleDecayWindowMs: 60_000,
-        sortMode: "lastActivity",
-        isCollapsed: () => false,
-      }),
-      trashedWorkspaces: [twoSession],
-      onEmptyTrash,
-    });
-
-    fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
-    fireEvent.click(screen.getByTestId("sidebar-trash-empty"));
-
-    // Cancel closes the open dialog (proving it opened) without purging.
+  it("Empty Trash: Cancel is inert, Escape keeps the panel open, one Confirm purges once", () => {
+    const props = withTrash();
+    click("sidebar-trash-toggle");
+    click("sidebar-trash-empty");
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-    expect(screen.queryByTestId("empty-trash-dialog")).toBeNull();
-    expect(onEmptyTrash).not.toHaveBeenCalled();
+    expect(query("empty-trash-dialog")).toBeNull();
 
-    // Reopen and confirm: a single confirm click invokes onEmptyTrash once
-    // (not zero, not twice). Confirming here unmounts the dialog immediately, so
-    // this asserts the single-fire happy path only; the synchronous firedRef
-    // re-entry guard is exercised in isolation in EmptyTrashConfirm.test.tsx,
-    // where onConfirm does not unmount so a second click can hit the guard.
-    fireEvent.click(screen.getByTestId("sidebar-trash-empty"));
-    fireEvent.click(screen.getByTestId("empty-trash-confirm"));
-    expect(onEmptyTrash).toHaveBeenCalledTimes(1);
-  });
-
-  it("Escape on the Empty Trash confirm closes only the dialog, not the Trash panel (#3167)", () => {
-    // The confirm portals to document.body, so before the fix the panel's own
-    // document Escape listener also fired and closed the panel underneath.
-    const ws = workspace("multi-ws", [session({ id: "m1", trashed_at: "2026-01-01T00:00:00Z" })]);
-    renderSidebar({
-      groups: buildSessionGroups([ws], {
-        idleDecayWindowMs: 60_000,
-        sortMode: "lastActivity",
-        isCollapsed: () => false,
-      }),
-      trashedWorkspaces: [ws],
-      onEmptyTrash: vi.fn(),
-    });
-
-    fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
-    fireEvent.click(screen.getByTestId("sidebar-trash-empty"));
-    expect(screen.getByTestId("empty-trash-dialog")).toBeTruthy();
-
+    // The confirm portals outside the panel, so Escape must not close the panel too.
+    click("sidebar-trash-empty");
     fireEvent.keyDown(document, { key: "Escape" });
+    expect(query("empty-trash-dialog")).toBeNull();
+    expect(query("sidebar-trash-menu")).not.toBeNull();
+    expect(props.onEmptyTrash).not.toHaveBeenCalled();
 
-    // The dialog closes, but the Trash panel stays open.
-    expect(screen.queryByTestId("empty-trash-dialog")).toBeNull();
-    expect(screen.getByTestId("sidebar-trash-menu")).toBeTruthy();
+    click("sidebar-trash-empty");
+    click("empty-trash-confirm");
+    expect(props.onEmptyTrash).toHaveBeenCalledTimes(1);
   });
 
-  it("omits the Trash icon when nothing is trashed", () => {
-    renderSidebar({
-      groups: buildSessionGroups([workspace("live-ws", [session({ id: "live", status: "Running" })])], {
-        idleDecayWindowMs: 60_000,
-        sortMode: "lastActivity",
-        isCollapsed: () => false,
-      }),
-    });
-    expect(screen.queryByTestId("sidebar-trash-toggle")).toBeNull();
-  });
-
-  it("renders the Projects section below 'Snoozed & archived' (#2512)", () => {
-    // An archived (sunk) workspace surfaces the sunk section; the Projects
-    // section header always renders when CRUD is available. Assert DOM order.
-    const archivedWs = workspace("archived-ws", [session({ id: "a1", archived_at: "2026-01-01T00:00:00Z" })]);
-    renderSidebar({
-      groups: buildSessionGroups([archivedWs], {
-        idleDecayWindowMs: 60_000,
-        sortMode: "lastActivity",
-        isCollapsed: () => false,
-      }),
-    });
-    const sunk = screen.getByTestId("sidebar-sunk-section");
-    const projects = screen.getByTestId("sidebar-projects-section");
-    expect(sunk.compareDocumentPosition(projects) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  it("omits the control when nothing is trashed, and lists Projects below Snoozed & archived", () => {
+    renderSidebar([workspace("archived-ws", [{ id: "a1", archived_at: TRASHED }])]);
+    expect(query("sidebar-trash-toggle")).toBeNull();
+    expect(follows(screen.getByTestId("sidebar-sunk-section"), screen.getByTestId("sidebar-projects-section"))).toBe(
+      true,
+    );
   });
 });

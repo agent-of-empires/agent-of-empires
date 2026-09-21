@@ -1,11 +1,6 @@
-// Shared helpers for parsing the JSON-shaped `args_preview` field on
-// structured view tool calls (and other JSON blobs the structured view UI displays).
-// The Rust side ships a string preview that's USUALLY a JSON object
-// but sometimes truncated or non-object — these helpers handle both.
+// Helpers for tool-call `args_preview`, usually but not always a JSON object.
 
-/** Parse a JSON object payload. Returns null when the input doesn't
- *  parse, isn't an object, or is an array (callers want
- *  field-by-field access, not array indexing). */
+/** Null unless the input parses to a non-array object. */
 export function parseJsonObject(s: string): Record<string, unknown> | null {
   try {
     const v = JSON.parse(s);
@@ -15,9 +10,7 @@ export function parseJsonObject(s: string): Record<string, unknown> | null {
   }
 }
 
-/** Return the first key whose value is a string. Used to surface a
- *  tool's primary argument (path, command, query) when the agent
- *  uses different field names across versions. */
+/** First string-valued key, since agents name the primary argument differently across versions. */
 export function pickStr(o: Record<string, unknown> | null, ...keys: string[]): string | null {
   if (!o) return null;
   for (const k of keys) {
@@ -27,7 +20,6 @@ export function pickStr(o: Record<string, unknown> | null, ...keys: string[]): s
   return null;
 }
 
-/** Return the first non-empty string in the chain, or null. */
 export function pickFirst(...candidates: Array<string | null | undefined>): string | null {
   for (const c of candidates) {
     if (typeof c === "string" && c.trim() !== "") return c;
@@ -35,12 +27,7 @@ export function pickFirst(...candidates: Array<string | null | undefined>): stri
   return null;
 }
 
-/** Derive a one-line preview from a tool call's `args_preview`, mirroring
- *  the per-card primary-arg extraction in ToolCards.tsx: command for
- *  execute, path for read/edit/delete, query/pattern for search, url for
- *  fetch, then the ACP-forwarded `_aoe_title`. Returns null when the
- *  payload carries no usable primary argument (e.g. an adapter that ships
- *  an empty `{}` for bash); callers fall back to the tool name. */
+/** One-line primary argument, mirroring ToolCards.tsx; null when the payload has none. */
 export function previewFromArgs(argsPreview: string): string | null {
   const args = parseJsonObject(argsPreview);
   return pickFirst(
@@ -52,25 +39,14 @@ export function previewFromArgs(argsPreview: string): string | null {
   );
 }
 
-/** Whether an `args_preview` has body content worth expanding: a
- *  non-object payload counts when non-blank; an object counts when it
- *  has at least one non-`_aoe_` key. Mirrors ArgsView's render gate so
- *  the approval card only shows an expand affordance when there is
- *  something behind it. */
+/** Mirrors ArgsView's render gate: non-blank text, or an object with a non-`_aoe_` key. */
 export function hasArgsBody(argsPreview: string): boolean {
   const parsed = parseJsonObject(argsPreview);
   if (!parsed) return argsPreview.trim().length > 0;
   return Object.keys(parsed).some((k) => !k.startsWith("_aoe_"));
 }
 
-/** Readable labels for known ACP permission identifiers that some agents
- *  send verbatim as the permission-request title (e.g. opencode's
- *  `external_directory`). These are internal protocol kinds, not real tool
- *  names, so the raw identifier reads as jargon on the approval card.
- *  Unknown titles pass through unchanged, so a new upstream identifier
- *  shows as-is (a debuggable signal) rather than a mangled auto-title; we
- *  deliberately avoid blanket snake_case-to-title casing, which mauls
- *  acronyms and legitimate tool names. */
+/** Labels for ACP permission kinds some agents send as titles. Unknown titles pass through untouched rather than being auto-cased. */
 const PERMISSION_TITLE_LABELS: Record<string, string> = {
   external_directory: "External directory access",
 };
@@ -100,10 +76,7 @@ export function hasTodoItemsArgsText(argsText: string): boolean {
   return todoItemsFromArgs(parseJsonObject(argsText)).length > 0;
 }
 
-/** Whether `args.todos` is present as an array, even an empty one. An
- *  empty `todos: []` is a real clear-list snapshot, not a non-todo tool;
- *  array-presence (not item count) is the discriminator both grouping and
- *  rendering key on so a clear still groups and renders. See #2003. */
+/** An empty `todos: []` is a real clear-list snapshot, so array presence is the discriminator. */
 export function hasTodoArrayArgsText(argsText: string): boolean {
   return Array.isArray(parseJsonObject(argsText)?.todos);
 }

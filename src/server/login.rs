@@ -1,22 +1,4 @@
 //! Passphrase-based login as a second authentication factor.
-//!
-//! When a passphrase is configured, users must enter it after token auth
-//! to access the dashboard. Login sessions are tracked server-side with
-//! a device-binding secret (replaces the prior strict IP binding, see
-//! #1131) and a 30-day sliding expiry window. Active use refreshes
-//! the deadline; 30 days of inactivity logs the device out and
-//! requires re-entering the passphrase. See #1137 for the rationale,
-//! and #1163 / #1167 for the lifetime extension (matches the
-//! "rarely-ever-log-out" experience users expect from a single-owner
-//! dev tool).
-//!
-//! The device-binding model: the client generates 32 random bytes via
-//! `crypto.getRandomValues`, stores them in `localStorage`, and presents
-//! them on every authenticated request. The server stores only the
-//! SHA-256 hash and uses a constant-time compare. A leaked session
-//! cookie alone is therefore insufficient, the attacker also needs the
-//! binding secret. Mobile IP rotation no longer logs anyone out because
-//! IP is now telemetry only.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -37,23 +19,10 @@ use super::auth::resolve_client_ip;
 use super::AppState;
 use crate::util::{now_ms, system_time_to_ms};
 
-/// Session lifetime (sliding window). Refreshes on every
-/// authenticated request, so an active user never sees it; the
-/// effective behavior is "log out after 30 days of inactivity",
-/// matching the rarely-prompt experience users expect from a tool
-/// they live in (GitHub-style, not banking-style). The cookie's
-/// `Max-Age=2592000` already advertised 30 days; this aligns the
-/// server-side TTL with the client-side hint. See #1137 (initial
-/// 24h window) and #1167 (extension rationale: bound devices stay
-/// signed in independent of token rotation).
-///
-/// `pub(crate)` so cross-module tests can pin the value and catch
-/// a silent regression to the old 24h window.
+/// Session lifetime (sliding window).
 pub(crate) const SESSION_LIFETIME: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
-/// Step-up elevation window. Required for high-risk operations
-/// (terminal attach, structured view command execution, file writes,
-/// destructive session ops). See #1131.
+/// Step-up elevation window.
 const ELEVATION_LIFETIME: Duration = Duration::from_secs(15 * 60);
 
 /// Maximum concurrent login sessions before evicting the oldest.
@@ -63,76 +32,40 @@ const MAX_SESSIONS: usize = 50;
 const MIN_PASSPHRASE_LENGTH: usize = 8;
 
 /// Length in raw bytes of the client-generated device binding secret.
-/// 32 bytes (256 bits) of entropy from `crypto.getRandomValues`. We
-/// reject shorter or longer payloads to catch typos and tampering.
 const BINDING_SECRET_BYTES: usize = 32;
 
 /// Filename for the persisted login-session store under the app dir.
-/// Owner-only (0600); survives daemon restart so signed-in devices are
-/// not re-prompted for the passphrase on every `aoe serve` bounce. See
-/// #1235.
 const SESSIONS_FILE: &str = "login_sessions.toml";
 
-/// Schema version stamped into the persisted store. Bump on a breaking
-/// layout change; an older/newer/unparseable file is dropped (start
-/// empty) rather than migrated, since the cost of a re-login is one
-/// passphrase prompt.
+/// Schema version stamped into the persisted store.
 const SESSIONS_SCHEMA_VERSION: u32 = 1;
 
-/// The sliding window refreshes `expires_at` on every authenticated
-/// request, but rewriting the store on every request is unacceptable
-/// write amplification. Instead we only re-persist a refreshed deadline
-/// once it has advanced more than this threshold since the last write.
-/// Worst case after a crash: a session expires up to this much earlier
-/// than it would have in memory, which is invisible against the 30-day
-/// window. Mutating events (create / invalidate / elevation) always
-/// persist immediately. See #1235.
+/// The sliding window refreshes `expires_at` on every authenticated request, but rewriting
+/// the store on every request is unacceptable write amplification.
 const REFRESH_PERSIST_THRESHOLD: Duration = Duration::from_secs(24 * 60 * 60);
 
 struct LoginSession {
     expires_at: Instant,
     /// SHA-256 hash of the client-presented device binding secret.
-    /// Constant-time compared on validation. We never store or log
-    /// the raw secret; a server-side leak of `LoginManager` state
-    /// must not be replayable.
     binding_hash: [u8; 32],
-    /// Step-up elevation deadline. `None` (or in the past) means the
-    /// session can browse the dashboard but cannot reach the
-    /// high-risk routes guarded by `is_elevated`. See #1131. Never
-    /// persisted: a daemon restart is a legitimate recency-break, so
-    /// a high-risk action re-prompts for the passphrase. See #1235.
+    /// Step-up elevation deadline.
     elevated_until: Option<Instant>,
     /// Per-session failed elevation attempts since the last reset.
-    /// Bound to the session id (not the client IP) so an attacker who
-    /// holds session + binding cannot defeat the rate limiter by
-    /// rotating IPs (mobile carrier, Tor, residential proxies).
-    /// Reset on a successful elevation or full lockout expiry.
     elevation_failures: u32,
-    /// Lockout deadline that gates further `/api/login/elevate`
-    /// attempts for this session. `None` outside an active lockout.
+    /// Lockout deadline that gates further `/api/login/elevate` attempts for this session.
     elevation_locked_until: Option<Instant>,
-    /// Wall-clock creation time, for the connected-devices view. Kept
-    /// as `SystemTime` (not `Instant`) so it round-trips across a
-    /// daemon restart. See #1235.
+    /// Wall-clock creation time, for the connected-devices view.
     created_at: SystemTime,
-    /// Client IP at creation, display-only telemetry for the devices
-    /// view. Never consulted for auth (#1131 removed IP binding).
+    /// Client IP at creation, display-only telemetry for the devices view.
     created_ip: String,
     /// User-agent string captured at login, for a friendly device
     /// label in the devices view. Display-only.
     user_agent: String,
-    /// Deadline value at the last time this session was persisted to
-    /// disk. Drives the `REFRESH_PERSIST_THRESHOLD` coalescing so a
-    /// sliding refresh only triggers a write once it has moved far
-    /// enough. Never serialized. See #1235.
+    /// Deadline value at the last time this session was persisted to disk.
     last_persisted_expires_at: Instant,
 }
 
-/// Threshold for the per-session elevation rate limiter. Tighter than
-/// the per-IP limiter on `/api/login` because the attacker must
-/// already hold a valid session + binding to even reach the elevate
-/// endpoint, so each failed attempt is a stronger signal of brute
-/// force. Three attempts trips a 15-minute lockout.
+/// Threshold for the per-session elevation rate limiter.
 const MAX_ELEVATION_FAILURES: u32 = 3;
 const ELEVATION_LOCKOUT: Duration = Duration::from_secs(15 * 60);
 
@@ -140,17 +73,12 @@ const ELEVATION_LOCKOUT: Duration = Duration::from_secs(15 * 60);
 pub struct LoginManager {
     passphrase_hash: Option<String>,
     sessions: RwLock<HashMap<String, LoginSession>>,
-    /// Path to the on-disk session store, when persistence is enabled
-    /// and an app dir is available. `None` disables persistence (tests,
-    /// `auth.persist_sessions = false`, or no resolvable app dir). See
-    /// #1235.
+    /// Path to the on-disk session store, when persistence is enabled and an app dir is
+    /// available.
     sessions_path: Option<PathBuf>,
 }
 
-/// Argon2 hash of a passphrase with a fresh random salt. The PHC string
-/// carries its own salt, so a later `argon2_verify` against it detects
-/// a passphrase change across restarts even though two hashes of the
-/// same passphrase never compare byte-equal. See #1235.
+/// Argon2 hash of a passphrase with a fresh random salt.
 fn hash_passphrase(passphrase: &str) -> String {
     use argon2::{Argon2, PasswordHasher};
 
@@ -170,9 +98,7 @@ fn argon2_verify(passphrase: &str, hash: &str) -> bool {
 }
 
 impl LoginManager {
-    /// Create a new login manager without persistence. If `passphrase`
-    /// is `Some`, hash it with argon2. Used by tests and any caller that
-    /// does not want an on-disk store.
+    /// Create a new login manager without persistence.
     pub fn new(passphrase: Option<&str>) -> Self {
         Self {
             passphrase_hash: passphrase.map(hash_passphrase),
@@ -181,12 +107,9 @@ impl LoginManager {
         }
     }
 
-    /// Create a login manager that persists sessions under `app_dir`,
-    /// rehydrating any previously stored sessions whose passphrase still
-    /// matches and whose sliding window has not lapsed. A missing,
-    /// unreadable, corrupt, or wrong-permission store starts empty
-    /// (logged), never an error: the worst case is one extra passphrase
-    /// prompt. See #1235.
+    /// Create a login manager that persists sessions under `app_dir`, rehydrating any
+    /// previously stored sessions whose passphrase still matches and whose sliding window
+    /// has not lapsed.
     pub fn with_persistence(passphrase: Option<&str>, app_dir: &Path) -> Self {
         let passphrase_hash = passphrase.map(hash_passphrase);
         let sessions_path = app_dir.join(SESSIONS_FILE);
@@ -203,12 +126,8 @@ impl LoginManager {
             }
         };
 
-        // Rewrite the store once at startup so the passphrase hash is
-        // refreshed (rotates the salt) and any dropped/expired entries
-        // are pruned on disk. Synchronous: a one-time tiny write, and no
-        // tokio lock is held yet. An insecure path (symlink, loose perms,
-        // untrusted parent dir) is refused inside `write_sessions`, which
-        // guards every writer rather than this one call site. See #1235.
+        // Rewrite the store once at startup so the passphrase hash is refreshed (rotates
+        // the salt) and any dropped/expired entries are pruned on disk.
         let snapshot = build_persisted(&passphrase_hash, &sessions);
         write_sessions(&sessions_path, &snapshot);
 
@@ -232,11 +151,7 @@ impl LoginManager {
         }
     }
 
-    /// Create a new login session bound to a device. Returns the
-    /// session ID (64-char hex). `binding_secret_bytes` is the raw 32
-    /// random bytes the client generated; only its SHA-256 hash is
-    /// retained. `created_ip` and `user_agent` are display-only metadata
-    /// for the connected-devices view; neither is consulted for auth.
+    /// Create a new login session bound to a device.
     pub async fn create_session(
         &self,
         binding_secret_bytes: &[u8],
@@ -278,12 +193,7 @@ impl LoginManager {
         session_id
     }
 
-    /// Validate a session. Checks existence, expiry, and a
-    /// constant-time match against the stored device binding hash.
-    /// On success, extends the sliding window. IP is no longer
-    /// consulted, mobile network rotation is a normal pattern and
-    /// the device-binding secret carries the identity instead. See
-    /// #1131.
+    /// Validate a session.
     pub async fn validate_session(&self, session_id: &str, presented_binding: &[u8]) -> bool {
         if session_id.is_empty() || presented_binding.len() != BINDING_SECRET_BYTES {
             return false;
@@ -291,16 +201,10 @@ impl LoginManager {
 
         let presented_hash = hash_binding_secret(presented_binding);
 
-        // `needs_persist` is set under the lock, acted on after release:
-        // a sliding refresh only re-persists once the deadline has moved
-        // past `REFRESH_PERSIST_THRESHOLD`, and an expiry eviction
-        // persists immediately. See #1235.
+        // `needs_persist` is set under the lock, acted on after release.
         let mut needs_persist = false;
-        // `Some(deadline)` when this validation refreshed the sliding
-        // window far enough to re-persist. The watermark is advanced only
-        // after a successful write (below), so a failed persist keeps
-        // retrying on later refreshes instead of suppressing them for the
-        // next ~24h. See #1235.
+        // `Some(deadline)` when this validation refreshed the sliding window far enough to
+        // re-persist.
         let mut refreshed_deadline: Option<Instant> = None;
         let valid = {
             let mut sessions = self.sessions.write().await;
@@ -313,9 +217,7 @@ impl LoginManager {
                 needs_persist = true;
                 false
             } else if session.binding_hash.ct_eq(&presented_hash).unwrap_u8() == 0 {
-                // Constant-time compare. `Choice::unwrap_u8()` gives a
-                // 0/1 we interpret as `bool` without branching on the
-                // comparison result.
+                // Constant-time compare.
                 false
             } else {
                 // Sliding window: extend expiry on each valid access.
@@ -341,11 +243,7 @@ impl LoginManager {
         valid
     }
 
-    /// Mark a session as elevated (passphrase confirmed) for
-    /// `ELEVATION_LIFETIME`. Caller is responsible for verifying the
-    /// passphrase before calling. Also resets the per-session
-    /// elevation failure counter, since a successful confirmation
-    /// proves the legitimate user is driving the prompt.
+    /// Mark a session as elevated (passphrase confirmed) for `ELEVATION_LIFETIME`.
     pub async fn elevate_session(&self, session_id: &str) -> bool {
         if session_id.is_empty() {
             return false;
@@ -368,10 +266,7 @@ impl LoginManager {
         true
     }
 
-    /// Whether the session's elevation endpoint is locked out. Returns
-    /// the remaining seconds on the lockout window when active. Bound
-    /// to the session id (not IP) so an attacker who holds session +
-    /// binding can't defeat the limiter by rotating IPs. See #1131.
+    /// Whether the session's elevation endpoint is locked out.
     pub async fn elevation_lockout_remaining(&self, session_id: &str) -> Option<u64> {
         if session_id.is_empty() {
             return None;
@@ -386,10 +281,7 @@ impl LoginManager {
         Some(locked_until.saturating_duration_since(now).as_secs().max(1))
     }
 
-    /// Record a failed passphrase entry on `/api/login/elevate` for
-    /// this session. Increments the per-session counter and arms a
-    /// `ELEVATION_LOCKOUT` window when the threshold is crossed.
-    /// Returns true when this call triggered a fresh lockout.
+    /// Record a failed passphrase entry on `/api/login/elevate` for this session.
     pub async fn record_elevation_failure(&self, session_id: &str) -> bool {
         if session_id.is_empty() {
             return false;
@@ -430,11 +322,7 @@ impl LoginManager {
         armed
     }
 
-    /// Read elevation state. Returns `(elevated, elevated_until_secs)`:
-    /// the bool reflects whether the elevation window is still open,
-    /// the optional seconds-from-now value is what `/api/login/status`
-    /// surfaces to the client. Returns `(false, None)` for an unknown
-    /// or expired session.
+    /// Read elevation state.
     pub async fn elevation_state(&self, session_id: &str) -> (bool, Option<u64>) {
         if session_id.is_empty() {
             return (false, None);
@@ -457,8 +345,7 @@ impl LoginManager {
         (true, Some(remaining))
     }
 
-    /// Whether the session is currently elevated. Auth middleware
-    /// calls this to gate sensitive routes.
+    /// Whether the session is currently elevated.
     pub async fn is_elevated(&self, session_id: &str) -> bool {
         self.elevation_state(session_id).await.0
     }
@@ -472,8 +359,6 @@ impl LoginManager {
     }
 
     /// Revoke a single session by id from the connected-devices view.
-    /// Returns whether a session was actually removed. Same effect as a
-    /// logout, but initiated by another (elevated) device. See #1235.
     pub async fn revoke_session(&self, session_id: &str) -> bool {
         let removed = self.sessions.write().await.remove(session_id).is_some();
         if removed {
@@ -482,10 +367,7 @@ impl LoginManager {
         removed
     }
 
-    /// Sign out every device: drop all sessions and persist the empty
-    /// store. The escape hatch that replaces the implicit "restart logs
-    /// everyone out" behavior persistence removes. Returns the number of
-    /// sessions cleared. See #1235.
+    /// Sign out every device.
     pub async fn logout_all(&self) -> usize {
         let count = {
             let mut sessions = self.sessions.write().await;
@@ -498,11 +380,6 @@ impl LoginManager {
     }
 
     /// Snapshot of the current sessions for the connected-devices view.
-    /// `last_seen` is derived from the sliding deadline
-    /// (`expires_at - SESSION_LIFETIME`), so it reflects the most recent
-    /// authenticated request without a dedicated field. The session that
-    /// owns `current_session_id` is flagged so the UI can label "this
-    /// device". See #1235.
     pub async fn device_snapshot(&self, current_session_id: Option<&str>) -> Vec<DeviceSession> {
         let sessions = self.sessions.read().await;
         let now_inst = Instant::now();
@@ -510,9 +387,8 @@ impl LoginManager {
         let mut out: Vec<DeviceSession> = sessions
             .iter()
             .map(|(id, s)| {
-                // last_seen = now - (time remaining until the deadline
-                // minus the full lifetime). Clamp to avoid a future
-                // timestamp on a freshly refreshed session.
+                // last_seen = now - (time remaining until the deadline minus the full
+                // lifetime).
                 let remaining = s.expires_at.saturating_duration_since(now_inst);
                 let since_last_seen = SESSION_LIFETIME.saturating_sub(remaining);
                 let last_seen = now_sys.checked_sub(since_last_seen).unwrap_or(now_sys);
@@ -548,12 +424,6 @@ impl LoginManager {
     }
 
     /// Persist the current sessions to disk when persistence is enabled.
-    /// Returns whether the store is now durable: `true` on a successful
-    /// write (or when persistence is disabled, nothing to do), `false`
-    /// when the write failed. Errors are logged, never propagated: a
-    /// failed write must not break an in-flight login. Runs the blocking
-    /// file write on a blocking thread so the async runtime is never
-    /// stalled. See #1235.
     async fn persist(&self) -> bool {
         let Some(path) = self.sessions_path.clone() else {
             return true;
@@ -585,18 +455,14 @@ impl LoginManager {
     }
 }
 
-/// Hash a device binding secret with SHA-256. The input has 256 bits
-/// of entropy from the client's `crypto.getRandomValues`, so plain
-/// SHA-256 is sufficient and avoids needing a process-scoped secret.
+/// Hash a device binding secret with SHA-256.
 fn hash_binding_secret(secret: &[u8]) -> [u8; 32] {
     Sha256::digest(secret).into()
 }
 
 // ── Persistence ──────────────────────────────────────────────────────────────
 
-/// A login session as surfaced to the connected-devices view. Derived
-/// from the live in-memory sessions, so it survives a daemon restart
-/// once persistence rehydrates them. See #1235.
+/// A login session as surfaced to the connected-devices view.
 #[derive(Clone, Serialize)]
 pub struct DeviceSession {
     pub session_id: String,
@@ -609,10 +475,9 @@ pub struct DeviceSession {
     pub current: bool,
 }
 
-/// On-disk shape of `login_sessions.toml`. `passphrase_hash` is the
-/// argon2 PHC string of the passphrase in force when the file was last
-/// written; on load it gates whether the sessions are rehydrated (same
-/// passphrase) or dropped (changed). See #1235.
+/// On-disk shape of `login_sessions.toml`. `passphrase_hash` is the argon2 PHC string of
+/// the passphrase in force when the file was last written; on load it gates whether the
+/// sessions are rehydrated (same passphrase) or dropped (changed).
 #[derive(Serialize, Deserialize)]
 struct PersistedFile {
     schema_version: u32,
@@ -642,9 +507,7 @@ struct PersistedSession {
     elevation_locked_until_ms: u64,
 }
 
-/// Convert an in-memory `Instant` deadline to a wall-clock epoch-ms
-/// value for persistence. Returns 0 when the deadline is already in the
-/// past.
+/// Convert an in-memory `Instant` deadline to a wall-clock epoch-ms value for persistence.
 fn instant_deadline_to_ms(deadline: Instant, now_inst: Instant, now_ms_val: u64) -> u64 {
     let remaining = deadline.saturating_duration_since(now_inst);
     if remaining.is_zero() {
@@ -688,15 +551,9 @@ fn build_persisted(
     }
 }
 
-/// Atomically write the session store, owner-only (0600). Returns
-/// whether the write succeeded. Errors are logged, never propagated: a
-/// failed persist must not break a login, but the boolean lets callers
-/// avoid advancing the on-disk-expiry watermark on a failed write.
+/// Atomically write the session store, owner-only (0600).
 fn write_sessions(path: &Path, file: &PersistedFile) -> bool {
-    // The no-symlink, owner-only invariant belongs on the write path too,
-    // not just at load. `atomic_write` resolves symlinks and writes through
-    // to the target, so an unguarded persist would hand the session secret
-    // to whatever a planted link points at. See #1235, #3186.
+    // The no-symlink, owner-only invariant belongs on the write path too, not just at load.
     if let Err(e) = check_path_security(path) {
         tracing::warn!(
             target: "auth.passphrase",
@@ -727,13 +584,7 @@ fn write_sessions(path: &Path, file: &PersistedFile) -> bool {
     true
 }
 
-/// Fail-closed check that the sessions store is safe to read from or
-/// write to: the parent dir must exist, not be a symlink, and not be
-/// group/world writable; the file itself (when it exists) must be a
-/// regular, owner-only (0600) file, not a symlink. Shared by the load
-/// path and the startup rewrite so neither fails open on a tampered or
-/// misconfigured app dir. A missing file is fine, it has not been
-/// created yet. See #1235.
+/// Fail-closed check that the sessions store is safe to read from or write to.
 fn check_path_security(path: &Path) -> anyhow::Result<()> {
     use anyhow::{bail, Context};
 
@@ -770,11 +621,7 @@ fn check_path_security(path: &Path) -> anyhow::Result<()> {
     }
 }
 
-/// Load and rehydrate persisted sessions. Returns an empty map (not an
-/// error) for the benign cases: file missing, schema mismatch, or
-/// passphrase changed. Returns `Err` only for states that warrant a
-/// visible warning (symlink, loose perms, unreadable, unparseable), in
-/// which case the caller also starts empty. See #1235.
+/// Load and rehydrate persisted sessions.
 fn load_sessions(
     path: &Path,
     passphrase: Option<&str>,
@@ -877,9 +724,6 @@ fn load_sessions(
 }
 
 /// Decode a base64url-encoded device binding secret from the wire.
-/// Returns the raw bytes only when they decode to exactly
-/// `BINDING_SECRET_BYTES`. Both padded and unpadded base64url are
-/// accepted because browser base64url emitters disagree on padding.
 pub fn decode_binding_secret(s: &str) -> Option<Vec<u8>> {
     use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
     use base64::Engine;
@@ -917,9 +761,7 @@ pub fn check_passphrase_strength(passphrase: &str) -> Option<String> {
 #[derive(Deserialize)]
 pub struct LoginRequest {
     passphrase: String,
-    /// Base64url encoding of 32 random bytes the client persists in
-    /// `localStorage`. Required since #1131; without it the session
-    /// cannot be device-bound and the response is 400.
+    /// Base64url encoding of 32 random bytes the client persists in `localStorage`.
     device_binding_secret: String,
 }
 
@@ -971,9 +813,8 @@ pub async fn login_handler(
     };
 
     let Some(binding_bytes) = decode_binding_secret(&login_req.device_binding_secret) else {
-        // Treat malformed bindings as a usage error (the client sent
-        // garbage), not a failed login attempt: no rate-limiter
-        // increment, no audit log.
+        // Treat malformed bindings as a usage error (the client sent garbage), not a failed
+        // login attempt.
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -1011,13 +852,7 @@ pub async fn login_handler(
 
         tracing::info!(target: "auth.passphrase", ip = %client_ip, "passphrase login successful");
 
-        // Fire-and-forget push to every existing subscriber: a new
-        // device just signed in. This is the operational mitigation
-        // for the one attack neither device binding nor step-up auth
-        // can prevent: an attacker who has both the first-factor token
-        // URL AND the passphrase (e.g. shoulder-surf + URL share). The
-        // legitimate owner sees the notification on their existing
-        // device and can rotate credentials. See #1131.
+        // Fire-and-forget push to every existing subscriber.
         let state_for_push = state.clone();
         tokio::spawn(async move {
             trigger_new_login_push(&state_for_push, &user_agent).await;
@@ -1062,14 +897,6 @@ pub struct ElevateRequest {
 }
 
 /// POST /api/login/elevate
-///
-/// Re-verifies the passphrase against the configured hash and, on
-/// success, sets the calling session's elevation window. Sensitive
-/// routes (terminal attach, structured view command execution, file writes)
-/// gate on the resulting `is_elevated` flag in the auth middleware.
-/// Already requires a valid token, login session cookie, and device
-/// binding by the time the handler runs (the middleware enforces all
-/// of those). See #1131.
 pub async fn elevate_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
@@ -1099,14 +926,7 @@ pub async fn elevate_handler(
             .into_response();
     };
 
-    // Two rate limiters guard this endpoint:
-    //   - Per-IP via `state.rate_limiter`, shared with `/api/login`.
-    //   - Per-session via `LoginManager::elevation_lockout_remaining`,
-    //     so an attacker who already holds session + binding can't
-    //     defeat the per-IP limiter by rotating IPs (mobile carrier,
-    //     Tor, residential proxies). See #1131.
-    // The session lockout is checked first so a locked session shows
-    // a consistent message regardless of the caller's IP.
+    // Two rate limiters guard this endpoint.
     if let Some(remaining) = state
         .login_manager
         .elevation_lockout_remaining(&session_id)
@@ -1234,10 +1054,6 @@ fn clear_login_cookie(secure: bool) -> String {
 }
 
 /// GET /api/devices
-///
-/// Lists the persisted login sessions as connected devices for the
-/// settings devices view. The session making the request is flagged
-/// `current` so the UI can label "this device". See #1235.
 pub async fn devices_handler(
     State(state): State<Arc<AppState>>,
     request: axum::extract::Request,
@@ -1252,12 +1068,6 @@ pub async fn devices_handler(
 }
 
 /// POST /api/login/logout-all
-///
-/// Signs every device out: drops all persisted login sessions. The
-/// escape hatch that replaces the implicit "daemon restart logs
-/// everyone out" behavior persistence removes. Elevation-gated by the
-/// auth middleware (`requires_elevation`). Also clears the caller's own
-/// cookie, since its session is among those dropped. See #1235.
 pub async fn logout_all_handler(State(state): State<Arc<AppState>>) -> axum::response::Response {
     let count = state.login_manager.logout_all().await;
     tracing::info!(target: "auth.passphrase", count, "signed out all devices");
@@ -1273,10 +1083,6 @@ pub async fn logout_all_handler(State(state): State<Arc<AppState>>) -> axum::res
 }
 
 /// DELETE /api/login/sessions/{id}
-///
-/// Revokes a single device's login session from the devices view.
-/// Elevation-gated. When the caller revokes its own session, the
-/// response also clears the cookie. See #1235.
 pub async fn revoke_session_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
@@ -1299,13 +1105,6 @@ pub async fn revoke_session_handler(
 }
 
 /// GET /api/login/status
-///
-/// Returns whether passphrase login is required, whether the caller
-/// currently holds a valid login session, and the elevation state
-/// (used by the frontend to decide whether to prompt for the
-/// passphrase again before a high-risk action). `authenticated` is
-/// only true when both the session cookie AND the device binding
-/// secret match, mirroring the auth middleware's enforcement (#1131).
 pub async fn login_status_handler(
     State(state): State<Arc<AppState>>,
     request: axum::extract::Request,
@@ -1360,12 +1159,8 @@ pub fn extract_login_session(request: &axum::extract::Request) -> Option<String>
     None
 }
 
-/// Fire a fire-and-forget web push to every existing subscriber that
-/// a new dashboard login just succeeded. Best-effort: any failure
-/// (no push state, no subscribers, network error, encryption error)
-/// is swallowed. The payload never includes the binding secret,
-/// session id, auth token, or passphrase; only the user-agent string
-/// truncated for display. See #1131.
+/// Fire a fire-and-forget web push to every existing subscriber that a new dashboard login
+/// just succeeded.
 async fn trigger_new_login_push(state: &AppState, user_agent: &str) {
     let Some(push) = state.push.as_ref() else {
         return;
@@ -1447,192 +1242,110 @@ pub fn build_login_cookie(session_id: &str, secure: bool) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn login_manager_disabled_when_no_passphrase() {
-        let mgr = LoginManager::new(None);
-        assert!(!mgr.is_enabled());
+    fn binding(byte: u8) -> Vec<u8> {
+        vec![byte; BINDING_SECRET_BYTES]
+    }
+
+    async fn session(mgr: &LoginManager, secret: &[u8]) -> String {
+        mgr.create_session(secret, "127.0.0.1", "test-agent").await
     }
 
     #[test]
-    fn login_manager_enabled_when_passphrase_set() {
-        let mgr = LoginManager::new(Some("test123"));
+    fn passphrase_verification_is_all_or_nothing() {
+        let mgr = LoginManager::new(Some("my_secret"));
         assert!(mgr.is_enabled());
-    }
-
-    #[test]
-    fn verify_correct_passphrase() {
-        let mgr = LoginManager::new(Some("my_secret"));
         assert!(mgr.verify_passphrase("my_secret"));
-    }
+        for wrong in ["wrong", "", "my_secre"] {
+            assert!(!mgr.verify_passphrase(wrong), "{wrong:?}");
+        }
 
-    #[test]
-    fn verify_incorrect_passphrase() {
-        let mgr = LoginManager::new(Some("my_secret"));
-        assert!(!mgr.verify_passphrase("wrong"));
-    }
+        let disabled = LoginManager::new(None);
+        assert!(!disabled.is_enabled());
+        assert!(!disabled.verify_passphrase("anything"));
 
-    #[test]
-    fn verify_empty_passphrase() {
-        let mgr = LoginManager::new(Some("my_secret"));
-        assert!(!mgr.verify_passphrase(""));
-    }
-
-    #[test]
-    fn verify_accepts_hash_from_argon2_0_5() {
-        // Produced by argon2 0.5.3; persisted session stores hold hashes in this form.
+        // Persisted stores hold hashes produced by argon2 0.5.3.
         let hash = "$argon2id$v=19$m=19456,t=2,p=1$YW9lLWZpeGVkLXNhbHQxNg$DsLn90oHo6VdenuubImBcuPgEWcMMEPqYxc8jPxJZcY";
         assert!(argon2_verify("hunter2", hash));
         assert!(!argon2_verify("hunter3", hash));
     }
 
-    #[test]
-    fn verify_fails_when_disabled() {
-        let mgr = LoginManager::new(None);
-        assert!(!mgr.verify_passphrase("anything"));
-    }
-
-    fn binding(byte: u8) -> Vec<u8> {
-        vec![byte; BINDING_SECRET_BYTES]
-    }
-
+    /// A session is keyed by its binding secret, not its IP (#1131), and the secret must
+    /// match in full: a prefix of the right bytes is still a different device.
     #[tokio::test]
-    async fn create_and_validate_session() {
+    async fn validate_session_matches_on_the_whole_binding_secret() {
         let mgr = LoginManager::new(Some("test"));
         let secret = binding(0xAA);
-        let session_id = mgr.create_session(&secret, "127.0.0.1", "test-agent").await;
-        assert!(mgr.validate_session(&session_id, &secret).await);
-    }
+        let id = session(&mgr, &secret).await;
 
-    #[tokio::test]
-    async fn validate_rejects_wrong_binding() {
-        let mgr = LoginManager::new(Some("test"));
-        let secret = binding(0xAA);
-        let other = binding(0xBB);
-        let session_id = mgr.create_session(&secret, "127.0.0.1", "test-agent").await;
-        assert!(!mgr.validate_session(&session_id, &other).await);
-    }
+        assert!(mgr.validate_session(&id, &secret).await);
+        assert!(mgr.validate_session(&id, &secret).await, "IP is not bound");
+        assert!(!mgr.validate_session(&id, &binding(0xBB)).await);
+        assert!(
+            !mgr.validate_session(&id, &[0xAA; BINDING_SECRET_BYTES - 1])
+                .await,
+            "a truncated secret must not match on its prefix"
+        );
+        for unknown in ["nonexistent", ""] {
+            assert!(!mgr.validate_session(unknown, &secret).await, "{unknown:?}");
+        }
 
-    #[tokio::test]
-    async fn validate_accepts_after_ip_change_when_binding_matches() {
-        // Regression for #1131: a mobile client whose public IP rotates
-        // (Wi-Fi -> cellular handoff, CGNAT, iCloud Private Relay) must
-        // not be logged out as long as the device-binding secret still
-        // matches. The session has no IP field anymore; just verify
-        // back-to-back validations on the same secret keep working.
-        let mgr = LoginManager::new(Some("test"));
-        let secret = binding(0xCC);
-        let session_id = mgr.create_session(&secret, "127.0.0.1", "test-agent").await;
-        assert!(mgr.validate_session(&session_id, &secret).await);
-        assert!(mgr.validate_session(&session_id, &secret).await);
-    }
-
-    #[tokio::test]
-    async fn validate_rejects_missing_or_empty() {
-        let mgr = LoginManager::new(Some("test"));
-        let secret = binding(0xDD);
-        let _session_id = mgr.create_session(&secret, "127.0.0.1", "test-agent").await;
-        assert!(!mgr.validate_session("nonexistent", &secret).await);
-        assert!(!mgr.validate_session("", &secret).await);
-    }
-
-    #[tokio::test]
-    async fn validate_rejects_wrong_length_binding() {
-        let mgr = LoginManager::new(Some("test"));
-        let secret = binding(0xEE);
-        let session_id = mgr.create_session(&secret, "127.0.0.1", "test-agent").await;
-        // 31 bytes -> rejected even though the prefix matches.
-        let short = vec![0xEE; BINDING_SECRET_BYTES - 1];
-        assert!(!mgr.validate_session(&session_id, &short).await);
-    }
-
-    #[tokio::test]
-    async fn invalidate_session_removes_it() {
-        let mgr = LoginManager::new(Some("test"));
-        let secret = binding(0x11);
-        let session_id = mgr.create_session(&secret, "127.0.0.1", "test-agent").await;
-        mgr.invalidate_session(&session_id).await;
-        assert!(!mgr.validate_session(&session_id, &secret).await);
-    }
-
-    #[tokio::test]
-    async fn invalidate_unknown_session_is_noop() {
-        let mgr = LoginManager::new(Some("test"));
+        mgr.invalidate_session(&id).await;
+        assert!(!mgr.validate_session(&id, &secret).await);
         mgr.invalidate_session("nonexistent").await;
     }
 
     #[tokio::test]
-    async fn elevation_starts_false_and_can_be_set() {
+    async fn elevation_starts_false_and_expires() {
         let mgr = LoginManager::new(Some("test"));
         let secret = binding(0x22);
-        let session_id = mgr.create_session(&secret, "127.0.0.1", "test-agent").await;
-        assert!(!mgr.is_elevated(&session_id).await);
-        assert!(mgr.elevate_session(&session_id).await);
-        let (elevated, remaining) = mgr.elevation_state(&session_id).await;
-        assert!(elevated);
-        assert!(remaining.is_some());
-    }
+        let id = session(&mgr, &secret).await;
 
-    #[tokio::test]
-    async fn elevation_rejects_unknown_session() {
-        let mgr = LoginManager::new(Some("test"));
+        assert!(!mgr.is_elevated(&id).await);
+        assert!(mgr.elevate_session(&id).await);
+        let (elevated, remaining) = mgr.elevation_state(&id).await;
+        assert!(elevated && remaining.is_some());
+
+        {
+            let mut sessions = mgr.sessions.write().await;
+            let entry = sessions.get_mut(&id).expect("session");
+            entry.elevated_until = Some(Instant::now() - Duration::from_secs(1));
+        }
+        assert!(!mgr.is_elevated(&id).await);
+
         assert!(!mgr.elevate_session("nope").await);
         assert!(!mgr.is_elevated("nope").await);
     }
 
+    /// #1131 follow-up: the failure budget arms a lockout once, a success resets it,
+    /// and an unknown session never arms anything.
     #[tokio::test]
-    async fn elevation_lockout_arms_after_threshold() {
-        // Regression for #1131 follow-up: per-session lockout so an
-        // attacker with stolen session + binding can't rotate IPs to
-        // defeat the per-IP rate limit while brute-forcing elevation.
+    async fn elevation_lockout_arms_once_per_failure_budget() {
         let mgr = LoginManager::new(Some("test"));
         let secret = binding(0x77);
-        let session_id = mgr.create_session(&secret, "127.0.0.1", "test-agent").await;
-        assert!(mgr.elevation_lockout_remaining(&session_id).await.is_none());
-        for _ in 0..(MAX_ELEVATION_FAILURES - 1) {
-            assert!(!mgr.record_elevation_failure(&session_id).await);
-        }
-        // Threshold-crossing failure arms the lockout.
-        assert!(mgr.record_elevation_failure(&session_id).await);
-        assert!(mgr.elevation_lockout_remaining(&session_id).await.is_some());
-        // Additional failures while locked don't extend the window.
-        assert!(!mgr.record_elevation_failure(&session_id).await);
-    }
+        let id = session(&mgr, &secret).await;
 
-    #[tokio::test]
-    async fn elevation_success_clears_failure_counter() {
-        let mgr = LoginManager::new(Some("test"));
-        let secret = binding(0x88);
-        let session_id = mgr.create_session(&secret, "127.0.0.1", "test-agent").await;
-        assert!(!mgr.record_elevation_failure(&session_id).await);
-        assert!(mgr.elevate_session(&session_id).await);
-        // Counter reset; the next failure budget starts fresh.
+        assert!(mgr.elevation_lockout_remaining(&id).await.is_none());
         for _ in 0..(MAX_ELEVATION_FAILURES - 1) {
-            assert!(!mgr.record_elevation_failure(&session_id).await);
+            assert!(!mgr.record_elevation_failure(&id).await);
         }
-        assert!(mgr.elevation_lockout_remaining(&session_id).await.is_none());
-    }
+        assert!(mgr.record_elevation_failure(&id).await, "threshold crossed");
+        assert!(mgr.elevation_lockout_remaining(&id).await.is_some());
+        assert!(
+            !mgr.record_elevation_failure(&id).await,
+            "failures while locked do not extend the window"
+        );
 
-    #[tokio::test]
-    async fn elevation_failure_unknown_session_is_noop() {
-        let mgr = LoginManager::new(Some("test"));
+        assert!(mgr.elevate_session(&id).await);
+        for _ in 0..(MAX_ELEVATION_FAILURES - 1) {
+            assert!(!mgr.record_elevation_failure(&id).await);
+        }
+        assert!(
+            mgr.elevation_lockout_remaining(&id).await.is_none(),
+            "a success starts a fresh budget"
+        );
+
         assert!(!mgr.record_elevation_failure("nope").await);
         assert!(mgr.elevation_lockout_remaining("nope").await.is_none());
-    }
-
-    #[tokio::test]
-    async fn elevation_expires() {
-        let mgr = LoginManager::new(Some("test"));
-        let secret = binding(0x33);
-        let session_id = mgr.create_session(&secret, "127.0.0.1", "test-agent").await;
-        assert!(mgr.elevate_session(&session_id).await);
-        // Manually rewind the deadline into the past.
-        {
-            let mut sessions = mgr.sessions.write().await;
-            if let Some(s) = sessions.get_mut(&session_id) {
-                s.elevated_until = Some(Instant::now() - Duration::from_secs(1));
-            }
-        }
-        assert!(!mgr.is_elevated(&session_id).await);
     }
 
     #[tokio::test]
@@ -1641,233 +1354,41 @@ mod tests {
         let secret = binding(0x44);
         let mut first_id = String::new();
         for i in 0..MAX_SESSIONS {
-            let id = mgr.create_session(&secret, "127.0.0.1", "test-agent").await;
+            let id = session(&mgr, &secret).await;
             if i == 0 {
                 first_id = id;
             }
         }
         assert!(mgr.validate_session(&first_id, &secret).await);
-        let _new_id = mgr.create_session(&secret, "127.0.0.1", "test-agent").await;
-        let sessions = mgr.sessions.read().await;
-        assert_eq!(sessions.len(), MAX_SESSIONS);
+        session(&mgr, &secret).await;
+        assert_eq!(mgr.sessions.read().await.len(), MAX_SESSIONS);
     }
 
     #[tokio::test]
     async fn cleanup_expired_removes_stale() {
         let mgr = LoginManager::new(Some("test"));
         let secret = binding(0x55);
-        let session_id = mgr.create_session(&secret, "127.0.0.1", "test-agent").await;
+        let id = session(&mgr, &secret).await;
         {
             let mut sessions = mgr.sessions.write().await;
-            if let Some(s) = sessions.get_mut(&session_id) {
-                s.expires_at = Instant::now() - Duration::from_secs(1);
-            }
+            sessions.get_mut(&id).expect("session").expires_at =
+                Instant::now() - Duration::from_secs(1);
         }
         mgr.cleanup_expired().await;
-        assert!(!mgr.validate_session(&session_id, &secret).await);
-    }
-
-    #[test]
-    fn decode_binding_secret_accepts_url_safe_no_pad() {
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        use base64::Engine;
-        let raw = [0xAB; BINDING_SECRET_BYTES];
-        let encoded = URL_SAFE_NO_PAD.encode(raw);
-        let decoded = decode_binding_secret(&encoded).expect("decodes");
-        assert_eq!(decoded, raw);
-    }
-
-    #[test]
-    fn decode_binding_secret_rejects_wrong_length() {
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        use base64::Engine;
-        let too_short = URL_SAFE_NO_PAD.encode([0xAB; 16]);
-        assert!(decode_binding_secret(&too_short).is_none());
-        let too_long = URL_SAFE_NO_PAD.encode([0xAB; 64]);
-        assert!(decode_binding_secret(&too_long).is_none());
-    }
-
-    #[test]
-    fn decode_binding_secret_rejects_garbage() {
-        assert!(decode_binding_secret("").is_none());
-        assert!(decode_binding_secret("!@#$%^&*()").is_none());
-    }
-
-    #[test]
-    fn passphrase_strength_short() {
-        assert!(check_passphrase_strength("short").is_some());
-    }
-
-    #[test]
-    fn passphrase_strength_adequate() {
-        assert!(check_passphrase_strength("longenough").is_none());
-    }
-
-    #[test]
-    fn build_cookie_without_secure() {
-        let cookie = build_login_cookie("abc123", false);
-        assert!(cookie.contains("aoe_session=abc123"));
-        assert!(cookie.contains("HttpOnly"));
-        assert!(cookie.contains("SameSite=Strict"));
-        assert!(cookie.contains("Max-Age=2592000"));
-        assert!(!cookie.contains("Secure"));
-    }
-
-    #[test]
-    fn build_cookie_with_secure() {
-        let cookie = build_login_cookie("abc123", true);
-        assert!(cookie.contains("Secure"));
-    }
-
-    #[test]
-    fn extract_session_from_cookie_header() {
-        let request = axum::http::Request::builder()
-            .header(header::COOKIE, "aoe_token=foo; aoe_session=bar123")
-            .body(axum::body::Body::empty())
-            .unwrap();
-
-        assert_eq!(extract_login_session(&request), Some("bar123".to_string()));
-    }
-
-    #[test]
-    fn extract_session_missing_cookie() {
-        let request = axum::http::Request::builder()
-            .header(header::COOKIE, "aoe_token=foo")
-            .body(axum::body::Body::empty())
-            .unwrap();
-
-        assert_eq!(extract_login_session(&request), None);
-    }
-
-    #[test]
-    fn extract_session_no_cookie_header() {
-        let request = axum::http::Request::builder()
-            .body(axum::body::Body::empty())
-            .unwrap();
-
-        assert_eq!(extract_login_session(&request), None);
-    }
-
-    // ── Persistence (#1235) ─────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn persisted_session_survives_restart() {
-        // Regression for #1235: a logged-in device must not be logged out
-        // when the daemon restarts. Fails on the in-memory-only tree
-        // because a fresh manager starts with an empty session map.
-        let dir = tempfile::tempdir().unwrap();
-        let secret = binding(0xA1);
-
-        let session_id = {
-            let mgr = LoginManager::with_persistence(Some("hunter2"), dir.path());
-            let id = mgr.create_session(&secret, "127.0.0.1", "test-agent").await;
-            assert!(mgr.validate_session(&id, &secret).await);
-            id
-        };
-
-        // Simulate a daemon restart: a brand-new manager over the same
-        // app dir and passphrase.
-        let mgr2 = LoginManager::with_persistence(Some("hunter2"), dir.path());
-        assert!(
-            mgr2.validate_session(&session_id, &secret).await,
-            "session should rehydrate across restart"
-        );
-    }
-
-    #[tokio::test]
-    async fn passphrase_change_drops_persisted_sessions() {
-        let dir = tempfile::tempdir().unwrap();
-        let secret = binding(0xB2);
-
-        let session_id = {
-            let mgr = LoginManager::with_persistence(Some("first-pass"), dir.path());
-            mgr.create_session(&secret, "127.0.0.1", "test-agent").await
-        };
-
-        // Restart with a different passphrase: the persisted sessions
-        // must be invalidated.
-        let mgr2 = LoginManager::with_persistence(Some("second-pass"), dir.path());
-        assert!(
-            !mgr2.validate_session(&session_id, &secret).await,
-            "changing the passphrase must drop persisted sessions"
-        );
-    }
-
-    #[tokio::test]
-    async fn elevation_does_not_survive_restart() {
-        // A daemon restart is a legitimate step-up recency break: the
-        // session stays valid but must require re-elevation. See #1235.
-        let dir = tempfile::tempdir().unwrap();
-        let secret = binding(0xC3);
-
-        let session_id = {
-            let mgr = LoginManager::with_persistence(Some("pass"), dir.path());
-            let id = mgr.create_session(&secret, "127.0.0.1", "test-agent").await;
-            assert!(mgr.elevate_session(&id).await);
-            assert!(mgr.is_elevated(&id).await);
-            id
-        };
-
-        let mgr2 = LoginManager::with_persistence(Some("pass"), dir.path());
-        assert!(mgr2.validate_session(&session_id, &secret).await);
-        assert!(
-            !mgr2.is_elevated(&session_id).await,
-            "elevation must not persist across restart"
-        );
-    }
-
-    #[tokio::test]
-    async fn lockout_state_survives_restart() {
-        // A restart must not reset an attacker's elevation failure budget.
-        let dir = tempfile::tempdir().unwrap();
-        let secret = binding(0xD4);
-
-        let session_id = {
-            let mgr = LoginManager::with_persistence(Some("pass"), dir.path());
-            let id = mgr.create_session(&secret, "127.0.0.1", "test-agent").await;
-            for _ in 0..MAX_ELEVATION_FAILURES {
-                mgr.record_elevation_failure(&id).await;
-            }
-            assert!(mgr.elevation_lockout_remaining(&id).await.is_some());
-            id
-        };
-
-        let mgr2 = LoginManager::with_persistence(Some("pass"), dir.path());
-        assert!(
-            mgr2.elevation_lockout_remaining(&session_id)
-                .await
-                .is_some(),
-            "an armed lockout must survive a restart"
-        );
-    }
-
-    #[tokio::test]
-    async fn logout_all_clears_and_persists() {
-        let dir = tempfile::tempdir().unwrap();
-        let secret = binding(0xE5);
-
-        let session_id = {
-            let mgr = LoginManager::with_persistence(Some("pass"), dir.path());
-            let id = mgr.create_session(&secret, "127.0.0.1", "test-agent").await;
-            assert_eq!(mgr.logout_all().await, 1);
-            assert!(!mgr.validate_session(&id, &secret).await);
-            id
-        };
-
-        // The cleared state must also be persisted, not just in memory.
-        let mgr2 = LoginManager::with_persistence(Some("pass"), dir.path());
-        assert!(!mgr2.validate_session(&session_id, &secret).await);
+        assert!(!mgr.validate_session(&id, &secret).await);
     }
 
     #[tokio::test]
     async fn revoke_session_removes_one() {
         let mgr = LoginManager::new(Some("pass"));
         let secret = binding(0xF6);
-        let id = mgr.create_session(&secret, "127.0.0.1", "test-agent").await;
+        let id = session(&mgr, &secret).await;
         assert!(mgr.revoke_session(&id).await);
         assert!(!mgr.validate_session(&id, &secret).await);
-        // Revoking a gone session reports false.
-        assert!(!mgr.revoke_session(&id).await);
+        assert!(
+            !mgr.revoke_session(&id).await,
+            "a gone session reports false"
+        );
     }
 
     #[tokio::test]
@@ -1880,20 +1401,127 @@ mod tests {
 
         let devices = mgr.device_snapshot(Some(&id)).await;
         assert_eq!(devices.len(), 1);
-        let d = &devices[0];
-        assert_eq!(d.session_id, id);
-        assert_eq!(d.created_ip, "10.0.0.9");
-        assert_eq!(d.user_agent, "Mozilla/5.0 Firefox/123");
-        assert!(d.current, "the requesting session is flagged current");
+        assert_eq!(devices[0].session_id, id);
+        assert_eq!(devices[0].created_ip, "10.0.0.9");
+        assert_eq!(devices[0].user_agent, "Mozilla/5.0 Firefox/123");
+        assert!(devices[0].current, "the requesting session is flagged");
+        assert!(!mgr.device_snapshot(Some("someone-else")).await[0].current);
+    }
 
-        let others = mgr.device_snapshot(Some("someone-else")).await;
-        assert!(!others[0].current);
+    #[test]
+    fn decode_binding_secret_accepts_only_a_full_url_safe_secret() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+
+        let raw = [0xAB; BINDING_SECRET_BYTES];
+        assert_eq!(
+            decode_binding_secret(&URL_SAFE_NO_PAD.encode(raw)).as_deref(),
+            Some(&raw[..])
+        );
+        for wrong_length in [
+            URL_SAFE_NO_PAD.encode([0xAB; 16]),
+            URL_SAFE_NO_PAD.encode([0xAB; 64]),
+        ] {
+            assert!(decode_binding_secret(&wrong_length).is_none());
+        }
+        for garbage in ["", "!@#$%^&*()"] {
+            assert!(decode_binding_secret(garbage).is_none());
+        }
+    }
+
+    #[test]
+    fn passphrase_strength_rejects_short_secrets() {
+        assert!(check_passphrase_strength("short").is_some());
+        assert!(check_passphrase_strength("longenough").is_none());
+    }
+
+    #[test]
+    fn build_login_cookie_carries_secure_only_over_tls() {
+        let insecure = build_login_cookie("abc123", false);
+        for needle in [
+            "aoe_session=abc123",
+            "HttpOnly",
+            "SameSite=Strict",
+            "Max-Age=2592000",
+        ] {
+            assert!(insecure.contains(needle), "{insecure:?} lacks {needle}");
+        }
+        assert!(!insecure.contains("Secure"));
+        assert!(build_login_cookie("abc123", true).contains("Secure"));
+    }
+
+    #[test]
+    fn extract_login_session_reads_only_the_session_cookie() {
+        let request = |cookie: Option<&str>| {
+            let mut builder = axum::http::Request::builder();
+            if let Some(cookie) = cookie {
+                builder = builder.header(header::COOKIE, cookie);
+            }
+            builder.body(axum::body::Body::empty()).unwrap()
+        };
+        assert_eq!(
+            extract_login_session(&request(Some("aoe_token=foo; aoe_session=bar123"))),
+            Some("bar123".to_string())
+        );
+        assert_eq!(extract_login_session(&request(Some("aoe_token=foo"))), None);
+        assert_eq!(extract_login_session(&request(None)), None);
+    }
+
+    /// #1235: a session survives a restart, but only while the passphrase that minted
+    /// it does. Elevation is a recency claim, so a restart breaks it; an armed lockout
+    /// is an attacker's budget, so a restart must not reset it.
+    #[tokio::test]
+    async fn persisted_sessions_rehydrate_but_elevation_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = binding(0xA1);
+
+        let id = {
+            let mgr = LoginManager::with_persistence(Some("hunter2"), dir.path());
+            let id = session(&mgr, &secret).await;
+            assert!(mgr.elevate_session(&id).await);
+            for _ in 0..MAX_ELEVATION_FAILURES {
+                mgr.record_elevation_failure(&id).await;
+            }
+            id
+        };
+
+        let restarted = LoginManager::with_persistence(Some("hunter2"), dir.path());
+        assert!(restarted.validate_session(&id, &secret).await);
+        assert!(
+            !restarted.is_elevated(&id).await,
+            "elevation is not persisted"
+        );
+        assert!(
+            restarted.elevation_lockout_remaining(&id).await.is_some(),
+            "an armed lockout must survive a restart"
+        );
+
+        let rekeyed = LoginManager::with_persistence(Some("second-pass"), dir.path());
+        assert!(
+            !rekeyed.validate_session(&id, &secret).await,
+            "changing the passphrase must drop persisted sessions"
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_all_clears_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = binding(0xE5);
+
+        let id = {
+            let mgr = LoginManager::with_persistence(Some("pass"), dir.path());
+            let id = session(&mgr, &secret).await;
+            assert_eq!(mgr.logout_all().await, 1);
+            assert!(!mgr.validate_session(&id, &secret).await);
+            id
+        };
+
+        let restarted = LoginManager::with_persistence(Some("pass"), dir.path());
+        assert!(!restarted.validate_session(&id, &secret).await);
     }
 
     #[tokio::test]
     async fn load_drops_expired_entries() {
-        // Hand-craft a store whose single session has a past deadline; it
-        // must be dropped on load while the file itself stays valid.
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
 
@@ -1921,96 +1549,48 @@ mod tests {
 
     #[tokio::test]
     async fn persistence_disabled_writes_no_file() {
-        // `new` (no persistence) must never touch disk.
         let dir = tempfile::tempdir().unwrap();
         let mgr = LoginManager::new(Some("pass"));
-        let secret = binding(0x19);
-        mgr.create_session(&secret, "127.0.0.1", "ua").await;
-        assert!(
-            !dir.path().join(SESSIONS_FILE).exists(),
-            "no persistence path means no file"
-        );
+        mgr.create_session(&binding(0x19), "127.0.0.1", "ua").await;
+        assert!(!dir.path().join(SESSIONS_FILE).exists());
     }
 
-    /// The write path enforces the same no-symlink invariant the load path
-    /// does. `atomic_write` follows symlinks (#3186), so an unguarded
-    /// persist would write the session secret through a planted link.
-    #[cfg(unix)]
-    #[test]
-    fn write_sessions_refuses_symlinked_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("planted.toml");
-        std::fs::write(&target, "untouched").unwrap();
-        let link = dir.path().join(SESSIONS_FILE);
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-
-        let file = PersistedFile {
-            schema_version: SESSIONS_SCHEMA_VERSION,
-            passphrase_hash: Some(hash_passphrase("pass")),
-            sessions: vec![],
-        };
-        assert!(
-            !write_sessions(&link, &file),
-            "a symlinked sessions path must be refused, not followed"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&target).unwrap(),
-            "untouched",
-            "the symlink target must never receive the session store"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn check_path_security_rejects_symlink_and_loose_perms() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().unwrap();
-
-        // A symlink at the sessions path is rejected (no following).
-        let target = dir.path().join("real.toml");
-        std::fs::write(&target, "x").unwrap();
-        let link = dir.path().join("link.toml");
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert!(
-            check_path_security(&link).is_err(),
-            "symlink must be rejected"
-        );
-
-        // A world/group-accessible file is rejected.
-        let loose = dir.path().join("loose.toml");
-        std::fs::write(&loose, "x").unwrap();
-        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(
-            check_path_security(&loose).is_err(),
-            "0644 file must be rejected"
-        );
-
-        // A 0600 file under a private dir passes.
-        let ok = dir.path().join("ok.toml");
-        std::fs::write(&ok, "x").unwrap();
-        std::fs::set_permissions(&ok, std::fs::Permissions::from_mode(0o600)).unwrap();
-        // tempfile dirs are 0700, so the parent check passes too.
-        assert!(check_path_security(&ok).is_ok(), "0600 file should pass");
-
-        // A missing file (not yet created) passes: the parent is fine.
-        assert!(check_path_security(&dir.path().join("missing.toml")).is_ok());
-    }
-
+    /// The store is fail-closed on a planted symlink: neither the write path nor the
+    /// startup rewrite may follow one, and a loose-permission file is refused too.
     #[cfg(unix)]
     #[tokio::test]
-    async fn with_persistence_skips_rewrite_on_symlinked_path() {
-        // Regression for the fail-closed contract: a symlinked store must
-        // not be rewritten (which would write through the link). See #1235.
+    async fn a_symlinked_session_store_is_refused_not_followed() {
+        use std::os::unix::fs::PermissionsExt;
+
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("outside.toml");
         std::fs::write(&target, "original").unwrap();
         let store = dir.path().join(SESSIONS_FILE);
         std::os::unix::fs::symlink(&target, &store).unwrap();
 
-        let _mgr = LoginManager::with_persistence(Some("pass"), dir.path());
+        let file = PersistedFile {
+            schema_version: SESSIONS_SCHEMA_VERSION,
+            passphrase_hash: Some(hash_passphrase("pass")),
+            sessions: vec![],
+        };
+        assert!(!write_sessions(&store, &file));
+        assert!(check_path_security(&store).is_err());
 
-        // The symlink target is untouched: the startup rewrite was skipped.
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "original");
+        let _mgr = LoginManager::with_persistence(Some("pass"), dir.path());
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "original",
+            "the symlink target must never receive the session store"
+        );
+
+        // Permissions: only a 0600 file (under the 0700 tempdir) is accepted, and a
+        // path that does not exist yet is fine.
+        for (mode, ok) in [(0o644, false), (0o600, true)] {
+            let path = dir.path().join(format!("perm{mode:o}.toml"));
+            std::fs::write(&path, "x").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(check_path_security(&path).is_ok(), ok, "mode {mode:o}");
+        }
+        assert!(check_path_security(&dir.path().join("missing.toml")).is_ok());
     }
 }

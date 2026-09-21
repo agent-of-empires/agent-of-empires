@@ -1,6 +1,6 @@
 //! tmux utility functions
 
-use super::tmux_no_server_running;
+use super::{tmux_no_server_running, SessionKind};
 use crate::session::config::{
     resolve_tmux_setting, tmux_setting_writes, Config, TmuxOptionWrite, TmuxSetting,
 };
@@ -32,8 +32,7 @@ pub fn strip_ansi(content: &str) -> String {
     result
 }
 
-/// Only targets ST-terminated (`\x1b\\`) OSC sequences; BEL-terminated ones
-/// must pass through unchanged since downstream parsers handle those correctly.
+/// Strip only ST-terminated OSC sequences; BEL-terminated ones pass through.
 pub(crate) fn strip_osc_st(content: &str) -> String {
     const OSC: &str = "\x1b]";
     const ST: &str = "\x1b\\";
@@ -80,88 +79,34 @@ pub fn sanitize_session_name(name: &str) -> String {
         .collect()
 }
 
-/// Append `; set-option -p -t <target> remain-on-exit on` to an in-flight
-/// tmux argument list so that remain-on-exit is set atomically with session
-/// creation. Using pane-level (`-p`) avoids bleeding into user-created panes
-/// in the same session.
-///
-/// Note: the `-p` (pane-level) flag requires tmux >= 3.0.
+/// Chain `; set-option <flags>` onto an in-flight tmux argv, so the option
+/// lands atomically with the command before it.
+fn chain_set_option(args: &mut Vec<String>, flags: &[&str]) {
+    args.push(";".to_string());
+    args.push("set-option".to_string());
+    args.extend(flags.iter().map(|flag| flag.to_string()));
+}
+
+/// Pane-level (`-p`, tmux >= 3.0) so user-created panes are unaffected.
 pub fn append_remain_on_exit_args(args: &mut Vec<String>, target: &str) {
-    args.extend([
-        ";".to_string(),
-        "set-option".to_string(),
-        "-p".to_string(),
-        "-t".to_string(),
-        target.to_string(),
-        "remain-on-exit".to_string(),
-        "on".to_string(),
-    ]);
+    chain_set_option(args, &["-p", "-t", target, "remain-on-exit", "on"]);
 }
 
-/// Append `; set-option -t <target> pane-base-index 0` to an in-flight tmux
-/// argument list so that pane indices always start at 0 regardless of the
-/// user's global config.  This lets status checks use `.0` to reliably target
-/// the agent's pane.  See #488.
+/// Pins pane indices to 0 so `^.0` always targets the agent's pane.
 pub fn append_pane_base_index_args(args: &mut Vec<String>, target: &str) {
-    args.extend([
-        ";".to_string(),
-        "set-option".to_string(),
-        "-t".to_string(),
-        target.to_string(),
-        "pane-base-index".to_string(),
-        "0".to_string(),
-    ]);
+    chain_set_option(args, &["-t", target, "pane-base-index", "0"]);
 }
 
-/// Append `; set-option -t <target> default-shell <shell>` so panes the user
-/// later splits off this session use their real shell instead of the shared
-/// tmux server's frozen `default-shell` (which a dev build with a sandboxed
-/// env can poison; see #2608). The first pane is launched with an explicit
-/// login-shell command at create time because a `default-shell` set chained
-/// after `new-session` is too late for the already-spawned pane.
+/// Later splits use the real shell rather than the shared server's possibly
+/// poisoned `default-shell`; the first pane gets an explicit command instead.
 pub fn append_default_shell_args(args: &mut Vec<String>, target: &str, shell: &str) {
-    args.extend([
-        ";".to_string(),
-        "set-option".to_string(),
-        "-t".to_string(),
-        target.to_string(),
-        "default-shell".to_string(),
-        shell.to_string(),
-    ]);
+    chain_set_option(args, &["-t", target, "default-shell", shell]);
 }
 
-/// Append every `[tmux]`-driven option write that a brand-new session needs, in
-/// one call, so the three create paths (`session.rs`, `terminal_session.rs`,
-/// `tool_session.rs`) cannot drift in which managed settings they honor.
-///
-/// Iterates the whole managed-settings table (`TmuxSetting::ALL`) and emits the
-/// writes each resolved action declares, so a new managed option is one table
-/// row rather than a helper plus an edit here. `LeaveToUser` writes nothing: a
-/// session created this instant has no session-scoped value aoe wrote to clear,
-/// so declining to write already leaves the user's own config in charge. A tmux
-/// session option outranks a global one, so unconditionally forcing values
-/// here is what silently overrode the file the user wrote and made `[tmux]
-/// mouse` look like a setting that did nothing (issue #3207).
-///
-/// The status bar row declares no creation-time writes on purpose: it needs a
-/// resolved theme and the session's title, so it is applied after creation by
-/// [`crate::tmux::status_bar::apply_all_tmux_options`], which resolves the same
-/// table and, unlike creation, actively unsets stale session-scoped values on
-/// `LeaveToUser`. Resolving the row here still probes the user's tmux config
-/// (`user_has_tmux_config`, an `exists()` check over the user's tmux config
-/// paths) and discards the result; that is the cost of iterating the table
-/// uniformly.
-///
-/// `mouse on` is what the web dashboard's two-finger scroll on mobile needs
-/// when the underlying agent uses tmux copy-mode for scrollback (the default
-/// renderer for Claude Code, and all other agents). Claude Code's fullscreen
-/// renderer (`/tui fullscreen`) bypasses tmux copy-mode: it runs on the
-/// alternate screen and relies on alternate-scroll turning the wheel into
-/// arrow keys (it binds the arrows to scroll), so the option is harmless but
-/// unused in that mode.
-///
-/// `config` must be the profile-merged config for the session being created;
-/// see [`crate::session::config::resolve_tmux_setting`].
+/// Every `[tmux]`-driven creation-time write, from the managed-settings table.
+/// `LeaveToUser` writes nothing; the status bar row is applied after creation
+/// by [`crate::tmux::status_bar::apply_all_tmux_options`]. `config` must be the
+/// profile-merged config.
 pub fn append_tmux_setting_args(args: &mut Vec<String>, target: &str, config: &Config) {
     for setting in TmuxSetting::ALL {
         let writes = tmux_setting_writes(setting, resolve_tmux_setting(setting, config));
@@ -169,14 +114,8 @@ pub fn append_tmux_setting_args(args: &mut Vec<String>, target: &str, config: &C
     }
 }
 
-/// Append the writes of one managed setting to an in-flight tmux argument
-/// list. Pure over the writes, so the emitted tokens are table-testable.
 fn append_tmux_setting_writes(args: &mut Vec<String>, target: &str, writes: &[TmuxOptionWrite]) {
     for write in writes {
-        args.push(";".to_string());
-        args.push("set-option".to_string());
-        // Only the scope flags differ per variant; the `-q` guard and the
-        // option/value pushes are shared.
         let (scope_flags, option, value, quiet) = match *write {
             TmuxOptionWrite::Session {
                 option,
@@ -194,90 +133,131 @@ fn append_tmux_setting_writes(args: &mut Vec<String>, target: &str, writes: &[Tm
                 quiet,
             } => (&["-w", "-t", target][..], option, value, quiet),
         };
+        let mut flags = Vec::with_capacity(scope_flags.len() + 3);
         if quiet {
-            args.push("-q".to_string());
+            flags.push("-q");
         }
-        args.extend(scope_flags.iter().map(|flag| flag.to_string()));
-        args.push(option.to_string());
-        args.push(value.to_string());
+        flags.extend_from_slice(scope_flags);
+        flags.extend([option, value]);
+        chain_set_option(args, &flags);
     }
 }
 
-/// Append `; set-option -t <target> window-size latest` so the tmux window
-/// follows the most recently active client. Required for the primary-client
-/// resize model: without this, a user's `~/.tmux.conf` could set
-/// `window-size smallest`, which would shrink the window to the smallest
-/// attached PTY regardless of which client is primary.
+/// The window follows the most recent client, whatever the user's
+/// `window-size` config says.
 pub fn append_window_size_args(args: &mut Vec<String>, target: &str) {
-    args.extend([
-        ";".to_string(),
-        "set-option".to_string(),
-        "-t".to_string(),
-        target.to_string(),
-        "window-size".to_string(),
-        "latest".to_string(),
-    ]);
+    chain_set_option(args, &["-t", target, "window-size", "latest"]);
 }
 
-/// Outcome of one `#{pane_dead}` probe against a session's agent pane.
-///
-/// The distinction that matters is `Dead` vs `Missing`: tmux answers a
-/// `display-message` against a session it cannot find with exit status 0, an
-/// empty stdout, and nothing on stderr, so "the pane is alive and not dead"
-/// and "there is no such session" are only separable by looking at whether
-/// the format expanded to anything at all.
+/// The option chain every aoe session kind appends to its `new-session`.
+pub(crate) fn append_session_setup_args(
+    args: &mut Vec<String>,
+    target: &str,
+    config: &Config,
+    default_shell: Option<&str>,
+    kind: SessionKind,
+) {
+    append_remain_on_exit_args(args, target);
+    append_pane_base_index_args(args, target);
+    append_window_size_args(args, target);
+    if let Some(shell) = default_shell {
+        append_default_shell_args(args, target, shell);
+    }
+    append_tmux_setting_args(args, target, config);
+    super::append_session_kind_args(args, target, kind);
+}
+
+/// Run a `new-session` chain. A concurrent creator winning the race
+/// ("duplicate session") counts as success.
+pub(crate) fn create_session_tolerating_duplicate(
+    args: &[String],
+    error: impl FnOnce(&str) -> String,
+) -> Result<()> {
+    let output = crate::tmux::tmux_command().args(args).output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.contains("duplicate session") {
+            bail!("{}", error(&stderr));
+        }
+    }
+    super::refresh_session_cache();
+    Ok(())
+}
+
+/// `switch-client` from inside tmux, else (or when that fails, e.g. an
+/// inherited `TMUX`) `attach-session`. Returns the failed exit status, if any.
+pub(crate) fn attach_client(name: &str) -> Result<Option<std::process::ExitStatus>> {
+    if inside_tmux() {
+        let status = crate::tmux::tmux_command()
+            .args(["switch-client", "-t", name])
+            .status()?;
+        if status.success() {
+            return Ok(None);
+        }
+    }
+    let status = crate::tmux::tmux_command()
+        .args(["attach-session", "-t", name])
+        .status()?;
+    Ok((!status.success()).then_some(status))
+}
+
+/// Kill a session's pane process tree (children can survive SIGHUP), then the
+/// session itself.
+pub(crate) fn kill_session_tree(name: &str) -> Result<()> {
+    if !crate::tmux::session_exists(name) {
+        return Ok(());
+    }
+    if let Some(pane_pid) = crate::process::get_pane_pid(name) {
+        crate::process::kill_process_tree(pane_pid);
+    }
+    kill_session_if_present(name)?;
+    super::refresh_session_cache();
+    Ok(())
+}
+
+/// Best-effort kill of every live session whose name `matches`.
+pub(crate) fn kill_sessions_matching(matches: impl Fn(&str) -> bool) {
+    let output = crate::tmux::tmux_query_command()
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output();
+    if let Some(out) = output.as_ref().ok().filter(|out| out.status.success()) {
+        for name in String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|name| matches(name))
+        {
+            if let Some(pid) = crate::process::get_pane_pid(name) {
+                crate::process::kill_process_tree(pid);
+            }
+            let _ = crate::tmux::tmux_command()
+                .args(["kill-session", "-t", name])
+                .output();
+        }
+    }
+    super::refresh_session_cache();
+}
+
+/// One `#{pane_dead}` probe of a session's agent pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PaneProbe {
-    /// `#{pane_dead}` expanded to `0`.
     Alive,
-    /// `#{pane_dead}` expanded to `1`: the pane exists and its process exited.
+    /// The pane exists and its process exited.
     Dead,
-    /// tmux ran and resolved nothing, so the session is gone. Not the same as
-    /// `Dead`: a caller that gates on `exists()` first wants this to read as
-    /// "not dead", while a caller holding a long-lived handle to the session
-    /// wants it to read as "stop".
-    ///
-    /// `Missing` is the precise "tmux resolved the target to nothing" signal,
-    /// and only that: exit 0 with empty stdout (the name did not resolve), or
-    /// a non-zero exit carrying the recognized no-server / dead-socket
-    /// (ENOENT) markers on stderr. There is no tmux server, so every session
-    /// on it is gone too. Classifying those as `Unknown` would be worse, not
-    /// safer: nothing ever terminates on `Unknown`, so a vanished server would
-    /// leave every poller running against sessions that cannot come back
-    /// under that server, which is the leak this variant exists to close.
-    ///
-    /// Every other empty-stdout failure (EACCES, ENOTSOCK, malformed stderr)
-    /// is `Unknown`: folding it into `Missing` stops a poller that has seen
-    /// the target alive after two such probes. So does stdout that is neither
-    /// `0`, `1`, nor empty.
-    ///
-    /// `Missing` stays precise because any target tmux can resolve *to a
-    /// session* expands the format to a digit, including out-of-range window
-    /// and pane indices (`:99.0`, `:^.99`), which it falls back from. Only an
-    /// unresolvable session name yields empty stdout, so a user's
-    /// `pane-base-index` setting cannot make a live pane read as `Missing`.
-    /// (Measured against tmux 3.7c.)
+    /// tmux resolved nothing: exit 0 with empty stdout (any resolvable session
+    /// expands to a digit, even with out-of-range indices), or a recognized
+    /// no-server failure. Long-lived pollers stop on this.
     Missing,
-    /// tmux itself could not be run, so the probe says nothing about the pane.
+    /// Anything else, including unrecognized failures; never terminal.
     Unknown,
 }
 
 pub(crate) fn probe_pane(session_name: &str) -> PaneProbe {
-    // An empty name would make the target `:^.0`, which tmux resolves against
-    // whatever session is current: an unrelated live pane would then answer
-    // `Alive` and a poller seeded with no name would never terminate. Nothing
-    // resolved, so `Missing`.
+    // An empty name would resolve `:^.0` against the current session.
     if session_name.is_empty() {
         return PaneProbe::Missing;
     }
-    // Use `^.0` to target the first window's first pane regardless of
-    // base-index or which pane is active, so the check always hits the
-    // agent's pane even when the user has created additional tmux windows
-    // or split panes.  See #435, #488.
+    // `^.0` is the agent's pane whatever the base-index or active pane.
     let target = format!("{session_name}:^.0");
-    // `tmux_query_command`, not `tmux_command`: `classify_pane_probe` matches
-    // the ENOENT marker in tmux's `error connecting to <socket> (<strerror>)`,
-    // and glibc localizes `strerror` by `LC_MESSAGES`.
+    // Query command: the no-server match reads a localized `strerror`.
     let Some(output) = crate::tmux::tmux_query_command()
         .args(["display-message", "-t", &target, "-p", "#{pane_dead}"])
         .output()
@@ -289,97 +269,53 @@ pub(crate) fn probe_pane(session_name: &str) -> PaneProbe {
     classify_pane_probe(output.status.success(), stdout.trim(), &output.stderr)
 }
 
-/// Pure classification of one `#{pane_dead}` probe, split out from the real
-/// tmux call so the failure taxonomy is unit-testable without a socket.
 pub(crate) fn classify_pane_probe(succeeded: bool, stdout: &str, stderr: &[u8]) -> PaneProbe {
     match stdout {
         "1" => PaneProbe::Dead,
         "0" => PaneProbe::Alive,
-        "" => {
-            if succeeded || tmux_no_server_running(stderr) {
-                PaneProbe::Missing
-            } else {
-                PaneProbe::Unknown
-            }
-        }
+        "" if succeeded || tmux_no_server_running(stderr) => PaneProbe::Missing,
         _ => PaneProbe::Unknown,
     }
 }
 
-/// Whether `session_name`'s agent pane exists and its process has exited.
-///
-/// A session tmux cannot find reads as `false`, not `true`: every caller of
-/// this pairs it with an `exists()` check, so folding "missing" into "dead"
-/// here would make an absent session look like a dead pane. Callers that
-/// treat an absent session as terminal (the session-id poller, which holds no
-/// separate existence gate) use [`probe_pane`] instead.
+/// A missing session reads as not dead; callers pair this with `exists()`.
 pub fn is_pane_dead(session_name: &str) -> bool {
     probe_pane(session_name) == PaneProbe::Dead
 }
 
-pub(crate) fn pane_current_command(session_name: &str) -> Option<String> {
-    // Use `^.0` to target the first window's first pane regardless of
-    // base-index or which pane is active.  See #435, #488.
+fn display_first_pane(session_name: &str, format: &str) -> Option<String> {
     let target = format!("{session_name}:^.0");
     crate::tmux::tmux_command()
-        .args([
-            "display-message",
-            "-t",
-            &target,
-            "-p",
-            "#{pane_current_command}",
-        ])
+        .args(["display-message", "-t", &target, "-p", format])
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
+}
+
+pub(crate) fn pane_current_command(session_name: &str) -> Option<String> {
+    display_first_pane(session_name, "#{pane_current_command}")
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
 
-/// The terminal title the pane's program published over OSC, for callers
-/// outside the batched poll that reads it as part of [`crate::tmux::PaneMetadata`].
-///
-/// Only `display-message`'s own trailing newline comes off, where the sibling
-/// helpers above trim: the batched read does not trim either, and a title is
-/// matched by `^`-anchored rules, so trimming here would let the same pane
-/// read one way through the poller and another through `aoe session capture`.
+/// The OSC terminal title. Only `display-message`'s own newline is removed, to
+/// match the untrimmed batched read that `^`-anchored rules see.
 pub(crate) fn pane_title(session_name: &str) -> Option<String> {
-    let target = format!("{session_name}:^.0");
-    crate::tmux::tmux_command()
-        .args(["display-message", "-t", &target, "-p", "#{pane_title}"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
+    display_first_pane(session_name, "#{pane_title}")
         .map(|s| strip_display_delimiter(&s).to_string())
         .filter(|s| !s.is_empty())
 }
 
-/// Drop the single newline `display-message -p` appends, and only that one.
-/// Trimming every trailing newline would also eat one the title itself
-/// carried, which is the difference between reporting a title and reporting a
-/// truncated one.
 fn strip_display_delimiter(raw: &str) -> &str {
     raw.strip_suffix('\n').unwrap_or(raw)
 }
 
 fn pane_start_command_is_protected(session_name: &str) -> bool {
-    let target = format!("{session_name}:^.0");
-    crate::tmux::tmux_command()
-        .args([
-            "display-message",
-            "-t",
-            &target,
-            "-p",
-            "#{pane_start_command}",
-        ])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
+    display_first_pane(session_name, "#{pane_start_command}")
         .is_some_and(|command| command.contains(PANE_ENV_FILE_PREFIX))
 }
 
-// Shells that indicate the agent is not running (the pane was restored by
-// tmux-resurrect, the agent crashed back to a prompt, or the user exited).
+/// Shells that mean the agent is not running.
 const KNOWN_SHELLS: &[&str] = &[
     "bash", "zsh", "sh", "fish", "dash", "ksh", "tcsh", "csh", "nu", "pwsh",
 ];
@@ -403,35 +339,24 @@ pub fn is_pane_running_shell(session_name: &str) -> bool {
     if !is_shell_command(&current_command) {
         return false;
     }
-
-    // Protected pane environment values are sourced by a short-lived script
-    // executed by the user's POSIX shell. While the launch command is alive,
-    // tmux therefore reports that shell rather than the agent as the pane's
-    // current command. The script itself is the pane command, so once the agent
-    // exits the pane becomes dead instead of returning to a prompt. Do not
-    // mistake this live wrapper for a resurrected or interactive shell.
+    // The protected env launch script runs under a POSIX shell, which tmux
+    // reports while the agent is alive; that wrapper is not a prompt.
     is_pane_running_shell_command(
         &current_command,
         pane_start_command_is_protected(session_name),
     )
 }
 
-/// Stock tmux keys, under the prefix, that take a client out of a session:
-/// `L` is `switch-client -l`, `d` is `detach-client`.
+/// Prefix keys that leave a session: `L` is `switch-client -l`, `d` detaches.
 pub(crate) const SWITCH_BACK_KEY: &str = "L";
 pub(crate) const DETACH_KEY: &str = "d";
 
-/// Whether this process runs inside a tmux client. Attaching from inside is a
-/// `switch-client` of that client; from outside it is a fresh `attach-session`.
 pub(crate) fn inside_tmux() -> bool {
     std::env::var("TMUX").is_ok()
 }
 
-/// The key hint for coming back to aoe after this process attaches in tmux
-/// mode. From outside tmux the attach is an `attach-session`, undone by
-/// `prefix d`. From inside tmux it is a `switch-client`, undone by
-/// `prefix L`, but with no client to switch (an inherited `TMUX`) it falls
-/// back to `attach-session`, so the hint names both keys.
+/// Inside tmux the attach is a `switch-client` (`L`) that may fall back to an
+/// attach (`d`), so both keys are named.
 pub fn attach_return_hint() -> String {
     attach_return_hint_for(inside_tmux())
 }
@@ -444,11 +369,7 @@ pub(crate) fn attach_return_hint_for(inside_tmux: bool) -> String {
     }
 }
 
-/// Returns the tmux prefix key formatted for display (e.g. "Ctrl+a", "Ctrl+b").
-/// Reads `tmux show-option -gv prefix` once on first call and caches the
-/// result; falls back to "Ctrl+b" if tmux is unavailable or the option can't
-/// be parsed. The prefix can't change while AOE is running, so caching avoids
-/// per-render-frame subprocess calls from the welcome dialog.
+/// The tmux prefix for display (e.g. "Ctrl+a"), read once and cached.
 pub fn tmux_prefix_display() -> &'static str {
     static CACHE: OnceLock<String> = OnceLock::new();
     CACHE.get_or_init(|| {
@@ -463,25 +384,15 @@ pub fn tmux_prefix_display() -> &'static str {
     })
 }
 
-/// Run `tmux kill-session -t <name>`. A missing session is treated as
-/// success, since the goal is "this session is not present": `can't find
-/// session` (the session is gone, e.g. callers commonly kill the pane's
-/// process tree first, which can tear the session down before this lands)
-/// and `no server running` (no tmux server at all, so no session exists)
-/// are both swallowed in the C locale. Any other tmux failure returns
-/// `Err`. Caller is responsible for `refresh_session_cache` after a
-/// successful kill.
+/// `kill-session` that treats an absent session or server as success. Any
+/// connect failure counts as absent here, unlike the pollers' narrower test.
+/// The caller refreshes the session cache.
 pub(crate) fn kill_session_if_present(name: &str) -> Result<()> {
     let output = crate::tmux::tmux_query_command()
         .args(["kill-session", "-t", name])
         .output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // Deliberately broader than `tmux_no_server_running`: for a kill, ANY
-        // connect failure (`error connecting`, any errno) means there is no
-        // server and thus no session to remove, so it is success. The status
-        // pollers need the narrower ENOENT-only test to keep transient glitches
-        // on the error path; here a false "absent" cannot act on a live pane.
         let absent = stderr.contains("can't find session")
             || stderr.contains("no server running")
             || stderr.contains("error connecting");
@@ -492,9 +403,7 @@ pub(crate) fn kill_session_if_present(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Convert tmux's raw prefix notation (e.g. "C-a", "M-b", "F12") to the
-/// display form shown in UI hints. Preserves case from tmux so users see the
-/// same letter they typed in `~/.tmux.conf`.
+/// tmux prefix notation ("C-a", "M-b", "F12") to display form.
 fn format_tmux_prefix(raw: &str) -> String {
     if let Some(key) = raw.strip_prefix("C-") {
         format!("Ctrl+{key}")
@@ -510,10 +419,8 @@ fn format_tmux_prefix(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tmux::test_helpers::require_tmux;
 
-    /// One tmux `set-option` write form emits exactly its tmux tokens: scope
-    /// flags, `-q` when quiet, and no target for the server scope. This pins
-    /// the emitted-args contract the table rows must keep (issue #3349).
     #[test]
     fn attach_return_hint_names_both_keys_inside_tmux() {
         assert_eq!(attach_return_hint_for(true), "L (or d)");
@@ -541,8 +448,6 @@ mod tests {
                 vec![";", "set-option", "-t", "aoe_x", "mouse", "off"],
             ),
             (
-                // No table row uses a quiet session write today; the arm
-                // still exists, so pin its tokens like the other scopes.
                 TmuxOptionWrite::Session {
                     option: "mouse",
                     value: "on",
@@ -556,7 +461,6 @@ mod tests {
                     value: "on",
                     quiet: true,
                 },
-                // No target: a server option must not be addressed per-session.
                 vec![";", "set-option", "-q", "-s", "set-clipboard", "on"],
             ),
             (
@@ -584,12 +488,6 @@ mod tests {
         }
     }
 
-    /// The full (setting, action) -> writes matrix, straight from the table
-    /// through the `tmux_setting_writes` seam. Covers the user stories at the
-    /// table level (issue #3349): US1 (Clipboard/Apply declares the
-    /// passthrough writes), US2 (ForceOff rows never carry a forced-on value;
-    /// clipboard declares no "off"), US3 (every row maps through one seam, no
-    /// per-helper branch).
     #[test]
     fn test_tmux_setting_writes_table() {
         use crate::session::config::{TmuxOptionWrite, TmuxSettingAction};
@@ -618,18 +516,13 @@ mod tests {
             },
         ];
         let cases = [
-            // The status bar is painted after creation with dynamic theme
-            // values; it declares no creation-time writes for any action.
             (TmuxSetting::StatusBar, Apply, &[][..]),
             (TmuxSetting::StatusBar, ForceOff, &[][..]),
             (TmuxSetting::StatusBar, LeaveToUser, &[][..]),
             (TmuxSetting::Mouse, Apply, &mouse_on[..]),
             (TmuxSetting::Mouse, ForceOff, &mouse_off[..]),
-            // LeaveToUser writes nothing at creation: a fresh session has no
-            // session-scoped value aoe wrote to clear.
             (TmuxSetting::Mouse, LeaveToUser, &[][..]),
             (TmuxSetting::Clipboard, Apply, &clipboard[..]),
-            // No expressible "off": unsetting would reach the user's server.
             (TmuxSetting::Clipboard, ForceOff, &[][..]),
             (TmuxSetting::Clipboard, LeaveToUser, &[][..]),
         ];
@@ -642,11 +535,6 @@ mod tests {
         }
     }
 
-    /// The public entry point: resolving the whole table and emitting in
-    /// canonical order (mouse before clipboard). Explicit modes keep the
-    /// assertions independent of the probe's result, and the isolated HOME
-    /// keeps the probe itself away from the real user files (issue #3349,
-    /// US2: no forced-on write survives `disabled`).
     #[test]
     #[serial_test::serial]
     fn test_append_tmux_setting_args_emits_rows_in_order() {
@@ -654,69 +542,27 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let _home = crate::session::test_support::isolate_home(tmp.path());
 
+        const MOUSE_ON: &str = "; set-option -t aoe_x mouse on";
+        const MOUSE_OFF: &str = "; set-option -t aoe_x mouse off";
+        const CLIPBOARD: &str = "; set-option -q -s set-clipboard on";
+        const PASSTHROUGH: &str = "; set-option -q -w -t aoe_x allow-passthrough on";
+
         let mut config = Config::default();
-        let all_on = vec![
-            ";",
-            "set-option",
-            "-t",
-            "aoe_x",
-            "mouse",
-            "on",
-            ";",
-            "set-option",
-            "-q",
-            "-s",
-            "set-clipboard",
-            "on",
-            ";",
-            "set-option",
-            "-q",
-            "-w",
-            "-t",
-            "aoe_x",
-            "allow-passthrough",
-            "on",
-        ];
-        // (status_bar, mouse, clipboard)
         let cases = [
-            ((Enabled, Enabled, Enabled), all_on.clone()),
-            // The status bar never contributes at creation, whatever its mode.
-            ((Disabled, Enabled, Enabled), all_on),
+            (
+                (Enabled, Enabled, Enabled),
+                format!("{MOUSE_ON} {CLIPBOARD} {PASSTHROUGH}"),
+            ),
+            (
+                (Disabled, Enabled, Enabled),
+                format!("{MOUSE_ON} {CLIPBOARD} {PASSTHROUGH}"),
+            ),
             (
                 (Enabled, Disabled, Enabled),
-                vec![
-                    ";",
-                    "set-option",
-                    "-t",
-                    "aoe_x",
-                    "mouse",
-                    "off",
-                    ";",
-                    "set-option",
-                    "-q",
-                    "-s",
-                    "set-clipboard",
-                    "on",
-                    ";",
-                    "set-option",
-                    "-q",
-                    "-w",
-                    "-t",
-                    "aoe_x",
-                    "allow-passthrough",
-                    "on",
-                ],
+                format!("{MOUSE_OFF} {CLIPBOARD} {PASSTHROUGH}"),
             ),
-            // A disabled clipboard declares no writes at all.
-            (
-                (Enabled, Disabled, Disabled),
-                vec![";", "set-option", "-t", "aoe_x", "mouse", "off"],
-            ),
-            // And a disabled clipboard with mouse on emits just the mouse.
-            (
-                (Enabled, Enabled, Disabled),
-                vec![";", "set-option", "-t", "aoe_x", "mouse", "on"],
-            ),
+            ((Enabled, Disabled, Disabled), MOUSE_OFF.to_string()),
+            ((Enabled, Enabled, Disabled), MOUSE_ON.to_string()),
         ];
         for ((status_bar, mouse, clipboard), expected) in cases {
             config.tmux.status_bar = status_bar;
@@ -725,16 +571,13 @@ mod tests {
             let mut args: Vec<String> = Vec::new();
             append_tmux_setting_args(&mut args, "aoe_x", &config);
             assert_eq!(
-                args, expected,
+                args,
+                expected.split(' ').collect::<Vec<_>>(),
                 "status_bar={status_bar:?} mouse={mouse:?} clipboard={clipboard:?}"
             );
         }
     }
 
-    /// US1 (issue #3349): a tmux.conf that sets a prefix key but never touches
-    /// clipboard still gets aoe's `set-clipboard` passthrough under
-    /// `clipboard = "auto"`, and each option defers independently of the
-    /// others.
     #[test]
     #[serial_test::serial]
     fn test_user_config_silent_on_option_still_applies_auto() {
@@ -743,7 +586,6 @@ mod tests {
         let _home = crate::session::test_support::isolate_home(tmp.path());
         let tmux_conf = tmp.path().join(".tmux.conf");
 
-        // All `auto`: the default config.
         let config = Config::default();
         let mouse_on = vec![";", "set-option", "-t", "aoe_x", "mouse", "on"];
         let clipboard = vec![
@@ -763,7 +605,6 @@ mod tests {
             "on",
         ];
 
-        // (a) Prefix key only: aoe still applies its mouse and clipboard writes.
         std::fs::write(&tmux_conf, "set -g prefix C-a\n").unwrap();
         let mut args: Vec<String> = Vec::new();
         append_tmux_setting_args(&mut args, "aoe_x", &config);
@@ -773,14 +614,11 @@ mod tests {
             args, expected,
             "a prefix-only tmux.conf must not defer clipboard"
         );
-        // A config existing at all does defer the status bar (coarse by
-        // design), pinning its WhenUserHasAnyConfig wiring.
         assert_eq!(
             resolve_tmux_setting(TmuxSetting::StatusBar, &config),
             TmuxSettingAction::LeaveToUser
         );
 
-        // (b) User takes set-clipboard: only the clipboard writes defer.
         std::fs::write(&tmux_conf, "set -g prefix C-a\nset -s set-clipboard on\n").unwrap();
         let mut args: Vec<String> = Vec::new();
         append_tmux_setting_args(&mut args, "aoe_x", &config);
@@ -789,7 +627,6 @@ mod tests {
             "set-clipboard must defer only the clipboard writes"
         );
 
-        // (c) User takes mouse: only the mouse write defers.
         std::fs::write(&tmux_conf, "set -g prefix C-a\nset -g mouse on\n").unwrap();
         let mut args: Vec<String> = Vec::new();
         append_tmux_setting_args(&mut args, "aoe_x", &config);
@@ -805,8 +642,6 @@ mod tests {
 
     #[test]
     fn test_strip_ansi() {
-        // Covers SGR (single, compound, 256-color, truecolor), OSC terminated
-        // by both BEL and ST, and passthrough of code-free input.
         let cases = [
             ("\x1b[32mgreen\x1b[0m", "green"),
             ("no codes here", "no codes here"),
@@ -957,9 +792,6 @@ mod tests {
 
     #[test]
     fn test_format_tmux_prefix() {
-        // Case is preserved: tmux returns the prefix in whatever case the user
-        // wrote it, and the displayed hint should match their muscle memory.
-        // An empty prefix falls back to tmux's own default.
         let cases = [
             ("C-a", "Ctrl+a"),
             ("C-b", "Ctrl+b"),
@@ -992,26 +824,10 @@ mod tests {
             ]
         );
     }
-
-    fn tmux_available() -> bool {
-        crate::tmux::tmux_command()
-            .arg("-V")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    }
-
-    // Serialized like every test that talks to the shared tmux server: a
-    // non-serial test that kills the server's last session makes the server
-    // exit, and a `#[serial]` peer whose `new-session` connects inside that
-    // teardown window fails with "server exited unexpectedly" (CI flake on
-    // update_status_reconciles_running_hook_to_waiting_on_claude_approval_prompt).
     #[test]
     #[serial_test::serial]
     fn kill_session_if_present_swallows_missing_session() {
-        if !tmux_available() {
-            return;
-        }
+        require_tmux!();
         let name = "aoe_test_kill_if_present_missing";
         let _ = crate::tmux::tmux_command()
             .args(["kill-session", "-t", name])
@@ -1023,9 +839,7 @@ mod tests {
     #[serial_test::serial]
     fn kill_session_if_present_kills_existing_session() {
         let _env = crate::session::test_support::EnvGuard::read_lock();
-        if !tmux_available() {
-            return;
-        }
+        require_tmux!();
         let guard =
             crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_kill_if_present_alive");
         let name = guard.name();
@@ -1053,12 +867,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn pane_title_reads_the_panes_published_title() {
-        if !tmux_available() {
-            return;
-        }
+        require_tmux!();
         let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_pane_title");
         let name = guard.name();
-        // Separate argv bypasses shell startup, which could overwrite the title.
         let mut args: Vec<String> = ["new-session", "-d", "-s", name, "sleep", "30"]
             .iter()
             .map(|arg| arg.to_string())
@@ -1079,10 +890,6 @@ mod tests {
         assert_eq!(title.as_deref(), Some("aoe-title-probe"));
     }
 
-    /// Only the delimiter `display-message` adds comes off. tmux 3.6 will not
-    /// store a newline in a title (`select-pane -T` refuses one and an OSC
-    /// title is sanitized), so this is locked here rather than against a live
-    /// pane, which cannot produce the input.
     #[test]
     fn strip_display_delimiter_removes_only_the_delimiter() {
         assert_eq!(strip_display_delimiter("title\n"), "title");
@@ -1100,10 +907,6 @@ mod tests {
 mod pane_probe_tests {
     use super::*;
 
-    /// The failure taxonomy the session-id poller depends on: a recognized
-    /// "gone" stays Missing, an unrecognized failure never folds into it, so
-    /// a poller that has seen the target alive is not stopped by two
-    /// unexpected probes.
     #[test]
     fn classify_pane_probe_splits_missing_from_unknown() {
         use std::str::from_utf8;
@@ -1111,8 +914,6 @@ mod pane_probe_tests {
         assert_eq!(classify_pane_probe(true, "0", &[]), PaneProbe::Alive);
         assert_eq!(classify_pane_probe(true, "1", &[]), PaneProbe::Dead);
 
-        // Precise "gone": the name did not resolve (exit 0, empty stdout),
-        // or tmux reported no server / a dead socket file.
         assert_eq!(classify_pane_probe(true, "", &[]), PaneProbe::Missing);
         let no_server = b"no server running on /tmp/tmux-501/default\n";
         assert_eq!(
@@ -1122,8 +923,6 @@ mod pane_probe_tests {
         let enoent = b"error connecting to /tmp/tmux-501/default (No such file or directory)\n";
         assert_eq!(classify_pane_probe(false, "", enoent), PaneProbe::Missing);
 
-        // Unexpected failures stay Unknown: the poller's alive-seen guard
-        // only stops on two Missing probes.
         let eacces = b"error connecting to /tmp/tmux-501/default (Permission denied)\n";
         assert_eq!(classify_pane_probe(false, "", eacces), PaneProbe::Unknown);
         let enotsock =
@@ -1134,7 +933,6 @@ mod pane_probe_tests {
             PaneProbe::Unknown
         );
 
-        // Malformed stdout is not a resolvable shape either.
         assert_eq!(
             classify_pane_probe(true, "garbage", &[]),
             PaneProbe::Unknown
@@ -1142,15 +940,10 @@ mod pane_probe_tests {
         assert_eq!(classify_pane_probe(false, "0", &[]), PaneProbe::Alive);
         assert_eq!(classify_pane_probe(false, "1", &[]), PaneProbe::Dead);
 
-        // The bytes really are valid UTF-8 in the shapes above, matching the
-        // lossy conversion probe_pane performs.
         assert!(from_utf8(no_server).is_ok());
         assert!(from_utf8(enoent).is_ok());
     }
 
-    /// An empty name never reaches tmux: `:^.0` resolves against whatever
-    /// session is current, so an unrelated live pane would answer `Alive` and
-    /// a poller seeded with no name would hold its budget slot forever.
     #[test]
     fn probe_pane_rejects_an_empty_session_name() {
         assert_eq!(probe_pane(""), PaneProbe::Missing);

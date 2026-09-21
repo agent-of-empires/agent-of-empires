@@ -7,29 +7,23 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::AppState;
+use super::{api_error, AppState};
 use crate::server::auth::{handler_elevated, AuthenticatedSession, LoopbackTrusted};
 use crate::session::skills_model::{self, SkillError, SkillProvenance};
-
-fn error_response(status: StatusCode, code: &str, message: String) -> Response {
-    (status, Json(json!({ "error": code, "message": message }))).into_response()
-}
 
 fn skill_error(error: SkillError) -> Response {
     match error {
         SkillError::InvalidInput(message) => {
-            error_response(StatusCode::BAD_REQUEST, "invalid_skill", message)
+            api_error(StatusCode::BAD_REQUEST, "invalid_skill", message)
         }
         SkillError::NotFound(message) => {
-            error_response(StatusCode::NOT_FOUND, "skill_not_found", message)
+            api_error(StatusCode::NOT_FOUND, "skill_not_found", message)
         }
-        SkillError::Collision(message) => {
-            error_response(StatusCode::CONFLICT, "skill_exists", message)
-        }
+        SkillError::Collision(message) => api_error(StatusCode::CONFLICT, "skill_exists", message),
         SkillError::ReadOnly(message) => {
-            error_response(StatusCode::FORBIDDEN, "skill_read_only", message)
+            api_error(StatusCode::FORBIDDEN, "skill_read_only", message)
         }
-        SkillError::Io(error) => error_response(
+        SkillError::Io(error) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal",
             format!("{error:#}"),
@@ -38,7 +32,7 @@ fn skill_error(error: SkillError) -> Response {
 }
 
 fn task_error(error: tokio::task::JoinError) -> Response {
-    error_response(
+    api_error(
         StatusCode::INTERNAL_SERVER_ERROR,
         "internal",
         error.to_string(),
@@ -57,10 +51,10 @@ async fn mutation_gate(
         return Err(response);
     }
     if !handler_elevated(state, session, loopback_trusted).await {
-        return Err(error_response(
+        return Err(api_error(
             StatusCode::FORBIDDEN,
             "elevation_required",
-            "Re-enter the passphrase to continue".to_string(),
+            "Re-enter the passphrase to continue",
         ));
     }
     Ok(())
@@ -114,7 +108,7 @@ pub async fn list_skills() -> Response {
             "roots": skills_model::skill_roots(),
         }))
         .into_response(),
-        Ok(Err(error)) => error_response(
+        Ok(Err(error)) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal",
             format!("{error:#}"),
@@ -127,9 +121,7 @@ pub async fn list_skills() -> Response {
 pub async fn read_skill(Path((source, directory)): Path<(String, String)>) -> Response {
     let provenance = match source_provenance(&source) {
         Ok(value) => value,
-        Err(message) => {
-            return error_response(StatusCode::BAD_REQUEST, "invalid_skill_source", message)
-        }
+        Err(message) => return api_error(StatusCode::BAD_REQUEST, "invalid_skill_source", message),
     };
     let result = tokio::task::spawn_blocking(move || {
         let home = dirs::home_dir().ok_or_else(|| {
@@ -216,9 +208,7 @@ pub async fn adopt_skill(
 ) -> Response {
     let provenance = match source_provenance(&source) {
         Ok(value) => value,
-        Err(message) => {
-            return error_response(StatusCode::BAD_REQUEST, "invalid_skill_source", message)
-        }
+        Err(message) => return api_error(StatusCode::BAD_REQUEST, "invalid_skill_source", message),
     };
     let result = tokio::task::spawn_blocking(move || {
         let home = dirs::home_dir().ok_or_else(|| {
@@ -253,26 +243,23 @@ pub struct SyncSkillsBody {
     roots: Vec<String>,
     /// Skills the caller has explicitly asked AoE to take over, overwriting a
     /// skill AoE does not manage or a propagated copy edited in place. Empty
-    /// means overwrite nothing, which is the default and what every automatic
-    /// sync uses.
+    /// (the default, and what every automatic sync uses) overwrites nothing.
     #[serde(default)]
     replace: Vec<String>,
-    /// When non-empty, reconcile only these skills. This is what makes sharing
-    /// a single skill a single-skill operation rather than a full sync whose
-    /// report is filtered afterwards.
+    /// When non-empty, reconcile only these skills, so sharing a single skill
+    /// is a single-skill operation rather than a filtered full sync.
     #[serde(default)]
     directories: Vec<String>,
 }
 
 /// `POST /api/skills/sync`: reconcile the managed store into agent skills dirs.
-///
 /// Returns one outcome per skill per root rather than failing on the first
 /// conflict: a destination AoE does not own is a normal result the user needs to
 /// see, not an error that should abandon the remaining roots.
 pub async fn sync_skills(_guard: SkillMutationGuard, Json(body): Json<SyncSkillsBody>) -> Response {
     for root in &body.roots {
         if skills_model::skill_root(root).is_none() {
-            return error_response(
+            return api_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_skill_source",
                 format!("Unknown skill root {root:?}"),

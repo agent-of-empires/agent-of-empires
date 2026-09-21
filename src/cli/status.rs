@@ -62,12 +62,8 @@ pub async fn run(profile: &str, args: StatusArgs) -> Result<()> {
         return Ok(());
     }
 
-    // Resolving the profile config installs the declarative status-rule
-    // registry (`[[agents.<name>.status_rules]]`); the per-instance poll
-    // below never loads config itself.
     crate::session::config::profile_config::resolve_config_or_warn(profile);
 
-    // Refresh tmux session cache
     crate::tmux::refresh_session_cache();
 
     let contended = crate::session::Instance::contended_capture_cwds(&instances);
@@ -113,7 +109,6 @@ pub async fn run(profile: &str, args: StatusArgs) -> Result<()> {
         );
     }
 
-    // Show update notice if available (skip for JSON/quiet output)
     if !args.json && !args.quiet {
         crate::update::print_update_notice().await;
     }

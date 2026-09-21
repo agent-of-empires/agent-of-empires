@@ -5,6 +5,7 @@
 //! `Worker`: requests go to a dedicated named thread, results come back
 //! over a channel the main loop drains each frame.
 
+use std::collections::HashSet;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -74,10 +75,8 @@ impl<Req: Send + 'static, Res: Send + 'static> Worker<Req, Res> {
         }
     }
 
-    /// Enqueue a request (non-blocking). A send failure means the worker
-    /// thread is gone (channel closed at teardown, or a panic in the
-    /// handler). Log it rather than dropping silently so a stuck-looking
-    /// in-flight row is traceable.
+    /// Enqueue a request. A send failure means the worker thread is gone, so
+    /// log it rather than dropping silently.
     pub fn request(&self, req: Req) {
         if let Err(e) = self.request_tx.send(req) {
             tracing::warn!(
@@ -89,11 +88,8 @@ impl<Req: Send + 'static, Res: Send + 'static> Worker<Req, Res> {
         }
     }
 
-    /// Non-blocking poll for a completed result. Surfaces `Disconnected`
-    /// (returned forever once the worker thread is gone, e.g. after a panic
-    /// in the handler) rather than collapsing it into `None`, so the caller
-    /// can clear stuck in-flight state instead of leaving rows pinned on a
-    /// transient status forever.
+    /// Non-blocking poll. Surfaces `Disconnected` rather than collapsing it
+    /// into `None`, so callers can clear state stuck on a dead worker.
     pub fn try_recv(&self) -> Result<Res, mpsc::TryRecvError> {
         self.result_rx.try_recv()
     }
@@ -111,9 +107,7 @@ impl<Req: Send + 'static, Res: Send + 'static> Worker<Req, Res> {
         drop(result_rx);
         result
     }
-    /// Test-only worker with one pre-seeded result and no handler; requests
-    /// are drained and ignored. Lets consumer tests exercise the
-    /// result-application path without running real side effects.
+    /// Test-only worker with one pre-seeded result; requests are ignored.
     #[cfg(test)]
     pub(crate) fn seeded_for_test(thread_name: &str, result: Res) -> Self {
         let (request_tx, request_rx) = mpsc::channel::<Req>();
@@ -134,6 +128,56 @@ impl<Req: Send + 'static, Res: Send + 'static> Worker<Req, Res> {
             result_rx,
             _handle: handle,
         }
+    }
+}
+
+/// A result that names the session its work belongs to.
+pub trait SessionScoped {
+    fn session_id(&self) -> &str;
+}
+
+/// A [`Worker`] that remembers the session ids of in-flight requests. Rows are
+/// marked optimistically at request time, so their status alone cannot say
+/// which requests a dead worker lost; this set can.
+pub struct TrackedWorker<Req, Res> {
+    worker: Worker<Req, Res>,
+    pending: HashSet<String>,
+}
+
+impl<Req: Send + 'static, Res: SessionScoped + Send + 'static> TrackedWorker<Req, Res> {
+    pub fn spawn(thread_name: &str, handler: impl FnMut(Req) -> Res + Send + 'static) -> Self {
+        Self {
+            worker: Worker::spawn(thread_name, handler),
+            pending: HashSet::new(),
+        }
+    }
+
+    pub fn request(&mut self, session_id: String, request: Req) {
+        self.pending.insert(session_id);
+        self.worker.request(request);
+    }
+
+    pub fn try_recv(&mut self) -> Result<Res, mpsc::TryRecvError> {
+        let result = self.worker.try_recv();
+        if let Ok(ref done) = result {
+            self.pending.remove(done.session_id());
+        }
+        result
+    }
+
+    /// Drain the in-flight set, for once the worker is known dead.
+    pub fn take_pending(&mut self) -> Vec<String> {
+        self.pending.drain().collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_pending(&self, id: &str) -> bool {
+        self.pending.contains(id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn finish_for_test(self) -> thread::Result<()> {
+        self.worker.finish_for_test()
     }
 }
 

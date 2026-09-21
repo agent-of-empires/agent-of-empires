@@ -1,4 +1,5 @@
 import { test, expect } from "./helpers/mockedTest";
+import { sessionResponse } from "./helpers/sessions";
 
 const NEW_SESSION_PANE_NAME = /New session Pick a project, then launch a new session/i;
 
@@ -199,35 +200,28 @@ test.describe("Mobile responsive", () => {
       ["five", "2026-01-06T00:00:00Z"],
       ["six", "2026-01-03T00:00:00Z"],
       ["trash", "2026-01-08T00:00:00Z"],
-    ].map(([id, last_accessed_at]) => ({
-      id,
-      title: `Session ${id}`,
-      project_path: `/repo/${id}`,
-      artifact_dir: `/tmp/${id}`,
-      group_path: "",
-      tool: "claude",
-      status: "Idle",
-      dormant: false,
-      yolo_mode: false,
-      created_at: "2026-01-01T00:00:00Z",
-      last_accessed_at,
-      idle_entered_at: null,
-      last_error: null,
-      branch: null,
-      main_repo_path: `/repo/${id}`,
-      is_sandboxed: false,
-      scratch: false,
-      favorited: false,
-      has_managed_worktree: false,
-      has_terminal: true,
-      profile: "default",
-      cleanup_defaults: {},
-      remote_owner: null,
-      notify_on_waiting: null,
-      notify_on_idle: null,
-      notify_on_error: null,
-      trashed_at: id === "trash" ? "2026-01-08T00:00:00Z" : null,
-    }));
+    ].map(([id, last_accessed_at]) =>
+      sessionResponse({
+        id: id!,
+        title: `Session ${id}`,
+        project_path: `/repo/${id}`,
+        artifact_dir: `/tmp/${id}`,
+        group_path: "",
+        dormant: false,
+        created_at: "2026-01-01T00:00:00Z",
+        last_accessed_at,
+        main_repo_path: `/repo/${id}`,
+        scratch: false,
+        favorited: false,
+        has_managed_worktree: false,
+        cleanup_defaults: {},
+        remote_owner: null,
+        notify_on_waiting: null,
+        notify_on_idle: null,
+        notify_on_error: null,
+        trashed_at: id === "trash" ? "2026-01-08T00:00:00Z" : null,
+      }),
+    );
     await page.route("**/api/sessions", (route) => route.fulfill({ json: { sessions, workspace_ordering: [] } }));
 
     await page.setViewportSize({ width: 375, height: 812 });

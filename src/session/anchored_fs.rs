@@ -3,9 +3,9 @@
 use anyhow::{bail, Context, Result};
 use nix::dir::Dir;
 use nix::errno::Errno;
-use nix::fcntl::{open, openat, AtFlags, OFlag};
+use nix::fcntl::{open, openat, renameat, AtFlags, OFlag};
 use nix::sys::stat::{fstat, fstatat, mkdirat, Mode};
-use nix::unistd::{unlinkat, UnlinkatFlags};
+use nix::unistd::{linkat, unlinkat, UnlinkatFlags};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::Read;
@@ -19,15 +19,8 @@ pub(crate) struct AnchoredDir {
 }
 
 impl AnchoredDir {
-    /// Anchor at `path`, whose ancestors are resolved the way any other
-    /// caller resolves them and whose own leaf may not be a symlink.
-    ///
-    /// Walking the ancestors with `O_NOFOLLOW` defended nothing: a hostile
-    /// `/var` is not a threat this type can answer, while macOS reaches both
-    /// `/tmp` and the per-user temp root through a symlink, so the walk
-    /// refused every anchored read on that platform. The leaf keeps
-    /// `O_NOFOLLOW` because it is the swap an attacker controls, and so does
-    /// every component below it, which is the escape this type exists to stop.
+    /// Anchor at `path`, whose ancestors are resolved the way any other caller resolves them and
+    /// whose own leaf may not be a symlink.
     pub(crate) fn open(path: &Path) -> Result<Self> {
         let root = path.to_path_buf();
         for component in path.components() {
@@ -144,6 +137,23 @@ impl AnchoredDir {
         Ok(Some(bytes))
     }
 
+    /// Create `relative` for writing, or `None` when an entry is already
+    /// there. `O_EXCL | O_NOFOLLOW` so a planted symlink is never followed
+    /// and an existing file is never truncated.
+    pub(crate) fn create_new_regular(&self, relative: &Path) -> Result<Option<File>> {
+        let (parent, leaf) = self.open_parent(relative)?;
+        match openat(
+            &parent,
+            leaf.as_os_str(),
+            OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_WRONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::S_IRUSR | Mode::S_IWUSR,
+        ) {
+            Ok(fd) => Ok(Some(File::from(fd))),
+            Err(Errno::EEXIST) => Ok(None),
+            Err(error) => Err(error).context("creating anchored file"),
+        }
+    }
+
     pub(crate) fn read_dir(&self, relative: &Path, max_entries: usize) -> Result<Vec<OsString>> {
         let fd = self.open_dir(relative)?;
         let mut dir = Dir::from_fd(fd)?;
@@ -178,15 +188,8 @@ impl AnchoredDir {
         self.modified(relative, true)
     }
 
-    /// What `relative` names: `Some(true)` a regular file, `Some(false)`
-    /// something that is not one, `None` nothing at all. `Err` when the
-    /// lookup itself could not be made, which callers that treat absence as
-    /// evidence must keep distinct from `None`.
-    ///
-    /// Inspects with `fstatat` rather than opening, so an entry this process
-    /// may stat but not read still answers `Some(true)`. A sandbox writes its
-    /// files as the container's user, and the host side only needs to know
-    /// they are there.
+    /// What `relative` names: `Some(true)` a regular file, `Some(false)` something that is not one,
+    /// `None` nothing at all.
     pub(crate) fn regular_lookup(&self, relative: &Path) -> Result<Option<bool>> {
         let (parent, leaf) = self.open_parent(relative)?;
         match fstatat(&parent, leaf.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
@@ -200,6 +203,45 @@ impl AnchoredDir {
 
     pub(crate) fn regular_exists(&self, relative: &Path) -> bool {
         matches!(self.regular_lookup(relative), Ok(Some(true)))
+    }
+
+    /// Publish the staging file `from` at `to` and drop the staging name.
+    /// `false` means something was already at `to` and was left untouched,
+    /// which only happens when `replace` is unset.
+    ///
+    /// Makes a file visible only once it is complete, so a process killed
+    /// mid-write leaves a staging name rather than a half file under the real
+    /// one. Without `replace` this is `linkat`, not `renameat`, because rename
+    /// replaces the destination: a writer that created `to` between a caller's
+    /// existence check and this call would lose its file.
+    /// `renameat2(RENAME_NOREPLACE)` would also answer, but it is Linux-only
+    /// and this has to hold on macOS.
+    pub(crate) fn publish_staged(&self, from: &Path, to: &Path, replace: bool) -> Result<bool> {
+        let (from_parent, from_leaf) = self.open_parent(from)?;
+        let (to_parent, to_leaf) = self.open_parent(to)?;
+        if replace {
+            renameat(
+                &from_parent,
+                from_leaf.as_os_str(),
+                &to_parent,
+                to_leaf.as_os_str(),
+            )
+            .context("replacing anchored file")?;
+            return Ok(true);
+        }
+        let published = match linkat(
+            &from_parent,
+            from_leaf.as_os_str(),
+            &to_parent,
+            to_leaf.as_os_str(),
+            AtFlags::empty(),
+        ) {
+            Ok(()) => true,
+            Err(Errno::EEXIST) => false,
+            Err(error) => return Err(error).context("publishing anchored file"),
+        };
+        self.remove_file(from)?;
+        Ok(published)
     }
 
     pub(crate) fn remove_file(&self, relative: &Path) -> Result<()> {
@@ -297,10 +339,6 @@ fn normal_components(path: &Path) -> Result<Vec<std::ffi::OsString>> {
 mod tests {
     use super::*;
 
-    /// A symlinked ancestor of the anchor is normal on macOS, where `/tmp`
-    /// and the per-user temp root under `/var` both resolve through one, and
-    /// it says nothing about whether the store below the anchor is safe.
-    /// Refusing it made every anchored read fail there.
     #[cfg(unix)]
     #[test]
     fn opens_through_a_symlinked_ancestor() {
@@ -323,8 +361,6 @@ mod tests {
         );
     }
 
-    /// The anchor's own leaf still may not be a symlink: that is the swap an
-    /// attacker controls, unlike the system directories above it.
     #[cfg(unix)]
     #[test]
     fn refuses_a_symlinked_anchor_leaf() {

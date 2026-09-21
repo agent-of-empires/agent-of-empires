@@ -1,4 +1,4 @@
-//! Custom instruction editor dialog with multi-line text area and Save/Cancel buttons
+//! Custom instruction editor.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
@@ -48,7 +48,6 @@ impl CustomInstructionDialog {
 
             KeyCode::Enter if self.focused_zone == 1 => {
                 if self.focused_button == 0 {
-                    // Save
                     let text = self.get_text();
                     let value = if text.trim().is_empty() {
                         None
@@ -57,7 +56,6 @@ impl CustomInstructionDialog {
                     };
                     DialogResult::Submit(value)
                 } else {
-                    // Cancel
                     DialogResult::Cancel
                 }
             }
@@ -89,19 +87,9 @@ impl CustomInstructionDialog {
     pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let dialog_width = (area.width * 70 / 100).max(40).min(area.width);
         let dialog_height = (area.height * 60 / 100).max(10).min(area.height);
-        let dialog_area = super::centered_rect(area, dialog_width, dialog_height);
-
-        frame.render_widget(Clear, dialog_area);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.accent))
-            .title(" Edit Custom Instruction ")
-            .title_style(Style::default().fg(theme.title).bold());
-
-        let inner = block.inner(dialog_area);
-        frame.render_widget(block, dialog_area);
+        let block = super::dialog_block(" Edit Custom Instruction ", theme);
+        let (_, inner) =
+            super::render_dialog_frame(frame, area, dialog_width, dialog_height, block);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -112,7 +100,6 @@ impl CustomInstructionDialog {
             ])
             .split(inner);
 
-        // Text area
         let textarea_border_color = if self.focused_zone == 0 {
             theme.accent
         } else {
@@ -154,7 +141,6 @@ impl CustomInstructionDialog {
             frame.set_cursor_position(Position::new(cursor_x, cursor_y));
         }
 
-        // Button row
         let button_area = chunks[1];
         let button_layout = Layout::default()
             .direction(Direction::Horizontal)
@@ -200,7 +186,6 @@ impl CustomInstructionDialog {
             button_layout[3],
         );
 
-        // Hint bar
         let hint = Line::from(vec![
             Span::styled("Tab", Style::default().fg(theme.hint)),
             Span::raw(" switch focus  "),

@@ -1,6 +1,4 @@
-//! The assembled settings schema: every section's derived descriptors in one
-//! flat list. Sections are added here as they migrate onto `#[derive(SettingsSection)]`.
-//! This is the single list the TUI, web, and server all consume.
+//! The assembled settings schema: every section's derived descriptors in one list.
 
 use super::FieldDescriptor;
 use crate::session::config::{
@@ -41,11 +39,7 @@ fn build_schema() -> Vec<FieldDescriptor> {
     out
 }
 
-/// The schema as the running process sees it: the static core [`schema`] plus
-/// one virtual `plugin:<id>` section per active plugin's declared settings. The
-/// server serves this over `GET /api/settings/schema`, validates PATCHes against
-/// it, and the TUI builds its Plugins tab from it, so plugin settings render and
-/// validate through the exact same path as core settings.
+/// The core [`schema`] plus a virtual `plugin:<id>` section per active plugin.
 pub fn runtime_schema() -> Vec<FieldDescriptor> {
     let mut out = schema();
     for p in crate::plugin::registry().active() {
@@ -57,17 +51,13 @@ pub fn runtime_schema() -> Vec<FieldDescriptor> {
     out
 }
 
-/// Look up a single field's descriptor by `section` and `field`.
 pub fn descriptor(section: &str, field: &str) -> Option<&'static FieldDescriptor> {
     schema_ref()
         .iter()
         .find(|d| d.section == section && d.field == field)
 }
 
-/// Whether the section is described by the settings schema at all. A section
-/// that is (every `#[derive(SettingsSection)]` config struct) declares every
-/// field a surface may touch, so a key it does not describe is `skip`ped or
-/// misspelled rather than merely undocumented.
+/// A schema section describes every field, so an undescribed key in it is skipped or a typo.
 pub fn section_in_schema(section: &str) -> bool {
     schema_ref().iter().any(|d| d.section == section)
 }
@@ -87,14 +77,8 @@ mod tests {
     }
 
     #[test]
-    fn acp_section_is_complete() {
-        let acp: Vec<_> = schema()
-            .into_iter()
-            .filter(|d| d.section == "acp")
-            .map(|d| d.field)
-            .collect();
-        // Every AcpConfig field that is a user setting must appear.
-        for expected in [
+    fn acp_section_fields_and_policies() {
+        for field in [
             "default_agent",
             "max_concurrent_workers",
             "replay_events",
@@ -102,20 +86,19 @@ mod tests {
             "show_tool_durations",
             "silent_orphan_grace_secs",
         ] {
-            assert!(
-                acp.iter().any(|f| f == expected),
-                "acp.{expected} missing from schema"
-            );
+            assert!(descriptor("acp", field).is_some(), "acp.{field} missing");
         }
-    }
-
-    #[test]
-    fn acp_node_path_is_local_only() {
-        let d = descriptor("acp", "node_path").expect("node_path descriptor");
+        // A host binary execution surface.
+        assert!(matches!(
+            descriptor("acp", "node_path").unwrap().web_write,
+            WebWritePolicy::LocalOnly { .. }
+        ));
         assert!(
-            matches!(d.web_write, WebWritePolicy::LocalOnly { .. }),
-            "node_path must stay local-only: it is a host binary execution surface"
+            descriptor("acp", "max_concurrent_workers")
+                .unwrap()
+                .advanced
         );
+        assert!(!descriptor("acp", "default_agent").unwrap().advanced);
     }
 
     #[test]
@@ -140,9 +123,6 @@ mod tests {
         }
     }
 
-    /// The poller-thread ceiling is process-wide tuning: the web shows it
-    /// under the Session tab's Advanced fold with the "not
-    /// profile-overridable" note, as a lower-bounded number (0 = default).
     #[test]
     fn session_id_poller_max_threads_is_an_advanced_global_only_number() {
         let d = descriptor("session", "session_id_poller_max_threads")
@@ -164,10 +144,7 @@ mod tests {
 
     #[test]
     fn schema_serializes_with_tagged_widget_policy_validation() {
-        // Locks the JSON contract the web `SettingsFieldDescriptor` TS type
-        // depends on (GET /api/settings/schema). Widgets are tagged `kind`,
-        // write policies `policy`, validation `rule`; every descriptor carries
-        // a dotted-path id via section+field.
+        // The JSON contract of the web `SettingsFieldDescriptor` type.
         let json = serde_json::to_value(schema()).expect("schema serializes");
         let arr = json.as_array().expect("schema is a JSON array");
         assert!(!arr.is_empty());
@@ -187,23 +164,9 @@ mod tests {
                 assert!(obj.contains_key(key), "descriptor missing `{key}`: {d}");
             }
             assert!(d["widget"].get("kind").is_some(), "widget not tagged: {d}");
-            assert!(
-                d["web_write"].get("policy").is_some(),
-                "web_write not tagged: {d}"
-            );
-            assert!(
-                d["validation"].get("rule").is_some(),
-                "validation not tagged: {d}"
-            );
+            assert!(d["web_write"].get("policy").is_some());
+            assert!(d["validation"].get("rule").is_some());
         }
-    }
-
-    #[test]
-    fn acp_advanced_grouping() {
-        let d = descriptor("acp", "max_concurrent_workers").unwrap();
-        assert!(d.advanced);
-        let d = descriptor("acp", "default_agent").unwrap();
-        assert!(!d.advanced);
     }
 
     #[test]
@@ -227,21 +190,16 @@ mod tests {
         }
     }
 
-    /// Every descriptor carries a resolved repo policy: its own
-    /// `#[setting(repo = ...)]` where it declares one, otherwise the
-    /// `repo_default` of its `#[setting_section(...)]`.
     #[test]
     fn field_repo_policy_resolves_from_field_then_section() {
         use super::super::RepoPolicy;
         for (section, field, expected) in [
-            // Declared on the field.
             ("sandbox", "extra_volumes", RepoPolicy::Deny),
             ("sandbox", "selinux_relabel", RepoPolicy::Deny),
             ("worktree", "path_template", RepoPolicy::Deny),
             ("session", "default_tool", RepoPolicy::Deny),
             ("session", "agent_detect_as", RepoPolicy::Allow),
-            // Inherited: `session` declares repo_default = "deny", every other
-            // section defaults to allow.
+            // Inherited from the section's repo_default.
             ("session", "yolo_mode_default", RepoPolicy::Deny),
             ("sandbox", "memory_limit", RepoPolicy::Allow),
             ("sandbox", "container_runtime", RepoPolicy::Allow),
@@ -251,8 +209,6 @@ mod tests {
             assert_eq!(d.repo_policy, expected, "{section}.{field}");
         }
 
-        // A permissive policy does not make a global-only field settable; the
-        // repo gate checks `profile_overridable` first.
         assert!(
             !descriptor("sandbox", "container_runtime")
                 .unwrap()
@@ -266,8 +222,6 @@ mod tests {
         assert!(section_in_schema("sandbox"));
         assert!(section_in_schema("worktree"));
         assert!(section_in_schema("updates"));
-        // `hooks` is a repo-overridable section with no `SettingsSection`
-        // derive, so its keys have no descriptors and must not fail closed.
         assert!(!section_in_schema("hooks"));
     }
 }

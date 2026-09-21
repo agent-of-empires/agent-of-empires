@@ -63,10 +63,9 @@ fn fork_denied_for_resume_only_agent_shows_info() {
     );
 }
 
-/// The fork seed forks the parent's agent, so the dialog must open preselected
-/// on that agent rather than the configured default. A Codex parent forking
-/// while the default tool is claude must land on codex, not claude (otherwise
-/// the dialog's tool and the seed disagree).
+/// The fork seed forks the parent's agent, so the dialog opens preselected on it rather
+/// than the configured default: a Codex parent must land on codex, or the dialog's tool and
+/// the seed disagree.
 #[test]
 #[serial]
 fn fork_from_selection_preselects_parent_tool() {
@@ -95,9 +94,9 @@ fn fork_from_selection_preselects_parent_tool() {
     );
 }
 
-/// A structured (ACP) parent forks via the ACP `session/fork` handshake, so the
-/// seed must be `Structured` carrying the parent's captured ACP session id, not
-/// a terminal resume-with-fork-flag seed.
+/// A structured parent forks via the ACP `session/fork` handshake, so the seed must be
+/// `Structured` carrying the parent's captured ACP session id, not a terminal
+/// resume-with-fork-flag seed.
 #[test]
 #[serial]
 fn fork_from_selection_structured_parent_seeds_structured_fork() {
@@ -155,12 +154,10 @@ fn fork_from_selection_structured_parent_without_acp_id_denies() {
     );
 }
 
-/// A structured parent whose agent is resume-only (aoe-agent: ACP-capable but
-/// no fork strategy) must be refused at the capability gate, BEFORE the
-/// captured-conversation check, even when it has an acp_session_id. Otherwise
-/// the fork would silently downgrade to session/new at the handshake. This is
-/// the exact silent-downgrade the reviewer flagged; the gate mirrors the REST
-/// create guard and the web `acp_can_fork` projection.
+/// A structured parent whose agent is resume-only (ACP-capable but with no fork strategy)
+/// must be refused at the capability gate before the captured-conversation check, even with
+/// an acp_session_id, or the fork silently downgrades to session/new at the handshake. The
+/// gate mirrors the REST create guard and the web `acp_can_fork` projection.
 #[test]
 #[serial]
 fn fork_from_selection_structured_unforkable_agent_denies() {
@@ -195,9 +192,8 @@ fn test_session_context_menu_snooze_opens_duration_dialog() {
     use crate::tui::dialogs::ContextMenuAction;
 
     let mut env = create_test_env_with_groups();
-    // Snooze is offered in Attention sort (it mirrors the Attention-gated `h`
-    // keybinding); dispatching it on an active session opens the duration
-    // picker, the same path the keyboard takes.
+    // Snooze is offered in Attention sort, mirroring the Attention-gated `h` keybinding, and
+    // dispatching it on an active session opens the duration picker like the keyboard.
     env.view.sort_order = SortOrder::Attention;
     env.view.flat_items = env.view.build_flat_items();
     let session_idx = env
@@ -1017,10 +1013,10 @@ fn test_has_dialog_true_when_search_active() {
     assert!(view.has_dialog());
 }
 
-/// The async CreationPoller result must replace a `Creating` stub even when an
-/// intervening TUI save already persisted it, keep the finalized row's group,
-/// and treat the committed row as authoritative: it is not a provisional
-/// pending add, and a later peer deletion is not resurrected by `save`.
+/// The async CreationPoller result must replace a `Creating` stub even when an intervening
+/// save already persisted it, keep the finalized row's group, and treat the committed row as
+/// authoritative rather than a provisional pending add, so a later peer deletion is not
+/// resurrected by `save`.
 #[test]
 #[serial]
 fn apply_creation_results_finalizes_persisted_stub() {
@@ -1121,10 +1117,9 @@ fn apply_creation_results_finalizes_persisted_stub() {
 }
 
 /// A peer can commit the same title/path while the background builder waits for
-/// finalization. The duplicate rollback must preserve every resource the
-/// persisted winner references (worktree, branch) and its own pre-existing
-/// empty group, while discarding the losing stub's provisional group, both in
-/// memory and across a later save.
+/// finalization. The duplicate rollback must preserve every resource the persisted winner
+/// references and its own pre-existing empty group, while discarding the losing stub's
+/// provisional group, in memory and across a later save.
 #[test]
 #[serial]
 fn apply_creation_results_rolls_back_on_peer_collision() {

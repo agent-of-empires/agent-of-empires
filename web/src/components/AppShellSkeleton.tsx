@@ -1,12 +1,6 @@
-// Presentational app-shell skeletons shown while the first startup fetches
-// settle. They let a PWA cold launch paint the chrome immediately and fill in
-// as data arrives, instead of holding a single blank surface that flips to a
-// fully-populated UI all at once. Purely visual: no data, no fetches, so it is
-// safe to render before auth resolves.
+// Presentational app-shell skeletons shown while the first startup fetches settle.
 
-// A faint placeholder block. surface-800 reads as "content that hasn't landed"
-// against the surface-900 body; the pulse is motion-safe so reduced-motion
-// users get a static block (matches the sidebar's existing pulse usage).
+// A faint placeholder block.
 const BLOCK = "rounded-md bg-surface-800 motion-safe:animate-pulse";
 
 // Decreasing widths so the placeholder rows read as a ragged list rather than a
@@ -43,9 +37,7 @@ export function MainPaneSkeleton() {
   );
 }
 
-/** Full-frame skeleton: TopBar strip + sidebar (md+) + main-pane placeholder.
- *  Used at the top-level auth gate, before we know whether the app or the login
- *  screen will render, so it carries no real data. */
+/** Full-frame skeleton: TopBar strip + sidebar (md+) + main-pane placeholder. */
 export function AppShellSkeleton() {
   return (
     <div className="h-dvh flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset">

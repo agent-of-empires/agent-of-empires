@@ -1,214 +1,108 @@
 // @vitest-environment jsdom
-//
-// Behavior tests for SessionGroupModal. The modal opens from the workspace
-// sidebar context menu; the user edits a session's group path, then saves
-// (Enter or the Save button) or cancels (Escape, Cancel, or backdrop click).
-// Saving trims the value, short-circuits unchanged values to a plain close,
-// surfaces save failures inline, and disables controls while in flight.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import { SessionGroupModal } from "../SessionGroupModal";
+import { expectRestoresFocus } from "./dialogTestUtils";
 
-function setup(overrides?: {
-  sessionTitle?: string;
-  currentGroup?: string;
-  onSave?: (group: string) => Promise<boolean>;
-  onClose?: () => void;
-}) {
-  const onSave = overrides?.onSave ?? vi.fn().mockResolvedValue(true);
-  const onClose = overrides?.onClose ?? vi.fn();
+function setup(currentGroup = "work", onSave: (group: string) => Promise<boolean> = vi.fn().mockResolvedValue(true)) {
+  const onClose = vi.fn();
   const utils = render(
-    <SessionGroupModal
-      sessionTitle={overrides?.sessionTitle ?? "my-session"}
-      currentGroup={overrides?.currentGroup ?? "work"}
-      onSave={onSave}
-      onClose={onClose}
-    />,
+    <SessionGroupModal sessionTitle="alpha" currentGroup={currentGroup} onSave={onSave} onClose={onClose} />,
   );
-  const input = utils.container.querySelector<HTMLInputElement>('[data-testid="session-group-modal-input"]')!;
-  const saveBtn = utils.container.querySelector<HTMLButtonElement>('[data-testid="session-group-modal-save"]')!;
-  const cancelBtn = Array.from(utils.container.querySelectorAll("button")).find(
-    (b) => b.textContent?.trim() === "Cancel",
-  ) as HTMLButtonElement;
-  return { ...utils, onSave, onClose, input, saveBtn, cancelBtn };
+  return {
+    ...utils,
+    onSave,
+    onClose,
+    input: screen.getByTestId("session-group-modal-input") as HTMLInputElement,
+    saveBtn: screen.getByTestId("session-group-modal-save") as HTMLButtonElement,
+    cancelBtn: screen.getByRole("button", { name: "Cancel" }) as HTMLButtonElement,
+  };
 }
 
-afterEach(() => {
-  cleanup();
-});
+const errorText = () => screen.queryByTestId("session-group-modal-error")?.textContent;
+const pending = () => {
+  let resolve: (ok: boolean) => void = () => {};
+  const onSave = vi.fn(() => new Promise<boolean>((r) => (resolve = r)));
+  return { onSave, resolve: (ok: boolean) => resolve(ok) };
+};
+
+afterEach(cleanup);
 
 describe("SessionGroupModal", () => {
-  it("seeds the input with the current group, focuses and selects it on mount", () => {
-    const { input } = setup({ currentGroup: "work/projects" });
+  it("is a modal named by its title with the current group focused", () => {
+    const { input, container } = setup("work/projects");
+    expect(screen.getByRole("dialog", { name: "Edit group" }).getAttribute("aria-modal")).toBe("true");
+    expect(container.textContent).toContain("alpha");
     expect(input.value).toBe("work/projects");
     expect(document.activeElement).toBe(input);
   });
 
-  it("renders the dialog with a11y attributes pointing at the title", () => {
-    const { container } = setup({ sessionTitle: "alpha" });
-    const dialog = container.querySelector('[role="dialog"]');
-    expect(dialog).toBeTruthy();
-    expect(dialog?.getAttribute("aria-modal")).toBe("true");
-    const labelId = dialog?.getAttribute("aria-labelledby");
-    expect(container.querySelector(`#${labelId}`)?.textContent).toMatch(/Edit group/);
-    expect(container.textContent).toContain("alpha");
-  });
-
-  it("clicking Save persists the trimmed value then closes", async () => {
-    const onSave = vi.fn().mockResolvedValue(true);
-    const onClose = vi.fn();
-    const { input, saveBtn } = setup({ currentGroup: "", onSave, onClose });
-    fireEvent.change(input, { target: { value: "  work/api  " } });
-    fireEvent.click(saveBtn);
-    expect(onSave).toHaveBeenCalledTimes(1);
-    expect(onSave).toHaveBeenCalledWith("work/api");
+  it.each([
+    ["Save click", "", "  work/api  ", "work/api", "click"],
+    ["Enter", "old", "new", "new", "enter"],
+    ["blank value ungroups", "work", "   ", "", "click"],
+  ])("%s saves the trimmed value then closes", async (_name, current, typed, saved, via) => {
+    const { input, saveBtn, onSave, onClose } = setup(current);
+    fireEvent.change(input, { target: { value: typed } });
+    if (via === "enter") fireEvent.keyDown(input, { key: "Enter" });
+    else fireEvent.click(saveBtn);
+    expect(onSave).toHaveBeenCalledWith(saved);
     await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
   });
 
-  it("pressing Enter in the input saves", async () => {
-    const onSave = vi.fn().mockResolvedValue(true);
-    const onClose = vi.fn();
-    const { input } = setup({ currentGroup: "old", onSave, onClose });
-    fireEvent.change(input, { target: { value: "new" } });
-    fireEvent.keyDown(input, { key: "Enter" });
-    expect(onSave).toHaveBeenCalledWith("new");
-    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
-  });
-
-  it("an empty (trimmed) value ungroups by sending an empty string", async () => {
-    const onSave = vi.fn().mockResolvedValue(true);
-    const { input, saveBtn } = setup({ currentGroup: "work", onSave });
-    fireEvent.change(input, { target: { value: "   " } });
-    fireEvent.click(saveBtn);
-    expect(onSave).toHaveBeenCalledWith("");
-    await Promise.resolve();
-  });
-
-  it("an unchanged value closes without calling onSave", () => {
-    const onSave = vi.fn().mockResolvedValue(true);
-    const onClose = vi.fn();
-    const { saveBtn } = setup({ currentGroup: "work", onSave, onClose });
+  it.each(["work", "  work  "])("closes without saving when the value %j is unchanged", (typed) => {
+    const { input, saveBtn, onSave, onClose } = setup("work");
+    fireEvent.change(input, { target: { value: typed } });
     fireEvent.click(saveBtn);
     expect(onSave).not.toHaveBeenCalled();
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
-  it("a value that only differs by surrounding whitespace is treated as unchanged", () => {
-    const onSave = vi.fn().mockResolvedValue(true);
-    const onClose = vi.fn();
-    const { input, saveBtn } = setup({ currentGroup: "work", onSave, onClose });
-    fireEvent.change(input, { target: { value: "  work  " } });
+  it.each([
+    ["", "work", "Failed to update group."],
+    ["work", "", "Failed to clear group."],
+  ])("from %j to %j a failed save shows %j and stays open", async (current, typed, message) => {
+    const { input, saveBtn, onClose } = setup(current, vi.fn().mockResolvedValue(false));
+    fireEvent.change(input, { target: { value: typed } });
     fireEvent.click(saveBtn);
-    expect(onSave).not.toHaveBeenCalled();
-    expect(onClose).toHaveBeenCalledTimes(1);
-  });
-
-  it("surfaces an update error and keeps the modal open when onSave returns false", async () => {
-    const onSave = vi.fn().mockResolvedValue(false);
-    const onClose = vi.fn();
-    const { input, saveBtn, container } = setup({ currentGroup: "", onSave, onClose });
-    fireEvent.change(input, { target: { value: "work" } });
-    fireEvent.click(saveBtn);
-    await waitFor(() =>
-      expect(container.querySelector('[data-testid="session-group-modal-error"]')?.textContent).toBe(
-        "Failed to update group.",
-      ),
-    );
+    await waitFor(() => expect(errorText()).toBe(message));
     expect(onClose).not.toHaveBeenCalled();
-    // Controls re-enabled and focus returned to the input for a retry.
     expect(saveBtn.disabled).toBe(false);
     expect(document.activeElement).toBe(input);
+    fireEvent.change(input, { target: { value: "again" } });
+    expect(errorText()).toBeUndefined();
   });
 
-  it("surfaces a clear error when ungrouping fails", async () => {
-    const onSave = vi.fn().mockResolvedValue(false);
-    const { input, saveBtn, container } = setup({ currentGroup: "work", onSave });
-    fireEvent.change(input, { target: { value: "" } });
-    fireEvent.click(saveBtn);
-    await waitFor(() =>
-      expect(container.querySelector('[data-testid="session-group-modal-error"]')?.textContent).toBe(
-        "Failed to clear group.",
-      ),
-    );
-  });
-
-  it("editing the input clears a previously shown error", async () => {
-    const onSave = vi.fn().mockResolvedValue(false);
-    const { input, saveBtn, container } = setup({ currentGroup: "", onSave });
+  it("disables controls and ignores repeat saves while one is in flight", async () => {
+    const { onSave, resolve } = pending();
+    const { input, saveBtn, cancelBtn, onClose } = setup("", onSave);
     fireEvent.change(input, { target: { value: "work" } });
-    fireEvent.click(saveBtn);
-    await waitFor(() => expect(container.querySelector('[data-testid="session-group-modal-error"]')).toBeTruthy());
-    fireEvent.change(input, { target: { value: "work2" } });
-    expect(container.querySelector('[data-testid="session-group-modal-error"]')).toBeNull();
-  });
-
-  it("disables both buttons while a save is in flight", async () => {
-    let resolveSave: ((ok: boolean) => void) | null = null;
-    const onSave = vi.fn(() => new Promise<boolean>((resolve) => (resolveSave = resolve)));
-    const { input, saveBtn, cancelBtn, onClose } = setup({ currentGroup: "", onSave });
-    fireEvent.change(input, { target: { value: "work" } });
-    fireEvent.click(saveBtn);
+    fireEvent.keyDown(input, { key: "Enter" });
     await Promise.resolve();
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onSave).toHaveBeenCalledTimes(1);
     expect(saveBtn.disabled).toBe(true);
     expect(cancelBtn.disabled).toBe(true);
     expect(saveBtn.textContent).toContain("Saving...");
-    resolveSave?.(true);
-    // Let the post-resolution state settle (modal closes on success) so the
-    // update doesn't land outside the test window and flake.
+    resolve(true);
     await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
   });
 
-  it("does not fire a second save while one is in flight", async () => {
-    let resolveSave: ((ok: boolean) => void) | null = null;
-    const onSave = vi.fn(() => new Promise<boolean>((resolve) => (resolveSave = resolve)));
-    const { input, onClose } = setup({ currentGroup: "", onSave });
-    fireEvent.change(input, { target: { value: "work" } });
-    fireEvent.keyDown(input, { key: "Enter" });
-    await Promise.resolve();
-    fireEvent.keyDown(input, { key: "Enter" });
-    expect(onSave).toHaveBeenCalledTimes(1);
-    resolveSave?.(true);
-    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
-  });
-
-  it("Cancel button closes without saving", () => {
-    const onSave = vi.fn().mockResolvedValue(true);
-    const onClose = vi.fn();
-    const { cancelBtn } = setup({ onSave, onClose });
+  it("closes without saving via Cancel, Escape, and the backdrop but not the panel", () => {
+    const { cancelBtn, input, onClose, onSave } = setup();
     fireEvent.click(cancelBtn);
-    expect(onClose).toHaveBeenCalledTimes(1);
+    fireEvent.keyDown(input, { key: "Escape" });
+    const backdrop = screen.getByTestId("session-group-modal");
+    fireEvent.click(backdrop.firstElementChild!);
+    expect(onClose).toHaveBeenCalledTimes(2);
+    fireEvent.click(backdrop);
+    expect(onClose).toHaveBeenCalledTimes(3);
     expect(onSave).not.toHaveBeenCalled();
   });
 
-  it("Escape in the input closes the modal", () => {
-    const onClose = vi.fn();
-    const { input } = setup({ onClose });
-    fireEvent.keyDown(input, { key: "Escape" });
-    expect(onClose).toHaveBeenCalledTimes(1);
-  });
-
-  it("clicking the backdrop closes, clicking the panel does not", () => {
-    const onClose = vi.fn();
-    const { container } = setup({ onClose });
-    const backdrop = container.querySelector('[data-testid="session-group-modal"]') as HTMLElement;
-    const panel = backdrop.querySelector("div") as HTMLElement;
-    fireEvent.click(panel);
-    expect(onClose).not.toHaveBeenCalled();
-    fireEvent.click(backdrop);
-    expect(onClose).toHaveBeenCalledTimes(1);
-  });
-
-  it("restores focus to the previously focused element on unmount", () => {
-    const trigger = document.createElement("button");
-    document.body.appendChild(trigger);
-    trigger.focus();
-    expect(document.activeElement).toBe(trigger);
-    const { unmount } = setup();
-    expect(document.activeElement).not.toBe(trigger);
-    unmount();
-    expect(document.activeElement).toBe(trigger);
-    trigger.remove();
+  it("restores focus on unmount", () => {
+    expectRestoresFocus(() => setup().unmount);
   });
 });

@@ -287,6 +287,8 @@ fn test_attach_uses_terminal_backend() {
 fn test_attach_applies_attached_status_snapshot_after_reload() {
     let source = std::fs::read_to_string("src/tui/app.rs").expect("Failed to read app.rs");
 
+    // Every attach path hands its hook snapshot to one settle helper, which
+    // owns the reload-then-apply order.
     for attach_method in [
         "attach_live_session",
         "attach_terminal",
@@ -297,11 +299,14 @@ fn test_attach_applies_attached_status_snapshot_after_reload() {
             attach_body,
             &[
                 "attached_status_updates",
-                "self.home.reload()?",
-                "apply_status_updates_without_hooks(attached_status_updates)",
+                "self.settle_after_attach(attached_status_updates)?",
             ],
         );
     }
+    assert_contains_in_order(
+        app_method_body(&source, "settle_after_attach"),
+        &["self.home.reload()?", "apply_status_updates_without_hooks("],
+    );
 }
 
 #[test]

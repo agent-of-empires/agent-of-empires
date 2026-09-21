@@ -1,5 +1,4 @@
 //! `aoe plugin`: plugin management (list, info, enable, disable, install,
-//! update, uninstall).
 
 use anyhow::Result;
 use clap::Subcommand;
@@ -154,10 +153,6 @@ fn run_info(id: &str) -> Result<()> {
     if !m.keybinds.is_empty() {
         println!("  keybinds:");
         for kb in &m.keybinds {
-            // A core binding on the same chord always wins; flag the conflict so
-            // the author knows the plugin keybind will never fire (#2094).
-            // An unparseable key is skipped by the TUI resolver, so flag it
-            // here rather than print it as if it were usable.
             let note = match crate::tui::home::bindings::parse_chord(&kb.key) {
                 Some(c) if crate::tui::home::bindings::core_shadows(&c) => "  (shadowed by core)",
                 Some(_) => "",
@@ -192,9 +187,6 @@ fn format_report(report: &crate::plugin::install::InstallReport, verb: &str) -> 
     } else {
         out.push_str(&report.capabilities.join(", "));
     }
-    // Surface inactivity whenever the grant did not cover the install, including
-    // the empty-capabilities case (declining a UI-only manifest change leaves a
-    // plugin ungranted with no capabilities to list).
     if !report.granted {
         out.push_str(" (not granted, plugin inactive)");
     } else if !report.capabilities.is_empty() {
@@ -285,49 +277,36 @@ mod tests {
     use crate::plugin::registry::ValidationState;
 
     #[test]
-    fn report_shows_validation_line() {
-        let report = InstallReport {
-            id: "acme.foo".into(),
-            version: "1.2.3".into(),
-            capabilities: vec!["session.read".into(), "filesystem.read".into()],
-            granted: true,
-            validation: ValidationState::Community,
-        };
-        let out = format_report(&report, "Installed");
+    fn format_report_surfaces_validation_and_grant_state() {
+        let report =
+            |version: &str, capabilities: Vec<String>, granted, validation| InstallReport {
+                id: "acme.foo".into(),
+                version: version.into(),
+                capabilities,
+                granted,
+                validation,
+            };
+
+        let granted = report(
+            "1.2.3",
+            vec!["session.read".into(), "filesystem.read".into()],
+            true,
+            ValidationState::Community,
+        );
         assert_eq!(
-            out,
+            format_report(&granted, "Installed"),
             "Installed acme.foo 1.2.3.\n  validation: community\n  capabilities: session.read, filesystem.read (granted)"
         );
-    }
 
-    #[test]
-    fn local_install_validation_labelled_local() {
-        let report = InstallReport {
-            id: "acme.foo".into(),
-            version: "0.1.0".into(),
-            capabilities: vec![],
-            granted: true,
-            validation: ValidationState::Local,
-        };
-        let out = format_report(&report, "Installed");
+        let local = report("0.1.0", vec![], true, ValidationState::Local);
+        let out = format_report(&local, "Installed");
         assert!(
             out.contains("\n  validation: local\n"),
-            "local install surfaces its validation: {out:?}"
+            "a local install surfaces its validation: {out:?}"
         );
-    }
 
-    #[test]
-    fn inactive_with_no_capabilities_still_warns() {
-        // An ungranted update with no capabilities (e.g. a declined UI-only
-        // manifest change) must still flag that the plugin is inactive.
-        let report = InstallReport {
-            id: "acme.foo".into(),
-            version: "0.1.0".into(),
-            capabilities: vec![],
-            granted: false,
-            validation: ValidationState::Community,
-        };
-        let out = format_report(&report, "Updated");
+        let inactive = report("0.1.0", vec![], false, ValidationState::Community);
+        let out = format_report(&inactive, "Updated");
         assert!(
             out.ends_with("  capabilities: none (not granted, plugin inactive)"),
             "inactivity is surfaced with no capabilities: {out:?}"

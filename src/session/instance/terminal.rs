@@ -3,22 +3,6 @@
 use super::*;
 
 /// Command run inside the sandbox container for the web Container terminal tab.
-///
-/// Resolves the container user's preferred shell at spawn time, inside the
-/// container. Known-compatible shells run in login mode so profile/rc files
-/// load; other authorized shells run plain.
-/// Resolution order: the passwd entry, `$SHELL`, bash, then sh. Each candidate
-/// is resolved and validated inside the container as a regular executable
-/// authorized shell. Passwd is read directly when `getent` is unavailable.
-///
-/// The script is evaluated by the container's `/bin/sh`, not the host shell tmux
-/// uses to spawn the session, so the embedded `$()` runs in the container. The
-/// host does not propagate its own `$SHELL` into the container, so this reads the
-/// container's value, not the host's.
-///
-/// `@KNOWN_SHELLS@` and `@LOGIN_FLAG_SHELLS@` are substituted from
-/// [`crate::session::environment`] so the container tab recognizes the same
-/// shells, and makes the same login-mode call, as the host tab.
 const CONTAINER_TERMINAL_AUTODETECT_SCRIPT: &str = r#"passwd_file=$1
 shells_file=$2
 
@@ -133,9 +117,8 @@ impl Instance {
         self.terminal_tmux_session_indexed(0)
     }
 
-    /// Paired host terminal at `index`. Index 0 is the historical single
-    /// terminal (the only one the TUI uses); index >= 1 are the additional
-    /// web dashboard terminal tabs (#2437).
+    /// Paired host terminal at `index`. Index 0 is the historical single terminal (the only one the
+    /// TUI uses).
     pub fn terminal_tmux_session_indexed(&self, index: u32) -> Result<tmux::TerminalSession> {
         tmux::TerminalSession::new_indexed(&self.id, &self.title, index)
     }
@@ -145,10 +128,6 @@ impl Instance {
             .as_ref()
             .map(|t| t.created)
             .unwrap_or(false)
-    }
-
-    pub fn start_terminal(&mut self) -> Result<()> {
-        self.start_terminal_with_size(None)
     }
 
     pub fn start_terminal_with_size(&mut self, size: Option<(u16, u16)>) -> Result<()> {
@@ -169,9 +148,7 @@ impl Instance {
             self.apply_terminal_tmux_options(index);
         }
 
-        // The persisted `terminal_info` cache is the index-0 fast path the TUI
-        // reads; additional terminals (index >= 1) are tracked by the web
-        // dashboard and queried straight from tmux, like container terminals.
+        // The persisted `terminal_info` cache is the index-0 fast path the TUI reads.
         if index == 0 {
             self.terminal_info = Some(TerminalInfo { created: true });
         }
@@ -191,14 +168,8 @@ impl Instance {
         Ok(())
     }
 
-    /// Kill the paired terminal tmux session if its pane is dead (shell
-    /// exited while `remain-on-exit on` kept the session as a tombstone).
-    /// Returns true if a kill happened so the caller knows to re-spawn.
-    /// A missing session or a live pane both return Ok(false).
-    pub fn kill_terminal_if_dead(&self) -> Result<bool> {
-        self.kill_terminal_if_dead_indexed(0)
-    }
-
+    /// Kill the paired terminal tmux session if its pane is dead (the shell exited while
+    /// `remain-on-exit on` kept the session as a tombstone).
     pub fn kill_terminal_if_dead_indexed(&self, index: u32) -> Result<bool> {
         let session = self.terminal_tmux_session_indexed(index)?;
         if session.exists() && session.is_pane_dead() {
@@ -307,11 +278,7 @@ impl Instance {
         Ok(())
     }
 
-    /// Container counterpart of [`Self::kill_terminal_if_dead`].
-    pub fn kill_container_terminal_if_dead(&self) -> Result<bool> {
-        self.kill_container_terminal_if_dead_indexed(0)
-    }
-
+    /// Container counterpart of [`Self::kill_terminal_if_dead_indexed`].
     pub fn kill_container_terminal_if_dead_indexed(&self, index: u32) -> Result<bool> {
         let session = self.container_terminal_tmux_session_indexed(index)?;
         if session.exists() && session.is_pane_dead() {
@@ -328,9 +295,8 @@ mod tests {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
-    /// Writes from a child `sh` so this binary never holds the writable
-    /// descriptor: a concurrent spawn forking inside that window would make
-    /// the later execve fail with ETXTBSY (#3861).
+    /// Writes from a child `sh` so this binary never holds the writable descriptor: a concurrent
+    /// spawn forking inside that window would make the later execve fail with ETXTBSY.
     fn write_executable(path: &std::path::Path, contents: &str) {
         let status = Command::new("/bin/sh")
             .args(["-c", r#"printf %s "$1" > "$2" && chmod 755 "$2""#, "sh"])
@@ -579,30 +545,13 @@ exec /usr/bin/env -i PATH="$TARGET_PATH" SHELL="$FALLBACK_SHELL" "$@"
     }
 
     #[test]
-    fn test_has_terminal_false_by_default() {
-        let inst = Instance::new("test", "/tmp/test");
-        assert!(!inst.has_terminal());
-    }
-
-    #[test]
-    fn test_has_terminal_true_when_created() {
+    fn has_terminal_requires_a_created_terminal() {
         let mut inst = Instance::new("test", "/tmp/test");
+        assert!(!inst.has_terminal(), "no terminal_info");
+        inst.terminal_info = Some(TerminalInfo { created: false });
+        assert!(!inst.has_terminal(), "terminal never created");
         inst.terminal_info = Some(TerminalInfo { created: true });
         assert!(inst.has_terminal());
-    }
-
-    #[test]
-    fn test_terminal_info_none_means_no_terminal() {
-        let inst = Instance::new("test", "/tmp/test");
-        assert!(inst.terminal_info.is_none());
-        assert!(!inst.has_terminal());
-    }
-
-    #[test]
-    fn test_terminal_info_created_false_means_no_terminal() {
-        let mut inst = Instance::new("test", "/tmp/test");
-        inst.terminal_info = Some(TerminalInfo { created: false });
-        assert!(!inst.has_terminal());
     }
 
     mod kill_terminal_if_dead {
@@ -616,10 +565,8 @@ exec /usr/bin/env -i PATH="$TARGET_PATH" SHELL="$FALLBACK_SHELL" "$@"
                 .unwrap_or(false)
         }
 
-        /// Manually create a tmux session under `name` with `remain-on-exit on`
-        /// so the session survives the inner command's exit. Used to simulate
-        /// the dead-pane state without going through `start_terminal`, which
-        /// would also apply unrelated tmux options.
+        /// Manually create a tmux session under `name` with `remain-on-exit on` so the session
+        /// survives the inner command's exit.
         fn spawn_remain_on_exit(name: &str, cmd: &str) {
             let output = crate::tmux::tmux_command()
                 .args([
@@ -650,94 +597,54 @@ exec /usr/bin/env -i PATH="$TARGET_PATH" SHELL="$FALLBACK_SHELL" "$@"
             crate::tmux::refresh_session_cache();
         }
 
-        fn cleanup(name: &str) {
-            let _ = crate::tmux::tmux_command()
-                .args(["kill-session", "-t", name])
-                .output();
-            crate::tmux::refresh_session_cache();
-        }
-
         #[test]
         #[serial_test::serial]
-        fn returns_false_when_no_session() {
-            if !tmux_available() {
-                eprintln!("Skipping: tmux not available");
-                return;
-            }
-            let inst = Instance::new("ktid_missing", "/tmp");
-            crate::tmux::refresh_session_cache();
-            assert!(!inst.kill_terminal_if_dead().unwrap());
-        }
-
-        #[test]
-        #[serial_test::serial]
-        fn returns_false_when_pane_alive() {
-            if !tmux_available() {
-                eprintln!("Skipping: tmux not available");
-                return;
-            }
-            let inst = Instance::new("ktid_alive", "/tmp");
-            let name = crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title);
-            let _guard = crate::tmux::test_helpers::TmuxTestSession::from_name(name.clone());
-            spawn_remain_on_exit(&name, "sleep 30");
-            let pane = crate::tmux::test_helpers::only_pane_id(&name);
-            let session = inst.terminal_tmux_session().unwrap();
-            assert!(session.exists());
-            assert!(!session.is_pane_dead());
-
-            assert!(
-                !inst.kill_terminal_if_dead().unwrap(),
-                "live pane should not trigger a kill"
-            );
-            assert_eq!(crate::tmux::test_helpers::only_pane_id(&name), pane);
-            assert!(session.exists());
-            assert!(!session.is_pane_dead());
-        }
-
-        #[test]
-        #[serial_test::serial]
-        fn kills_dead_pane_session() {
+        fn only_a_dead_terminal_pane_is_killed() {
             use crate::tmux::test_helpers::{only_pane_id, wait_for_pane_dead, TmuxTestSession};
 
             if !tmux_available() {
                 eprintln!("Skipping: tmux not available");
                 return;
             }
-            let inst = Instance::new("ktid_dead", "/tmp");
-            let name = crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title);
-            let _guard = TmuxTestSession::from_name(name.clone());
-            // `true` exits immediately; remain-on-exit keeps the session alive
-            // with a dead pane (matches the production failure mode: shell
-            // exited via Ctrl+D / `exit` / SIGHUP, session still listed).
-            spawn_remain_on_exit(&name, "true");
-            wait_for_pane_dead(&only_pane_id(&name));
 
-            let session = inst.terminal_tmux_session().unwrap();
+            let missing = Instance::new("ktid_missing", "/tmp");
+            crate::tmux::refresh_session_cache();
             assert!(
-                session.exists(),
-                "session should still exist via remain-on-exit"
-            );
-            assert!(
-                session.is_pane_dead(),
-                "pane should be dead after `true` exits"
+                !missing.kill_terminal_if_dead_indexed(0).unwrap(),
+                "no session"
             );
 
-            let killed = inst.kill_terminal_if_dead().unwrap();
+            let alive = Instance::new("ktid_alive", "/tmp");
+            let alive_name = crate::tmux::TerminalSession::generate_name(&alive.id, &alive.title);
+            let _alive = TmuxTestSession::from_name(alive_name.clone());
+            spawn_remain_on_exit(&alive_name, "sleep 30");
+            let pane = only_pane_id(&alive_name);
             assert!(
-                killed,
-                "kill_terminal_if_dead should return true for dead pane"
+                !alive.kill_terminal_if_dead_indexed(0).unwrap(),
+                "live pane"
             );
+            assert_eq!(only_pane_id(&alive_name), pane, "live pane survives");
+            let session = alive.terminal_tmux_session().unwrap();
+            assert!(session.exists() && !session.is_pane_dead());
 
-            let session = inst.terminal_tmux_session().unwrap();
-            assert!(!session.exists(), "session should be gone after kill");
+            let dead = Instance::new("ktid_dead", "/tmp");
+            let dead_name = crate::tmux::TerminalSession::generate_name(&dead.id, &dead.title);
+            let _dead = TmuxTestSession::from_name(dead_name.clone());
+            // `true` exits immediately; remain-on-exit keeps the session.
+            spawn_remain_on_exit(&dead_name, "true");
+            wait_for_pane_dead(&only_pane_id(&dead_name));
+            let session = dead.terminal_tmux_session().unwrap();
+            assert!(session.exists() && session.is_pane_dead());
 
-            // Idempotent: second call on now-missing session returns false.
             assert!(
-                !inst.kill_terminal_if_dead().unwrap(),
-                "second call on missing session should return false"
+                dead.kill_terminal_if_dead_indexed(0).unwrap(),
+                "dead pane is killed"
             );
-
-            cleanup(&name);
+            assert!(!dead.terminal_tmux_session().unwrap().exists());
+            assert!(
+                !dead.kill_terminal_if_dead_indexed(0).unwrap(),
+                "second call on a missing session"
+            );
         }
     }
 }

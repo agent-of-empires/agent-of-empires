@@ -329,183 +329,282 @@ mod tests {
         serde_json::from_value(overrides).expect("profile override deserializes")
     }
 
+    /// The value shapes each `validate` helper accepts. `host` and the
+    /// namespace-sharing network forms share another stack's network, and a
+    /// memory limit without a unit suffix would be read as bytes by Docker.
     #[test]
-    fn validate_network_accepts_empty_none_bridge_and_named() {
-        assert!(validate_network_format("").is_ok());
-        assert!(validate_network_format("none").is_ok());
-        assert!(validate_network_format("bridge").is_ok());
-        assert!(validate_network_format("egress-proxy").is_ok());
-        assert!(validate_network_format("my_net.1").is_ok());
+    fn profile_field_validators_accept_and_reject() {
+        for value in ["", "none", "bridge", "egress-proxy", "my_net.1"] {
+            assert!(validate_network_format(value).is_ok(), "{value}");
+        }
+        for value in [
+            "host",
+            "HOST",
+            "container:abc",
+            "ns:/var/run/netns/x",
+            "has space",
+        ] {
+            assert!(validate_network_format(value).is_err(), "{value}");
+        }
+
+        for value in ["/host:/container", "/host:/container:ro"] {
+            assert!(validate_volume_format(value).is_ok(), "{value}");
+        }
+        for value in ["", "/only-one", ":/container", "/host:"] {
+            assert!(validate_volume_format(value).is_err(), "{value}");
+        }
+
+        for value in ["", "512m", "2g", "8G"] {
+            assert!(validate_memory_limit(value).is_ok(), "{value}");
+        }
+        for value in ["1024", "12", "invalid", "512mb"] {
+            assert!(validate_memory_limit(value).is_err(), "{value}");
+        }
+
+        assert!(validate_check_interval(1).is_ok());
+        assert!(validate_check_interval(24).is_ok());
+        assert!(validate_check_interval(0).is_err());
     }
 
+    /// A profile is a sparse overlay: an empty one serializes to nothing, and
+    /// what it carries survives a TOML round trip under its own keys.
     #[test]
-    fn validate_network_rejects_host_and_namespace_forms() {
-        assert!(validate_network_format("host").is_err());
-        assert!(validate_network_format("HOST").is_err());
-        assert!(validate_network_format("container:abc").is_err());
-        assert!(validate_network_format("ns:/var/run/netns/x").is_err());
-        assert!(validate_network_format("has space").is_err());
-    }
+    fn profile_config_round_trips_its_sparse_overrides() {
+        let empty = ProfileConfig::default();
+        assert!(empty.description.is_none());
+        assert!(empty.overrides.is_empty());
+        assert!(toml::to_string(&empty).unwrap().trim().is_empty());
 
-    #[test]
-    fn test_profile_config_default() {
-        let config = ProfileConfig::default();
-        assert!(config.description.is_none());
-        assert!(config.overrides.is_empty());
-    }
+        let config: ProfileConfig = toml::from_str(
+            r#"
+            description = "Read-only review profile"
+            environment = ["CLAUDE_CONFIG_DIR=/home/me/.claude-accounts/work", "GH_TOKEN"]
 
-    #[test]
-    fn test_profile_config_serialization_empty() {
-        let config = ProfileConfig::default();
-        let serialized = toml::to_string(&config).unwrap();
-        // Empty config should serialize to empty (skip_serializing_if + empty map).
-        assert!(serialized.trim().is_empty());
-    }
-
-    #[test]
-    fn test_profile_config_serialization_partial() {
-        let config = profile_from(json!({"updates": {"update_check_mode": "off"}}));
-        let serialized = toml::to_string_pretty(&config).unwrap();
-        assert!(serialized.contains("[updates]"));
-        assert!(serialized.contains("update_check_mode = \"off\""));
-    }
-
-    #[test]
-    fn test_profile_config_deserialization() {
-        let toml = r#"
             [updates]
             update_check_mode = "off"
 
             [sandbox]
             enabled_by_default = true
-        "#;
+            volume_ignores = ["target", ".venv"]
 
-        let config: ProfileConfig = toml::from_str(toml).unwrap();
-        let ov = serde_json::to_value(&config).unwrap();
-        assert_eq!(ov["updates"]["update_check_mode"], json!("off"));
-        assert_eq!(ov["sandbox"]["enabled_by_default"], json!(true));
-    }
-
-    #[test]
-    fn test_merge_configs_no_overrides() {
-        let global = Config::default();
-        let profile = ProfileConfig::default();
-        let merged = merge_configs(global.clone(), &profile);
-
+            [tmux]
+            mouse = "enabled"
+            "#,
+        )
+        .unwrap();
         assert_eq!(
-            merged.updates.update_check_mode,
-            global.updates.update_check_mode
+            config.description.as_deref(),
+            Some("Read-only review profile")
         );
-        assert_eq!(merged.worktree.enabled, global.worktree.enabled);
+
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        assert!(serialized.contains("Read-only review profile"));
+        assert!(serialized.contains("[updates]"));
+        assert!(serialized.contains(r#"update_check_mode = "off""#));
+        assert!(serialized.contains(r#"mouse = "enabled""#));
+        assert!(serialized.contains("CLAUDE_CONFIG_DIR=/home/me/.claude-accounts/work"));
+        assert!(serialized.contains("GH_TOKEN"));
+
+        let reparsed: ProfileConfig = toml::from_str(&serialized).unwrap();
+        let overrides = serde_json::to_value(&reparsed).unwrap();
+        assert_eq!(overrides["updates"]["update_check_mode"], json!("off"));
+        assert_eq!(overrides["sandbox"]["enabled_by_default"], json!(true));
+        assert_eq!(
+            overrides["sandbox"]["volume_ignores"],
+            json!(["target", ".venv"])
+        );
+        assert_eq!(overrides["tmux"]["mouse"], json!("enabled"));
     }
 
+    /// A plain string stands in for a one-element list wherever the target type
+    /// has a `string_or_vec` deserializer; the coercion happens on merge.
     #[test]
-    fn test_merge_configs_with_overrides() {
+    fn profile_string_shorthand_coerces_to_a_one_element_list() {
+        let config: ProfileConfig = toml::from_str(
+            r#"
+            environment = "FOO=bar"
+
+            [sandbox]
+            environment = "ANTHROPIC_API_KEY"
+            extra_volumes = "/data:/data:ro"
+            volume_ignores = "node_modules"
+            port_mappings = "3000:3000"
+
+            [hooks]
+            on_create = "npm install"
+            on_launch = "npm start"
+            "#,
+        )
+        .unwrap();
+
+        let merged = merge_configs(Config::default(), &config);
+        assert_eq!(merged.environment, vec!["FOO=bar"]);
+        assert_eq!(merged.sandbox.environment, vec!["ANTHROPIC_API_KEY"]);
+        assert_eq!(merged.sandbox.extra_volumes, vec!["/data:/data:ro"]);
+        assert_eq!(merged.sandbox.volume_ignores, vec!["node_modules"]);
+        assert_eq!(merged.sandbox.port_mappings, vec!["3000:3000"]);
+        assert_eq!(merged.hooks.on_create, vec!["npm install"]);
+        assert_eq!(merged.hooks.on_launch, vec!["npm start"]);
+    }
+
+    /// Anything a profile carries counts as an override, including the two
+    /// fields that live outside the sparse map.
+    #[test]
+    fn profile_has_overrides_covers_description_and_environment() {
+        assert!(!profile_has_overrides(&ProfileConfig::default()));
+        for block in [
+            json!({"theme": {"name": "dark"}}),
+            json!({"environment": ["FOO=bar"]}),
+        ] {
+            assert!(profile_has_overrides(&profile_from(block)));
+        }
+        let profile = ProfileConfig {
+            description: Some("My profile".to_string()),
+            ..Default::default()
+        };
+        assert!(profile_has_overrides(&profile));
+    }
+
+    /// The sparse overlay replaces the keys a profile names and leaves every
+    /// other key at its global value. `Vec` fields replace rather than extend,
+    /// matching `sandbox.environment`; a per-agent `status_map` merges by key.
+    #[test]
+    fn merge_configs_overrides_named_keys_and_inherits_the_rest() {
         use crate::session::config::UpdateCheckMode;
-        let global = Config::default();
-        let profile = profile_from(json!({
-            "updates": {"update_check_mode": "off"},
-            "worktree": {"enabled": true},
-        }));
+        type Case = (fn(&mut Config), serde_json::Value, fn(&Config));
+        let cases: Vec<Case> = vec![
+            // Nothing overridden.
+            (
+                |_| {},
+                json!({}),
+                |merged| {
+                    assert_eq!(merged.updates.update_check_mode, UpdateCheckMode::Notify);
+                    assert!(!merged.worktree.enabled);
+                },
+            ),
+            // Scalars across sections; a sibling key keeps its global value.
+            (
+                |_| {},
+                json!({"updates": {"update_check_mode": "off"}, "worktree": {"enabled": true}}),
+                |merged| {
+                    assert_eq!(merged.updates.update_check_mode, UpdateCheckMode::Off);
+                    assert!(merged.worktree.enabled);
+                    assert!(!merged.updates.auto_update_plugins);
+                },
+            ),
+            (
+                |global| {
+                    global.status_hooks.enabled = false;
+                    global.status_hooks.on_waiting = Some("global-waiting".to_string());
+                    global.status_hooks.on_idle = Some("global-idle".to_string());
+                },
+                json!({"status_hooks": {"enabled": true, "on_waiting": "profile-waiting"}}),
+                |merged| {
+                    assert!(merged.status_hooks.enabled);
+                    assert_eq!(
+                        merged.status_hooks.on_waiting.as_deref(),
+                        Some("profile-waiting")
+                    );
+                    assert_eq!(merged.status_hooks.on_idle.as_deref(), Some("global-idle"));
+                },
+            ),
+            (
+                |global| {
+                    let map = &mut global
+                        .agents
+                        .entry("claude".to_string())
+                        .or_default()
+                        .status_map;
+                    map.insert("Stop".to_string(), crate::agents::HookStatus::Idle);
+                    map.insert("PreToolUse".to_string(), crate::agents::HookStatus::Running);
+                },
+                json!({"agents": {"claude": {"status_map": {"Stop": "error"}}}}),
+                |merged| {
+                    let map = &merged.agents["claude"].status_map;
+                    assert_eq!(map.get("Stop"), Some(&crate::agents::HookStatus::Error));
+                    assert_eq!(
+                        map.get("PreToolUse"),
+                        Some(&crate::agents::HookStatus::Running)
+                    );
+                },
+            ),
+            (
+                |global| global.theme.name = "catppuccin-latte".to_string(),
+                json!({"theme": {"name": "tokyo-night"}}),
+                |merged| assert_eq!(merged.theme.name, "tokyo-night"),
+            ),
+            (
+                |global| global.theme.name = "catppuccin-latte".to_string(),
+                json!({}),
+                |merged| assert_eq!(merged.theme.name, "catppuccin-latte"),
+            ),
+            // The sandbox lists replace wholesale.
+            (
+                |global| {
+                    global.sandbox.volume_ignores = vec!["stale".to_string()];
+                    global.sandbox.extra_volumes = vec!["/from-global:/g".to_string()];
+                    global.sandbox.port_mappings = vec!["3000:3000".to_string()];
+                },
+                json!({"sandbox": {
+                    "volume_ignores": ["target", "node_modules"],
+                    "extra_volumes": ["/from-profile:/p"],
+                    "port_mappings": ["8080:8080", "9090:9090"],
+                }}),
+                |merged| {
+                    assert_eq!(
+                        merged.sandbox.volume_ignores,
+                        vec!["target", "node_modules"]
+                    );
+                    assert_eq!(merged.sandbox.extra_volumes, vec!["/from-profile:/p"]);
+                    assert_eq!(merged.sandbox.port_mappings, vec!["8080:8080", "9090:9090"]);
+                },
+            ),
+            // Naming one sandbox key leaves the others at their global value.
+            (
+                |global| {
+                    global.sandbox.volume_ignores = vec!["target".to_string()];
+                    global.sandbox.extra_volumes = vec!["/from-global:/g".to_string()];
+                    global.sandbox.port_mappings = vec!["3000:3000".to_string()];
+                },
+                json!({"sandbox": {"enabled_by_default": true, "cpu_limit": "2"}}),
+                |merged| {
+                    assert!(merged.sandbox.enabled_by_default);
+                    assert_eq!(merged.sandbox.volume_ignores, vec!["target"]);
+                    assert_eq!(merged.sandbox.extra_volumes, vec!["/from-global:/g"]);
+                    assert_eq!(merged.sandbox.port_mappings, vec!["3000:3000"]);
+                },
+            ),
+            (
+                |global| global.environment = vec!["FROM_GLOBAL=1".to_string()],
+                json!({"environment": ["FROM_PROFILE=2"]}),
+                |merged| assert_eq!(merged.environment, vec!["FROM_PROFILE=2".to_string()]),
+            ),
+            (
+                |global| global.environment = vec!["FROM_GLOBAL=1".to_string()],
+                json!({}),
+                |merged| assert_eq!(merged.environment, vec!["FROM_GLOBAL=1".to_string()]),
+            ),
+            (
+                |global| {
+                    global.acp.default_agent = "from-global".to_string();
+                    global.acp.max_concurrent_workers = 7;
+                },
+                json!({"acp": {"replay_events": 42, "node_path": "/opt/node"}}),
+                |merged| {
+                    assert_eq!(merged.acp.replay_events, 42);
+                    assert_eq!(merged.acp.node_path, "/opt/node");
+                    assert_eq!(merged.acp.default_agent, "from-global");
+                    assert_eq!(merged.acp.max_concurrent_workers, 7);
+                    assert!(merged.acp.show_tool_durations);
+                },
+            ),
+        ];
 
-        let merged = merge_configs(global, &profile);
-
-        assert_eq!(merged.updates.update_check_mode, UpdateCheckMode::Off);
-        // auto_update_plugins should retain the global default since it is
-        // not overridden.
-        assert!(!merged.updates.auto_update_plugins);
-        assert!(merged.worktree.enabled);
-    }
-
-    #[test]
-    fn test_merge_configs_with_status_hook_overrides() {
-        let mut global = Config::default();
-        global.status_hooks.enabled = false;
-        global.status_hooks.on_waiting = Some("global-waiting".to_string());
-        global.status_hooks.on_idle = Some("global-idle".to_string());
-
-        let profile = profile_from(json!({
-            "status_hooks": {"enabled": true, "on_waiting": "profile-waiting"}
-        }));
-
-        let merged = merge_configs(global, &profile);
-        assert!(merged.status_hooks.enabled);
-        assert_eq!(
-            merged.status_hooks.on_waiting.as_deref(),
-            Some("profile-waiting")
-        );
-        assert_eq!(merged.status_hooks.on_idle.as_deref(), Some("global-idle"));
-    }
-
-    #[test]
-    fn test_merge_configs_with_agent_status_map_overrides() {
-        let mut global = Config::default();
-        global
-            .agents
-            .entry("claude".to_string())
-            .or_default()
-            .status_map
-            .insert("Stop".to_string(), crate::agents::HookStatus::Idle);
-        global
-            .agents
-            .entry("claude".to_string())
-            .or_default()
-            .status_map
-            .insert("PreToolUse".to_string(), crate::agents::HookStatus::Running);
-
-        let profile = profile_from(json!({
-            "agents": {"claude": {"status_map": {"Stop": "error"}}}
-        }));
-
-        let merged = merge_configs(global, &profile);
-        let status_map = &merged.agents["claude"].status_map;
-        assert_eq!(
-            status_map.get("PreToolUse"),
-            Some(&crate::agents::HookStatus::Running)
-        );
-        assert_eq!(
-            status_map.get("Stop"),
-            Some(&crate::agents::HookStatus::Error)
-        );
-    }
-
-    #[test]
-    fn test_profile_has_overrides() {
-        let empty = ProfileConfig::default();
-        assert!(!profile_has_overrides(&empty));
-
-        let with_override = profile_from(json!({"theme": {"name": "dark"}}));
-        assert!(profile_has_overrides(&with_override));
-    }
-
-    #[test]
-    fn test_validate_volume_format() {
-        assert!(validate_volume_format("/host:/container").is_ok());
-        assert!(validate_volume_format("/host:/container:ro").is_ok());
-        assert!(validate_volume_format("").is_err());
-        assert!(validate_volume_format("/only-one").is_err());
-        assert!(validate_volume_format(":/container").is_err());
-        assert!(validate_volume_format("/host:").is_err());
-    }
-
-    #[test]
-    fn test_validate_memory_limit() {
-        assert!(validate_memory_limit("").is_ok()); // empty == no limit
-        assert!(validate_memory_limit("512m").is_ok());
-        assert!(validate_memory_limit("2g").is_ok());
-        assert!(validate_memory_limit("8G").is_ok());
-        // A unit suffix is required: a bare number (bytes to Docker) is rejected.
-        assert!(validate_memory_limit("1024").is_err());
-        assert!(validate_memory_limit("12").is_err());
-        assert!(validate_memory_limit("invalid").is_err());
-        assert!(validate_memory_limit("512mb").is_err());
-    }
-
-    #[test]
-    fn test_validate_check_interval() {
-        assert!(validate_check_interval(1).is_ok());
-        assert!(validate_check_interval(24).is_ok());
-        assert!(validate_check_interval(0).is_err());
+        for (setup, block, check) in cases {
+            let mut global = Config::default();
+            setup(&mut global);
+            check(&merge_configs(global, &profile_from(block)));
+        }
     }
 
     /// A profile's `[tmux]` block overrides per field and inherits the rest.
@@ -618,271 +717,6 @@ mod tests {
                 "{setting:?} profile"
             );
         }
-    }
-
-    #[test]
-    fn test_merge_configs_with_volume_ignores_override() {
-        let global = Config::default();
-        assert!(global.sandbox.volume_ignores.is_empty());
-
-        let profile =
-            profile_from(json!({"sandbox": {"volume_ignores": ["target", "node_modules"]}}));
-        let merged = merge_configs(global, &profile);
-        assert_eq!(
-            merged.sandbox.volume_ignores,
-            vec!["target", "node_modules"]
-        );
-    }
-
-    #[test]
-    fn test_merge_configs_volume_ignores_inherits_when_not_overridden() {
-        let mut global = Config::default();
-        global.sandbox.volume_ignores = vec!["target".to_string()];
-
-        let profile = profile_from(json!({"sandbox": {"enabled_by_default": true}}));
-        let merged = merge_configs(global, &profile);
-        assert_eq!(merged.sandbox.volume_ignores, vec!["target"]);
-        assert!(merged.sandbox.enabled_by_default);
-    }
-
-    #[test]
-    fn test_volume_ignores_override_serialization() {
-        let config = profile_from(json!({"sandbox": {"volume_ignores": ["target", ".venv"]}}));
-        let serialized = toml::to_string_pretty(&config).unwrap();
-        assert!(serialized.contains("volume_ignores"));
-
-        let deserialized: ProfileConfig = toml::from_str(&serialized).unwrap();
-        let ov = serde_json::to_value(&deserialized).unwrap();
-        assert_eq!(ov["sandbox"]["volume_ignores"], json!(["target", ".venv"]));
-    }
-
-    #[test]
-    fn test_tmux_config_override_serialization() {
-        let config = profile_from(json!({
-            "tmux": {"status_bar": "enabled", "mouse": "enabled", "clipboard": "enabled"}
-        }));
-        let serialized = toml::to_string_pretty(&config).unwrap();
-        assert!(serialized.contains("[tmux]"));
-        assert!(serialized.contains(r#"mouse = "enabled""#));
-
-        let deserialized: ProfileConfig = toml::from_str(&serialized).unwrap();
-        let ov = serde_json::to_value(&deserialized).unwrap();
-        assert_eq!(ov["tmux"]["mouse"], json!("enabled"));
-    }
-
-    #[test]
-    fn test_merge_configs_with_theme_override() {
-        let global = Config::default();
-        let profile = profile_from(json!({"theme": {"name": "tokyo-night"}}));
-        let merged = merge_configs(global, &profile);
-        assert_eq!(merged.theme.name, "tokyo-night");
-    }
-
-    #[test]
-    fn test_merge_configs_theme_inherits_when_not_overridden() {
-        let mut global = Config::default();
-        global.theme.name = "catppuccin-latte".to_string();
-
-        let profile = ProfileConfig::default();
-        let merged = merge_configs(global, &profile);
-        assert_eq!(merged.theme.name, "catppuccin-latte");
-    }
-
-    #[test]
-    fn test_sandbox_override_string_shorthand() {
-        // Regression: a single string stands in for a one-element list, coerced
-        // by the target `SandboxConfig`'s `string_or_vec` deserializer on merge.
-        let toml = r#"
-            [sandbox]
-            environment = "ANTHROPIC_API_KEY"
-            extra_volumes = "/data:/data:ro"
-            volume_ignores = "node_modules"
-            port_mappings = "3000:3000"
-        "#;
-        let config: ProfileConfig = toml::from_str(toml).unwrap();
-        let merged = merge_configs(Config::default(), &config);
-        assert_eq!(merged.sandbox.environment, vec!["ANTHROPIC_API_KEY"]);
-        assert_eq!(merged.sandbox.extra_volumes, vec!["/data:/data:ro"]);
-        assert_eq!(merged.sandbox.volume_ignores, vec!["node_modules"]);
-        assert_eq!(merged.sandbox.port_mappings, vec!["3000:3000"]);
-    }
-
-    #[test]
-    fn test_hooks_override_string_shorthand() {
-        // Regression: HooksConfig accepts a plain string, coerced on merge.
-        let toml = r#"
-            [hooks]
-            on_create = "npm install"
-            on_launch = "npm start"
-        "#;
-        let config: ProfileConfig = toml::from_str(toml).unwrap();
-        let merged = merge_configs(Config::default(), &config);
-        assert_eq!(merged.hooks.on_create, vec!["npm install"]);
-        assert_eq!(merged.hooks.on_launch, vec!["npm start"]);
-    }
-
-    #[test]
-    fn test_environment_override_round_trips() {
-        let toml_in = r#"
-            environment = ["CLAUDE_CONFIG_DIR=/home/me/.claude-accounts/work", "GH_TOKEN"]
-        "#;
-        let config: ProfileConfig = toml::from_str(toml_in).unwrap();
-        let merged = merge_configs(Config::default(), &config);
-        assert_eq!(
-            merged.environment,
-            vec![
-                "CLAUDE_CONFIG_DIR=/home/me/.claude-accounts/work".to_string(),
-                "GH_TOKEN".to_string(),
-            ]
-        );
-
-        let out = toml::to_string_pretty(&config).unwrap();
-        assert!(out.contains("CLAUDE_CONFIG_DIR=/home/me/.claude-accounts/work"));
-        assert!(out.contains("GH_TOKEN"));
-    }
-
-    #[test]
-    fn test_environment_string_shorthand_deserializes() {
-        // A single string stands in for a one-element list, coerced on merge.
-        let toml_in = r#"environment = "FOO=bar""#;
-        let config: ProfileConfig = toml::from_str(toml_in).unwrap();
-        let merged = merge_configs(Config::default(), &config);
-        assert_eq!(merged.environment, vec!["FOO=bar".to_string()]);
-    }
-
-    #[test]
-    fn test_environment_override_promotes_profile_has_overrides() {
-        let profile = ProfileConfig::default();
-        assert!(!profile_has_overrides(&profile));
-        let profile = profile_from(json!({"environment": ["FOO=bar"]}));
-        assert!(profile_has_overrides(&profile));
-    }
-
-    #[test]
-    fn test_merge_configs_replaces_global_environment() {
-        let global = Config {
-            environment: vec!["FROM_GLOBAL=1".to_string()],
-            ..Default::default()
-        };
-        let profile = profile_from(json!({"environment": ["FROM_PROFILE=2"]}));
-        let merged = merge_configs(global, &profile);
-        // Profile env replaces (matches sandbox.environment semantics).
-        assert_eq!(merged.environment, vec!["FROM_PROFILE=2".to_string()]);
-    }
-
-    #[test]
-    fn test_description_round_trips() {
-        let toml_in = r#"description = "Read-only review profile""#;
-        let config: ProfileConfig = toml::from_str(toml_in).unwrap();
-        assert_eq!(
-            config.description.as_deref(),
-            Some("Read-only review profile"),
-        );
-
-        let serialized = toml::to_string_pretty(&config).unwrap();
-        assert!(serialized.contains("Read-only review profile"));
-    }
-
-    #[test]
-    fn test_description_default_is_none() {
-        let config = ProfileConfig::default();
-        assert!(config.description.is_none());
-        let serialized = toml::to_string(&config).unwrap();
-        assert!(serialized.trim().is_empty());
-    }
-
-    #[test]
-    fn test_description_promotes_profile_has_overrides() {
-        let mut profile = ProfileConfig::default();
-        assert!(!profile_has_overrides(&profile));
-        profile.description = Some("My profile".to_string());
-        assert!(profile_has_overrides(&profile));
-    }
-
-    #[test]
-    fn test_merge_configs_inherits_global_environment_when_profile_none() {
-        let global = Config {
-            environment: vec!["FROM_GLOBAL=1".to_string()],
-            ..Default::default()
-        };
-        let profile = ProfileConfig::default();
-        let merged = merge_configs(global, &profile);
-        assert_eq!(merged.environment, vec!["FROM_GLOBAL=1".to_string()]);
-    }
-
-    // Replace (not extend) semantics for the Vec sandbox overrides.
-    #[test]
-    fn test_merge_configs_replaces_extra_volumes() {
-        let mut global = Config::default();
-        global.sandbox.extra_volumes = vec!["/from-global:/g".to_string()];
-
-        let profile = profile_from(json!({"sandbox": {"extra_volumes": ["/from-profile:/p"]}}));
-        let merged = merge_configs(global, &profile);
-        assert_eq!(merged.sandbox.extra_volumes, vec!["/from-profile:/p"]);
-    }
-
-    #[test]
-    fn test_merge_configs_extra_volumes_inherits_when_none() {
-        let mut global = Config::default();
-        global.sandbox.extra_volumes = vec!["/from-global:/g".to_string()];
-
-        let profile = profile_from(json!({"sandbox": {"enabled_by_default": true}}));
-        let merged = merge_configs(global, &profile);
-        assert_eq!(merged.sandbox.extra_volumes, vec!["/from-global:/g"]);
-    }
-
-    #[test]
-    fn test_merge_configs_replaces_port_mappings() {
-        let mut global = Config::default();
-        global.sandbox.port_mappings = vec!["3000:3000".to_string()];
-
-        let profile =
-            profile_from(json!({"sandbox": {"port_mappings": ["8080:8080", "9090:9090"]}}));
-        let merged = merge_configs(global, &profile);
-        assert_eq!(merged.sandbox.port_mappings, vec!["8080:8080", "9090:9090"]);
-    }
-
-    #[test]
-    fn test_merge_configs_port_mappings_inherits_when_none() {
-        let mut global = Config::default();
-        global.sandbox.port_mappings = vec!["3000:3000".to_string()];
-
-        let profile = profile_from(json!({"sandbox": {"cpu_limit": "2"}}));
-        let merged = merge_configs(global, &profile);
-        assert_eq!(merged.sandbox.port_mappings, vec!["3000:3000"]);
-    }
-
-    #[test]
-    fn test_merge_configs_with_acp_overrides() {
-        let global = Config::default();
-
-        let profile = profile_from(json!({"acp": {
-            "default_agent": "claude-code",
-            "max_concurrent_workers": 9,
-            "replay_events": 1024,
-            "node_path": "/opt/node",
-        }}));
-
-        let merged = merge_configs(global, &profile);
-        assert_eq!(merged.acp.default_agent, "claude-code");
-        assert_eq!(merged.acp.max_concurrent_workers, 9);
-        assert_eq!(merged.acp.replay_events, 1024);
-        assert_eq!(merged.acp.node_path, "/opt/node");
-        // Not overridden: inherits global default.
-        assert!(merged.acp.show_tool_durations);
-    }
-
-    #[test]
-    fn test_merge_configs_acp_inherits_when_none() {
-        let mut global = Config::default();
-        global.acp.default_agent = "from-global".to_string();
-        global.acp.max_concurrent_workers = 7;
-
-        let profile = profile_from(json!({"acp": {"replay_events": 42}}));
-        let merged = merge_configs(global, &profile);
-        assert_eq!(merged.acp.replay_events, 42);
-        assert_eq!(merged.acp.default_agent, "from-global");
-        assert_eq!(merged.acp.max_concurrent_workers, 7);
     }
 
     #[test]

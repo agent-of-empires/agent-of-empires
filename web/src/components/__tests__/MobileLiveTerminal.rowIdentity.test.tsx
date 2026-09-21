@@ -1,151 +1,68 @@
 // @vitest-environment jsdom
-//
-// Rows rendered across streaming frames. Select-to-copy depends on row DOM
-// nodes surviving the frames that arrive while the selection is being made: a
-// remounted row collapses the browser selection, and on iOS also dismisses the
-// Copy callout. The trimmed row count must also hold still while an agent's
-// bottom row oscillates, or the bottom-aligned block flutters (#2087).
+// Row nodes must survive streamed frames, or a selection in progress collapses; the trimmed row count must
+// also hold while an agent's bottom row oscillates (#2087).
 
-import { createRef } from "react";
-import { afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
-import { act, render, screen } from "@testing-library/react";
-import { MobileLiveTerminal } from "../MobileLiveTerminal";
-import type { LiveFrame } from "../../hooks/useLiveTerminal";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { act, screen } from "@testing-library/react";
+import { CHAR_W, installResizeObserver, linesFrame, renderLiveTerminal, stubElementSize } from "./liveTerminalHarness";
 
 vi.mock("../../hooks/useWebSettings", () => ({
   useWebSettings: () => ({ settings: { mobileFontSize: 14, desktopFontSize: 14 }, update: vi.fn() }),
 }));
 
-// jsdom has no layout: charW falls back to fontSize * 0.6, so this width
-// renders 28 columns once the sizing effect has run.
 const WIDTH = 240;
-const COLS = Math.floor(WIDTH / (14 * 0.6));
-const RESIZE_DEBOUNCE_MS = 150;
 const SHRINK_DELAY_MS = 1500;
-let roCallbacks: Array<() => void> = [];
-
-beforeAll(() => {
-  globalThis.ResizeObserver = class {
-    private cb: () => void;
-    constructor(cb: () => void) {
-      this.cb = cb;
-    }
-    observe() {
-      roCallbacks.push(this.cb);
-    }
-    unobserve() {}
-    disconnect() {
-      roCallbacks = roCallbacks.filter((c) => c !== this.cb);
-    }
-  } as unknown as typeof ResizeObserver;
-  Object.defineProperty(HTMLElement.prototype, "clientWidth", { configurable: true, get: () => WIDTH });
-  Object.defineProperty(HTMLElement.prototype, "clientHeight", { configurable: true, get: () => 600 });
-});
+stubElementSize({ clientWidth: () => WIDTH, clientHeight: () => 600 });
+const observers = installResizeObserver();
 
 beforeEach(() => {
   vi.useFakeTimers();
-  roCallbacks = [];
+  observers.clear();
 });
+afterEach(() => vi.useRealTimers());
 
-afterEach(() => {
-  vi.useRealTimers();
-});
-
-function frame(lines: string[], rows: number, history = Math.max(0, lines.length - rows)): LiveFrame {
-  return {
-    content: lines.join("\n") + "\n",
-    lines,
-    rows,
-    history,
-    cursor: null,
-    altScreen: false,
-    mouse: false,
-    mouseSgr: false,
-  };
-}
-
-function terminal(f: LiveFrame) {
-  return (
-    <MobileLiveTerminal
-      frame={f}
-      connected
-      active
-      reading={false}
-      sendResize={vi.fn()}
-      setWindow={vi.fn()}
-      setCadence={vi.fn()}
-      enterReading={vi.fn()}
-      returnToLive={vi.fn()}
-      sendData={vi.fn()}
-      typedWordRef={{ current: "" }}
-      uploadPastedImage={vi.fn()}
-      forwardWheel={vi.fn()}
-      forwardButton={vi.fn()}
-      ctrlActiveRef={createRef<boolean>() as React.RefObject<boolean>}
-      clearCtrl={vi.fn()}
-      inputRef={createRef<HTMLTextAreaElement>()}
-      onInputFocusChange={vi.fn()}
-      bottomAlign
-      keyboardOpen={false}
-    />
-  );
-}
-
-function rowCount(container: HTMLElement) {
-  return container.querySelectorAll("[data-live-content] > div:not([aria-hidden])").length;
-}
+const rowOf = (text: string) => screen.getByText(text).parentElement;
 
 it("keeps unchanged row nodes when the agent appends lines", () => {
-  const { rerender } = render(terminal(frame(["alpha", "beta", "$ "], 3)));
-  const alpha = screen.getByText("alpha").parentElement;
-  const beta = screen.getByText("beta").parentElement;
-
-  rerender(terminal(frame(["alpha", "beta", "gamma", "delta", "$ "], 3)));
-
-  expect(screen.getByText("alpha").parentElement).toBe(alpha);
-  expect(screen.getByText("beta").parentElement).toBe(beta);
+  const view = renderLiveTerminal({ frame: linesFrame(["alpha", "beta", "$ "], { rows: 3, history: 0 }) });
+  const [alpha, beta] = [rowOf("alpha"), rowOf("beta")];
+  view.rerenderWith({ frame: linesFrame(["alpha", "beta", "gamma", "delta", "$ "], { rows: 3, history: 2 }) });
+  expect(rowOf("alpha")).toBe(alpha);
+  expect(rowOf("beta")).toBe(beta);
   expect(screen.getByText("delta")).toBeTruthy();
 });
 
 it("keeps row nodes when the window slides past wrapped lines", () => {
-  // Two lines wider than the pane sit above the text being selected; the
-  // live edge then slides the window by two lines, so those wrapped rows
-  // drop off the top while the history count grows to match.
+  // Two lines wider than the 28-column pane scroll off the top while history grows to match.
   const wide = (tag: string) => `${tag} `.repeat(20).trimEnd();
-  const { container, rerender } = render(terminal(frame([wide("one"), wide("two"), "alpha", "beta", "$ "], 3)));
-  act(() => {
-    for (const cb of roCallbacks) cb();
-    vi.advanceTimersByTime(RESIZE_DEBOUNCE_MS);
+  const view = renderLiveTerminal({
+    frame: linesFrame([wide("one"), wide("two"), "alpha", "beta", "$ "], { rows: 3, history: 2 }),
   });
-  expect(COLS).toBe(28);
-  expect(rowCount(container)).toBeGreaterThan(5);
-  const alpha = screen.getByText("alpha").parentElement;
-
-  rerender(terminal(frame(["alpha", "beta", "gamma", "delta", "$ "], 3, 4)));
-
-  expect(screen.getByText("alpha").parentElement).toBe(alpha);
+  observers.settle(150);
+  expect(Math.floor(WIDTH / CHAR_W)).toBe(28);
+  expect(view.rowCount()).toBeGreaterThan(5);
+  const alpha = rowOf("alpha");
+  view.rerenderWith({ frame: linesFrame(["alpha", "beta", "gamma", "delta", "$ "], { rows: 3, history: 4 }) });
+  expect(rowOf("alpha")).toBe(alpha);
 });
 
 it("holds the trimmed row count while the bottom row oscillates, then trims once quiet", () => {
   const body = ["HEADER", ...Array.from({ length: 16 }, (_, i) => `body ${i + 1}`), "INPUTBOX>", ""];
-  const spinnerOn = frame([...body, "spinner working..."], body.length + 1);
-  const spinnerOff = frame([...body, ""], body.length + 1);
-  const full = body.length + 1;
-  const trimmed = body.indexOf("INPUTBOX>") + 1;
-  const { container, rerender } = render(terminal(spinnerOn));
-  expect(rowCount(container)).toBe(full);
+  const rows = body.length + 1;
+  const spinnerOn = linesFrame([...body, "spinner working..."], { rows, history: 0 });
+  const spinnerOff = linesFrame([...body, ""], { rows, history: 0 });
+  const view = renderLiveTerminal({ frame: spinnerOn });
+  expect(view.rowCount()).toBe(rows);
 
-  // Longer than the shrink delay, so a shrink that fires between redraws shows.
+  // Longer than the shrink delay, so a shrink firing between redraws would show.
   for (let elapsed = 0; elapsed < 2 * SHRINK_DELAY_MS; elapsed += 240) {
-    rerender(terminal(spinnerOff));
-    act(() => vi.advanceTimersByTime(120));
-    expect(rowCount(container)).toBe(full);
-    rerender(terminal(spinnerOn));
-    act(() => vi.advanceTimersByTime(120));
-    expect(rowCount(container)).toBe(full);
+    for (const frame of [spinnerOff, spinnerOn]) {
+      view.rerenderWith({ frame });
+      act(() => vi.advanceTimersByTime(120));
+      expect(view.rowCount()).toBe(rows);
+    }
   }
-
-  rerender(terminal(spinnerOff));
+  view.rerenderWith({ frame: spinnerOff });
   act(() => vi.advanceTimersByTime(SHRINK_DELAY_MS));
-  expect(rowCount(container)).toBe(trimmed);
+  expect(view.rowCount()).toBe(body.indexOf("INPUTBOX>") + 1);
 });

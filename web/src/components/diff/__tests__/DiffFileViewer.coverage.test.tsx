@@ -1,16 +1,4 @@
 // @vitest-environment jsdom
-//
-// Branch coverage for DiffFileViewer that the split-layout spec does not reach:
-// the loading / error / no-contents / binary / truncated / no-changes states,
-// the renamed-file header (old_path → path), the Find toggle and Cmd+F
-// shortcut, the stale-comments block, active comment annotations, and the
-// draft-comment flow (line selection -> CommentForm -> save / cancel).
-//
-// The Pierre renderer and worker pool never run under jsdom, so
-// `@pierre/diffs/react` is mocked with a stand-in that exposes the passed
-// annotations and lets a test fire `options.onLineSelected` to start a draft.
-// Comment anchoring is mocked so each test can pick the active / stale shape it
-// needs without constructing real diff metadata.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
@@ -51,8 +39,6 @@ vi.mock("../comments/language", () => ({
   extensionToLanguage: () => "typescript",
 }));
 
-// Stand-ins for the comment / find subcomponents so we can observe props and
-// fire their callbacks without rendering the real (heavier) UI.
 vi.mock("../comments/CommentCard", () => ({
   CommentCard: ({ anchored }: { anchored: { comment: { id: string } } }) => (
     <div data-testid="comment-card">card:{anchored.comment.id}</div>
@@ -88,9 +74,7 @@ vi.mock("@pierre/diffs", () => ({
   processFile: () => ({ name: "parsed" }),
 }));
 
-// FileDiff stand-in: render the annotations it was handed (so card / form
-// branches surface) and expose a button that fires onLineSelected to start a
-// comment draft.
+// Renders the annotations it gets and a button that starts a draft selection.
 type Ann = { metadata: { kind: "card" | "form"; anchored?: { comment: { id: string } } } };
 vi.mock("@pierre/diffs/react", () => ({
   FileDiff: ({
@@ -153,7 +137,6 @@ beforeEach(() => {
   mock.error = null;
   mock.anchored = [];
   mock.snippet = "captured";
-  // A generous width so split layout can engage if selected.
   class WideRO {
     cb: ResizeObserverCallback;
     constructor(cb: ResizeObserverCallback) {
@@ -175,74 +158,41 @@ afterEach(() => {
   window.localStorage.clear();
 });
 
-describe("DiffFileViewer status states", () => {
-  it("shows the loading screen when loading with no contents", () => {
-    mock.contents = undefined;
-    mock.loading = true;
+describe("DiffFileViewer states and header", () => {
+  it.each<[string, Partial<typeof mock>, string]>([
+    ["loading", { contents: undefined, loading: true }, "Loading diff..."],
+    ["error", { contents: undefined, error: "boom" }, "boom"],
+    ["no contents", { contents: undefined }, "Select a file to view changes"],
+    ["binary", { contents: { ...baseContents, is_binary: true } }, "Binary file changed"],
+    ["truncated", { contents: { ...baseContents, truncated: true } }, "File too large to diff inline"],
+    [
+      "unchanged",
+      { contents: { ...baseContents, old_content: "same\n", new_content: "same\n" } },
+      "No changes in this file",
+    ],
+  ])("renders the %s state", (_, state, text) => {
+    Object.assign(mock, state);
     render(<DiffFileViewer sessionId="s1" filePath="a.ts" />);
-    expect(screen.getByText("Loading diff...")).toBeTruthy();
+    expect(screen.getByText(text)).toBeTruthy();
   });
 
-  it("shows the error message when the fetch fails", () => {
-    mock.contents = undefined;
-    mock.error = "boom";
+  it("renders status, counts, and no back button without onClose", () => {
     render(<DiffFileViewer sessionId="s1" filePath="a.ts" />);
-    expect(screen.getByText("boom")).toBeTruthy();
+    for (const t of ["Modified", "+2", "-1"]) expect(screen.getByText(t)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Back to terminal" })).toBeNull();
   });
 
-  it("prompts to select a file when there are no contents and no error", () => {
-    mock.contents = undefined;
-    render(<DiffFileViewer sessionId="s1" filePath="a.ts" />);
-    expect(screen.getByText("Select a file to view changes")).toBeTruthy();
-  });
-
-  it("renders the binary-file placeholder", () => {
-    mock.contents = { ...baseContents, is_binary: true };
-    render(<DiffFileViewer sessionId="s1" filePath="a.ts" />);
-    expect(screen.getByText("Binary file changed")).toBeTruthy();
-  });
-
-  it("renders the too-large placeholder when truncated", () => {
-    mock.contents = { ...baseContents, truncated: true };
-    render(<DiffFileViewer sessionId="s1" filePath="a.ts" />);
-    expect(screen.getByText("File too large to diff inline")).toBeTruthy();
-  });
-
-  it("renders the no-changes placeholder when old and new contents match", () => {
-    mock.contents = { ...baseContents, old_content: "same\n", new_content: "same\n" };
-    render(<DiffFileViewer sessionId="s1" filePath="a.ts" />);
-    expect(screen.getByText("No changes in this file")).toBeTruthy();
-  });
-});
-
-describe("DiffFileViewer header", () => {
-  it("renders the status label and +/- counts", () => {
-    render(<DiffFileViewer sessionId="s1" filePath="a.ts" />);
-    expect(screen.getByText("Modified")).toBeTruthy();
-    expect(screen.getByText("+2")).toBeTruthy();
-    expect(screen.getByText("-1")).toBeTruthy();
-  });
-
-  it("renders the rename arrow for a renamed file", () => {
+  it("renders a rename arrow and calls onClose from the back button", () => {
     mock.contents = {
       ...baseContents,
       file: { path: "new.ts", old_path: "old.ts", status: "renamed", additions: 0, deletions: 0 },
     };
-    render(<DiffFileViewer sessionId="s1" filePath="new.ts" />);
+    const onClose = vi.fn();
+    render(<DiffFileViewer sessionId="s1" filePath="new.ts" onClose={onClose} />);
     expect(screen.getByText("Renamed")).toBeTruthy();
     expect(screen.getByText("old.ts → new.ts")).toBeTruthy();
-  });
-
-  it("invokes onClose from the Terminal back button", () => {
-    const onClose = vi.fn();
-    render(<DiffFileViewer sessionId="s1" filePath="a.ts" onClose={onClose} />);
     fireEvent.click(screen.getByRole("button", { name: "Back to terminal" }));
     expect(onClose).toHaveBeenCalled();
-  });
-
-  it("does not render a back button without onClose", () => {
-    render(<DiffFileViewer sessionId="s1" filePath="a.ts" />);
-    expect(screen.queryByRole("button", { name: "Back to terminal" })).toBeNull();
   });
 });
 
@@ -253,7 +203,6 @@ describe("DiffFileViewer find", () => {
     fireEvent.click(screen.getByRole("button", { name: "Find in diff" }));
     expect(screen.getByTestId("find-bar")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Find in diff" }).getAttribute("aria-pressed")).toBe("true");
-    // Close via the FindBar's own close callback.
     fireEvent.click(screen.getByText("close-find"));
     expect(screen.queryByTestId("find-bar")).toBeNull();
   });
@@ -288,7 +237,6 @@ describe("DiffFileViewer comments", () => {
     mock.anchored = [{ status: "active", comment: { id: "c9", side: "new", endLine: 3 } }];
     render(<DiffFileViewer sessionId="s1" filePath="a.ts" commentsEnabled commentsStore={commentsStore()} />);
     expect(screen.getByText("card:c9")).toBeTruthy();
-    // Line selection is enabled when comments are active.
     expect(screen.getByTestId("pierre-diff").getAttribute("data-selection")).toBe("true");
   });
 

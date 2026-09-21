@@ -1,7 +1,4 @@
 // @vitest-environment jsdom
-//
-// Coverage for the inline diff CommentForm: range label, empty-body Save
-// gating, Cmd/Ctrl+Enter save, Esc cancel, and the Cancel/Save buttons.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";

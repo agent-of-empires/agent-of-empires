@@ -1,30 +1,15 @@
-// Keeps a bottom-pinned scroller pinned when something resizes it. Split out
-// of StructuredView so the observer wiring is unit-testable without mounting
-// the assistant-ui runtime (the #1282 pattern).
+// Keep a bottom-pinned scroller pinned when it resizes; split out of StructuredView for testing.
 
 export interface RepinOnResizeOptions {
   target: Element;
-  /** Height that matters for this target, read at subscribe time and again on
-   *  every callback. `ResizeObserver` also fires for width-only changes and for
-   *  a resize that nets to zero, neither of which can move the scroll bottom. */
+  /** Width-only and net-zero resizes also fire the observer but cannot move the bottom. */
   readHeight: () => number;
-  /** Whether the scroller was pinned to the bottom *before* this resize. Must
-   *  be sampled at scroll time: by the time the observer fires, layout has
-   *  already settled at the new height, so reading pinned-ness now would report
-   *  false for exactly the case worth catching. */
+  /** Must be sampled at scroll time; by the time the observer fires, layout has already settled. */
   wasAtBottom: () => boolean;
   repin: () => void;
 }
 
-/** Observe `target` and re-pin whenever its height actually changes.
- *
- *  Shrinking is the case that needs it: the transcript is silently left a few
- *  hundred pixels short of the bottom. Growing is already self-correcting
- *  because the browser clamps `scrollTop`, so re-pinning there is a no-op
- *  rather than a second code path. The pin is skipped when the user had
- *  scrolled away, so a resize never yanks them back down.
- *
- *  Returns the observer; the caller disconnects it on cleanup. */
+/** Re-pin on a real height change (shrinking strands the transcript short of the bottom) unless the user had scrolled away. The caller disconnects the returned observer. */
 export function repinOnResize({ target, readHeight, wasAtBottom, repin }: RepinOnResizeOptions): ResizeObserver {
   let prevHeight = readHeight();
   const ro = new ResizeObserver(() => {

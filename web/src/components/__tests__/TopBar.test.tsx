@@ -1,15 +1,4 @@
 // @vitest-environment jsdom
-//
-// Presentational contract test for TopBar. TopBar is a pure prop-driven
-// component (it pulls no data on its own), so this suite renders it
-// directly with the prop permutations we care about and asserts the
-// surface badges/buttons match. The full mounted topbar is exercised
-// end-to-end in web/tests/top-bar.spec.ts; that suite covers menu
-// interaction but cannot exercise the dev-build badge without mocking
-// `/api/about`, which is what this Vitest file does instead.
-//
-// Part of #1055 (DEV build badge so concurrently-running debug/release
-// instances on ports 8081 / 8080 are visually distinguishable).
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/react";

@@ -1,5 +1,4 @@
-//! The ACP event listener: turning agent events into session status,
-//! unread marks, and stored session ids.
+//! The ACP event listener.
 
 use crate::server::push::StatusChange;
 use crate::session::Instance;
@@ -10,25 +9,14 @@ use tokio::sync::{broadcast, RwLock};
 use super::state::{instance_lock_in, AppState};
 use crate::server::{acp_ws, api};
 
-/// One task instead of two halves the broadcast clone count and locks
-/// `state.instances` once per event instead of twice for the events
-/// (e.g. `AcpSessionAssigned`) that both consumers care about.
+/// One task instead of two halves the broadcast clone count and locks `state.instances`
+/// once per event instead of twice for the events (e.g.
 pub(super) async fn acp_event_listener(state: Arc<AppState>) {
     let mut rx = state.acp_events_tx.subscribe();
     loop {
         let frame = match rx.recv().await {
             Ok(f) => f,
-            // Lagged: a missed event can desync the sidebar dot or
-            // skip persisting an `AcpSessionAssigned`. Status will
-            // reconcile on the next event; a missed acp_session_id
-            // means at most one restart loses context. Far better to
-            // continue than to exit the listener entirely.
-            //
-            // The unread mark does NOT self-heal like status does: it is
-            // edge-triggered on `Running -> Idle`, so a dropped `Stopped` would
-            // lose it for good and no later event would reproduce it. The
-            // events are durable, recorded before broadcast, so replay the
-            // structured rows from the event log before continuing.
+            // Lagged.
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                 tracing::warn!(
                     target: "acp.event_listener",
@@ -39,6 +27,7 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                     &state.instances,
                     &state.acp_event_store,
                     &state.instance_locks,
+                    &state.acp_control_cache,
                     state.file_watch.clone(),
                     &state.status_tx,
                 )
@@ -63,11 +52,7 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             }
         };
 
-        // Detect wake-fire: a `UserPromptSent` arriving at-or-after a
-        // `WakeupScheduled`'s `at` timestamp means the agent's pending
-        // wake just fired. Push opt-in to the user's phone so /loop
-        // dynamic runs don't need them to keep checking the dashboard.
-        // See #1091.
+        // Detect wake-fire.
         if matches!(
             frame.event.as_ref(),
             crate::acp::state::Event::UserPromptSent { .. }
@@ -116,13 +101,7 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             }
         }
 
-        // Approval push: when the worker emits an `ApprovalRequested`
-        // event, trigger a Web Push so the user sees a "needs approval"
-        // alert even when the dashboard is backgrounded. Unlike the
-        // status-change pushes in `push.rs`, approvals do NOT honour
-        // the TUI/web active-session suppression; the service worker
-        // still routes focused clients to an in-app toast via the
-        // existing `aoe-push` postMessage path. See #1038.
+        // Approval push.
         if let crate::acp::state::Event::ApprovalRequested { approval } = frame.event.as_ref() {
             let state_for_push = state.clone();
             let session_id = frame.session_id.clone();
@@ -141,10 +120,7 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             });
         }
 
-        // Clear push: when the approval is handled (on any device), retract
-        // the "needs approval" notification that the request push raised, so
-        // a backgrounded phone or second computer does not keep showing a
-        // stale alert for an already-resolved request. See #2491.
+        // Clear push.
         if let crate::acp::state::Event::ApprovalResolved { decision, .. } = frame.event.as_ref() {
             record_approval_decision(&state, *decision);
             let state_for_push = state.clone();
@@ -155,11 +131,7 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             });
         }
 
-        // Question push: an `AskUserQuestion` (ElicitationRequested) blocks
-        // the turn on the user just like an approval, so it gets the same
-        // dedicated, suppression-bypassing push instead of only the generic
-        // Waiting one. Same live-event-only path as the approval push above.
-        // See #2146.
+        // Question push.
         if let crate::acp::state::Event::ElicitationRequested { elicitation } = frame.event.as_ref()
         {
             let state_for_push = state.clone();
@@ -171,8 +143,7 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             });
         }
 
-        // Clear push for an answered question, mirroring the approval clear
-        // above. See #2491.
+        // Clear push for an answered question, mirroring the approval clear above.
         if matches!(
             frame.event.as_ref(),
             crate::acp::state::Event::ElicitationResolved { .. }
@@ -185,10 +156,7 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             });
         }
 
-        // Recall cache: record the agent's advertised config options so the
-        // per-agent defaults settings page can populate its dropdowns without a
-        // live session. `record` debounces unchanged snapshots and writes off
-        // the async runtime. See #2631.
+        // Recall cache.
         if let crate::acp::state::Event::ConfigOptionsUpdated { options } = frame.event.as_ref() {
             if !options.is_empty() {
                 let agent = state
@@ -221,14 +189,7 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             }
         }
 
-        // Smart-rename defer: fire the one-shot only on a clean
-        // `prompt_complete` `Event::Stopped`, so it never races the live worker
-        // for the same provider API. Fast-path on the event variant BEFORE
-        // touching the two sync mutexes so high-volume streaming-delta frames
-        // (`AgentMessageChunk`, `ToolCallStarted`, `ThinkingStarted`, ...) skip
-        // the locks entirely; the pure predicate then applies the reason
-        // allowlist + the two per-session `contains()` checks. See #2348 and
-        // the post-merge review nit on #2651.
+        // Smart-rename defer.
         let should_rename = matches!(
             frame.event.as_ref(),
             crate::acp::state::Event::Stopped { .. }
@@ -269,20 +230,14 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                             first_user_prompt,
                             context,
                         },
-                        // Automatic turn-end trigger: honor the smart_rename
-                        // setting. Only the manual action forces past it (#3039).
+                        // Automatic turn-end trigger.
                         false,
                     )
                     .await;
                 });
             } else {
-                // A `prompt_complete` Stopped without any persisted UserPromptSent
-                // is unexpected: `publish_user_prompt_with_attachments` runs
-                // strictly before `send_prompt` in the ACP handler, so by the
-                // time the turn ends the first prompt should be durable in the
-                // event store. A silent skip would hide a plumbing bug (attachment
-                // rollback, pruning of an old session, race with SessionCleared);
-                // surface it at debug so operators can trace it.
+                // A `prompt_complete` Stopped without any persisted UserPromptSent is
+                // unexpected.
                 tracing::debug!(
                     target: "smart_rename",
                     session = %frame.session_id,
@@ -291,11 +246,7 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             }
         }
 
-        // Conversation-summary defer: same clean-turn-boundary discipline as
-        // smart-rename. Fast-path on the event variant before the inflight
-        // lock so streaming frames skip it; the spawned task re-checks the
-        // setting, eligibility, and the byte/turn delta threshold (all of
-        // which need config + the event store). See #2808.
+        // Conversation-summary defer.
         let should_summarize = matches!(
             frame.event.as_ref(),
             crate::acp::state::Event::Stopped { .. }
@@ -323,7 +274,31 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             });
         }
 
-        let status_intent = derive_acp_status(frame.event.as_ref());
+        // Gated on `reads_activity_flags`: a cold cache (nothing has
+        // hydrated this session since the daemon started, e.g. right after a
+        // restart with a reattached worker) must not cost every other arm a
+        // full log replay on this serial listener task. The replay picks up
+        // this frame's own event too, since it is persisted to the store
+        // before being broadcast, and `fold_control_state` hydrates through
+        // the cache's per-session lock, so a second frame for the same cold
+        // session waits for the first rather than double-hydrating (#4001).
+        if reads_activity_flags(frame.event.as_ref())
+            && !state.acp_control_cache.is_hydrated(&frame.session_id)
+        {
+            state
+                .session_service
+                .fold_control_state(&frame.session_id)
+                .await;
+        }
+        let turn_active_after = state.acp_control_cache.turn_active(&frame.session_id);
+        let background_agent_active_after = state
+            .acp_control_cache
+            .has_active_background_agent(&frame.session_id);
+        let status_intent = derive_acp_status(
+            frame.event.as_ref(),
+            turn_active_after,
+            background_agent_active_after,
+        );
         let acp_change = derive_acp_session_change(frame.event.as_ref());
         let load_session_capability = match (frame.event.as_ref(), frame.worker_generation) {
             (
@@ -339,8 +314,7 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             continue;
         }
 
-        // Acquire `instances` once for both branches. Releases before
-        // the (potentially blocking) sessions.json save.
+        // Acquire `instances` once for both branches.
         let (profile_to_save, unread_profile) = {
             let mut instances = state.instances.write().await;
             let Some(inst) = instances.iter_mut().find(|i| i.id == frame.session_id) else {
@@ -349,14 +323,7 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             if !inst.is_structured() {
                 continue;
             }
-            // Check while holding the instance lock: teardown removes the worker
-            // before clearing this field, so either this write happens first and
-            // is cleared, or the stale generation is rejected.
-            //
-            // This awaits the supervisor's `workers` mutex with the `instances`
-            // write lock held. That ordering is only safe while `Supervisor`
-            // never reaches for `instances`; give it a path that does and this
-            // becomes a lock cycle.
+            // Check while holding the instance lock.
             if let Some((capable, generation)) = load_session_capability {
                 if state
                     .acp_supervisor
@@ -367,14 +334,8 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                 }
             }
 
-            // Snapshotting around the call is exactly "the transition
-            // `apply_status_intent` actually applied": it assigns `status` in
-            // one place and every rejected or no-op path (the trashed /
-            // Deleting / Creating guard, the Stopped guard, the ineligible
-            // HealError guard, `status == target`) leaves it untouched. We hold
-            // the write lock across both reads, so nothing else can move it in
-            // between. A future refactor that makes `apply_status_intent`
-            // assign `status` more than once has to revisit this.
+            // Snapshotting around the call is exactly "the transition `apply_status_intent`
+            // actually applied".
             let old_status = inst.status;
             apply_status_intent(inst, status_intent, &state.status_tx);
             let unread_profile =
@@ -388,27 +349,6 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
         };
 
         // The turn just finished, so the row takes the automatic unread mark.
-        // This is the sole producer of it for a structured row. The tmux poll
-        // loop has no authority over a paneless one, which is why #3162 stopped
-        // it reporting phantom transitions for them and so left this gap; the
-        // TUI's passive path is gated off them to keep the boolean single-writer.
-        //
-        // The write has to be durable. `reload_state_instances_from_disk` rebases
-        // every row on the disk row on each 2s tick and `merge_runtime_fields`
-        // does not carry `unread`, so an in-memory-only mark is gone within two
-        // seconds. Memory is mirrored only after the write lands, the same
-        // ordering `flush_passive_transition_writes` uses (#2755) and for the
-        // same reason: a mark that exists only in daemon memory is served over
-        // `/api/sessions`, mirrored into the TUI, and then silently dropped by
-        // the next reload.
-        //
-        // Deliberately not folded into the `profile_to_save` save below:
-        // `derive_acp_session_change` yields nothing for `Event::Stopped`, so an
-        // identity change and a turn-end can never arrive on the same event and
-        // there is no atomicity to win.
-        //
-        // `persist_and_mirror_unread` owns the lock and commit-check ordering;
-        // see its docstring for why both are load-bearing.
         if let Some(profile) = unread_profile {
             let lock = state.instance_lock(&frame.session_id).await;
             persist_and_mirror_unread(
@@ -422,8 +362,6 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
         }
 
         // Persist `acp_session_id` to disk if the field changed.
-        // Sync FS (file copy + JSON write) goes through spawn_blocking
-        // so the runtime stays responsive under large session lists.
         if let Some(profile) = profile_to_save {
             let session_id_for_log = frame.session_id.clone();
             let session_id_for_save = frame.session_id.clone();
@@ -467,16 +405,6 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
 }
 
 /// Tally a resolved approval for the opt-in telemetry snapshot.
-///
-/// Counted here rather than at the HTTP endpoint because only the
-/// permission handler knows which option the user's answer resolved to:
-/// an answered option list posts an allow-shaped decision whatever the
-/// option means, and a stale option id cancels instead of resolving.
-/// This event carries the decision that actually reached the agent.
-///
-/// `Cancelled` is not a user decision (the daemon-restart sweep and the
-/// stale-option path both emit it), so it counts as nothing; it is
-/// matched explicitly so a new variant is a compile error here.
 fn record_approval_decision(state: &AppState, decision: crate::acp::approvals::ApprovalDecision) {
     use crate::acp::approvals::ApprovalDecision;
     use std::sync::atomic::Ordering::Relaxed;
@@ -489,14 +417,8 @@ fn record_approval_decision(state: &AppState, decision: crate::acp::approvals::A
     counter.fetch_add(1, Relaxed);
 }
 
-/// Seed each acp-enabled session's `Instance.status` from the most
-/// recent lifecycle event in the on-disk event log. Runs once at
-/// daemon startup, before the status poll loop and the acp event
-/// listener start, so a session that was mid-turn when the previous
-/// daemon died doesn't render Idle until the next live event arrives.
-/// Acts via the same `apply_status_intent` path as the live listener
-/// so push subscribers and the broadcast channel see the seeded
-/// transitions as ordinary StatusChange events. See #1103 (B).
+/// Seed each acp-enabled session's `Instance.status` from the most recent lifecycle event
+/// in the on-disk event log.
 pub(crate) async fn seed_acp_statuses(state: Arc<AppState>) {
     let acp_ids: Vec<String> = state
         .instances
@@ -513,18 +435,17 @@ pub(crate) async fn seed_acp_statuses(state: Arc<AppState>) {
         let Some(event) = state.acp_event_store.latest_seed_status_event(&id) else {
             continue;
         };
-        let Some(intent) = derive_acp_status(&event) else {
+        // No live control-state fold to consult at boot (the cache is
+        // cold and boot deliberately does not hydrate it), so a background
+        // sub-agent outstanding across a restart reads as Idle here; the
+        // reconciler and the next live event correct it once the tailer
+        // resumes (#4001).
+        let Some(intent) = derive_acp_status(&event, false, false) else {
             continue;
         };
         let mut instances = state.instances.write().await;
         if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-            // At startup the on-disk event log is the whole truth: nothing
-            // is racing the apply, unlike the live stream. If the latest
-            // lifecycle event shows a turn was in flight when the previous
-            // daemon died, a stale persisted Stopped must not trap the dot
-            // grey, so clear it before the Running/Waiting intent applies.
-            // A latest Idle/Error (clean or deliberate stop) is left as
-            // Stopped by apply_status_intent's guard. See #2248.
+            // At startup the on-disk event log is the whole truth.
             if inst.status == Status::Stopped
                 && matches!(intent, StatusIntent::Set(Status::Running | Status::Waiting))
             {
@@ -535,10 +456,7 @@ pub(crate) async fn seed_acp_statuses(state: Arc<AppState>) {
     }
 }
 
-/// Fold a derived `StatusIntent` into an `Instance`. Pure mutation;
-/// callers hold the write lock. Sends a `StatusChange` on
-/// `status_tx` so push notifications and the dashboard see the
-/// transition like any tmux-driven one.
+/// Fold a derived `StatusIntent` into an `Instance`.
 pub(crate) fn apply_status_intent(
     inst: &mut Instance,
     intent: Option<StatusIntent>,
@@ -551,24 +469,29 @@ pub(crate) fn apply_status_intent(
     }
     let target = match intent {
         StatusIntent::Set(s) => {
-            // A Stopped session must not be woken by a trailing worker
-            // event: acp events keep arriving for a few ticks after a
-            // Stop, and a deliberate Stop must keep showing Stopped. Only
-            // a fresh worker-epoch signal (HealError below) lifts Stopped;
-            // the live UserPromptSent that follows the respawn then drives
-            // Running. Without this, the chain Stopped -> (trailing prompt)
-            // Running -> (trailing stop) Idle would strand a deliberate
-            // Stop on Idle.
+            // A Stopped session must not be woken by a trailing worker event.
             if inst.status == Status::Stopped {
                 return;
             }
             s
         }
-        // HealError comes only from AcpSessionAssigned / RateLimitAuto
-        // Resumed, both emitted when a fresh worker attaches and never as
-        // trailing post-stop events. So heal a sticky Error AND wake a
-        // session out of a stale Stopped (idle-reap or manual stop, then
-        // re-prompt): the live worker is provably back. See #2248.
+        // Background sub-agent events must not speak for the main turn: they
+        // preserve its Waiting (a pending approval/elicitation) and Error (a
+        // dead connection the supervisor is still respawning), and Stopped
+        // likewise stays until the main turn's own lifecycle moves it. The
+        // main turn's own events (plain `Set`) resolve Waiting and Error;
+        // Error also heals on a fresh worker attach.
+        StatusIntent::SetUnlessHeld(s) => {
+            if matches!(
+                inst.status,
+                Status::Stopped | Status::Waiting | Status::Error
+            ) {
+                return;
+            }
+            s
+        }
+        // HealError comes only from AcpSessionAssigned / RateLimitAuto Resumed, both
+        // emitted when a fresh worker attaches and never as trailing post-stop events.
         StatusIntent::HealError => {
             if !matches!(inst.status, Status::Error | Status::Stopped) {
                 return;
@@ -582,11 +505,7 @@ pub(crate) fn apply_status_intent(
     let prev = inst.status;
     inst.status = target;
     let now = chrono::Utc::now();
-    // last_accessed_at is deliberately NOT stamped here (#3465 residual):
-    // the value relays through SessionFeed into TUI memory, and
-    // save()'s merge_from_tui monotone max persists it ungated, so the
-    // touched arm of merge_user_action_diff wiped concurrent archives.
-    // Structured rows take real touches from user prompts instead.
+    // last_accessed_at is deliberately NOT stamped here (#3465 residual).
     inst.idle_entered_at = if target == Status::Idle {
         Some(now)
     } else {
@@ -601,24 +520,8 @@ pub(crate) fn apply_status_intent(
     });
 }
 
-/// Whether a structured row whose ACP status just moved should take the
-/// automatic unread mark, i.e. whether its turn just finished.
-///
-/// `inst` is the row *after* [`apply_status_intent`] ran and `old_status` is
-/// the snapshot taken before it. The predicate is deliberately byte-identical
-/// to the one in [`super::status_poll::decide_passive_transition`] and in the
-/// TUI's
-/// `apply_status_update`, so "a turn just finished" means the same thing on
-/// every surface.
-///
-/// `Running -> Idle` is the whole edge. An approval or elicitation excursion
-/// comes back through `Set(Running)` (`ApprovalResolved` /
-/// `ElicitationResolved`) before the turn's `Stopped`, so an answered-then-
-/// completed turn still ends on this edge and needs no case of its own. A
-/// direct `Waiting -> Idle` means the turn stopped while still blocked on the
-/// user, who is by construction present for it. Every `Stopped` reason maps to
-/// `Idle`, so a rate-limit park marks unread too; that is the same policy
-/// terminal sessions get, and a parked session does want attention.
+/// Whether a structured row whose ACP status just moved should take the automatic unread
+/// mark, i.e. whether its turn just finished.
 pub(super) fn should_mark_acp_unread(
     inst: &Instance,
     old_status: Status,
@@ -631,30 +534,8 @@ pub(super) fn should_mark_acp_unread(
         && !inst.unread
 }
 
-/// Write the automatic unread mark for `id` to its profile store, then mirror it
-/// into daemon memory. Returns whether the mark actually landed.
-///
-/// Takes primitives rather than [`AppState`] so it is reachable from tests
-/// (`AppState` has no test constructor).
-///
-/// Ordering rules, both of which cost correctness if dropped:
-///
-/// 1. **Under `instance_lock`.** The same mutex `PATCH /api/sessions/:id/unread`
-///    takes, held across both the write and the mirror. Without it a clear can
-///    land between them and leave disk read while memory says unread, and the
-///    user's explicit mark-read loses to a mark it happened after. Holding it
-///    makes the two orderings the only ones possible, and both are correct: a
-///    clear before this marks (the turn genuinely finished afterwards), a clear
-///    after this wins (the user read it afterwards).
-/// 2. **Only mirror a committed mutation.** `persist_session_update` reports
-///    `Ok` for a write whose closure matched no row, so `profile` going stale
-///    (a concurrent profile move) would otherwise mark memory off a successful
-///    no-op on the *old* profile, and the next reload would drop the
-///    notification. The flag reports whether the owning row was really mutated.
-///
-/// A stale-profile write is not retried. The row is left read rather than
-/// half-marked, the turn's mark is simply lost, and the move is rare enough that
-/// a re-resolve loop is not worth the added failure surface here.
+/// Write the automatic unread mark for `id` to its profile store, then mirror it into
+/// daemon memory.
 pub(super) async fn persist_and_mirror_unread(
     instances: &RwLock<Vec<Instance>>,
     instance_lock: &tokio::sync::Mutex<()>,
@@ -698,37 +579,13 @@ pub(super) async fn persist_and_mirror_unread(
     true
 }
 
-/// Re-derive every structured row's status from the durable event log after the
-/// ACP broadcast dropped frames, marking any row whose turn ended while we were
-/// not listening. Returns the number of rows marked.
-///
-/// `acp_events_tx` is a `broadcast` of [`super::state::ACP_CHANNEL_CAPACITY`],
-/// and a lagged
-/// receiver is told only *how many* frames it missed, never which. Status
-/// tolerated that because it is level-triggered: any later event re-derives the
-/// right value. The unread mark is edge-triggered, so a dropped `Stopped` loses
-/// it permanently, and nothing else would ever produce it.
-///
-/// The events themselves are durable (recorded before broadcast), so the log is
-/// the recovery source. `latest_seed_status_event` is the same query
-/// `seed_acp_statuses` uses at boot, and for the same reason: it returns the
-/// most recent *lifecycle* event, which is exactly the frame whose loss matters.
-///
-/// This deliberately does NOT reuse `seed_acp_statuses`, despite the shared
-/// shape, because the two differ on both points that matter:
-///
-/// - **Boot must not mark.** Its replay re-reads history, so a `Stopped` from
-///   before the restart would re-mark a row the user has already read, on every
-///   restart. Here a `Stopped` under a still-`Running` memory status is evidence
-///   of a turn that ended during this daemon's life and was missed.
-/// - **Boot lifts a stale `Stopped`**, because a persisted `Stopped` from a
-///   daemon that died mid-turn would otherwise trap the dot grey. Mid-run a
-///   `Stopped` in memory is a deliberate stop, so `apply_status_intent`'s guard
-///   should keep it.
+/// Re-derive every structured row's status from the durable event log after the ACP
+/// broadcast dropped frames, marking any row whose turn ended while we were not listening.
 pub(super) async fn recover_structured_unread_after_lag(
     instances: &RwLock<Vec<Instance>>,
     event_store: &crate::acp::event_store::EventStore,
     instance_locks: &RwLock<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    control_cache: &crate::acp::control_cache::ControlStateCache,
     file_watch: Arc<crate::file_watch::FileWatchService>,
     status_tx: &broadcast::Sender<StatusChange>,
 ) -> usize {
@@ -745,7 +602,18 @@ pub(super) async fn recover_structured_unread_after_lag(
         let Some(event) = event_store.latest_seed_status_event(&id) else {
             continue;
         };
-        let Some(intent) = derive_acp_status(&event) else {
+        // Unlike boot's cold `(false, false)` seeding, this reads the live
+        // control cache (the boot-vs-lag contrast above): hydrated, it is
+        // at-or-ahead of this event's fold, so its activity flags are the
+        // best available verdict; a miss (never opened, evicted, or
+        // forgotten) degrades to boot's conservative verdict. The seed query
+        // excludes background events, so a `Stopped` under a still-running
+        // sub-agent needs this (#4001).
+        let turn_active_after = control_cache.turn_active(&id);
+        let background_agent_active_after = control_cache.has_active_background_agent(&id);
+        let Some(intent) =
+            derive_acp_status(&event, turn_active_after, background_agent_active_after)
+        else {
             continue;
         };
         // Same snapshot-around-apply as the live path, so "the transition that
@@ -773,10 +641,7 @@ pub(super) async fn recover_structured_unread_after_lag(
     marked
 }
 
-/// Fold a derived `AcpSessionChange` into an `Instance`. Returns the
-/// owning profile when sessions.json needs to be re-saved (so the new
-/// `acp_session_id` survives daemon restart), or `None` if the
-/// change was a no-op or no change was emitted.
+/// Fold a derived `AcpSessionChange` into an `Instance`.
 pub(super) fn apply_acp_session_change(
     inst: &mut Instance,
     session_id: &str,
@@ -784,32 +649,18 @@ pub(super) fn apply_acp_session_change(
 ) -> Option<String> {
     match change? {
         AcpSessionChange::Assigned(new_id) => {
-            // A worker just initialized (session/new or session/load), so the
-            // session is by definition no longer idle-dormant. Clear any
-            // marker now: a stale one left by a non-user respawn (e.g. the
-            // build-stale respawn #1754, which brings the worker back without
-            // a user wake) otherwise makes the reconciler's
-            // `!is_idle_dormant()` resume filter refuse to bring the session
-            // back after this worker later dies, deadlocking a queued prompt
-            // that the client parked waiting for a worker that never returns.
-            // See #2237.
+            // A worker just initialized (session/new or session/load), so the session is by
+            // definition no longer idle-dormant.
             let cleared_stale_dormant = inst.idle_dormant_since.take().is_some();
             let same_acp_session = inst.acp_session_id.as_deref() == Some(new_id.as_str());
-            // #2276: clear import_pending only when the assigned id matches the
-            // imported one, i.e. the import's session/load actually landed and
-            // its replay is now in the event store. A fallback session/new (or
-            // a stale worker) reports a different id; consuming the marker then
-            // would block a later retry from re-seeding the transcript.
+            // #2276.
             let cleared_import_pending = if same_acp_session {
                 inst.import_pending.take().unwrap_or(false)
             } else {
                 false
             };
             if same_acp_session {
-                // Same id (a reattach / session/load reuses it). Only persist
-                // if we actually cleared a stale dormant marker or the import
-                // flag; otherwise the id is already on disk and there is
-                // nothing to rewrite.
+                // Same id (a reattach / session/load reuses it).
                 if cleared_stale_dormant || cleared_import_pending {
                     tracing::info!(
                         target: "acp.event_listener",
@@ -828,16 +679,9 @@ pub(super) fn apply_acp_session_change(
                 "persisting agent-assigned ACP session id"
             );
             inst.acp_session_id = Some(new_id.clone());
-            // A structured fork sets fork_pending + import_pending together at
-            // creation and does not pre-pin acp_session_id, so the adapter's
-            // new forked id arrives on THIS different-id path. Consume both
-            // one-shot markers together: a restart resumes the child via
-            // session/load instead of re-forking the parent, and leaving
-            // import_pending set would make that resume re-seed the transcript
-            // into an already-populated store (duplicate-key corruption, the
-            // #2276 class). Gate the import clear on fork_pending having been
-            // set, so a non-fork different-id assignment leaves import_pending
-            // alone for its own retry.
+            // A structured fork sets fork_pending + import_pending together at creation and
+            // does not pre-pin acp_session_id, so the adapter's new forked id arrives on
+            // THIS different-id path.
             if inst.fork_pending.take().is_some() {
                 inst.import_pending = None;
             }
@@ -850,13 +694,8 @@ pub(super) fn apply_acp_session_change(
                 "clearing stored ACP session id after a context reset (session/load or session/fork failure)"
             );
             inst.acp_session_id = None;
-            // A structured fork that failed (or was refused by a resume-only
-            // agent) reaches here via SessionContextReset. Clear the one-shot
-            // fork marker so the reconciler stops re-issuing the same failing
-            // `session/fork` on every reattach, and drop the paired
-            // import_pending the same way the success path does so the fallback
-            // spawn is a clean session/new. A session/load-failure reset has no
-            // fork pending, so this is a no-op there.
+            // A structured fork that failed (or was refused by a resume-only agent) reaches
+            // here via SessionContextReset.
             if inst.fork_pending.take().is_some() {
                 inst.import_pending = None;
             }
@@ -867,19 +706,10 @@ pub(super) fn apply_acp_session_change(
                 session = %session_id,
                 "clearing stored ACP session id after a user /clear"
             );
-            // For a profile that forwards its clear alias, AoE never learns the
-            // adapter's post-clear conversation id, so the only way to stop a
-            // restart from resurrecting the pre-clear conversation via
-            // session/load is to drop the stored id now and force a fresh
-            // session/new. That leaves the post-clear conversation
-            // unresumable, which is why the profiles whose adapters withhold
-            // the new id drive the reset themselves instead
-            // (`clear_requires_driven_reset`); on that path this arm still
-            // runs, but the driven burst ends in `AcpSessionAssigned`, which
-            // re-pins the id the adapter just minted. Clear the paired
-            // fork/import markers unconditionally too: a /clear issued before
-            // a pending fork/import resolves must still restart clean, not
-            // re-session/fork the parent. See #3080.
+            // For a profile that forwards its clear alias, AoE never learns the adapter's
+            // post-clear conversation id, so the only way to stop a restart from
+            // resurrecting the pre-clear conversation via session/load is to drop the
+            // stored id now and force a fresh session/new.
             inst.acp_session_id = None;
             inst.fork_pending = None;
             inst.import_pending = None;
@@ -888,16 +718,12 @@ pub(super) fn apply_acp_session_change(
     Some(inst.source_profile.clone())
 }
 
-/// What an event tells the ACP-session-id listener to do. `None` means
-/// the event is irrelevant. Extracted so the JSON-shape parsing has a
-/// pure-function test surface.
+/// What an event tells the ACP-session-id listener to do.
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub(super) enum AcpSessionChange {
     Assigned(String),
     Reset(String),
-    /// A user `/clear`: drop the stored resume id so the next worker
-    /// restart starts a fresh `session/new` instead of resurrecting the
-    /// pre-clear conversation via `session/load`. See #3080.
+    /// A user `/clear`.
     Cleared,
 }
 
@@ -913,54 +739,107 @@ pub(super) fn derive_acp_session_change(event: &crate::acp::Event) -> Option<Acp
     }
 }
 
-/// What an acp event implies for the sidebar status. `Set` is an
-/// unconditional transition; `HealError` only takes effect if the
-/// current status is `Error` (used to recover the sidebar from a
-/// sticky `AgentStartupError` banner after a successful respawn
-/// without clobbering an in-progress Running/Waiting turn).
+/// What an acp event implies for the sidebar status.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum StatusIntent {
     Set(Status),
+    /// Like `Set`, but a no-op while the sidebar sits on a status only the
+    /// main turn may resolve: `Waiting` (a pending approval/elicitation),
+    /// `Stopped` (a deliberate stop), or `Error` (a dead connection awaiting
+    /// respawn). Background sub-agent lifecycle events must not speak for
+    /// the main turn; its own events (plain `Set`) and `HealError` resolve
+    /// those. Used only by the `BackgroundAgent*` arms (#4001).
+    SetUnlessHeld(Status),
     HealError,
 }
 
-pub(crate) fn derive_acp_status(event: &crate::acp::Event) -> Option<StatusIntent> {
+/// Whether `derive_acp_status` reads either activity flag for `event`,
+/// i.e. whether a caller must hydrate a cold control cache before calling
+/// it. Adjacent to the two flag-reading arms below, not structurally tied to
+/// them: nothing enforces the pairing at compile time.
+/// `derive_acp_status_ignores_the_flags_off_the_two_reading_arms` covers
+/// every arm named today and fails if one of those starts reading the flags
+/// without being added here; the two functions sit next to each other so a
+/// genuinely new `Event` variant with a flag-reading arm is still on the
+/// reviewer to catch in the diff, the test cannot see it.
+pub(super) fn reads_activity_flags(event: &crate::acp::Event) -> bool {
+    matches!(
+        event,
+        crate::acp::Event::Stopped { .. } | crate::acp::Event::BackgroundAgentCompleted { .. }
+    )
+}
+
+/// `turn_active_after` and `background_agent_active_after` are the session's
+/// post-event activity flags from the folded control state (`AcpState::
+/// turn_active` / `has_active_background_agent()`); misses read `false` and
+/// degrade to boot's conservative verdict. `turn_active` itself still gates
+/// prompt dispatch and the queue drain and tracks only the main turn. Both
+/// `Stopped` and `BackgroundAgentCompleted` resolve Idle only once neither
+/// flag is set; the former needs the flags because the cache can be ahead of
+/// a lagged frame (a newer turn already opened), the latter because a
+/// sub-agent can outlive its own completion event's ordering.
+/// `reads_activity_flags` above must name exactly these two arms. See #4001.
+pub(crate) fn derive_acp_status(
+    event: &crate::acp::Event,
+    turn_active_after: bool,
+    background_agent_active_after: bool,
+) -> Option<StatusIntent> {
     use crate::acp::Event;
     match event {
         Event::UserPromptSent { .. }
         | Event::ApprovalResolved { .. }
         | Event::ElicitationResolved { .. } => Some(StatusIntent::Set(Status::Running)),
-        // Agent transcript output means a turn is live even when no
-        // UserPromptSent preceded it. A fired ScheduleWakeup or a background
-        // TaskOutput notification resumes the turn agent-side, streaming only
-        // these events; aoe never publishes a prompt for them, so without this
-        // the sidebar dot stayed grey through real work. apply_status_intent's
-        // guards keep a deliberate Stopped grey and no-op once already Running.
+        // Agent transcript output means a turn is live even when no UserPromptSent preceded
+        // it.
         Event::ThinkingStarted
         | Event::AgentMessageChunk { .. }
         | Event::ToolCallStarted { .. } => Some(StatusIntent::Set(Status::Running)),
+        // A launched or still-working background sub-agent keeps the sidebar
+        // dot lit even while the main turn is between its own events. Must
+        // not override a pending approval/elicitation's Waiting dot, which
+        // speaks to the main turn, not the sub-agent (#4001).
+        Event::BackgroundAgentLaunched { .. } => Some(StatusIntent::SetUnlessHeld(Status::Running)),
+        Event::BackgroundAgentProgress {
+            status: crate::acp::state::BackgroundAgentStatus::Running,
+            ..
+        } => Some(StatusIntent::SetUnlessHeld(Status::Running)),
         // A pending approval or elicitation both block the turn on the
         // user, so the sidebar dot goes yellow either way.
         Event::ApprovalRequested { .. } | Event::ElicitationRequested { .. } => {
             Some(StatusIntent::Set(Status::Waiting))
         }
-        // All Stopped reasons surface as Idle, including the
-        // rate-limit park: the worker is not crashed, the user just
-        // hit a provider quota and the session is waiting for reset
-        // (or for the user to switch to another ACP backend). The
-        // dedicated RateLimit banner carries the reset time, so the
-        // sidebar pill staying grey is the right signal. See #1281.
-        Event::Stopped { .. } => Some(StatusIntent::Set(Status::Idle)),
+        // All Stopped reasons surface as Idle, including the rate-limit park.
+        //
+        // Unless something is still busy after this `Stopped`: a background
+        // sub-agent keeps working past its parent (#4001), and the cache can
+        // be ahead of a lagged frame (a newer turn already opened), so the
+        // arm consults both activity flags. Live, the event itself folds
+        // `turn_active` false, so ahead-ness is the only source of `true`.
+        Event::Stopped { .. } => Some(StatusIntent::Set(
+            if turn_active_after || background_agent_active_after {
+                Status::Running
+            } else {
+                Status::Idle
+            },
+        )),
+        // The last outstanding background agent finished. Only drops to Idle
+        // once neither the main turn nor a sibling agent is still active
+        // (`turn_active_after` covers a sub-agent launched mid-turn that
+        // outlives its own completion event's ordering; the `Stopped` arm
+        // consults the same flags). `SetUnlessHeld`
+        // because a sibling agent finishing must not clobber a pending
+        // approval/elicitation on the main turn (#4001).
+        Event::BackgroundAgentCompleted { .. } => Some(StatusIntent::SetUnlessHeld(
+            if turn_active_after || background_agent_active_after {
+                Status::Running
+            } else {
+                Status::Idle
+            },
+        )),
         Event::AgentStartupError { .. } => Some(StatusIntent::Set(Status::Error)),
-        // A successful session/new or session/load means the agent
-        // is alive. Heal a sticky Error banner so the sidebar dot
-        // reverts from red to grey; do NOT clobber an in-progress
-        // Running/Waiting turn (a respawn during an active turn
-        // would otherwise stop the spinner mid-stream).
+        // A successful session/new or session/load means the agent is alive.
         Event::AcpSessionAssigned { .. } => Some(StatusIntent::HealError),
-        // Auto-resume after a rate-limit park: the worker is coming back.
-        // Heal any sticky error so the sidebar dot recovers; the imminent
-        // fresh spawn emits AcpSessionAssigned and live events right after.
+        // Auto-resume after a rate-limit park.
         Event::RateLimitAutoResumed { .. } => Some(StatusIntent::HealError),
         _ => None,
     }
@@ -972,10 +851,42 @@ mod tests {
     use crate::acp::protocol::AcpBroadcastFrame;
     use crate::server::test_support;
 
-    /// #3741: the tally follows the decision that reached the agent, and
-    /// a cancellation is not a user decision, so it counts as nothing.
-    /// The endpoint cannot do this itself: an answered option list posts
-    /// an allow-shaped decision whatever the option turns out to mean.
+    /// A broadcast only reaches receivers that subscribed before the send, and a spawned
+    /// listener subscribes as its first act.
+    async fn await_subscribed(state: &AppState) {
+        for _ in 0..500 {
+            if state.acp_events_tx.receiver_count() > 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        panic!("listener never subscribed");
+    }
+
+    /// Poll the session row until `want` holds, bounded so a failure reports the reason.
+    async fn await_row(
+        state: &AppState,
+        id: &str,
+        want: fn(&Instance) -> bool,
+        why: &str,
+    ) -> Instance {
+        for _ in 0..500 {
+            let row = state
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|i| i.id == id)
+                .cloned();
+            if let Some(row) = row.filter(want) {
+                return row;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        panic!("{why}");
+    }
+
+    /// #3741.
     #[test]
     fn approval_tally_counts_the_effective_decision_and_skips_cancellations() {
         use crate::acp::approvals::ApprovalDecision;
@@ -1002,113 +913,42 @@ mod tests {
         assert_eq!(counts(), (1, 1, 2), "a cancellation is not a decision");
     }
 
-    /// #3181: the automatic mark's predicate for a structured row, driven off
-    /// the live ACP turn-end event. One table rather than a test per case, per
-    /// the repo's compile-cost rule.
+    /// #3181: only a structured row's own Running -> Idle turn end marks unread.
     #[test]
     fn should_mark_acp_unread_only_on_a_structured_running_to_idle_turn_end() {
-        // (name, structured, old_status, new_status, unread_enabled, already_unread, expected)
-        let cases = [
-            (
-                "turn finished",
-                true,
-                Status::Running,
-                Status::Idle,
-                true,
-                false,
-                true,
-            ),
-            // The turn stopped while still blocked on the user, who is by
-            // construction present for it; an answered approval comes back
-            // through Running first, so this is not the answered-then-completed
-            // path.
-            (
-                "still blocked on the user",
-                true,
-                Status::Waiting,
-                Status::Idle,
-                true,
-                false,
-                false,
-            ),
-            (
-                "crashed, not finished",
-                true,
-                Status::Running,
-                Status::Error,
-                true,
-                false,
-                false,
-            ),
-            (
-                "turn starting",
-                true,
-                Status::Idle,
-                Status::Running,
-                true,
-                false,
-                false,
-            ),
-            (
-                "no transition applied",
-                true,
-                Status::Running,
-                Status::Running,
-                true,
-                false,
-                false,
-            ),
-            (
-                "feature off",
-                true,
-                Status::Running,
-                Status::Idle,
-                false,
-                false,
-                false,
-            ),
-            // Re-marking would churn the flock once per turn, and would undo a
-            // read the user has not been given a new turn to earn.
-            (
-                "already unread",
-                true,
-                Status::Running,
-                Status::Idle,
-                true,
-                true,
-                false,
-            ),
-            // Terminal rows stay with the tmux poll loop's
-            // `decide_passive_transition`.
-            (
-                "terminal row, owned elsewhere",
-                false,
-                Status::Running,
-                Status::Idle,
-                true,
-                false,
-                false,
-            ),
-        ];
-        for (name, structured, old, new, enabled, already_unread, expected) in cases {
-            let mut inst = Instance::new(name, "/tmp/test");
+        // The helper reads the row *after* `apply_status_intent` ran, so `new` is its
+        // current status and `old` the one it moved from.
+        let mark = |structured: bool, old, new, enabled, already_unread| {
+            let mut inst = Instance::new("row", "/tmp/test");
             if structured {
                 inst.view = crate::session::View::Structured;
             }
-            // The helper reads the row *after* `apply_status_intent` ran.
             inst.status = new;
             inst.unread = already_unread;
-            assert_eq!(
-                should_mark_acp_unread(&inst, old, enabled),
-                expected,
-                "{name}"
-            );
-        }
+            should_mark_acp_unread(&inst, old, enabled)
+        };
+        use Status::{Error, Idle, Running, Waiting};
+
+        assert!(mark(true, Running, Idle, true, false), "turn finished");
+        // The turn stopped while still blocked on the user, who is by construction
+        // present for it; an answered approval comes back through Running first, so
+        // this is not the answered-then-completed path.
+        assert!(
+            !mark(true, Waiting, Idle, true, false),
+            "blocked on the user"
+        );
+        assert!(!mark(true, Running, Error, true, false), "crashed");
+        assert!(!mark(true, Idle, Running, true, false), "turn starting");
+        assert!(!mark(true, Running, Running, true, false), "no transition");
+        assert!(!mark(true, Running, Idle, false, false), "feature off");
+        // Re-marking would churn the flock once per turn, and would undo a read the
+        // user has not been given a new turn to earn.
+        assert!(!mark(true, Running, Idle, true, true), "already unread");
+        // Terminal rows stay with the tmux poll loop's `decide_passive_transition`.
+        assert!(!mark(false, Running, Idle, true, false), "terminal row");
     }
 
-    /// Seed `profile`'s store with `rows`, so a persist closure has a matching
-    /// id to mark. Mirrors the shape used by the `flush_passive_transition_*`
-    /// tests in `status_poll.rs`.
+    /// Seed `profile`'s store with `rows`, so a persist closure has a matching id to mark.
     fn seed_profile_store(profile: &str, rows: Vec<Instance>) {
         crate::session::Storage::new_unwatched(profile)
             .expect("storage")
@@ -1128,14 +968,7 @@ mod tests {
             .find(|i| i.id == id)
     }
 
-    /// The commit-check half of `persist_and_mirror_unread`: memory is mirrored
-    /// only when the write actually mutated the owning row.
-    ///
-    /// The second call is the profile-move case a reviewer raised on #3530.
-    /// `persist_session_update` reports `Ok` for a write whose closure matched
-    /// nothing, so mirroring on `is_ok()` alone would mark memory off a
-    /// successful no-op against a profile the row no longer lives in, and the
-    /// next disk reload would silently drop the notification.
+    /// The commit-check half of `persist_and_mirror_unread`.
     #[tokio::test]
     #[serial_test::serial]
     async fn persist_and_mirror_unread_mirrors_only_a_committed_mutation() {
@@ -1148,8 +981,7 @@ mod tests {
         inst.source_profile = owning.to_string();
         let id = inst.id.clone();
         seed_profile_store(owning, vec![inst.clone()]);
-        // The profile the row is *not* in. Created empty, so the write there
-        // succeeds while matching nothing.
+        // The profile the row is *not* in.
         seed_profile_store("acp-unread-stale", Vec::new());
 
         let instances = RwLock::new(vec![inst]);
@@ -1195,9 +1027,8 @@ mod tests {
     }
 
     /// A failed write must not strand a memory-only mark, the #2755 rule that
-    /// `flush_passive_transition_defers_unread_until_persist_ok` (in
-    /// `status_poll.rs`) locks for the tmux poller. Separate test rather than a
-    /// row in the one above because it needs the store deliberately broken.
+    /// `flush_passive_transition_defers_unread_until_persist_ok` (in `status_poll.rs`)
+    /// locks for the tmux poller.
     #[tokio::test]
     #[serial_test::serial]
     async fn persist_and_mirror_unread_skips_the_mirror_on_a_failed_write() {
@@ -1232,16 +1063,7 @@ mod tests {
         );
     }
 
-    /// Lag replay, the other finding on #3530: the ACP broadcast tells a lagged
-    /// receiver only how many frames it missed, never which, so a dropped
-    /// `Stopped` would lose the turn-end mark permanently (unlike status, which
-    /// is level-triggered and re-derives from any later event). The events are
-    /// durable, so recovery reads the log.
-    ///
-    /// Three rows in one pass, all with a durable `Stopped` as their latest
-    /// lifecycle event, so the discriminator is the row rather than the event:
-    /// only the structured row still sitting at `Running` represents a turn that
-    /// ended unobserved.
+    /// Lag replay, the other finding on #3530.
     #[tokio::test]
     #[serial_test::serial]
     async fn recover_structured_unread_after_lag_marks_only_a_missed_turn_end() {
@@ -1251,15 +1073,13 @@ mod tests {
 
         let profile = "acp-unread-lag-replay";
 
-        // The turn ended while the listener was lagged: memory still says
-        // Running, the log already has the Stopped we never saw.
+        // The turn ended while the listener was lagged.
         let mut missed = Instance::new("acp-missed", "/tmp/acp");
         missed.view = crate::session::View::Structured;
         missed.source_profile = profile.to_string();
         missed.status = Status::Running;
 
-        // Already reconciled: the Stopped was observed, so there is no
-        // transition left to apply and no second mark to make.
+        // Already reconciled.
         let mut already = Instance::new("acp-already-idle", "/tmp/acp");
         already.view = crate::session::View::Structured;
         already.source_profile = profile.to_string();
@@ -1288,6 +1108,11 @@ mod tests {
                 )
                 .expect("record stopped");
         }
+        // A cold control cache for these sessions: lag recovery never
+        // hydrates it, so the reads miss and degrade to boot's conservative
+        // `(false, false)` verdict, the Idle+unread behavior this test pins
+        // (#4001).
+        let control_cache = crate::acp::control_cache::ControlStateCache::new();
 
         let instances = RwLock::new(rows);
         let locks = RwLock::new(std::collections::HashMap::new());
@@ -1297,6 +1122,7 @@ mod tests {
             &instances,
             &store,
             &locks,
+            &control_cache,
             crate::file_watch::FileWatchService::noop(),
             &status_tx,
         )
@@ -1331,6 +1157,223 @@ mod tests {
         assert!(!row(&terminal_id).unread);
     }
 
+    /// #4001: the lag-recovery replay must consult the live control cache.
+    /// The seed query excludes background events, so the latest status event
+    /// is the turn's `Stopped` even though a background sub-agent is still
+    /// running; deriving from hardcoded inactivity would resolve Idle under
+    /// the live `Running` memory status and mark an unfinished turn unread.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn recover_structured_unread_after_lag_keeps_running_for_a_live_background_agent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+        crate::session::set_unread_enabled(true);
+
+        let profile = "acp-unread-lag-background";
+
+        // Same shape as the missed turn end: memory still says Running.
+        let mut live = Instance::new("acp-live-bg", "/tmp/acp");
+        live.view = crate::session::View::Structured;
+        live.source_profile = profile.to_string();
+        live.status = Status::Running;
+        let live_id = live.id.clone();
+        let rows = vec![live];
+        seed_profile_store(profile, rows.clone());
+
+        let db = temp.path().join("acp-events.db");
+        let store = crate::acp::event_store::EventStore::open(&db, 1000).expect("event store");
+        store
+            .record(
+                &live_id,
+                1,
+                &crate::acp::Event::UserPromptSent {
+                    text: "spawn and go".into(),
+                    attachments: Vec::new(),
+                    prompt_id: None,
+                    synthesized: false,
+                },
+            )
+            .expect("record prompt");
+        store
+            .record(
+                &live_id,
+                2,
+                &crate::acp::Event::BackgroundAgentLaunched {
+                    agent_id: "bg-1".into(),
+                    tool_call_id: "tc-1".into(),
+                    description: "map backend".into(),
+                    prompt: "do it".into(),
+                    model: "claude-opus-4-8".into(),
+                    output_file: "/tmp/bg-1.output".into(),
+                    started_at: chrono::Utc::now(),
+                },
+            )
+            .expect("record launch");
+        store
+            .record(
+                &live_id,
+                3,
+                &crate::acp::Event::Stopped {
+                    reason: "prompt_complete".into(),
+                },
+            )
+            .expect("record stop");
+
+        // The daemon's control cache folded the same log, so it still sees
+        // the outstanding sub-agent even though the seed query does not.
+        let control_cache = crate::acp::control_cache::ControlStateCache::new();
+        control_cache.get_or_hydrate(&live_id, || {
+            let mut reduced = crate::acp::state::AcpState::new(
+                crate::acp::state::AcpSessionId(live_id.clone()),
+                crate::acp::state::AgentName("claude".into()),
+                None,
+            );
+            let mut last_seq = 0;
+            for (seq, event) in store.replay_from(&live_id, 0) {
+                let _ = reduced.apply_event(event);
+                last_seq = seq;
+            }
+            (reduced, last_seq)
+        });
+        assert!(
+            control_cache.has_active_background_agent(&live_id),
+            "precondition: the folded cache still sees the sub-agent"
+        );
+
+        let instances = RwLock::new(rows);
+        let locks = RwLock::new(std::collections::HashMap::new());
+        let (status_tx, _rx) = broadcast::channel(16);
+
+        let marked = recover_structured_unread_after_lag(
+            &instances,
+            &store,
+            &locks,
+            &control_cache,
+            crate::file_watch::FileWatchService::noop(),
+            &status_tx,
+        )
+        .await;
+
+        assert_eq!(marked, 0, "a live background sub-agent is not a turn end");
+
+        let guard = instances.read().await;
+        let inst = guard.iter().find(|i| i.id == live_id).expect("row");
+        assert_eq!(
+            inst.status,
+            Status::Running,
+            "the Stopped must not resolve Idle under the still-running sub-agent"
+        );
+        assert!(!inst.unread, "an unfinished turn must not be marked unread");
+    }
+
+    /// #4001: a `UserDiffCommentsPrompt` opens a turn in the control state
+    /// but is absent from the seed query, so during such a turn the latest
+    /// seed event is the previous turn's `Stopped`. Lag recovery must let
+    /// the cache's `turn_active` override that stale seed instead of
+    /// resolving Idle under the live turn and marking it unread.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn recover_structured_unread_after_lag_keeps_running_for_a_newer_turn_past_the_seed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+        crate::session::set_unread_enabled(true);
+
+        let profile = "acp-unread-lag-newer-turn";
+
+        let mut live = Instance::new("acp-live-newer-turn", "/tmp/acp");
+        live.view = crate::session::View::Structured;
+        live.source_profile = profile.to_string();
+        live.status = Status::Running;
+        let live_id = live.id.clone();
+        let rows = vec![live];
+        seed_profile_store(profile, rows.clone());
+
+        let db = temp.path().join("acp-events.db");
+        let store = crate::acp::event_store::EventStore::open(&db, 1000).expect("event store");
+        store
+            .record(
+                &live_id,
+                1,
+                &crate::acp::Event::UserPromptSent {
+                    text: "first turn".into(),
+                    attachments: Vec::new(),
+                    prompt_id: None,
+                    synthesized: false,
+                },
+            )
+            .expect("record prompt");
+        store
+            .record(
+                &live_id,
+                2,
+                &crate::acp::Event::Stopped {
+                    reason: "prompt_complete".into(),
+                },
+            )
+            .expect("record stop");
+        // The newer turn the seed query cannot see.
+        store
+            .record(
+                &live_id,
+                3,
+                &crate::acp::Event::UserDiffCommentsPrompt {
+                    intro: "intro".into(),
+                    outro: "outro".into(),
+                    is_multi_repo: false,
+                    comments: Vec::new(),
+                    assembled_markdown: "diff".into(),
+                },
+            )
+            .expect("record diff prompt");
+
+        let control_cache = crate::acp::control_cache::ControlStateCache::new();
+        control_cache.get_or_hydrate(&live_id, || {
+            let mut reduced = crate::acp::state::AcpState::new(
+                crate::acp::state::AcpSessionId(live_id.clone()),
+                crate::acp::state::AgentName("claude".into()),
+                None,
+            );
+            let mut last_seq = 0;
+            for (seq, event) in store.replay_from(&live_id, 0) {
+                let _ = reduced.apply_event(event);
+                last_seq = seq;
+            }
+            (reduced, last_seq)
+        });
+        assert!(
+            control_cache.turn_active(&live_id),
+            "precondition: the folded cache sees the newer turn"
+        );
+
+        let instances = RwLock::new(rows);
+        let locks = RwLock::new(std::collections::HashMap::new());
+        let (status_tx, _rx) = broadcast::channel(16);
+
+        let marked = recover_structured_unread_after_lag(
+            &instances,
+            &store,
+            &locks,
+            &control_cache,
+            crate::file_watch::FileWatchService::noop(),
+            &status_tx,
+        )
+        .await;
+
+        assert_eq!(marked, 0, "a live newer turn is not a turn end");
+
+        let guard = instances.read().await;
+        let inst = guard.iter().find(|i| i.id == live_id).expect("row");
+        assert_eq!(
+            inst.status,
+            Status::Running,
+            "the stale seed Stopped must not resolve Idle under the newer turn"
+        );
+        assert!(!inst.unread, "an unfinished turn must not be marked unread");
+    }
+
+    /// A capability frame is only applied when it names the worker generation that is
+    /// still live, so an event queued by a replaced worker is dropped while the sentinel
+    /// event behind it still lands.
     #[tokio::test]
     async fn acp_event_listener_tracks_load_session_capability_updates() {
         let _app_dir = crate::session::test_support::isolate_app_dir();
@@ -1342,57 +1385,38 @@ mod tests {
         let first_generation = state.acp_supervisor.test_insert_worker(&id).await;
         let listener = tokio::spawn(acp_event_listener(state.clone()));
 
-        for _ in 0..500 {
-            if state.acp_events_tx.receiver_count() > 0 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        }
-        assert!(state.acp_events_tx.receiver_count() > 0);
+        await_subscribed(&state).await;
 
-        let send_capability = |seq, capable, worker_generation| {
+        let send = |seq, event, worker_generation| {
             state
                 .acp_events_tx
                 .send(AcpBroadcastFrame {
                     session_id: id.clone(),
                     seq,
-                    event: Arc::new(crate::acp::Event::PromptCapabilities {
-                        image: false,
-                        audio: false,
-                        embedded_context: false,
-                        load_session: Some(capable),
-                        steering: false,
-                    }),
-                    worker_generation: Some(worker_generation),
+                    event: Arc::new(event),
+                    worker_generation,
                 })
                 .expect("listener is subscribed");
         };
+        let capability = |load_session| crate::acp::Event::PromptCapabilities {
+            image: false,
+            audio: false,
+            embedded_context: false,
+            load_session: Some(load_session),
+            steering: false,
+        };
 
-        send_capability(1, true, first_generation);
-        for _ in 0..500 {
-            if state
-                .instances
-                .read()
-                .await
-                .iter()
-                .find(|inst| inst.id == id)
-                .is_some_and(|inst| inst.acp_load_session_capable == Some(true))
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        }
-        assert!(
-            state
-                .instances
-                .read()
-                .await
-                .iter()
-                .find(|inst| inst.id == id)
-                .is_some_and(|inst| inst.acp_load_session_capable == Some(true)),
-            "the active worker capability was not applied"
-        );
+        send(1, capability(true), Some(first_generation));
+        await_row(
+            &state,
+            &id,
+            |i| i.acp_load_session_capable == Some(true),
+            "the active worker capability was not applied",
+        )
+        .await;
 
+        // Replace the worker, then publish a stale frame from the old generation with a
+        // generation-less sentinel behind it.
         state.acp_supervisor.test_remove_worker(&id).await;
         state
             .instances
@@ -1405,83 +1429,40 @@ mod tests {
         let second_generation = state.acp_supervisor.test_insert_worker(&id).await;
         assert_ne!(first_generation, second_generation);
 
-        send_capability(2, false, first_generation);
-        state
-            .acp_events_tx
-            .send(AcpBroadcastFrame {
-                session_id: id.clone(),
-                seq: 3,
-                event: Arc::new(crate::acp::Event::AcpSessionAssigned {
-                    acp_session_id: "replacement-acp-id".to_string(),
-                }),
-                worker_generation: None,
-            })
-            .expect("listener is subscribed");
-        for _ in 0..500 {
-            if state
-                .instances
-                .read()
-                .await
-                .iter()
-                .find(|inst| inst.id == id)
-                .is_some_and(|inst| inst.acp_session_id.as_deref() == Some("replacement-acp-id"))
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        }
-        let instance = state
-            .instances
-            .read()
-            .await
-            .iter()
-            .find(|inst| inst.id == id)
-            .cloned()
-            .expect("instance");
-        assert_eq!(
-            instance.acp_session_id.as_deref(),
-            Some("replacement-acp-id"),
-            "the sentinel event behind the stale frame was not applied"
+        send(2, capability(false), Some(first_generation));
+        send(
+            3,
+            crate::acp::Event::AcpSessionAssigned {
+                acp_session_id: "replacement-acp-id".to_string(),
+            },
+            None,
         );
+        let row = await_row(
+            &state,
+            &id,
+            |i| i.acp_session_id.as_deref() == Some("replacement-acp-id"),
+            "the sentinel event behind the stale frame was not applied",
+        )
+        .await;
         assert_eq!(
-            instance.acp_load_session_capable, None,
+            row.acp_load_session_capable, None,
             "a queued event from the replaced worker must be ignored"
         );
 
-        send_capability(4, false, second_generation);
-        for _ in 0..500 {
-            if state
-                .instances
-                .read()
-                .await
-                .iter()
-                .find(|inst| inst.id == id)
-                .is_some_and(|inst| inst.acp_load_session_capable == Some(false))
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        }
-        assert!(
-            state
-                .instances
-                .read()
-                .await
-                .iter()
-                .find(|inst| inst.id == id)
-                .is_some_and(|inst| inst.acp_load_session_capable == Some(false)),
-            "the replacement worker capability was not applied"
-        );
+        send(4, capability(false), Some(second_generation));
+        await_row(
+            &state,
+            &id,
+            |i| i.acp_load_session_capable == Some(false),
+            "the replacement worker capability was not applied",
+        )
+        .await;
 
         listener.abort();
         let _ = listener.await;
     }
-    /// End to end over `acp_event_listener` itself, the path that actually
-    /// closes #3181. The predicate table and the TUI ownership tests all pass
-    /// even if the snapshot is taken *after* `apply_status_intent`, the persist
-    /// is dropped, or the mirror is reordered, because none of them run the
-    /// listener. This one drives a real `Event::Stopped` frame through the
-    /// broadcast and asserts both halves of the write.
+
+    /// End to end over `acp_event_listener` itself, the path that actually closes #3181.
     #[tokio::test]
     #[serial_test::serial]
     async fn acp_event_listener_marks_a_finished_turn_unread_on_disk_and_in_memory() {
@@ -1501,20 +1482,7 @@ mod tests {
         let state = test_support::build_test_app_state(vec![inst]);
         let listener = tokio::spawn(acp_event_listener(state.clone()));
 
-        // A broadcast only reaches receivers that subscribed before the send,
-        // and the spawned listener subscribes as its first act. Wait for that
-        // rather than racing it; nothing else in this test subscribes, so the
-        // count reaching 1 is precisely "the listener is listening".
-        for _ in 0..500 {
-            if state.acp_events_tx.receiver_count() > 0 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        }
-        assert!(
-            state.acp_events_tx.receiver_count() > 0,
-            "listener never subscribed"
-        );
+        await_subscribed(&state).await;
 
         // The turn ends.
         state
@@ -1529,273 +1497,447 @@ mod tests {
             })
             .expect("listener is subscribed");
 
-        // The listener owns the write, so poll rather than sleeping a fixed
-        // interval: the persist is a real flock'd file write. Wait on the
-        // *mirror*, which is the last step, so this cannot abort the listener
-        // in between the disk write and the mirror and then blame the mirror.
-        let mut mirrored = false;
-        for _ in 0..500 {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            if state
-                .instances
-                .read()
-                .await
-                .iter()
-                .any(|i| i.id == id && i.unread)
-            {
-                mirrored = true;
-                break;
-            }
-        }
+        let row = await_row(
+            &state,
+            &id,
+            |i| i.unread,
+            "daemon memory must mirror the mark, so /api/sessions reports it",
+        )
+        .await;
         listener.abort();
         let _ = listener.await;
 
-        assert!(
-            mirrored,
-            "daemon memory must mirror the mark, so /api/sessions reports it"
-        );
+        assert_eq!(row.status, Status::Idle, "the Stopped applied");
         assert!(
             load_profile_row(profile, &id).is_some_and(|i| i.unread),
             "and the mark must be durable, which is the #3181 fix; a memory-only \
              mark is dropped by the next reload"
         );
-        let instances = state.instances.read().await;
-        let row = instances.iter().find(|i| i.id == id).expect("row present");
-        assert_eq!(row.status, Status::Idle, "the Stopped applied");
     }
 
-    // #2237: a worker coming live (AcpSessionAssigned) must clear a stale
-    // idle-dormant marker, even when the acp_session_id is unchanged (a
-    // session/load reattach reuses it). Without this, a stale marker left by a
-    // non-user respawn keeps the reconciler's resume filter skipping the
-    // session forever once the worker dies, deadlocking a queued prompt.
-    #[test]
-    fn acp_session_assigned_clears_stale_dormant_marker_on_same_id() {
-        let mut inst = Instance::new("seed", "/tmp/seed");
-        inst.acp_session_id = Some("sid-1".to_string());
-        inst.idle_dormant_since = Some(chrono::Utc::now());
+    /// #4001: after a daemon restart the control cache is cold, and the
+    /// live listener's own reads of it never hydrate. A worker reattaching
+    /// mid-turn then emits its background sub-agent's completion live, with
+    /// no Stopped in between; without hydrating first, both activity flags
+    /// read false and the completion wrongly derives Idle, marking the
+    /// still-open turn unread. Hydrating must pick up the whole log,
+    /// including the still-open `UserPromptSent`, and keep the row Running.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn acp_event_listener_hydrates_a_cold_cache_for_a_reattached_mid_turn_completion() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+        crate::session::set_unread_enabled(true);
 
-        // Same id as already stored: the only reason to persist is the
-        // stale-dormant clear, so the function must return Some(profile).
-        let persist = apply_acp_session_change(
-            &mut inst,
-            "seed",
-            Some(&AcpSessionChange::Assigned("sid-1".to_string())),
-        );
-        assert!(
-            inst.idle_dormant_since.is_none(),
-            "dormant marker must be cleared when a worker (re)assigns"
-        );
-        assert!(
-            persist.is_some(),
-            "clearing a stale marker must trigger a persist even on an unchanged id"
-        );
-    }
-
-    // A structured fork mints a brand-new child id on its first session/fork,
-    // so the assigned id differs from the (None) acp_session_id and we take the
-    // new-assignment path. That path must consume the one-shot fork_pending seed
-    // and persist, so a restart resumes the child via session/load rather than
-    // re-forking the parent.
-    #[test]
-    fn assigning_forked_id_clears_fork_pending_and_persists() {
-        let mut inst = Instance::new("seed", "/tmp/seed");
+        let profile = "acp-listener-cold-reattach";
+        let mut inst = Instance::new("acp-cold-reattach", "/tmp/acp");
         inst.view = crate::session::View::Structured;
-        inst.acp_session_id = None;
-        inst.fork_pending = Some("parent-acp-id".into());
-        inst.import_pending = Some(true);
+        inst.source_profile = profile.to_string();
+        // Seeded Idle, not the Running a real boot would leave: the poll
+        // below must observe the listener drive Idle -> Running, or a
+        // vacuous seed would pass whether or not the fix ran.
+        inst.status = Status::Idle;
+        let id = inst.id.clone();
+        seed_profile_store(profile, vec![inst.clone()]);
 
-        let profile = apply_acp_session_change(
-            &mut inst,
-            "sess-1",
-            Some(&AcpSessionChange::Assigned("forked-child-id".into())),
+        let state = test_support::build_test_app_state(vec![inst]);
+
+        // The whole pre-restart log, persisted but never folded into this
+        // (fresh, cold) process's cache: the turn is still open, a sub-agent
+        // was launched, and it has now completed. No Stopped.
+        state
+            .acp_event_store
+            .record(
+                &id,
+                1,
+                &crate::acp::Event::UserPromptSent {
+                    text: "spawn and go".into(),
+                    attachments: Vec::new(),
+                    prompt_id: None,
+                    synthesized: false,
+                },
+            )
+            .expect("record prompt");
+        state
+            .acp_event_store
+            .record(
+                &id,
+                2,
+                &crate::acp::Event::BackgroundAgentLaunched {
+                    agent_id: "bg-1".into(),
+                    tool_call_id: "tc-1".into(),
+                    description: "map backend".into(),
+                    prompt: "do it".into(),
+                    model: "claude-opus-4-8".into(),
+                    output_file: "/tmp/bg-1.output".into(),
+                    started_at: chrono::Utc::now(),
+                },
+            )
+            .expect("record launch");
+        let completed = crate::acp::Event::BackgroundAgentCompleted {
+            agent_id: "bg-1".into(),
+            status: crate::acp::state::BackgroundAgentStatus::Completed,
+            tools: Vec::new(),
+            result: Some("done".into()),
+            warning: None,
+            ended_at: chrono::Utc::now(),
+        };
+        state
+            .acp_event_store
+            .record(&id, 3, &completed)
+            .expect("record completion");
+
+        assert!(
+            !state.acp_control_cache.is_hydrated(&id),
+            "precondition: a fresh process starts with a cold cache"
         );
 
-        assert_eq!(inst.acp_session_id.as_deref(), Some("forked-child-id"));
-        assert_eq!(
-            inst.fork_pending, None,
-            "fork_pending cleared once the forked id is assigned"
+        let listener = tokio::spawn(acp_event_listener(state.clone()));
+        for _ in 0..500 {
+            if state.acp_events_tx.receiver_count() > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(
+            state.acp_events_tx.receiver_count() > 0,
+            "listener never subscribed"
         );
-        assert_eq!(
-            inst.import_pending, None,
-            "import_pending consumed alongside fork_pending so a restart does not re-seed the transcript into the forked store"
+
+        // The reattached worker's tailer resumes and emits the sub-agent's
+        // completion as the first live frame this process sees.
+        state
+            .acp_events_tx
+            .send(AcpBroadcastFrame {
+                session_id: id.clone(),
+                seq: 3,
+                event: Arc::new(completed),
+                worker_generation: None,
+            })
+            .expect("listener is subscribed");
+
+        // Poll for the Idle -> Running transition, not the cache's hydrated
+        // flag: a yield point (the instances write lock) sits between the
+        // hydrating await and the status write landing, so a hydrated cache
+        // does not imply the write happened yet. `status` is the whole
+        // discriminating signal here: `should_mark_acp_unread` only marks a
+        // row unread off an OLD status of Running, and the seed above is
+        // Idle, so unread cannot flip regardless of the fix; the guard below
+        // checks it anyway in case a future change adds a different path to
+        // unread. Without the gated hydration `row.status` never turns
+        // Running (a cold read derives Idle) and the loop times out.
+        let mut resolved = false;
+        for _ in 0..500 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let instances = state.instances.read().await;
+            if let Some(row) = instances.iter().find(|i| i.id == id) {
+                if row.status == Status::Running {
+                    resolved = true;
+                    break;
+                }
+            }
+        }
+        listener.abort();
+
+        assert!(
+            resolved,
+            "a live turn must not drop to Idle off a cold-cache miss"
+        );
+        {
+            let instances = state.instances.read().await;
+            let row = instances.iter().find(|i| i.id == id).expect("row");
+            assert!(
+                !row.unread,
+                "guard: a resolved live turn must not be unread"
+            );
+        }
+        assert!(
+            state.acp_control_cache.is_hydrated(&id),
+            "the listener must have hydrated the cold session"
         );
         assert!(
-            profile.is_some(),
-            "must persist so the forked id survives restart"
+            state.acp_control_cache.turn_active(&id),
+            "the replay must pick up the still-open UserPromptSent"
         );
     }
 
-    // A different-id assignment that is NOT consuming a fork (fork_pending is
-    // None) must leave import_pending alone: that marker belongs to the import
-    // flow, which lands on the same-id path, and clearing it here would block a
-    // legitimate import retry from re-seeding the transcript.
-    #[test]
-    fn non_fork_assignment_preserves_import_pending() {
-        let mut inst = Instance::new("seed", "/tmp/seed");
-        inst.acp_session_id = None;
-        inst.fork_pending = None;
-        inst.import_pending = Some(true);
+    /// #4001: the `Stopped` arm reads the same activity flags as
+    /// `BackgroundAgentCompleted` and needs the same cold-cache hydration.
+    /// A worker reattaches with its sub-agent still running, the main turn
+    /// ends, and the tailer's next line this process sees is a plain
+    /// `Stopped` (no completion yet); without hydrating first, both flags
+    /// read false and `Stopped` wrongly derives Idle, marking the still-open
+    /// work unread. Hydrating must pick up the outstanding launch and keep
+    /// the row Running.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn acp_event_listener_hydrates_a_cold_cache_for_a_stopped_turn_with_an_outstanding_agent()
+    {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+        crate::session::set_unread_enabled(true);
 
-        let profile = apply_acp_session_change(
-            &mut inst,
-            "sess-1",
-            Some(&AcpSessionChange::Assigned("some-new-id".into())),
+        let profile = "acp-listener-cold-stopped-outstanding";
+        let mut inst = Instance::new("acp-cold-stopped-outstanding", "/tmp/acp");
+        inst.view = crate::session::View::Structured;
+        inst.source_profile = profile.to_string();
+        // Seeded Idle, not the Running a real boot would leave: the poll
+        // below must observe the listener drive Idle -> Running, or a
+        // vacuous seed would pass whether or not the fix ran.
+        inst.status = Status::Idle;
+        let id = inst.id.clone();
+        seed_profile_store(profile, vec![inst.clone()]);
+
+        let state = test_support::build_test_app_state(vec![inst]);
+
+        // The pre-restart log: a sub-agent was launched and is still going
+        // (no completion recorded) when the main turn's Stopped arrives.
+        state
+            .acp_event_store
+            .record(
+                &id,
+                1,
+                &crate::acp::Event::UserPromptSent {
+                    text: "spawn and go".into(),
+                    attachments: Vec::new(),
+                    prompt_id: None,
+                    synthesized: false,
+                },
+            )
+            .expect("record prompt");
+        state
+            .acp_event_store
+            .record(
+                &id,
+                2,
+                &crate::acp::Event::BackgroundAgentLaunched {
+                    agent_id: "bg-1".into(),
+                    tool_call_id: "tc-1".into(),
+                    description: "map backend".into(),
+                    prompt: "do it".into(),
+                    model: "claude-opus-4-8".into(),
+                    output_file: "/tmp/bg-1.output".into(),
+                    started_at: chrono::Utc::now(),
+                },
+            )
+            .expect("record launch");
+        let stopped = crate::acp::Event::Stopped {
+            reason: "prompt_complete".into(),
+        };
+        state
+            .acp_event_store
+            .record(&id, 3, &stopped)
+            .expect("record stop");
+
+        assert!(
+            !state.acp_control_cache.is_hydrated(&id),
+            "precondition: a fresh process starts with a cold cache"
         );
 
-        assert_eq!(inst.acp_session_id.as_deref(), Some("some-new-id"));
-        assert_eq!(
-            inst.import_pending,
-            Some(true),
-            "a non-fork different-id assignment must not consume import_pending"
+        let listener = tokio::spawn(acp_event_listener(state.clone()));
+        for _ in 0..500 {
+            if state.acp_events_tx.receiver_count() > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(
+            state.acp_events_tx.receiver_count() > 0,
+            "listener never subscribed"
+        );
+
+        // The reattached worker's tailer resumes and emits the main turn's
+        // Stopped as the first live frame this process sees.
+        state
+            .acp_events_tx
+            .send(AcpBroadcastFrame {
+                session_id: id.clone(),
+                seq: 3,
+                event: Arc::new(stopped),
+                worker_generation: None,
+            })
+            .expect("listener is subscribed");
+
+        // Same discriminating signal as the completion test above: the
+        // seeded Idle status means `should_mark_acp_unread` can never flip
+        // unread here, so `status` alone is what the poll must watch for,
+        // and the guard assertion below checks unread separately.
+        let mut resolved = false;
+        for _ in 0..500 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let instances = state.instances.read().await;
+            if let Some(row) = instances.iter().find(|i| i.id == id) {
+                if row.status == Status::Running {
+                    resolved = true;
+                    break;
+                }
+            }
+        }
+        listener.abort();
+
+        assert!(
+            resolved,
+            "a sub-agent still running past its parent's Stopped must not drop to Idle off a cold-cache miss"
+        );
+        {
+            let instances = state.instances.read().await;
+            let row = instances.iter().find(|i| i.id == id).expect("row");
+            assert!(
+                !row.unread,
+                "guard: a resolved live turn must not be unread"
+            );
+        }
+        assert!(
+            state.acp_control_cache.is_hydrated(&id),
+            "the listener must have hydrated the cold session"
         );
         assert!(
-            profile.is_some(),
-            "a new id assignment must persist regardless of markers"
+            state.acp_control_cache.has_active_background_agent(&id),
+            "the replay must pick up the still-outstanding launch"
         );
     }
 
-    // A SessionContextReset from a FAILED structured fork must clear the
-    // one-shot fork marker (and its paired import marker) so neither the
-    // reconciler nor the supervisor re-issues the same failing session/fork on
-    // the next reattach. This is the reducer side of the fork-failure retry-loop
-    // fix; the reset carries no new id, so acp_session_id is cleared too.
+    /// #2237 plus the one-shot fork/import markers: a reassignment clears a stale
+    /// dormant marker even when the id is unchanged, a consumed fork drops both markers
+    /// together so a restart neither re-forks nor re-seeds the transcript, and a change
+    /// that is not consuming a fork leaves `import_pending` for the restart that needs it.
     #[test]
-    fn reset_clears_fork_pending_and_import_pending() {
-        let mut inst = Instance::new("seed", "/tmp/seed");
-        inst.view = crate::session::View::Structured;
-        inst.acp_session_id = Some("stale-parent-id".into());
-        inst.fork_pending = Some("parent-acp-id".into());
-        inst.import_pending = Some(true);
+    fn apply_acp_session_change_matrix() {
+        use AcpSessionChange::*;
+        type Row = (Option<String>, Option<String>, Option<bool>, bool);
 
-        let profile = apply_acp_session_change(
-            &mut inst,
-            "sess-1",
-            Some(&AcpSessionChange::Reset("fork_failed: boom".into())),
-        );
+        fn applied(
+            id: Option<&str>,
+            fork: Option<&str>,
+            import: Option<bool>,
+            dormant: bool,
+            change: AcpSessionChange,
+        ) -> Row {
+            let mut inst = Instance::new("seed", "/tmp/seed");
+            inst.view = crate::session::View::Structured;
+            inst.acp_session_id = id.map(str::to_string);
+            inst.fork_pending = fork.map(str::to_string);
+            inst.import_pending = import;
+            inst.idle_dormant_since = dormant.then(chrono::Utc::now);
+            let persist = apply_acp_session_change(&mut inst, "sess-1", Some(&change));
+            (
+                inst.acp_session_id.clone(),
+                inst.fork_pending.clone(),
+                inst.import_pending,
+                persist.is_some(),
+            )
+        }
+        fn want(id: Option<&str>, fork: Option<&str>, import: Option<bool>, persists: bool) -> Row {
+            (
+                id.map(str::to_string),
+                fork.map(str::to_string),
+                import,
+                persists,
+            )
+        }
 
-        assert_eq!(inst.acp_session_id, None, "reset clears the stored id");
         assert_eq!(
-            inst.fork_pending, None,
-            "a failed fork's one-shot marker must clear so it is not retried"
-        );
-        assert_eq!(
-            inst.import_pending, None,
-            "import_pending is consumed alongside fork_pending on reset"
-        );
-        assert!(profile.is_some(), "the reset must persist");
-    }
-
-    // A SessionContextReset from a plain session/load failure (no fork pending)
-    // must clear the dead id but leave import_pending untouched: that marker
-    // belongs to the import flow, and clearing it here would block a legitimate
-    // import retry. Mirrors the non-fork assignment guard.
-    #[test]
-    fn reset_without_fork_pending_preserves_import_pending() {
-        let mut inst = Instance::new("seed", "/tmp/seed");
-        inst.acp_session_id = Some("dead-id".into());
-        inst.fork_pending = None;
-        inst.import_pending = Some(true);
-
-        let profile = apply_acp_session_change(
-            &mut inst,
-            "sess-1",
-            Some(&AcpSessionChange::Reset("session/load failed: gone".into())),
-        );
-
-        assert_eq!(inst.acp_session_id, None, "reset clears the dead id");
-        assert_eq!(
-            inst.import_pending,
-            Some(true),
-            "a non-fork reset must not consume import_pending"
-        );
-        assert!(profile.is_some(), "the reset must persist");
-    }
-
-    #[test]
-    fn acp_session_assigned_same_id_no_marker_is_noop() {
-        let mut inst = Instance::new("seed", "/tmp/seed");
-        inst.acp_session_id = Some("sid-1".to_string());
-        inst.idle_dormant_since = None;
-        // Same id, nothing stale to clear: must stay a no-op (no rewrite).
-        let persist = apply_acp_session_change(
-            &mut inst,
-            "seed",
-            Some(&AcpSessionChange::Assigned("sid-1".to_string())),
-        );
-        assert!(
-            persist.is_none(),
-            "unchanged id with no stale marker is a no-op"
-        );
-    }
-
-    // #3080: a user /clear emits Event::SessionCleared. Before the fix this
-    // derived no session change, so the stale ACP id survived on disk and the
-    // next worker restart replayed the pre-clear conversation via session/load.
-    // It must now derive a Cleared change so the stored id is dropped.
-    #[test]
-    fn session_cleared_derives_cleared_change() {
-        assert_eq!(
-            derive_acp_session_change(&crate::acp::Event::SessionCleared),
-            Some(AcpSessionChange::Cleared),
-            "a /clear must invalidate the persisted ACP resume id"
-        );
-    }
-
-    // Applying Cleared must null the stored id and force a clean restart by
-    // dropping the paired fork/import markers too: a /clear issued before a
-    // pending fork/import resolves must still restart as session/new, not
-    // re-session/fork the parent. See #3080.
-    #[test]
-    fn cleared_nulls_stored_id_and_pending_markers() {
-        let mut inst = Instance::new("seed", "/tmp/seed");
-        inst.view = crate::session::View::Structured;
-        inst.acp_session_id = Some("pre-clear-id".into());
-        inst.fork_pending = Some("parent-acp-id".into());
-        inst.import_pending = Some(true);
-
-        let profile =
-            apply_acp_session_change(&mut inst, "sess-1", Some(&AcpSessionChange::Cleared));
-
-        assert_eq!(inst.acp_session_id, None, "clear drops the stored id");
-        assert_eq!(
-            inst.fork_pending, None,
-            "clear drops fork_pending so restart does not re-fork the parent"
+            applied(Some("sid-1"), None, None, true, Assigned("sid-1".into())),
+            want(Some("sid-1"), None, None, true),
+            "a stale dormant marker must be cleared, and persisted, on an unchanged id"
         );
         assert_eq!(
-            inst.import_pending, None,
-            "clear drops import_pending so restart is a clean session/new"
+            applied(Some("sid-1"), None, None, false, Assigned("sid-1".into())),
+            want(Some("sid-1"), None, None, false),
+            "an unchanged id with nothing stale is a no-op"
         );
-        assert!(profile.is_some(), "the clear must persist");
-    }
-
-    // Regression for the event-ordering the listener sees: an id assigned at
-    // connect followed by a later /clear must end with no stored id. See #3080.
-    #[test]
-    fn assign_then_clear_leaves_no_stored_id() {
-        let mut inst = Instance::new("seed", "/tmp/seed");
-        inst.view = crate::session::View::Structured;
-
-        apply_acp_session_change(
-            &mut inst,
-            "sess-1",
-            Some(&AcpSessionChange::Assigned("old-id".into())),
-        );
-        assert_eq!(inst.acp_session_id, Some("old-id".into()));
-
-        apply_acp_session_change(&mut inst, "sess-1", Some(&AcpSessionChange::Cleared));
         assert_eq!(
-            inst.acp_session_id, None,
-            "a /clear after an assignment must not leave the old id on disk"
+            applied(
+                None,
+                Some("parent"),
+                Some(true),
+                false,
+                Assigned("child".into())
+            ),
+            want(Some("child"), None, None, true),
+            "the forked id consumes both one-shot markers"
+        );
+        assert_eq!(
+            applied(None, None, Some(true), false, Assigned("new-id".into())),
+            want(Some("new-id"), None, Some(true), true),
+            "a non-fork assignment keeps import_pending"
+        );
+        assert_eq!(
+            applied(
+                Some("stale"),
+                Some("parent"),
+                Some(true),
+                false,
+                Reset("fork_failed: boom".into())
+            ),
+            want(None, None, None, true),
+            "a failed fork's markers must clear so the reconciler does not retry it"
+        );
+        assert_eq!(
+            applied(
+                Some("dead-id"),
+                None,
+                Some(true),
+                false,
+                Reset("session/load failed: gone".into())
+            ),
+            want(None, None, Some(true), true),
+            "a plain load failure clears the dead id only"
+        );
+        assert_eq!(
+            applied(
+                Some("pre-clear"),
+                Some("parent"),
+                Some(true),
+                false,
+                Cleared
+            ),
+            want(None, None, None, true),
+            "a clear forces a restart into a clean session/new"
         );
     }
 
     #[test]
-    fn derive_acp_status_maps_terminal_events() {
-        use crate::acp::approvals::{ApprovalDecision, Nonce};
-        use crate::acp::permissions::build_approval;
-        use crate::acp::state::ToolCall;
+    fn derive_acp_session_change_reads_only_session_lifecycle_events() {
         use crate::acp::Event;
+        assert_eq!(
+            derive_acp_session_change(&Event::AcpSessionAssigned {
+                acp_session_id: "uuid-1234".into()
+            }),
+            Some(AcpSessionChange::Assigned("uuid-1234".into()))
+        );
+        assert_eq!(
+            derive_acp_session_change(&Event::SessionContextReset {
+                reason: "session/load failed: bad id".into()
+            }),
+            Some(AcpSessionChange::Reset(
+                "session/load failed: bad id".into()
+            ))
+        );
+        // #3080: a /clear must invalidate the persisted ACP resume id.
+        assert_eq!(
+            derive_acp_session_change(&Event::SessionCleared),
+            Some(AcpSessionChange::Cleared)
+        );
+        for unrelated in [
+            Event::AgentMessageChunk { text: "x".into() },
+            Event::Stopped {
+                reason: "prompt_complete".into(),
+            },
+            Event::ThinkingStarted,
+        ] {
+            assert_eq!(derive_acp_session_change(&unrelated), None);
+        }
+    }
+
+    #[test]
+    fn derive_acp_status_maps_events_to_status_intents() {
+        use crate::acp::approvals::{ApprovalDecision, Nonce};
+        use crate::acp::elicitations::{Elicitation, ElicitationOutcome};
+        use crate::acp::permissions::build_approval;
+        use crate::acp::state::{BackgroundAgentStatus, ToolCall};
+        use crate::acp::Event;
+
         let tool_call = ToolCall {
             id: "t".into(),
             name: "shell".into(),
@@ -1806,31 +1948,7 @@ mod tests {
             memory_recall: None,
             diffs: Vec::new(),
         };
-        assert_eq!(
-            derive_acp_status(&Event::UserPromptSent {
-                prompt_id: None,
-                text: "hi".into(),
-                attachments: Vec::new(),
-            }),
-            Some(StatusIntent::Set(Status::Running))
-        );
-        assert_eq!(
-            derive_acp_status(&Event::ApprovalRequested {
-                approval: build_approval(tool_call.clone(), Vec::new()),
-            }),
-            Some(StatusIntent::Set(Status::Waiting))
-        );
-        assert_eq!(
-            derive_acp_status(&Event::ApprovalResolved {
-                nonce: Nonce("x".into()),
-                decision: ApprovalDecision::Allow,
-            }),
-            Some(StatusIntent::Set(Status::Running))
-        );
-        // A pending elicitation blocks the turn on the user just like an
-        // approval, so the sidebar dot must go yellow (Waiting) and recover
-        // to Running on resolution.
-        let elicitation = crate::acp::elicitations::Elicitation {
+        let elicitation = Elicitation {
             nonce: Nonce("e-1".into()),
             message: "Pick".into(),
             title: None,
@@ -1840,133 +1958,228 @@ mod tests {
             requested_at: chrono::Utc::now(),
             resolved: None,
         };
-        assert_eq!(
-            derive_acp_status(&Event::ElicitationRequested { elicitation }),
-            Some(StatusIntent::Set(Status::Waiting))
-        );
-        assert_eq!(
-            derive_acp_status(&Event::ElicitationResolved {
-                nonce: Nonce("e-1".into()),
-                outcome: crate::acp::elicitations::ElicitationOutcome::Accepted,
-                answers: Vec::new(),
-            }),
-            Some(StatusIntent::Set(Status::Running))
-        );
-        assert_eq!(
-            derive_acp_status(&Event::Stopped {
-                reason: "prompt_complete".into()
-            }),
-            Some(StatusIntent::Set(Status::Idle))
-        );
-        // Rate-limit park: NOT an error; sidebar stays grey, the
-        // dedicated RateLimit banner carries the reset time. See #1281.
-        assert_eq!(
-            derive_acp_status(&Event::Stopped {
-                reason: "rate_limited".into()
-            }),
-            Some(StatusIntent::Set(Status::Idle))
-        );
-        assert_eq!(
-            derive_acp_status(&Event::AgentStartupError {
-                message: "boom".into()
-            }),
-            Some(StatusIntent::Set(Status::Error))
-        );
-        // AcpSessionAssigned heals an Error banner only — never
-        // clobbers an in-progress Running/Waiting turn.
-        assert_eq!(
-            derive_acp_status(&Event::AcpSessionAssigned {
-                acp_session_id: "uuid".into()
-            }),
-            Some(StatusIntent::HealError)
-        );
-        // Rate-limit auto-resume breadcrumb heals like AcpSessionAssigned:
-        // the worker is coming back, so clear a sticky error without
-        // clobbering an in-progress turn. See #1722.
-        assert_eq!(
-            derive_acp_status(&Event::RateLimitAutoResumed {
-                resets_at: chrono::Utc::now(),
-                manual: false,
-            }),
-            Some(StatusIntent::HealError)
-        );
-    }
+        let set = |s: Status| Some(StatusIntent::Set(s));
+        let held = |s: Status| Some(StatusIntent::SetUnlessHeld(s));
 
-    #[test]
-    fn derive_acp_session_change_extracts_assigned_id() {
-        use crate::acp::Event;
-        let ev = Event::AcpSessionAssigned {
-            acp_session_id: "uuid-1234".into(),
-        };
-        assert_eq!(
-            derive_acp_session_change(&ev),
-            Some(AcpSessionChange::Assigned("uuid-1234".into()))
-        );
-    }
-
-    #[test]
-    fn derive_acp_session_change_extracts_reset_reason() {
-        use crate::acp::Event;
-        let ev = Event::SessionContextReset {
-            reason: "session/load failed: bad id".into(),
-        };
-        assert_eq!(
-            derive_acp_session_change(&ev),
-            Some(AcpSessionChange::Reset(
-                "session/load failed: bad id".into()
-            ))
-        );
-    }
-
-    #[test]
-    fn derive_acp_session_change_ignores_unrelated_events() {
-        use crate::acp::Event;
-        assert_eq!(
-            derive_acp_session_change(&Event::AgentMessageChunk { text: "x".into() }),
-            None
-        );
-        assert_eq!(
-            derive_acp_session_change(&Event::Stopped {
-                reason: "prompt_complete".into()
-            }),
-            None
-        );
-        assert_eq!(derive_acp_session_change(&Event::ThinkingStarted), None);
-    }
-
-    #[test]
-    fn derive_acp_status_running_on_agent_activity() {
-        use crate::acp::state::ToolCall;
-        use crate::acp::Event;
-        // A turn that resumes agent-side (fired ScheduleWakeup, background
-        // TaskOutput notification) streams only these events, never a
-        // UserPromptSent. They must drive Running so the sidebar dot recovers.
-        assert_eq!(
-            derive_acp_status(&Event::AgentMessageChunk { text: "x".into() }),
-            Some(StatusIntent::Set(Status::Running))
-        );
-        assert_eq!(
-            derive_acp_status(&Event::ThinkingStarted),
-            Some(StatusIntent::Set(Status::Running))
-        );
-        assert_eq!(
-            derive_acp_status(&Event::ToolCallStarted {
-                tool_call: ToolCall {
-                    id: "t".into(),
-                    name: "shell".into(),
-                    kind: "execute".into(),
-                    args_preview: "{}".into(),
-                    started_at: chrono::Utc::now(),
-                    parent_tool_call_id: None,
-                    memory_recall: None,
-                    diffs: Vec::new(),
+        // Arms that ignore both activity flags, asserted under both flag
+        // settings so one that starts reading them without being added to
+        // `reads_activity_flags` fails here. A brand-new `Event` variant with
+        // its own flag-reading arm is in neither this table nor the predicate,
+        // so extending both stays a reviewer-caught convention (#4001).
+        let flag_blind = [
+            // Agent-side activity drives Running on its own: a turn resumed by a fired
+            // wakeup or a background TaskOutput never sends a UserPromptSent.
+            (
+                Event::UserPromptSent {
+                    prompt_id: None,
+                    text: "hi".into(),
+                    attachments: Vec::new(),
+                    synthesized: false,
                 },
-            }),
-            Some(StatusIntent::Set(Status::Running))
+                set(Status::Running),
+            ),
+            (
+                Event::AgentMessageChunk { text: "x".into() },
+                set(Status::Running),
+            ),
+            (Event::ThinkingStarted, set(Status::Running)),
+            (
+                Event::ToolCallStarted {
+                    tool_call: tool_call.clone(),
+                },
+                set(Status::Running),
+            ),
+            // A pending approval or elicitation blocks the turn on the user, and both
+            // recover to Running once resolved.
+            (
+                Event::ApprovalRequested {
+                    approval: build_approval(tool_call, Vec::new()),
+                },
+                set(Status::Waiting),
+            ),
+            (
+                Event::ApprovalResolved {
+                    nonce: Nonce("x".into()),
+                    decision: ApprovalDecision::Allow,
+                },
+                set(Status::Running),
+            ),
+            (
+                Event::ElicitationRequested { elicitation },
+                set(Status::Waiting),
+            ),
+            (
+                Event::ElicitationResolved {
+                    nonce: Nonce("e-1".into()),
+                    outcome: ElicitationOutcome::Accepted,
+                    answers: Vec::new(),
+                },
+                set(Status::Running),
+            ),
+            // A launched or still-working sub-agent keeps the dot lit, but must
+            // not speak for the main turn's Waiting/Stopped/Error.
+            (
+                Event::BackgroundAgentLaunched {
+                    agent_id: "a-1".into(),
+                    tool_call_id: "t".into(),
+                    description: "desc".into(),
+                    prompt: "p".into(),
+                    model: "m".into(),
+                    output_file: "f".into(),
+                    started_at: chrono::Utc::now(),
+                },
+                held(Status::Running),
+            ),
+            (
+                Event::BackgroundAgentProgress {
+                    agent_id: "a-1".into(),
+                    status: BackgroundAgentStatus::Running,
+                    tool_count: 1,
+                    tools: Vec::new(),
+                    last_tool: None,
+                    last_text: None,
+                    at: chrono::Utc::now(),
+                },
+                held(Status::Running),
+            ),
+            (
+                Event::AgentStartupError {
+                    message: "boom".into(),
+                },
+                set(Status::Error),
+            ),
+            // A live session heals an Error banner but never an in-progress turn.
+            (
+                Event::AcpSessionAssigned {
+                    acp_session_id: "uuid".into(),
+                },
+                Some(StatusIntent::HealError),
+            ),
+            (
+                Event::RateLimitAutoResumed {
+                    resets_at: chrono::Utc::now(),
+                    manual: false,
+                },
+                Some(StatusIntent::HealError),
+            ),
+            // ThinkingEnded ends a sub-phase; ThinkingStarted already set Running.
+            (Event::ThinkingEnded, None),
+        ];
+        for (event, want) in flag_blind {
+            assert!(!reads_activity_flags(&event), "{event:?}");
+            assert_eq!(derive_acp_status(&event, false, false), want, "{event:?}");
+            assert_eq!(derive_acp_status(&event, true, true), want, "{event:?}");
+        }
+
+        // The two arms that do read the flags resolve Idle only once neither
+        // the main turn nor a background sub-agent is still active. Live, a
+        // `Stopped` folds `turn_active` false itself, so a true flag there
+        // means the cache is ahead of a lagged frame. See #4001.
+        let stopped = || Event::Stopped {
+            reason: "prompt_complete".into(),
+        };
+        let completed = || Event::BackgroundAgentCompleted {
+            agent_id: "a-1".into(),
+            status: BackgroundAgentStatus::Completed,
+            tools: Vec::new(),
+            result: None,
+            warning: None,
+            ended_at: chrono::Utc::now(),
+        };
+        // Every Stopped reason surfaces as Idle, the rate-limit park included.
+        let parked = || Event::Stopped {
+            reason: "rate_limited".into(),
+        };
+        let flag_reading = [
+            (stopped(), false, false, set(Status::Idle)),
+            (stopped(), false, true, set(Status::Running)),
+            (stopped(), true, false, set(Status::Running)),
+            (parked(), false, false, set(Status::Idle)),
+            (completed(), false, false, held(Status::Idle)),
+            (completed(), false, true, held(Status::Running)),
+            (completed(), true, false, held(Status::Running)),
+        ];
+        for (event, turn_active, background_active, want) in flag_reading {
+            assert!(reads_activity_flags(&event), "{event:?}");
+            assert_eq!(
+                derive_acp_status(&event, turn_active, background_active),
+                want,
+                "{event:?} turn={turn_active} background={background_active}"
+            );
+        }
+    }
+
+    /// #4001: stopping a session mid-sub-agent must not leave it reading
+    /// Running forever. `Supervisor::shutdown_with_reason`'s teardown path
+    /// now publishes a synthetic `BackgroundAgentCompleted { Detached }` for
+    /// every outstanding agent before its own `Stopped`; replay this exact
+    /// sequence through a real `AcpState` (not hand-fed booleans) to prove
+    /// the fold actually clears `has_active_background_agent`, and that the
+    /// resumed session's terminating `Stopped` derives Idle off it.
+    #[test]
+    fn derive_acp_status_resolves_idle_once_teardown_detaches_the_last_agent() {
+        use crate::acp::state::{AcpSessionId, AcpState, AgentName, BackgroundAgentStatus};
+        use crate::acp::Event;
+
+        let mut state = AcpState::new(AcpSessionId("s-1".into()), AgentName("claude".into()), None);
+        state
+            .apply_event(Event::UserPromptSent {
+                prompt_id: None,
+                text: "spawn and go".into(),
+                attachments: Vec::new(),
+                synthesized: false,
+            })
+            .unwrap();
+        state
+            .apply_event(Event::BackgroundAgentLaunched {
+                agent_id: "bg-1".into(),
+                tool_call_id: "tc-1".into(),
+                description: "map backend".into(),
+                prompt: "do it".into(),
+                model: "claude-opus-4-8".into(),
+                output_file: "/tmp/bg-1.output".into(),
+                started_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        assert!(
+            state.has_active_background_agent(),
+            "precondition: the launch is still outstanding"
         );
-        // ThinkingEnded is a sub-phase terminator, not a work signal; leaving
-        // it None avoids needless intents (ThinkingStarted already set Running).
-        assert_eq!(derive_acp_status(&Event::ThinkingEnded), None);
+
+        // Without this event the fold below would still see the agent as
+        // outstanding and the final Stopped would derive Running: this is
+        // the bug (#4001), not a hypothetical.
+        state
+            .apply_event(Event::BackgroundAgentCompleted {
+                agent_id: "bg-1".into(),
+                status: BackgroundAgentStatus::Detached,
+                tools: Vec::new(),
+                result: None,
+                warning: None,
+                ended_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        assert!(
+            !state.has_active_background_agent(),
+            "a Detached completion closes the record like any other terminal status"
+        );
+
+        state
+            .apply_event(Event::Stopped {
+                reason: "user_stopped".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            derive_acp_status(
+                &Event::Stopped {
+                    reason: "user_stopped".into()
+                },
+                state.turn_active,
+                state.has_active_background_agent(),
+            ),
+            Some(StatusIntent::Set(Status::Idle)),
+            "the resumed session's turn-end must not read Running forever"
+        );
     }
 
     // --- #2248: a structured session must heal out of a stale Stopped ---
@@ -1985,10 +2198,7 @@ mod tests {
 
     #[test]
     fn heal_error_wakes_a_stopped_session() {
-        // AcpSessionAssigned / RateLimitAutoResumed -> HealError: a fresh
-        // worker attached, so a stale Stopped from idle-reap or a prior
-        // manual stop must heal. This is the #2248 trap: pre-fix the guard
-        // froze Stopped and the dot stayed grey through a live turn.
+        // AcpSessionAssigned / RateLimitAutoResumed -> HealError.
         let mut inst = stopped_structured_instance();
         apply(&mut inst, StatusIntent::HealError);
         assert_eq!(inst.status, Status::Idle);
@@ -2014,10 +2224,7 @@ mod tests {
 
     #[test]
     fn agent_activity_wakes_an_idle_session_after_a_fired_wakeup() {
-        // A session that paused on ScheduleWakeup sits Idle. When the wake
-        // fires the turn resumes agent-side with activity events (no
-        // UserPromptSent), so the activity-derived Set(Running) must flip the
-        // dot green instead of leaving it grey.
+        // A session that paused on ScheduleWakeup sits Idle.
         let mut inst = stopped_structured_instance();
         inst.status = Status::Idle;
         apply(&mut inst, StatusIntent::Set(Status::Running));
@@ -2033,15 +2240,227 @@ mod tests {
         assert_eq!(inst.status, Status::Idle);
     }
 
+    /// #4001: a background sub-agent's progress must not clobber a pending
+    /// approval/elicitation's Waiting dot; the main turn's own
+    /// `ApprovalResolved`/`ElicitationResolved` (a plain `Set`) still
+    /// recovers it normally.
+    #[test]
+    fn set_unless_waiting_is_a_noop_while_waiting_but_plain_set_still_recovers() {
+        let mut inst = stopped_structured_instance();
+        inst.status = Status::Waiting;
+        apply(&mut inst, StatusIntent::SetUnlessHeld(Status::Running));
+        assert_eq!(
+            inst.status,
+            Status::Waiting,
+            "a background agent's own progress does not resolve the main turn's approval"
+        );
+
+        apply(&mut inst, StatusIntent::Set(Status::Running));
+        assert_eq!(
+            inst.status,
+            Status::Running,
+            "the main turn's own ApprovalResolved/ElicitationResolved still recovers Waiting"
+        );
+    }
+
+    #[test]
+    fn set_unless_waiting_behaves_like_set_when_not_waiting() {
+        let mut inst = stopped_structured_instance();
+        inst.status = Status::Idle;
+        apply(&mut inst, StatusIntent::SetUnlessHeld(Status::Running));
+        assert_eq!(inst.status, Status::Running);
+    }
+
+    /// A background sub-agent's lifecycle must not clear the main
+    /// connection's Error banner: the tailer keeps draining on a cloned
+    /// sender while the supervisor evaluates a respawn. The main turn's
+    /// own events (plain `Set`) and `HealError` from a fresh worker attach
+    /// both still resolve Error; only `SetUnlessHeld` preserves it.
+    #[test]
+    fn set_unless_waiting_never_clears_a_main_agent_error() {
+        let mut inst = stopped_structured_instance();
+        inst.status = Status::Error;
+        apply(&mut inst, StatusIntent::SetUnlessHeld(Status::Running));
+        assert_eq!(
+            inst.status,
+            Status::Error,
+            "a background sub-agent starting must not clear the main connection's error"
+        );
+
+        apply(&mut inst, StatusIntent::SetUnlessHeld(Status::Idle));
+        assert_eq!(
+            inst.status,
+            Status::Error,
+            "a background sub-agent finishing must not clear it either"
+        );
+
+        apply(&mut inst, StatusIntent::HealError);
+        assert_eq!(
+            inst.status,
+            Status::Idle,
+            "a fresh worker attach still resolves it"
+        );
+    }
+
+    /// #4001: a background agent finishing must not clobber a pending
+    /// approval/elicitation on the main turn either.
+    #[test]
+    fn background_agent_completed_does_not_clobber_waiting() {
+        use crate::acp::Event;
+        let mut inst = stopped_structured_instance();
+        inst.status = Status::Waiting;
+        let intent = derive_acp_status(
+            &Event::BackgroundAgentCompleted {
+                agent_id: "a-1".into(),
+                status: crate::acp::state::BackgroundAgentStatus::Completed,
+                tools: Vec::new(),
+                result: None,
+                warning: None,
+                ended_at: chrono::Utc::now(),
+            },
+            false,
+            false,
+        )
+        .expect("BackgroundAgentCompleted derives an intent");
+        apply(&mut inst, intent);
+        assert_eq!(inst.status, Status::Waiting);
+    }
+
+    /// #4001: a sub-agent launched mid-turn can complete before its parent
+    /// turn's own `Stopped`. That completion must not drop the sidebar to
+    /// Idle (and, via `should_mark_acp_unread`'s Running->Idle edge, must not
+    /// mark the still-unfinished turn unread) just because it was the last
+    /// background agent outstanding.
+    #[test]
+    fn background_agent_completed_mid_turn_keeps_running_and_does_not_mark_unread() {
+        use crate::acp::Event;
+        let mut inst = stopped_structured_instance();
+        inst.status = Status::Idle;
+
+        // UserPromptSent: turn starts.
+        let intent = derive_acp_status(
+            &Event::UserPromptSent {
+                prompt_id: None,
+                text: "hi".into(),
+                attachments: Vec::new(),
+                synthesized: false,
+            },
+            true,
+            false,
+        )
+        .unwrap();
+        apply(&mut inst, intent);
+        assert_eq!(inst.status, Status::Running);
+
+        // BackgroundAgentLaunched: still running, no other agents yet.
+        let intent = derive_acp_status(
+            &Event::BackgroundAgentLaunched {
+                agent_id: "a-1".into(),
+                tool_call_id: "t".into(),
+                description: "desc".into(),
+                prompt: "p".into(),
+                model: "m".into(),
+                output_file: "f".into(),
+                started_at: chrono::Utc::now(),
+            },
+            true,
+            true,
+        )
+        .unwrap();
+        apply(&mut inst, intent);
+        assert_eq!(inst.status, Status::Running);
+
+        // BackgroundAgentCompleted lands before the main turn's Stopped: the
+        // main turn is still active and no sibling agent remains, so this
+        // must stay Running rather than derive Idle from
+        // background_agent_active_after alone.
+        let old_status = inst.status;
+        let intent = derive_acp_status(
+            &Event::BackgroundAgentCompleted {
+                agent_id: "a-1".into(),
+                status: crate::acp::state::BackgroundAgentStatus::Completed,
+                tools: Vec::new(),
+                result: None,
+                warning: None,
+                ended_at: chrono::Utc::now(),
+            },
+            true,
+            false,
+        )
+        .unwrap();
+        apply(&mut inst, intent);
+        assert_eq!(
+            inst.status,
+            Status::Running,
+            "the main turn is still active"
+        );
+        assert!(
+            !should_mark_acp_unread(&inst, old_status, true),
+            "a mid-turn completion must not mark an unfinished turn unread"
+        );
+
+        // The main turn's own Stopped, no agents left: this is the one real
+        // turn-end edge, and must still mark unread as before.
+        let old_status = inst.status;
+        let intent = derive_acp_status(
+            &Event::Stopped {
+                reason: "prompt_complete".into(),
+            },
+            false,
+            false,
+        )
+        .unwrap();
+        apply(&mut inst, intent);
+        assert_eq!(inst.status, Status::Idle);
+        assert!(should_mark_acp_unread(&inst, old_status, true));
+    }
+
+    /// #4001: `BackgroundAgentCompleted` arriving after the main turn's own
+    /// `Stopped` (the ordinary case) still resolves Idle once it is the last
+    /// agent outstanding, and must not regress from the mid-turn fix above.
+    #[test]
+    fn background_agent_completed_after_stopped_still_resolves_idle() {
+        use crate::acp::Event;
+        let mut inst = stopped_structured_instance();
+        inst.status = Status::Running;
+
+        let intent = derive_acp_status(
+            &Event::Stopped {
+                reason: "prompt_complete".into(),
+            },
+            false,
+            true,
+        )
+        .unwrap();
+        apply(&mut inst, intent);
+        assert_eq!(
+            inst.status,
+            Status::Running,
+            "a background agent outlives Stopped"
+        );
+
+        let old_status = inst.status;
+        let intent = derive_acp_status(
+            &Event::BackgroundAgentCompleted {
+                agent_id: "a-1".into(),
+                status: crate::acp::state::BackgroundAgentStatus::Completed,
+                tools: Vec::new(),
+                result: None,
+                warning: None,
+                ended_at: chrono::Utc::now(),
+            },
+            false,
+            false,
+        )
+        .unwrap();
+        apply(&mut inst, intent);
+        assert_eq!(inst.status, Status::Idle);
+        assert!(should_mark_acp_unread(&inst, old_status, true));
+    }
+
     #[test]
     fn status_intent_transitions_preserve_last_accessed_at() {
-        // #3465 residual: the intent applier used to restamp
-        // last_accessed_at on every transition. The value relays through
-        // SessionFeed into TUI memory and save()'s merge_from_tui
-        // monotone max persists it, so a phantom stamp here wiped
-        // concurrent archives through merge_user_action_diff's touched
-        // arm. Structured rows take real touches from user prompts
-        // (`SessionService::touch_and_wake_on_prompt`), so the field stays gesture-only.
+        // #3465 residual.
         let mut inst = stopped_structured_instance();
         inst.status = Status::Idle;
         let user_touch = chrono::Utc::now() - chrono::Duration::seconds(60);
@@ -2068,12 +2487,7 @@ mod tests {
 
     #[test]
     fn relayed_intent_stamp_wipes_concurrent_archive() {
-        // Full #3465 residual chain on structured rows:
-        // apply_status_intent stamps daemon memory, save()'s
-        // merge_from_tui folds that memory into disk with an ungated
-        // monotone max, and a writer holding a pre snapshot from before
-        // the stamp loses its archive to merge_user_action_diff's
-        // touched arm. Dropping the intent stamp breaks this chain.
+        // Full #3465 residual chain on structured rows.
         let user_touch = chrono::Utc::now() - chrono::Duration::seconds(60);
 
         let mut daemon_row = stopped_structured_instance();
@@ -2100,10 +2514,8 @@ mod tests {
 
     #[test]
     fn trailing_set_intents_do_not_wake_a_stopped_session() {
-        // A deliberate Stop, or a session mid-stop, keeps emitting acp
-        // events for a few ticks. None of those Set intents may revive it,
-        // or the chain Stopped -> Running -> Idle would strand a deliberate
-        // Stop on Idle.
+        // A deliberate Stop, or a session mid-stop, keeps emitting acp events for a few
+        // ticks.
         for target in [Status::Running, Status::Waiting, Status::Idle] {
             let mut inst = stopped_structured_instance();
             apply(&mut inst, StatusIntent::Set(target));
@@ -2130,9 +2542,7 @@ mod tests {
     #[tokio::test]
     async fn seed_unblocks_a_stopped_session_with_an_in_flight_turn() {
         use crate::acp::Event;
-        // Daemon restart: session persisted Stopped, but the last lifecycle
-        // event was a UserPromptSent (a turn was in flight when the prior
-        // daemon died). Seed must reflect the live turn, not the stale dot.
+        // Daemon restart.
         let inst = stopped_structured_instance();
         let id = inst.id.clone();
         let state = test_support::build_test_app_state(vec![inst]);
@@ -2145,6 +2555,7 @@ mod tests {
                     prompt_id: None,
                     text: "go".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .expect("record");

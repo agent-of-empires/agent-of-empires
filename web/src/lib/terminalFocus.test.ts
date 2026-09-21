@@ -3,7 +3,6 @@ import { consumePendingTerminalFocus, setPendingTerminalFocus } from "./terminal
 
 describe("terminalFocus pending intent", () => {
   beforeEach(() => {
-    // Drain any leftover pending intent between tests.
     consumePendingTerminalFocus("agent");
     consumePendingTerminalFocus("paired");
   });
@@ -17,7 +16,6 @@ describe("terminalFocus pending intent", () => {
   it("consumePendingTerminalFocus does not match a different target", () => {
     setPendingTerminalFocus("paired");
     expect(consumePendingTerminalFocus("agent")).toBe(false);
-    // The pending intent is still there for the right target.
     expect(consumePendingTerminalFocus("paired")).toBe(true);
   });
 

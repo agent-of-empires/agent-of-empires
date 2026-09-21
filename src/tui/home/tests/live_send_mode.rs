@@ -1,18 +1,14 @@
-//! Live-send wiring at the home view level. Translation correctness
-//! is covered by unit tests in src/tui/home/live_send.rs. Here we
-//! verify the integration points: keys are captured while live mode
-//! is active, Ctrl+q clears the state, the per-keystroke liveness
-//! check auto-exits on drift, and the predicate plumbing treats
-//! live mode like a modal capture so the rest of the TUI suspends
-//! underneath it.
+//! Live-send wiring at the home-view level; translation correctness is covered by unit
+//! tests in src/tui/home/live_send.rs. Here: keys are captured while live mode is active,
+//! Ctrl+q clears the state, the per-keystroke liveness check auto-exits on drift, and the
+//! predicate plumbing treats live mode like a modal capture.
 
 use super::super::live_send::LiveSendState;
 use super::*;
 
-/// Seed live-send state pointing at the first instance in the test
-/// env, with a matching tmux_name so the drift check passes. Tests
-/// that want to trigger drift either install pointing at a missing
-/// id or mutate the instance's title after installing.
+/// Seed live-send state pointing at the first instance in the env, with a matching
+/// tmux_name so the drift check passes. Drift tests install a missing id or mutate the
+/// title afterwards.
 fn install_live_for_first_session(env: &mut TestEnv) -> String {
     let id = env
         .view
@@ -25,13 +21,10 @@ fn install_live_for_first_session(env: &mut TestEnv) -> String {
         .expect("test env has no sessions; use install_live_orphan instead");
     let inst = env.view.get_instance(&id).unwrap().clone();
     let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
-    // CI runs the e2e suite in the same `cargo test` invocation,
-    // which populates the global tmux session cache. The drift
-    // check then sees our fake test session name as "not in tmux"
-    // (Some(false)) and clears live_send mid-test. Pre-inject the
-    // name so the cache reports Some(true) for it; orphan tests
-    // (install_live_orphan) deliberately skip this and let the
-    // instance-missing branch fire instead.
+    // CI runs the e2e suite in the same `cargo test` invocation, which populates the global
+    // tmux session cache, so the drift check would see this fake name as not in tmux and
+    // clear live_send mid-test. Pre-inject it; orphan tests skip this so the
+    // instance-missing branch fires instead.
     crate::tmux::test_inject_session_into_cache(&tmux_name);
     env.view.live_send = Some(LiveSendState {
         session_id: inst.id.clone(),
@@ -46,9 +39,8 @@ fn install_live_for_first_session(env: &mut TestEnv) -> String {
     id
 }
 
-/// Install live-send state pointing at a session id the env does
-/// NOT contain — used to verify the drift check fires (auto-exit
-/// + info dialog) when the underlying instance has vanished.
+/// Install live-send state pointing at a session id the env does not contain, to verify the
+/// drift check auto-exits with an info dialog when the instance has vanished.
 fn install_live_orphan(env: &mut TestEnv) {
     env.view.live_send = Some(LiveSendState {
         session_id: "missing-id".to_string(),
@@ -62,11 +54,9 @@ fn install_live_orphan(env: &mut TestEnv) {
     });
 }
 
-/// A lock-loss flag from the live-send worker (another surface stole
-/// the size-owner lock) exits live mode from the main-loop poll, with
-/// no keystroke needed, drops the worker, and explains the takeover in
-/// an info dialog. The sizing reset is skipped so the thief's grid
-/// stands; only the shared teardown runs.
+/// A lock-loss flag from the worker (another surface stole the size-owner lock) exits live
+/// mode from the main-loop poll with no keystroke, drops the worker and explains the
+/// takeover. The sizing reset is skipped so the thief's grid stands.
 #[test]
 #[serial]
 fn poll_live_send_takeover_exits_live_mode_with_dialog() {
@@ -118,9 +108,8 @@ fn ctrl_q_exits_live_mode() {
 #[test]
 #[serial]
 fn ctrl_q_exits_even_when_session_has_drifted() {
-    // Ctrl+q is the safety chord: it must always exit cleanly,
-    // even if the underlying session went away (so the user can
-    // recover from a stuck live mode without an extra dialog).
+    // Ctrl+q is the safety chord: it must exit cleanly even if the session went away, so a
+    // stuck live mode is recoverable without an extra dialog.
     let mut env = create_test_env_empty();
     install_live_orphan(&mut env);
     env.view.handle_key(
@@ -134,12 +123,9 @@ fn ctrl_q_exits_even_when_session_has_drifted() {
 #[test]
 #[serial]
 fn arbitrary_key_in_live_mode_does_not_emit_action() {
-    // Live-send swallows the key (forwards it to tmux). The tmux
-    // call will quietly fail because the test env doesn't have a
-    // real tmux pane, but the home view must NOT bubble an
-    // Action::* out (otherwise the action would race with the
-    // live state). Use bare `x` so the test doesn't collide with
-    // the Ctrl+q exit chord.
+    // Live-send swallows the key. The tmux call fails quietly in the test env, but the home
+    // view must not bubble an Action out, which would race the live state. Bare `x` avoids
+    // colliding with the Ctrl+q exit chord.
     let mut env = create_test_env_with_sessions(1);
     install_live_for_first_session(&mut env);
     let action = env
@@ -153,10 +139,8 @@ fn arbitrary_key_in_live_mode_does_not_emit_action() {
 #[test]
 #[serial]
 fn drift_check_auto_exits_when_instance_missing() {
-    // If the session is deleted while live mode is active, the
-    // very next keystroke should auto-exit and surface an info
-    // dialog explaining why (so the user isn't typing into the
-    // void with no feedback).
+    // A session deleted while live mode is active must auto-exit on the next keystroke with
+    // an info dialog, so the user isn't typing into the void.
     let mut env = create_test_env_empty();
     install_live_orphan(&mut env);
     env.view
@@ -168,9 +152,8 @@ fn drift_check_auto_exits_when_instance_missing() {
 #[test]
 #[serial]
 fn shift_page_up_scrolls_preview_instead_of_sending_to_agent() {
-    // Terminal-emulator convention: Shift+PageUp scrolls the outer
-    // scrollback, not the inner program. Live mode honors that so
-    // users can read agent history without exiting.
+    // Terminal-emulator convention: Shift+PageUp scrolls the outer scrollback, so live mode
+    // honors it and agent history is readable without exiting.
     let mut env = create_test_env_with_sessions(1);
     install_live_for_first_session(&mut env);
     env.view.preview_scroll_offset = 0;
@@ -206,10 +189,8 @@ fn shift_page_down_scrolls_preview_forward() {
 #[test]
 #[serial]
 fn bare_page_up_still_passes_through_to_agent() {
-    // Regression guard: only the Shift-modified Page chord is
-    // intercepted. Bare PageUp must keep flowing to the agent so
-    // agents that page their own UI (claude-code transcript, etc.)
-    // keep responding.
+    // Only the Shift-modified Page chord is intercepted; bare PageUp keeps flowing to the
+    // agent so agents that page their own UI keep responding.
     let mut env = create_test_env_with_sessions(1);
     install_live_for_first_session(&mut env);
     env.view.preview_scroll_offset = 25;
@@ -227,10 +208,9 @@ fn bare_page_up_still_passes_through_to_agent() {
 #[test]
 #[serial]
 fn drift_check_auto_exits_when_session_renamed() {
-    // A rename that carried the tmux session with it: the worker now holds
-    // a name tmux no longer has, so the next keystroke should auto-exit.
-    // Force the cache to the post-rename state (only the new name live) so
-    // the id-anchored resolution has nothing stale to adopt.
+    // A rename that carried the tmux session with it leaves the worker holding a name tmux
+    // no longer has, so the next keystroke auto-exits. Force the cache to the post-rename
+    // state so the id-anchored resolution has nothing stale to adopt.
     let mut env = create_test_env_with_sessions(1);
     let id = install_live_for_first_session(&mut env);
     env.view.mutate_instance(&id, |inst| {
@@ -250,10 +230,9 @@ fn drift_check_auto_exits_when_session_renamed() {
 #[test]
 #[serial]
 fn drift_check_stays_when_retitle_did_not_rename_the_tmux_session() {
-    // #3157: smart rename moves the title but the tmux session keeps the
-    // name it was created under. The worker still holds THIS session's
-    // pane, so that is not drift and live mode must survive; auto-exiting
-    // here would kick the user out of a pane that is still correct.
+    // #3157: smart rename moves the title while the tmux session keeps its created name.
+    // The worker still holds this session's pane, so that is not drift and auto-exiting
+    // would kick the user out of a correct pane.
     let mut env = create_test_env_with_sessions(1);
     let id = install_live_for_first_session(&mut env);
     let created = env.view.live_send.as_ref().unwrap().tmux_name.clone();
@@ -275,14 +254,11 @@ fn drift_check_stays_when_retitle_did_not_rename_the_tmux_session() {
 #[test]
 #[serial]
 fn drift_check_does_not_exit_for_tool_target_named_via_tool_session() {
-    // Regression guard: the Tool arm of the drift check must resolve
-    // the current name the same way `prepare_live_send` computed
-    // `tmux_name` at entry (via `ToolSession::new(..).session_name()`).
-    // A prior bug instead re-derived the Tool arm's "current name"
-    // through `Session::generate_name`, the agent-pane naming scheme,
-    // which never matches a tool's own tmux name. That mismatch made
-    // every Tool-view live-send look "renamed" on its very first
-    // keystroke and auto-exit immediately.
+    // The Tool arm of the drift check must resolve the current name the way
+    // `prepare_live_send` computed `tmux_name` at entry, through
+    // `ToolSession::new(..).session_name()`. Re-deriving it through
+    // `Session::generate_name`, the agent-pane scheme, made every Tool-view live-send look
+    // renamed on its first keystroke.
     let mut env = create_test_env_with_sessions(1);
     let id = env
         .view
@@ -322,9 +298,8 @@ fn drift_check_does_not_exit_for_tool_target_named_via_tool_session() {
 #[test]
 #[serial]
 fn live_mode_makes_has_dialog_true() {
-    // Every dialog-gating predicate that already inspects has_dialog()
-    // (mouse swallow, list nav suspend, palette skip) inherits live
-    // mode for free via this single addition.
+    // Every dialog-gating predicate that inspects has_dialog() (mouse swallow, nav suspend,
+    // palette skip) inherits live mode through this single addition.
     let mut env = create_test_env_empty();
     assert!(!env.view.has_dialog());
     install_live_orphan(&mut env);
@@ -334,10 +309,9 @@ fn live_mode_makes_has_dialog_true() {
 #[test]
 #[serial]
 fn live_mode_enables_paste_burst() {
-    // wants_paste_burst is what tells the runtime to batch a stream
-    // of Char events into a single Paste event when bracketed-paste
-    // markers are missing (mosh, some SSH wrappers). Live mode wants
-    // batching so a paste streams as one tmux call.
+    // wants_paste_burst tells the runtime to batch a stream of Char events into one Paste
+    // when bracketed-paste markers are missing, which live mode wants so a paste streams as
+    // one tmux call.
     let mut env = create_test_env_empty();
     install_live_orphan(&mut env);
     assert!(env.view.wants_paste_burst());
@@ -346,9 +320,8 @@ fn live_mode_enables_paste_burst() {
 #[test]
 #[serial]
 fn tab_does_not_start_live_send_without_selection() {
-    // No session selected (empty list, cursor on a group, etc.) →
-    // Tab must silently no-op rather than emitting a deferred
-    // action targeting nothing.
+    // With no session selected, Tab must no-op rather than emit a deferred action targeting
+    // nothing.
     let mut env = create_test_env_empty();
     let action = env
         .view
@@ -360,17 +333,14 @@ fn tab_does_not_start_live_send_without_selection() {
 #[test]
 #[serial]
 fn tab_emits_enter_live_send_for_stopped_session() {
-    // start_live_send is intentionally permissive: it accepts any
-    // non-Creating instance and defers ensure_pane_ready to
-    // prepare_live_send. Without this, Tab would silently no-op on
-    // stopped/dead-but-recoverable rows because the tmux session
-    // doesn't exist yet.
+    // start_live_send is deliberately permissive: it accepts any non-Creating instance and
+    // defers ensure_pane_ready to prepare_live_send, or Tab would no-op on
+    // dead-but-recoverable rows whose tmux session doesn't exist yet.
     let mut env = create_test_env_with_sessions(1);
     env.view.cursor = 0;
     env.view.update_selected();
-    // Pin the status explicitly so this regression guard doesn't
-    // rely on the implicit Instance::new default surviving future
-    // refactors. A real stopped session is what we're modeling.
+    // Pin the status explicitly so this guard doesn't rely on the implicit Instance::new
+    // default: a real stopped session is what is being modeled.
     let id = env
         .view
         .flat_items
@@ -396,10 +366,9 @@ fn tab_emits_enter_live_send_for_stopped_session() {
 #[test]
 #[serial]
 fn tab_does_not_start_live_send_for_acp_session() {
-    // Acp sessions are not tmux-backed, so live-send has no valid
-    // target. Tab must refuse with a visible "no tmux pane" toast
-    // (a silent no-op reads as a broken key) and must never
-    // enqueue an Action::EnterLiveSend that would fail downstream.
+    // Acp sessions are not tmux-backed, so Tab must refuse with a visible "no tmux pane"
+    // toast (a silent no-op reads as a broken key) and never enqueue an EnterLiveSend that
+    // would fail downstream.
     let mut env = create_test_env_with_sessions(1);
     env.view.cursor = 0;
     env.view.update_selected();
@@ -432,12 +401,9 @@ fn tab_does_not_start_live_send_for_acp_session() {
 #[test]
 #[serial]
 fn has_non_live_send_overlay_false_in_pure_live_mode() {
-    // Regression for the dead-fast-path bug: `has_dialog()` returns
-    // true when live-send is active, which would gate off the
-    // preview-only fast path (added in #1495) — the very thing it
-    // was supposed to enable. `has_non_live_send_overlay()` is the
-    // helper the fast-path gates use; in pure live mode with no
-    // other dialog open, it must be false so the fast path can run.
+    // `has_dialog()` is true while live-send is active, which would gate off the
+    // preview-only fast path (#1495) it was meant to enable. `has_non_live_send_overlay()`
+    // is what the fast path gates on, and in pure live mode it must be false.
     let mut env = create_test_env_with_sessions(1);
     install_live_for_first_session(&mut env);
     assert!(env.view.has_dialog(), "has_dialog includes live_send");
@@ -450,22 +416,18 @@ fn has_non_live_send_overlay_false_in_pure_live_mode() {
 #[test]
 #[serial]
 fn has_non_live_send_overlay_true_when_dialog_also_open() {
-    // The fast path still has to bail when any non-live overlay is
-    // on top of the home view (settings, diff, info dialog, etc.),
-    // because the snapshot it repaints doesn't include them.
+    // The fast path still bails when a non-live overlay is on top, since the snapshot it
+    // repaints doesn't include them.
     let mut env = create_test_env_with_sessions(1);
     install_live_for_first_session(&mut env);
     env.view.info_dialog = Some(InfoDialog::new("title", "body"));
     assert!(env.view.has_non_live_send_overlay());
 }
 
-/// Regression for the preview-mode paste misroute: a rename dialog
-/// opened on top of live-send (reachable via the right-click context
-/// menu, which stays clickable while "attached") must receive pastes.
-/// Before the fix, `handle_paste` gave live-send absolute priority,
-/// so the clipboard streamed into the agent's pane while the user was
-/// staring at a focused dialog input; the key path had already been
-/// taught to route to overlays, but paste hadn't.
+/// A rename dialog opened on top of live-send (reachable via the right-click menu, which
+/// stays clickable while attached) must receive pastes. `handle_paste` gave live-send
+/// absolute priority, so the clipboard streamed into the agent's pane while the user stared
+/// at a focused dialog input; the key path already routed to overlays, but paste did not.
 #[test]
 #[serial]
 fn paste_routes_to_rename_dialog_opened_over_live_send() {
@@ -488,11 +450,9 @@ fn paste_routes_to_rename_dialog_opened_over_live_send() {
     );
 }
 
-/// Companion pin: with live-send active and NO overlay on top, paste
-/// keeps streaming to the pane. The unit fixture has no worker
-/// attached, so the observable contract is that the live-send branch
-/// consumes the paste: nothing buffers into a compose dialog or
-/// pending_paste.
+/// Companion pin: with live-send active and no overlay on top, paste keeps streaming to the
+/// pane. The fixture has no worker attached, so the observable contract is that the
+/// live-send branch consumes it, buffering nothing into a dialog or pending_paste.
 #[test]
 #[serial]
 fn paste_in_pure_live_mode_is_consumed_by_live_send() {
@@ -506,12 +466,10 @@ fn paste_in_pure_live_mode_is_consumed_by_live_send() {
     assert!(env.view.pending_paste.is_none());
 }
 
-/// A finalized preview highlight (installed via a mouse drag, which
-/// never runs through `handle_key`) must be dropped when the user
-/// pastes into a dialog opened over live-send. Before the clear was
-/// hoisted to the top of `handle_paste`, only the pane-streaming
-/// branch cleared it, so the highlight survived a dialog-routed paste
-/// and kept repainting over stale cells after the dialog closed.
+/// A finalized preview highlight installed via a mouse drag, which never runs through
+/// `handle_key`, must be dropped when the user pastes into a dialog opened over live-send.
+/// Before the clear was hoisted to the top of `handle_paste`, only the pane-streaming branch
+/// cleared it and the highlight repainted over stale cells.
 #[test]
 #[serial]
 fn paste_into_dialog_over_live_send_clears_preview_selection() {
@@ -655,11 +613,9 @@ fn accepted_capture_keeps_content_and_cursor_in_one_cache_frame() {
 #[test]
 #[serial]
 fn warm_predicates_stay_cold_without_a_live_pane() {
-    // The EnterLiveSend / SendMessage handlers skip the "Reviving
-    // session..." toast only when the target pane is provably warm; every
-    // uncertain case must stay cold so a real revive keeps its feedback.
-    // The unit fixture has no tmux server, so even a live-status row must
-    // report cold (pane existence is the load-bearing half).
+    // The toast is skipped only when the target pane is provably warm; every uncertain case
+    // stays cold so a real revive keeps its feedback. The fixture has no tmux server, so
+    // even a live-status row reports cold, since pane existence is the load-bearing half.
     let mut env = create_test_env_with_sessions(1);
     let id = env
         .view
@@ -705,12 +661,10 @@ fn warm_predicates_stay_cold_without_a_live_pane() {
 #[test]
 #[serial]
 fn passive_preview_sync_ignores_one_frame_toast_geometry() {
-    // The EnterLiveSend / SendMessage handlers draw exactly one frame with
-    // a transient toast up; its bottom bar makes the preview output rect
-    // one row shorter for that frame only. The passive sync must not chase
-    // it: pre-debounce it resized the agent's pane down and back up ~30ms
-    // apart, and the double SIGWINCH made claude's bottom-anchored input
-    // box (and cursor) visibly jump right as live mode opened.
+    // The handlers draw one frame with a transient toast whose bottom bar makes the output
+    // rect a row shorter for that frame only. The passive sync must not chase it:
+    // pre-debounce it resized the agent's pane down and back ~30ms apart, and the double
+    // SIGWINCH made bottom-anchored agent UIs jump as live mode opened.
     let mut env = create_test_env_with_sessions(1);
     let id = env
         .view
@@ -781,9 +735,8 @@ fn fleet_reconcile_presizes_open_sessions_once_per_epoch() {
         );
     }
 
-    // The fixture sessions have no tmux panes, so the worker declines
-    // each intent. Once the declines are adopted, the same epoch must not
-    // re-queue them.
+    // The fixture sessions have no tmux panes, so the worker declines each intent, and once
+    // the declines are adopted the same epoch must not re-queue them.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         env.view
@@ -824,9 +777,9 @@ fn fleet_reconcile_presizes_open_sessions_once_per_epoch() {
         );
     }
 
-    // Moving the selection is NOT an epoch: the armed key is pure
-    // geometry, so switching the excluded session must not re-arm, and
-    // the previously excluded session fires on the same refresh.
+    // Moving the selection is not an epoch: the armed key is pure geometry, so switching the
+    // excluded session must not re-arm, and the previously excluded one fires on the same
+    // refresh.
     let armed_before = env.view.passive_fleet_armed.clone();
     env.view.selected_session = Some(ids[1].clone());
     env.view
@@ -858,9 +811,8 @@ fn fleet_reconcile_reasserts_after_external_resize() {
     env.view
         .reconcile_passive_fleet(inner, false, Some(&selected));
 
-    // Pretend ids[1]'s resize was applied at its wanted geometry (read
-    // back from the armed epoch so the fixture can't drift from the real
-    // layout math).
+    // Pretend ids[1]'s resize was applied at its wanted geometry, read back from the armed
+    // epoch so the fixture can't drift from the real layout math.
     let (cols, rows) = env
         .view
         .passive_fleet_armed
@@ -900,14 +852,11 @@ fn fleet_reconcile_reasserts_after_external_resize() {
 #[test]
 #[serial]
 fn stale_observation_published_after_adoption_does_not_invalidate() {
-    // The cache boundary of the timestamp race: a `list-panes` that read
-    // the pane BEFORE our resize can finish publishing AFTER the resize's
-    // adoption. The snapshot's time is the observation instant (captured
-    // pre-fork), so the pre-resize sizes it carries must read as older
-    // than the adoption and leave the synced entry alone. Re-stamping
-    // `cache.time` at publication would make this observation look
-    // fresher than the adoption and turns this test red (the injector
-    // routes through the real publication path).
+    // The cache boundary of the timestamp race: a `list-panes` that read the pane before our
+    // resize can publish after its adoption. The snapshot's time is the observation instant,
+    // captured pre-fork, so the pre-resize sizes must read as older than the adoption and
+    // leave the synced entry alone. Re-stamping `cache.time` at publication turns this
+    // test red.
     let _cache_guard = crate::tmux::PaneMetaCacheGuard::capture();
     let mut env = create_test_env_with_sessions(2);
     let ids: Vec<String> = env
@@ -985,9 +934,9 @@ fn fleet_reconcile_retries_expired_declines() {
         .map(|&(_, cols, rows)| (cols, rows))
         .expect("armed epoch covers ids[1]");
 
-    // A decline older than the retry window reads as absent, so the
-    // session recovers once its blocking attach or size owner may have
-    // gone away, instead of staying parked until a geometry change.
+    // A decline older than the retry window reads as absent, so the session recovers once
+    // its blocking attach or size owner may have gone, instead of staying parked until a
+    // geometry change.
     let expired = std::time::Instant::now()
         .checked_sub(
             crate::tui::home::render::PASSIVE_DECLINE_RETRY + std::time::Duration::from_secs(1),
@@ -1013,10 +962,9 @@ fn fleet_reconcile_retries_expired_declines() {
 #[test]
 #[serial]
 fn fleet_reconcile_is_single_tui_only() {
-    // With two aoe TUIs alive, each would treat the other's fleet
-    // resizes as external (observed-size invalidation) and re-assert its
-    // own geometry, oscillating every open pane. The presence count gates
-    // the whole fleet pass; only the selected-session sync stays on.
+    // With two TUIs alive, each would treat the other's fleet resizes as external and
+    // re-assert its own geometry, oscillating every open pane. The presence count gates the
+    // whole fleet pass; only the selected-session sync stays on.
     let mut env = create_test_env_with_sessions(2);
     let ids: Vec<String> = env
         .view
@@ -1053,12 +1001,10 @@ fn fleet_reconcile_is_single_tui_only() {
 #[test]
 #[serial]
 fn refresh_terminal_cache_overwrites_on_empty_capture() {
-    // Counterpart to `refresh_preserves_cache_when_live_capture_fails`:
-    // only the agent path carries the live-send kill switch. The terminal
-    // path must overwrite to empty so the preview surfaces "session looks
-    // gone". With the worker as the ONLY capture source, the empty frame
-    // arrives through the mailbox (the worker forwards empties for
-    // terminal panes); paint applies it without any synchronous fork.
+    // Counterpart to `refresh_preserves_cache_when_live_capture_fails`: only the agent path
+    // carries the live-send kill switch, so the terminal path must overwrite to empty and
+    // surface "session looks gone". The empty frame arrives through the mailbox, since the
+    // worker forwards empties for terminal panes, and paint applies it without a fork.
     let mut env = create_test_env_with_sessions(1);
     let id = env
         .view
@@ -1092,14 +1038,11 @@ fn refresh_terminal_cache_overwrites_on_empty_capture() {
 }
 
 mod paste_splitting {
-    //! `split_paste_for_live_send` decomposes a pasted string into
-    //! tmux operations the live-send worker can actually deliver.
-    //! Single-line pastes stay on the simple `Literal` + `Named("Tab")`
-    //! path so raw shells and bracketed-paste-unaware agents keep
-    //! working. Multi-line pastes are dispatched as one `TmuxKey::Paste`
-    //! payload without escape markers; tmux delegates bracketed-paste
-    //! handling to `paste-buffer -p`, so the agent sees one paste instead
-    //! of one `Enter` per line.
+    //! `split_paste_for_live_send` decomposes a pasted string into tmux operations the
+    //! worker can deliver. Single-line pastes stay on the `Literal` + `Named("Tab")` path so
+    //! raw shells and bracketed-paste-unaware agents keep working; multi-line pastes go as
+    //! one `TmuxKey::Paste` without markers, leaving bracketed-paste to `paste-buffer -p`,
+    //! so the agent sees one paste instead of one `Enter` per line.
 
     use crate::tui::home::input::split_paste_for_live_send;
     use crate::tui::home::live_send::TmuxKey;
@@ -1111,13 +1054,9 @@ mod paste_splitting {
         TmuxKey::Named(name.to_string())
     }
 
-    /// Expected shape for a multi-line paste: one `Paste` action
-    /// carrying the payload verbatim. No bracketed-paste markers
-    /// appear here on purpose. tmux adds them via `paste-buffer -p`
-    /// only for panes that set DECSET 2004, so a raw shell or SQL
-    /// REPL no longer receives markers it would render as literal
-    /// `00~` / `01~` text. Interior newlines stay `\n`; tmux
-    /// translates them to CR when it performs the paste.
+    /// Expected shape for a multi-line paste: one `Paste` carrying the payload verbatim,
+    /// with no bracketed-paste markers. tmux adds those via `paste-buffer -p` only for panes
+    /// that set DECSET 2004. Interior newlines stay `\n`; tmux translates them to CR.
     fn paste(body: &str) -> Vec<TmuxKey> {
         vec![TmuxKey::Paste(body.to_string())]
     }
@@ -1159,12 +1098,10 @@ mod paste_splitting {
         }
     }
 
-    /// The bug: we used to hand-roll `\e[200~` / `\e[201~` into the
-    /// payload and ship it as raw bytes, so every pane got the markers
-    /// whether or not it had set DECSET 2004. A raw shell or SQL REPL
-    /// parses `\e[2` as a partial Insert-key sequence, discards it, and
-    /// self-inserts the leftover `00~` / `01~` into the user's text.
-    /// The payload must now carry no escape bytes at all; tmux decides.
+    /// The bug: hand-rolling `\e[200~` / `\e[201~` into the payload shipped the markers to
+    /// every pane whether or not it set DECSET 2004, and a raw shell parses `\e[2` as a
+    /// partial Insert sequence and self-inserts the leftover `00~` / `01~`. The payload must
+    /// carry no escape bytes at all.
     #[test]
     fn multiline_paste_carries_no_escape_markers() {
         let keys = split_paste_for_live_send("SELECT id\nFROM users;");
@@ -1183,10 +1120,8 @@ mod paste_splitting {
 
     #[test]
     fn multiline_paste_dispatches_as_one_payload() {
-        // Single-dispatch: the entire paste is one `Paste` action, so
-        // the worker fires exactly one `load-buffer` + `paste-buffer`
-        // pair. Verifies the length-of-1 invariant the worker relies
-        // on for paste latency.
+        // Single-dispatch: the whole paste is one `Paste` action, so the worker fires
+        // exactly one `load-buffer` + `paste-buffer` pair.
         let out = split_paste_for_live_send("a\nb\nc\nd");
         assert_eq!(out.len(), 1, "multiline paste must be one TmuxKey");
         match &out[0] {

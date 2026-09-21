@@ -1,14 +1,4 @@
-//! Tokio task helpers: panic aware spawning plus tracing span
-//! propagation for long lived background work.
-//!
-//! `tokio::spawn` swallows panics into a `JoinError` returned from
-//! `JoinHandle::await`. For long lived tasks whose `JoinHandle` is
-//! dropped (every fire and forget `tokio::spawn(...)` in this crate),
-//! the panic message is lost. `spawn_supervised` wraps the future in
-//! `catch_unwind` so a panic surfaces through `tracing::error!` with
-//! a static task name attached, which makes `aoe logs` answer
-//! "why did the cleanup task stop running" instead of dropping the
-//! signal on the floor.
+//! Panic-aware task spawning: a dropped `JoinHandle` would otherwise lose the panic.
 
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
@@ -16,15 +6,9 @@ use std::panic::AssertUnwindSafe;
 use futures_util::FutureExt;
 use tokio::task::JoinHandle;
 
-/// What to do when the wrapped future panics. Production code logs;
-/// tests surface so failures are loud.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum PanicPolicy {
-    /// Log the panic via `tracing::error!(target = "task.panic", ...)`
-    /// and let the runtime continue. The default for daemon tasks.
     Log,
-    /// Re-raise the panic after logging it. Use in tests so a
-    /// panicking task fails the test instead of disappearing.
     Surface,
 }
 
@@ -94,10 +78,6 @@ mod tests {
 
     #[tokio::test]
     async fn panic_in_log_policy_does_not_propagate() {
-        // The wrapper catches the panic; the caller's join completes
-        // Ok(()) and the runtime survives. We can't assert on the
-        // tracing output without a custom subscriber, but absence
-        // of a JoinError is the contract we depend on.
         let handle = spawn_supervised("test.panic.log", PanicPolicy::Log, async {
             panic!("intentional panic for test");
         });

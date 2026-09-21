@@ -1,8 +1,3 @@
-// Spinner verb selection. The verb cycle is purely cosmetic, but
-// pickIndex must be deterministic per seed (otherwise the verb flips
-// every render and reads as a glitch) and stay in-bounds for any
-// pool size including zero.
-
 import { describe, expect, it } from "vitest";
 
 import {
@@ -41,8 +36,6 @@ describe("pickIndex", () => {
   });
 
   it("handles negative-ish hash output (Math.abs guard)", () => {
-    // The mulberry-ish hash can produce sign-flipped intermediate
-    // values; any seed must yield a non-negative index.
     for (let s = -10; s <= 10; s++) {
       const r = pickIndex(5, s);
       expect(r).toBeGreaterThanOrEqual(0);
@@ -72,17 +65,12 @@ describe("chooseVerb", () => {
   });
 
   it("clamps a long tool title so it does not flood the spinner (#1728)", () => {
-    // inFlightTool.name carries the ACP title, which for Bash is the full
-    // command line. A heredoc-into-consult-llm dispatch can run hundreds
-    // of chars; the inline spinner must not inline it verbatim.
     const longCommand =
       "cat <<'__CONSULT_LLM_END__' | consult-llm --task plan -m gemini -m openai -f /Users/foo/terminal_handler.rs";
     const out = chooseVerb("tool", 3, longCommand);
     expect(out.endsWith("…")).toBe(true);
-    // The inlined name is bounded; the full command never reaches the row.
     expect(out).not.toContain(longCommand);
     expect(out).not.toContain("consult-llm");
-    // Whole label = "<verb> <clamped>…"; clamped slice is <= TOOL_LABEL_MAX.
     const verb = out.split(" ")[0];
     const inlined = out.slice(verb.length + 1, -1);
     expect(inlined.length).toBeLessThanOrEqual(TOOL_LABEL_MAX);
@@ -135,8 +123,6 @@ describe("constants", () => {
   it("SPINNER_FRAMES is 10 single-codepoint frames", () => {
     expect(SPINNER_FRAMES).toHaveLength(10);
     for (const frame of SPINNER_FRAMES) {
-      // Each braille glyph is a single codepoint above U+FFFF? No,
-      // they sit in the BMP at U+28xx, so .length === 1 is correct.
       expect(frame).toHaveLength(1);
     }
   });

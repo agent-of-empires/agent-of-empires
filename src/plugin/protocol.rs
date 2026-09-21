@@ -1,52 +1,22 @@
 //! The plugin worker protocol: newline-delimited JSON-RPC 2.0 over the
-//! worker's stdio.
-//!
-//! A worker is the JSON-RPC client: it writes one request object per line to
-//! its stdout and reads one response object per line on its stdin. The host
-//! is the server. This is the language-agnostic wire contract; any executable
-//! that speaks it is a valid worker, which is why the host resolves and
-//! launches workers of different runtime kinds (see [`crate::plugin::launch`])
-//! through the same path.
-//!
-//! Notifications (no `id`) are accepted but produce no response. Anything the
-//! worker writes to stderr is never protocol; it is drained to the worker log.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// JSON-RPC error codes. The negative range below `-32000` is reserved by the
-/// spec for implementation-defined server errors; [`codes::FORBIDDEN`] is ours, for a
-/// method whose capability the plugin did not declare or was not granted.
 pub mod codes {
     pub const PARSE_ERROR: i64 = -32700;
     pub const INVALID_REQUEST: i64 = -32600;
     pub const METHOD_NOT_FOUND: i64 = -32601;
     pub const INVALID_PARAMS: i64 = -32602;
     pub const INTERNAL_ERROR: i64 = -32603;
-    /// Capability not declared or not granted for the calling plugin.
     pub const FORBIDDEN: i64 = -32001;
-    /// The request is authorized capability-wise but denied by host policy
-    /// (e.g. an unattended mode without the `session.unattended` grant).
     pub const POLICY_DENIED: i64 = -32002;
-    /// The request conflicts with existing state (idempotency-key reuse
-    /// with a different payload).
     pub const CONFLICT: i64 = -32003;
-    /// A rolling-window rate or concurrency limit was exceeded.
     pub const RATE_LIMITED: i64 = -32004;
-    /// A precondition the plugin cannot fix by retrying as-is (untrusted
-    /// repository, undiscovered catalog, failed mode application).
     pub const FAILED_PRECONDITION: i64 = -32005;
-    /// The host cannot serve the request right now; retryable.
     pub const SERVICE_UNAVAILABLE: i64 = -32006;
 }
 
-/// One inbound request from a worker. `id` is absent for a notification.
-///
-/// Every field is optional at the serde layer so that any well-formed JSON
-/// object deserializes; the JSON-RPC 2.0 envelope is then validated by
-/// [`RpcRequest::validate_envelope`]. This keeps a parse failure meaning
-/// "malformed JSON" (PARSE_ERROR) and a bad request shape meaning
-/// "invalid request" (INVALID_REQUEST), rather than conflating the two.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RpcRequest {
     #[serde(default)]
@@ -60,15 +30,10 @@ pub struct RpcRequest {
 }
 
 impl RpcRequest {
-    /// A request with no `id` is a notification: the host must not answer it.
     pub fn is_notification(&self) -> bool {
         self.id.is_none()
     }
 
-    /// Validate the JSON-RPC 2.0 envelope, returning the method name on success.
-    /// `jsonrpc` must be exactly `"2.0"` and `method` must be present and
-    /// non-empty; otherwise the request is well-formed JSON but not a valid
-    /// request, which the host reports as `INVALID_REQUEST`.
     pub fn validate_envelope(&self) -> Result<&str, &'static str> {
         if self.jsonrpc.as_deref() != Some("2.0") {
             return Err("jsonrpc field must be \"2.0\"");
@@ -80,7 +45,6 @@ impl RpcRequest {
     }
 }
 
-/// One outbound response to a worker. Exactly one of `result` / `error` is set.
 #[derive(Debug, Clone, Serialize)]
 pub struct RpcResponse {
     pub jsonrpc: &'static str,
@@ -91,8 +55,6 @@ pub struct RpcResponse {
     pub error: Option<RpcError>,
 }
 
-/// A JSON-RPC error object. `data.kind` (when present) is the stable
-/// machine-readable contract; `message` is diagnostic prose and not stable.
 #[derive(Debug, Clone, Serialize)]
 pub struct RpcError {
     pub code: i64,
@@ -133,9 +95,7 @@ impl RpcResponse {
         }
     }
 
-    /// Serialize to a single ndjson line including the trailing newline.
     pub fn to_line(&self) -> String {
-        // Serializing a plain struct of JSON values cannot fail.
         let mut line = serde_json::to_string(self).unwrap_or_else(|_| {
             r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"serialize failed"}}"#
                 .to_string()
@@ -145,9 +105,6 @@ impl RpcResponse {
     }
 }
 
-/// Parse one ndjson line into a request. An empty or whitespace-only line is
-/// `Ok(None)` (skipped); malformed JSON is an error the caller reports as a
-/// parse error and treats as fatal to the worker.
 pub fn parse_request(line: &str) -> Result<Option<RpcRequest>, serde_json::Error> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
@@ -181,29 +138,22 @@ mod tests {
     }
 
     #[test]
-    fn blank_line_is_skipped() {
+    fn a_blank_line_is_skipped_and_a_malformed_one_is_an_error() {
         assert!(parse_request("   ").unwrap().is_none());
         assert!(parse_request("").unwrap().is_none());
-    }
-
-    #[test]
-    fn malformed_line_is_error() {
         assert!(parse_request("{not json").is_err());
     }
 
     #[test]
     fn well_formed_json_with_bad_envelope_is_not_a_parse_error() {
-        // Missing jsonrpc: parses fine, but the envelope is invalid.
         let req = parse_request(r#"{"method":"sessions.list"}"#)
             .unwrap()
             .unwrap();
         assert!(req.validate_envelope().is_err());
-        // Wrong jsonrpc version.
         let req = parse_request(r#"{"jsonrpc":"1.0","method":"sessions.list"}"#)
             .unwrap()
             .unwrap();
         assert!(req.validate_envelope().is_err());
-        // Missing method.
         let req = parse_request(r#"{"jsonrpc":"2.0"}"#).unwrap().unwrap();
         assert!(req.validate_envelope().is_err());
     }

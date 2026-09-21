@@ -1,17 +1,10 @@
 //! Locate a structured view daemon (`aoe serve`) the client should talk to.
 //!
-//! Resolution order:
-//!
-//! 1. `AOE_DAEMON_URL` env var (paired with `AOE_DAEMON_TOKEN`). Env
-//!    is preferred over CLI flags so the token never leaks via `ps`.
-//! 2. Local daemon: `<app_dir>/serve.url` + a live `<app_dir>/serve.pid`.
-//!    The loopback alternate is preferred over the primary line so
-//!    clients on the same box don't round-trip through a tunnel.
-//!
-//! Returns `Err(NoLocalDaemon)` when neither resolves.
-//! [`super::daemon_manager::require_daemon`] wraps this with a
-//! health-check on the env override and a friendlier no-daemon error
-//! variant whose message tells the user how to start one.
+//! `AOE_DAEMON_URL` (+ `AOE_DAEMON_TOKEN`) wins, because env keeps the token
+//! out of `ps`. Otherwise `<app_dir>/serve.url` plus a live `serve.pid`,
+//! preferring the loopback alternate so a same-box client does not round-trip
+//! through a tunnel. [`super::daemon_manager::require_daemon`] wraps this with
+//! a health check and a friendlier no-daemon error.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -22,21 +15,16 @@ use thiserror::Error;
 use crate::cli::serve::{daemon_pid, read_serve_urls, ServeUrl};
 use crate::daemon::{DaemonClient, DaemonClientError};
 
-/// A located daemon endpoint. `base_url` carries no query string so it
-/// is safe to log; the auth token (if any) travels separately and is
-/// applied as an `Authorization: Bearer` header by [`super::http`] and
-/// as a `?token=` query for the WebSocket handshake by [`super::ws`].
+/// `base_url` carries no query string so it is safe to log; the token travels
+/// separately, as a bearer header in [`super::http`] and a `?token=` query in
+/// [`super::ws`].
 #[derive(Debug, Clone)]
 pub struct DaemonEndpoint {
-    /// Bare base URL (`http://127.0.0.1:8080`). No trailing slash, no
-    /// query string.
+    /// Bare base URL (`http://127.0.0.1:8080`), no trailing slash or query.
     pub base_url: String,
-    /// Bearer token captured during discovery. Loopback clients re-read the
-    /// owner-only `serve.token` before each request because remote daemons
-    /// rotate it while a TUI can remain open.
-    ///
-    /// `None` when the daemon was started with `--no-auth`, or when
-    /// `AOE_DAEMON_URL` is set without `AOE_DAEMON_TOKEN`.
+    /// Discovery-time token, `None` under `--no-auth`. Loopback clients
+    /// re-read `serve.token` per request because the daemon rotates it while
+    /// a TUI stays open.
     token: Arc<RwLock<Option<String>>>,
     local_token_path: Option<PathBuf>,
     pub source: Source,
@@ -57,32 +45,26 @@ impl DaemonEndpoint {
         self
     }
 
-    /// Same base URL, scheme rewritten to `ws://` / `wss://` so a
-    /// caller can hand it to `tokio_tungstenite::connect_async`.
+    /// Same base URL with a `ws://` / `wss://` scheme.
     pub fn ws_base_url(&self) -> String {
         http_to_ws(&self.base_url)
     }
 
-    /// Session-list client for this endpoint, carrying the credential as
-    /// resolved now (see `resolved_token`).
+    /// Session-list client carrying the credential as resolved now.
     pub fn daemon_client(&self) -> Result<DaemonClient, DaemonClientError> {
         let token = self.resolved_token();
         DaemonClient::new(&self.base_url, token.as_deref())
     }
 
-    /// Resolve the credential to send now rather than relying forever on the
-    /// discovery-time snapshot. Only loopback local-daemon discovery may
-    /// consult the app directory; explicit env and legacy public endpoints
-    /// must never receive a token read for some other local daemon.
+    /// The credential to send now, not the discovery-time snapshot. Only a
+    /// loopback local-daemon endpoint may re-read the app directory: an env
+    /// override or a legacy public endpoint must never be handed some other
+    /// local daemon's token.
     pub(crate) fn resolved_token(&self) -> Option<String> {
-        let cached = self.cached_token();
-        if self.source != Source::LocalDaemon || !is_loopback(&self.base_url) {
-            return cached;
+        match self.local_token_path.as_deref() {
+            Some(path) => self.resolved_token_from_path(path),
+            None => self.cached_token(),
         }
-        let Some(token_path) = self.local_token_path.as_deref() else {
-            return cached;
-        };
-        self.resolved_token_from_path(token_path)
     }
 
     fn resolved_token_from_path(&self, token_path: &Path) -> Option<String> {
@@ -91,11 +73,10 @@ impl DaemonEndpoint {
         if self.source != Source::LocalDaemon || !is_loopback(&self.base_url) {
             return cached;
         }
-        let Some(current) = read_valid_token(token_path) else {
-            return cached;
-        };
-        *self.token.write().unwrap_or_else(|e| e.into_inner()) = Some(current.clone());
-        Some(current)
+        read_valid_token(token_path).map_or(cached, |current| {
+            *self.token.write().unwrap_or_else(|e| e.into_inner()) = Some(current.clone());
+            Some(current)
+        })
     }
 
     pub(crate) fn has_token(&self) -> bool {
@@ -109,9 +90,7 @@ impl DaemonEndpoint {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
-    /// `AOE_DAEMON_URL` env var.
     Env,
-    /// Read from `<app_dir>/serve.url`.
     LocalDaemon,
 }
 
@@ -133,8 +112,7 @@ pub fn discover() -> Result<DaemonEndpoint, DiscoveryError> {
     discover_local()
 }
 
-/// `AOE_DAEMON_URL` (+ optional `AOE_DAEMON_TOKEN`). Returns `None`
-/// when the env var is unset or empty.
+/// `None` when `AOE_DAEMON_URL` is unset or empty.
 pub fn discover_env() -> Option<DaemonEndpoint> {
     let url = env::var("AOE_DAEMON_URL").ok()?;
     let url = url.trim();
@@ -152,8 +130,7 @@ pub fn discover_env() -> Option<DaemonEndpoint> {
     ))
 }
 
-/// Local serve daemon discovery. Returns `Err(NoLocalDaemon)` when no
-/// live daemon is found.
+/// `Err(NoLocalDaemon)` when no live local daemon is found.
 pub fn discover_local() -> Result<DaemonEndpoint, DiscoveryError> {
     if daemon_pid().is_none() {
         return Err(DiscoveryError::NoLocalDaemon);
@@ -169,15 +146,13 @@ pub fn discover_local() -> Result<DaemonEndpoint, DiscoveryError> {
         return Err(DiscoveryError::Malformed);
     }
     let endpoint = DaemonEndpoint::new(base_url, token, Source::LocalDaemon);
-    let endpoint = if is_loopback(&endpoint.base_url) {
-        match crate::session::get_app_dir() {
-            Ok(app_dir) => endpoint.with_local_token_path(app_dir.join("serve.token")),
-            Err(_) => endpoint,
-        }
-    } else {
-        endpoint
-    };
-    Ok(endpoint)
+    let app_dir = is_loopback(&endpoint.base_url)
+        .then(crate::session::get_app_dir)
+        .and_then(Result::ok);
+    Ok(match app_dir {
+        Some(dir) => endpoint.with_local_token_path(dir.join("serve.token")),
+        None => endpoint,
+    })
 }
 
 fn preferred_daemon_url(urls: &[ServeUrl]) -> Option<&ServeUrl> {
@@ -243,138 +218,70 @@ mod tests {
     }
 
     #[test]
-    fn extract_token_simple() {
-        assert_eq!(
-            extract_token("http://localhost:8080/?token=abc123"),
-            Some("abc123")
-        );
-    }
-
-    #[test]
-    fn extract_token_none_when_missing() {
-        assert_eq!(extract_token("http://localhost:8080/"), None);
-        assert_eq!(extract_token("http://localhost:8080/?foo=bar"), None);
-    }
-
-    #[test]
-    fn extract_token_none_when_empty() {
-        assert_eq!(extract_token("http://localhost:8080/?token="), None);
-    }
-
-    #[test]
-    fn extract_token_multi_param() {
-        assert_eq!(
-            extract_token("http://localhost:8080/?foo=bar&token=zzz"),
-            Some("zzz")
-        );
-    }
-
-    #[test]
-    fn trim_query_strips_query_string() {
+    fn url_parsing_helpers() {
+        for (url, token) in [
+            ("http://localhost:8080/?token=abc123", Some("abc123")),
+            ("http://localhost:8080/?foo=bar&token=zzz", Some("zzz")),
+            ("http://localhost:8080/", None),
+            ("http://localhost:8080/?foo=bar", None),
+            ("http://localhost:8080/?token=", None),
+        ] {
+            assert_eq!(extract_token(url), token, "{url}");
+        }
         assert_eq!(
             trim_query("http://localhost:8080/?token=abc"),
             "http://localhost:8080/"
         );
-        assert_eq!(
-            trim_query("http://localhost:8080/"),
-            "http://localhost:8080/"
-        );
-    }
-
-    #[test]
-    fn http_to_ws_handles_both_schemes() {
+        assert_eq!(trim_query("http://host/"), "http://host/");
         assert_eq!(http_to_ws("http://127.0.0.1:8080"), "ws://127.0.0.1:8080");
-        assert_eq!(
-            http_to_ws("https://remote.example.com"),
-            "wss://remote.example.com"
-        );
+        assert_eq!(http_to_ws("https://remote.test"), "wss://remote.test");
         assert_eq!(http_to_ws("ws://already"), "ws://already");
     }
 
+    /// A loopback local daemon adopts a rotated token, keeps the last valid one
+    /// across a torn or non-hex write, and caches it for the next read.
     #[test]
-    fn local_endpoint_resolves_rotated_token_at_use_time() {
+    fn loopback_endpoint_tracks_rotated_token() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("serve.token");
-        let old = "a".repeat(64);
-        let new = "b".repeat(64);
-        std::fs::write(&path, &new).unwrap();
-
-        let endpoint = endpoint(Some(&old), Source::LocalDaemon);
-        assert_eq!(endpoint.resolved_token_from_path(&path), Some(new));
-    }
-
-    #[test]
-    fn local_endpoint_falls_back_during_invalid_token_write() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("serve.token");
-        let old = "a".repeat(64);
-        std::fs::write(&path, "partial").unwrap();
-
-        let endpoint = endpoint(Some(&old), Source::LocalDaemon);
-        assert_eq!(endpoint.resolved_token_from_path(&path), Some(old));
-    }
-
-    #[test]
-    fn local_endpoint_rejects_non_lowercase_hex_tokens() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("serve.token");
-        let old = "a".repeat(64);
-        let endpoint = endpoint(Some(&old), Source::LocalDaemon);
-
-        for invalid in ["A".repeat(64), "g".repeat(64)] {
-            std::fs::write(&path, invalid).unwrap();
-            assert_eq!(endpoint.resolved_token_from_path(&path), Some(old.clone()));
-        }
-    }
-
-    #[test]
-    fn local_endpoint_caches_last_valid_rotated_token() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("serve.token");
-        let old = "a".repeat(64);
-        let new = "b".repeat(64);
+        let (old, new) = ("a".repeat(64), "b".repeat(64));
         let endpoint = endpoint(Some(&old), Source::LocalDaemon);
 
         std::fs::write(&path, &new).unwrap();
         assert_eq!(endpoint.resolved_token_from_path(&path), Some(new.clone()));
-        std::fs::write(&path, "partial").unwrap();
-        assert_eq!(endpoint.resolved_token_from_path(&path), Some(new));
+        for invalid in ["partial".to_string(), "A".repeat(64), "g".repeat(64)] {
+            std::fs::write(&path, invalid).unwrap();
+            assert_eq!(endpoint.resolved_token_from_path(&path), Some(new.clone()));
+        }
     }
 
+    /// Only a loopback local daemon may be handed the app directory's token: a
+    /// legacy public endpoint, an env override, and a `--no-auth` endpoint all
+    /// keep what discovery gave them.
     #[test]
-    fn legacy_public_endpoint_never_receives_local_daemon_token() {
+    fn non_loopback_endpoints_never_read_the_local_token_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("serve.token");
-        let captured = "a".repeat(64);
         std::fs::write(&path, "b".repeat(64)).unwrap();
-        let endpoint = DaemonEndpoint::new(
+        let captured = "a".repeat(64);
+
+        let public = DaemonEndpoint::new(
             "https://old-tunnel.example.com".into(),
             Some(captured.clone()),
             Source::LocalDaemon,
         );
-
-        assert_eq!(endpoint.resolved_token_from_path(&path), Some(captured));
-    }
-
-    #[test]
-    fn env_endpoint_never_reads_local_daemon_token() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("serve.token");
-        let explicit = "a".repeat(64);
-        std::fs::write(&path, "b".repeat(64)).unwrap();
-
-        let endpoint = endpoint(Some(&explicit), Source::Env);
-        assert_eq!(endpoint.resolved_token_from_path(&path), Some(explicit));
-    }
-
-    #[test]
-    fn no_auth_endpoint_ignores_lingering_token_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("serve.token");
-        std::fs::write(&path, "b".repeat(64)).unwrap();
-
-        let endpoint = endpoint(None, Source::LocalDaemon);
-        assert_eq!(endpoint.resolved_token_from_path(&path), None);
+        assert_eq!(
+            public.resolved_token_from_path(&path),
+            Some(captured.clone())
+        );
+        assert_eq!(
+            endpoint(Some(&captured), Source::Env).resolved_token_from_path(&path),
+            Some(captured)
+        );
+        assert_eq!(
+            endpoint(None, Source::LocalDaemon).resolved_token_from_path(&path),
+            None
+        );
     }
 
     #[test]
@@ -389,32 +296,24 @@ mod tests {
         assert!(!is_loopback("http://127.0.0.1.evil.example"));
     }
 
+    /// The loopback alternate wins, but a lone public URL is still selected.
     #[test]
-    fn preferred_daemon_url_uses_loopback_alternate() {
-        let urls = vec![
-            ServeUrl {
-                label: None,
-                url: "https://aoe.example.test/?token=secret".into(),
-            },
-            ServeUrl {
-                label: Some("localhost".into()),
-                url: "http://127.0.0.1:8080/?token=secret".into(),
-            },
-        ];
-
-        let selected = preferred_daemon_url(&urls).expect("a daemon URL should be selected");
-        assert_eq!(selected.url, urls[1].url);
-    }
-
-    #[test]
-    fn preferred_daemon_url_keeps_single_url_backward_compatibility() {
-        let urls = vec![ServeUrl {
+    fn preferred_daemon_url_prefers_loopback() {
+        let public = ServeUrl {
             label: None,
             url: "https://aoe.example.test/?token=secret".into(),
-        }];
-
-        let selected = preferred_daemon_url(&urls).expect("a daemon URL should be selected");
-        assert_eq!(selected.url, urls[0].url);
+        };
+        let loopback = ServeUrl {
+            label: Some("localhost".into()),
+            url: "http://127.0.0.1:8080/?token=secret".into(),
+        };
+        for (urls, want) in [
+            (vec![public.clone(), loopback.clone()], &loopback),
+            (vec![public.clone()], &public),
+        ] {
+            let selected = preferred_daemon_url(&urls).expect("a daemon URL is selected");
+            assert_eq!(selected.url, want.url);
+        }
     }
 
     #[test]
@@ -436,8 +335,7 @@ mod tests {
             ("AOE_DAEMON_TOKEN", "real-token"),
         ]);
         let endpoint = discover_env().expect("env override should resolve");
-        // ENV override strips the query string defensively even though
-        // tokens should travel via AOE_DAEMON_TOKEN, not the URL.
+        // Stripped defensively: the token belongs in AOE_DAEMON_TOKEN.
         assert_eq!(endpoint.base_url, "https://remote.example.com:9000");
         assert_eq!(endpoint.cached_token().as_deref(), Some("real-token"));
         assert_eq!(endpoint.source, Source::Env);

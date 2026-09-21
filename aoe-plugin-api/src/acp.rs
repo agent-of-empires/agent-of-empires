@@ -1,15 +1,4 @@
 //! ACP capability-discovery DTOs for the `acp.capabilities.get` worker RPC
-//! (API v9, #2897).
-//!
-//! This is the stable wire contract a session-driving plugin (for example
-//! `plugin-cron`) pins its fixtures against. The host assembles it from the
-//! static agent registry plus the last option catalog each agent advertised.
-//! `acp.capabilities.get` never launches an agent, so a never-run agent reports
-//! `CatalogStatus::Undiscovered` with empty lists; `acp.capabilities.probe`
-//! (API v11, the `acp.capabilities.probe` grant) runs a handshake-only probe to
-//! populate the catalog first, then returns the same shape. All lists are
-//! sorted by id so serialized fixtures are deterministic. Fields are additive
-//! from here on; an incompatible reshape bumps the crate `API_VERSION`.
 
 use serde::{Deserialize, Serialize};
 
@@ -26,16 +15,10 @@ pub struct AcpAgentCapability {
     pub id: String,
     pub display_name: String,
     pub catalog_status: CatalogStatus,
-    /// RFC3339 timestamp of the advertised catalog snapshot; `Some` only when
-    /// `catalog_status` is `Discovered`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog_updated_at: Option<String>,
     pub models: Vec<AcpModelCapability>,
     pub modes: Vec<AcpModeCapability>,
-    /// Reasoning-effort / thought-level choices the agent advertised (for
-    /// example claude's `think`/`ultrathink`). Empty for agents that do not
-    /// expose one or whose catalog is undiscovered. Added in API v11; omitted
-    /// from the wire when empty so v10 fixtures stay byte-stable.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub thinking: Vec<AcpThinkingCapability>,
 }
@@ -54,9 +37,6 @@ pub struct AcpThinkingCapability {
     pub display_name: String,
 }
 
-/// A permission/approval mode choice, carrying the HOST's security
-/// classification. The plugin must not infer safety from mode names; the
-/// host assigns `approval_class` and enforces it at `sessions.create`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcpModeCapability {
     pub id: String,
@@ -65,7 +45,6 @@ pub struct AcpModeCapability {
 }
 
 /// Whether the host has ever observed this agent's advertised option catalog.
-/// Models/modes are populated only after the agent has run at least once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CatalogStatus {
@@ -73,20 +52,12 @@ pub enum CatalogStatus {
     Discovered,
 }
 
-/// Host-assigned security class of an approval mode. `Unattended` requires
-/// the distinct high-severity `session.unattended` grant at
-/// `sessions.create`; the host classifies unknown modes as `Unattended`
-/// (fail closed), never trusting a plugin- or agent-supplied label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalClass {
     /// Approvals prompt a human through the host UI (adapter default).
     Interactive,
-    /// A reviewed mode that preserves host approvals or prohibits mutation
-    /// (for example a plan/read-only preset).
     Guarded,
-    /// The agent can act without a human present (bypass or auto-write
-    /// modes, and every mode the host cannot classify).
     Unattended,
 }
 
@@ -159,7 +130,6 @@ mod tests {
         };
         let json = serde_json::to_value(&agent).expect("serialize");
         assert!(json.get("catalog_updated_at").is_none());
-        // Empty thinking is omitted so v10 fixtures stay byte-stable.
         assert!(json.get("thinking").is_none());
         assert_eq!(json["catalog_status"], "undiscovered");
     }

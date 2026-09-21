@@ -43,10 +43,8 @@ export function TokenEntryPage({ onSuccess }: Props) {
     saveToken(token);
     resetTokenExpired();
 
-    // /api/login/status is exempt from the passphrase session check, so a
-    // token-good-but-passphrase-missing paste verifies as success here and
-    // App.tsx routes to LoginPage. A session-gated endpoint would 401 and
-    // look like a token rejection.
+    // /api/login/status is exempt from the passphrase session check, so a token-good-but-passphrase-missing paste
+    // verifies as success here and App.tsx routes to LoginPage.
     const verified = await verifyToken();
 
     if (verified) {

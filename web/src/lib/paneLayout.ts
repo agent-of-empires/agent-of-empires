@@ -5,39 +5,28 @@ import { safeGetItem, safeSetItem } from "./safeStorage";
 import { BUILTIN_PANES, isTerminalTabId, terminalTabId, type DockLocation } from "./panes";
 
 const LAYOUT_KEY = "aoe-pane-layout-v2";
-// v1 (#2432): a flat `Record<paneId, {open, dock}>`, browser-global. Read once
-// to seed the v2 per-session template so an upgrading user keeps their open
-// panes, then superseded by LAYOUT_KEY.
+// v1 per-browser layout, read once to seed the v2 per-session template.
 const LEGACY_V1_KEY = "aoe-pane-layout";
-// The pre-pane single right-column collapse flag (#2405 and earlier).
+// The pre-pane single right-column collapse flag.
 const LEGACY_COLLAPSED_KEY = "aoe-right-collapsed";
 
-/** A tab id: `"diff"`, `"terminal:<n>"`, or `"plugin:<plugin>:<entry>"`. */
+/** `"diff"`, `"terminal:<n>"`, or `"plugin:<plugin>:<entry>"`. */
 export type TabId = string;
 
-/** An ordered set of tabs sharing one strip, with the active one shown. */
 export interface PaneGroup {
   tabs: TabId[];
   active: TabId | null;
 }
 
-/** The tab layout for one session.
- *
- *  Each dock holds an array of groups, but only one group per dock is rendered
- *  today (a single tab strip). The array shape is deliberate: the drag-and-drop
- *  follow-up (#2437's sibling) adds split groups within a dock without another
- *  storage migration. */
+/** One session's tab layout. Only one group per dock renders today; the array leaves room for split groups without a storage migration. */
 export interface DockLayout {
   right: PaneGroup[];
   bottom: PaneGroup[];
-  // Monotonic terminal-index allocator. Never reused, so a freshly opened tab
-  // can't alias a just-closed terminal's tmux session.
+  // Never reused, so a new tab can't alias a just-closed terminal's tmux session.
   nextTerminalIndex: number;
-  // Plugin tabs the user explicitly closed, so the auto-add pass does not
-  // immediately re-add them on the next render.
+  // Plugin tabs the user closed, so auto-add does not reopen them.
   closedPlugins: TabId[];
-  // Per-dock visibility. Collapsed docks keep their tabs so expand restores
-  // the same pane set, tab order, and active tab.
+  // Collapsed docks keep their tabs.
   collapsed: Record<DockLocation, boolean>;
 }
 
@@ -53,19 +42,14 @@ function emptyDockLayout(): DockLayout {
   return { right: [], bottom: [], nextTerminalIndex: 1, closedPlugins: [], collapsed: { right: false, bottom: false } };
 }
 
-/** All groups in a dock, in render order. */
 export function dockGroups(layout: DockLayout, dock: DockLocation): PaneGroup[] {
   return layout[dock];
 }
 
-/** Every tab in a dock, flattened across its groups. Callers asking "is this
- *  open / which dock holds it / close everything here" want the whole dock, not
- *  a single group. */
 export function dockTabs(layout: DockLayout, dock: DockLocation): TabId[] {
   return layout[dock].flatMap((g) => g.tabs);
 }
 
-/** Address of a tab: its dock, its group's index, and its index in that group. */
 export interface TabAddress {
   dock: DockLocation;
   group: number;
@@ -83,13 +67,11 @@ export function findTab(layout: DockLayout, tabId: TabId): TabAddress | null {
   return null;
 }
 
-/** True when `tabId` is the active tab of whichever group holds it. */
 export function isActiveTab(layout: DockLayout, tabId: TabId): boolean {
   const at = findTab(layout, tabId);
   return at ? layout[at.dock][at.group]!.active === tabId : false;
 }
 
-/** Which dock a tab currently lives in, or null if it is closed. */
 export function dockOf(layout: DockLayout, tabId: TabId): DockLocation | null {
   return findTab(layout, tabId)?.dock ?? null;
 }
@@ -120,10 +102,7 @@ function ensureGroup(layout: DockLayout, dock: DockLocation): PaneGroup {
   return layout[dock][0]!;
 }
 
-/** Drop any group whose last tab just closed, leaving sibling groups intact. A
- *  dock with no groups renders nothing (the parent keys off a zero-length
- *  array). Prunes on real tab count, so a group holding only an unloaded plugin
- *  tab survives. */
+/** Prunes on real tab count, so a group holding only an unloaded plugin tab survives. */
 function pruneEmpty(layout: DockLayout, dock: DockLocation): void {
   layout[dock] = layout[dock].filter((g) => g.tabs.length > 0);
 }
@@ -145,7 +124,6 @@ export function removeTab(layout: DockLayout, tabId: TabId): DockLayout {
   const group = next[at.dock][at.group]!;
   group.tabs.splice(at.index, 1);
   if (group.active === tabId) {
-    // Prefer the tab that shifted into this slot, else the new last tab.
     group.active = group.tabs[at.index] ?? group.tabs[group.tabs.length - 1] ?? null;
   }
   if (tabId.startsWith("plugin:") && !next.closedPlugins.includes(tabId)) {
@@ -167,8 +145,7 @@ function clampIndex(index: number, max: number): number {
   return Math.max(0, Math.min(Math.floor(index), max));
 }
 
-/** Where a tab should land: an existing group (`group` + `index`) or a fresh
- *  group spliced into the dock at position `group` (when `newGroup`). */
+/** An existing group (`group` + `index`) or, with `newGroup`, a fresh group spliced in at `group`. */
 export interface PlaceTarget {
   dock: DockLocation;
   group: number;
@@ -176,17 +153,7 @@ export interface PlaceTarget {
   newGroup?: boolean;
 }
 
-/** Move `tabId` to `target`. The single placement primitive: subsumes
- *  within-group reorder, cross-group and cross-dock moves, and splitting a tab
- *  into a new group. `index` is the position in the destination group *after*
- *  the tab is removed from its source.
- *
- *  Active-tab rule: a within-group reorder keeps whatever was active (so
- *  dragging a background tab never steals focus and dragging the active tab
- *  keeps it active); any move into a different group activates the tab there,
- *  since it would otherwise land hidden behind that group's active tab.
- *  Implemented directly rather than via removeTab so a move never marks a plugin
- *  tab as explicitly closed. */
+/** Move `tabId` to `target`; `index` is measured after removal from the source. A within-group reorder keeps the active tab; moving into another group activates it there. Never marks a plugin tab as closed. */
 export function placeTab(layout: DockLayout, tabId: TabId, target: PlaceTarget): DockLayout {
   const src = findTab(layout, tabId);
   if (!src) return layout;
@@ -195,8 +162,6 @@ export function placeTab(layout: DockLayout, tabId: TabId, target: PlaceTarget):
   const srcActive = srcGroup.active;
   srcGroup.tabs.splice(src.index, 1);
   if (srcActive === tabId) {
-    // Source loses its active tab: prefer the tab that shifted into the slot,
-    // else the new last tab. (Restored below for a within-group reorder.)
     srcGroup.active = srcGroup.tabs[src.index] ?? srcGroup.tabs[srcGroup.tabs.length - 1] ?? null;
   }
   let srcPruned = false;
@@ -204,8 +169,7 @@ export function placeTab(layout: DockLayout, tabId: TabId, target: PlaceTarget):
     next[src.dock].splice(src.group, 1);
     srcPruned = true;
   }
-  // Removing the source group renumbers later groups in the same dock; the
-  // caller's `target.group` was computed against the pre-removal layout.
+  // Removing the source group renumbers later groups in the same dock.
   let groupIdx = target.group;
   if (srcPruned && src.dock === target.dock && src.group < groupIdx) groupIdx--;
   const destGroups = next[target.dock];
@@ -231,7 +195,6 @@ export function moveTab(layout: DockLayout, tabId: TabId, toDock: DockLocation):
   return placeTab(layout, tabId, { dock: toDock, group: last, index: groups[last]!.tabs.length });
 }
 
-/** Allocate a fresh terminal tab in `dock` and return its id + new layout. */
 export function addTerminal(layout: DockLayout, dock: DockLocation): { layout: DockLayout; tabId: TabId } {
   const tabId = terminalTabId(layout.nextTerminalIndex);
   const next = addTab(layout, dock, tabId);
@@ -249,36 +212,23 @@ export function removeAllTerminals(layout: DockLayout): DockLayout {
   return next;
 }
 
-/** Add any available plugin pane that is neither open nor explicitly closed to
- *  its default dock, in the order given. Keeps already-open plugins and their
- *  position untouched. */
+/** Add available plugin panes that are neither open nor closed, leaving open ones in place. */
 export function syncPluginTabs(layout: DockLayout, available: { id: TabId; defaultDock: DockLocation }[]): DockLayout {
   let next = layout;
   for (const p of available) {
     if (dockOf(next, p.id)) continue;
     if (next.closedPlugins.includes(p.id)) continue;
-    // Auto-added plugin tabs don't steal focus from the active tab.
+    // Auto-added plugin tabs don't steal focus.
     next = addTab(next, p.defaultDock, p.id, false);
   }
   return next;
 }
 
-// --- persistence + migration ---
-
-// Built-in panes that open by default / on a v1 migration. The Sub agents
-// pane is intentionally excluded: it is opt-in, opened on demand via its
-// ActivityBar toggle or by clicking an inline sub-agent card, so it never
-// auto-opens as an empty tab. A v1 layout predates it, so it can never
-// have been "open" there either.
-// The Files pane, like Sub agents, is opened on demand from the ActivityBar
-// (not auto-seeded into a fresh layout), so a new session opens with just the
-// diff + terminal tabs it always had. See #3088.
+// Sub agents and Files are opt-in, so they never auto-open as empty tabs.
 const AUTO_OPEN_PANES = BUILTIN_PANES.filter((p) => p.id !== "agents" && p.id !== "files");
 
 function defaultTemplate(): DockLayout {
-  // Desktop opens diff + terminal in the right dock (matches the historical
-  // expanded right column); narrow viewports start empty and drive the surface
-  // via the mobile picker instead.
+  // Narrow viewports start empty and use the mobile picker.
   const open = typeof window !== "undefined" && window.innerWidth >= 768;
   const base = emptyDockLayout();
   if (!open) return base;
@@ -314,7 +264,7 @@ function migrateTemplate(): DockLayout {
       }
       return l;
     } catch {
-      // fall through to collapsed flag / defaults
+      // Fall through to the collapsed flag and defaults.
     }
   }
   const collapsed = safeGetItem(LEGACY_COLLAPSED_KEY);
@@ -344,9 +294,7 @@ function normalizeGroups(v: unknown): PaneGroup[] {
   return groups;
 }
 
-/** Drop from `group` any tab id already claimed by an earlier dock. A tab must
- *  live in exactly one dock; a corrupted store with the same id in both would
- *  hand dnd-kit duplicate sortable ids and break dragging. */
+/** A corrupted store with one id in two docks would give dnd-kit duplicate sortable ids. */
 function dropDuplicates(group: PaneGroup[], seen: Set<TabId>): PaneGroup[] {
   return group
     .map((g) => {
@@ -394,26 +342,22 @@ function loadStore(): LayoutStore {
         return { version: 2, template: normalizeDock(parsed.template), sessions };
       }
     } catch {
-      // Malformed JSON: fall through to migration / defaults.
+      // Malformed JSON: fall through to migration and defaults.
     }
   }
   return { version: 2, template: migrateTemplate(), sessions: {} };
 }
 
 export interface PaneLayoutApi {
-  /** The active session's layout (the template if the session is unseen). */
   layout: DockLayout;
-  /** Open a specific tab id in `dock` (no-op if already open anywhere). */
+  /** No-op if already open anywhere. */
   openTab: (tabId: TabId, dock: DockLocation) => void;
   addTerminal: (dock: DockLocation) => void;
   closeTab: (tabId: TabId) => void;
   activateTab: (dock: DockLocation, tabId: TabId) => void;
   moveTab: (tabId: TabId, toDock: DockLocation) => void;
-  /** Reorder, move across docks/groups, or split into a new group. */
   placeTab: (tabId: TabId, target: PlaceTarget) => void;
-  /** Activity-bar toggle for a built-in kind ("diff" or "terminal"). */
   toggleKind: (kind: "diff" | "terminal" | "agents" | "files", defaultDock: DockLocation) => void;
-  /** Add/remove a plugin pane tab (activity-bar toggle). */
   togglePlugin: (id: TabId, defaultDock: DockLocation) => void;
   syncPlugins: (available: { id: TabId; defaultDock: DockLocation }[]) => void;
   setDockCollapsed: (dock: DockLocation, collapsed: boolean) => void;
@@ -442,23 +386,12 @@ function terminalTabs(layout: DockLayout): { id: TabId; dock: DockLocation }[] {
   );
 }
 
-/** Which built-in panes may auto-open in a new session (#3035). Kept minimal
- *  and decoupled from the full `WebSettings` shape so the layout module owns
- *  only what it filters on. */
 export interface AutoOpenPanePrefs {
   diff: boolean;
   terminal: boolean;
 }
 
-/** The layout an unseen session inherits: the persisted template with the diff
- *  tab and/or terminals stripped out per the user's auto-open prefs. Filtering
- *  happens here, at seed time, rather than in `defaultTemplate()`, so the
- *  toggles take effect for existing users (whose template was persisted with
- *  panes open) and only shape sessions opened after the toggle changed. Purely
- *  subtractive: a pref back on restores only what the template still holds, it
- *  cannot conjure a pane the template never had (e.g. a mobile-first template).
- *  Plugin panes are not in the template; their auto-open is gated separately in
- *  the App shell. */
+/** Strip auto-open panes from the template at seed time, so the prefs affect existing users but only new sessions. Purely subtractive. */
 export function seedLayout(template: DockLayout, prefs: AutoOpenPanePrefs): DockLayout {
   let l = template;
   if (!prefs.diff) l = removeTab(l, "diff");
@@ -483,16 +416,11 @@ export function usePaneLayout(sessionId: string | null): PaneLayoutApi {
     [store, sessionId, autoOpenDiffPane, autoOpenTerminalPane],
   );
 
-  // Apply a pure transform to the active session's layout, seeding it from the
-  // template the first time the session is touched.
   const mutate = useCallback(
     (fn: (l: DockLayout) => DockLayout) => {
       if (!sessionId) return;
       setStore((s) => {
-        // Read prefs synchronously here, not from the hook closure: putting
-        // `settings` in this callback's deps would rebuild the whole pane API
-        // (and re-render every consumer) on any unrelated web-setting change,
-        // and omitting it would stale-seed. See #3035.
+        // Read prefs synchronously: depending on `settings` would rebuild the pane API on any setting change.
         const prefs = getWebSettingsSnapshot();
         const current =
           s.sessions[sessionId] ??
@@ -537,8 +465,7 @@ export function usePaneLayout(sessionId: string | null): PaneLayoutApi {
   const toggleKind = useCallback(
     (kind: "diff" | "terminal" | "agents" | "files", defaultDock: DockLocation) =>
       mutate((l) => {
-        // Single-instance panes (diff, files, agents) toggle their one tab; the
-        // terminal kind is multi-instance and toggles the whole group.
+        // Single-instance panes toggle their tab; terminals toggle the whole group.
         if (kind === "diff" || kind === "agents" || kind === "files") {
           const at = findTab(l, kind);
           if (at) return isDockCollapsed(l, at.dock) ? openOrRevealTab(l, kind, defaultDock) : removeTab(l, kind);

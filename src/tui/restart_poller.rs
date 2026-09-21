@@ -92,6 +92,7 @@ mod tests {
             skip_on_launch: false,
             bound_hooks: true,
             discard_sandbox_container: false,
+            conversation_carry: None,
         });
 
         let result = loop {

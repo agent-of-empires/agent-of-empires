@@ -6,7 +6,7 @@ import { DiffFileList } from "./diff/DiffFileList";
 import { DiffFileViewer } from "./diff/DiffFileViewer";
 import { CommentsBanner } from "./diff/comments/CommentsBanner";
 import { SendCommentsDialog } from "./diff/comments/SendCommentsDialog";
-import { PluginPaneBody } from "./plugin/PluginSlots";
+import { PluginPaneBody } from "./plugin/PluginPane";
 import type { RightPanelView } from "../lib/rightPanelView";
 import { isPluginPaneId, type PluginPane } from "../lib/pluginPanes";
 import type { RepoBase, RichDiffFile, SessionResponse } from "../lib/types";
@@ -200,9 +200,8 @@ export function MobileMainPane({
         )}
 
         {activePluginPane && (
-          // Reserve the bottom home-indicator inset here too (see the diff and
-          // paired wrappers); the App root no longer does. Collapses to 0 with
-          // the keyboard open and on desktop.
+          // Reserve the bottom home-indicator inset here too (see the diff and paired wrappers); the App root no
+          // longer does.
           <div
             className="absolute inset-0 z-10 flex flex-col min-h-0 overflow-hidden bg-surface-900"
             data-testid="mobile-plugin-layer"

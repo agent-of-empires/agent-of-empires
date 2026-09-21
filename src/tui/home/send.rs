@@ -2,9 +2,8 @@
 
 use super::*;
 
-/// Map a decision to its agent-defined keystroke sequence. Pure and
-/// tmux-free so the choice-to-field mapping is unit-testable without a
-/// real pane; `execute_permission_response` is the only caller.
+/// Map a decision to its agent-defined keystroke sequence. Pure and tmux-free so the
+/// mapping is unit-testable; `execute_permission_response` is the only caller.
 pub(super) fn permission_response_tokens(
     response: &crate::agents::PermissionResponse,
     choice: crate::tui::dialogs::PermissionResponseChoice,
@@ -30,15 +29,13 @@ impl HomeView {
         }
     }
 
-    /// Stamp `last_accessed_at` on a session (user-initiated interaction).
+    /// Stamp `last_accessed_at` on a session (a user-initiated interaction).
     ///
-    /// Sunk rows (archived or snoozed) take the heavier `apply_user_action`
-    /// path so the auto-unarchive/unsnooze side effect in `touch_last_accessed`
-    /// is persisted (merge_from_tui doesn't carry those fields; without this,
-    /// reload would resurrect the sink from disk) and the row leaves the
-    /// Archived section visually on the same frame. Non-sunk rows stay on
-    /// the cheap mutate_instance path; their only mutation is the timestamp,
-    /// which save() already mirrors via merge_from_tui.
+    /// Sunk rows take the heavier `apply_user_action` path so the auto-unarchive side effect
+    /// in `touch_last_accessed` is persisted (merge_from_tui doesn't carry those fields, so
+    /// a reload would resurrect the sink) and the row leaves the Archived section on the same
+    /// frame. Non-sunk rows stay on the cheap mutate_instance path, since save() already
+    /// mirrors the timestamp.
     pub fn stamp_last_accessed(&mut self, id: &str) {
         let was_sunk = self
             .instances
@@ -60,21 +57,19 @@ impl HomeView {
         }
     }
 
-    /// Run the send-message work after the dialog has been dismissed: call
-    /// `ensure_pane_ready` (which may auto-start or respawn), then deliver
-    /// the keystrokes. Errors are surfaced via `info_dialog` so the caller
-    /// (`execute_action`) only has to clear its transient status.
+    /// Run the send-message work after the dialog is dismissed: `ensure_pane_ready` (which
+    /// may auto-start or respawn), then deliver the keystrokes. Errors surface via
+    /// `info_dialog`, so the caller only has to clear its transient status.
     ///
     pub fn execute_send_message(&mut self, session_id: &str, message: &str) {
         let target = std::mem::replace(
             &mut self.pending_send_target,
             live_send::LiveSendTarget::Agent,
         );
-        // Same pane-readiness cascades as live-send: agent runs the
-        // full `ensure_pane_ready` (Docker, splash, resume); terminals
-        // just need their tmux session to exist with a live pane. Every cold
-        // target starts at the visible preview size, avoiding an immediate
-        // full-terminal-to-preview resize and its SIGWINCH repaint.
+        // Same pane-readiness cascades as live-send: the agent runs the full
+        // `ensure_pane_ready` while terminals just need a live pane. Every cold target starts
+        // at the visible preview size, avoiding an immediate resize and its SIGWINCH
+        // repaint.
         let boot_size = self.live_send_boot_size();
         match &target {
             live_send::LiveSendTarget::Agent => {
@@ -159,9 +154,8 @@ impl HomeView {
                 crate::tmux::ToolSession::new(&inst.id, &inst.title, name).session_name(),
             ),
         };
-        // Agent gets a tool-specific Enter delay so paste-burst-aware
-        // agents (e.g. Codex) don't swallow the final Enter. Shells in
-        // the paired terminal panes don't need the delay.
+        // The agent gets a tool-specific Enter delay so paste-burst-aware agents don't
+        // swallow the final Enter; shells in the terminal panes don't need it.
         let delay = match &target {
             live_send::LiveSendTarget::Agent => crate::agents::send_keys_enter_delay(&inst.tool),
             live_send::LiveSendTarget::Terminal
@@ -185,11 +179,9 @@ impl HomeView {
         }
     }
 
-    /// Send the tmux keystrokes for a permission-prompt decision straight
-    /// to the selected session's agent pane. No pane-readiness wait like
-    /// `execute_send_message` performs: this action only makes sense
-    /// against an already-live pane showing a prompt, so there is nothing
-    /// to revive.
+    /// Send the tmux keystrokes for a permission-prompt decision to the selected session's
+    /// agent pane. No pane-readiness wait: this only makes sense against a live pane already
+    /// showing a prompt.
     pub fn execute_permission_response(
         &mut self,
         session_id: &str,

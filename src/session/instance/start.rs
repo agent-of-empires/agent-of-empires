@@ -55,69 +55,36 @@ pub(super) mod test_support {
 }
 
 /// Outcome of `start_with_resume_fallback`.
-///
-/// Tmux/process failures propagate as `Err` so callers keep the existing
-/// `Status::Error` + `last_error` path. Resume-probe death is represented
-/// explicitly as `ResumeFailed` because it preserves durable state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartOutcome {
     /// Session ID was set and resume succeeded; pane is alive.
     Resumed,
-    /// Resume was attempted, but the pane died during the probe before AoE
-    /// observed an explicit invalid-resume signal. The sid was preserved and
-    /// marked so startup recovery does not retry it automatically.
+    /// Resume was attempted, but the pane died during the probe before AoE observed an explicit
+    /// invalid-resume signal.
     ResumeFailed { sid: String },
-    /// No resume cascade ran. Either no prior sid, the agent doesn't support
-    /// resume, the sid was invalid, the session is structured view-mode (no tmux
-    /// pane), or the tmux session was already alive when entered (so
-    /// `start_with_size_opts` was a no-op and the probe had nothing to
-    /// detect). The pane is alive on return; whether a fresh launch
-    /// actually occurred this call depends on the caller having killed
-    /// any pre-existing pane first.
+    /// No resume cascade ran.
     Fresh,
-    /// A resume was skipped, and the session started fresh instead, because
-    /// `sid` already failed a resume probe once before. Retrying the
-    /// identical sid would only reproduce the original `ResumeFailed`
-    /// forever, so this launch routes through `ResumeIntent::Cleared`
-    /// instead (same as a manual `aoe session set-session-id ""`): a fresh
-    /// sid is assigned and `sid` is not carried forward. Distinct from
-    /// `Fresh` so callers can tell the user their conversation did not
-    /// resume, instead of silently starting a blank session; the prior
-    /// conversation is still reachable through the agent's own resume/
-    /// history picker. See #2609.
+    /// A resume was skipped, and the session started fresh instead, because `sid` already failed a
+    /// resume probe once before.
     FreshAfterFailedResume { sid: String },
 }
 
 /// What `start_with_size_opts` did with the agent's session id this call.
-/// `start_with_resume_fallback` matches on `Existing` to gate the Tier-1
-/// settle probe; without the gate, fresh Claude launches mislabel as
-/// `StartOutcome::Resumed` because `acquire_session_id` always assigns a
-/// UUID for Claude. `Fresh` carries its own probe gate for the launches that
-/// pin an already-stored id (see `pinned_prior_sid`).
 #[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchSidOutcome {
-    /// `acquire_session_id` reused a prior sid: `ResumeIntent::Use(sid)`,
-    /// observed `agent_session_id`, or retroactive-capture hit. The launch
-    /// command embedded the agent's resume flag.
+    /// `acquire_session_id` reused a prior sid: `ResumeIntent::Use(sid)`, observed
+    /// `agent_session_id`, or retroactive-capture hit.
     Existing { sid: String },
     /// `acquire_session_id` returned a fresh sid (Claude UUID generation)
     /// or `None`. No prior conversation continued.
     Fresh {
-        /// Set when the fresh launch pinned an id the session already had
-        /// stored, rather than a UUID minted for a brand-new conversation:
-        /// the #2700 empty-thread downgrade (`--session-id <sid>`) and a fork
-        /// (whose child id is pre-generated at creation). Both can die on the
-        /// spot, for a live id or an unresolvable parent, so both are worth
-        /// probing; a genuinely new session cannot and skips the probe.
-        /// See #3399.
+        /// Set when the fresh launch pinned an id the session already had stored, rather than a
+        /// UUID minted for a brand-new conversation.
         pinned_prior_sid: Option<String>,
     },
-    /// `start_with_size_opts` short-circuited before `apply_session_flags`
-    /// ran: structured view-mode session, or a pre-existing tmux pane that is
-    /// still alive (kill_clean cache race). `agent_session_id` was not mutated
-    /// this call. A pre-existing *dead* pane is not skipped; it is torn down
-    /// and relaunched (#3399).
+    /// `start_with_size_opts` short-circuited before `apply_session_flags` ran: structured
+    /// view-mode session, or a pre-existing tmux pane that is still alive (kill_clean cache race).
     Skipped,
 }
 
@@ -155,10 +122,6 @@ impl Instance {
         if self.is_structured() {
             return Ok(LaunchSidOutcome::Skipped);
         }
-        // A `remain-on-exit` corpse still owns the tmux name, so plain
-        // `exists()` reads a crashed agent as a running session and start
-        // becomes a silent no-op the caller reports as success. Recreate the
-        // pane instead, the way restart already does. See #3399.
         let session = self.tmux_session()?;
         let corpse_pane = if session.exists() {
             if !session.is_pane_dead() {
@@ -174,14 +137,8 @@ impl Instance {
             Some(Status::Starting),
         )?;
 
-        // The durable reservation excludes peer launches while user hooks run.
-        // Both flocks must be absent because a hook may invoke aoe for this
-        // same session. Reacquire in the global order afterward and reload the
-        // authoritative title (via `reconcile_from_disk`) before deriving the
-        // tmux launch name: `spawn_prepared_launch`'s `tmux_session()` reads
-        // `self.title`, so the reload guarantees the name comes from the
-        // committed title a concurrent rename may have written during hooks,
-        // never the pre-hook value.
+        // The durable reservation excludes peer launches while user hooks run. Both flocks must be
+        // absent because a hook may invoke aoe for this same session.
         drop(lifecycle_lock);
         drop(title_lock);
         let hook_result = self.run_pre_launch_hooks(skip_on_launch, &profile);
@@ -285,13 +242,8 @@ impl Instance {
             prepared.expected_prior_omp_generation.as_deref(),
         );
         if let Some(metadata) = omp_capture_metadata.as_ref() {
-            // The launch preamble (`wrap_omp_launch`) rewrites OMP's breadcrumb
-            // and writes the capture marker only if the store's terminal-sessions
-            // directory already exists; it otherwise falls through to a raw
-            // launch and capture silently no-ops. A first-ever OMP launch (or a
-            // freshly routed store) has no such directory yet, so ensure it here
-            // for the host store. Sandboxed launches resolve a container-side
-            // path the host must not create.
+            // The launch preamble (`wrap_omp_launch`) rewrites OMP's breadcrumb and writes the
+            // capture marker only if the store's terminal-sessions directory already exists.
             if !self.is_sandboxed() {
                 if let Err(error) = std::fs::create_dir_all(&metadata.layout.terminal_sessions) {
                     tracing::warn!(

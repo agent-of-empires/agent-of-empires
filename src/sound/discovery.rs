@@ -1,16 +1,13 @@
-//! Locate the user's sounds directory, enumerate installed sounds,
-//! and validate that a requested sound is actually present.
+//! Sounds directory lookup, installed-sound enumeration, and validation.
 
 use std::path::PathBuf;
 
 use crate::session::get_app_dir;
 
-/// Get the directory where sound files are stored
 pub fn get_sounds_dir() -> Option<PathBuf> {
     get_app_dir().ok().map(|d| d.join("sounds"))
 }
 
-/// List available sound files (names with extensions)
 pub fn list_available_sounds() -> Vec<String> {
     let Some(dir) = get_sounds_dir() else {
         return Vec::new();
@@ -38,7 +35,6 @@ pub fn list_available_sounds() -> Vec<String> {
     sounds
 }
 
-/// Find the full path for a sound by filename (expects full filename with extension)
 pub(super) fn find_sound_file(filename: &str) -> Option<PathBuf> {
     let dir = get_sounds_dir()?;
     let path = dir.join(filename);
@@ -49,7 +45,6 @@ pub(super) fn find_sound_file(filename: &str) -> Option<PathBuf> {
     }
 }
 
-/// Validate that a sound file exists (for settings validation)
 pub fn validate_sound_exists(filename: &str) -> Result<(), String> {
     if filename.is_empty() {
         return Ok(());
@@ -80,17 +75,14 @@ mod tests {
 
     #[test]
     fn test_validate_sound_exists_empty() {
-        // Empty name should be valid
         assert!(validate_sound_exists("").is_ok());
     }
 
     #[test]
     fn test_validate_sound_exists_nonexistent() {
-        // Non-existent sound should return error
         let result = validate_sound_exists("nonexistent_sound_xyz");
         assert!(result.is_err());
         if let Err(msg) = result {
-            // Error should mention either no sounds installed or sound not found
             assert!(
                 msg.contains("not found") || msg.contains("No sounds installed"),
                 "Error message: {}",

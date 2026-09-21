@@ -1,8 +1,4 @@
-// Confirm-dialog copy for a terminal <-> structured view swap, matching the
-// TUI wording (src/tui/home/input.rs `prompt_switch_view_for_selected`). The
-// context-preservation gate that used to live here as a client mirror of
-// `agents::acp_transcript_cli_resumable` now rides on `SessionResponse`
-// (`keeps_context`), computed server-side, so both frontends share one gate.
+// Confirm-dialog copy for switching views, matching the TUI wording.
 
 export interface SwitchViewCopy {
   title: string;
@@ -10,10 +6,7 @@ export interface SwitchViewCopy {
   confirmLabel: string;
 }
 
-/** Title + body + confirm label for the switch-view confirm dialog, matching
- *  the TUI wording. `toStructured` is the switch direction; `keepsContext` is
- *  `acpTranscriptCliResumable(tool, acpAgent)`. Claude keeps the conversation
- *  in both directions; other agents restart fresh. */
+/** `keepsContext` comes from the server's `keeps_context`. */
 export function switchViewCopy(toStructured: boolean, keepsContext: boolean): SwitchViewCopy {
   if (toStructured) {
     return {

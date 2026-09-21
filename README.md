@@ -62,9 +62,7 @@ one in a persistent session with optional worktree and container isolation.
 
 ## How It Works
 
-Each agent runs in its own [tmux](https://github.com/tmux/tmux/wiki) session, so your agents keep running when you close the TUI, disconnect SSH, or your terminal crashes. Reopen `aoe` and everything is exactly where you left it.
-
-The key tmux shortcut to know: **`Ctrl+b d`** detaches from a session and returns to the TUI.
+Each agent runs in its own [tmux](https://github.com/tmux/tmux/wiki) session, so your agents keep running when you close the TUI, disconnect SSH, or your terminal crashes. Reopen `aoe` and everything is where you left it. The key shortcut to know: **`Ctrl+b d`** detaches from a session and returns to the TUI.
 
 ## Installation
 
@@ -95,7 +93,7 @@ aoe add --cmd claude         # Create a session running Claude Code
 aoe serve                    # Start the web dashboard
 ```
 
-In the TUI, press `?` for help. The bottom information bar shows all available keybindings in context.
+In the TUI, press `?` for help. The bottom information bar shows the keybindings available in context.
 
 ## Documentation
 
@@ -104,7 +102,8 @@ In the TUI, press `?` for help. The bottom information bar shows all available k
 - [Guides](https://www.agent-of-empires.com/guides/)
 - [CLI](https://www.agent-of-empires.com/docs/cli/reference/) and
   [HTTP API](https://www.agent-of-empires.com/docs/api/) references
-- [Development](https://www.agent-of-empires.com/docs/development/)
+- [Development](https://www.agent-of-empires.com/docs/development/) and
+  [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## Roadmap
 
@@ -112,37 +111,15 @@ The AoE roadmap is public: see the [project board](https://github.com/orgs/agent
 
 ## FAQ
 
-### What happens when I close aoe?
+**What happens when I close aoe?** Nothing. Sessions are tmux sessions running in the background; they are removed only when you delete them.
 
-Nothing. Sessions are tmux sessions running in the background. Open and close `aoe` as often as you like. Sessions only get removed when you explicitly delete them.
+**Which AI tools are supported?** Run `aoe agents` for the current list and availability on your machine.
 
-### Which AI tools are supported?
+**Can I use AoE over SSH?** Yes. Sessions persist across disconnects; reconnect and run `aoe` again.
 
-Run `aoe agents` for the current list and availability on your machine.
+**Does it work on Windows?** Only through WSL2. AoE depends on tmux and POSIX process handling.
 
-### Can I use AoE over SSH?
-
-Yes. Sessions persist across disconnects; reconnect and run `aoe` again.
-
-### Does it work on Windows?
-
-Only through WSL2. AoE depends on tmux and POSIX process handling, so native Windows is not supported.
-
-### How is this different from just using tmux directly?
-
-tmux gives you persistent sessions. AoE adds agent-aware status detection (running, waiting, idle, error), git worktree management, Docker sandboxing, a web dashboard, remote phone access, and a diff viewer, all wrapped around your existing tmux workflow. You can still `tmux attach` to any AoE session directly.
-
-## Development
-
-```bash
-cargo build
-cargo test
-cargo fmt
-cargo clippy
-cargo build --features web
-```
-
-See [Development](docs/development.md) for the full reference.
+**How is this different from plain tmux?** tmux gives you persistent sessions. AoE adds agent-aware status detection, git worktree management, container sandboxing, a web dashboard with phone access, and a diff viewer around them. You can still `tmux attach` to any AoE session directly.
 
 ## Acknowledgments
 

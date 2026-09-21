@@ -1,15 +1,11 @@
-//! HTTP client for the structured view daemon.
-//!
-//! One `HttpClient` per `DaemonEndpoint`; methods map 1:1 to the
-//! per-session structured view REST surface (`/api/sessions/{id}/acp/*`).
-//! Auth: the endpoint's optional `token` is sent as
-//! `Authorization: Bearer <token>` on every request, never as a
-//! query string, so it doesn't leak via logs or `ps`.
+//! HTTP client for the daemon's structured view REST surface. The token is
+//! always sent as a bearer header, never in the URL.
 
 use std::time::Duration;
 
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
-use reqwest::{header, StatusCode};
+use reqwest::{header, Method, StatusCode};
+use serde::de::DeserializeOwned;
 use thiserror::Error;
 
 use super::discovery::DaemonEndpoint;
@@ -18,15 +14,13 @@ use crate::acp::protocol::{
     ApprovalDecisionWire, FilesResponse, PromptRequest, ReplayResponse, ResolveApprovalRequest,
     SwitchAgentRequest, SwitchAgentResponse,
 };
+use crate::acp::transcript::TranscriptRow;
 use crate::plugin::ui_state::UiSnapshot;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Percent-encode set for a single URL path segment. A well-formed fqid
-/// (`plugin.<id>.<command>`, dotted lowercase) is left intact so it round-trips
-/// to the same string server-side, while structurally dangerous bytes (`/`,
-/// `?`, `#`, `%`, space, controls) are escaped so a malformed id can never
-/// break out of its path segment.
+/// Escapes bytes that could break out of one URL path segment while leaving a
+/// dotted plugin fqid intact.
 const PATH_SEGMENT: &AsciiSet = &CONTROLS
     .add(b' ')
     .add(b'/')
@@ -43,12 +37,9 @@ const PATH_SEGMENT: &AsciiSet = &CONTROLS
     .add(b'|')
     .add(b'}');
 
-/// One active plugin command as the daemon reports it (`GET
-/// /api/plugins/commands`), the source of truth the structured view resolves
-/// keybinds against: for a session on a remote daemon the plugin may not be
-/// installed on the TUI's own machine, so its local registry cannot resolve or
-/// execute it. Mirrors the server's `PluginCommandView`; only the execution
-/// fields are kept.
+/// An active plugin command as the daemon reports it. The structured view
+/// resolves keybinds against this because a remote daemon's plugins may not
+/// exist locally.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct PluginCommandView {
     pub fqid: String,
@@ -67,11 +58,10 @@ struct PluginCommandsEnvelope {
 /// Wire mirror of the daemon's `/acp/prompt` disposition.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
 pub struct PromptDispatchWire {
-    /// `sent` / `steered` / `queued`. Defaults to `sent`, which is what the
-    /// pre-Tier-3 empty 202 body meant.
+    /// An empty body from an older daemon means `sent`.
     #[serde(default)]
     pub disposition: PromptDispositionWire,
-    /// The queue row's id, present only on `queued`.
+    /// Present only on `queued`.
     #[serde(default)]
     pub queued_id: Option<String>,
 }
@@ -85,12 +75,9 @@ pub enum PromptDispositionWire {
     Queued,
 }
 
-/// Page size requested by [`HttpClient::replay_paged`]. Stays at or
-/// under the server's `MAX_REPLAY_PAGE` so it is never clamped down.
+/// At or under the server's `MAX_REPLAY_PAGE`, so it is never clamped.
 pub const REPLAY_PAGE_SIZE: u64 = 1000;
 
-/// Acp daemon HTTP client. Cheap to clone; the underlying
-/// `reqwest::Client` is reference-counted.
 #[derive(Debug, Clone)]
 pub struct HttpClient {
     http: reqwest::Client,
@@ -103,26 +90,28 @@ pub enum HttpError {
     Transport(#[from] reqwest::Error),
     #[error("structured view session {0} not found on the daemon")]
     SessionNotFound(String),
-    // A 404 whose body names the missing nonce: the approval already
-    // resolved server-side (concurrent decision, watchdog cancel, or the
-    // agent offered no matching option). Distinct from SessionNotFound so
-    // the approval flow can clear the card instead of toasting an error.
-    // See #1821.
+    /// The approval or elicitation already resolved server-side, so the card
+    /// can clear quietly (#1821).
     #[error("approval already resolved")]
     ApprovalGone,
     #[error("daemon is read-only (started with --read-only); request refused")]
     ReadOnly,
-    // The daemon may reject for several reasons: stale token, missing
-    // passphrase session, device binding mismatch. Pointing at
-    // `AOE_DAEMON_TOKEN` was misleading on `--auth=passphrase` and
-    // `--auth=none` daemons that never had a token in the first
-    // place. See #1525.
+    /// Worded for every auth mode, not only token auth (#1525).
     #[error("daemon rejected the request (401); restart `aoe serve` or check `--auth` mode")]
     Unauthorized,
     #[error("daemon returned HTTP {status}: {body}")]
     Server { status: StatusCode, body: String },
     #[error(transparent)]
     Daemon(#[from] crate::daemon::DaemonClientError),
+}
+
+/// Which endpoint family a request belongs to, deciding what a 404 means.
+#[derive(Clone, Copy)]
+enum Scope<'a> {
+    /// A 404 is a missing session.
+    Session(&'a str),
+    /// Daemon-wide: a 404 is an absent route (older daemon).
+    Global,
 }
 
 impl HttpClient {
@@ -134,82 +123,114 @@ impl HttpClient {
         Ok(Self { http, endpoint })
     }
 
-    /// `GET /api/sessions/{id}/acp/replay?since=N`. Unbounded fetch
-    /// (no `limit`): the server still applies its default page bound, so
-    /// this returns at most one page. Used by the status probe, which
-    /// only reads the metadata (`highest_seq`/`lowest_seq`) and passes
-    /// `since=u64::MAX` so no frames come back. History consumers should
-    /// use [`replay_paged`](Self::replay_paged) instead.
-    pub async fn replay(&self, session_id: &str, since: u64) -> Result<ReplayResponse, HttpError> {
-        let url = format!(
-            "{}/api/sessions/{}/acp/replay?since={}",
-            self.endpoint.base_url, session_id, since
-        );
-        let res = self.auth(self.http.get(&url)).send().await?;
-        let res = check_status(res, session_id).await?;
-        Ok(res.json::<ReplayResponse>().await?)
+    fn request(&self, method: Method, path: &str) -> reqwest::RequestBuilder {
+        let url = format!("{}{path}", self.endpoint.base_url);
+        self.auth(self.http.request(method, url))
     }
 
-    /// `GET /api/sessions/{id}/acp/replay?since=N&limit=L`. One page.
+    async fn send(
+        &self,
+        request: reqwest::RequestBuilder,
+        scope: Scope<'_>,
+    ) -> Result<reqwest::Response, HttpError> {
+        let res = request.send().await?;
+        let status = res.status();
+        if status.is_success() {
+            return Ok(res);
+        }
+        let body = res.text().await.unwrap_or_default();
+        Err(classify_error(status, &body, scope))
+    }
+
+    async fn get_json<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        scope: Scope<'_>,
+    ) -> Result<T, HttpError> {
+        let res = self.send(self.request(Method::GET, path), scope).await?;
+        Ok(res.json().await?)
+    }
+
+    /// POST/PATCH/DELETE to a session endpoint, discarding the body.
+    async fn session_call(
+        &self,
+        method: Method,
+        session_id: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<(), HttpError> {
+        let mut request = self.request(method, &format!("/api/sessions/{session_id}{path}"));
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        self.send(request, Scope::Session(session_id)).await?;
+        Ok(())
+    }
+
+    /// One unbounded page (the server's default bound applies). The status
+    /// probe uses `since=u64::MAX` for metadata only; history consumers use
+    /// [`replay_paged`](Self::replay_paged).
+    pub async fn replay(&self, session_id: &str, since: u64) -> Result<ReplayResponse, HttpError> {
+        let path = format!("/api/sessions/{session_id}/acp/replay?since={since}");
+        self.get_json(&path, Scope::Session(session_id)).await
+    }
+
     pub async fn replay_page(
         &self,
         session_id: &str,
         since: u64,
         limit: u64,
     ) -> Result<ReplayResponse, HttpError> {
-        let url = format!(
-            "{}/api/sessions/{}/acp/replay?since={}&limit={}",
-            self.endpoint.base_url, session_id, since, limit
-        );
-        let res = self.auth(self.http.get(&url)).send().await?;
-        let res = check_status(res, session_id).await?;
-        Ok(res.json::<ReplayResponse>().await?)
+        let path = format!("/api/sessions/{session_id}/acp/replay?since={since}&limit={limit}");
+        self.get_json(&path, Scope::Session(session_id)).await
     }
 
-    /// Page through replay history from `since`, accumulating every
-    /// frame into one `ReplayResponse`. Each request is bounded to
-    /// `page_size` so the daemon never buffers the whole history at once.
-    ///
-    /// The loop is capped at the first page's `highest_seq`: events
-    /// appended after replay began arrive over the live WS channel and
-    /// are deduped by the reducer, so chasing them here would never
-    /// converge on a busy session. Stops early and propagates `lost` if
-    /// any page reports a retention gap, leaving the caller to reset.
+    /// Fetch bounded pages from `since`, capped at the first page's
+    /// `highest_seq` (later events arrive over the WS), stopping at a
+    /// retention gap. Returns the pages and whether a gap was reported.
+    async fn collect_pages(
+        &self,
+        session_id: &str,
+        since: u64,
+        page_size: u64,
+        view_rows: bool,
+    ) -> Result<(Vec<ReplayResponse>, bool), HttpError> {
+        let view = if view_rows { "&view=rows" } else { "" };
+        let mut pages = Vec::new();
+        let mut cursor = since;
+        let mut cap = None;
+        loop {
+            let path = format!(
+                "/api/sessions/{session_id}/acp/replay?since={cursor}&limit={page_size}{view}"
+            );
+            let page: ReplayResponse = self.get_json(&path, Scope::Session(session_id)).await?;
+            let cap = *cap.get_or_insert(page.highest_seq);
+            let (lost, next, has_more) = (page.lost, page.next_cursor, page.has_more);
+            pages.push(page);
+            if lost {
+                return Ok((pages, true));
+            }
+            match next {
+                Some(next) if has_more && next > cursor && next < cap => cursor = next,
+                _ => return Ok((pages, false)),
+            }
+        }
+    }
+
+    /// Every frame from `since` in one response; see `collect_pages`.
     pub async fn replay_paged(
         &self,
         session_id: &str,
         since: u64,
         page_size: u64,
     ) -> Result<ReplayResponse, HttpError> {
-        let mut frames = Vec::new();
-        let mut cursor = since;
-        let mut target: Option<u64> = None;
-        let mut lost = false;
-        // Assigned every iteration before the post-loop read; the loop
-        // always runs at least once.
-        let mut highest_seq;
-        let mut lowest_seq;
-        loop {
-            let page = self.replay_page(session_id, cursor, page_size).await?;
-            highest_seq = page.highest_seq;
-            lowest_seq = page.lowest_seq;
-            let cap = *target.get_or_insert(page.highest_seq);
-            frames.extend(page.frames);
-            if page.lost {
-                lost = true;
-                break;
-            }
-            match page.next_cursor {
-                // Keep paging only while the cursor advances and stays
-                // within the snapshot window captured on the first page.
-                Some(next) if page.has_more && next > cursor && next < cap => {
-                    cursor = next;
-                }
-                _ => break,
-            }
-        }
+        let (pages, lost) = self
+            .collect_pages(session_id, since, page_size, false)
+            .await?;
+        let last = pages.last().expect("at least one page");
+        let (highest_seq, lowest_seq) = (last.highest_seq, last.lowest_seq);
         Ok(ReplayResponse {
-            frames,
+            frames: pages.into_iter().flat_map(|page| page.frames).collect(),
             lost,
             highest_seq,
             lowest_seq,
@@ -219,303 +240,161 @@ impl HttpClient {
         })
     }
 
-    /// `GET /api/sessions/{id}/acp/replay?since=N&limit=L&view=rows`. One
-    /// page of the server-folded transcript rows (`TranscriptRow[]` in
-    /// `rows`, `frames` empty), same pagination metadata as the raw
-    /// projection.
-    async fn replay_rows_page(
-        &self,
-        session_id: &str,
-        since: u64,
-        limit: u64,
-    ) -> Result<ReplayResponse, HttpError> {
-        let url = format!(
-            "{}/api/sessions/{}/acp/replay?since={}&limit={}&view=rows",
-            self.endpoint.base_url, session_id, since, limit
-        );
-        let res = self.auth(self.http.get(&url)).send().await?;
-        let res = check_status(res, session_id).await?;
-        Ok(res.json::<ReplayResponse>().await?)
-    }
-
-    /// Page through the server-folded transcript rows from `since`,
-    /// accumulating every page's `rows` in order and reconciling by row id
-    /// (the server folds each page in isolation, so a `tool_start` split
-    /// across a page seam can repeat under one id; last non-sparse wins).
-    /// The transcript twin of [`replay_paged`](Self::replay_paged): same
-    /// snapshot-window cap and retention-gap (`lost`) handling. Returns the
-    /// merged rows plus whether a page reported a gap.
+    /// Server-folded transcript rows from `since`. Pages fold in isolation, so
+    /// rows are reconciled by id across page seams.
     pub async fn replay_rows_paged(
         &self,
         session_id: &str,
         since: u64,
         page_size: u64,
-    ) -> Result<(Vec<crate::acp::transcript::TranscriptRow>, bool), HttpError> {
-        let mut rows: Vec<crate::acp::transcript::TranscriptRow> = Vec::new();
-        let mut cursor = since;
-        let mut target: Option<u64> = None;
-        let mut lost = false;
-        loop {
-            let page = self.replay_rows_page(session_id, cursor, page_size).await?;
-            let cap = *target.get_or_insert(page.highest_seq);
-            if let Some(page_rows) = page.rows {
-                for row in page_rows {
-                    crate::acp::transcript::upsert_transcript_row(&mut rows, row);
-                }
-            }
-            if page.lost {
-                lost = true;
-                break;
-            }
-            match page.next_cursor {
-                Some(next) if page.has_more && next > cursor && next < cap => {
-                    cursor = next;
-                }
-                _ => break,
-            }
+    ) -> Result<(Vec<TranscriptRow>, bool), HttpError> {
+        let (pages, lost) = self
+            .collect_pages(session_id, since, page_size, true)
+            .await?;
+        let mut rows = Vec::new();
+        for row in pages
+            .into_iter()
+            .flat_map(|page| page.rows.unwrap_or_default())
+        {
+            crate::acp::transcript::upsert_transcript_row(&mut rows, row);
         }
         Ok((rows, lost))
     }
 
-    /// `GET /api/sessions/{id}/acp/files`. Workspace file list for
-    /// the composer's `@`-mention picker.
+    /// Workspace files for the composer's `@`-mention picker.
     pub async fn files(&self, session_id: &str) -> Result<FilesResponse, HttpError> {
-        let url = format!(
-            "{}/api/sessions/{}/acp/files",
-            self.endpoint.base_url, session_id
-        );
-        let res = self.auth(self.http.get(&url)).send().await?;
-        let res = check_status(res, session_id).await?;
-        Ok(res.json::<FilesResponse>().await?)
+        let path = format!("/api/sessions/{session_id}/acp/files");
+        self.get_json(&path, Scope::Session(session_id)).await
     }
 
-    /// `POST /api/sessions/{id}/acp/prompt`.
-    ///
-    /// The daemon returns whether it sent, steered, or queued the prompt. An
-    /// absent body is treated as `Sent` for older daemons.
+    /// Returns whether the daemon sent, steered, or queued the prompt.
     pub async fn prompt(
         &self,
         session_id: &str,
         text: &str,
     ) -> Result<PromptDispatchWire, HttpError> {
-        let url = format!(
-            "{}/api/sessions/{}/acp/prompt",
-            self.endpoint.base_url, session_id
-        );
         let body = PromptRequest {
             text: text.to_string(),
             attachments: Vec::new(),
             prompt_id: None,
         };
-        let res = self.auth(self.http.post(&url)).json(&body).send().await?;
-        let res = check_status(res, session_id).await?;
+        let path = format!("/api/sessions/{session_id}/acp/prompt");
+        let request = self.request(Method::POST, &path).json(&body);
+        let res = self.send(request, Scope::Session(session_id)).await?;
         Ok(res.json::<PromptDispatchWire>().await.unwrap_or_default())
     }
 
-    /// `GET /api/plugins/ui-state`. The daemon-wide plugin UI snapshot
-    /// (host-rendered slots + notifications) the web dashboard polls; the
-    /// native structured view renders the TUI-applicable subset (#2402).
-    /// Global, not session-scoped, so a miss must not be classified as a
-    /// session-not-found.
+    /// The daemon-wide plugin UI snapshot (#2402).
     pub async fn plugin_ui_state(&self) -> Result<UiSnapshot, HttpError> {
-        let url = format!("{}/api/plugins/ui-state", self.endpoint.base_url);
-        let res = self.auth(self.http.get(&url)).send().await?;
-        let res = check_global_status(res).await?;
-        Ok(res.json::<UiSnapshot>().await?)
+        self.get_json("/api/plugins/ui-state", Scope::Global).await
     }
 
-    /// `GET /api/plugins/commands`. The daemon's active plugin commands with
-    /// their keybinds and client actions. The structured view resolves plugin
-    /// chords against this rather than the TUI's local registry, so a session on
-    /// a remote daemon can drive plugins installed only there. Global, like
-    /// `plugin_ui_state`.
     pub async fn plugin_commands(&self) -> Result<Vec<PluginCommandView>, HttpError> {
-        let url = format!("{}/api/plugins/commands", self.endpoint.base_url);
-        let res = self.auth(self.http.get(&url)).send().await?;
-        let res = check_global_status(res).await?;
-        Ok(res.json::<PluginCommandsEnvelope>().await?.commands)
+        let envelope: PluginCommandsEnvelope = self
+            .get_json("/api/plugins/commands", Scope::Global)
+            .await?;
+        Ok(envelope.commands)
     }
 
-    /// `POST /api/plugins/commands/{fqid}/invoke`. Dispatch an action-less
-    /// plugin command to its worker as a fire-and-forget notification (the TUI
-    /// twin of the web palette's invoke). Global, like `plugin_ui_state`; the
-    /// daemon validates the command and session. `fqid` has no slashes, so it
-    /// is a single path segment.
+    /// Fire-and-forget dispatch of an action-less plugin command.
     pub async fn invoke_plugin_command(
         &self,
         fqid: &str,
         session_id: &str,
     ) -> Result<(), HttpError> {
-        let url = format!(
-            "{}/api/plugins/commands/{}/invoke",
-            self.endpoint.base_url,
+        let path = format!(
+            "/api/plugins/commands/{}/invoke",
             utf8_percent_encode(fqid, PATH_SEGMENT)
         );
         let body = serde_json::json!({ "session_id": session_id });
-        let res = self.auth(self.http.post(&url)).json(&body).send().await?;
-        check_global_status(res).await?;
+        let request = self.request(Method::POST, &path).json(&body);
+        self.send(request, Scope::Global).await?;
         Ok(())
     }
 
-    /// `POST /api/plugins/{id}/enabled`. Toggling through the daemon (rather
-    /// than writing config locally) lets its plugin host reconcile workers
-    /// live: enabling launches the worker, disabling tears it down. Global,
-    /// like `plugin_ui_state`.
+    /// Toggled through the daemon so its plugin host reconciles workers live.
     pub async fn set_plugin_enabled(
         &self,
         plugin_id: &str,
         enabled: bool,
     ) -> Result<(), HttpError> {
-        let url = format!(
-            "{}/api/plugins/{}/enabled",
-            self.endpoint.base_url, plugin_id
-        );
-        let res = self
-            .auth(self.http.post(&url))
-            .json(&serde_json::json!({ "enabled": enabled }))
-            .send()
-            .await?;
-        check_global_status(res).await?;
+        let body = serde_json::json!({ "enabled": enabled });
+        let request = self
+            .request(Method::POST, &format!("/api/plugins/{plugin_id}/enabled"))
+            .json(&body);
+        self.send(request, Scope::Global).await?;
         Ok(())
     }
 
-    /// `POST /api/plugins/{id}/worker/restart`: the daemon reloads plugins from
-    /// disk and replaces this plugin's worker after its tree changed.
+    /// Reload plugins from disk and replace this plugin's worker.
     pub async fn restart_plugin_worker(&self, plugin_id: &str) -> Result<(), HttpError> {
-        let url = format!(
-            "{}/api/plugins/{}/worker/restart",
-            self.endpoint.base_url, plugin_id
-        );
-        let res = self.auth(self.http.post(&url)).send().await?;
-        check_global_status(res).await?;
+        let path = format!("/api/plugins/{plugin_id}/worker/restart");
+        self.send(self.request(Method::POST, &path), Scope::Global)
+            .await?;
         Ok(())
     }
 
-    /// `POST /api/sessions/{id}/acp/cancel`.
     pub async fn cancel(&self, session_id: &str) -> Result<(), HttpError> {
-        let url = format!(
-            "{}/api/sessions/{}/acp/cancel",
-            self.endpoint.base_url, session_id
-        );
-        let res = self.auth(self.http.post(&url)).send().await?;
-        check_status(res, session_id).await?;
-        Ok(())
+        self.session_call(Method::POST, session_id, "/acp/cancel", None)
+            .await
     }
 
-    /// `GET /api/sessions/{id}/queue`: the server-owned prompt queue, ordered
-    /// by ascending `seq`. The daemon owns and drains this queue, so the native
-    /// view mirrors it rather than keeping its own.
+    /// The daemon-owned prompt queue, ordered by `seq`. The native view never
+    /// enqueues itself: the daemon parks prompts posted to `/acp/prompt`.
     pub async fn queue_list(
         &self,
         session_id: &str,
     ) -> Result<Vec<crate::daemon::QueuedPromptEntry>, HttpError> {
-        let url = format!(
-            "{}/api/sessions/{}/queue",
-            self.endpoint.base_url, session_id
-        );
-        let res = self.auth(self.http.get(&url)).send().await?;
-        let res = check_status(res, session_id).await?;
-        Ok(res.json().await?)
+        let path = format!("/api/sessions/{session_id}/queue");
+        self.get_json(&path, Scope::Session(session_id)).await
     }
 
-    // No `queue_enqueue` here: since Tier 3 the native view never decides to
-    // queue. It POSTs every prompt to `/acp/prompt` and the daemon parks it if
-    // it must, so a client-side enqueue would be a second, competing decision.
-    // `POST /api/sessions/{id}/queue` still exists for the web's own paths.
-
-    /// `PATCH /api/sessions/{id}/queue/{promptId}`: replace a queued prompt's
-    /// text in place, keeping its position. The prompt id is client-minted and
-    /// may be arbitrary, so it is percent-encoded to a single path segment.
+    /// Replace a queued prompt's text in place. The client-minted id is
+    /// encoded as one path segment.
     pub async fn queue_edit(
         &self,
         session_id: &str,
         prompt_id: &str,
         text: &str,
     ) -> Result<(), HttpError> {
-        let url = format!(
-            "{}/api/sessions/{}/queue/{}",
-            self.endpoint.base_url,
-            session_id,
-            utf8_percent_encode(prompt_id, PATH_SEGMENT)
-        );
+        let path = format!("/queue/{}", utf8_percent_encode(prompt_id, PATH_SEGMENT));
         let body = serde_json::json!({ "text": text });
-        let res = self.auth(self.http.patch(&url)).json(&body).send().await?;
-        check_status(res, session_id).await?;
-        Ok(())
+        self.session_call(Method::PATCH, session_id, &path, Some(body))
+            .await
     }
 
-    /// `DELETE /api/sessions/{id}/queue`: drop every queued prompt.
     pub async fn queue_clear(&self, session_id: &str) -> Result<(), HttpError> {
-        let url = format!(
-            "{}/api/sessions/{}/queue",
-            self.endpoint.base_url, session_id
-        );
-        let res = self.auth(self.http.delete(&url)).send().await?;
-        check_status(res, session_id).await?;
-        Ok(())
+        self.session_call(Method::DELETE, session_id, "/queue", None)
+            .await
     }
 
-    /// `POST /api/sessions/{id}/smart-rename`: on-demand "Auto-name now" for a
-    /// structured session. The daemon forces past the `smart_rename`-disabled
-    /// gate and runs the one-shot detached; a 2xx means "started", not
-    /// "renamed" (the new title arrives over the structured-view WS).
+    /// "Auto-name now": 2xx means started; the title arrives over the WS.
     pub async fn smart_rename(&self, session_id: &str) -> Result<(), HttpError> {
-        let url = format!(
-            "{}/api/sessions/{}/smart-rename",
-            self.endpoint.base_url, session_id
-        );
-        let res = self.auth(self.http.post(&url)).send().await?;
-        check_status(res, session_id).await?;
-        Ok(())
+        self.session_call(Method::POST, session_id, "/smart-rename", None)
+            .await
     }
 
-    /// `POST /api/sessions/{id}/acp/mode`: set the active session
-    /// permission mode (an ACP `session/set_mode` round-trip). The new
-    /// mode echoes back over the WebSocket as `CurrentModeChanged`;
-    /// a rejection surfaces as `ModeSwitchFailed`.
+    /// The result echoes over the WS as `CurrentModeChanged` or
+    /// `ModeSwitchFailed`.
     pub async fn set_mode(&self, session_id: &str, mode_id: &str) -> Result<(), HttpError> {
-        let url = format!(
-            "{}/api/sessions/{}/acp/mode",
-            self.endpoint.base_url, session_id
-        );
         let body = serde_json::json!({ "mode_id": mode_id });
-        let res = self.auth(self.http.post(&url)).json(&body).send().await?;
-        check_status(res, session_id).await?;
-        Ok(())
+        self.session_call(Method::POST, session_id, "/acp/mode", Some(body))
+            .await
     }
 
-    /// `POST /api/sessions/{id}/acp/enable`: switch a terminal-mode
-    /// session to the structured view. The daemon tears down the tmux
-    /// pane, persists `view = Structured`, and its reconciler spawns the
-    /// ACP worker. Idempotent when the session is already structured.
+    /// Switch a terminal session to the structured view. Idempotent.
     pub async fn acp_enable(&self, session_id: &str) -> Result<(), HttpError> {
-        let url = format!(
-            "{}/api/sessions/{}/acp/enable",
-            self.endpoint.base_url, session_id
-        );
-        let res = self.auth(self.http.post(&url)).send().await?;
-        check_status(res, session_id).await?;
-        Ok(())
+        self.session_call(Method::POST, session_id, "/acp/enable", None)
+            .await
     }
 
-    /// `POST /api/sessions/{id}/acp/disable`: switch a structured-view
-    /// session back to a tmux terminal. The daemon stops the worker and
-    /// persists `view = Terminal`; the next attach spawns the pane.
-    /// Idempotent when the session is already terminal.
+    /// Switch a structured session back to a terminal. Idempotent.
     pub async fn acp_disable(&self, session_id: &str) -> Result<(), HttpError> {
-        let url = format!(
-            "{}/api/sessions/{}/acp/disable",
-            self.endpoint.base_url, session_id
-        );
-        let res = self.auth(self.http.post(&url)).send().await?;
-        check_status(res, session_id).await?;
-        Ok(())
+        self.session_call(Method::POST, session_id, "/acp/disable", None)
+            .await
     }
 
-    /// `POST /api/sessions/{id}/acp/switch-agent`. Hands the session
-    /// off to another ACP backend, keeping the transcript. Returns the
-    /// daemon's response (before/switch seqs) so callers can fetch a
-    /// context primer if they want a handoff recap.
+    /// Hand the session to another ACP backend, keeping the transcript.
     pub async fn switch_agent(
         &self,
         session_id: &str,
@@ -523,22 +402,35 @@ impl HttpClient {
         model: Option<&str>,
         reason: Option<&str>,
     ) -> Result<SwitchAgentResponse, HttpError> {
-        let url = format!(
-            "{}/api/sessions/{}/acp/switch-agent",
-            self.endpoint.base_url, session_id
-        );
         let body = SwitchAgentRequest {
             target: target.to_string(),
             model: model.map(str::to_string),
             reason: reason.map(str::to_string),
         };
-        let res = self.auth(self.http.post(&url)).json(&body).send().await?;
-        let res = check_status(res, session_id).await?;
-        Ok(res.json::<SwitchAgentResponse>().await?)
+        let path = format!("/api/sessions/{session_id}/acp/switch-agent");
+        let request = self.request(Method::POST, &path).json(&body);
+        let res = self.send(request, Scope::Session(session_id)).await?;
+        Ok(res.json().await?)
     }
 
-    /// `POST /api/sessions/{id}/acp/approvals/{nonce}`. `option_id` names
-    /// an option the TUI answered through the option picker.
+    async fn resolve(
+        &self,
+        session_id: &str,
+        kind: &str,
+        nonce: &str,
+        body: &impl serde::Serialize,
+    ) -> Result<(), HttpError> {
+        let path = format!("/api/sessions/{session_id}/acp/{kind}/{nonce}");
+        let res = self.request(Method::POST, &path).json(body).send().await?;
+        let status = res.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let text = res.text().await.unwrap_or_default();
+        Err(classify_resolve_error(status, &text, nonce, session_id))
+    }
+
+    /// `option_id` names an option chosen through the option picker.
     pub async fn resolve_approval(
         &self,
         session_id: &str,
@@ -546,52 +438,24 @@ impl HttpClient {
         decision: ApprovalDecisionWire,
         option_id: Option<String>,
     ) -> Result<(), HttpError> {
-        let url = format!(
-            "{}/api/sessions/{}/acp/approvals/{}",
-            self.endpoint.base_url, session_id, nonce
-        );
         let body = ResolveApprovalRequest {
             decision,
             option_id,
         };
-        let res = self.auth(self.http.post(&url)).json(&body).send().await?;
-        let status = res.status();
-        if status.is_success() {
-            return Ok(());
-        }
-        let text = res.text().await.unwrap_or_default();
-        Err(classify_resolve_error(status, &text, nonce, session_id))
+        self.resolve(session_id, "approvals", nonce, &body).await
     }
 
-    /// `POST /api/sessions/{id}/acp/elicitations/{nonce}`. The native TUI
-    /// only ever sends decline/cancel (the rich answer form is web-only),
-    /// but the body is the full `ElicitationResolution` so the same client
-    /// could submit answers.
     pub async fn resolve_elicitation(
         &self,
         session_id: &str,
         nonce: &str,
         resolution: &ElicitationResolution,
     ) -> Result<(), HttpError> {
-        let url = format!(
-            "{}/api/sessions/{}/acp/elicitations/{}",
-            self.endpoint.base_url, session_id, nonce
-        );
-        let res = self
-            .auth(self.http.post(&url))
-            .json(resolution)
-            .send()
-            .await?;
-        let status = res.status();
-        if status.is_success() {
-            return Ok(());
-        }
-        let text = res.text().await.unwrap_or_default();
-        Err(classify_resolve_error(status, &text, nonce, session_id))
+        self.resolve(session_id, "elicitations", nonce, resolution)
+            .await
     }
 
-    /// Session title, resolved ACP agent, and path roots used by the native
-    /// structured view, projected from the shared `GET /api/sessions` read.
+    /// Title, resolved agent, and path roots, from the shared session list.
     pub async fn session_view_info(
         &self,
         session_id: &str,
@@ -617,42 +481,27 @@ impl HttpClient {
             .ok_or_else(|| HttpError::SessionNotFound(session_id.to_string()))
     }
 
-    /// Context-window percentage at which the daemon wants the structured
-    /// view to show its compaction reminder, or `None` when the reminder is
-    /// off. Read from the daemon rather than local config on purpose: the
-    /// native view can attach to a remote daemon over `AOE_DAEMON_URL`,
-    /// where this host's `config.toml` describes a different install, and
-    /// the daemon already resolves the active profile's value for the web
-    /// dashboard. See #3253.
+    /// The compaction reminder percentage, or `None` when off. Read from the
+    /// daemon because a remote daemon's config differs from this host's (#3253).
     pub async fn compaction_reminder(&self) -> Result<Option<u8>, HttpError> {
-        /// The two `/api/about` fields the view needs.
         #[derive(serde::Deserialize)]
         struct ReminderAbout {
             acp_compaction_reminder: bool,
             acp_compaction_reminder_percent: u8,
         }
-        let url = format!("{}/api/about", self.endpoint.base_url);
-        let res = self.auth(self.http.get(&url)).send().await?;
-        let res = check_status(res, "<about>").await?;
-        let about = res.json::<ReminderAbout>().await?;
+        let about: ReminderAbout = self
+            .get_json("/api/about", Scope::Session("<about>"))
+            .await?;
         Ok(about
             .acp_compaction_reminder
             .then_some(about.acp_compaction_reminder_percent)
             .filter(|pct| (1..=99).contains(pct)))
     }
 
-    /// Lightweight reachability probe used by `require_daemon` (when
-    /// `AOE_DAEMON_URL` is set, we fail loud before falling into raw
-    /// reqwest transport errors) and `aoe serve --status` (renders
-    /// remote daemon info instead of "Daemon: not running").
-    ///
-    /// Hits `GET /api/sessions`, the cheapest authenticated endpoint
-    /// in the surface; succeeds with 200 when the daemon is up *and*
-    /// the token is valid, separates "host is down" (transport error)
-    /// from "auth misconfigured" (401).
+    /// Cheapest authenticated probe: separates a down host (transport error)
+    /// from misconfigured auth (401).
     pub async fn health_check(&self) -> Result<(), HttpError> {
-        let url = format!("{}/api/sessions", self.endpoint.base_url);
-        let res = self.auth(self.http.get(&url)).send().await?;
+        let res = self.request(Method::GET, "/api/sessions").send().await?;
         let status = res.status();
         if status.is_success() {
             return Ok(());
@@ -672,47 +521,15 @@ impl HttpClient {
     }
 }
 
-async fn check_status(
-    res: reqwest::Response,
-    session_id: &str,
-) -> Result<reqwest::Response, HttpError> {
-    let status = res.status();
-    if status.is_success() {
-        return Ok(res);
-    }
-    let body = res.text().await.unwrap_or_default();
-    Err(classify_error(status, &body, session_id))
-}
-
-/// Status check for daemon-wide (non-session) endpoints. Like
-/// [`check_status`] but never mints `SessionNotFound`: a 404 here means the
-/// route is absent (e.g. an older daemon without the plugin UI endpoint),
-/// not a missing session, so it maps to a plain `Server` error.
-async fn check_global_status(res: reqwest::Response) -> Result<reqwest::Response, HttpError> {
-    let status = res.status();
-    if status.is_success() {
-        return Ok(res);
-    }
-    let body = res.text().await.unwrap_or_default();
-    match status {
-        StatusCode::UNAUTHORIZED => Err(HttpError::Unauthorized),
-        StatusCode::FORBIDDEN if body.contains("read-only") || body.contains("read_only") => {
-            Err(HttpError::ReadOnly)
-        }
-        _ => Err(HttpError::Server { status, body }),
-    }
-}
-
-/// Map a non-success daemon response onto a typed error. Split out from
-/// `check_status` so the status/body dispatch is unit-testable without a
-/// live `reqwest::Response`.
-fn classify_error(status: StatusCode, body: &str, session_id: &str) -> HttpError {
-    match status {
-        StatusCode::UNAUTHORIZED => HttpError::Unauthorized,
-        StatusCode::FORBIDDEN if body.contains("read-only") || body.contains("read_only") => {
+fn classify_error(status: StatusCode, body: &str, scope: Scope<'_>) -> HttpError {
+    match (status, scope) {
+        (StatusCode::UNAUTHORIZED, _) => HttpError::Unauthorized,
+        (StatusCode::FORBIDDEN, _) if body.contains("read-only") || body.contains("read_only") => {
             HttpError::ReadOnly
         }
-        StatusCode::NOT_FOUND => HttpError::SessionNotFound(session_id.to_string()),
+        (StatusCode::NOT_FOUND, Scope::Session(session_id)) => {
+            HttpError::SessionNotFound(session_id.to_string())
+        }
         _ => HttpError::Server {
             status,
             body: body.to_string(),
@@ -720,14 +537,8 @@ fn classify_error(status: StatusCode, body: &str, session_id: &str) -> HttpError
     }
 }
 
-/// Classify the response of an approval- or elicitation-resolve POST.
-/// Scoped to those endpoints (not the shared `check_status`, which
-/// replay/prompt/cancel use too) so only this path can mint `ApprovalGone`.
-/// A 404 whose body names *this* nonce means the pending approval or
-/// elicitation already resolved server-side (a concurrent decision, a
-/// watchdog, or a torn-down request); the caller clears the card quietly
-/// rather than surfacing an error. Anything else folds back into the
-/// generic classifier. See #1821.
+/// Only the resolve endpoints mint `ApprovalGone`, and only for a 404 naming
+/// this nonce (#1821).
 fn classify_resolve_error(
     status: StatusCode,
     body: &str,
@@ -739,7 +550,7 @@ fn classify_resolve_error(
     if status == StatusCode::NOT_FOUND && names_gone_target && body.contains(nonce) {
         HttpError::ApprovalGone
     } else {
-        classify_error(status, body, session_id)
+        classify_error(status, body, Scope::Session(session_id))
     }
 }
 
@@ -748,149 +559,85 @@ mod tests {
     use super::*;
     use crate::acp::client::discovery::Source;
 
-    fn endpoint(base: &str, token: Option<&str>) -> DaemonEndpoint {
-        DaemonEndpoint::new(base.to_string(), token.map(str::to_string), Source::Env)
-    }
-
-    #[test]
-    fn auth_sets_bearer_when_token_present() {
-        let client = HttpClient::new(endpoint("http://127.0.0.1:8080", Some("tok"))).unwrap();
+    fn authorization(endpoint: DaemonEndpoint) -> Option<String> {
+        let client = HttpClient::new(endpoint).unwrap();
         let request = client
-            .auth(client.http.get("http://127.0.0.1:8080/api/sessions"))
+            .request(Method::GET, "/api/sessions")
             .build()
             .unwrap();
-        assert_eq!(
-            request.headers().get(header::AUTHORIZATION).unwrap(),
-            "Bearer tok"
-        );
+        request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .map(|v| v.to_str().unwrap().to_string())
     }
 
     #[test]
-    fn auth_uses_rotated_token_for_local_daemon() {
+    fn auth_header() {
+        let base = "http://127.0.0.1:8080".to_string();
+        assert_eq!(
+            authorization(DaemonEndpoint::new(
+                base.clone(),
+                Some("tok".into()),
+                Source::Env
+            )),
+            Some("Bearer tok".into())
+        );
+        assert_eq!(
+            authorization(DaemonEndpoint::new(base.clone(), None, Source::Env)),
+            None
+        );
+        // A local daemon's rotated token file wins over the discovered one.
         let dir = tempfile::tempdir().unwrap();
         let token_path = dir.path().join("serve.token");
         let rotated = "b".repeat(64);
         std::fs::write(&token_path, &rotated).unwrap();
-        let endpoint = DaemonEndpoint::new(
-            "http://127.0.0.1:8080".into(),
-            Some("a".repeat(64)),
-            Source::LocalDaemon,
-        )
-        .with_local_token_path(token_path);
-        let client = HttpClient::new(endpoint).unwrap();
-
-        let request = client
-            .auth(client.http.get("http://127.0.0.1:8080/api/sessions"))
-            .build()
-            .unwrap();
-        let expected = format!("Bearer {rotated}");
-        assert_eq!(
-            request
-                .headers()
-                .get(header::AUTHORIZATION)
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            expected
-        );
+        let local = DaemonEndpoint::new(base, Some("a".repeat(64)), Source::LocalDaemon)
+            .with_local_token_path(token_path);
+        assert_eq!(authorization(local), Some(format!("Bearer {rotated}")));
     }
 
     #[test]
-    fn auth_skips_bearer_when_no_token() {
-        let client = HttpClient::new(endpoint("http://127.0.0.1:8080", None)).unwrap();
-        let request = client
-            .auth(client.http.get("http://127.0.0.1:8080/api/sessions"))
-            .build()
-            .unwrap();
-        assert!(request.headers().get(header::AUTHORIZATION).is_none());
-    }
-
-    // Regression test for #1525. The startup toast on a 401 from the
-    // structured view endpoints folds in `HttpError::Unauthorized`'s Display.
-    // Previously that Display string hard-coded `AOE_DAEMON_TOKEN`,
-    // which made the toast actively misleading on `--auth=passphrase`
-    // and `--auth=none` daemons that never had a token. Pin the new
-    // wording so the env-var hint can't regress back in.
-    #[test]
-    fn classify_resolve_error_clears_only_on_matching_nonce() {
-        // #1821: ApprovalGone is minted only by the resolve path, only for a
-        // 404 that names *this* nonce. A session-gone 404, or a 404 naming a
-        // different nonce, stays a real error.
+    fn error_classification() {
+        let session = Scope::Session("s-1");
+        let gone =
+            |body: &str| classify_resolve_error(StatusCode::NOT_FOUND, body, "abc-123", "s-1");
         assert!(matches!(
-            classify_resolve_error(
-                StatusCode::NOT_FOUND,
-                "no pending approval with nonce abc-123",
-                "abc-123",
-                "s-1"
-            ),
+            gone("no pending approval with nonce abc-123"),
             HttpError::ApprovalGone
         ));
         assert!(matches!(
-            classify_resolve_error(
-                StatusCode::NOT_FOUND,
-                "no pending approval with nonce other-999",
-                "abc-123",
-                "s-1"
-            ),
-            HttpError::SessionNotFound(s) if s == "s-1"
-        ));
-        assert!(matches!(
-            classify_resolve_error(
-                StatusCode::NOT_FOUND,
-                "session has no running structured view",
-                "abc-123",
-                "s-1"
-            ),
-            HttpError::SessionNotFound(s) if s == "s-1"
-        ));
-        // A gone elicitation nonce is classified the same as a gone approval.
-        assert!(matches!(
-            classify_resolve_error(
-                StatusCode::NOT_FOUND,
-                "no pending elicitation with nonce abc-123",
-                "abc-123",
-                "s-1"
-            ),
+            gone("no pending elicitation with nonce abc-123"),
             HttpError::ApprovalGone
         ));
-    }
-
-    #[test]
-    fn classify_error_never_mints_approval_gone() {
-        // The shared classifier (used by replay/prompt/cancel/session-list)
-        // must not produce ApprovalGone; a bare 404 is a session miss.
+        for body in [
+            "no pending approval with nonce other-999",
+            "session has no running structured view",
+        ] {
+            assert!(matches!(gone(body), HttpError::SessionNotFound(s) if s == "s-1"));
+        }
+        // The shared classifier never mints ApprovalGone.
         assert!(matches!(
-            classify_error(StatusCode::NOT_FOUND, "no pending approval with that nonce", "s-1"),
+            classify_error(StatusCode::NOT_FOUND, "no pending approval with that nonce", session),
             HttpError::SessionNotFound(s) if s == "s-1"
         ));
-    }
-
-    #[test]
-    fn classify_error_maps_auth_and_read_only() {
         assert!(matches!(
-            classify_error(StatusCode::UNAUTHORIZED, "", "s-1"),
+            classify_error(StatusCode::NOT_FOUND, "", Scope::Global),
+            HttpError::Server { .. }
+        ));
+        assert!(matches!(
+            classify_error(StatusCode::UNAUTHORIZED, "", session),
             HttpError::Unauthorized
         ));
         assert!(matches!(
-            classify_error(StatusCode::FORBIDDEN, "daemon is read-only", "s-1"),
+            classify_error(StatusCode::FORBIDDEN, "daemon is read-only", Scope::Global),
             HttpError::ReadOnly
         ));
         assert!(matches!(
-            classify_error(StatusCode::INTERNAL_SERVER_ERROR, "boom", "s-1"),
+            classify_error(StatusCode::INTERNAL_SERVER_ERROR, "boom", session),
             HttpError::Server { .. }
         ));
-    }
-
-    #[test]
-    fn unauthorized_display_omits_token_env_var() {
+        // #1525: the 401 message must not blame a token env var.
         let rendered = HttpError::Unauthorized.to_string();
-        assert!(
-            !rendered.contains("AOE_DAEMON_TOKEN"),
-            "Unauthorized message must not pin diagnosis to a token env var that does not exist in passphrase or no-auth mode: {rendered}"
-        );
-        assert!(
-            rendered.contains("401"),
-            "Unauthorized message should still surface the underlying HTTP status: {rendered}"
-        );
+        assert!(!rendered.contains("AOE_DAEMON_TOKEN") && rendered.contains("401"));
     }
 }

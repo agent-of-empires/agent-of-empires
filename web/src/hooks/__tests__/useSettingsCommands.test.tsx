@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-//
-// Contract test for the per-setting command-palette entries (#2108). Asserts
-// schema -> entry generation (local_only omitted), that writable toggles flip
-// inline through the default profile, and that every other widget, elevation
-// toggles, and read-only mode produce a jump instead of a write.
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { renderHook, waitFor } from "@testing-library/react";
@@ -63,18 +58,20 @@ beforeEach(() => {
   vi.mocked(updateProfileSettings).mockResolvedValue(true);
 });
 
-function render(overrides: Partial<Parameters<typeof useSettingsCommands>[0]> = {}) {
+/** Render and wait for the four writable fields the schema above yields. */
+async function render(overrides: Partial<Parameters<typeof useSettingsCommands>[0]> = {}) {
   const onOpenSettingsTab = vi.fn();
   const hook = renderHook((args: Parameters<typeof useSettingsCommands>[0]) => useSettingsCommands(args), {
     initialProps: { open: true, readOnly: false, onOpenSettingsTab, ...overrides },
   });
-  return { ...hook, onOpenSettingsTab };
+  await waitFor(() => expect(hook.result.current.length).toBe(4));
+  const action = (id: string) => hook.result.current.find((a) => a.id === id);
+  return { ...hook, onOpenSettingsTab, action };
 }
 
 describe("useSettingsCommands", () => {
   it("generates one Settings entry per writable field, omitting local_only", async () => {
-    const { result } = render();
-    await waitFor(() => expect(result.current.length).toBe(4));
+    const { result } = await render();
     const ids = result.current.map((a) => a.id);
     expect(ids).toContain("setting:session.live_send");
     expect(ids).toContain("setting:worktree.auto_cleanup");
@@ -85,8 +82,7 @@ describe("useSettingsCommands", () => {
   });
 
   it("flips a writable toggle inline through the default profile", async () => {
-    const { result } = render();
-    await waitFor(() => expect(result.current.length).toBe(4));
+    const { result } = await render();
     const toggle = result.current.find((a) => a.id === "setting:session.live_send");
     expect(toggle?.subtitle).toBe("Off · main");
     toggle?.perform();
@@ -94,26 +90,23 @@ describe("useSettingsCommands", () => {
   });
 
   it("labels a global-only toggle's scope as Global", async () => {
-    const { result } = render();
-    await waitFor(() => expect(result.current.length).toBe(4));
+    const { result } = await render();
     const toggle = result.current.find((a) => a.id === "setting:worktree.auto_cleanup");
     expect(toggle?.subtitle).toBe("On · Global");
   });
 
   it("jumps for non-toggle widgets and elevation toggles, never writing", async () => {
-    const { result, onOpenSettingsTab } = render();
-    await waitFor(() => expect(result.current.length).toBe(4));
-    result.current.find((a) => a.id === "setting:acp.replay")?.perform();
+    const { onOpenSettingsTab, action } = await render();
+    action("setting:acp.replay")?.perform();
     expect(onOpenSettingsTab).toHaveBeenCalledWith("structured-view");
-    result.current.find((a) => a.id === "setting:security.danger")?.perform();
+    action("setting:security.danger")?.perform();
     expect(onOpenSettingsTab).toHaveBeenCalledWith("security");
     expect(updateProfileSettings).not.toHaveBeenCalled();
   });
 
   it("turns every toggle into a jump in read-only mode", async () => {
-    const { result, onOpenSettingsTab } = render({ readOnly: true });
-    await waitFor(() => expect(result.current.length).toBe(4));
-    result.current.find((a) => a.id === "setting:session.live_send")?.perform();
+    const { onOpenSettingsTab, action } = await render({ readOnly: true });
+    action("setting:session.live_send")?.perform();
     expect(onOpenSettingsTab).toHaveBeenCalledWith("session");
     expect(updateProfileSettings).not.toHaveBeenCalled();
   });

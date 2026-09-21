@@ -5,27 +5,16 @@ pub struct VolumeMount {
     pub read_only: bool,
 }
 
-/// A named Docker/Podman volume mounted at a specific container path.
-/// Used by `volume_ignores_strategy = "named"` to bypass VirtioFS shadowing on macOS.
 pub struct NamedVolumeMount {
     pub volume_name: String,
     pub container_path: String,
 }
 
-/// An environment variable entry for a container.
-///
-/// `Inherit` entries use Docker's `-e KEY` form (no value in argv), which reads
-/// the value from the calling process's environment. This prevents secrets from
-/// leaking into `ps` output.
-///
-/// `Literal` entries use `-e KEY=VALUE` and are appropriate for non-secret,
-/// hard-coded values.
+/// `Inherit` passes the value through the process environment (`-e KEY`) so secrets stay
+/// out of `ps`; `Literal` emits `-e KEY=VALUE`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EnvEntry {
-    /// Value inherited from host environment. Only the key appears in argv;
-    /// the value is passed to Docker via the process environment.
     Inherit { key: String, value: String },
-    /// Literal (non-secret) value. Both key and value appear in argv.
     Literal { key: String, value: String },
 }
 
@@ -43,23 +32,8 @@ impl EnvEntry {
     }
 }
 
-/// Translate env entries into docker `-e` argv flags plus an inherit list.
-///
-/// For each `Inherit` entry, pushes `-e KEY` to argv and `(KEY, value)` to the
-/// returned inherit list; the caller must apply the inherit pairs to the
-/// spawning process's environment via `Command::env(k, v)` so docker can
-/// resolve the bare `-e KEY` flag without the value ever appearing in argv
-/// or `ps` output. For each `Literal` entry, pushes `-e KEY=VALUE` to argv.
-///
-/// Both the create path (`docker run`) and every exec path (`docker exec` from
-/// tmux sessions, ACP agent spawn, and ACP `terminal/create`) share this
-/// translation. Keeping it in one place ensures they cannot drift.
-///
-/// Dedupes by key (first wins). `collect_environment` already dedupes its
-/// output, but the helper repeats the check so any caller that builds its
-/// own entry list cannot accidentally emit two `-e KEY` flags for the same
-/// key (which docker accepts but with last-write-wins semantics that aren't
-/// always intended).
+/// The caller must set the returned inherit pairs on the spawning `Command`. Dedupes by
+/// key, first wins.
 pub fn docker_env_args(entries: &[EnvEntry]) -> (Vec<String>, Vec<(String, String)>) {
     let mut argv = Vec::with_capacity(entries.len() * 2);
     let mut inherit = Vec::new();
@@ -83,7 +57,6 @@ pub fn docker_env_args(entries: &[EnvEntry]) -> (Vec<String>, Vec<(String, Strin
     (argv, inherit)
 }
 
-/// A Docker-style `run` flag supported by a container runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunFlag {
     Privileged,
@@ -92,7 +65,6 @@ pub enum RunFlag {
     SecurityOpt,
 }
 
-/// Container run-policy flags mapped from `[sandbox]` settings.
 #[derive(Debug, Default, Clone)]
 pub struct RunPolicy {
     pub privileged: bool,
@@ -107,37 +79,19 @@ pub struct ContainerConfig {
     pub working_dir: String,
     pub volumes: Vec<VolumeMount>,
     pub anonymous_volumes: Vec<String>,
-    /// Named volumes for volume_ignores when strategy = "named". Cleaned up explicitly on session delete.
     pub named_ignore_volumes: Vec<NamedVolumeMount>,
-    /// Whether these paths, `working_dir` included, follow from the project's real
-    /// layout rather than from the collapsed fallback a failed `find_main_repo` takes.
-    ///
-    /// Gates the volume reclaim in `stranded_named_ignore_volumes`, which reads a
-    /// changed `working_dir` as a move; under the fallback that change may be nothing
-    /// but the failure. Defaults to false, so a config that has not positively
-    /// established its paths never drives a deletion.
+    /// False unless the paths come from the real project layout; gates volume reclaim.
     pub named_ignore_volumes_authoritative: bool,
     pub environment: Vec<EnvEntry>,
     pub cpu_limit: Option<String>,
     pub memory_limit: Option<String>,
     pub port_mappings: Vec<String>,
-    /// Container network mode passed to `--network`. `None` uses the runtime
-    /// default (bridge). Set from `sandbox.network`; `bridge` and the rejected
-    /// `host` value are normalized to `None` before reaching here.
     pub network: Option<String>,
-    /// Append the SELinux relabel flag (`:z`) to host bind mounts so the container
-    /// can access them on SELinux-enforcing hosts (Fedora, RHEL). Set from
-    /// `sandbox.selinux_relabel`; only emitted for runtimes that support it.
     pub selinux_relabel: bool,
-    /// Runtime-only evidence that this config installed an identity publisher.
     pub identity_publisher_installed: bool,
-    /// Container paths of the credential files every store of the agent
-    /// shares, one bind mount each. Labelled at create, so a container built
-    /// before a file was shared, which mounts only the store, can be told apart.
+    /// Labelled at create so a container built before a file was shared can be told apart.
     pub shared_credential_mounts: Vec<String>,
-    /// The agent identity whose config this container mounts; see
-    /// `container_agent_identity`. Labelled at create, so a container reused
-    /// after a tool swap can be told apart.
+    /// Labelled at create so a container reused after a tool swap can be told apart.
     pub agent_tool: String,
     pub run_policy: RunPolicy,
 }
@@ -267,122 +221,72 @@ mod tests {
     }
 
     #[test]
-    fn docker_env_args_inherit_keeps_value_out_of_argv() {
-        let entries = vec![EnvEntry::Inherit {
-            key: "GH_TOKEN".to_string(),
-            value: "ghp_secret".to_string(),
-        }];
-        let (argv, inherit) = docker_env_args(&entries);
-        assert_eq!(argv, vec!["-e".to_string(), "GH_TOKEN".to_string()]);
-        assert_eq!(
-            inherit,
-            vec![("GH_TOKEN".to_string(), "ghp_secret".to_string())]
+    fn docker_env_args_keeps_order_hides_inherited_values_and_takes_the_first_key() {
+        let inherit = |key: &str, value: &str| EnvEntry::Inherit {
+            key: key.to_string(),
+            value: value.to_string(),
+        };
+        let literal = |key: &str, value: &str| EnvEntry::Literal {
+            key: key.to_string(),
+            value: value.to_string(),
+        };
+        // (entries, expected argv, expected inherited pairs, values that must not reach argv)
+        type EnvCase = (
+            Vec<EnvEntry>,
+            &'static [&'static str],
+            &'static [(&'static str, &'static str)],
+            &'static [&'static str],
         );
-        assert!(
-            !argv.iter().any(|a| a.contains("ghp_secret")),
-            "secret leaked into argv"
-        );
-    }
-
-    #[test]
-    fn docker_env_args_literal_emits_key_eq_value() {
-        let entries = vec![EnvEntry::Literal {
-            key: "TERM".to_string(),
-            value: "xterm-256color".to_string(),
-        }];
-        let (argv, inherit) = docker_env_args(&entries);
-        assert_eq!(
-            argv,
-            vec!["-e".to_string(), "TERM=xterm-256color".to_string()]
-        );
-        assert!(inherit.is_empty());
-    }
-
-    #[test]
-    fn docker_env_args_mixed_preserves_order() {
-        let entries = vec![
-            EnvEntry::Inherit {
-                key: "SECRET".to_string(),
-                value: "s3cr3t".to_string(),
-            },
-            EnvEntry::Literal {
-                key: "TERM".to_string(),
-                value: "xterm".to_string(),
-            },
-            EnvEntry::Inherit {
-                key: "TOKEN".to_string(),
-                value: "tok".to_string(),
-            },
+        let cases: [EnvCase; 5] = [
+            (
+                vec![inherit("GH_TOKEN", "ghp_secret")],
+                &["-e", "GH_TOKEN"],
+                &[("GH_TOKEN", "ghp_secret")],
+                &["ghp_secret"],
+            ),
+            (
+                vec![literal("TERM", "xterm-256color")],
+                &["-e", "TERM=xterm-256color"],
+                &[],
+                &[],
+            ),
+            (
+                vec![
+                    inherit("SECRET", "s3cr3t"),
+                    literal("TERM", "xterm"),
+                    inherit("TOKEN", "tok"),
+                ],
+                &["-e", "SECRET", "-e", "TERM=xterm", "-e", "TOKEN"],
+                &[("SECRET", "s3cr3t"), ("TOKEN", "tok")],
+                &["s3cr3t"],
+            ),
+            (vec![], &[], &[], &[]),
+            (
+                vec![
+                    inherit("GH_TOKEN", "ghp_first"),
+                    literal("GH_TOKEN", "literal_should_be_skipped"),
+                    inherit("OTHER", "kept"),
+                ],
+                &["-e", "GH_TOKEN", "-e", "OTHER"],
+                &[("GH_TOKEN", "ghp_first"), ("OTHER", "kept")],
+                &["literal_should_be_skipped"],
+            ),
         ];
-        let (argv, inherit) = docker_env_args(&entries);
-        assert_eq!(
-            argv,
-            vec![
-                "-e".to_string(),
-                "SECRET".to_string(),
-                "-e".to_string(),
-                "TERM=xterm".to_string(),
-                "-e".to_string(),
-                "TOKEN".to_string(),
-            ]
-        );
-        assert_eq!(
-            inherit,
-            vec![
-                ("SECRET".to_string(), "s3cr3t".to_string()),
-                ("TOKEN".to_string(), "tok".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn docker_env_args_empty() {
-        let (argv, inherit) = docker_env_args(&[]);
-        assert!(argv.is_empty());
-        assert!(inherit.is_empty());
-    }
-
-    #[test]
-    fn docker_env_args_dedupes_duplicate_keys_first_wins() {
-        // Guards against a caller that hand-builds entries and accidentally
-        // passes the same key twice. Docker accepts duplicate `-e` flags
-        // with last-write-wins, which is rarely what the caller meant.
-        let entries = vec![
-            EnvEntry::Inherit {
-                key: "GH_TOKEN".to_string(),
-                value: "ghp_first".to_string(),
-            },
-            EnvEntry::Literal {
-                key: "GH_TOKEN".to_string(),
-                value: "literal_should_be_skipped".to_string(),
-            },
-            EnvEntry::Inherit {
-                key: "OTHER".to_string(),
-                value: "kept".to_string(),
-            },
-        ];
-        let (argv, inherit) = docker_env_args(&entries);
-        // First GH_TOKEN entry wins; the literal duplicate is dropped.
-        assert_eq!(
-            argv,
-            vec![
-                "-e".to_string(),
-                "GH_TOKEN".to_string(),
-                "-e".to_string(),
-                "OTHER".to_string(),
-            ]
-        );
-        assert_eq!(
-            inherit,
-            vec![
-                ("GH_TOKEN".to_string(), "ghp_first".to_string()),
-                ("OTHER".to_string(), "kept".to_string()),
-            ]
-        );
-        assert!(
-            !argv.iter().any(|a| a.contains("literal_should_be_skipped")),
-            "duplicate key's value leaked into argv"
-        );
+        for (entries, expected_argv, expected_inherit, secrets) in cases {
+            let (argv, inherited) = docker_env_args(&entries);
+            assert_eq!(argv, expected_argv);
+            let expected_inherit: Vec<(String, String)> = expected_inherit
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            assert_eq!(inherited, expected_inherit);
+            for secret in secrets {
+                assert!(
+                    !argv.iter().any(|a| a.contains(secret)),
+                    "{secret} leaked into argv"
+                );
+            }
+        }
     }
 
     #[test]

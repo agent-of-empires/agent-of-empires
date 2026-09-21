@@ -3,6 +3,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import type { SessionResponse } from "../../lib/types";
+import { makeSession as baseSession } from "./fixtures";
 
 vi.mock("../TerminalView", () => ({
   TerminalView: ({ session, active }: { session: SessionResponse; active: boolean }) => (
@@ -19,38 +20,32 @@ afterEach(() => {
   cleanup();
 });
 
-function makeSession(id: string): SessionResponse {
-  return {
-    id,
-    title: id,
-    project_path: `/tmp/${id}`,
-    group_path: "/tmp",
-    tool: "claude",
-    status: "Running",
-    yolo_mode: false,
-    created_at: new Date().toISOString(),
-    last_accessed_at: null,
-    idle_entered_at: null,
-    last_error: null,
-    branch: null,
-    main_repo_path: null,
-    is_sandboxed: false,
-    favorited: false,
-    has_managed_worktree: false,
-    has_terminal: true,
-    profile: "default",
-    cleanup_defaults: {
-      delete_worktree: false,
-      delete_branch: false,
-      delete_sandbox: false,
-    },
-    remote_owner: null,
-    notify_on_waiting: null,
-    notify_on_idle: null,
-    notify_on_error: null,
-    claude_fullscreen: false,
-    workspace_repos: [],
-  };
+const makeSession = (id: string) => baseSession({ id, title: id, project_path: `/tmp/${id}`, status: "Running" });
+
+/** Three sessions with a keep-alive limit of 2, activated s1 then s2 so both stay mounted. */
+async function mountThreeKeepingTwo() {
+  const sessions = [makeSession("s1"), makeSession("s2"), makeSession("s3")];
+  const activate = (id: string, limit: number) =>
+    rerender(
+      <TerminalSessionStack
+        activeSessionId={id}
+        sessions={sessions}
+        persistent={true}
+        maxPersistentTerminals={limit}
+      />,
+    );
+  const { rerender } = render(
+    <TerminalSessionStack activeSessionId="s1" sessions={sessions} persistent={true} maxPersistentTerminals={2} />,
+  );
+  await waitFor(() => {
+    expect(screen.getByTestId("terminal-s1")).toBeDefined();
+  });
+  activate("s2", 2);
+  await waitFor(() => {
+    expect(screen.getByTestId("terminal-s1")).toBeDefined();
+    expect(screen.getByTestId("terminal-s2")).toBeDefined();
+  });
+  return activate;
 }
 
 describe("TerminalSessionStack", () => {
@@ -83,25 +78,9 @@ describe("TerminalSessionStack", () => {
   });
 
   it("evicts older inactive sessions beyond the configured limit", async () => {
-    const sessions = [makeSession("s1"), makeSession("s2"), makeSession("s3")];
-    const { rerender } = render(
-      <TerminalSessionStack activeSessionId="s1" sessions={sessions} persistent={true} maxPersistentTerminals={2} />,
-    );
-    await waitFor(() => {
-      expect(screen.getByTestId("terminal-s1")).toBeDefined();
-    });
+    const activate = await mountThreeKeepingTwo();
 
-    rerender(
-      <TerminalSessionStack activeSessionId="s2" sessions={sessions} persistent={true} maxPersistentTerminals={2} />,
-    );
-    await waitFor(() => {
-      expect(screen.getByTestId("terminal-s1")).toBeDefined();
-      expect(screen.getByTestId("terminal-s2")).toBeDefined();
-    });
-
-    rerender(
-      <TerminalSessionStack activeSessionId="s3" sessions={sessions} persistent={true} maxPersistentTerminals={1} />,
-    );
+    activate("s3", 1);
     await waitFor(() => {
       expect(screen.queryByTestId("terminal-s1")).toBeNull();
       expect(screen.queryByTestId("terminal-s2")).toBeNull();
@@ -110,25 +89,9 @@ describe("TerminalSessionStack", () => {
   });
 
   it("counts the configured limit as the total mounted terminal count", async () => {
-    const sessions = [makeSession("s1"), makeSession("s2"), makeSession("s3")];
-    const { rerender } = render(
-      <TerminalSessionStack activeSessionId="s1" sessions={sessions} persistent={true} maxPersistentTerminals={2} />,
-    );
-    await waitFor(() => {
-      expect(screen.getByTestId("terminal-s1")).toBeDefined();
-    });
+    const activate = await mountThreeKeepingTwo();
 
-    rerender(
-      <TerminalSessionStack activeSessionId="s2" sessions={sessions} persistent={true} maxPersistentTerminals={2} />,
-    );
-    await waitFor(() => {
-      expect(screen.getByTestId("terminal-s1")).toBeDefined();
-      expect(screen.getByTestId("terminal-s2")).toBeDefined();
-    });
-
-    rerender(
-      <TerminalSessionStack activeSessionId="s3" sessions={sessions} persistent={true} maxPersistentTerminals={2} />,
-    );
+    activate("s3", 2);
     await waitFor(() => {
       expect(screen.queryByTestId("terminal-s1")).toBeNull();
       expect(screen.getByTestId("terminal-s2").dataset.active).toBe("false");

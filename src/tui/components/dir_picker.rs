@@ -122,7 +122,6 @@ impl DirPicker {
         result
     }
 
-    /// Resolve a filtered list entry name to an absolute path.
     fn resolve_path(&self, name: &str) -> PathBuf {
         if name == "./" {
             self.cwd.clone()
@@ -428,47 +427,65 @@ impl DirPicker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyEvent, KeyModifiers};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    /// Create a temp directory with known subdirectories for deterministic tests.
-    fn setup_tempdir() -> (tempfile::TempDir, PathBuf) {
-        let tmp = tempfile::tempdir().expect("failed to create tempdir");
+    /// A picker opened on a temp dir holding `dirs` plus one regular file, which
+    /// must never be listed.
+    fn picker_over(dirs: &[&str]) -> (tempfile::TempDir, PathBuf, DirPicker) {
+        let tmp = tempfile::tempdir().expect("tempdir");
         let base = tmp.path().to_path_buf();
-        std::fs::create_dir(base.join("alpha")).unwrap();
-        std::fs::create_dir(base.join("beta")).unwrap();
-        std::fs::create_dir(base.join("gamma")).unwrap();
-        // Create a regular file to verify it's excluded
+        for dir in dirs {
+            std::fs::create_dir(base.join(dir)).unwrap();
+        }
         std::fs::write(base.join("file.txt"), "hello").unwrap();
-        (tmp, base)
-    }
-
-    #[test]
-    fn test_new_is_inactive() {
-        let picker = DirPicker::new();
-        assert!(!picker.is_active());
-    }
-
-    #[test]
-    fn test_activate_sets_cwd_and_lists_dirs() {
-        let (_tmp, base) = setup_tempdir();
         let mut picker = DirPicker::new();
         picker.activate(&base.to_string_lossy());
+        (tmp, base, picker)
+    }
+
+    /// The standard fixture, listing `./`, `../`, alpha, beta, gamma.
+    fn fixture() -> (tempfile::TempDir, PathBuf, DirPicker) {
+        picker_over(&["alpha", "beta", "gamma"])
+    }
+
+    fn press(picker: &mut DirPicker, codes: &[KeyCode]) -> DirPickerResult {
+        let mut result = DirPickerResult::Continue;
+        for code in codes {
+            result = picker.handle_key(key(*code));
+        }
+        result
+    }
+
+    fn typed(picker: &mut DirPicker, text: &str) {
+        for ch in text.chars() {
+            picker.handle_key(key(KeyCode::Char(ch)));
+        }
+    }
+
+    fn selected_path(result: DirPickerResult, what: &str) -> String {
+        match result {
+            DirPickerResult::Selected(path) => path,
+            _ => panic!("expected Selected from {what}"),
+        }
+    }
+
+    #[test]
+    fn activate_lists_directories_only_and_starts_on_the_dot_entry() {
+        assert!(!DirPicker::new().is_active());
+        let (_tmp, base, picker) = fixture();
         assert!(picker.is_active());
         assert_eq!(picker.cwd, base);
         assert_eq!(picker.filter.value(), "");
         assert_eq!(picker.selected, 0);
-        // Should list 3 dirs, not the file
-        assert_eq!(picker.dirs.len(), 3);
-        assert!(picker.dirs.contains(&"alpha".to_string()));
-        assert!(!picker.dirs.contains(&"file.txt".to_string()));
+        assert_eq!(picker.dirs, vec!["alpha", "beta", "gamma"]);
+        assert_eq!(picker.filtered_dirs()[..2], ["./", "../"]);
     }
 
     #[test]
-    fn test_activate_with_empty_path() {
+    fn activate_with_an_empty_path_still_lands_on_a_real_directory() {
         let mut picker = DirPicker::new();
         picker.activate("");
         assert!(picker.is_active());
@@ -476,441 +493,224 @@ mod tests {
     }
 
     #[test]
-    fn test_dirs_sorted_case_insensitive() {
-        let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path().to_path_buf();
-        std::fs::create_dir(base.join("Zebra")).unwrap();
-        std::fs::create_dir(base.join("apple")).unwrap();
-        std::fs::create_dir(base.join("Banana")).unwrap();
-
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
+    fn listing_sorts_case_insensitively() {
+        let (_tmp, _base, picker) = picker_over(&["Zebra", "apple", "Banana"]);
         assert_eq!(picker.dirs, vec!["apple", "Banana", "Zebra"]);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn test_esc_cancels() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
+    fn listing_includes_symlinked_directories() {
+        let (_tmp, base, mut picker) = picker_over(&["real"]);
+        std::os::unix::fs::symlink(base.join("real"), base.join("link")).unwrap();
+        picker.refresh_dirs();
+        assert!(picker.dirs.contains(&"link".to_string()));
+    }
 
-        let result = picker.handle_key(key(KeyCode::Esc));
-        assert!(matches!(result, DirPickerResult::Cancelled));
-        assert!(!picker.is_active());
+    /// Hidden directories need an explicit Ctrl+H, which toggles both ways.
+    #[test]
+    fn ctrl_h_toggles_hidden_directories() {
+        let (_tmp, _base, mut picker) = picker_over(&[".hidden", "visible"]);
+        assert_eq!(picker.dirs, vec!["visible"]);
+        let ctrl_h = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL);
+        picker.handle_key(ctrl_h);
+        assert!(picker.show_hidden);
+        assert_eq!(picker.dirs, vec![".hidden", "visible"]);
+        picker.handle_key(ctrl_h);
+        assert!(!picker.show_hidden);
+        assert_eq!(picker.dirs, vec!["visible"]);
     }
 
     #[test]
-    fn test_enter_on_dot_selects_cwd() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
+    fn esc_cancels_and_closes() {
+        let (_tmp, _base, mut picker) = fixture();
+        assert!(matches!(
+            press(&mut picker, &[KeyCode::Esc]),
+            DirPickerResult::Cancelled
+        ));
+        assert!(!picker.is_active());
+    }
 
-        // selected=0 is "./" -- Enter on it selects the current directory
-        let result = picker.handle_key(key(KeyCode::Enter));
-        match result {
-            DirPickerResult::Selected(path) => {
-                assert_eq!(path, base.to_string_lossy());
-            }
-            _ => panic!("Expected Selected"),
+    /// `Enter` and `Right` both act on the highlighted row: `./` selects the
+    /// current directory and closes, a subdirectory navigates into it and resets
+    /// the filter and selection.
+    #[test]
+    fn enter_and_right_select_the_dot_row_or_navigate_into_a_subdir() {
+        for accept in [KeyCode::Enter, KeyCode::Right] {
+            let (_tmp, base, mut picker) = fixture();
+            let path = selected_path(press(&mut picker, &[accept]), "./");
+            assert_eq!(path, base.to_string_lossy());
+            assert!(!picker.is_active());
+
+            // Rows are ./, ../, alpha, beta, gamma, so two Downs reach alpha.
+            let (_tmp, base, mut picker) = fixture();
+            let result = press(&mut picker, &[KeyCode::Down, KeyCode::Down, accept]);
+            assert!(matches!(result, DirPickerResult::Continue));
+            assert!(picker.is_active());
+            assert_eq!(picker.cwd, base.join("alpha"));
+            assert_eq!(picker.filter.value(), "");
+            assert_eq!(picker.selected, 0);
         }
-        assert!(!picker.is_active());
     }
 
+    /// Every way up: `Enter` on `../`, `Left`, and `Backspace` on an empty
+    /// filter.
     #[test]
-    fn test_enter_on_parent_navigates_up() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-
-        // Navigate to "../" (index 1: ./, ../, alpha, beta, gamma)
-        picker.handle_key(key(KeyCode::Down));
-        assert_eq!(picker.selected, 1);
-
-        let result = picker.handle_key(key(KeyCode::Enter));
+    fn parent_navigation_keys_all_reach_the_parent() {
+        let (_tmp, base, mut picker) = fixture();
+        let result = press(&mut picker, &[KeyCode::Down, KeyCode::Enter]);
         assert!(matches!(result, DirPickerResult::Continue));
         assert!(picker.is_active());
-        assert_eq!(picker.cwd, base.parent().unwrap().to_path_buf());
-    }
+        assert_eq!(picker.cwd, base.parent().unwrap());
 
-    #[test]
-    fn test_enter_on_subdir_navigates_into() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-
-        // Navigate to "alpha" (index 2: ./, ../, alpha, beta, gamma)
-        picker.handle_key(key(KeyCode::Down));
-        picker.handle_key(key(KeyCode::Down));
-        let result = picker.handle_key(key(KeyCode::Enter));
-        assert!(matches!(result, DirPickerResult::Continue));
-        assert!(picker.is_active());
-        assert_eq!(picker.cwd, base.join("alpha"));
-        assert_eq!(picker.filter.value(), "");
-        assert_eq!(picker.selected, 0);
-    }
-
-    #[test]
-    fn test_right_arrow_navigates_into_directory() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-
-        // Navigate to "alpha" (index 2)
-        picker.handle_key(key(KeyCode::Down));
-        picker.handle_key(key(KeyCode::Down));
-        let result = picker.handle_key(key(KeyCode::Right));
-        assert!(matches!(result, DirPickerResult::Continue));
-        assert_eq!(picker.cwd, base.join("alpha"));
-    }
-
-    #[test]
-    fn test_right_arrow_on_dot_selects_cwd() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-
-        // selected=0 is "./" -- Right on it selects (same as Enter on ./)
-        let result = picker.handle_key(key(KeyCode::Right));
-        match result {
-            DirPickerResult::Selected(path) => {
-                assert_eq!(path, base.to_string_lossy());
-            }
-            _ => panic!("Expected Selected"),
+        for code in [KeyCode::Left, KeyCode::Backspace] {
+            let (_tmp, base, _) = fixture();
+            let mut picker = DirPicker::new();
+            picker.activate(&base.join("alpha").to_string_lossy());
+            press(&mut picker, &[code]);
+            assert_eq!(picker.cwd, base, "{code:?}");
         }
+    }
+
+    /// After navigating in, `./` selects the directory just entered.
+    #[test]
+    fn entering_a_subdir_then_accepting_dot_selects_it() {
+        let (_tmp, base, mut picker) = fixture();
+        press(&mut picker, &[KeyCode::Down, KeyCode::Down, KeyCode::Enter]);
+        assert_eq!(picker.cwd, base.join("alpha"));
+        let path = selected_path(press(&mut picker, &[KeyCode::Enter]), "./");
+        assert_eq!(path, base.join("alpha").to_string_lossy());
         assert!(!picker.is_active());
     }
 
     #[test]
-    fn test_left_arrow_navigates_to_parent() {
-        let (_tmp, base) = setup_tempdir();
-        let child = base.join("alpha");
-        let mut picker = DirPicker::new();
-        picker.activate(&child.to_string_lossy());
-
-        let result = picker.handle_key(key(KeyCode::Left));
-        assert!(matches!(result, DirPickerResult::Continue));
-        assert_eq!(picker.cwd, base);
-    }
-
-    #[test]
-    fn test_backspace_empty_filter_goes_to_parent() {
-        let (_tmp, base) = setup_tempdir();
-        let child = base.join("alpha");
-        let mut picker = DirPicker::new();
-        picker.activate(&child.to_string_lossy());
-
-        picker.handle_key(key(KeyCode::Backspace));
-        assert_eq!(picker.cwd, base);
-    }
-
-    #[test]
-    fn test_backspace_with_filter_removes_char() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-
-        picker.handle_key(key(KeyCode::Char('a')));
-        assert_eq!(picker.filter.value(), "a");
-        picker.handle_key(key(KeyCode::Backspace));
-        assert_eq!(picker.filter.value(), "");
-    }
-
-    #[test]
-    fn test_enter_navigates_then_dot_selects() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-
-        // Navigate to "alpha" (index 2) and enter it
-        picker.handle_key(key(KeyCode::Down));
-        picker.handle_key(key(KeyCode::Down));
-        picker.handle_key(key(KeyCode::Enter));
-        assert_eq!(picker.cwd, base.join("alpha"));
-
-        // After entering, selected resets to 0 which is "./"
-        // Enter on "./" selects the current directory
-        let result = picker.handle_key(key(KeyCode::Enter));
-        match result {
-            DirPickerResult::Selected(path) => {
-                assert_eq!(path, base.join("alpha").to_string_lossy().to_string());
-            }
-            _ => panic!("Expected Selected"),
-        }
-        assert!(!picker.is_active());
-    }
-
-    #[test]
-    fn test_navigation_up_down() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-
-        // Can't go above 0
-        picker.handle_key(key(KeyCode::Up));
+    fn up_and_down_clamp_at_both_ends() {
+        let (_tmp, _base, mut picker) = fixture();
+        press(&mut picker, &[KeyCode::Up]);
         assert_eq!(picker.selected, 0);
-
-        picker.handle_key(key(KeyCode::Down));
+        press(&mut picker, &[KeyCode::Down, KeyCode::Down, KeyCode::Up]);
         assert_eq!(picker.selected, 1);
-        picker.handle_key(key(KeyCode::Down));
-        assert_eq!(picker.selected, 2);
-        picker.handle_key(key(KeyCode::Up));
-        assert_eq!(picker.selected, 1);
-    }
-
-    #[test]
-    fn test_navigation_clamps_at_end() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-
-        // 5 items: "./", "../", "alpha", "beta", "gamma"
-        for _ in 0..10 {
-            picker.handle_key(key(KeyCode::Down));
-        }
+        // Five rows: ./, ../, alpha, beta, gamma.
+        press(&mut picker, &[KeyCode::Down; 10]);
         assert_eq!(picker.selected, 4);
     }
 
+    /// Filtering matches directory names, drops the `./` and `../` rows unless
+    /// the filter itself looks like them, and resets the highlight.
     #[test]
-    fn test_filtered_dirs_includes_dot_entry() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-
-        let filtered = picker.filtered_dirs();
-        assert_eq!(filtered[0], "./");
-        assert_eq!(filtered[1], "../");
-    }
-
-    #[test]
-    fn test_filter_narrows_results() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-
-        // "a" matches "alpha", "beta", "gamma" (all contain 'a'), but not "./" or "../"
-        picker.handle_key(key(KeyCode::Char('a')));
-        let filtered = picker.filtered_dirs();
-        assert!(filtered.contains(&"alpha".to_string()));
-        assert!(filtered.contains(&"beta".to_string()));
-        assert!(filtered.contains(&"gamma".to_string()));
-        assert!(!filtered.contains(&"./".to_string()));
-        assert!(!filtered.contains(&"../".to_string()));
-
-        // "al" matches only "alpha"
-        picker.handle_key(key(KeyCode::Char('l')));
-        let filtered = picker.filtered_dirs();
-        assert_eq!(filtered, vec!["alpha"]);
-    }
-
-    #[test]
-    fn test_filter_resets_selection() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-
-        picker.handle_key(key(KeyCode::Down));
-        picker.handle_key(key(KeyCode::Down));
+    fn filter_narrows_the_list_and_resets_the_selection() {
+        let (_tmp, _base, mut picker) = fixture();
+        press(&mut picker, &[KeyCode::Down, KeyCode::Down]);
         assert_eq!(picker.selected, 2);
 
-        picker.handle_key(key(KeyCode::Char('a')));
+        typed(&mut picker, "a");
         assert_eq!(picker.selected, 0);
+        assert_eq!(picker.filtered_dirs(), vec!["alpha", "beta", "gamma"]);
+
+        typed(&mut picker, "l");
+        assert_eq!(picker.filtered_dirs(), vec!["alpha"]);
+
+        // Backspace with a filter edits it rather than navigating up.
+        press(&mut picker, &[KeyCode::Backspace]);
+        assert_eq!(picker.filter.value(), "a");
     }
 
     #[test]
-    fn test_jk_are_filter_chars_not_navigation() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
+    fn dot_filter_keeps_the_navigation_rows_only_while_it_matches_them() {
+        let (_tmp, _base, mut picker) = fixture();
+        typed(&mut picker, ".");
+        let filtered = picker.filtered_dirs();
+        assert!(filtered.contains(&"./".to_string()));
+        assert!(filtered.contains(&"../".to_string()));
 
-        picker.handle_key(key(KeyCode::Char('j')));
-        assert_eq!(picker.filter.value(), "j");
-        assert_eq!(picker.selected, 0);
+        typed(&mut picker, "/");
+        let filtered = picker.filtered_dirs();
+        assert!(!filtered.contains(&"./".to_string()));
+        assert!(!filtered.contains(&"../".to_string()));
+    }
 
-        picker.handle_key(key(KeyCode::Char('k')));
+    /// The filter owns every printable key, so `j`/`k` type rather than move.
+    #[test]
+    fn printable_keys_type_into_the_filter() {
+        let (_tmp, _base, mut picker) = fixture();
+        typed(&mut picker, "jk");
         assert_eq!(picker.filter.value(), "jk");
+        assert_eq!(picker.selected, 0);
     }
 
     #[test]
-    fn test_symlinked_dirs_are_listed() {
-        let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path().to_path_buf();
-        let real_dir = base.join("real");
-        std::fs::create_dir(&real_dir).unwrap();
+    fn enter_on_a_single_filtered_match_navigates_into_it() {
+        let (_tmp, base, mut picker) = fixture();
+        typed(&mut picker, "al");
+        press(&mut picker, &[KeyCode::Enter]);
+        assert_eq!(picker.cwd, base.join("alpha"));
+        assert_eq!(picker.filter.value(), "");
+        assert_eq!(picker.selected, 0);
+        assert!(picker.is_active());
+    }
 
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(&real_dir, base.join("link")).unwrap();
-            let mut picker = DirPicker::new();
-            picker.activate(&base.to_string_lossy());
-            assert!(picker.dirs.contains(&"real".to_string()));
-            assert!(picker.dirs.contains(&"link".to_string()));
-        }
+    /// Keys with nothing to act on leave the picker exactly as it was.
+    #[test]
+    fn enter_on_an_empty_match_list_and_tab_are_no_ops() {
+        let (_tmp, _base, mut picker) = fixture();
+        typed(&mut picker, "zzz");
+        assert!(picker.filtered_dirs().is_empty());
+        assert!(matches!(
+            press(&mut picker, &[KeyCode::Enter]),
+            DirPickerResult::Continue
+        ));
+        assert!(picker.is_active());
+
+        let (_tmp, base, mut picker) = fixture();
+        assert!(matches!(
+            press(&mut picker, &[KeyCode::Tab]),
+            DirPickerResult::Continue
+        ));
+        assert_eq!(picker.cwd, base);
+        assert_eq!(picker.selected, 0);
     }
 
     #[test]
-    fn test_files_excluded_from_listing() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-        assert!(!picker.dirs.contains(&"file.txt".to_string()));
-    }
-
-    #[test]
-    fn test_parent_entry_not_shown_at_root() {
+    fn root_has_no_parent_row_but_keeps_the_dot_row() {
         let mut picker = DirPicker::new();
         picker.activate("/");
         let filtered = picker.filtered_dirs();
         assert!(!filtered.contains(&"../".to_string()));
-        // "./" should still be present at root
         assert!(filtered.contains(&"./".to_string()));
     }
 
     #[test]
-    fn test_dotfiles_hidden_by_default() {
-        let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path().to_path_buf();
-        std::fs::create_dir(base.join(".hidden")).unwrap();
-        std::fs::create_dir(base.join("visible")).unwrap();
-
+    fn an_unreadable_directory_lists_nothing_and_flags_the_error() {
         let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-        assert!(picker.dirs.contains(&"visible".to_string()));
-        assert!(!picker.dirs.contains(&".hidden".to_string()));
-    }
-
-    #[test]
-    fn test_ctrl_h_toggles_hidden() {
-        let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path().to_path_buf();
-        std::fs::create_dir(base.join(".hidden")).unwrap();
-        std::fs::create_dir(base.join("visible")).unwrap();
-
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-        assert!(!picker.dirs.contains(&".hidden".to_string()));
-
-        let ctrl_h = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL);
-        picker.handle_key(ctrl_h);
-        assert!(picker.show_hidden);
-        assert!(picker.dirs.contains(&".hidden".to_string()));
-        assert!(picker.dirs.contains(&"visible".to_string()));
-
-        picker.handle_key(ctrl_h);
-        assert!(!picker.show_hidden);
-        assert!(!picker.dirs.contains(&".hidden".to_string()));
-    }
-
-    #[test]
-    fn test_enter_on_empty_filtered_list_is_noop() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-
-        // Type a filter that matches nothing
-        picker.handle_key(key(KeyCode::Char('z')));
-        picker.handle_key(key(KeyCode::Char('z')));
-        picker.handle_key(key(KeyCode::Char('z')));
-        let filtered = picker.filtered_dirs();
-        assert!(filtered.is_empty());
-
-        let result = picker.handle_key(key(KeyCode::Enter));
-        assert!(matches!(result, DirPickerResult::Continue));
-        assert!(picker.is_active());
-    }
-
-    #[test]
-    fn test_unreadable_dir_shows_error() {
-        let mut picker = DirPicker::new();
-        // Activate on a path that doesn't exist to trigger read_dir failure
         picker.cwd = PathBuf::from("/nonexistent_path_that_should_not_exist");
         picker.refresh_dirs();
         assert!(picker.read_error);
         assert!(picker.dirs.is_empty());
     }
 
+    /// Long paths are cut from the left, keeping the tail, and never split a
+    /// multi-byte character.
     #[test]
-    fn test_dot_filter_matches_navigation_entries() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-
-        // Typing "." should show both "./" and "../"
-        picker.handle_key(key(KeyCode::Char('.')));
-        let filtered = picker.filtered_dirs();
-        assert!(filtered.contains(&"./".to_string()));
-        assert!(filtered.contains(&"../".to_string()));
-
-        // Typing "/" after "." (filter is "./") should NOT show either
-        picker.handle_key(key(KeyCode::Char('/')));
-        let filtered = picker.filtered_dirs();
-        assert!(!filtered.contains(&"./".to_string()));
-        assert!(!filtered.contains(&"../".to_string()));
-    }
-
-    #[test]
-    fn test_enter_single_filtered_match_navigates() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-
-        // Type "al" to filter down to just "alpha"
-        picker.handle_key(key(KeyCode::Char('a')));
-        picker.handle_key(key(KeyCode::Char('l')));
-        let filtered = picker.filtered_dirs();
-        assert_eq!(filtered, vec!["alpha"]);
-
-        // Enter should navigate into "alpha"
-        picker.handle_key(key(KeyCode::Enter));
-        assert_eq!(picker.cwd, base.join("alpha"));
-        assert_eq!(picker.filter.value(), "");
-        assert_eq!(picker.selected, 0);
-        assert!(picker.is_active());
-    }
-
-    #[test]
-    fn test_tab_does_nothing_in_dir_picker() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-        let original_cwd = picker.cwd.clone();
-
-        let result = picker.handle_key(key(KeyCode::Tab));
-        assert!(matches!(result, DirPickerResult::Continue));
-        assert_eq!(picker.cwd, original_cwd);
-        assert_eq!(picker.selected, 0);
-    }
-
-    #[test]
-    fn test_truncate_path_short() {
+    fn truncate_path_keeps_the_tail_within_the_budget() {
         assert_eq!(DirPicker::truncate_path("/short", 20), "/short");
-    }
+        assert_eq!(DirPicker::truncate_path("/exact", 6), "/exact");
 
-    #[test]
-    fn test_truncate_path_long() {
         let long = "/home/user/very/deeply/nested/directory/structure";
-        let truncated = DirPicker::truncate_path(long, 30);
-        assert!(truncated.starts_with("..."));
-        assert!(truncated.chars().count() <= 30);
-        assert!(truncated.ends_with("directory/structure"));
-    }
+        let cut = DirPicker::truncate_path(long, 30);
+        assert!(cut.starts_with("..."));
+        assert!(cut.chars().count() <= 30);
+        assert!(cut.ends_with("directory/structure"));
 
-    #[test]
-    fn test_truncate_path_exact() {
-        let path = "/exact";
-        assert_eq!(DirPicker::truncate_path(path, 6), "/exact");
-    }
-
-    #[test]
-    fn test_truncate_path_multibyte_utf8() {
-        let path = "/home/user/projetcs/donnees/repertoire";
-        let truncated = DirPicker::truncate_path(path, 20);
-        assert!(truncated.starts_with("..."));
-        assert!(truncated.chars().count() <= 20);
-
-        // Ensure it doesn't panic on actual multi-byte chars
-        let unicode_path = "/home/\u{00e9}\u{00e8}\u{00ea}/\u{00fc}\u{00f6}\u{00e4}/dir";
-        let truncated = DirPicker::truncate_path(unicode_path, 10);
-        assert!(truncated.starts_with("..."));
-        assert!(truncated.chars().count() <= 10);
+        for (path, budget) in [
+            ("/home/user/projetcs/donnees/repertoire", 20),
+            (
+                "/home/\u{00e9}\u{00e8}\u{00ea}/\u{00fc}\u{00f6}\u{00e4}/dir",
+                10,
+            ),
+        ] {
+            let cut = DirPicker::truncate_path(path, budget);
+            assert!(cut.starts_with("..."), "{path}");
+            assert!(cut.chars().count() <= budget, "{path}");
+        }
     }
 }

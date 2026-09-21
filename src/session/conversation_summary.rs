@@ -1,22 +1,4 @@
-//! Agent-agnostic "summary of the conversation so far" for structured-view
-//! (ACP) sessions.
-//!
-//! Mirrors [`crate::session::smart_rename`] in spirit (a one-shot call to the
-//! session's own agent CLI, e.g. `claude -p`, gated on a one-shot-capable,
-//! non-sandboxed, non-overridden agent) but differs in three ways that matter:
-//!
-//! - It is **recurring**, not once-per-session: it fires as the transcript
-//!   grows and can also be triggered on demand.
-//! - Its input is the **transcript** (reconstructed from the event store),
-//!   not the first prompt, so it is capped hard and summarized **incrementally**
-//!   (previous summary + new-events delta) to keep each call O(delta), not
-//!   O(whole transcript).
-//! - The result is published as an append-only `Event::ConversationSummary`
-//!   rather than mutating the session title.
-//!
-//! ACP carries no conversation summary of its own (the claude-agent-acp adapter
-//! drops the SDK's compaction summary), so aoe generates its own here, which is
-//! also what makes it work across claude / codex / opencode / others. See #2808.
+//! Agent-agnostic "summary of the conversation so far" for structured-view (ACP) sessions.
 
 use crate::acp::state::Event;
 use crate::agents;
@@ -25,16 +7,10 @@ use crate::session::smart_rename::{
 };
 use std::collections::HashMap;
 
-/// Only one summary one-shot runs at a time process-wide. A summary reads the
-/// whole (capped) transcript, so it is slower and costlier than a title call;
-/// a single dedicated slot keeps it from starving smart-rename's snappier pool.
+/// Only one summary one-shot runs at a time process-wide.
 pub const MAX_CONCURRENT: usize = 1;
 
-/// Hard cap on the transcript text handed to the one-shot. Kept well under both
-/// macOS `ARG_MAX` (~256 KiB total argv+env) and Linux `MAX_ARG_STRLEN`
-/// (128 KiB per argument) so the prompt can travel as a single argv element,
-/// exactly like smart-rename, without an `E2BIG` failure or a bespoke stdin
-/// transport.
+/// Hard cap on the transcript text handed to the one-shot.
 // ponytail: argv transport with a 48 KiB cap; switch to piping the prompt via
 // stdin only if a future change needs a materially larger single call.
 const MAX_INPUT_BYTES: usize = 48_000;
@@ -53,21 +29,16 @@ const MAX_SUMMARY_CHARS: usize = 4_000;
 /// summary reaches this many bytes.
 const MIN_DELTA_BYTES: usize = 8_000;
 
-/// Automatic trigger fallback: summarize after this many completed user turns
-/// since the last summary even if the byte delta is small (long, low-output
-/// conversations still deserve a recap).
+/// Automatic trigger fallback: summarize after this many completed user turns since the last
+/// summary even if the byte delta is small (long, low-output conversations still deserve a recap).
 const MIN_DELTA_TURNS: usize = 8;
 
-// Summary eligibility reuses smart-rename's `SkipReason` (imported above)
-// minus the rename-only `NameNotDefault` / `Disabled` gates: a summary does
-// not care about the title, and the on-demand path runs even when the
-// automatic setting is off.
+// Summary eligibility reuses smart-rename's `SkipReason` (imported above) minus the rename-only
+// `NameNotDefault` / `Disabled` gates: a summary does not care about the title, and the on-demand
+// path runs even when the automatic setting is off.
 
 /// Resolve the agent for the summary one-shot and gate it, mirroring
-/// `smart_rename::check_eligible_resolved` but without the title / enabled
-/// gates. `summary_setting` is the shared utility-agent setting
-/// (`smart_rename_agent`; empty = session agent). Structured-only,
-/// one-shot-capable, not sandboxed, not command-overridden.
+/// `smart_rename::check_eligible_resolved` but without the title / enabled gates.
 pub fn resolve_summary_agent(
     structured: bool,
     session_tool: &str,
@@ -89,11 +60,10 @@ pub fn resolve_summary_agent(
     if agent.oneshot_flag.is_none() {
         return Err(SkipReason::NoOneshot);
     }
-    // Only a command override of the resolved summary agent's own binary
-    // disqualifies it: when the summary agent is the session's own agent, the
-    // session's launch command counts; when it is a different agent, the
-    // one-shot launches that binary fresh, so the session command is irrelevant
-    // (same semantics as smart-rename).
+    // Only a command override of the resolved summary agent's own binary disqualifies it: when the
+    // summary agent is the session's own agent, the session's launch command counts; when it is a
+    // different agent, the one-shot launches that binary fresh, so the session command is
+    // irrelevant (same semantics as smart-rename).
     let (command, override_in_cfg) = if summary_tool == session_tool {
         (session_command, overrides.contains_key(session_tool))
     } else {
@@ -121,17 +91,8 @@ pub fn last_summary(events: &[(u64, Event)]) -> (Option<String>, u64) {
         .unwrap_or((None, 0))
 }
 
-/// Reconstruct the transcript for events with seq greater than `since_seq` into
-/// a compact, agent-readable form. Returns `(text, snapshot_seq, new_turns)`
-/// where `snapshot_seq` is the highest seq included (so the caller can record
-/// exactly what the summary covers) and `new_turns` counts user prompts in the
-/// delta (the turn-count trigger fallback).
-///
-/// Tool output and thinking are dropped; tool calls are reduced to an
-/// intent-only line so a `grep` dump or a file read cannot bloat the input.
-/// If the rendered delta exceeds `MAX_INPUT_BYTES`, the oldest content is
-/// dropped (the tail is the most relevant for "so far") and a marker is
-/// prepended so the model knows the head was truncated.
+/// Reconstruct the transcript for events with seq greater than `since_seq` into a compact,
+/// agent-readable form.
 pub fn extract_transcript_delta(events: &[(u64, Event)], since_seq: u64) -> (String, u64, usize) {
     let mut out = String::new();
     let mut snapshot_seq = since_seq;
@@ -144,13 +105,24 @@ pub fn extract_transcript_delta(events: &[(u64, Event)], since_seq: u64) -> (Str
         }
         snapshot_seq = *seq;
         match event {
-            Event::UserPromptSent { text, .. } => {
+            // A rate-limit resume continuation replays a prompt already
+            // captured earlier in this same event log (#4041); counting or
+            // re-rendering it here would double the turn and duplicate the
+            // `[User]` block for what is really one interrupted turn.
+            Event::UserPromptSent {
+                text,
+                synthesized: false,
+                ..
+            } => {
                 agent_open = false;
                 new_turns += 1;
                 out.push_str("\n[User]\n");
                 out.push_str(text.trim());
                 out.push('\n');
             }
+            Event::UserPromptSent {
+                synthesized: true, ..
+            } => {}
             Event::AgentMessageChunk { text } => {
                 // Coalesce a run of chunks under one [Assistant] header.
                 if !agent_open {
@@ -186,9 +158,7 @@ pub fn extract_transcript_delta(events: &[(u64, Event)], since_seq: u64) -> (Str
     (out, snapshot_seq, new_turns)
 }
 
-/// Instruction for the summary one-shot. Asks for a compact recap and, when a
-/// previous summary is supplied, an incremental update rather than a re-read of
-/// the whole history.
+/// Instruction for the summary one-shot.
 const INSTRUCTION: &str = "You are summarizing an ongoing coding-agent session for a human who wants \
 to see, at a glance, what has happened so far. Write a concise summary in a few short bullet points: \
 what the user asked for, what the agent has done, the current state, and any open thread. \
@@ -208,10 +178,7 @@ pub fn build_summary_prompt(previous: Option<&str>, delta: &str) -> String {
     prompt
 }
 
-/// Turn raw agent stdout into a clean summary, or `None` when the agent
-/// produced nothing usable. Lighter than the title sanitizer: a summary is
-/// multi-line prose, so we only strip ANSI, trim, reject empty / refusals, and
-/// cap the length.
+/// Turn raw agent stdout into a clean summary, or `None` when the agent produced nothing usable.
 pub fn sanitize_summary(raw: &str) -> Option<String> {
     let cleaned = strip_ansi(raw);
     let trimmed = cleaned.trim();
@@ -233,9 +200,7 @@ pub fn sanitize_summary(raw: &str) -> Option<String> {
     Some(capped)
 }
 
-/// Should the automatic trigger fire for this delta? `true` when the byte delta
-/// or the turn-count fallback is reached. Manual (on-demand) summaries bypass
-/// this entirely.
+/// Should the automatic trigger fire for this delta?
 pub fn delta_meets_threshold(delta_bytes: usize, new_turns: usize) -> bool {
     delta_bytes >= MIN_DELTA_BYTES || new_turns >= MIN_DELTA_TURNS
 }
@@ -264,11 +229,8 @@ mod serve {
         Manual,
     }
 
-    /// Cheap sync predicate for the ACP listener: a clean `prompt_complete`
-    /// `Stopped` for a session with no in-flight summary. The setting, the
-    /// eligibility gate, and the delta threshold are all re-checked inside
-    /// [`try_conversation_summary`] (they need config + the event store), so
-    /// this only filters the high-volume frames before spawning a task.
+    /// Cheap sync predicate for the ACP listener: a clean `prompt_complete` `Stopped` for a session
+    /// with no in-flight summary.
     pub fn should_trigger_summary(
         event: &Event,
         session_id: &str,
@@ -278,9 +240,8 @@ mod serve {
             && !inflight.contains(session_id)
     }
 
-    /// Marks a session as having an in-flight summary so the auto trigger and a
-    /// concurrent manual request cannot both run (and race on the last-summary
-    /// seq). Removed on drop.
+    /// Marks a session as having an in-flight summary so the auto trigger and a concurrent manual
+    /// request cannot both run (and race on the last-summary seq).
     struct InflightGuard<'a> {
         set: &'a Mutex<HashSet<String>>,
         id: String,
@@ -307,10 +268,7 @@ mod serve {
         }
     }
 
-    /// Best-effort conversation summary for a structured-view session. Spawn it
-    /// detached: it never returns an error and never touches the prompt flow.
-    /// `Auto` honours the `conversation_summary` setting and the delta
-    /// threshold; `Manual` bypasses both but still requires an eligible agent.
+    /// Best-effort conversation summary for a structured-view session.
     pub async fn try_conversation_summary(
         state: Arc<AppState>,
         session_id: String,
@@ -371,9 +329,9 @@ mod serve {
         }
 
         let prompt = build_summary_prompt(previous.as_deref(), &delta);
-        // A summary reads the whole transcript and can run a bigger model turn
-        // (see SUMMARY_TIMEOUT), so it uses the CLI default model rather than
-        // the cheap alias smart-rename titles pin.
+        // A summary reads the whole transcript and can run a bigger model turn (see
+        // SUMMARY_TIMEOUT), so it uses the CLI default model rather than the cheap alias
+        // smart-rename titles pin.
         let Some(argv) = crate::session::smart_rename::build_oneshot_argv(
             agent,
             &prompt,
@@ -420,6 +378,15 @@ mod tests {
             prompt_id: None,
             text: text.into(),
             attachments: vec![],
+            synthesized: false,
+        }
+    }
+    fn synthesized_user(text: &str) -> Event {
+        Event::UserPromptSent {
+            prompt_id: None,
+            text: text.into(),
+            attachments: vec![],
+            synthesized: true,
         }
     }
     fn agent(text: &str) -> Event {
@@ -449,11 +416,27 @@ mod tests {
         ];
         let (text, snap, turns) = extract_transcript_delta(&events, 0);
         assert!(text.contains("[User]\nfix the login bug"));
-        // Two agent chunks coalesce under a single [Assistant] header.
         assert_eq!(text.matches("[Assistant]").count(), 1);
         assert!(text.contains("Looking at auth.rs"));
         assert_eq!(snap, 3);
         assert_eq!(turns, 1);
+    }
+
+    #[test]
+    fn extract_skips_a_rate_limit_resend_so_it_neither_counts_nor_duplicates() {
+        // The interrupted prompt already appears once (seq 1); the daemon's
+        // redelivery at seq 3 (#4041) must not add a second [User] block or
+        // count as a new turn.
+        let events = vec![
+            (1, user("keep working")),
+            (2, agent("on it")),
+            (3, synthesized_user("keep working")),
+            (4, agent("done")),
+        ];
+        let (text, snap, turns) = extract_transcript_delta(&events, 0);
+        assert_eq!(text.matches("[User]").count(), 1);
+        assert_eq!(turns, 1);
+        assert_eq!(snap, 4);
     }
 
     #[test]
@@ -462,7 +445,6 @@ mod tests {
         let events = vec![(1, tool("Bash", &big))];
         let (text, _, _) = extract_transcript_delta(&events, 0);
         assert!(text.contains("[Tool: Bash]"));
-        // The 5000-byte args_preview is capped, so it cannot bloat the input.
         assert!(
             text.len() < 500,
             "tool args not capped: {} bytes",
@@ -525,7 +507,6 @@ mod tests {
         assert!(p.contains("Summary so far"));
         assert!(p.contains("prior recap"));
         assert!(p.contains("next thing"));
-        // Without a previous summary, no incremental clause.
         let p0 = build_summary_prompt(None, "[User]\nfirst");
         assert!(!p0.contains("Summary so far"));
         assert!(p0.contains("first"));
@@ -555,26 +536,19 @@ mod tests {
     #[test]
     fn resolve_summary_agent_gates() {
         let overrides = HashMap::new();
-        // Happy path: structured claude, no override, not sandboxed.
         assert!(resolve_summary_agent(true, "claude", "", false, "", &overrides).is_ok());
-        // Not structured.
         assert!(matches!(
             resolve_summary_agent(false, "claude", "", false, "", &overrides),
             Err(SkipReason::NotStructured)
         ));
-        // Sandboxed.
         assert!(matches!(
             resolve_summary_agent(true, "claude", "", true, "", &overrides),
             Err(SkipReason::Sandboxed)
         ));
-        // Agent without a one-shot mode (cursor).
         assert!(matches!(
             resolve_summary_agent(true, "cursor", "", false, "", &overrides),
             Err(SkipReason::NoOneshot)
         ));
-        // A distinct summary agent is used verbatim.
         assert!(resolve_summary_agent(true, "claude", "codex", false, "", &overrides).is_ok());
-        // Unlike smart-rename, the title never gates a summary: a
-        // custom-named session is still eligible (no NameNotDefault path).
     }
 }

@@ -25,16 +25,10 @@ describe("retryDelayMs", () => {
   it("caps at 10s for the tail of the backoff", () => {
     expect(retryDelayMs(6)).toBe(6000);
     expect(retryDelayMs(7)).toBe(10000);
-    // Defense against an off-by-one: even an out-of-range attempt
-    // never exceeds the tail value, so the retry handler can't
-    // accidentally schedule a 30s+ timeout if MAX_RETRIES creeps up.
     expect(retryDelayMs(20)).toBe(10000);
   });
 
   it("clamps non-positive attempts to the first delay", () => {
-    // Defensive: the call site always passes attempt >= 1, but a future
-    // change to retry-state machine arithmetic shouldn't drop a 0 into
-    // retryDelayMs and produce undefined.
     expect(retryDelayMs(0)).toBe(200);
     expect(retryDelayMs(-1)).toBe(200);
   });

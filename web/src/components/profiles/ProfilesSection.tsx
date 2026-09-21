@@ -13,15 +13,13 @@ import {
 import type { HooksOverride, ProfileInfo, ProfileSettingsResponse } from "../../lib/types";
 import { buildEffectiveHooks } from "../../lib/profileHooks";
 import { HooksReadOnlyPanel } from "./HooksReadOnlyPanel";
+import { validateProfileName } from "./profileName";
 
 interface Props {
   readOnly?: boolean;
 }
 
-// Sections deep-linked into the rest of the Settings tabs (scoped to the
-// selected profile via ?profile=). Per-section editing, including the
-// passphrase-gated sandbox/worktree saves, stays in those tabs; this section
-// owns profile-management metadata only.
+// Per-section editing stays in those Settings tabs, scoped via ?profile=.
 const EDIT_SECTIONS: ReadonlyArray<{ tab: string; label: string }> = [
   { tab: "session", label: "Session" },
   { tab: "theme", label: "Theme" },
@@ -29,11 +27,9 @@ const EDIT_SECTIONS: ReadonlyArray<{ tab: string; label: string }> = [
   { tab: "worktree", label: "Worktree" },
 ];
 
-function validateName(name: string): string | null {
-  if (!name) return "Name is required";
-  if (!/^[a-zA-Z0-9_-]+$/.test(name)) return "Only letters, digits, hyphens, and underscores";
-  return null;
-}
+const SECONDARY_BUTTON =
+  "px-3 py-1.5 rounded-md border border-surface-700 text-xs text-text-secondary hover:bg-surface-800 cursor-pointer";
+const LINK_BUTTON = "text-xs text-text-dim hover:text-text-primary cursor-pointer";
 
 export function ProfilesSection({ readOnly }: Props) {
   const navigate = useNavigate();
@@ -43,27 +39,24 @@ export function ProfilesSection({ readOnly }: Props) {
   const [globalHooks, setGlobalHooks] = useState<HooksOverride | undefined>(undefined);
   const [description, setDescription] = useState("");
   const [error, setError] = useState<string | null>(null);
-  const [creating, setCreating] = useState(false);
-  const [renaming, setRenaming] = useState(false);
-  const [inputValue, setInputValue] = useState("");
+  const [nameInput, setNameInput] = useState<{ mode: "create" | "rename"; value: string } | null>(null);
 
-  // A request id guards against a slow response for a previously-selected
-  // profile winning after a fast switch.
+  // Drops a slow load for a previously selected profile.
   const loadSeq = useRef(0);
-  // Set once the user edits the description, so the async load's late
-  // `setDescription` can't clobber an in-progress edit.
+  // A late load must not clobber an in-progress description edit.
   const descriptionDirty = useRef(false);
 
-  const loadProfileSettings = (name: string) => {
+  const selectProfile = (name: string) => {
+    setSelected(name);
     const seq = ++loadSeq.current;
     descriptionDirty.current = false;
-    if (!name) {
+    const clear = (err: string | null) => {
       setProfileSettings(null);
       setGlobalHooks(undefined);
       setDescription("");
-      setError(null);
-      return;
-    }
+      setError(err);
+    };
+    if (!name) return clear(null);
     Promise.all([getProfileSettings(name), fetchSettings()])
       .then(([profile, global]) => {
         if (seq !== loadSeq.current) return;
@@ -75,18 +68,11 @@ export function ProfilesSection({ readOnly }: Props) {
         }
       })
       .catch(() => {
-        if (seq !== loadSeq.current) return;
-        setProfileSettings(null);
-        setGlobalHooks(undefined);
-        setDescription("");
-        setError("Failed to load profile settings");
+        if (seq === loadSeq.current) clear("Failed to load profile settings");
       });
   };
 
-  const reload = async () => {
-    const list = await fetchProfiles();
-    setProfiles(list);
-  };
+  const reload = async () => setProfiles(await fetchProfiles());
 
   useEffect(() => {
     let cancelled = false;
@@ -94,90 +80,53 @@ export function ProfilesSection({ readOnly }: Props) {
       const list = await fetchProfiles();
       if (cancelled) return;
       setProfiles(list);
-      const current = list.find((p) => p.is_default)?.name ?? list[0]?.name ?? "";
-      setSelected(current);
-      loadProfileSettings(current);
+      selectProfile(list.find((p) => p.is_default)?.name ?? list[0]?.name ?? "");
     })();
     return () => {
       cancelled = true;
     };
   }, []);
 
-  const closeInput = () => {
-    setCreating(false);
-    setRenaming(false);
-    setInputValue("");
+  const openInput = (mode: "create" | "rename", value: string) => {
+    setNameInput({ mode, value });
     setError(null);
   };
 
-  const handleCreate = async () => {
-    const trimmed = inputValue.trim();
-    const err = validateName(trimmed);
-    if (err) {
-      setError(err);
-      return;
-    }
-    const ok = await createProfile(trimmed);
-    if (!ok) {
-      setError("Failed to create profile");
-      return;
-    }
-    closeInput();
-    setSelected(trimmed);
-    loadProfileSettings(trimmed);
-    await reload();
+  const closeInput = () => {
+    setNameInput(null);
+    setError(null);
   };
 
-  const handleRename = async () => {
-    const trimmed = inputValue.trim();
-    if (trimmed === selected) {
-      closeInput();
-      return;
-    }
-    const err = validateName(trimmed);
-    if (err) {
-      setError(err);
-      return;
-    }
-    const ok = await renameProfile(selected, trimmed);
-    if (!ok) {
-      setError("Failed to rename profile");
-      return;
-    }
+  const submitName = async () => {
+    if (!nameInput) return;
+    const { mode } = nameInput;
+    const trimmed = nameInput.value.trim();
+    if (mode === "rename" && trimmed === selected) return closeInput();
+    const err = validateProfileName(trimmed);
+    if (err) return setError(err);
+    const ok = mode === "create" ? await createProfile(trimmed) : await renameProfile(selected, trimmed);
+    if (!ok) return setError(`Failed to ${mode} profile`);
     closeInput();
-    setSelected(trimmed);
-    loadProfileSettings(trimmed);
+    selectProfile(trimmed);
     await reload();
   };
 
   const handleDelete = async (name: string) => {
     if (!confirm(`Delete profile "${name}"?`)) return;
-    const ok = await deleteProfile(name);
-    if (!ok) {
-      setError("Failed to delete profile");
-      return;
-    }
-    if (selected === name) {
-      setSelected("");
-      loadProfileSettings("");
-    }
+    if (!(await deleteProfile(name))) return setError("Failed to delete profile");
+    if (selected === name) selectProfile("");
     await reload();
   };
 
   const handleSetDefault = async (name: string) => {
-    const ok = await setDefaultProfile(name);
-    if (ok) await reload();
+    if (await setDefaultProfile(name)) await reload();
   };
 
   const handleSaveDescription = async () => {
     setError(null);
     const trimmed = description.trim();
-    const ok = await updateProfileSettings(selected, {
-      description: trimmed ? trimmed : null,
-    });
-    if (!ok) {
-      setError("Failed to save description");
-      return;
+    if (!(await updateProfileSettings(selected, { description: trimmed ? trimmed : null }))) {
+      return setError("Failed to save description");
     }
     descriptionDirty.current = false;
     await reload();
@@ -185,20 +134,16 @@ export function ProfilesSection({ readOnly }: Props) {
 
   const selectedInfo = profiles.find((p) => p.name === selected);
   const isDefault = selectedInfo?.is_default ?? false;
-  const hookGroups = buildEffectiveHooks(profileSettings?.hooks, globalHooks);
+  const creating = nameInput?.mode === "create";
 
   return (
     <div className="space-y-3" data-testid="profiles-section">
       <p className="text-xs text-text-dim">Manage configuration profiles and inspect their lifecycle hooks.</p>
 
-      {!readOnly && !creating && !renaming && (
+      {!readOnly && !nameInput && (
         <button
           type="button"
-          onClick={() => {
-            setCreating(true);
-            setInputValue("");
-            setError(null);
-          }}
+          onClick={() => openInput("create", "")}
           className="px-3 py-1.5 text-sm bg-brand-600 hover:bg-brand-700 text-surface-900 rounded-md cursor-pointer font-medium"
         >
           + New profile
@@ -211,21 +156,18 @@ export function ProfilesSection({ readOnly }: Props) {
         </div>
       )}
 
-      {(creating || renaming) && (
+      {nameInput && (
         <div className="flex gap-2 bg-surface-850 border border-surface-700 rounded-lg p-3">
           <input
             type="text"
-            value={inputValue}
+            value={nameInput.value}
             autoFocus
             onChange={(e) => {
-              setInputValue(e.target.value);
+              setNameInput({ ...nameInput, value: e.target.value });
               setError(null);
             }}
             onKeyDown={(e) => {
-              if (e.key === "Enter") {
-                if (creating) handleCreate();
-                else handleRename();
-              }
+              if (e.key === "Enter") submitName();
               if (e.key === "Escape") closeInput();
             }}
             placeholder={creating ? "Profile name" : "New name"}
@@ -233,16 +175,12 @@ export function ProfilesSection({ readOnly }: Props) {
           />
           <button
             type="button"
-            onClick={creating ? handleCreate : handleRename}
+            onClick={submitName}
             className="px-3 py-1.5 rounded-md bg-brand-600 hover:bg-brand-500 text-xs font-medium text-surface-950 cursor-pointer"
           >
             {creating ? "Create" : "Rename"}
           </button>
-          <button
-            type="button"
-            onClick={closeInput}
-            className="px-3 py-1.5 rounded-md border border-surface-700 text-xs text-text-secondary hover:bg-surface-800 cursor-pointer"
-          >
+          <button type="button" onClick={closeInput} className={SECONDARY_BUTTON}>
             Cancel
           </button>
         </div>
@@ -254,10 +192,7 @@ export function ProfilesSection({ readOnly }: Props) {
             <button
               key={p.name}
               type="button"
-              onClick={() => {
-                setSelected(p.name);
-                loadProfileSettings(p.name);
-              }}
+              onClick={() => selectProfile(p.name)}
               className={`flex items-center justify-between rounded-md px-3 py-2 text-sm text-left cursor-pointer ${
                 p.name === selected ? "bg-surface-700 text-text-primary" : "text-text-secondary hover:bg-surface-800"
               }`}
@@ -280,23 +215,14 @@ export function ProfilesSection({ readOnly }: Props) {
                 {!readOnly && (
                   <>
                     {!isDefault && (
-                      <button
-                        type="button"
-                        onClick={() => handleSetDefault(selectedInfo.name)}
-                        className="text-xs text-text-dim hover:text-text-primary cursor-pointer"
-                      >
+                      <button type="button" onClick={() => handleSetDefault(selectedInfo.name)} className={LINK_BUTTON}>
                         Set as default
                       </button>
                     )}
                     <button
                       type="button"
-                      onClick={() => {
-                        setRenaming(true);
-                        setCreating(false);
-                        setInputValue(selectedInfo.name);
-                        setError(null);
-                      }}
-                      className="text-xs text-text-dim hover:text-text-primary cursor-pointer"
+                      onClick={() => openInput("rename", selectedInfo.name)}
+                      className={LINK_BUTTON}
                     >
                       Rename
                     </button>
@@ -328,11 +254,7 @@ export function ProfilesSection({ readOnly }: Props) {
                     className="flex-1 bg-surface-900 border border-surface-700 rounded-md px-2 py-1.5 text-sm text-text-primary focus:border-brand-600 focus:outline-none disabled:opacity-60"
                   />
                   {!readOnly && (
-                    <button
-                      type="button"
-                      onClick={handleSaveDescription}
-                      className="px-3 py-1.5 rounded-md border border-surface-700 text-xs text-text-secondary hover:bg-surface-800 cursor-pointer"
-                    >
+                    <button type="button" onClick={handleSaveDescription} className={SECONDARY_BUTTON}>
                       Save
                     </button>
                   )}
@@ -347,7 +269,7 @@ export function ProfilesSection({ readOnly }: Props) {
                       key={s.tab}
                       type="button"
                       onClick={() => navigate(`/settings/${s.tab}?profile=${encodeURIComponent(selectedInfo.name)}`)}
-                      className="px-3 py-1.5 rounded-md border border-surface-700 text-xs text-text-secondary hover:bg-surface-800 cursor-pointer"
+                      className={SECONDARY_BUTTON}
                     >
                       {s.label} &rarr;
                     </button>
@@ -355,7 +277,7 @@ export function ProfilesSection({ readOnly }: Props) {
                 </div>
               </div>
 
-              <HooksReadOnlyPanel groups={hookGroups} />
+              <HooksReadOnlyPanel groups={buildEffectiveHooks(profileSettings?.hooks, globalHooks)} />
             </div>
           ) : (
             <p className="text-sm text-text-dim">

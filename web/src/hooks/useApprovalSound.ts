@@ -1,22 +1,3 @@
-// Browser-side approval sound for the structured view.
-//
-// When the structured view transitions from "no pending approvals" to "at least
-// one pending approval", play the configured sound (from `[sound]` in
-// the daemon's config) in the browser. The host-side sound module only
-// fires on session-status transitions and runs on the server host, so
-// it is the wrong side of the wire when the dashboard is on a separate
-// machine. See #1038.
-//
-// Trade-offs:
-//   - Autoplay policies: the first play() may reject if the user has
-//     not interacted with the dashboard yet. We swallow the rejection;
-//     the OS push notification and in-app toast still surface the
-//     approval, so the missing sound is graceful, not fatal.
-//   - Auth: the fetch interceptor injects `Authorization: Bearer` on
-//     every fetch (web/src/lib/fetchInterceptor.ts), and `<audio src>`
-//     does not run through that interceptor, so the bytes are fetched
-//     and handed to Audio via `URL.createObjectURL`.
-
 import { useEffect, useState } from "react";
 import { fetchSettings, fetchSounds, fetchSoundBlob } from "../lib/api";
 
@@ -38,21 +19,9 @@ const SETTINGS_TTL_MS = 30_000;
 
 let cachedSound: CachedSound | null = null;
 
-/** Grace window after mount during which 0->>=1 transitions are
- *  swallowed. The structured view WS replays every stored event for the
- *  session on connect, so a fresh page load on a session with pending
- *  approvals would otherwise ring the chime even though nothing new
- *  happened. The OS push only fires on the live broadcast edge in the
- *  supervisor (no replay path), so the two channels stay consistent.
- *
- *  Reconnects do not unmount `StructuredView`, so this gate only swallows
- *  the initial-load case; new approvals that arrive while the socket
- *  is offline still chime after the reducer applies them on reconnect. */
+// The WS replays stored events on connect; don't chime for approvals that were already pending.
 const REPLAY_QUIET_MS = 1500;
 
-/** Drop the module-level caches. Called by the logout flow so the next
- *  authenticated user sees their own settings and doesn't replay the
- *  previous user's blob URL. */
 export function clearApprovalSoundCache(): void {
   cachedSettings = null;
   cachedSettingsAt = 0;
@@ -94,6 +63,7 @@ async function ensureSoundUrl(name: string): Promise<string | null> {
   if (cachedSound && cachedSound.name === name) {
     return cachedSound.url;
   }
+  // `<audio src>` bypasses the fetch auth interceptor, so load the bytes via fetch.
   const blob = await fetchSoundBlob(name);
   if (!blob) return null;
   if (cachedSound) {
@@ -113,28 +83,18 @@ async function playApprovalSound(): Promise<void> {
   if (!url) return;
   const audio = new Audio(url);
   const volume = typeof sound.volume === "number" ? sound.volume : 1.0;
-  // The host-side scale is 0.1-1.5 with 1.0 = normal; HTMLAudioElement
-  // tops out at 1.0, so clamp directly rather than rescaling 1.5 down
-  // to a 0.667 audible "normal".
+  // The host scale tops out at 1.5; HTMLAudioElement at 1.0.
   audio.volume = Math.max(0, Math.min(1, volume));
   try {
     await audio.play();
   } catch {
-    // Autoplay policy or backgrounded tab. The push and in-app toast
-    // still cover the user-visible signal; the missing chime is not
-    // worth a retry storm.
+    // Autoplay blocked; the push and toast still notify.
   }
 }
 
-/** Watch `pendingCount` for a 0 -> >=1 edge and play the configured
- *  approval sound. Pure passive: the hook does not mount any UI and
- *  has no return value. */
 export function useApprovalSound(pendingCount: number): void {
   const [trackedPendingCount, setTrackedPendingCount] = useState(pendingCount);
   const [quietPeriodDone, setQuietPeriodDone] = useState(false);
-  // Bumped on a committed 0 -> >=1 edge; the effect below plays the chime.
-  // Keeping playback in an effect (not the render-time block) keeps the hook
-  // pure and avoids duplicate/late chimes under re-render or replay.
   const [playbackToken, setPlaybackToken] = useState(0);
 
   useEffect(() => {

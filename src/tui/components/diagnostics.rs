@@ -7,24 +7,17 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 use unicode_width::UnicodeWidthStr;
 
-use crate::process::metrics::{AgentMetric, MemorySample, MetricsSnapshot};
+use crate::process::metrics::{
+    pressure_band, AgentMetric, MemorySample, MetricsSnapshot, PressureBand,
+};
 use crate::tui::components::truncate_to_width;
 use crate::tui::styles::Theme;
 
-/// Fraction used at or above which the strip reads Critical.
-const HEADROOM_CRITICAL: f64 = 0.90;
-/// Fraction used at or above which the strip reads Warn.
-const HEADROOM_WARN: f64 = 0.70;
-/// PSI `some` avg10 percent at or above which a present PSI signal reads Critical.
-const PSI_CRITICAL: f32 = 20.0;
-/// PSI `some` avg10 percent at or above which a present PSI signal reads Warn.
-const PSI_WARN: f32 = 5.0;
 const HEALTH_FIXED_ROWS: u16 = 6;
 const AGENT_TABLE_HEADER_ROWS: u16 = 1;
 /// Display width of the fixed metric block on the agent table, identical on the
-/// header (`{:>7} {:>9} {:>6}`) and on each row (` {cpu:>6} {:>9} {:>6}`). The
-/// name column takes whatever is left, so both lines must derive it the same
-/// way or the columns drift apart.
+/// header and on each row. The name column takes what is left, so both lines
+/// must derive it the same way or the columns drift apart.
 const AGENT_METRICS_WIDTH: usize = 24;
 
 pub(crate) fn agent_table_visible_rows(preview_height: u16) -> usize {
@@ -34,11 +27,10 @@ pub(crate) fn agent_table_visible_rows(preview_height: u16) -> usize {
         .saturating_sub(AGENT_TABLE_HEADER_ROWS) as usize
 }
 
-/// Gutter between the pane border and its contents, widening as the pane does.
-/// The agent table stretches its name column to whatever it is given, so at one
-/// column of padding a wide pane reads as pinned to its edges; a narrow one
-/// needs the width for the columns more than it needs the gutter. `width` is
-/// the outer pane width, borders included.
+/// Gutter between the pane border and its contents, widening with the pane: the
+/// name column stretches, so a wide pane otherwise reads as pinned to its edges,
+/// while a narrow one needs the width more than the gutter. `width` is the outer
+/// pane width, borders included.
 fn health_padding(width: u16) -> u16 {
     match width {
         0..=47 => 1,
@@ -56,9 +48,8 @@ fn agent_name_width(table_width: u16) -> usize {
 /// Marker on a sandboxed row, matching the session list's `[container]` badge.
 const CONTAINER_BADGE: &str = " [container]";
 
-/// The name cell: the agent title, plus the container marker when the row's
-/// figures come from a sandbox rather than a host process tree (its memory
-/// figure is the container's usage, not an RSS sum). The spans always total
+/// The name cell: the agent title, plus the container marker when the figures
+/// come from a sandbox rather than a host process tree. The spans always total
 /// `width`, so the metric columns stay under their headers.
 fn agent_name_spans<'a>(agent: &AgentMetric, width: usize, theme: &Theme) -> Vec<Span<'a>> {
     // Below this the badge would crowd out the name; the row keeps its
@@ -102,61 +93,6 @@ fn format_agent_title(title: &str, width: usize) -> String {
     let title = truncate_to_width(title, width);
     let padding = width.saturating_sub(super::text::rendered_width(&title));
     format!("{title}{}", " ".repeat(padding))
-}
-
-/// Memory-pressure severity, worst-of across the available signals. Ordered
-/// ascending so the derived `Ord` lets callers fold inputs with `max`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum PressureBand {
-    Ok,
-    Warn,
-    Critical,
-}
-
-/// Classify a memory sample into a pressure band. Headroom is always an input;
-/// PSI (Linux) and the macOS pressure level contribute only when present, so a
-/// platform that omits a signal never has it read as a false all-clear. The
-/// worst band across the present inputs wins.
-pub(crate) fn pressure_band(mem: &MemorySample) -> PressureBand {
-    let mut band = band_from_headroom(mem.used_fraction());
-    if let Some(v) = mem.psi_mem_some_avg10 {
-        band = band.max(band_from_psi(v));
-    }
-    if let Some(v) = mem.psi_io_some_avg10 {
-        band = band.max(band_from_psi(v));
-    }
-    if let Some(level) = mem.macos_pressure_level {
-        band = band.max(band_from_macos(level));
-    }
-    band
-}
-
-fn band_from_headroom(used_fraction: f64) -> PressureBand {
-    if used_fraction >= HEADROOM_CRITICAL {
-        PressureBand::Critical
-    } else if used_fraction >= HEADROOM_WARN {
-        PressureBand::Warn
-    } else {
-        PressureBand::Ok
-    }
-}
-
-fn band_from_psi(some_avg10: f32) -> PressureBand {
-    if some_avg10 >= PSI_CRITICAL {
-        PressureBand::Critical
-    } else if some_avg10 >= PSI_WARN {
-        PressureBand::Warn
-    } else {
-        PressureBand::Ok
-    }
-}
-
-fn band_from_macos(level: u8) -> PressureBand {
-    match level {
-        4 => PressureBand::Critical,
-        2 => PressureBand::Warn,
-        _ => PressureBand::Ok,
-    }
 }
 
 fn band_color(theme: &Theme, band: PressureBand) -> Color {
@@ -332,11 +268,7 @@ pub fn render_system_health(
 
     let rows = Layout::vertical([Constraint::Length(6), Constraint::Min(0)]).split(inner);
     let band = pressure_band(&snapshot.memory);
-    let severity = match band {
-        PressureBand::Ok => "OK",
-        PressureBand::Warn => "WARN",
-        PressureBand::Critical => "CRITICAL",
-    };
+    let severity = band.as_str().to_ascii_uppercase();
     let lines = vec![
         Line::from(vec![
             Span::styled("Status  ", Style::default().fg(theme.dimmed)),
@@ -412,85 +344,6 @@ pub fn render_system_health(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn sample_with_fraction(used_fraction: f64) -> MemorySample {
-        // total 1000 so available maps cleanly to the target fraction.
-        MemorySample {
-            total_bytes: 1000,
-            available_bytes: (1000.0 * (1.0 - used_fraction)).round() as u64,
-            ..MemorySample::default()
-        }
-    }
-
-    #[test]
-    fn pressure_band_from_headroom_only() {
-        let cases = [
-            (0.0, PressureBand::Ok),
-            (0.69, PressureBand::Ok),
-            (0.70, PressureBand::Warn),
-            (0.89, PressureBand::Warn),
-            (0.90, PressureBand::Critical),
-            (0.99, PressureBand::Critical),
-        ];
-        for (frac, expected) in cases {
-            assert_eq!(
-                pressure_band(&sample_with_fraction(frac)),
-                expected,
-                "headroom fraction {frac}"
-            );
-        }
-    }
-
-    #[test]
-    fn pressure_band_escalates_on_psi_when_headroom_calm() {
-        // Headroom alone is Ok (50% used); PSI drives the band up.
-        let mut mem = sample_with_fraction(0.50);
-        assert_eq!(pressure_band(&mem), PressureBand::Ok);
-
-        mem.psi_mem_some_avg10 = Some(6.0);
-        assert_eq!(pressure_band(&mem), PressureBand::Warn);
-
-        mem.psi_mem_some_avg10 = Some(25.0);
-        assert_eq!(pressure_band(&mem), PressureBand::Critical);
-
-        // io pressure alone (mem PSI absent) still escalates.
-        let mem_io = MemorySample {
-            psi_io_some_avg10: Some(25.0),
-            ..sample_with_fraction(0.50)
-        };
-        assert_eq!(pressure_band(&mem_io), PressureBand::Critical);
-    }
-
-    #[test]
-    fn pressure_band_from_macos_level() {
-        let cases = [
-            (1u8, PressureBand::Ok),
-            (2, PressureBand::Warn),
-            (4, PressureBand::Critical),
-        ];
-        for (level, expected) in cases {
-            let mem = MemorySample {
-                macos_pressure_level: Some(level),
-                ..sample_with_fraction(0.50)
-            };
-            assert_eq!(pressure_band(&mem), expected, "macos level {level}");
-        }
-    }
-
-    #[test]
-    fn pressure_band_takes_worst_of_inputs() {
-        // Critical headroom must not be softened by a calm PSI reading.
-        let mem = MemorySample {
-            psi_mem_some_avg10: Some(1.0),
-            ..sample_with_fraction(0.95)
-        };
-        assert_eq!(pressure_band(&mem), PressureBand::Critical);
-    }
-
-    #[test]
-    fn pressure_band_default_sample_is_ok() {
-        assert_eq!(pressure_band(&MemorySample::default()), PressureBand::Ok);
-    }
 
     #[test]
     fn agent_table_visible_rows_handles_boundaries() {

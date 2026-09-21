@@ -1,18 +1,4 @@
-//! Project-local `.mcp.json` parsing for the repo-trust gate (#1985).
-//!
-//! This lives outside `acp` so the trust system (`repo_config`) and the TUI
-//! trust dialog can read, fingerprint, and display a repo's project MCP
-//! servers without depending on the ACP schema types. The supervisor converts these into ACP `McpServer` values for
-//! forwarding (see `acp::mcp_config::project_servers_to_acp`), parsing the file
-//! exactly once so the fingerprint that gates trust and the servers that are
-//! forwarded can never diverge.
-//!
-//! The on-disk shape is the ecosystem-standard `.mcp.json` (`mcpServers` map),
-//! the same shape AoE already reads for the global and per-profile layers.
-//! Unlike those, a project-local file is repo-provided and therefore only
-//! forwarded once the repo is trusted: a stdio server launches its `command`
-//! the moment a session spawns, so an untrusted repo's `.mcp.json` is a
-//! zero-click RCE surface gated exactly like lifecycle hooks.
+//! Standard `.mcp.json` parsing, redaction, and trust fingerprinting, free of ACP types.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -21,22 +7,19 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// Project-local MCP config filename, read from the repository root.
 pub const PROJECT_MCP_FILE: &str = ".mcp.json";
 
-/// On-disk shape of `<repo>/.mcp.json`. Unknown top-level keys are ignored.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ProjectMcpFile {
+pub(super) struct StandardMcpFile {
     #[serde(default)]
-    mcp_servers: BTreeMap<String, RawServer>,
+    pub(super) mcp_servers: BTreeMap<String, StandardRawServer>,
 }
 
-/// A single raw server entry. Absent `type` (or `type: "stdio"`) selects the
-/// stdio transport; `type: "http"` / `type: "sse"` select the remote transports.
+/// Absent `type` (or `"stdio"`) selects stdio; `"http"` / `"sse"` select remote transports.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RawServer {
+pub(super) struct StandardRawServer {
     #[serde(default, rename = "type")]
     transport: Option<String>,
     command: Option<String>,
@@ -49,10 +32,8 @@ struct RawServer {
     headers: BTreeMap<String, String>,
 }
 
-/// One project MCP server, transport-resolved. `env` / `headers` are `BTreeMap`
-/// so the fingerprint is order-independent. Values are kept in memory for the
-/// fingerprint (a changed token is an effective config change), but the display
-/// helpers redact them so secrets never reach a screen or log.
+/// Secret env/header values are kept for forwarding and fingerprinting; display
+/// paths must go through the redacting helpers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectMcpServer {
     pub name: String,
@@ -77,7 +58,6 @@ pub enum ProjectMcpTransport {
 }
 
 impl ProjectMcpServer {
-    /// Transport label for display and fingerprinting.
     pub fn kind(&self) -> &'static str {
         match self.transport {
             ProjectMcpTransport::Stdio { .. } => "stdio",
@@ -86,65 +66,32 @@ impl ProjectMcpServer {
         }
     }
 
-    /// One-line redacted summary for the trust dialog and CLI prompt: shows the
-    /// command/args or URL plus env-var / header NAMES, never their values.
+    /// One-line summary showing command/args or URL plus env/header names, never values.
     pub fn redacted_summary(&self) -> String {
-        match &self.transport {
+        let (target, label, keys) = match &self.transport {
             ProjectMcpTransport::Stdio { command, args, env } => {
-                let mut s = format!("{} (stdio): {}", self.name, command);
-                if !args.is_empty() {
-                    s.push(' ');
-                    s.push_str(&args.join(" "));
-                }
-                if !env.is_empty() {
-                    s.push_str(&format!(
-                        "  [env: {}]",
-                        env.keys().cloned().collect::<Vec<_>>().join(", ")
-                    ));
-                }
-                s
+                let target = std::iter::once(command).chain(args).cloned();
+                (target.collect::<Vec<_>>().join(" "), "env", env)
             }
-            ProjectMcpTransport::Http { url, headers } => {
-                redacted_remote(&self.name, "http", url, headers)
-            }
-            ProjectMcpTransport::Sse { url, headers } => {
-                redacted_remote(&self.name, "sse", url, headers)
-            }
+            ProjectMcpTransport::Http { url, headers }
+            | ProjectMcpTransport::Sse { url, headers } => (url.clone(), "headers", headers),
+        };
+        let mut s = format!("{} ({}): {target}", self.name, self.kind());
+        if !keys.is_empty() {
+            let names: Vec<_> = keys.keys().map(String::as_str).collect();
+            s.push_str(&format!("  [{label}: {}]", names.join(", ")));
         }
+        s
     }
 }
 
-fn redacted_remote(
-    name: &str,
-    kind: &str,
-    url: &str,
-    headers: &BTreeMap<String, String>,
-) -> String {
-    let mut s = format!("{} ({}): {}", name, kind, url);
-    if !headers.is_empty() {
-        s.push_str(&format!(
-            "  [headers: {}]",
-            headers.keys().cloned().collect::<Vec<_>>().join(", ")
-        ));
-    }
-    s
-}
-
-/// Read and parse `<repo_path>/.mcp.json` into transport-resolved servers,
-/// sorted by name (the `BTreeMap` key order). A missing file yields an empty
-/// list; a present-but-malformed file is an error the caller surfaces (the
-/// trust dialog shows it; the supervisor warns and skips). Unlike the native
-/// agent configs, a project file is small and fully under review, so a single
-/// bad entry fails the whole parse rather than being silently dropped.
+/// Parses `<repo_path>/.mcp.json`. Unlike native agent configs, one bad entry
+/// fails the whole file, since the file is under trust review.
 pub fn load_project_mcp_servers(repo_path: &Path) -> Result<Vec<ProjectMcpServer>> {
     load_standard_mcp_servers(&repo_path.join(PROJECT_MCP_FILE))
 }
 
-/// Read and parse a standard `.mcp.json`-shaped file at `path` into
-/// transport-resolved servers. A missing file yields an empty list; a
-/// present-but-malformed file is an error the caller surfaces. Shared by the
-/// project-local layer and the AoE-owned global/per-profile `mcp.json` layers
-/// (`session::mcp::mcp_model`), which all use this exact on-disk shape.
+/// A missing file yields no servers; a malformed one is an error.
 pub(crate) fn load_standard_mcp_servers(path: &Path) -> Result<Vec<ProjectMcpServer>> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
@@ -157,62 +104,51 @@ pub(crate) fn load_standard_mcp_servers(path: &Path) -> Result<Vec<ProjectMcpSer
         .with_context(|| format!("parsing MCP config at {}", path.display()))
 }
 
-/// Parse standard `.mcp.json` text into transport-resolved servers. Split from
-/// the file read so the conversion rules are unit-testable without touching
-/// disk. Public so `session::mcp::mcp_model` reuses the exact same standard-shape
-/// parse for the global and per-profile layers.
 pub fn parse_standard_mcp_servers(text: &str) -> Result<Vec<ProjectMcpServer>> {
-    let parsed: ProjectMcpFile = serde_json::from_str(text)?;
+    let parsed: StandardMcpFile = serde_json::from_str(text)?;
     parsed
         .mcp_servers
         .into_iter()
-        .map(|(name, raw)| resolve_server(name, raw))
+        .map(|(name, raw)| convert_standard(name, raw))
         .collect()
 }
 
-fn resolve_server(name: String, raw: RawServer) -> Result<ProjectMcpServer> {
+pub(super) fn convert_standard(name: String, raw: StandardRawServer) -> Result<ProjectMcpServer> {
+    let url = |url: Option<String>| {
+        url.with_context(|| format!("MCP server \"{name}\" is missing \"url\""))
+    };
     let transport = match raw.transport.as_deref() {
-        None | Some("stdio") => {
-            let command = raw
+        None | Some("stdio") => ProjectMcpTransport::Stdio {
+            command: raw
                 .command
-                .with_context(|| format!("MCP server \"{name}\" is missing \"command\""))?;
-            ProjectMcpTransport::Stdio {
-                command,
-                args: raw.args,
-                env: raw.env,
-            }
-        }
-        Some("http") => {
-            let url = raw
-                .url
-                .with_context(|| format!("MCP server \"{name}\" is missing \"url\""))?;
-            ProjectMcpTransport::Http {
-                url,
-                headers: raw.headers,
-            }
-        }
-        Some("sse") => {
-            let url = raw
-                .url
-                .with_context(|| format!("MCP server \"{name}\" is missing \"url\""))?;
-            ProjectMcpTransport::Sse {
-                url,
-                headers: raw.headers,
-            }
-        }
+                .with_context(|| format!("MCP server \"{name}\" is missing \"command\""))?,
+            args: raw.args,
+            env: raw.env,
+        },
+        Some("http") => ProjectMcpTransport::Http {
+            url: url(raw.url)?,
+            headers: raw.headers,
+        },
+        Some("sse") => ProjectMcpTransport::Sse {
+            url: url(raw.url)?,
+            headers: raw.headers,
+        },
         Some(other) => bail!("MCP server \"{name}\" has unknown type \"{other}\""),
     };
     Ok(ProjectMcpServer { name, transport })
 }
 
-/// Deterministic SHA-256 fingerprint over the effective server set. Includes
-/// env and header VALUES: a rotated token changes what the forwarded server
-/// does, so it must re-prompt trust (the issue's "re-prompt when the effective
-/// config changes"). The display helpers redact those same values, so the hash
-/// input is more sensitive than anything shown; never log it. Servers are
-/// already name-sorted and `env` / `headers` are `BTreeMap`, so the encoding is
-/// stable across runs and JSON key orderings.
+/// SHA-256 over the name-sorted set, including secret values so a rotated token
+/// re-prompts trust. Never log it.
 pub fn fingerprint(servers: &[ProjectMcpServer]) -> String {
+    fn pairs(tag: &[u8], map: &BTreeMap<String, String>, hasher: &mut Sha256) {
+        for (k, v) in map {
+            hasher.update(tag);
+            hasher.update(k.as_bytes());
+            hasher.update(b"=");
+            hasher.update(v.as_bytes());
+        }
+    }
     let mut hasher = Sha256::new();
     for server in servers {
         hasher.update(b"name:");
@@ -227,23 +163,13 @@ pub fn fingerprint(servers: &[ProjectMcpServer]) -> String {
                     hasher.update(b"\narg:");
                     hasher.update(arg.as_bytes());
                 }
-                for (k, v) in env {
-                    hasher.update(b"\nenv:");
-                    hasher.update(k.as_bytes());
-                    hasher.update(b"=");
-                    hasher.update(v.as_bytes());
-                }
+                pairs(b"\nenv:", env, &mut hasher);
             }
             ProjectMcpTransport::Http { url, headers }
             | ProjectMcpTransport::Sse { url, headers } => {
                 hasher.update(b"\nurl:");
                 hasher.update(url.as_bytes());
-                for (k, v) in headers {
-                    hasher.update(b"\nheader:");
-                    hasher.update(k.as_bytes());
-                    hasher.update(b"=");
-                    hasher.update(v.as_bytes());
-                }
+                pairs(b"\nheader:", headers, &mut hasher);
             }
         }
         hasher.update(b"\n;;\n");
@@ -259,85 +185,48 @@ pub fn fingerprint(servers: &[ProjectMcpServer]) -> String {
 mod tests {
     use super::*;
 
-    fn names(servers: &[ProjectMcpServer]) -> Vec<&str> {
-        servers.iter().map(|s| s.name.as_str()).collect()
-    }
-
     #[test]
-    fn missing_file_is_empty() {
+    fn load_and_parse() {
         let dir = tempfile::tempdir().unwrap();
         assert!(load_project_mcp_servers(dir.path()).unwrap().is_empty());
-    }
+        std::fs::write(dir.path().join(PROJECT_MCP_FILE), "{ not json").unwrap();
+        assert!(load_project_mcp_servers(dir.path()).is_err());
 
-    #[test]
-    fn parses_and_sorts_by_name() {
-        let text = r#"{ "mcpServers": {
+        let servers = parse_standard_mcp_servers(
+            r#"{ "mcpServers": {
             "zebra": { "command": "z" },
             "alpha": { "command": "a", "args": ["--x"], "env": { "TOKEN": "secret" } },
             "remote": { "type": "http", "url": "https://e/mcp", "headers": { "Authorization": "Bearer x" } }
-        } }"#;
-        let servers = parse_standard_mcp_servers(text).unwrap();
-        assert_eq!(names(&servers), vec!["alpha", "remote", "zebra"]);
+        } }"#,
+        )
+        .unwrap();
+        let names: Vec<_> = servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "remote", "zebra"]);
+
+        for bad in [
+            r#"{ "mcpServers": { "x": { "args": ["--y"] } } }"#,
+            r#"{ "mcpServers": { "x": { "type": "http" } } }"#,
+            r#"{ "mcpServers": { "x": { "type": "pigeon", "url": "u" } } }"#,
+        ] {
+            assert!(parse_standard_mcp_servers(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
-    fn stdio_without_command_is_error() {
-        assert!(
-            parse_standard_mcp_servers(r#"{ "mcpServers": { "x": { "args": ["--y"] } } }"#)
-                .is_err()
+    fn fingerprint_is_order_independent_and_covers_secret_values() {
+        let fp = |env: &str| {
+            fingerprint(
+                &parse_standard_mcp_servers(&format!(
+                    r#"{{ "mcpServers": {{ "fs": {{ "command": "c", "env": {env} }} }} }}"#
+                ))
+                .unwrap(),
+            )
+        };
+        assert_eq!(
+            fp(r#"{ "A": "1", "B": "2" }"#),
+            fp(r#"{ "B": "2", "A": "1" }"#)
         );
-    }
-
-    #[test]
-    fn remote_without_url_is_error() {
-        assert!(
-            parse_standard_mcp_servers(r#"{ "mcpServers": { "x": { "type": "http" } } }"#).is_err()
-        );
-    }
-
-    #[test]
-    fn unknown_type_is_error() {
-        assert!(parse_standard_mcp_servers(
-            r#"{ "mcpServers": { "x": { "type": "pigeon", "url": "u" } } }"#
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn malformed_file_is_error() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(PROJECT_MCP_FILE), "{ not json").unwrap();
-        assert!(load_project_mcp_servers(dir.path()).is_err());
-    }
-
-    #[test]
-    fn fingerprint_is_deterministic_and_order_independent() {
-        let a = parse_standard_mcp_servers(
-            r#"{ "mcpServers": { "fs": { "command": "c", "env": { "A": "1", "B": "2" } } } }"#,
-        )
-        .unwrap();
-        let b = parse_standard_mcp_servers(
-            r#"{ "mcpServers": { "fs": { "command": "c", "env": { "B": "2", "A": "1" } } } }"#,
-        )
-        .unwrap();
-        assert_eq!(fingerprint(&a), fingerprint(&b));
-    }
-
-    #[test]
-    fn fingerprint_changes_when_secret_value_changes() {
-        let a = parse_standard_mcp_servers(
-            r#"{ "mcpServers": { "fs": { "command": "c", "env": { "TOKEN": "old" } } } }"#,
-        )
-        .unwrap();
-        let b = parse_standard_mcp_servers(
-            r#"{ "mcpServers": { "fs": { "command": "c", "env": { "TOKEN": "new" } } } }"#,
-        )
-        .unwrap();
-        assert_ne!(
-            fingerprint(&a),
-            fingerprint(&b),
-            "rotating a secret value must re-prompt trust"
-        );
+        assert_ne!(fp(r#"{ "TOKEN": "old" }"#), fp(r#"{ "TOKEN": "new" }"#));
     }
 
     #[test]
@@ -349,11 +238,13 @@ mod tests {
             } }"#,
         )
         .unwrap();
-        let stdio = servers[0].redacted_summary();
-        assert!(stdio.contains("mcp-fs") && stdio.contains("--root") && stdio.contains("TOKEN"));
-        assert!(!stdio.contains("supersecret"), "env value leaked: {stdio}");
-        let http = servers[1].redacted_summary();
-        assert!(http.contains("https://e/mcp") && http.contains("Authorization"));
-        assert!(!http.contains("hunter2"), "header value leaked: {http}");
+        assert_eq!(
+            servers[0].redacted_summary(),
+            "fs (stdio): mcp-fs --root .  [env: TOKEN]"
+        );
+        assert_eq!(
+            servers[1].redacted_summary(),
+            "remote (http): https://e/mcp  [headers: Authorization]"
+        );
     }
 }

@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-//
-// Vitest coverage for the sidebar Projects section (#2212): row rendering,
-// read-only gating, the add affordance, the empty state, and the row context
-// menu (edit / remove). Drives the keyboard + create paths CodeRabbit flagged
-// as uncovered.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
@@ -98,9 +93,8 @@ describe("ProjectsSection", () => {
     renderSection();
     fireEvent.contextMenu(screen.getByTestId("sidebar-project-row"));
     const menu = screen.getByTestId("sidebar-project-context-menu");
-    // `100vh` overshoots iOS Safari's visible viewport (dynamic toolbar),
-    // so the menu would never exceed its own max-height and overflow-y-auto
-    // would never engage. `dvh` matches the visible viewport.
+    // `100vh` overshoots iOS Safari's visible viewport (dynamic toolbar), so the menu would never exceed its own
+    // max-height and overflow-y-auto would never engage.
     expect(menu.style.maxHeight).toContain("dvh");
     expect(menu.className).toContain("overflow-y-auto");
   });

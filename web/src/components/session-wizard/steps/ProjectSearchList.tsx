@@ -24,9 +24,7 @@ interface Props {
   emptyMessage?: string;
 }
 
-/** Search box + saved/recent rows shared by the main Project step and the
- *  extra-repos picker (#3743), so both offer the same searchable list
- *  instead of two divergent UIs over the same underlying project data. */
+/** Search box plus saved and recent rows, shared by ProjectStep and ExtraReposPicker. */
 export function ProjectSearchList({
   query,
   onQueryChange,

@@ -2,13 +2,7 @@ import type { ReactNode } from "react";
 
 import { collapsibleInnerClass, collapsibleRegionClass } from "../lib/collapsibleChrome";
 
-/** Chrome region (top bar, composer) that collapses to zero layout height.
- *
- *  `id` lands on the *outer* row, and doubles as the test id, because that one
- *  element is both the `aria-controls` target of the region's handle and the
- *  element whose measured height is the feature's contract (0 when collapsed).
- *  The collapsed child keeps a non-zero box of its own, clipped by the row, so
- *  pointing either at the child would be wrong. */
+/** Chrome region (top bar, composer) that collapses to zero layout height. */
 export function CollapsibleRegion({
   id,
   collapsed,
@@ -43,18 +37,7 @@ interface HandleProps {
   testId: string;
 }
 
-/** Persistent collapse handle for a {@link CollapsibleRegion}.
- *
- *  Rendered as a sibling of the region, never inside it: a handle nested in
- *  the collapsing element would disappear with it and strand the user in the
- *  collapsed state. The host is zero-height and the button is absolutely
- *  positioned, so the handle costs the layout nothing in either state; it
- *  overlays a 28x16 corner of the transcript edge instead.
- *
- *  Hit area and visible area are the same box deliberately. An invisible hit
- *  area larger than the tab reads as an empty patch of transcript that eats
- *  taps meant for whatever is underneath (a banner's dismiss button, a link in
- *  a message), which is worse here than a small target the user can see. */
+/** Persistent collapse handle for a {@link CollapsibleRegion}. */
 export function ChromeCollapseHandle({
   edge,
   collapsed,

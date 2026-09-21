@@ -99,7 +99,6 @@ async fn show_info(profile: &str, identifier: &str) -> Result<()> {
             wt_info.created_at.format("%Y-%m-%d %H:%M:%S")
         );
 
-        // Check if worktree still exists
         let worktree_path = PathBuf::from(&session.project_path);
         if worktree_path.exists() {
             println!("\n  Status:        ✓ Worktree exists");
@@ -153,15 +152,6 @@ async fn show_info(profile: &str, identifier: &str) -> Result<()> {
     Ok(())
 }
 
-/// Split a repo's worktrees into the ones `cleanup` may remove and the ones it
-/// must leave alone, dropping the main worktree and anything a session still
-/// points at.
-///
-/// Having no session normally makes a worktree garbage, but not when it holds a
-/// branch git states is the repo's default: in a bare-repo layout that checkout
-/// is the default branch's only working tree, and cleanup removes with force, so
-/// reaping it would destroy infrastructure the moment its session went away
-/// (#3215).
 fn partition_orphaned_worktrees(
     worktrees: Vec<WorktreeEntry>,
     main_repo: &Path,
@@ -187,7 +177,6 @@ async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
     let mut orphaned_sessions = Vec::new();
     let mut orphaned_worktrees = Vec::new();
 
-    // Find sessions with missing worktrees
     for inst in &instances {
         if let Some(_wt_info) = &inst.worktree_info {
             let worktree_path = PathBuf::from(&inst.project_path);
@@ -195,7 +184,6 @@ async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
                 orphaned_sessions.push(inst.clone());
             }
         } else if let Some(ws_info) = &inst.workspace_info {
-            // Check if workspace dir exists
             let ws_path = PathBuf::from(&ws_info.workspace_dir);
             if !ws_path.exists() {
                 orphaned_sessions.push(inst.clone());
@@ -203,7 +191,6 @@ async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
         }
     }
 
-    // Find worktrees not associated with any session
     let mut protected_worktrees = Vec::new();
     let current_dir = std::env::current_dir()?;
     if GitWorktree::is_git_repo(&current_dir) {
@@ -239,7 +226,6 @@ async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Report findings
     if !orphaned_sessions.is_empty() {
         println!("Orphaned Sessions (worktree deleted but session remains):\n");
         for inst in &orphaned_sessions {
@@ -269,7 +255,6 @@ async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Actual cleanup with force flag
     use std::io::{self, Write};
 
     print!("\nProceed with cleanup? This will:\n");
@@ -292,7 +277,6 @@ async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
 
     let mut removed_count = 0;
 
-    // Remove orphaned sessions
     if !orphaned_sessions.is_empty() {
         let orphan_ids: HashSet<String> = orphaned_sessions.iter().map(|o| o.id.clone()).collect();
         storage.update(|all_instances, _groups| {
@@ -304,7 +288,6 @@ async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
         println!("✓ Removed {} orphaned sessions", orphaned_sessions.len());
     }
 
-    // Remove orphaned worktrees
     if !orphaned_worktrees.is_empty() {
         let current_dir = std::env::current_dir()?;
         let main_repo = GitWorktree::find_main_repo(&current_dir)?;
@@ -340,8 +323,6 @@ mod tests {
         }
     }
 
-    /// #3215: cleanup removes with force, so a default branch's checkout must
-    /// never reach its removal list, however orphaned it looks.
     #[test]
     fn partition_orphaned_worktrees_keeps_the_default_branch_out_of_the_removal_list() {
         let worktrees = vec![

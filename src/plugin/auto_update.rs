@@ -1,16 +1,4 @@
 //! Opt-in clean-only plugin auto-update sweep at startup.
-//!
-//! Gated on `updates.auto_update_plugins` (off by default). When on, the TUI and
-//! `aoe serve` spawn [`spawn_if_enabled`] at startup; it checks installed
-//! external plugins for updates and applies only the ones that need no new
-//! consent. Anything that changes capabilities, build steps, or UI slots is
-//! skipped and left for a manual `aoe plugin update`, so a background sweep never
-//! grants new capabilities or runs a changed build step unattended, and never
-//! deactivates a working plugin.
-//!
-//! ponytail: no cross-process lock around the sweep; it runs once at startup and
-//! the pre-existing install/update path is itself unguarded. Add an on-disk
-//! plugin-op lock if concurrent CLI/daemon mutation becomes a real problem.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -20,13 +8,8 @@ use crate::session::Config;
 
 use super::{install, update_check};
 
-/// The running plugin host as the sweep sees it. Kept abstract so the sweep
-/// never reaches into the plugin host; the `aoe serve` daemon implements it on
-/// `PluginHost`.
 pub trait UpdateNotifier: Send + Sync {
-    /// Surface a consent-needed skip in-product.
     fn needs_approval(&self, plugin_id: &str, reason: &str);
-    /// Move a running worker onto an update that just landed.
     fn update_applied(
         self: Arc<Self>,
         plugin_id: String,
@@ -53,7 +36,6 @@ impl UpdateNotifier for super::host::PluginHost {
     }
 }
 
-/// What a sweep did, for logging and tests.
 #[derive(Debug, Default)]
 pub struct SweepSummary {
     pub applied: Vec<String>,
@@ -61,16 +43,6 @@ pub struct SweepSummary {
     pub errors: Vec<(String, String)>,
 }
 
-/// Check outdated external plugins and apply only the clean updates. Logs each
-/// outcome. Safe to call regardless of the setting; callers gate on it via
-/// [`spawn_if_enabled`].
-///
-/// When a `notifier` is present (the `aoe serve` daemon), an applied update
-/// restarts its worker there, and an update skipped because it needs fresh
-/// consent also surfaces a notification so the dashboard shows it in-product
-/// instead of only logging a CLI instruction, unless the user already dismissed
-/// that exact version. Without one, a running daemon is asked to reload each
-/// applied update.
 pub async fn sweep(notifier: Option<&Arc<dyn UpdateNotifier>>) -> SweepSummary {
     let mut summary = SweepSummary::default();
     for status in update_check::outdated().await {
@@ -145,8 +117,6 @@ pub async fn sweep(notifier: Option<&Arc<dyn UpdateNotifier>>) -> SweepSummary {
     summary
 }
 
-/// Whether the user already dismissed in-app the exact version a sweep skipped,
-/// so the sweep does not re-notify on every daemon restart.
 fn already_dismissed(id: &str, fingerprint: &str) -> bool {
     Config::load()
         .ok()
@@ -155,10 +125,6 @@ fn already_dismissed(id: &str, fingerprint: &str) -> bool {
         == Some(fingerprint)
 }
 
-/// Spawn the sweep in the background when the setting opts in. Non-blocking so
-/// startup is never delayed by network or git; the registry is reloaded inside
-/// `install::update_clean` as each update lands. `notifier` is the running
-/// plugin host (`aoe serve`); `None` where there is none.
 pub fn spawn_if_enabled(config: &Config, notifier: Option<Arc<dyn UpdateNotifier>>) {
     if !config.updates.auto_update_plugins {
         return;

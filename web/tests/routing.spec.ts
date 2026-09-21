@@ -1,4 +1,21 @@
 import { test, expect } from "./helpers/mockedTest";
+import { sessionResponse } from "./helpers/sessions";
+
+function makeSession(id: string, projectPath = `/tmp/${id}`) {
+  return sessionResponse({
+    id,
+    project_path: projectPath,
+    group_path: "/tmp",
+    status: "Running",
+    has_managed_worktree: false,
+    cleanup_defaults: {},
+    remote_owner: null,
+    notify_on_waiting: null,
+    notify_on_idle: null,
+    notify_on_error: null,
+    claude_fullscreen: false,
+  });
+}
 
 const NEW_SESSION_PANE_NAME = /New session Pick a project, then launch a new session/i;
 
@@ -72,34 +89,7 @@ test.describe("URL routing", () => {
       if (r.request().method() === "POST") return r.fulfill({ status: 400 });
       return r.fulfill({
         json: {
-          sessions: [
-            {
-              id: "known-session",
-              title: "known-session",
-              project_path: "/tmp/known",
-              group_path: "/tmp",
-              tool: "claude",
-              status: "Running",
-              yolo_mode: false,
-              created_at: new Date().toISOString(),
-              last_accessed_at: null,
-              idle_entered_at: null,
-              last_error: null,
-              branch: null,
-              main_repo_path: null,
-              is_sandboxed: false,
-              has_managed_worktree: false,
-              has_terminal: true,
-              profile: "default",
-              cleanup_defaults: {},
-              remote_owner: null,
-              notify_on_waiting: null,
-              notify_on_idle: null,
-              notify_on_error: null,
-              claude_fullscreen: false,
-              workspace_repos: [],
-            },
-          ],
+          sessions: [makeSession("known-session", "/tmp/known")],
           workspace_ordering: [],
         },
       });
@@ -139,39 +129,10 @@ test.describe("URL routing", () => {
 
 const LAST_SESSION_KEY = "aoe-last-session-id";
 
-function makeSession(id: string) {
-  return {
-    id,
-    title: id,
-    project_path: `/tmp/${id}`,
-    group_path: "/tmp",
-    tool: "claude",
-    status: "Running",
-    yolo_mode: false,
-    created_at: new Date().toISOString(),
-    last_accessed_at: null,
-    idle_entered_at: null,
-    last_error: null,
-    branch: null,
-    main_repo_path: null,
-    is_sandboxed: false,
-    has_managed_worktree: false,
-    has_terminal: true,
-    profile: "default",
-    cleanup_defaults: {},
-    remote_owner: null,
-    notify_on_waiting: null,
-    notify_on_idle: null,
-    notify_on_error: null,
-    claude_fullscreen: false,
-    workspace_repos: [],
-  };
-}
-
 async function stubSessions(page: import("@playwright/test").Page, ids: string[]) {
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() === "POST") return r.fulfill({ status: 400 });
-    return r.fulfill({ json: { sessions: ids.map(makeSession), workspace_ordering: [] } });
+    return r.fulfill({ json: { sessions: ids.map((id) => makeSession(id)), workspace_ordering: [] } });
   });
   await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
   await page.route("**/api/sessions/*/terminal", (r) => r.fulfill({ status: 200, body: "" }));

@@ -1,15 +1,4 @@
 //! Public-HTTPS tunnel integration for secure remote access.
-//!
-//! Supports three transports, auto-picked by `server::start_server` in
-//! this preference order:
-//! 1. Tailscale Funnel: preferred when `tailscale` is installed and logged in.
-//!    Gives a stable `https://<machine>.<tailnet>.ts.net` URL, so installed
-//!    PWAs survive server restarts. No child process to manage; the Tailscale
-//!    daemon owns the ingress.
-//! 2. Named Cloudflare tunnel: user-provided `--tunnel-name` + `--tunnel-url`.
-//!    Stable hostname on the user's own domain.
-//! 3. Cloudflare quick tunnel: fallback. Zero-config, but the URL rotates on
-//!    every restart, which breaks installed PWAs. Documented limitation.
 
 use std::sync::Arc;
 
@@ -19,10 +8,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-/// Manages a public-HTTPS tunnel. For Cloudflare variants, wraps a
-/// `cloudflared` subprocess and supervises it. For Tailscale Funnel,
-/// there's no child process: the Tailscale daemon owns the ingress,
-/// and this handle is essentially a URL carrier.
+/// Manages a public-HTTPS tunnel.
 pub struct TunnelHandle {
     /// None for Tailscale (no child process to supervise).
     child: Option<Arc<Mutex<Child>>>,
@@ -171,24 +157,12 @@ impl TunnelHandle {
         })
     }
 
-    /// Configure Tailscale Funnel for the local port and return a
-    /// handle carrying the stable `https://<host>.<tailnet>.ts.net` URL.
-    /// Uses the single-command Funnel syntax introduced in Tailscale
-    /// 1.52: one call to `tailscale funnel --bg --yes <port>` replaces
-    /// the legacy `tailscale serve` + `tailscale funnel` dance and
-    /// surfaces clearer errors when Funnel isn't pre-approved in the
-    /// tailnet ACL. No subprocess supervision is needed; the Tailscale
-    /// daemon owns the ingress and the command returns once the config
-    /// is applied.
+    /// Configure Tailscale Funnel for the local port and return a handle carrying the
+    /// stable `https://<host>.<tailnet>.ts.net` URL.
     pub async fn spawn_tailscale(local_port: u16) -> anyhow::Result<Self> {
-        // Hard cap on each tailscale command so we never wedge if
-        // tailscale pops an interactive prompt (HTTPS-certs consent,
-        // Funnel-not-enabled-in-ACL, node not signed in). 60s because
-        // first-time HTTPS cert provisioning on a fresh node can
-        // legitimately take 30-45s. When the timeout fires, the error
-        // bubbles up to start_server which surfaces it to the user
-        // with fix instructions; we do NOT silently fall back to
-        // Cloudflare because that would hide the real problem.
+        // Hard cap on each tailscale command so we never wedge if tailscale pops an
+        // interactive prompt (HTTPS-certs consent, Funnel-not-enabled-in-ACL, node not
+        // signed in).
         const STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
         debug!(
             local_port = local_port,
@@ -196,13 +170,7 @@ impl TunnelHandle {
             "tailscale: spawn_tailscale starting"
         );
 
-        // Pre-flight 1: confirm this node is allowed to use Funnel at
-        // all. Tailscale surfaces Funnel eligibility as the node cap
-        // `https://tailscale.com/cap/funnel-ports` in `status --json`;
-        // if it's missing, the ACL hasn't granted `funnel` to this
-        // node and the `tailscale funnel` command will fail with a
-        // generic error. Checking here lets us point the user at the
-        // admin console with a concrete fix instead.
+        // Pre-flight 1.
         if let Err(e) = check_funnel_capability().await {
             debug!(reason = %e, "spawn_tailscale: funnel cap check failed");
             anyhow::bail!(
@@ -212,12 +180,7 @@ impl TunnelHandle {
             );
         }
 
-        // Pre-flight 2: if Funnel is already configured on our chosen
-        // HTTPS port (443) for a DIFFERENT backend, bail rather than
-        // silently taking it over. Belt-and-suspenders; the modern
-        // `tailscale funnel <port>` single-command syntax is mostly
-        // additive, but a user with a Funnel on 443 pointing at their
-        // own service would have it replaced otherwise.
+        // Pre-flight 2.
         if let Some(existing) = inspect_existing_funnel(local_port).await {
             anyhow::bail!(
                 "port 443 is already configured on this node for a different \
@@ -227,16 +190,7 @@ impl TunnelHandle {
             );
         }
 
-        // Single-command Funnel (Tailscale 1.52+). Replaces the old
-        // `tailscale serve --https=443` + `tailscale funnel 443` two-step
-        // dance. `--bg` persists across aoe restarts; `--yes` skips
-        // interactive prompts so we fail fast instead of hanging if
-        // Funnel isn't pre-approved in the tailnet ACL.
-        //
-        // We stream stderr line-by-line into the debug log instead of
-        // buffering with `.output()`, so the user can watch progress
-        // (cert provisioning, etc.) in debug.log instead of staring at
-        // a black box for up to a minute.
+        // Single-command Funnel (Tailscale 1.52+).
         let funnel_arg = local_port.to_string();
         let funnel_args = ["funnel", "--bg", "--yes", &funnel_arg];
         info!(
@@ -255,30 +209,7 @@ impl TunnelHandle {
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
 
-        // Spawn drain tasks for both streams. Tailscale emits progress
-        // on stderr (most useful for diagnosing hangs); logged at info!
-        // so the TUI Starting screen surfaces it when tailing the
-        // configured log file, without needing AGENT_OF_EMPIRES_DEBUG=1.
-        // Stdout stays at debug! because Tailscale rarely prints there
-        // and the lines that do appear are noisier.
-        //
-        // Do NOT override the `target` on these log macros: the
-        // EnvFilter uses `agent_of_empires=debug`, which matches the
-        // default module path (agent_of_empires::server::tunnel). A
-        // custom target like "tailscale_funnel" would not match that
-        // prefix and every line would be silently dropped, which is
-        // exactly how this used to fail.
-        //
-        // Also: scan each stderr line for the tailnet-level Funnel
-        // activation URL. When Funnel isn't enabled for the tailnet
-        // (distinct from the per-node ACL grant we already pre-flight),
-        // `tailscale funnel` prints something like:
-        //     Funnel is not enabled on your tailnet.
-        //     To enable, visit:
-        //              https://login.tailscale.com/f/funnel?node=XXXX
-        // and then hangs waiting for the user to click the link. We
-        // detect that URL, send it over a oneshot, kill the child, and
-        // bail with a crisp error instead of waiting for the 60s timeout.
+        // Spawn drain tasks for both streams.
         let (activation_tx, mut activation_rx) = tokio::sync::oneshot::channel::<String>();
         let activation_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(activation_tx)));
         if let Some(stderr) = stderr {
@@ -307,11 +238,7 @@ impl TunnelHandle {
         let status = tokio::select! {
             biased;
             maybe_url = &mut activation_rx => {
-                // Tailscale told us exactly how to fix this. Kill the
-                // (hung) child and surface the URL verbatim. If the
-                // oneshot closed without a URL (buffering quirk, etc.),
-                // fall back to generic guidance rather than guessing at
-                // a URL that may not match this tailnet.
+                // Tailscale told us exactly how to fix this.
                 let _ = child.kill().await;
                 let detail = match maybe_url {
                     Ok(url) => format!(
@@ -382,9 +309,6 @@ impl TunnelHandle {
     }
 
     /// Gracefully shut down the tunnel process.
-    /// Cancels the health monitor first, then sends SIGTERM to cloudflared.
-    /// For Tailscale funnels, leaves the funnel configuration in place on
-    /// purpose: restarting aoe shouldn't tear down the PWA's origin.
     #[tracing::instrument(target = "serve.tunnel", skip_all)]
     pub async fn shutdown(self) {
         self.cancel.cancel();
@@ -413,9 +337,6 @@ impl TunnelHandle {
     }
 
     /// Spawn a background task that monitors tunnel health and attempts one restart.
-    /// The task stops when the cancellation token is cancelled (during shutdown).
-    /// No-op for Tailscale funnels (no child process to supervise; the
-    /// Tailscale daemon handles its own health).
     pub fn spawn_health_monitor(&self) {
         let Some(child_arc) = self.child.as_ref() else {
             return; // Tailscale: no child to monitor
@@ -433,11 +354,7 @@ impl TunnelHandle {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
                 }
 
-                // Read try_wait under the lock, then drop the guard
-                // before any await. Holding the child mutex across
-                // restart_tunnel().await would block aoe serve --stop
-                // (which also wants the lock to terminate the child)
-                // for the multi-second cloudflared spawn time.
+                // Read try_wait under the lock, then drop the guard before any await.
                 let exit_status = {
                     let mut child_guard = child.lock().await;
                     match child_guard.try_wait() {
@@ -476,11 +393,8 @@ impl TunnelHandle {
 
                 match restart_result {
                     Ok(new_child) => {
-                        // Re-acquire the lock just long enough to install
-                        // the replacement child. The previous iteration's
-                        // try_wait branch is the only other holder; it
-                        // bails on Ok(None) within the lock, so contention
-                        // is bounded.
+                        // Re-acquire the lock just long enough to install the replacement
+                        // child.
                         *child.lock().await = new_child;
                         has_restarted = true;
                         info!("Cloudflare tunnel restarted successfully");
@@ -528,21 +442,16 @@ async fn restart_tunnel(kind: &TunnelKind, port: u16) -> anyhow::Result<Child> {
             Ok(child)
         }
         TunnelKind::Tailscale => {
-            // Unreachable in practice: the health monitor doesn't run
-            // for Tailscale (see spawn_health_monitor early-return), so
-            // restart_tunnel is never called with this variant. If a
-            // future refactor changes that invariant, fail loudly.
+            // Unreachable in practice.
             anyhow::bail!("restart_tunnel called for Tailscale; no child process exists")
         }
     }
 }
 
-/// True if `tailscale` is on PATH, the daemon is logged in, and Funnel
-/// is enabled for the tailnet. Conservative: any failure returns false
-/// so callers fall back cleanly to Cloudflare.
+/// True if `tailscale` is on PATH, the daemon is logged in, and Funnel is enabled for the
+/// tailnet.
 pub async fn tailscale_available() -> bool {
-    // Cheapest possible check first: does the CLI exist and return
-    // a successful status?
+    // Cheapest possible check first.
     let version = Command::new("tailscale").arg("--version").output().await;
     match &version {
         Ok(o) => debug!(
@@ -560,8 +469,7 @@ pub async fn tailscale_available() -> bool {
     if !out.status.success() {
         return false;
     }
-    // Then confirm the daemon is running and signed in. `status` exits
-    // non-zero if not logged in.
+    // Then confirm the daemon is running and signed in.
     let status = Command::new("tailscale").arg("status").output().await;
     match &status {
         Ok(o) => debug!(
@@ -578,17 +486,7 @@ pub async fn tailscale_available() -> bool {
     out.status.success()
 }
 
-/// Probe `tailscale funnel status --json` to see if port 443 is already
-/// configured. Returns `Some(<description>)` when a different backend
-/// already holds the port; `None` when the port is free OR already
-/// points at our local port (same-target re-runs are idempotent and
-/// safe). Used as a pre-flight before we run `tailscale funnel` so we
-/// don't stomp on a user's existing setup.
-///
-/// Best-effort: any probe failure returns `None` so the spawn attempt
-/// proceeds. If Tailscale's JSON schema changes or the CLI errors out
-/// for an unrelated reason, we don't want a parse miss to block a user
-/// whose Funnel would otherwise work fine.
+/// Probe `tailscale funnel status --json` to see if port 443 is already configured.
 async fn inspect_existing_funnel(local_port: u16) -> Option<String> {
     let out = Command::new("tailscale")
         .args(["funnel", "status", "--json"])
@@ -612,25 +510,8 @@ async fn inspect_existing_funnel(local_port: u16) -> Option<String> {
         }
     };
 
-    // Walk the Web map looking for a port-443 handler whose target
-    // isn't something we can safely replace. Shape (from Tailscale's
-    // ServeConfig):
-    //   { "Web": { "${host}:443": { "Handlers": {
-    //       "/": { "Proxy": "http://127.0.0.1:4999" },  // or:
-    //       "/": { "Path":  "/var/www" },               // file server, or:
-    //       "/": { "Text":  "hello" }                   // static text
-    //   } } } }
-    //
-    // Rules:
-    // - Proxy to OUR local_port: idempotent, no-op.
-    // - Proxy to 127.0.0.1:<other-port> or localhost:*: stale aoe config
-    //   from a previous run (e.g. port changed across restarts).
-    //   `tailscale funnel --bg --yes <new>` will cleanly replace it; no
-    //   need to bail.
-    // - Proxy to anything else (tailnet IP, non-loopback): user has a
-    //   different service on 443 and we'd clobber it. Bail.
-    // - Non-Proxy (file server / static text): always a conflict; these
-    //   are explicitly user-configured.
+    // Walk the Web map looking for a port-443 handler whose target isn't something we can
+    // safely replace.
     let web = parsed.get("Web")?.as_object()?;
     let expected_proxy_substring = format!("127.0.0.1:{}", local_port);
     for (vhost, cfg) in web.iter() {
@@ -696,20 +577,9 @@ async fn inspect_existing_funnel(local_port: u16) -> Option<String> {
 }
 
 /// Verify this node has the Funnel node-capability set in its ACL.
-///
-/// Tailscale surfaces Funnel eligibility as the cap key
-/// `https://tailscale.com/cap/funnel-ports` on `Self.CapMap` in
-/// `tailscale status --json`. Value is the list of allowed ports
-/// (default 443, 8443, 10000). We only care that the key exists;
-/// port 443 is always in the default grant when the cap is present.
-///
-/// Returns Err with a short reason on any missing/malformed field so
-/// the caller can surface an actionable message pointing at the ACL
-/// editor.
 async fn check_funnel_capability() -> anyhow::Result<()> {
-    // Tailscale emits the cap key with the allowed-port list appended as
-    // a query string, e.g. `?ports=443,8443,10000`. Match by prefix so
-    // future port-list changes don't break the check.
+    // Tailscale emits the cap key with the allowed-port list appended as a query string,
+    // e.g. `?ports=443,8443,10000`.
     const FUNNEL_CAP_PREFIX: &str = "https://tailscale.com/cap/funnel-ports";
     let out = Command::new("tailscale")
         .args(["status", "--json"])
@@ -786,18 +656,15 @@ async fn tailscale_funnel_url() -> anyhow::Result<String> {
     Ok(format!("https://{}", host))
 }
 
-/// Does this ServeConfig proxy URL point at the local machine
-/// (127.0.0.1, localhost, or ::1)? Used to distinguish stale aoe
-/// configs (which we replace without complaint) from a user's legit
-/// tailnet-facing service (which we refuse to clobber).
+/// Does this ServeConfig proxy URL point at the local machine (127.0.0.1, localhost, or
+/// ::1)?
 fn proxy_is_loopback(proxy: &str) -> bool {
     let lower = proxy.to_ascii_lowercase();
     let after_scheme = lower
         .split_once("://")
         .map(|(_, rest)| rest)
         .unwrap_or(&lower);
-    // IPv6 is bracketed: `[::1]:8080`. Everything else separates host
-    // and port with the first ':' / '/' after the scheme.
+    // IPv6 is bracketed.
     if let Some(rest) = after_scheme.strip_prefix('[') {
         return rest.starts_with("::1]");
     }
@@ -808,11 +675,8 @@ fn proxy_is_loopback(proxy: &str) -> bool {
     matches!(host, "127.0.0.1" | "localhost")
 }
 
-/// Parse a `https://login.tailscale.com/f/funnel?...` activation URL
-/// out of a `tailscale funnel` stderr line. Tailscale prints this when
-/// Funnel isn't enabled for the tailnet — the URL is node-specific
-/// (carries the current node id as a query param) so it jumps the user
-/// straight to the right approval flow.
+/// Parse a `https://login.tailscale.com/f/funnel?...` activation URL out of a `tailscale
+/// funnel` stderr line.
 fn extract_funnel_activation_url(line: &str) -> Option<String> {
     const PREFIX: &str = "https://login.tailscale.com/f/funnel";
     let idx = line.find(PREFIX)?;
@@ -826,7 +690,6 @@ fn extract_tunnel_url(line: &str) -> Option<String> {
     for word in line.split_whitespace() {
         if word.starts_with("https://") && word.contains(".trycloudflare.com") {
             // Trim trailing punctuation that may appear in log output.
-            // The URL always ends with ".com" so strip anything after that.
             if let Some(pos) = word.find(".trycloudflare.com") {
                 let end = pos + ".trycloudflare.com".len();
                 return Some(word[..end].to_string());
@@ -836,8 +699,7 @@ fn extract_tunnel_url(line: &str) -> Option<String> {
     None
 }
 
-/// Render a QR code to stderr for easy phone scanning. Without the dashboard
-/// bundle there is nothing for a phone to open, so only the URL is printed.
+/// Render a QR code to stderr for easy phone scanning.
 #[cfg(not(feature = "web"))]
 pub fn print_qr_code(url: &str) {
     eprintln!();
@@ -895,15 +757,11 @@ pub fn check_cloudflared() -> anyhow::Result<()> {
     }
 }
 
-/// Sync counterpart of `tailscale_available()` for use from the TUI
-/// (which avoids spinning up a tokio runtime just to probe for a CLI).
-/// Conservative: any error means "not available" and we fall through
-/// to Cloudflare.
+/// Sync counterpart of `tailscale_available()` for use from the TUI (which avoids spinning
+/// up a tokio runtime just to probe for a CLI).
 pub fn tailscale_available_sync() -> bool {
-    // Unlike the async path, this runs on the TUI render hot path, so
-    // we keep it cheap and quiet on the happy path. On failure, we log
-    // at debug! so `AGENT_OF_EMPIRES_DEBUG=1` surfaces exactly which
-    // step bounced.
+    // Unlike the async path, this runs on the TUI render hot path, so we keep it cheap and
+    // quiet on the happy path.
     let version = std::process::Command::new("tailscale")
         .arg("--version")
         .stdout(std::process::Stdio::null())
@@ -934,21 +792,10 @@ pub fn tailscale_available_sync() -> bool {
     status_ok
 }
 
-/// Sync counterpart of `check_funnel_capability()`. Returns true when
-/// this node's ACL grants the `funnel` nodeAttr (i.e. Funnel is usable).
-/// Used by the TUI transport picker to show "Ready" vs "needs ACL grant"
-/// on the Tailscale Funnel card without requiring the user to commit and
-/// then see a spawn-time failure.
-///
-/// Conservative: any failure (daemon down, JSON parse error) returns
-/// false. Dumps the CapMap keys and Self.Tags at debug! so a user hitting
-/// a false negative can grep debug.log and see why the detection missed:
-/// most often the node is tagged and the ACL rule targets autogroup:member
-/// (which excludes tagged devices).
+/// Sync counterpart of `check_funnel_capability()`.
 pub fn tailscale_funnel_cap_ready_sync() -> bool {
-    // Tailscale emits the cap key with the allowed-port list appended as
-    // a query string, e.g. `?ports=443,8443,10000`. Match by prefix so
-    // future port-list changes don't break the check.
+    // Tailscale emits the cap key with the allowed-port list appended as a query string,
+    // e.g. `?ports=443,8443,10000`.
     const FUNNEL_CAP_PREFIX: &str = "https://tailscale.com/cap/funnel-ports";
     let out = std::process::Command::new("tailscale")
         .args(["status", "--json"])
@@ -1044,8 +891,7 @@ mod tests {
 
     #[test]
     fn extract_funnel_activation_url_matches_indented_line() {
-        // Real tailscale funnel output: URL arrives on its own line
-        // after "To enable, visit:", indented with whitespace.
+        // Real tailscale funnel output.
         let line = "         https://login.tailscale.com/f/funnel?node=n6ADBuFYMT11CNTRL";
         assert_eq!(
             extract_funnel_activation_url(line),
@@ -1089,7 +935,6 @@ mod tests {
     #[test]
     fn check_cloudflared_returns_err_when_missing() {
         // This test verifies the function doesn't panic with a missing binary.
-        // It may pass or fail depending on whether cloudflared is installed.
         let result = check_cloudflared();
         // We just verify it returns a Result without panicking
         let _ = result;

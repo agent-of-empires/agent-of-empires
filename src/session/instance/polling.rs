@@ -7,13 +7,6 @@ use sha2::{Digest as _, Sha256};
 const MANAGED_CAPTURE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Outcome of [`Instance::maybe_start_poller`].
-///
-/// Only the last two variants are failures a caller should retry with
-/// backoff or warn about. A session can legitimately have nothing to poll
-/// right now — its capture metadata is not resolvable yet, its sandbox
-/// store is not mounted, another process holds the store lease — and
-/// treating those as failed spawns misreports a healthy fleet as over
-/// budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PollerStart {
     /// A poller thread is running for this session (started now, or already).
@@ -29,15 +22,8 @@ pub enum PollerStart {
     SpawnFailed,
 }
 
-/// An exclusive claim on one physical capture store, held for as long as the
-/// poller that owns it runs.
-///
-/// `Drop` unlocks explicitly rather than letting the descriptor close do it. A
-/// `flock` belongs to the open file description, not to one descriptor, so a
-/// process forked while the lease was open holds the lock alive through its
-/// inherited copy until `exec` clears it. Releasing by close alone leaves the
-/// store reading as owned by someone else for that window; `unlock` releases
-/// the description itself, and every inherited copy with it.
+/// An exclusive claim on one physical capture store, held for as long as the poller that owns it
+/// runs.
 #[derive(Debug)]
 struct ManagedCaptureLease(std::fs::File);
 
@@ -103,8 +89,13 @@ fn try_acquire_managed_capture_lease(
 }
 
 /// Use a unique live agent; paired-only or ambiguous live panes forbid fallback.
-/// An empty or unavailable scan may use the derived name during MISSING_TARGET_GRACE.
-/// Its name-shape check remains necessary because no live kind marker is available.
+fn log_observed_session_id(instance_id: &str) -> Box<dyn Fn(&str) + Send + 'static> {
+    let instance_id = instance_id.to_string();
+    Box::new(move |new_id| {
+        tracing::info!(target: "session.store", "Session ID observed for {}: {}", instance_id, new_id);
+    })
+}
+
 fn poller_seed_name(
     live: AgentSeed,
     derived: impl FnOnce() -> Option<String>,
@@ -120,13 +111,8 @@ fn poller_seed_name(
 }
 
 impl Instance {
-    /// Whether this session should run a session-id poller: the agent has a
-    /// resume strategy to capture for, and its conversation is not already
-    /// known.
-    ///
-    /// Pi polls its sidecar or nothing: the pane publishes its own
-    /// conversation, and a store keyed by cwd cannot say which pane owns what.
-    /// Reads memory only: this runs per session on every TUI refresh.
+    /// Whether this session should run a session-id poller: the agent has a resume strategy to
+    /// capture for, and its conversation is not already known.
     pub(crate) fn launch_has_session_publisher(&self) -> bool {
         let Some((capture, context)) = self.resolved_session_support() else {
             return false;
@@ -210,11 +196,6 @@ impl Instance {
     }
 
     /// Store a freshly spawned poller, or say why there is none.
-    ///
-    /// The one place a start succeeds, so it is also the one place the
-    /// repair schedule is cleared: a poller started directly (session
-    /// create, restart, resume) must not leave a stale backoff behind for
-    /// the next repair to wait out.
     fn install_poller(
         &mut self,
         poller: SessionPoller,
@@ -340,12 +321,8 @@ impl Instance {
         };
         self.session_id_poller_retry_after = None;
 
-        // Unlike the eligibility checks above, this forks `tmux list-sessions`,
-        // so it stays behind the budget gate rather than joining them: an
-        // over-budget process would otherwise pay a fork per deferred repair.
-        // A session that is both over budget and without an agent pane is
-        // reported as over budget, and the next repair tick stops looking once
-        // its own snapshot agrees the agent pane is gone.
+        // Unlike the eligibility checks above, this forks `tmux list-sessions`, so it stays behind
+        // the budget gate rather than joining them.
         let Some(tmux_session_name) = poller_seed_name(
             self.live_agent_seed(),
             || self.tmux_session().ok().map(|s| s.name().to_string()),
@@ -387,10 +364,7 @@ impl Instance {
             } else {
                 Box::new(omp_poll_fn(self.id.clone(), extra_excludes))
             };
-            let log_id = self.id.clone();
-            let on_change: Box<dyn Fn(&str) + Send + 'static> = Box::new(move |new_id| {
-                tracing::info!(target: "session.store", "Session ID observed for {}: {}", log_id, new_id);
-            });
+            let on_change = log_observed_session_id(&self.id);
             let initial = initial_known.map(|sid| metadata.session_observation(sid));
             let spawn = poller.start_observations(instance_id, poll_fn, on_change, initial);
             return self.install_poller(poller, spawn);
@@ -402,10 +376,7 @@ impl Instance {
             };
             let inner = crate::session::capture::pi_sidecar_poll_fn(self.id.clone(), source);
             let poll_fn: crate::session::poller::SessionIdPollFn = Box::new(move |_| inner());
-            let log_id = self.id.clone();
-            let on_change: Box<dyn Fn(&str) + Send + 'static> = Box::new(move |new_id| {
-                tracing::info!(target: "session.store", "Session ID observed for {}: {}", log_id, new_id);
-            });
+            let on_change = log_observed_session_id(&self.id);
             let initial =
                 initial_known.map(crate::session::poller::SessionIdObservation::instance_sidecar);
             let spawn = poller.start_observations(instance_id, poll_fn, on_change, initial);
@@ -425,53 +396,51 @@ impl Instance {
                 let sidecar_id = self.id.clone();
                 Box::new(move || crate::hooks::read_hook_session_id(&sidecar_id))
             }
-            crate::agents::SessionCaptureBackend::Codex => {
+            store_backed @ (crate::agents::SessionCaptureBackend::Codex
+            | crate::agents::SessionCaptureBackend::Gemini
+            | crate::agents::SessionCaptureBackend::Hermes
+            | crate::agents::SessionCaptureBackend::Kimi) => {
                 let Some(store) = self.sandbox_capture_store_dir() else {
                     return PollerStart::NotApplicable;
                 };
-                Box::new(codex_poll_fn_sandboxed_store(
-                    store,
-                    self.container_workdir(),
-                    self.id.clone(),
-                    capture_floor,
-                    extra_excludes,
-                ))
-            }
-            crate::agents::SessionCaptureBackend::Gemini => {
-                let Some(store) = self.sandbox_capture_store_dir() else {
-                    return PollerStart::NotApplicable;
-                };
-                Box::new(gemini_poll_fn_sandboxed_store(
-                    store,
-                    self.container_workdir(),
-                    self.id.clone(),
-                    capture_floor,
-                    extra_excludes,
-                ))
-            }
-            crate::agents::SessionCaptureBackend::Hermes => {
-                let Some(store) = self.sandbox_capture_store_dir() else {
-                    return PollerStart::NotApplicable;
-                };
-                Box::new(hermes_poll_fn_sandboxed_store(
-                    store,
-                    self.container_workdir(),
-                    self.id.clone(),
-                    capture_floor,
-                    extra_excludes,
-                ))
-            }
-            crate::agents::SessionCaptureBackend::Kimi => {
-                let Some(store) = self.sandbox_capture_store_dir() else {
-                    return PollerStart::NotApplicable;
-                };
-                Box::new(kimi_poll_fn_sandboxed_store(
-                    store,
-                    self.container_workdir(),
-                    self.id.clone(),
-                    capture_floor_ms,
-                    extra_excludes,
-                ))
+                let workdir = self.container_workdir();
+                let id = self.id.clone();
+                match store_backed {
+                    crate::agents::SessionCaptureBackend::Codex => {
+                        Box::new(codex_poll_fn_sandboxed_store(
+                            store,
+                            workdir,
+                            id,
+                            capture_floor,
+                            extra_excludes,
+                        ))
+                    }
+                    crate::agents::SessionCaptureBackend::Gemini => {
+                        Box::new(gemini_poll_fn_sandboxed_store(
+                            store,
+                            workdir,
+                            id,
+                            capture_floor,
+                            extra_excludes,
+                        ))
+                    }
+                    crate::agents::SessionCaptureBackend::Hermes => {
+                        Box::new(hermes_poll_fn_sandboxed_store(
+                            store,
+                            workdir,
+                            id,
+                            capture_floor,
+                            extra_excludes,
+                        ))
+                    }
+                    _ => Box::new(kimi_poll_fn_sandboxed_store(
+                        store,
+                        workdir,
+                        id,
+                        capture_floor_ms,
+                        extra_excludes,
+                    )),
+                }
             }
             crate::agents::SessionCaptureBackend::PrimeAgent => {
                 let Some(plan) = prime_plan else {
@@ -502,10 +471,7 @@ impl Instance {
                 poll_fn
             };
 
-        let log_id = self.id.clone();
-        let on_change: Box<dyn Fn(&str) + Send + 'static> = Box::new(move |new_id| {
-            tracing::info!(target: "session.store", "Session ID observed for {}: {}", log_id, new_id);
-        });
+        let on_change = log_observed_session_id(&self.id);
         let spawn = poller.start(instance_id, poll_fn, on_change, initial_known);
         self.install_poller(poller, spawn)
     }
@@ -520,16 +486,11 @@ impl Instance {
     }
 
     /// Replace a missing or finished poller once its tmux pane is live.
-    ///
-    /// OMP pollers reload pane metadata on every tick, so a replacement binds
-    /// to the durable generation that won any concurrent restart race.
     pub(crate) fn repair_session_id_poller_if_needed(
         &mut self,
         snapshot: &crate::tmux::LiveSessionSnapshot,
     ) -> bool {
-        // Structured sessions have ACP workers rather than tmux panes. Their
-        // lifecycle is reconciled by the daemon, so probing tmux here can only
-        // fail and is especially costly from the native TUI's refresh loop.
+        // Structured sessions have ACP workers rather than tmux panes.
         if self.is_structured()
             || !self.supports_session_poller()
             || self.session_id_poller_is_running()
@@ -543,9 +504,8 @@ impl Instance {
             return false;
         }
         let now = std::time::Instant::now();
-        // A failed attempt schedules the next one (5 s doubling to 60 s), so
-        // an over-budget fleet is not re-probed — and re-warned — for every
-        // session on every 2 s tick.
+        // A failed attempt schedules the next one (5 s doubling to 60 s), so an over-budget fleet
+        // is not re-probed — and re-warned — for every session on every 2 s tick.
         if !self.poller_repair.due(now) {
             return false;
         }
@@ -553,9 +513,8 @@ impl Instance {
         match self.maybe_start_poller() {
             // `install_poller` cleared the schedule.
             PollerStart::Started => true,
-            // Nothing failed: the session has nothing to poll right now, or
-            // the managed store's own retry deadline governs. Neither is a
-            // reason to back off or to blame the thread budget.
+            // Nothing failed: the session has nothing to poll right now, or the managed store's own
+            // retry deadline governs.
             PollerStart::NotApplicable | PollerStart::Deferred => {
                 self.poller_repair.reset();
                 false
@@ -626,14 +585,11 @@ impl Instance {
     }
 
     pub(super) fn stop_and_flush_poller_lifecycle_locked(&mut self) {
-        // A Pi pane's last word is in its sidecar, which no poller may have
-        // read: a CLI-only pane has none, and a restart tears the pane down
-        // before the next one starts. Every teardown reaches here, so this is
-        // where the flush belongs rather than at one call site.
+        // A Pi pane's last word is in its sidecar, which no poller may have read: a CLI-only pane
+        // has none, and a restart tears the pane down before the next one starts.
         self.flush_pi_sidecar_if_published();
-        // stop_poller() signals the thread but leaves the handle in place, so
-        // this is_some() means "a poller existed and may have queued a final
-        // observation": drain it before dropping the handle below.
+        // stop_poller() signals the thread but leaves the handle in place, so this is_some() means
+        // "a poller existed and may have queued a final observation".
         self.stop_poller();
         if self.session_id_poller.is_some() {
             let file_watch = self.resolve_file_watch();
@@ -649,12 +605,10 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::PollerStart;
-    use crate::session::{Instance, SandboxInfo, Status};
+    use crate::session::instance::test_helpers::*;
+    use crate::session::{Instance, Status};
 
-    /// The 2026-09-04 fleet shape: two sessions past the poller budget were
-    /// re-probed by the daemon every 2 s tick, each attempt logging a
-    /// "budget exhausted" + "Failed to start session poller" pair (~2.5
-    /// lines/s). Repair must schedule its retry instead.
+    /// The 2026-09-04 fleet shape.
     #[test]
     fn repair_defers_with_backoff_while_the_poller_budget_is_spent() {
         let budget = crate::session::poller::test_support::IsolatedBudget::exhausted();
@@ -710,9 +664,7 @@ mod tests {
         inst.stop_poller();
     }
 
-    /// A direct (non-repair) start is a success too: it must clear any
-    /// schedule left by earlier deferrals, or a poller that later dies waits
-    /// out a stale 60 s delay before repair even looks at it.
+    /// A direct (non-repair) start is a success too.
     #[test]
     fn direct_start_clears_a_deferred_repair_schedule() {
         let _budget = crate::session::poller::test_support::IsolatedBudget::with_ceiling(1);
@@ -733,10 +685,8 @@ mod tests {
         inst.stop_poller();
     }
 
-    /// A live pane with nothing to poll right now (here: an OMP pane whose
-    /// capture metadata is not resolvable) is not a failed spawn. Repair
-    /// must not schedule a backoff for it, and must not warn that the thread
-    /// budget is too small.
+    /// A live pane with nothing to poll right now (here: an OMP pane whose capture metadata is not
+    /// resolvable) is not a failed spawn.
     #[test]
     fn repair_does_not_defer_a_session_with_nothing_to_poll() {
         let mut inst = Instance::new("omp-no-meta", "/tmp/omp-no-meta");
@@ -777,16 +727,10 @@ mod tests {
         let budget = crate::session::poller::test_support::IsolatedBudget::exhausted();
         let mut inst = Instance::new("prime-repair", "/tmp/prime-repair");
         inst.tool = "prime-agent".to_string();
-        inst.sandbox_info = Some(SandboxInfo {
-            enabled: true,
-            container_id: None,
-            image: "test-image".to_string(),
-            container_name: "prime-repair".to_string(),
-            extra_env: None,
-            custom_instruction: None,
-            before_start_env: Vec::new(),
-            container_workdir: Some("/workspace/prime-repair".to_string()),
-        });
+        inst.sandbox_info = Some(test_sandbox(
+            "prime-repair",
+            Some("/workspace/prime-repair"),
+        ));
         let store = inst.sandbox_capture_store_dir().unwrap();
         std::fs::create_dir_all(&store).unwrap();
         let live = crate::tmux::LiveSessionSnapshot::from_parts(
@@ -897,16 +841,7 @@ mod tests {
 
         let mut sandboxed = Instance::new("pisandboxpoll001", "/tmp/pi-poll");
         sandboxed.tool = "pi".to_string();
-        sandboxed.sandbox_info = Some(crate::session::SandboxInfo {
-            enabled: true,
-            container_id: None,
-            image: "test:latest".to_string(),
-            container_name: "aoe-pi-poll".to_string(),
-            extra_env: None,
-            custom_instruction: None,
-            container_workdir: None,
-            before_start_env: Vec::new(),
-        });
+        sandboxed.sandbox_info = Some(test_sandbox("aoe-pi-poll", None));
         let dir = sandboxed
             .pi_sidecar_source()
             .and_then(|s| match s {
@@ -956,18 +891,8 @@ mod tests {
     fn managed_capture_repair_honors_contention_backoff() {
         let app = tempfile::tempdir().unwrap();
         let _app_guard = crate::session::test_support::isolate_app_dir_at(app.path());
-        let mut inst = Instance::new("gemini", "/tmp/gemini-backoff");
-        inst.tool = "gemini".to_string();
-        inst.sandbox_info = Some(SandboxInfo {
-            enabled: true,
-            container_id: None,
-            image: "test-image".to_string(),
-            container_name: "test".to_string(),
-            extra_env: None,
-            custom_instruction: None,
-            before_start_env: Vec::new(),
-            container_workdir: Some("/workspace/gemini-backoff".to_string()),
-        });
+        let mut inst = tool_instance("gemini", "/tmp/gemini-backoff");
+        inst.sandbox_info = Some(test_sandbox("test", Some("/workspace/gemini-backoff")));
         let name = inst.tmux_session().unwrap().name().to_string();
         let live = crate::tmux::LiveSessionSnapshot::from_parts(Some(vec![name]), None);
         inst.session_id_poller_retry_after =
@@ -987,16 +912,7 @@ mod tests {
         let mut inst = Instance::new(title, project_path);
         inst.tool = "gemini".to_string();
         inst.status = Status::Running;
-        inst.sandbox_info = Some(SandboxInfo {
-            enabled: true,
-            container_id: None,
-            image: "test-image".to_string(),
-            container_name: format!("test-{}", inst.id),
-            extra_env: None,
-            custom_instruction: None,
-            before_start_env: Vec::new(),
-            container_workdir: Some(workdir.to_string()),
-        });
+        inst.sandbox_info = Some(test_sandbox(&format!("test-{}", inst.id), Some(workdir)));
         inst
     }
 
@@ -1095,10 +1011,8 @@ mod tests {
         drop(distinct);
     }
 
-    /// Repair declines when no live agent pane exists for the row: a terminal
-    /// outliving the agent is not something a session-id poller can follow.
-    /// Decline happens before the handle is cleared, so a later tick with a
-    /// live pane can still repair.
+    /// Repair declines when no live agent pane exists for the row: a terminal outliving the agent
+    /// is not something a session-id poller can follow.
     #[test]
     fn repair_declines_without_a_live_agent_pane() {
         let mut inst = Instance::new("repair-no-pane", "/tmp/repair-no-pane");
@@ -1124,20 +1038,15 @@ mod tests {
         );
     }
 
-    /// The live arm is decisive and the derived arm is the fallback only when
-    /// the scan found nothing live at all. The live arm's own filtering is the
-    /// kind-aware scan in `tmux::live_agent_name_for_id`, pinned there; here
-    /// the seed must take whatever agent name that scan returns, including one
-    /// whose sanitized title reads as a paired terminal's, and must not fall
-    /// back to a derived name for a row whose agent pane is gone.
+    /// The live arm is decisive and the derived arm is the fallback only when the scan found
+    /// nothing live at all.
     #[test]
     fn poller_seed_name_prefers_the_live_agent_and_falls_back_to_the_derived_name() {
         const ID: &str = "9f2c41d6-0000-4000-8000-000000000001";
         let agent = crate::tmux::Session::generate_name(ID, "Vikings");
         let renamed = crate::tmux::Session::generate_name(ID, "Vikings the sequel");
-        // A title sanitizing under TERMINAL_PREFIX: the agent name the name
-        // shape alone refuses, which the live scan now answers with because
-        // the session says what kind it is.
+        // A title sanitizing under TERMINAL_PREFIX: the agent name the name shape alone refuses,
+        // which the live scan now answers with because the session says what kind it is.
         let aux_shaped = crate::tmux::Session::generate_name(ID, "term rewriting");
 
         // (case, what the live scan says, derived name, expected seed)
@@ -1196,11 +1105,8 @@ mod tests {
         }
     }
 
-    /// #3888 end to end: a row titled `term rewriting` whose agent session is
-    /// live and marked gets a poller, on that session. Before the kind
-    /// marker its own agent name was indistinguishable from a paired
-    /// terminal's, so every start declined and the row captured no
-    /// conversation id.
+    /// #3888 end to end: a row titled `term rewriting` whose agent session is live and marked gets
+    /// a poller, on that session.
     #[test]
     #[serial_test::serial]
     #[cfg(unix)]
@@ -1239,15 +1145,8 @@ mod tests {
         inst.stop_poller();
     }
 
-    /// The race #3880 describes: repair sees a live agent pane in its
-    /// snapshot, the agent dies before `maybe_start_poller` re-queries tmux,
-    /// and only the paired terminal answers. The start declines instead of
-    /// seeding a poller that would never terminate, keeping the budget slot
-    /// and leaving the next tick free to try again.
-    ///
-    /// The re-query is driven off a title whose own agent name is aux-shaped,
-    /// which is the same "no agent name resolves" answer a surviving terminal
-    /// produces, without a live tmux server.
+    /// The race #3880 describes: repair sees a live agent pane in its snapshot, the agent dies
+    /// before `maybe_start_poller` re-queries tmux, and only the paired terminal answers.
     #[test]
     fn repair_declines_when_the_agent_pane_dies_under_the_snapshot() {
         let budget = crate::session::poller::test_support::IsolatedBudget::with_ceiling(1);

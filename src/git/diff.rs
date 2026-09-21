@@ -1,7 +1,4 @@
-//! Git diff computation module
-//!
-//! Provides functionality for computing diffs between branches/commits
-//! and the working directory.
+//! Diffs between a branch or commit and the working directory.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -10,7 +7,6 @@ use similar::{ChangeTag, TextDiff};
 
 use super::error::{GitError, Result};
 
-/// Status of a file in the diff
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileStatus {
     Added,
@@ -23,7 +19,6 @@ pub enum FileStatus {
 }
 
 impl FileStatus {
-    /// Returns a single character indicator for the status
     pub fn indicator(&self) -> char {
         match self {
             FileStatus::Added => 'A',
@@ -36,7 +31,6 @@ impl FileStatus {
         }
     }
 
-    /// Returns a human-readable label
     pub fn label(&self) -> &'static str {
         match self {
             FileStatus::Added => "added",
@@ -50,63 +44,45 @@ impl FileStatus {
     }
 }
 
-/// Represents a file that has changed
 #[derive(Debug, Clone)]
 pub struct DiffFile {
-    /// Path to the file (relative to repo root)
+    /// Relative to the repo root.
     pub path: PathBuf,
-    /// Previous path if renamed
     pub old_path: Option<PathBuf>,
-    /// Status of the change
     pub status: FileStatus,
-    /// Number of lines added
     pub additions: usize,
-    /// Number of lines deleted
     pub deletions: usize,
 }
 
-/// A single line in a diff with change information
 #[derive(Debug, Clone)]
 pub struct DiffLine {
-    /// The type of change
     pub tag: ChangeTag,
-    /// Line number in old file (None for insertions)
+    /// `None` for an insertion.
     pub old_line_num: Option<usize>,
-    /// Line number in new file (None for deletions)
+    /// `None` for a deletion.
     pub new_line_num: Option<usize>,
-    /// The actual content of the line
     pub content: String,
 }
 
-/// A hunk (group of changes) in a diff
+/// A group of changes in a diff.
 #[derive(Debug, Clone)]
 pub struct DiffHunk {
-    /// Starting line in old file
     pub old_start: usize,
-    /// Number of lines in old file
     pub old_lines: usize,
-    /// Starting line in new file
     pub new_start: usize,
-    /// Number of lines in new file
     pub new_lines: usize,
-    /// Lines in this hunk
     pub lines: Vec<DiffLine>,
 }
 
-/// Complete diff for a single file
 #[derive(Debug, Clone)]
 pub struct FileDiff {
-    /// The file being diffed
     pub file: DiffFile,
-    /// Hunks of changes
     pub hunks: Vec<DiffHunk>,
-    /// Whether this is a binary file
     pub is_binary: bool,
 }
 
-/// Compute the list of changed files between a base branch and the working directory.
-/// Uses the merge-base of HEAD and the base branch, so only changes introduced
-/// on the current branch are shown (matching GitHub PR diff behavior).
+/// Changed files between a base branch and the working directory, from the
+/// merge-base of HEAD and the base, so only this branch's changes show.
 pub fn compute_changed_files(repo_path: &Path, base_branch: &str) -> Result<Vec<DiffFile>> {
     let repo = super::open_repo_at(repo_path)?;
 
@@ -212,7 +188,7 @@ pub fn compute_changed_files(repo_path: &Path, base_branch: &str) -> Result<Vec<
     Ok(files)
 }
 
-/// Resolve a reference to a commit (branch name, tag, or commit hash)
+/// Resolve a branch name, tag, or commit hash to a commit.
 fn get_commit_from_ref<'a>(
     repo: &'a git2::Repository,
     reference: &str,
@@ -252,13 +228,10 @@ fn get_commit_from_ref<'a>(
         .map_err(|_| GitError::BranchNotFound(reference.to_string()))
 }
 
-/// Get the merge-base tree between HEAD and the given reference.
-/// This produces GitHub-style PR diffs: only changes introduced on the
-/// current branch are shown, excluding new commits on the base branch
-/// that haven't been merged in yet.
-///
-/// Falls back to the ref's tip tree if HEAD can't be resolved (e.g.
-/// on an unborn branch or when comparing against HEAD itself).
+/// The merge-base tree between HEAD and `reference`, so a diff excludes
+/// commits added to the base since the branch forked. Falls back to the
+/// ref's tip tree when HEAD does not resolve (unborn branch, or HEAD
+/// itself).
 fn get_merge_base_tree<'a>(repo: &'a git2::Repository, reference: &str) -> Result<git2::Tree<'a>> {
     let base_commit = get_commit_from_ref(repo, reference)?;
 
@@ -277,10 +250,8 @@ fn get_merge_base_tree<'a>(repo: &'a git2::Repository, reference: &str) -> Resul
     Ok(base_commit.tree()?)
 }
 
-/// Check whether the merge-base between HEAD and the given base branch can
-/// be computed. Returns `Some(warning)` if the diff will fall back to
-/// comparing against the branch tip directly (which includes unrelated
-/// changes from the base branch).
+/// `Some(warning)` when no merge-base can be computed, so the diff will
+/// compare against the branch tip and include unrelated base changes.
 pub fn check_merge_base_status(repo_path: &Path, base_branch: &str) -> Option<String> {
     let repo = match super::open_repo_at(repo_path) {
         Ok(r) => r,
@@ -333,9 +304,7 @@ pub fn check_merge_base_status(repo_path: &Path, base_branch: &str) -> Option<St
     }
 }
 
-/// Compute the full diff for a specific file.
-/// Uses the merge-base of HEAD and the base branch so only changes from
-/// the current branch are shown.
+/// Full diff for one file, against the merge-base of HEAD and the base.
 pub fn compute_file_diff(
     repo_path: &Path,
     file_path: &Path,
@@ -441,13 +410,10 @@ pub fn compute_file_diff(
     })
 }
 
-/// Raw old/new contents of a single file plus its status.
-///
-/// Feeds the contents-based diff endpoint, which lets the web client parse
-/// and render diffs itself (via `@pierre/diffs`) instead of consuming
-/// server-computed hunks. Additions/deletions are intentionally absent: the
-/// renderer derives them, and the file-list endpoint already carries per-file
-/// counts for the sidebar.
+/// Raw old and new contents of one file plus its status, for the endpoint
+/// the web client renders itself via `@pierre/diffs`. No addition or
+/// deletion counts: the renderer derives them and the file list already
+/// carries them.
 #[derive(Debug, Clone)]
 pub struct FileContents {
     pub path: PathBuf,
@@ -455,19 +421,15 @@ pub struct FileContents {
     pub status: FileStatus,
     pub old_content: String,
     pub new_content: String,
-    /// Unified diff of old → new, computed server-side so the web client can
-    /// parse it as text instead of re-running a (slow, main-thread) diff
-    /// algorithm on the raw contents. Empty for binary files.
+    /// Unified diff of old against new, computed here so the client parses
+    /// text rather than re-running the diff on its main thread. Empty for a
+    /// binary file.
     pub patch: String,
     pub is_binary: bool,
 }
 
-/// Read the old (base-tree) and new (working-dir) contents of a single file
-/// plus a server-computed unified diff of the two.
-///
-/// The diff is computed here, natively, precisely so the web client never
-/// has to: `@pierre/diffs` parses the patch text and only offloads
-/// highlighting to its worker pool.
+/// Base-tree and working-dir contents of one file, plus a unified diff of
+/// the two computed here so the client only parses it.
 pub fn compute_file_contents(
     repo_path: &Path,
     file_path: &Path,
@@ -514,8 +476,7 @@ struct FileState {
     status: FileStatus,
 }
 
-/// Read a file's base-tree and working-dir contents, detect binary, and
-/// classify its status (added/deleted/modified/conflicted).
+/// Base-tree and working-dir contents, the binary flag, and the status.
 fn read_file_state(
     repo: &git2::Repository,
     workdir: &Path,
@@ -585,7 +546,7 @@ fn read_file_state(
     })
 }
 
-/// Get raw bytes of a blob from a tree by path
+/// Raw bytes of a blob in a tree.
 fn get_blob_bytes(repo: &git2::Repository, tree: &git2::Tree, path: &Path) -> Option<Vec<u8>> {
     let entry = tree.get_path(path).ok()?;
     let obj = entry.to_object(repo).ok()?;
@@ -593,7 +554,7 @@ fn get_blob_bytes(repo: &git2::Repository, tree: &git2::Tree, path: &Path) -> Op
     Some(blob.content().to_vec())
 }
 
-/// Check if raw bytes appear to be binary (null byte heuristic)
+/// Null-byte heuristic for binary content.
 fn is_binary_bytes(content: &[u8]) -> bool {
     content.iter().take(8000).any(|&b| b == 0)
 }
@@ -606,20 +567,15 @@ pub struct FullFileContents {
     pub is_binary: bool,
 }
 
-/// Read the full contents of an unchanged, agent-cited file for the full-file
-/// fallback in the structured-view diff viewer. See #1810.
+/// Full contents of an unchanged, agent-cited file, for the structured-view
+/// viewer's full-file fallback (#1810).
 ///
-/// Membership is gated on the path being a tracked **blob** in `HEAD`. That
-/// excludes `.git/` internals, gitignored secrets like `.env`, and submodule
-/// gitlinks (a commit entry, not a blob), none of which should be readable
-/// through this endpoint. The *contents* are then read from the working
-/// directory via `canonical_path` (already canonicalized and containment-checked
-/// by the caller) so what renders matches what the agent actually saw and any
-/// symlink resolves through the same containment guard.
-///
-/// Returns `Ok(None)` when the path is not a tracked blob or is not a regular
-/// file on disk, so the caller answers `404` without disclosing whether an
-/// untracked file exists.
+/// Membership is gated on the path being a tracked blob in `HEAD`, which
+/// excludes `.git/` internals, gitignored secrets, and submodule gitlinks.
+/// The contents come from the working directory via the caller's already
+/// containment-checked `canonical_path`, so what renders is what the agent
+/// saw. `Ok(None)` for anything else, so the caller answers `404` without
+/// disclosing whether an untracked file exists.
 pub fn compute_unchanged_file_contents(
     repo_path: &Path,
     file_path: &Path,
@@ -653,7 +609,7 @@ pub fn compute_unchanged_file_contents(
     Ok(Some(FullFileContents { content, is_binary }))
 }
 
-/// Get the content of a file from the working directory
+/// Working-directory contents of a file.
 pub fn get_working_file_content(repo_path: &Path, file_path: &Path) -> Result<String> {
     let repo = super::open_repo_at(repo_path)?;
     let workdir = repo.workdir().ok_or(GitError::NotAGitRepo)?;
@@ -662,7 +618,7 @@ pub fn get_working_file_content(repo_path: &Path, file_path: &Path) -> Result<St
     std::fs::read_to_string(&full_path).map_err(GitError::IoError)
 }
 
-/// Save content to a file in the working directory
+/// Write contents to a file in the working directory.
 pub fn save_working_file_content(repo_path: &Path, file_path: &Path, content: &str) -> Result<()> {
     let repo = super::open_repo_at(repo_path)?;
     let workdir = repo.workdir().ok_or(GitError::NotAGitRepo)?;
@@ -676,7 +632,7 @@ pub fn save_working_file_content(repo_path: &Path, file_path: &Path, content: &s
     std::fs::write(&full_path, content).map_err(GitError::IoError)
 }
 
-/// List available branches in the repository
+/// Local branch names.
 pub fn list_branches(repo_path: &Path) -> Result<Vec<String>> {
     let repo = super::open_repo_at(repo_path)?;
     let mut branches = Vec::new();
@@ -706,19 +662,16 @@ pub fn list_branches(repo_path: &Path) -> Result<Vec<String>> {
 /// One entry returned by [`list_branches_with_remotes`].
 #[derive(Debug, Clone)]
 pub struct BranchEntry {
-    /// Short branch name (e.g. `feature/x`). For remote-only branches
-    /// the remote prefix (`origin/`) is stripped; pass the short name
-    /// to `create_worktree` and it resolves the remote internally.
+    /// Short name, with any remote prefix stripped; `create_worktree`
+    /// resolves the remote itself.
     pub name: String,
-    /// True if the branch only exists on the remote (no matching local
-    /// branch). The UI surfaces this so the user knows the new
-    /// worktree will fetch + branch from the remote tip.
+    /// No matching local branch, so a new worktree fetches and branches
+    /// from the remote tip. Surfaced in the UI.
     pub remote_only: bool,
 }
 
-/// List local branches plus remote-only branches (stripped of their
-/// remote prefix). Used by the worktree base-branch picker so users
-/// can pick a teammate's branch they haven't fetched locally. See #948.
+/// Local branches plus remote-only ones, so the base-branch picker can
+/// offer a teammate's unfetched branch (#948).
 pub fn list_branches_with_remotes(repo_path: &Path) -> Result<Vec<BranchEntry>> {
     let repo = super::open_repo_at(repo_path)?;
     let mut locals: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -768,32 +721,25 @@ pub fn list_branches_with_remotes(repo_path: &Path) -> Result<Vec<BranchEntry>> 
     Ok(entries)
 }
 
-/// Get the default branch name (main or master).
-/// Delegates to `GitWorktree::detect_default_branch` which also checks
-/// remote tracking refs as a fallback.
+/// The default branch name, via `GitWorktree::detect_default_branch`.
 pub fn get_default_branch(repo_path: &Path) -> Result<String> {
     let git_wt = super::GitWorktree::new(repo_path.to_path_buf())?;
     git_wt.detect_default_branch()
 }
 
-/// Get the default base ref for diffing as a remote-qualified ref name
-/// when the freshest copy lives on a non-default remote. Falls back to
-/// the short branch name when the picked candidate is local.
-///
-/// Use this (not `get_default_branch`) for diff base resolution, so
-/// fork + `upstream` layouts compare against `upstream/main` instead
-/// of a stale local `main`. See issue #1029.
+/// The default diff base, remote-qualified when the freshest copy lives on
+/// a non-default remote and short when the pick is local. Diff resolution
+/// uses this rather than `get_default_branch`, so a fork with an `upstream`
+/// compares against `upstream/main` instead of a stale local `main`
+/// (#1029).
 pub fn get_default_base_ref(repo_path: &Path) -> Result<String> {
     let git_wt = super::GitWorktree::new(repo_path.to_path_buf())?;
     Ok(git_wt.detect_default_branch_info()?.qualified_ref())
 }
 
-/// Returns `Ok(())` when `reference` resolves to a commit in the repo at
-/// `repo_path` using the same resolution chain (`local branch`,
-/// `origin/<ref>` tracking branch, `revparse_single`) that
-/// `compute_changed_files` consults. Used by the CLI to validate
-/// user-provided refs (e.g. `aoe session set-base`) before persisting
-/// a per-session diff base override. See #970.
+/// Whether `reference` resolves through the same chain
+/// `compute_changed_files` uses, so the CLI can validate a ref before
+/// persisting it as a per-session diff base (#970).
 pub fn validate_ref(repo_path: &Path, reference: &str) -> Result<()> {
     let repo = git2::Repository::open(repo_path)?;
     get_commit_from_ref(&repo, reference).map(|_| ())
@@ -830,7 +776,7 @@ mod tests {
         (dir, repo)
     }
 
-    /// Helper to create a commit on the current branch
+    /// Commit on the current branch.
     fn commit_file(repo: &git2::Repository, path: &str, content: &str, message: &str) {
         let dir = repo.workdir().unwrap();
         let file_path = dir.join(path);
@@ -886,16 +832,14 @@ mod tests {
         assert!(out.is_none(), ".git internals must not be served");
     }
 
-    /// Ensure a local branch exists at the given commit.
-    /// This keeps tests stable when git init defaults to `main` vs `master`.
+    /// Pin a branch name, so `git init`'s default does not decide the test.
     fn ensure_local_branch(repo: &git2::Repository, name: &str, commit: &git2::Commit<'_>) {
         if repo.find_branch(name, git2::BranchType::Local).is_err() {
             repo.branch(name, commit, false).unwrap();
         }
     }
 
-    /// Set up a repo with a main branch and a feature branch that diverged.
-    /// main has extra commits that the feature branch doesn't have.
+    /// A repo whose main branch has commits the feature branch forked before.
     fn setup_branching_repo() -> (TempDir, git2::Repository) {
         let dir = TempDir::new().unwrap();
         let repo = git2::Repository::init(dir.path()).unwrap();
@@ -1051,26 +995,25 @@ mod tests {
     }
 
     #[test]
-    fn test_check_merge_base_status_ok_when_common_ancestor_exists() {
-        let (dir, _repo) = setup_branching_repo();
-        // Feature branch and main share a common ancestor, so no warning
-        let status = check_merge_base_status(dir.path(), "main");
-        assert!(
-            status.is_none(),
-            "Expected no warning when merge-base exists, got: {:?}",
-            status
-        );
-    }
-
-    #[test]
-    fn test_check_merge_base_status_warns_on_missing_branch() {
-        let (dir, _repo) = setup_test_repo();
-        let status = check_merge_base_status(dir.path(), "nonexistent-branch");
-        assert!(status.is_some(), "Expected warning for missing branch");
-        assert!(
-            status.unwrap().contains("not found"),
-            "Warning should mention branch not found"
-        );
+    fn check_merge_base_status_warns_only_where_no_base_exists() {
+        let (branching, _repo) = setup_branching_repo();
+        let (plain, _repo) = setup_test_repo();
+        let cases = [
+            // A shared ancestor, and HEAD against itself, both diff cleanly.
+            (branching.path(), "main", None),
+            (plain.path(), "HEAD", None),
+            (plain.path(), "nonexistent-branch", Some("not found")),
+        ];
+        for (repo, base, expected) in cases {
+            let status = check_merge_base_status(repo, base);
+            match expected {
+                None => assert!(status.is_none(), "{base}: {status:?}"),
+                Some(text) => assert!(
+                    status.as_deref().is_some_and(|s| s.contains(text)),
+                    "{base}: {status:?}"
+                ),
+            }
+        }
     }
 
     #[test]
@@ -1106,26 +1049,6 @@ mod tests {
             status.unwrap().contains("No common ancestor"),
             "Warning should mention no common ancestor"
         );
-    }
-
-    #[test]
-    fn test_check_merge_base_status_ok_same_commit() {
-        let (dir, _repo) = setup_test_repo();
-        // Comparing HEAD against HEAD -- same commit, no warning
-        let status = check_merge_base_status(dir.path(), "HEAD");
-        assert!(
-            status.is_none(),
-            "Expected no warning when comparing same commit, got: {:?}",
-            status
-        );
-    }
-
-    #[test]
-    fn test_file_status_indicator() {
-        assert_eq!(FileStatus::Added.indicator(), 'A');
-        assert_eq!(FileStatus::Modified.indicator(), 'M');
-        assert_eq!(FileStatus::Deleted.indicator(), 'D');
-        assert_eq!(FileStatus::Renamed.indicator(), 'R');
     }
 
     #[test]
@@ -1257,47 +1180,27 @@ mod tests {
     }
 
     #[test]
-    fn test_list_branches() {
+    fn branch_listing_sees_local_branches_and_the_default() {
         let (dir, repo) = setup_test_repo();
-
-        // Create another branch
-        let head = repo.head().unwrap();
-        let commit = head.peel_to_commit().unwrap();
+        let commit = repo.head().unwrap().peel_to_commit().unwrap();
         repo.branch("feature", &commit, false).unwrap();
 
         let branches = list_branches(dir.path()).unwrap();
-        assert!(!branches.is_empty());
+        assert!(branches.iter().any(|b| b == "feature"), "{branches:?}");
+        assert!(branches.contains(&get_default_branch(dir.path()).unwrap()));
     }
 
     #[test]
-    fn test_get_default_branch() {
-        let (dir, _repo) = setup_test_repo();
-        // Should return the current branch (usually "master" for git init)
-        let branch = get_default_branch(dir.path());
-        assert!(branch.is_ok());
-    }
-
-    #[test]
-    fn test_validate_ref_accepts_existing_branch() {
+    fn validate_ref_accepts_only_a_resolvable_ref() {
         let (dir, repo) = setup_test_repo();
-        let head_name = repo.head().unwrap().shorthand().unwrap().to_string();
-        validate_ref(dir.path(), &head_name).expect("HEAD branch should resolve");
-    }
+        let head = repo.head().unwrap().shorthand().unwrap().to_string();
+        validate_ref(dir.path(), &head).expect("the HEAD branch resolves");
+        assert!(validate_ref(dir.path(), "definitely-does-not-exist").is_err());
 
-    #[test]
-    fn test_validate_ref_rejects_missing_branch() {
-        let (dir, _repo) = setup_test_repo();
-        let err = validate_ref(dir.path(), "definitely-does-not-exist");
-        assert!(err.is_err(), "missing ref should not resolve");
-    }
-
-    #[test]
-    fn test_validate_ref_rejects_non_repo() {
-        let dir = TempDir::new().unwrap();
-        let err = validate_ref(dir.path(), "main");
+        let bare = TempDir::new().unwrap();
         assert!(
-            err.is_err(),
-            "validate_ref against non-repo path should error"
+            validate_ref(bare.path(), "main").is_err(),
+            "a path that is not a repo resolves nothing"
         );
     }
 
@@ -1308,8 +1211,7 @@ mod tests {
         assert!(is_binary_bytes(b"hello\0world"));
     }
 
-    /// Set up a repo in a mid-merge state with a conflict on `conflicted.txt`.
-    /// Returns the temp dir; HEAD is on `feature` branch.
+    /// A repo mid-merge with a conflict on `conflicted.txt`, HEAD on `feature`.
     fn setup_conflict_repo() -> (TempDir, git2::Repository) {
         let dir = TempDir::new().unwrap();
         let repo = git2::Repository::init(dir.path()).unwrap();

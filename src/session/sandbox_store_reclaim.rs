@@ -1,34 +1,4 @@
 //! Reclaim per-instance agent stores whose session is gone.
-//!
-//! A sandboxed session mounts `<agent config>/sandbox-v2/<instance id>` as the
-//! agent's config directory, so the store holds that agent's credentials.
-//! Purging a session removes its own stores; this pass covers the ones already
-//! stranded, including stores left by versions that removed nothing.
-//!
-//! Both are deliberately narrow, because the thing being deleted is a copy of a
-//! live credential:
-//!
-//! - A store is an orphan only when its id resolves in no profile of either
-//!   build namespace. A registry that cannot be read is never "a profile with
-//!   no sessions"; the pass fails and deletes nothing.
-//! - A store is removed only when *no* container for its id exists, under any
-//!   installed runtime. Not merely "not running": a stopped container can be
-//!   started between the check and the removal, and no lock a reclaim can hold
-//!   is observed by `docker start`. Requiring absence closes that race by
-//!   construction, since a container for an id no session owns cannot be
-//!   created either. A runtime that cannot answer reads as "exists", which is
-//!   v027's fail-closed posture. Every runtime is asked, not just the one this
-//!   build's config names, because ownership spans both build namespaces and
-//!   each can name a different one.
-//! - A store seeded moments ago is preserved. Container preparation seeds the
-//!   store before the session row is inserted (`cli::add` runs `on_create`
-//!   hooks, and so `get_container_for_instance`, before it persists), so a
-//!   just-created store is briefly indistinguishable from an orphan.
-//! - The pass runs under v027's transition lock and refuses while a store move
-//!   is mid-flight. It cannot see a half-copied store either way: v027 copies
-//!   into `.v027-stage-<id>` and renames, and only a bare 16-hex name is ever a
-//!   candidate here, so a store appears to this pass whole or not at all.
-//!   Widening that name filter would break the guarantee.
 
 use crate::migrations::v027_isolate_sandbox_stores as v027;
 use anyhow::{bail, Context, Result};
@@ -129,22 +99,9 @@ pub fn reclaim() -> Result<Outcome> {
 }
 
 /// How recently a store may have been written to and still be reclaimed.
-///
-/// Container preparation seeds a store before the session row exists, so
-/// within this window an orphan and a session being created look the same. A
-/// store stranded by a purge is minutes to months old, so the cost of the
-/// window is nothing and it closes the only gap the locks cannot.
 const CREATION_GRACE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
-/// Whether any installed runtime still has a container for this id, in any
-/// state.
-///
-/// `get_container_runtime` resolves through `Config::load`, whose path is the
-/// invoking build's app dir, and each namespace (or profile) can name a
-/// different runtime, so asking only ours would miss a container holding the
-/// store. Each runtime is asked through v027's own probe, so the fail-closed
-/// answer for a runtime that cannot be reached is unchanged; a runtime that is
-/// not installed holds no containers and contributes nothing.
+/// Whether any installed runtime still has a container for this id, in any state.
 fn every_runtime_probe(announce: bool) -> impl Fn(&str) -> Result<bool> {
     let constructors: Vec<fn() -> crate::containers::ContainerRuntime> = vec![
         crate::containers::ContainerRuntime::docker,
@@ -168,14 +125,6 @@ fn every_runtime_probe(announce: bool) -> impl Fn(&str) -> Result<bool> {
 }
 
 /// One runtime's presence answer, batched.
-///
-/// Every listed state counts as present, including `Exited` and `Created`. The
-/// migration's probe reads the same listing for *liveness*, where a stopped
-/// container is `Some(false)` and short-circuits before the fallback; reusing
-/// that here would let an ordinary stopped container read as absent and take
-/// its store with it. Only a container the listing does not mention reaches
-/// the inspect fallback, which is the sole path that can tell "absent" from
-/// "could not be asked".
 fn presence_probe(
     batch: impl Fn() -> std::collections::HashMap<String, crate::containers::ContainerState>,
     inspect: impl Fn(&str) -> Result<(bool, bool)>,
@@ -190,9 +139,7 @@ fn presence_probe(
     )
 }
 
-/// Retained if any runtime says so. Short-circuits, so a runtime that cannot
-/// answer (and therefore answers "retained") keeps the store without the rest
-/// being asked.
+/// Retained if any runtime says so.
 fn any_retained(probes: &[Box<v027::RunningProbe<'_>>], id: &str) -> Result<bool> {
     for probe in probes {
         if probe(id)? {
@@ -202,10 +149,8 @@ fn any_retained(probes: &[Box<v027::RunningProbe<'_>>], id: &str) -> Result<bool
     Ok(false)
 }
 
-/// One runtime's answer for one id, in the shape v027's probe expects: whether
-/// a container exists, and whether that is the fail-closed substitute for a
-/// runtime that could not be asked. A runtime that is not installed answers a
-/// definitive "no": it has no containers to hold this store.
+/// One runtime's answer for one id, in the shape v027's probe expects: whether a container exists,
+/// and whether that is the fail-closed substitute for a runtime that could not be asked.
 fn probe_exists_with(
     runtime: crate::containers::ContainerRuntime,
     id: &str,
@@ -222,10 +167,7 @@ fn probe_exists_with(
     }
 }
 
-/// App dirs beyond our own whose sessions still claim a store under these
-/// roots. Debug and release builds keep separate app dirs but share `$HOME`,
-/// and so share the store roots under it: reading only our own registry would
-/// call every session of the other build an orphan and delete its credentials.
+/// App dirs beyond our own whose sessions still claim a store under these roots.
 fn also_owned(app_dir: &Path) -> Vec<PathBuf> {
     crate::session::sibling_namespace_app_dir()
         .filter(|sibling| sibling != app_dir)
@@ -233,22 +175,7 @@ fn also_owned(app_dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Serialise reclaim passes against each other, and hold v027's transition
-/// lock for the duration.
-///
-/// The transition lock is taken *shared*. Exclusive would also block
-/// `Storage::update`, which is what publishes the session row for a store
-/// being created: holding it exclusively turns the creation race below into a
-/// guaranteed loss by preventing the very insert that would mark the store
-/// owned. Shared still excludes v027's own planning and publishing, which take
-/// it exclusively, and v027's copy phase holds no transition lock at all, so
-/// exclusivity buys nothing there either.
-///
-/// A row that is merely still on the shared store does not block the pass: it
-/// owns no private store to reclaim yet, and the one it will own carries its
-/// id, which this pass reads as claimed. Blocking on that instead would refuse
-/// forever on any machine holding an archived or trashed pre-transition
-/// session, since those keep their shared store until they are started again.
+/// Serialise reclaim passes against each other, and hold v027's transition lock for the duration.
 fn guard(app_dir: &Path) -> Result<(crate::session::StorageFlock, crate::session::StorageFlock)> {
     fs::create_dir_all(app_dir)?;
     let pass = crate::session::acquire_storage_flock(app_dir, RECLAIM_LOCK)?;
@@ -265,11 +192,6 @@ fn guard(app_dir: &Path) -> Result<(crate::session::StorageFlock, crate::session
 const RECLAIM_LOCK: &str = ".sandbox-reclaim.lock";
 
 /// The store ids every profile's registry claims.
-///
-/// Fails rather than answering short. A missing registry file is a profile
-/// with no sessions; a registry that exists but cannot be read, parsed, or
-/// understood is a profile whose sessions we cannot see, and treating its
-/// stores as unowned would delete them.
 fn owned_ids(app_dir: &Path, also: &[PathBuf]) -> Result<BTreeSet<String>> {
     let mut paths = registry_paths(app_dir)?;
     if paths.is_empty() {
@@ -300,9 +222,7 @@ fn owned_ids(app_dir: &Path, also: &[PathBuf]) -> Result<BTreeSet<String>> {
     Ok(ids)
 }
 
-/// Every profile's registry, plus the default one. A `sessions.json` that is
-/// present but not a regular file is a registry we cannot read, so it fails
-/// the pass rather than being skipped.
+/// Every profile's registry, plus the default one.
 fn registry_paths(app_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut dirs = vec![app_dir.to_path_buf()];
     let profiles = app_dir.join("profiles");
@@ -310,11 +230,9 @@ fn registry_paths(app_dir: &Path) -> Result<Vec<PathBuf>> {
         Ok(entries) => {
             for entry in entries {
                 let path = entry?.path();
-                // Resolved, not `DirEntry::file_type`, which does not follow
-                // symlinks: a symlinked profile directory would otherwise be
-                // skipped and its sessions would read as unowned. An entry we
-                // cannot stat at all fails the pass rather than being skipped,
-                // for the same reason.
+                // Resolved, not `DirEntry::file_type`, which does not follow symlinks: a symlinked
+                // profile directory would otherwise be skipped and its sessions would read as
+                // unowned.
                 match fs::metadata(&path) {
                     Ok(metadata) if metadata.is_dir() => dirs.push(path),
                     // A stray file under `profiles/` is not a profile.
@@ -338,11 +256,6 @@ fn registry_paths(app_dir: &Path) -> Result<Vec<PathBuf>> {
     for dir in dirs {
         let path = dir.join("sessions.json");
         // Only a genuinely absent registry is a profile with no sessions.
-        // Every other failure means a registry we cannot read, and skipping it
-        // would drop its sessions from the ownership inventory and make its
-        // stores look like orphans. Presence is decided without following the
-        // link, resolution with it, so a dangling symlink fails here rather
-        // than reading as absent.
         match fs::symlink_metadata(&path) {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -375,9 +288,8 @@ fn registry_paths(app_dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-/// Every `sandbox-v2` root any profile can place a store under: the built-in
-/// root per agent config mount, plus the root of each `agent_config_dir` a
-/// profile declares.
+/// Every `sandbox-v2` root any profile can place a store under: the built-in root per agent config
+/// mount, plus the root of each `agent_config_dir` a profile declares.
 fn store_roots(app_dir: &Path, home: &Path) -> Result<Vec<PathBuf>> {
     let mut roots: BTreeSet<PathBuf> = BTreeSet::new();
     let tools = crate::session::config::container_config::agent_config_mount_tools();
@@ -441,9 +353,7 @@ fn plan_in(
     Ok(plan)
 }
 
-/// `None` when the store may be removed. Mirrors v027's orphan gate: a path
-/// that is not a plain directory says nothing about what it holds, and a
-/// running container is still writing to it.
+/// `None` when the store may be removed.
 fn classify(
     path: &Path,
     id: &str,
@@ -464,9 +374,7 @@ fn classify(
     Ok(None)
 }
 
-/// Whether `metadata` was modified inside `window`. An unreadable or
-/// future-dated timestamp counts as recent: it is the arm that keeps the
-/// store.
+/// Whether `metadata` was modified inside `window`.
 fn written_within(metadata: &fs::Metadata, window: std::time::Duration) -> bool {
     let Ok(modified) = metadata.modified() else {
         return true;
@@ -489,16 +397,12 @@ fn reclaim_in(
         plan,
         ..Outcome::default()
     };
-    // Ownership is re-read: the pass holds the transition lock shared, so a
-    // session created during it can publish its row, and a store that was
-    // unclaimed at planning time may be claimed by the time we reach it.
+    // Ownership is re-read: the pass holds the transition lock shared, so a session created during
+    // it can publish its row, and a store that was unclaimed at planning time may be claimed by the
+    // time we reach it.
     let owned = owned_ids(app_dir, also_owned)?;
     for orphan in &outcome.plan.orphans {
-        // Per candidate, not once for the loop. v027's probe caches its
-        // container listing until the liveness epoch moves, and removing an
-        // earlier candidate can take a while, so a snapshot taken before the
-        // first removal is stale by the last. v027 refreshes for the same
-        // reason before it publishes.
+        // Per candidate, not once for the loop.
         v027::refresh_liveness();
         if owned.contains(&orphan.id) {
             outcome
@@ -506,9 +410,9 @@ fn reclaim_in(
                 .push((orphan.path.clone(), "claimed since the scan".to_string()));
             continue;
         }
-        // Re-classified against the path as it is now, with fresh container
-        // evidence: the last thing standing between a swapped store, or one
-        // whose container reappeared, and `remove_dir_all`.
+        // Re-classified against the path as it is now, with fresh container evidence: the last
+        // thing standing between a swapped store, or one whose container reappeared, and
+        // `remove_dir_all`.
         match classify(&orphan.path, &orphan.id, grace, container_exists) {
             Ok(None) => {}
             Ok(Some(reason)) => {
@@ -544,9 +448,8 @@ fn directory_bytes(root: &Path) -> u64 {
     let mut total = 0;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        // Sizing is advisory, so a subtree that cannot be read is counted as
-        // zero rather than failing the report. A store that cannot be read
-        // also cannot be removed, and that failure is reported per store.
+        // Sizing is advisory, so a subtree that cannot be read is counted as zero rather than
+        // failing the report.
         let Ok(entries) = fs::read_dir(&dir) else {
             continue;
         };
@@ -566,11 +469,6 @@ fn directory_bytes(root: &Path) -> u64 {
 }
 
 /// Remove the stores of one session being purged.
-///
-/// Returns the paths removed and the bytes they held. A session still on a
-/// shared legacy store owns no per-instance directory to remove, and v027 may
-/// be publishing the private one it will own, so it is left to the reclaim
-/// pass.
 pub(crate) fn remove_stores_for(
     instance: &crate::session::Instance,
 ) -> Result<(Vec<PathBuf>, u64)> {
@@ -634,26 +532,28 @@ mod tests {
         path
     }
 
-    /// Tests plant a store and reclaim it in the same millisecond, so the
-    /// creation grace period is opted out of except where it is the subject.
+    /// A fresh `(tempdir, app dir, home)` triple with the app dir created.
+    fn dirs() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("app");
+        let home = dir.path().join("home");
+        fs::create_dir_all(&app).unwrap();
+        (dir, app, home)
+    }
+
     const NO_GRACE: std::time::Duration = std::time::Duration::ZERO;
 
-    /// No container anywhere for this id.
     fn gone(_: &str) -> Result<bool> {
         Ok(false)
     }
 
-    /// A container still exists for it.
     fn retained(_: &str) -> Result<bool> {
         Ok(true)
     }
 
     #[test]
     fn a_store_no_profile_claims_is_an_orphan_and_one_that_is_claimed_is_not() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = dir.path().join("app");
-        let home = dir.path().join("home");
-        fs::create_dir_all(&app).unwrap();
+        let (_dir, app, home) = dirs();
         app_with_rows(&app, &["1111111111111111"]);
         store(&home, "1111111111111111", 10);
         let orphan = store(&home, "2222222222222222", 40);
@@ -714,10 +614,7 @@ mod tests {
 
     #[test]
     fn no_registry_at_all_fails_rather_than_reclaiming_every_store() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = dir.path().join("app");
-        let home = dir.path().join("home");
-        fs::create_dir_all(&app).unwrap();
+        let (_dir, app, home) = dirs();
         store(&home, "2222222222222222", 40);
 
         let error = plan_in(&app, &[], &home, NO_GRACE, &gone).unwrap_err();
@@ -727,10 +624,7 @@ mod tests {
 
     #[test]
     fn a_live_orphan_is_preserved_and_never_removed() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = dir.path().join("app");
-        let home = dir.path().join("home");
-        fs::create_dir_all(&app).unwrap();
+        let (_dir, app, home) = dirs();
         app_with_rows(&app, &[]);
         let path = store(&home, "2222222222222222", 40);
 
@@ -747,10 +641,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_symlinked_store_is_preserved_and_its_target_is_left_alone() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = dir.path().join("app");
-        let home = dir.path().join("home");
-        fs::create_dir_all(&app).unwrap();
+        let (dir, app, home) = dirs();
         app_with_rows(&app, &[]);
         let target = dir.path().join("elsewhere");
         fs::create_dir_all(&target).unwrap();
@@ -771,10 +662,7 @@ mod tests {
 
     #[test]
     fn reclaiming_removes_the_orphan_and_reports_what_it_freed() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = dir.path().join("app");
-        let home = dir.path().join("home");
-        fs::create_dir_all(&app).unwrap();
+        let (_dir, app, home) = dirs();
         app_with_rows(&app, &["1111111111111111"]);
         let kept = store(&home, "1111111111111111", 10);
         let orphan = store(&home, "2222222222222222", 40);
@@ -792,8 +680,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let app = dir.path().join("app");
         fs::create_dir_all(&app).unwrap();
-        // Archived and trashed rows keep their shared store until they are
-        // started again, so this one is pending for as long as it exists.
         fs::write(
             app.join("sessions.json"),
             r#"[{"id":"1111111111111111","sandbox_info":{"enabled":true},"archived_at":"2026-01-01T00:00:00Z"}]"#,
@@ -811,9 +697,6 @@ mod tests {
         assert!(guard(&app).is_err(), "a move in flight must block the pass");
     }
 
-    /// Debug and release builds keep separate app dirs but share `$HOME`, so
-    /// a pass that read only its own registry would delete the credentials of
-    /// every session belonging to the other build.
     #[test]
     fn a_session_of_the_other_build_namespace_is_not_an_orphan() {
         let dir = tempfile::tempdir().unwrap();
@@ -836,15 +719,9 @@ mod tests {
         assert!(store.exists(), "the other build's store was reclaimed");
     }
 
-    /// Container preparation seeds the store before the session row is
-    /// inserted, so a store written to moments ago may belong to a session
-    /// being created right now rather than to no one.
     #[test]
     fn a_store_being_created_is_preserved_until_the_grace_period_lapses() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = dir.path().join("app");
-        let home = dir.path().join("home");
-        fs::create_dir_all(&app).unwrap();
+        let (_dir, app, home) = dirs();
         app_with_rows(&app, &[]);
         let seeding = store(&home, "2222222222222222", 40);
 
@@ -859,20 +736,12 @@ mod tests {
         );
     }
 
-    /// A store unclaimed when the plan was made can be claimed by the time the
-    /// pass reaches it: the transition lock is held shared precisely so that
-    /// insert is not blocked, so the delete phase has to look again.
     #[test]
     fn a_store_claimed_after_the_scan_is_not_removed() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = dir.path().join("app");
-        let home = dir.path().join("home");
-        fs::create_dir_all(&app).unwrap();
+        let (_dir, app, home) = dirs();
         app_with_rows(&app, &[]);
         let path = store(&home, "2222222222222222", 40);
 
-        // The probe runs between planning and deletion, which is where a
-        // concurrent `aoe add` would publish its row.
         let claim_on_probe = |_: &str| {
             app_with_rows(&app, &["2222222222222222"]);
             Ok(false)
@@ -883,9 +752,6 @@ mod tests {
         assert!(outcome.removed.is_empty());
     }
 
-    /// A container of a runtime this build's config does not name still holds
-    /// the store it has mounted, so every runtime is asked and any one of them
-    /// saying live is enough.
     #[test]
     fn liveness_is_the_union_of_every_runtime_asked() {
         let quiet: Box<v027::RunningProbe<'_>> = Box::new(|_| Ok(false));
@@ -905,14 +771,7 @@ mod tests {
         );
     }
 
-    /// The batch listing is read for presence, not liveness. A stopped
-    /// container is listed, and the migration's own probe answers `Some(false)`
-    /// for it and short-circuits before the existence fallback; reading the
-    /// listing that way here would let every ordinary stopped container's
-    /// store be reclaimed out from under a restart.
-    ///
-    /// Drives the composed probe with an injected listing rather than a final
-    /// boolean, which is the layer the bug lived in.
+    // The batch listing is read for presence, not liveness.
     #[test]
     fn a_listed_stopped_container_counts_as_present() {
         use crate::containers::{ContainerState, DockerContainer};
@@ -925,8 +784,6 @@ mod tests {
                     states.insert(DockerContainer::generate_name(id), state);
                     states
                 },
-                // Would report the container absent. Reaching it at all for a
-                // listed container is the defect.
                 |_| Ok((false, false)),
                 false,
             );
@@ -946,8 +803,6 @@ mod tests {
             assert!(listed(state), "{state:?} was read as absent");
         }
 
-        // Not listed at all: only then does the fallback decide, and it is the
-        // one answer that can distinguish absent from unanswerable.
         v027::refresh_liveness();
         let absent = presence_probe(
             std::collections::HashMap::new,
@@ -964,13 +819,9 @@ mod tests {
         );
     }
 
-    /// A store live under a runtime this build does not use must survive.
     #[test]
     fn a_store_live_under_another_runtime_is_preserved() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = dir.path().join("app");
-        let home = dir.path().join("home");
-        fs::create_dir_all(&app).unwrap();
+        let (_dir, app, home) = dirs();
         app_with_rows(&app, &[]);
         let path = store(&home, "2222222222222222", 40);
         let probes: Vec<Box<v027::RunningProbe<'_>>> =
@@ -986,7 +837,6 @@ mod tests {
         assert_eq!(outcome.plan.preserved, vec![(path, Preserved::Retained)]);
     }
 
-    /// `remove_stores_for` must not follow a symlink out of the store root.
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
@@ -1015,12 +865,6 @@ mod tests {
         );
     }
 
-    /// A registry that is there but cannot be resolved must abort the pass.
-    /// Skipping it would drop its sessions from the ownership inventory and
-    /// make their stores, which are perfectly readable, look like orphans.
-    ///
-    /// Dangling symlinks rather than permission bits: tests run as root in
-    /// some environments, where a mode of `000` is not an error at all.
     #[cfg(unix)]
     #[test]
     fn an_unresolvable_registry_aborts_before_removing_anything() {
@@ -1061,22 +905,13 @@ mod tests {
         }
     }
 
-    /// Removing one store takes time, and a container for a later candidate
-    /// can appear while it happens. Evidence has to be re-taken per candidate,
-    /// not once for the loop.
     #[test]
     fn a_candidate_whose_container_appears_mid_pass_survives() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = dir.path().join("app");
-        let home = dir.path().join("home");
-        fs::create_dir_all(&app).unwrap();
+        let (_dir, app, home) = dirs();
         app_with_rows(&app, &[]);
         let first = store(&home, "2222222222222222", 40);
         let second = store(&home, "3333333333333333", 40);
 
-        // Stands in for a container coming up during the first removal: both
-        // stores are unattached while the plan is made, and the second gains a
-        // container the moment the first is gone.
         let gate = first.clone();
         let appears = move |_: &str| Ok(!gate.exists());
 
@@ -1097,10 +932,7 @@ mod tests {
 
     #[test]
     fn a_directory_that_is_not_an_instance_id_is_never_touched() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = dir.path().join("app");
-        let home = dir.path().join("home");
-        fs::create_dir_all(&app).unwrap();
+        let (_dir, app, home) = dirs();
         app_with_rows(&app, &[]);
         let staging = home
             .join(".claude")

@@ -2815,18 +2815,13 @@ impl Default for TmuxConfig {
 }
 
 /// The files aoe treats as "the user's tmux config", in tmux's own search
-/// order. Shared so the existence check and the option recognizer can never
-/// drift to different locations.
+/// order, shared so the existence check and the option recognizer cannot drift.
 ///
-/// tmux reads `$XDG_CONFIG_HOME/tmux/tmux.conf` and `~/.config/tmux/tmux.conf`
-/// as separate entries, and they differ whenever `XDG_CONFIG_HOME` points
-/// somewhere other than `~/.config`; missing the first is how a user with
-/// `set -g mouse off` there stayed overridden (#3207).
-///
-/// tmux's search path also starts with `/etc/tmux.conf`, deliberately left out:
-/// it is not the user's file, and some distros ship one, so folding it in would
-/// make [`user_has_tmux_config`] true on every account of those machines and
-/// silently drop aoe's status bar for all of them.
+/// `$XDG_CONFIG_HOME/tmux/tmux.conf` and `~/.config/tmux/tmux.conf` are separate
+/// entries because they differ whenever `XDG_CONFIG_HOME` is set elsewhere
+/// (#3207). `/etc/tmux.conf` is deliberately left out: it is not the user's
+/// file, and distros that ship one would otherwise drop aoe's status bar for
+/// every account on the machine.
 fn user_tmux_config_paths() -> Vec<PathBuf> {
     let home = dirs::home_dir();
     let mut paths = Vec::with_capacity(3);
@@ -2852,37 +2847,20 @@ pub fn user_has_tmux_config() -> bool {
 }
 
 /// A tmux option group aoe manages on its own sessions, one variant per
-/// `[tmux]` setting that writes to tmux.
-///
-/// Adding a managed option is a variant plus a `TmuxSetting::row` arm and an
-/// entry in `TmuxSetting::ALL`, not a new `should_apply_*` helper plus an
-/// edit to each of the three create paths. A setting whose application is
-/// post-creation (theme painting, unsets of stale session-scoped values)
-/// also needs a change in
-/// [`crate::tmux::status_bar::apply_all_tmux_options`], which does not
-/// iterate `ALL`.
+/// `[tmux]` setting that writes to tmux. Adding one is a variant, a
+/// `TmuxSetting::row` arm and an `ALL` entry; a setting applied after creation
+/// also needs [`crate::tmux::status_bar::apply_all_tmux_options`], which does
+/// not iterate `ALL`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TmuxSetting {
     /// aoe's themed status bar, nine session options wide.
     StatusBar,
-    /// tmux's `mouse`, which is what turns a wheel scroll (or the dashboard's
-    /// touch scroll) into copy-mode scrollback.
-    ///
-    /// A session option outranks the user's `set -g mouse ...`, so applying
-    /// aoe's value unconditionally ignored the file they wrote and made
-    /// `[tmux] mouse` look like a setting that did nothing (#3207). But keying
-    /// `auto` on mere config *existence* would silently break touch scroll for
-    /// everyone who keeps a `tmux.conf` for a prefix key or a theme and never
-    /// mentions `mouse`, since tmux's own default is off. Hence the
-    /// per-option `WhenUserSets` defer rule:
-    ///
-    /// | `[tmux] mouse` | their tmux config | result |
-    /// |---|---|---|
-    /// | `auto` | sets `mouse` | leave their `mouse` in charge |
-    /// | `auto` | silent on `mouse` | `mouse on` |
-    /// | `auto` | no config at all | `mouse on` |
-    /// | `enabled` | anything | `mouse on` |
-    /// | `disabled` | anything | `mouse off` |
+    /// tmux's `mouse`, which turns a wheel or touch scroll into copy-mode
+    /// scrollback. A session option outranks `set -g mouse`, so `auto` defers
+    /// only when the user's config sets `mouse` itself (#3207): keying on mere
+    /// config existence would break touch scroll for everyone who keeps a
+    /// tmux.conf for a prefix key, since tmux's own default is off. `enabled`
+    /// and `disabled` always win.
     Mouse,
     /// OSC 52 forwarding out of the wrapped agent: `set-clipboard` plus
     /// `allow-passthrough`. Without it, "select to copy" inside the agent
@@ -2892,33 +2870,22 @@ pub enum TmuxSetting {
 
 /// What makes [`TmuxSettingMode::Auto`] step aside for a given setting.
 enum TmuxAutoDefer {
-    /// Defer only when the user's own tmux config sets one of these options.
-    /// The precise rule, and the only one that can honor the `set -g <option>`
-    /// they actually wrote while still applying aoe's value for everyone who
-    /// keeps a tmux config for unrelated reasons (#3207).
+    /// Defer only when the user's config sets one of these options, so a
+    /// `set -g <option>` they wrote wins while everyone who keeps a tmux config
+    /// for unrelated reasons still gets aoe's value (#3207).
     WhenUserSets(&'static [&'static str]),
-    /// Defer whenever the user has a tmux config at all. Coarse by design, for
-    /// a setting that paints a whole group of options rather than mirroring
-    /// one: probing nine `status*` options individually would be fuzzy, and a
-    /// user who themed their own bar wants their theme, not a partial merge of
-    /// it with aoe's.
+    /// Defer whenever the user has a tmux config at all. Coarse by design, for a
+    /// setting that paints a whole group of options: a user who themed their own
+    /// bar wants their theme, not a partial merge with aoe's.
     WhenUserHasAnyConfig,
 }
 
-/// One tmux `set-option` aoe writes on its own sessions, at creation.
-///
-/// The variant is the scope the write addresses (session `-t <target>`,
-/// server `-s`, window `-w -t <target>`), so a write's scope flags follow
-/// from its variant alone; the target of session/window writes is a runtime
-/// parameter of the emitter, not a property of the write. Scope flags are
-/// emitted explicitly (`-s`, `-w`, `-t`) rather than left to tmux's scope
-/// inference, so the write is unambiguous and resilient to future inference
-/// changes (same convention as `append_remain_on_exit_args`). `quiet` adds
-/// tmux's `-q` (ignore unknown options), which aoe needs for
-/// `allow-passthrough` on tmux < 3.3, where `allow-passthrough` does not
-/// exist and the set-option call would otherwise fail the whole
-/// `new-session` invocation; it is a per-write property, not a scope
-/// property.
+/// One tmux `set-option` aoe writes on its own sessions, at creation. The
+/// variant is the scope, and its flags (`-s`, `-w`, `-t`) are always emitted
+/// rather than left to tmux's scope inference; the target is a runtime
+/// parameter of the emitter. `quiet` adds `-q`, which `allow-passthrough` needs
+/// on tmux < 3.3, where the unknown option would otherwise fail the whole
+/// `new-session`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TmuxOptionWrite {
     /// `set-option [-q] -t <target> <option> <value>` on the new session.
@@ -2942,11 +2909,8 @@ pub(crate) enum TmuxOptionWrite {
 }
 
 /// One row of the managed-settings table: where the mode is read from, what
-/// makes `auto` defer, and the writes aoe emits at creation (`apply`) or to
-/// turn the setting off where "off" is expressible (`force_off`).
-///
-/// The enum variant is the row's identity; there is no `key` field because
-/// nothing consumes one (the issue sketch reserved it for docs and logs).
+/// makes `auto` defer, and the writes aoe emits at creation (`apply`) or to turn
+/// the setting off where "off" is expressible (`force_off`).
 struct TmuxManagedSetting {
     mode: fn(&TmuxConfig) -> TmuxSettingMode,
     defer: TmuxAutoDefer,
@@ -3998,167 +3962,88 @@ mod tests {
         assert_eq!(config.session.session_id_poller_max_threads, 400);
     }
 
+    /// The defaults an empty config.toml must produce, and that a partial file
+    /// only overrides what it names.
     #[test]
-    fn test_config_default() {
-        let config = Config::default();
-        // An unset default_profile deserializes empty: "not explicitly
-        // chosen". The active profile is resolved at runtime, not baked in
-        // as a magic name here.
-        let deserialized: Config = toml::from_str("").unwrap();
-        assert_eq!(deserialized.default_profile, "");
+    fn config_defaults_are_quiet_and_partial_files_only_override_what_they_name() {
+        let config: Config = toml::from_str("").unwrap();
+        // Unset means "not explicitly chosen": the active profile is resolved at
+        // runtime rather than baked in as a magic name here.
+        assert_eq!(config.default_profile, "");
         assert!(!config.worktree.enabled);
         assert!(!config.sandbox.enabled_by_default);
         assert_eq!(config.updates.update_check_mode, UpdateCheckMode::Notify);
-    }
+        assert_eq!(config.theme.name, "");
+        // The freshness signal stays off until a positive value opts in.
+        assert_eq!(config.theme.idle_decay_minutes, 0);
 
-    #[test]
-    fn test_config_deserialize_empty_toml() {
-        let config: Config = toml::from_str("").unwrap();
-        assert_eq!(config.default_profile, "");
-    }
-
-    #[test]
-    fn test_config_deserialize_partial_toml() {
-        let toml = r#"
+        let config: Config = toml::from_str(
+            r#"
             default_profile = "custom"
-        "#;
-        let config: Config = toml::from_str(toml).unwrap();
+
+            [theme]
+            name = "dracula"
+            idle_decay_minutes = 5
+            "#,
+        )
+        .unwrap();
         assert_eq!(config.default_profile, "custom");
-        // Other fields should have defaults
+        assert_eq!(config.theme.name, "dracula");
+        assert_eq!(config.theme.idle_decay_minutes, 5);
         assert!(!config.worktree.enabled);
     }
 
+    /// A plugin's enable-state and settings survive a save/load round trip.
+    /// Disabling a plugin hides its settings from every surface but must never
+    /// destroy them. An empty map serializes nothing rather than a stray table.
     #[test]
-    fn test_plugins_table_round_trips_through_save() {
-        // A plugin's enable-state must survive serialize/deserialize.
-        let toml_in = r#"
-            [plugins."aoe.web"]
-            enabled = false
-        "#;
-        let config: Config = toml::from_str(toml_in).unwrap();
-        assert!(!config.plugins["aoe.web"].enabled);
-
-        let serialized = toml::to_string(&config).unwrap();
-        let reloaded: Config = toml::from_str(&serialized).unwrap();
-        assert!(!reloaded.plugins["aoe.web"].enabled);
-    }
-
-    #[test]
-    fn test_plugins_default_empty_and_omitted_from_toml() {
+    fn plugin_table_round_trips_and_stays_out_of_an_empty_config() {
         let config: Config = toml::from_str("").unwrap();
         assert!(config.plugins.is_empty());
-        let serialized = toml::to_string(&config).unwrap();
-        assert!(
-            !serialized.contains("[plugins"),
-            "empty plugins map must not serialize a stray section"
-        );
-    }
+        assert!(!toml::to_string(&config).unwrap().contains("[plugins"));
 
-    #[test]
-    fn test_plugin_settings_persist_even_while_disabled() {
-        // Disabling a plugin hides its settings from every surface but must
-        // never destroy them: the values survive a save/load round-trip.
-        let toml_in = r#"
+        let config: Config = toml::from_str(
+            r#"
+            [plugins."aoe.web"]
+            enabled = true
+
             [plugins."aoe.status"]
             enabled = false
 
             [plugins."aoe.status".settings]
             poll_interval_ms = 1000
             verbose = true
-        "#;
-        let config: Config = toml::from_str(toml_in).unwrap();
-        let plugin = &config.plugins["aoe.status"];
-        assert!(!plugin.enabled);
-        assert_eq!(plugin.settings["poll_interval_ms"].as_integer(), Some(1000));
+            "#,
+        )
+        .unwrap();
+        assert!(config.plugins["aoe.web"].settings.is_empty());
+        assert!(!config.plugins["aoe.status"].enabled);
+        assert_eq!(
+            config.plugins["aoe.status"].settings["poll_interval_ms"].as_integer(),
+            Some(1000)
+        );
 
-        let serialized = toml::to_string(&config).unwrap();
-        let reloaded: Config = toml::from_str(&serialized).unwrap();
+        let reloaded: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert!(reloaded.plugins["aoe.web"].enabled);
+        assert!(!reloaded.plugins["aoe.status"].enabled);
         assert_eq!(
             reloaded.plugins["aoe.status"].settings["verbose"].as_bool(),
             Some(true)
         );
     }
 
+    /// The `update_check_mode` spellings config.toml is allowed to use.
     #[test]
-    fn test_plugin_empty_settings_omitted_from_toml() {
-        let toml_in = r#"
-            [plugins."aoe.web"]
-            enabled = true
-        "#;
-        let config: Config = toml::from_str(toml_in).unwrap();
-        assert!(config.plugins["aoe.web"].settings.is_empty());
-        let serialized = toml::to_string(&config).unwrap();
-        assert!(
-            !serialized.contains("settings"),
-            "empty plugin settings must not serialize a stray section"
-        );
-    }
-
-    // Tests for ThemeConfig
-    #[test]
-    fn test_theme_config_default() {
-        let theme = ThemeConfig::default();
-        assert_eq!(theme.name, "");
-        // Freshness signal is off by default; users opt in by setting a
-        // positive value via Settings -> Theme -> Idle Decay (minutes)
-        // or in config.toml directly.
-        assert_eq!(theme.idle_decay_minutes, 0);
-    }
-
-    #[test]
-    fn test_theme_config_deserialize() {
-        let toml = r#"name = "dark""#;
-        let theme: ThemeConfig = toml::from_str(toml).unwrap();
-        assert_eq!(theme.name, "dark");
-        // Missing field defaults to the off state. Existing configs
-        // without `idle_decay_minutes` get the calmer (no-rattle)
-        // default rather than being opted into the visual signal.
-        assert_eq!(theme.idle_decay_minutes, 0);
-    }
-
-    #[test]
-    fn test_theme_config_idle_decay_override() {
-        let toml = r#"
-            name = "dracula"
-            idle_decay_minutes = 5
-        "#;
-        let theme: ThemeConfig = toml::from_str(toml).unwrap();
-        assert_eq!(theme.idle_decay_minutes, 5);
-    }
-
-    #[test]
-    fn test_theme_config_idle_decay_zero_disables() {
-        // 0 is a valid setting that disables the freshness signal
-        // entirely. Verifying it round-trips cleanly so users can opt
-        // out without having to remove the field.
-        let toml = r#"
-            idle_decay_minutes = 0
-        "#;
-        let theme: ThemeConfig = toml::from_str(toml).unwrap();
-        assert_eq!(theme.idle_decay_minutes, 0);
-    }
-
-    // Tests for UpdatesConfig
-    #[test]
-    fn test_updates_config_default() {
-        let updates = UpdatesConfig::default();
-        assert_eq!(updates.update_check_mode, UpdateCheckMode::Notify);
-    }
-
-    #[test]
-    fn test_updates_config_deserialize() {
-        let toml = r#"
-            update_check_mode = "off"
-        "#;
-        let updates: UpdatesConfig = toml::from_str(toml).unwrap();
-        assert_eq!(updates.update_check_mode, UpdateCheckMode::Off);
-    }
-
-    #[test]
-    fn test_updates_config_partial_deserialize() {
-        let toml = r#"update_check_mode = "auto""#;
-        let updates: UpdatesConfig = toml::from_str(toml).unwrap();
-        assert_eq!(updates.update_check_mode, UpdateCheckMode::Auto);
+    fn update_check_mode_spellings() {
+        for (key, expected) in [
+            ("off", UpdateCheckMode::Off),
+            ("notify", UpdateCheckMode::Notify),
+            ("auto", UpdateCheckMode::Auto),
+        ] {
+            let updates: UpdatesConfig =
+                toml::from_str(&format!("update_check_mode = \"{key}\"")).unwrap();
+            assert_eq!(updates.update_check_mode, expected, "{key}");
+        }
     }
 
     #[test]
@@ -4196,48 +4081,38 @@ mod tests {
         assert_eq!(updates.update_check_mode, UpdateCheckMode::Notify);
     }
 
-    // Tests for WorktreeConfig
+    /// The `[worktree]` defaults and the keys config.toml may set. A config
+    /// predating `init_submodules` keeps initializing them recursively (#942).
     #[test]
-    fn test_worktree_config_default() {
+    fn worktree_config_defaults_and_keys() {
         let wt = WorktreeConfig::default();
         assert!(!wt.enabled);
         assert_eq!(wt.path_template, "../{repo-name}-worktrees/{branch}");
         assert!(wt.auto_cleanup);
-        assert!(
-            wt.init_submodules,
-            "init_submodules must default to true to preserve #942 behavior"
-        );
-    }
+        assert!(wt.init_submodules);
 
-    #[test]
-    fn test_worktree_config_deserialize() {
-        let toml = r#"
+        let wt: WorktreeConfig = toml::from_str("enabled = true").unwrap();
+        assert!(wt.init_submodules);
+
+        let wt: WorktreeConfig = toml::from_str(
+            r#"
             enabled = true
             path_template = "/custom/{branch}"
             auto_cleanup = false
             init_submodules = false
-        "#;
-        let wt: WorktreeConfig = toml::from_str(toml).unwrap();
+            "#,
+        )
+        .unwrap();
         assert!(wt.enabled);
         assert_eq!(wt.path_template, "/custom/{branch}");
         assert!(!wt.auto_cleanup);
         assert!(!wt.init_submodules);
     }
 
+    /// The `[sandbox]` defaults, the keys config.toml may set, and that
+    /// `volume_ignores` survives a full save/load round trip.
     #[test]
-    fn test_worktree_config_init_submodules_defaults_when_absent() {
-        // Configs predating this option must continue to recursively init
-        // submodules (preserve #942 behavior) when upgrading.
-        let toml = r#"
-            enabled = true
-        "#;
-        let wt: WorktreeConfig = toml::from_str(toml).unwrap();
-        assert!(wt.init_submodules);
-    }
-
-    // Tests for SandboxConfig
-    #[test]
-    fn test_sandbox_config_default() {
+    fn sandbox_config_defaults_and_keys() {
         let sb = SandboxConfig::default();
         assert!(!sb.enabled_by_default);
         assert!(sb.auto_cleanup);
@@ -4248,113 +4123,84 @@ mod tests {
         assert!(sb.memory_limit.is_none());
         assert!(sb.volume_ignores.is_empty());
         assert!(sb.network.is_none());
-    }
 
-    #[test]
-    fn test_sandbox_config_deserialize() {
-        let toml = r#"
+        let sb: SandboxConfig = toml::from_str(
+            r#"
             enabled_by_default = true
             default_image = "custom:latest"
             extra_volumes = ["/data:/data"]
             environment = ["MY_VAR"]
+            volume_ignores = ["target", ".venv", "node_modules"]
             auto_cleanup = false
             cpu_limit = "2"
             memory_limit = "4g"
             port_mappings = ["3000:3000", "5432:5432"]
             network = "none"
-        "#;
-        let sb: SandboxConfig = toml::from_str(toml).unwrap();
+            "#,
+        )
+        .unwrap();
         assert!(sb.enabled_by_default);
         assert_eq!(sb.default_image, "custom:latest");
         assert_eq!(sb.extra_volumes, vec!["/data:/data"]);
         assert_eq!(sb.environment, vec!["MY_VAR"]);
+        assert_eq!(sb.volume_ignores, vec!["target", ".venv", "node_modules"]);
         assert!(!sb.auto_cleanup);
         assert_eq!(sb.cpu_limit, Some("2".to_string()));
         assert_eq!(sb.memory_limit, Some("4g".to_string()));
-        assert_eq!(
-            sb.port_mappings,
-            vec!["3000:3000".to_string(), "5432:5432".to_string()]
-        );
+        assert_eq!(sb.port_mappings, vec!["3000:3000", "5432:5432"]);
         assert_eq!(sb.network, Some("none".to_string()));
-    }
 
-    #[test]
-    fn test_sandbox_config_volume_ignores_deserialize() {
-        let toml = r#"
-            volume_ignores = ["target", ".venv", "node_modules"]
-        "#;
-        let sb: SandboxConfig = toml::from_str(toml).unwrap();
-        assert_eq!(sb.volume_ignores, vec!["target", ".venv", "node_modules"]);
-    }
-
-    #[test]
-    fn test_sandbox_config_volume_ignores_defaults_empty() {
-        let toml = r#"enabled_by_default = false"#;
-        let sb: SandboxConfig = toml::from_str(toml).unwrap();
-        assert!(sb.volume_ignores.is_empty());
-    }
-
-    #[test]
-    fn test_sandbox_config_volume_ignores_roundtrip() {
         let mut config = Config::default();
         config.sandbox.volume_ignores = vec!["target".to_string(), "node_modules".to_string()];
-
-        let serialized = toml::to_string(&config).unwrap();
-        let deserialized: Config = toml::from_str(&serialized).unwrap();
-
+        let reparsed: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
         assert_eq!(
-            deserialized.sandbox.volume_ignores,
+            reparsed.sandbox.volume_ignores,
             vec!["target", "node_modules"]
         );
     }
 
+    /// Every `Vec<String>` sandbox field also accepts a plain string.
     #[test]
-    fn test_sandbox_config_string_shorthand() {
-        // Regression test: all Vec<String> sandbox fields accept a plain string
-        let toml = r#"
+    fn sandbox_config_string_shorthand() {
+        let sb: SandboxConfig = toml::from_str(
+            r#"
             environment = "ANTHROPIC_API_KEY"
             extra_volumes = "/data:/data:ro"
             volume_ignores = "node_modules"
             port_mappings = "3000:3000"
-        "#;
-        let sb: SandboxConfig = toml::from_str(toml).unwrap();
+            "#,
+        )
+        .unwrap();
         assert_eq!(sb.environment, vec!["ANTHROPIC_API_KEY"]);
         assert_eq!(sb.extra_volumes, vec!["/data:/data:ro"]);
         assert_eq!(sb.volume_ignores, vec!["node_modules"]);
         assert_eq!(sb.port_mappings, vec!["3000:3000"]);
     }
 
-    // Tests for AppStateConfig
+    /// The `[app_state]` defaults and keys. A file written before a flag
+    /// existed reads back as not-yet-seen rather than seen.
     #[test]
-    fn test_app_state_config_default() {
+    fn app_state_config_defaults_and_keys() {
         let app = AppStateConfig::default();
         assert!(!app.has_seen_welcome);
         assert!(!app.has_seen_web_tour);
         assert!(app.last_seen_version.is_none());
         assert!(app.dismissed_update_version.is_none());
-    }
 
-    #[test]
-    fn test_app_state_config_deserialize() {
-        let toml = r#"
+        let app: AppStateConfig = toml::from_str(
+            r#"
             has_seen_welcome = true
             last_seen_version = "1.0.0"
             dismissed_update_version = "1.0.0"
-        "#;
-        let app: AppStateConfig = toml::from_str(toml).unwrap();
+            "#,
+        )
+        .unwrap();
         assert!(app.has_seen_welcome);
-        // Absent from the toml: defaults to false (backward compatible).
         assert!(!app.has_seen_web_tour);
         assert_eq!(app.last_seen_version, Some("1.0.0".to_string()));
         assert_eq!(app.dismissed_update_version, Some("1.0.0".to_string()));
-    }
 
-    #[test]
-    fn test_app_state_config_web_tour_roundtrip() {
-        let toml = r#"
-            has_seen_web_tour = true
-        "#;
-        let app: AppStateConfig = toml::from_str(toml).unwrap();
+        let app: AppStateConfig = toml::from_str("has_seen_web_tour = true").unwrap();
         assert!(app.has_seen_web_tour);
         assert!(!app.has_seen_welcome);
     }
@@ -4415,45 +4261,12 @@ mod tests {
         assert_eq!(reparsed.row_tag, RowTagMode::None);
     }
 
-    // Full config serialization roundtrip
+    /// A whole config.toml with nested sections parses, and everything it sets
+    /// survives a serialize/parse round trip.
     #[test]
-    fn test_config_serialization_roundtrip() {
-        let config = Config {
-            default_profile: "test".to_string(),
-            worktree: WorktreeConfig {
-                enabled: true,
-                ..Default::default()
-            },
-            sandbox: SandboxConfig {
-                enabled_by_default: true,
-                ..Default::default()
-            },
-            updates: UpdatesConfig {
-                update_check_mode: UpdateCheckMode::Auto,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        let serialized = toml::to_string(&config).unwrap();
-        let deserialized: Config = toml::from_str(&serialized).unwrap();
-
-        assert_eq!(config.default_profile, deserialized.default_profile);
-        assert_eq!(config.worktree.enabled, deserialized.worktree.enabled);
-        assert_eq!(
-            config.sandbox.enabled_by_default,
-            deserialized.sandbox.enabled_by_default
-        );
-        assert_eq!(
-            config.updates.update_check_mode,
-            deserialized.updates.update_check_mode
-        );
-    }
-
-    // Test nested sections in TOML
-    #[test]
-    fn test_config_nested_sections() {
-        let toml = r#"
+    fn config_nested_sections_round_trip() {
+        let config: Config = toml::from_str(
+            r#"
             default_profile = "work"
 
             [theme]
@@ -4467,28 +4280,24 @@ mod tests {
             enabled_by_default = true
 
             [updates]
-            update_check_mode = "notify"
+            update_check_mode = "auto"
 
             [app_state]
             has_seen_welcome = true
-        "#;
-
-        let config: Config = toml::from_str(toml).unwrap();
-        assert_eq!(config.default_profile, "work");
-        assert_eq!(config.theme.name, "monokai");
-        assert!(config.worktree.enabled);
-        assert_eq!(config.worktree.path_template, "../wt/{branch}");
-        assert!(config.sandbox.enabled_by_default);
-        assert_eq!(config.updates.update_check_mode, UpdateCheckMode::Notify);
+            "#,
+        )
+        .unwrap();
         assert!(config.app_state.has_seen_welcome);
-    }
 
-    // Test get_update_settings helper
-    #[test]
-    fn test_get_update_settings_returns_defaults_when_no_config() {
-        // This test doesn't access the filesystem, so it should return defaults
-        let settings = UpdatesConfig::default();
-        assert_eq!(settings.update_check_mode, UpdateCheckMode::Notify);
+        let reparsed: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        for parsed in [&config, &reparsed] {
+            assert_eq!(parsed.default_profile, "work");
+            assert_eq!(parsed.theme.name, "monokai");
+            assert!(parsed.worktree.enabled);
+            assert_eq!(parsed.worktree.path_template, "../wt/{branch}");
+            assert!(parsed.sandbox.enabled_by_default);
+            assert_eq!(parsed.updates.update_check_mode, UpdateCheckMode::Auto);
+        }
     }
 
     // Tests for TmuxConfig
@@ -4503,6 +4312,12 @@ mod tests {
         use TmuxSettingMode::{Auto, Disabled, Enabled};
         let modes = |tmux: &TmuxConfig| (tmux.status_bar, tmux.mouse, tmux.clipboard);
         assert_eq!(modes(&TmuxConfig::default()), (Auto, Auto, Auto));
+
+        // `vt_live` predates the setting and defaulted on, so an existing
+        // config.toml without it must still come up live.
+        assert!(TmuxConfig::default().vt_live);
+        let tmux: TmuxConfig = toml::from_str("vt_live = false").unwrap();
+        assert!(!tmux.vt_live);
 
         let cases = [
             // Absent fields fall back to `auto` through `#[serde(default)]`.
@@ -4537,17 +4352,6 @@ mod tests {
     }
 
     #[test]
-    fn test_tmux_config_vt_live_defaults_on_and_deserializes_off() {
-        // Absent from an existing config.toml => on (the pre-setting
-        // behavior; the AOE_VT_LIVE env hatch this replaces defaulted on).
-        let tmux: TmuxConfig = toml::from_str(r#""#).unwrap();
-        assert!(tmux.vt_live, "vt_live must default on when absent");
-        // Explicit off round-trips.
-        let tmux: TmuxConfig = toml::from_str(r#"vt_live = false"#).unwrap();
-        assert!(!tmux.vt_live);
-    }
-
-    #[test]
     fn test_vt_live_in_settings_schema() {
         // The single-source schema must expose the toggle so both the TUI
         // and web settings render it (docs/development/adding-settings.md).
@@ -4557,11 +4361,7 @@ mod tests {
             .find(|f| f.section == "tmux" && f.field == "vt_live")
             .expect("vt_live field in tmux schema section");
         assert!(field.advanced, "vt_live should sit under the Advanced fold");
-        assert!(
-            !field.profile_overridable,
-            "vt_live is machine-level (the server reads global config); a \
-             profile override would desync the TUI and web transports"
-        );
+        assert!(!field.profile_overridable);
     }
 
     #[test]
@@ -4594,53 +4394,34 @@ mod tests {
         }
     }
 
-    // Tests for DiffConfig
+    /// The `[diff]` defaults, the keys config.toml may set, and that
+    /// `split_view` survives a serialize/parse round trip.
     #[test]
-    fn test_diff_config_default() {
+    fn diff_config_defaults_and_keys() {
         let diff = DiffConfig::default();
         assert!(diff.default_branch.is_none());
         assert_eq!(diff.context_lines, 3);
-    }
+        assert!(!diff.split_view);
 
-    #[test]
-    fn test_diff_config_deserialize() {
-        let toml = r#"
-            default_branch = "main"
-            context_lines = 5
-        "#;
-        let diff: DiffConfig = toml::from_str(toml).unwrap();
-        assert_eq!(diff.default_branch, Some("main".to_string()));
-        assert_eq!(diff.context_lines, 5);
-    }
-
-    #[test]
-    fn test_diff_config_partial_deserialize() {
-        let toml = r#"default_branch = "develop""#;
-        let diff: DiffConfig = toml::from_str(toml).unwrap();
+        let diff: DiffConfig = toml::from_str(r#"default_branch = "develop""#).unwrap();
         assert_eq!(diff.default_branch, Some("develop".to_string()));
         assert_eq!(diff.context_lines, 3);
-    }
 
-    #[test]
-    fn test_diff_config_in_full_config() {
-        let toml = r#"
+        let config: Config = toml::from_str(
+            r#"
             [diff]
             default_branch = "main"
             context_lines = 10
-        "#;
-        let config: Config = toml::from_str(toml).unwrap();
+            split_view = true
+            "#,
+        )
+        .unwrap();
         assert_eq!(config.diff.default_branch, Some("main".to_string()));
         assert_eq!(config.diff.context_lines, 10);
-    }
+        assert!(config.diff.split_view);
 
-    #[test]
-    fn diff_config_split_view_roundtrips() {
-        let mut cfg = DiffConfig::default();
-        assert!(!cfg.split_view);
-        cfg.split_view = true;
-        let toml = toml::to_string(&cfg).unwrap();
-        let back: DiffConfig = toml::from_str(&toml).unwrap();
-        assert!(back.split_view);
+        let reparsed: DiffConfig = toml::from_str(&toml::to_string(&config.diff).unwrap()).unwrap();
+        assert!(reparsed.split_view);
     }
 
     #[test]
@@ -4668,13 +4449,11 @@ mod tests {
         let deserialized: Config = toml::from_str(&serialized).unwrap();
         assert_eq!(
             deserialized.session.agent_command_override.get("claude"),
-            Some(&"safehouse".to_string()),
-            "agent_command_override should survive roundtrip"
+            Some(&"safehouse".to_string())
         );
         assert_eq!(
             deserialized.session.agent_extra_args.get("opencode"),
-            Some(&"--port 8080".to_string()),
-            "agent_extra_args should survive roundtrip"
+            Some(&"--port 8080".to_string())
         );
         assert_eq!(
             deserialized.acp.acp_defaults.get("opencode"),
@@ -4688,8 +4467,11 @@ mod tests {
         );
     }
 
+    /// The `[agents.*]` status map and rules keep their on-disk shape through a
+    /// round trip, and an unknown status name fails the parse loudly rather
+    /// than silently dropping the entry.
     #[test]
-    fn agent_status_map_roundtrips() {
+    fn agent_status_map_and_rules_round_trip() {
         let mut config = Config::default();
         config
             .agents
@@ -4697,32 +4479,17 @@ mod tests {
             .or_default()
             .status_map
             .insert("Stop".to_string(), crate::agents::HookStatus::Error);
-
         let serialized = toml::to_string_pretty(&config).unwrap();
         assert!(serialized.contains("[agents.claude.status_map]"));
-        assert!(serialized.contains("Stop = \"error\""));
-
-        let deserialized: Config = toml::from_str(&serialized).unwrap();
+        assert!(serialized.contains(r#"Stop = "error""#));
+        let reparsed: Config = toml::from_str(&serialized).unwrap();
         assert_eq!(
-            deserialized.agents["claude"].status_map.get("Stop"),
+            reparsed.agents["claude"].status_map.get("Stop"),
             Some(&crate::agents::HookStatus::Error)
         );
-    }
 
-    #[test]
-    fn agent_status_map_rejects_invalid_status() {
-        let toml = r#"
-            [agents.claude.status_map]
-            Stop = "stopped"
-        "#;
-
-        let err = toml::from_str::<Config>(toml).unwrap_err();
-        assert!(err.to_string().contains("stopped"));
-    }
-
-    #[test]
-    fn agent_status_rules_roundtrip() {
-        let toml = r#"
+        let config: Config = toml::from_str(
+            r#"
             [[agents.gjc.status_rules]]
             status = "running"
             contains = "esc to interrupt"
@@ -4730,9 +4497,9 @@ mod tests {
             [[agents.gjc.status_rules]]
             status = "waiting"
             regex = "\\(y/n\\)"
-        "#;
-
-        let config: Config = toml::from_str(toml).unwrap();
+            "#,
+        )
+        .unwrap();
         let rules = &config.agents["gjc"].status_rules;
         assert_eq!(rules.len(), 2);
         assert_eq!(rules[0].status, crate::agents::HookStatus::Running);
@@ -4740,47 +4507,49 @@ mod tests {
         assert!(rules[0].regex.is_none());
         assert_eq!(rules[1].status, crate::agents::HookStatus::Waiting);
         assert_eq!(rules[1].regex.as_deref(), Some(r"\(y/n\)"));
-
         let serialized = toml::to_string_pretty(&config).unwrap();
         assert!(serialized.contains("[[agents.gjc.status_rules]]"));
         let reparsed: Config = toml::from_str(&serialized).unwrap();
         assert_eq!(reparsed.agents["gjc"].status_rules, *rules);
+
+        for source in [
+            "[agents.claude.status_map]\nStop = \"stopped\"\n",
+            "[[agents.gjc.status_rules]]\nstatus = \"stopped\"\ncontains = \"x\"\n",
+        ] {
+            let err = toml::from_str::<Config>(source).unwrap_err();
+            assert!(err.to_string().contains("stopped"), "{source}");
+        }
     }
 
+    /// Every accessor on `AcpAgentDefaults` treats a blank string as unset, and
+    /// the per-model effort wins over the flat one only when it has a value.
     #[test]
-    fn agent_status_rules_reject_invalid_status() {
-        let toml = r#"
-            [[agents.gjc.status_rules]]
-            status = "stopped"
-            contains = "x"
-        "#;
+    fn acp_defaults_read_blank_values_as_unset() {
+        let mut defaults = AcpAgentDefaults::default();
+        assert_eq!(defaults.mode(), None);
+        assert_eq!(defaults.model(), None);
+        for blank in [Some(String::new()), None] {
+            defaults.mode.clone_from(&blank);
+            defaults.model.clone_from(&blank);
+            assert_eq!(defaults.mode(), None);
+            assert_eq!(defaults.model(), None);
+        }
+        defaults.mode = Some("plan".to_string());
+        defaults.model = Some("openai/gpt-5.5".to_string());
+        assert_eq!(defaults.mode().as_deref(), Some("plan"));
+        assert_eq!(defaults.model().as_deref(), Some("openai/gpt-5.5"));
 
-        let err = toml::from_str::<Config>(toml).unwrap_err();
-        assert!(err.to_string().contains("stopped"));
-    }
-
-    #[test]
-    fn acp_defaults_effort_for_model_prefers_per_model_then_flat() {
-        let mut defaults = AcpAgentDefaults {
-            effort: Some("low".to_string()),
-            ..Default::default()
-        };
+        defaults.effort = Some("low".to_string());
         defaults
             .effort_by_model
             .insert("gpt-5".to_string(), "high".to_string());
-
-        // Matching model uses the per-model override.
         assert_eq!(
             defaults.effort_for_model(Some("gpt-5")).as_deref(),
             Some("high")
         );
-        // Non-matching model and the no-model case fall back to the flat effort.
-        assert_eq!(
-            defaults.effort_for_model(Some("other")).as_deref(),
-            Some("low")
-        );
-        assert_eq!(defaults.effort_for_model(None).as_deref(), Some("low"));
-        // An empty per-model value is treated as unset and falls back.
+        for model in [Some("other"), None] {
+            assert_eq!(defaults.effort_for_model(model).as_deref(), Some("low"));
+        }
         defaults
             .effort_by_model
             .insert("gpt-5".to_string(), String::new());
@@ -4790,45 +4559,22 @@ mod tests {
         );
     }
 
+    /// A pin needs both the flag and a non-blank model; a plain default is not
+    /// one, and an agent with no entry is not pinned either.
     #[test]
-    fn acp_defaults_is_empty_covers_new_fields() {
-        let mut defaults = AcpAgentDefaults::default();
-        assert!(defaults.is_empty());
-        defaults.mode = Some("plan".to_string());
-        assert!(!defaults.is_empty());
-
-        let mut with_map = AcpAgentDefaults::default();
-        with_map
-            .effort_by_model
-            .insert("gpt-5".to_string(), "high".to_string());
-        assert!(!with_map.is_empty());
-
-        let with_pin = AcpAgentDefaults {
-            pin_model: true,
-            ..Default::default()
-        };
-        assert!(!with_pin.is_empty());
-    }
-
-    #[test]
-    fn acp_defaults_pinned_model_needs_both_the_flag_and_a_model() {
+    fn acp_pinned_model_needs_the_flag_and_a_model() {
         let mut defaults = AcpAgentDefaults {
             model: Some("openai/gpt-5.5".to_string()),
             ..Default::default()
         };
-        // A plain default is not a pin.
         assert_eq!(defaults.pinned_model(), None);
         defaults.pin_model = true;
         assert_eq!(defaults.pinned_model().as_deref(), Some("openai/gpt-5.5"));
-        // The flag alone pins nothing: a blank model is unset, as everywhere.
-        defaults.model = Some(String::new());
-        assert_eq!(defaults.pinned_model(), None);
-        defaults.model = None;
-        assert_eq!(defaults.pinned_model(), None);
-    }
+        for blank in [Some(String::new()), None] {
+            defaults.model = blank;
+            assert_eq!(defaults.pinned_model(), None);
+        }
 
-    #[test]
-    fn acp_config_pinned_model_for_ignores_a_plain_default() {
         let mut config = AcpConfig::default();
         config.acp_defaults.insert(
             "opencode".to_string(),
@@ -4853,175 +4599,115 @@ mod tests {
         assert_eq!(config.pinned_model_for("gemini"), None);
     }
 
+    /// `is_empty` covers every field, so a default that only sets one of them
+    /// is still written out.
     #[test]
-    fn acp_defaults_mode_treats_empty_as_unset() {
-        let mut defaults = AcpAgentDefaults::default();
-        assert_eq!(defaults.mode(), None);
-        defaults.mode = Some(String::new());
-        assert_eq!(defaults.mode(), None);
-        defaults.mode = Some("plan".to_string());
-        assert_eq!(defaults.mode().as_deref(), Some("plan"));
-    }
+    fn acp_defaults_is_empty_covers_every_field() {
+        assert!(AcpAgentDefaults::default().is_empty());
 
-    #[test]
-    fn acp_defaults_model_treats_empty_as_unset() {
-        let mut defaults = AcpAgentDefaults::default();
-        assert_eq!(defaults.model(), None);
-        defaults.model = Some(String::new());
-        assert_eq!(defaults.model(), None);
-        defaults.model = Some("openai/gpt-5.5".to_string());
-        assert_eq!(defaults.model().as_deref(), Some("openai/gpt-5.5"));
-    }
-
-    #[test]
-    fn resolve_spawn_model_effort_explicit_request_wins() {
-        let defaults = AcpAgentDefaults {
-            model: Some("openai/gpt-5.5".to_string()),
-            effort: Some("low".to_string()),
+        let with_mode = AcpAgentDefaults {
+            mode: Some("plan".to_string()),
             ..Default::default()
         };
-        let (model, effort) = resolve_spawn_model_effort(
-            Some(&defaults),
-            Some("anthropic/claude".to_string()),
-            Some("high".to_string()),
-        );
-        assert_eq!(model.as_deref(), Some("anthropic/claude"));
-        assert_eq!(effort.as_deref(), Some("high"));
-    }
+        assert!(!with_mode.is_empty());
 
-    #[test]
-    fn resolve_spawn_model_effort_falls_back_to_default() {
-        let defaults = AcpAgentDefaults {
-            model: Some("openai/gpt-5.5".to_string()),
-            effort: Some("low".to_string()),
-            ..Default::default()
-        };
-        let (model, effort) = resolve_spawn_model_effort(Some(&defaults), None, None);
-        assert_eq!(model.as_deref(), Some("openai/gpt-5.5"));
-        assert_eq!(effort.as_deref(), Some("low"));
-    }
-
-    #[test]
-    fn resolve_spawn_model_effort_blank_request_treated_as_unset() {
-        let defaults = AcpAgentDefaults {
-            model: Some("openai/gpt-5.5".to_string()),
-            effort: Some("low".to_string()),
-            ..Default::default()
-        };
-        let (model, effort) = resolve_spawn_model_effort(
-            Some(&defaults),
-            Some("   ".to_string()),
-            Some(String::new()),
-        );
-        assert_eq!(model.as_deref(), Some("openai/gpt-5.5"));
-        assert_eq!(effort.as_deref(), Some("low"));
-    }
-
-    #[test]
-    fn resolve_spawn_model_effort_per_model_effort_keyed_on_resolved_model() {
-        let mut defaults = AcpAgentDefaults {
-            model: Some("gpt-5".to_string()),
-            effort: Some("low".to_string()),
-            ..Default::default()
-        };
-        defaults
+        let mut with_map = AcpAgentDefaults::default();
+        with_map
             .effort_by_model
             .insert("gpt-5".to_string(), "high".to_string());
-        // Model resolves to the default gpt-5, so the per-model effort applies.
-        let (model, effort) = resolve_spawn_model_effort(Some(&defaults), None, None);
-        assert_eq!(model.as_deref(), Some("gpt-5"));
-        assert_eq!(effort.as_deref(), Some("high"));
-        // An explicit model that has no per-model override falls back to flat.
-        let (model, effort) =
-            resolve_spawn_model_effort(Some(&defaults), Some("other".to_string()), None);
-        assert_eq!(model.as_deref(), Some("other"));
-        assert_eq!(effort.as_deref(), Some("low"));
-    }
+        assert!(!with_map.is_empty());
 
-    #[test]
-    fn resolve_spawn_model_effort_trims_padded_request_values() {
-        let mut defaults = AcpAgentDefaults {
-            effort: Some("low".to_string()),
-            ..Default::default()
-        };
-        defaults
-            .effort_by_model
-            .insert("gpt-5".to_string(), "high".to_string());
-        // A padded request model is trimmed before it is retained, so it both
-        // persists clean and matches its per-model effort override.
-        let (model, effort) = resolve_spawn_model_effort(
-            Some(&defaults),
-            Some("  gpt-5  ".to_string()),
-            Some("  high  ".to_string()),
-        );
-        assert_eq!(model.as_deref(), Some("gpt-5"));
-        assert_eq!(effort.as_deref(), Some("high"));
-        // With no explicit effort, the trimmed model still keys the per-model
-        // override.
-        let (model, effort) =
-            resolve_spawn_model_effort(Some(&defaults), Some("  gpt-5  ".to_string()), None);
-        assert_eq!(model.as_deref(), Some("gpt-5"));
-        assert_eq!(effort.as_deref(), Some("high"));
-    }
-
-    #[test]
-    fn resolve_spawn_model_effort_no_defaults_no_request_is_none() {
-        let (model, effort) = resolve_spawn_model_effort(None, None, None);
-        assert_eq!(model, None);
-        assert_eq!(effort, None);
-    }
-
-    #[test]
-    fn resolve_spawn_model_effort_ignores_blank_configured_pin() {
-        let defaults = AcpAgentDefaults {
-            model: Some(" \t\n".into()),
-            pin_model: true,
-            effort_by_model: HashMap::from([("requested".into(), "high".into())]),
-            ..Default::default()
-        };
-        assert_eq!(
-            resolve_spawn_model_effort(Some(&defaults), Some("requested".into()), None),
-            (Some("requested".into()), Some("high".into()))
-        );
-        assert_eq!(
-            resolve_spawn_model_effort(Some(&defaults), None, None),
-            (None, None)
-        );
-    }
-
-    #[test]
-    fn resolve_spawn_model_effort_pin_replaces_an_explicit_request() {
-        let mut defaults = AcpAgentDefaults {
-            model: Some("openai/gpt-5.5".to_string()),
-            effort: Some("low".to_string()),
+        let with_pin = AcpAgentDefaults {
             pin_model: true,
             ..Default::default()
         };
-        defaults
-            .effort_by_model
-            .insert("openai/gpt-5.5".to_string(), "high".to_string());
-        // The request names another model: the pin wins, and the per-model
-        // effort is keyed on the pin rather than on the request.
-        let (model, effort) =
-            resolve_spawn_model_effort(Some(&defaults), Some("anthropic/claude".to_string()), None);
-        assert_eq!(model.as_deref(), Some("openai/gpt-5.5"));
-        assert_eq!(effort.as_deref(), Some("high"));
-        // The pin is on the model only; an explicit effort is still honored.
-        let (model, effort) = resolve_spawn_model_effort(
-            Some(&defaults),
-            Some("anthropic/claude".to_string()),
-            Some("medium".to_string()),
+        assert!(!with_pin.is_empty());
+    }
+
+    /// Spawn resolution precedence: a pin replaces the request, an explicit
+    /// request otherwise beats the configured default, blank values on either
+    /// side are unset, and the per-model effort is keyed on the model that
+    /// actually resolved (after trimming), not on the one that was asked for.
+    #[test]
+    fn resolve_spawn_model_effort_precedence() {
+        fn defaults(
+            model: Option<&str>,
+            effort: Option<&str>,
+            pin_model: bool,
+            by_model: &[(&str, &str)],
+        ) -> AcpAgentDefaults {
+            AcpAgentDefaults {
+                model: model.map(str::to_string),
+                effort: effort.map(str::to_string),
+                pin_model,
+                effort_by_model: by_model
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect(),
+                ..Default::default()
+            }
+        }
+
+        let flat = defaults(Some("def"), Some("lo"), false, &[]);
+        let keyed = defaults(Some("def"), Some("lo"), false, &[("def", "hi")]);
+        let bare = defaults(None, Some("lo"), false, &[("def", "hi")]);
+        let blank_pin = defaults(Some(" \t\n"), None, true, &[("req", "hi")]);
+        let pinned = defaults(Some("def"), Some("lo"), true, &[("def", "hi")]);
+
+        // (defaults, requested model, requested effort, resolved model, resolved effort)
+        type Case<'a> = (
+            Option<&'a AcpAgentDefaults>,
+            Option<&'a str>,
+            Option<&'a str>,
+            Option<&'a str>,
+            Option<&'a str>,
         );
-        assert_eq!(model.as_deref(), Some("openai/gpt-5.5"));
-        assert_eq!(effort.as_deref(), Some("medium"));
-        // With no request at all the pin fills in like a default would.
-        let (model, _) = resolve_spawn_model_effort(Some(&defaults), None, None);
-        assert_eq!(model.as_deref(), Some("openai/gpt-5.5"));
-        // Without the flag the same entry is a default: the request wins.
-        defaults.pin_model = false;
-        let (model, _) =
-            resolve_spawn_model_effort(Some(&defaults), Some("anthropic/claude".to_string()), None);
-        assert_eq!(model.as_deref(), Some("anthropic/claude"));
+        let cases: &[Case] = &[
+            (
+                Some(&flat),
+                Some("req"),
+                Some("hi"),
+                Some("req"),
+                Some("hi"),
+            ),
+            (Some(&flat), None, None, Some("def"), Some("lo")),
+            (Some(&flat), Some("  "), Some(""), Some("def"), Some("lo")),
+            (Some(&keyed), None, None, Some("def"), Some("hi")),
+            (Some(&keyed), Some("req"), None, Some("req"), Some("lo")),
+            (
+                Some(&bare),
+                Some(" def "),
+                Some(" hi "),
+                Some("def"),
+                Some("hi"),
+            ),
+            (Some(&bare), Some(" def "), None, Some("def"), Some("hi")),
+            (None, None, None, None, None),
+            (Some(&blank_pin), Some("req"), None, Some("req"), Some("hi")),
+            (Some(&blank_pin), None, None, None, None),
+            (Some(&pinned), Some("req"), None, Some("def"), Some("hi")),
+            (
+                Some(&pinned),
+                Some("req"),
+                Some("med"),
+                Some("def"),
+                Some("med"),
+            ),
+            (Some(&pinned), None, None, Some("def"), Some("hi")),
+        ];
+
+        for (defaults, model, effort, want_model, want_effort) in cases {
+            let resolved = resolve_spawn_model_effort(
+                *defaults,
+                model.map(str::to_string),
+                effort.map(str::to_string),
+            );
+            assert_eq!(
+                (resolved.0.as_deref(), resolved.1.as_deref()),
+                (*want_model, *want_effort),
+                "model={model:?} effort={effort:?}"
+            );
+        }
     }
 
     #[test]
@@ -5043,89 +4729,62 @@ mod tests {
         assert!(session.host_tab_title, "host_tab_title (#3444)");
     }
 
+    /// `background` defaults to false, round-trips when set, and is omitted
+    /// from the serialized form when it is false.
     #[test]
-    fn test_tool_background_defaults_false_when_absent() {
-        let toml = r#"
+    fn tool_background_defaults_off_and_round_trips() {
+        let config: Config = toml::from_str(
+            r#"
             [tools.github]
             command = "gh repo view --web"
-        "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        assert!(!cfg.tools["github"].background);
-    }
 
-    #[test]
-    fn test_tool_background_roundtrips_when_enabled() {
-        let toml = r#"
-            [tools.github]
-            command = "gh repo view --web"
+            [tools.lazygit]
+            command = "lazygit"
             hotkey = "Alt+o"
             background = true
-        "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        assert!(cfg.tools["github"].background);
+            "#,
+        )
+        .unwrap();
+        assert!(!config.tools["github"].background);
+        assert!(config.tools["lazygit"].background);
 
-        let serialized = toml::to_string_pretty(&cfg).unwrap();
+        let serialized = toml::to_string_pretty(&config).unwrap();
         assert!(serialized.contains("background = true"));
+        assert!(!serialized.contains("background = false"));
         let reparsed: Config = toml::from_str(&serialized).unwrap();
-        assert!(reparsed.tools["github"].background);
+        assert!(reparsed.tools["lazygit"].background);
+        assert!(!reparsed.tools["github"].background);
     }
 
+    /// A non-empty `agent_command_override` wins, an empty one falls through to
+    /// `custom_agents`, and a tool neither names resolves to nothing.
     #[test]
-    fn test_tool_background_false_is_omitted() {
-        let mut cfg = Config::default();
-        cfg.tools.insert(
-            "lazygit".to_string(),
-            ToolSessionConfig {
-                command: "lazygit".to_string(),
-                hotkey: None,
-                background: false,
-            },
-        );
-
-        let serialized = toml::to_string_pretty(&cfg).unwrap();
-        assert!(!serialized.contains("background"));
-    }
-
-    #[test]
-    fn test_resolve_tool_command_prefers_command_override() {
-        let mut config = SessionConfig::default();
-        config
-            .agent_command_override
-            .insert("my-agent".to_string(), "override-cmd".to_string());
-        config
-            .custom_agents
-            .insert("my-agent".to_string(), "custom-cmd".to_string());
-        assert_eq!(config.resolve_tool_command("my-agent"), "override-cmd");
-    }
-
-    #[test]
-    fn test_resolve_tool_command_falls_back_to_custom_agents() {
-        let mut config = SessionConfig::default();
-        config
-            .custom_agents
-            .insert("my-agent".to_string(), "ssh -t host claude".to_string());
-        assert_eq!(
-            config.resolve_tool_command("my-agent"),
-            "ssh -t host claude"
-        );
-    }
-
-    #[test]
-    fn test_resolve_tool_command_skips_empty_override() {
-        let mut config = SessionConfig::default();
-        config
-            .agent_command_override
-            .insert("my-agent".to_string(), String::new());
-        config
-            .custom_agents
-            .insert("my-agent".to_string(), "custom-cmd".to_string());
-        assert_eq!(config.resolve_tool_command("my-agent"), "custom-cmd");
-    }
-
-    #[test]
-    fn test_resolve_tool_command_returns_empty_for_unknown() {
-        let config = SessionConfig::default();
-        assert_eq!(config.resolve_tool_command("nonexistent"), "");
+    fn resolve_tool_command_precedence() {
+        // (override, custom_agents entry, resolved command)
+        let cases = [
+            (Some("override-cmd"), Some("custom-cmd"), "override-cmd"),
+            (None, Some("ssh -t host claude"), "ssh -t host claude"),
+            (Some(""), Some("custom-cmd"), "custom-cmd"),
+            (None, None, ""),
+        ];
+        for (override_cmd, custom, expected) in cases {
+            let mut config = SessionConfig::default();
+            if let Some(value) = override_cmd {
+                config
+                    .agent_command_override
+                    .insert("my-agent".to_string(), value.to_string());
+            }
+            if let Some(value) = custom {
+                config
+                    .custom_agents
+                    .insert("my-agent".to_string(), value.to_string());
+            }
+            assert_eq!(
+                config.resolve_tool_command("my-agent"),
+                expected,
+                "override={override_cmd:?} custom={custom:?}"
+            );
+        }
     }
 
     #[test]
@@ -5162,51 +4821,22 @@ mod tests {
         assert_eq!(config.agent_config_dir_for("other-agent", home), None);
     }
 
+    /// Both duration validators bound their input, and every snooze preset the
+    /// TUI dialog offers (1-6h, 24h, 1 week) passes the one behind the API.
     #[test]
-    fn test_session_config_default_snooze_duration_is_30() {
-        let config = SessionConfig::default();
-        assert_eq!(
-            config.snooze_duration_minutes, 30,
-            "default snooze duration must be 30 minutes"
-        );
-    }
+    fn duration_validators_bound_their_inputs() {
+        assert_eq!(SessionConfig::default().snooze_duration_minutes, 30);
 
-    #[test]
-    fn test_validate_snooze_duration_accepts_valid_range() {
-        assert!(validate_snooze_duration(1).is_ok());
-        assert!(validate_snooze_duration(30).is_ok());
-        assert!(validate_snooze_duration(1440).is_ok());
-    }
-
-    #[test]
-    fn test_validate_snooze_duration_rejects_out_of_range() {
+        for minutes in [1u64, 30, 60, 120, 180, 240, 300, 360, 1440, 7 * 1440] {
+            assert!(validate_snooze_duration(minutes).is_ok(), "{minutes} min");
+        }
         assert!(validate_snooze_duration(0).is_err());
         assert!(validate_snooze_duration(SNOOZE_MAX_MINUTES + 1).is_err());
-    }
 
-    #[test]
-    fn test_validate_auto_stop_idle_secs_accepts_u32_range() {
-        assert!(validate_auto_stop_idle_secs(0).is_ok());
-        assert!(validate_auto_stop_idle_secs(3600).is_ok());
-        assert!(validate_auto_stop_idle_secs(u32::MAX as u64).is_ok());
-    }
-
-    #[test]
-    fn test_validate_auto_stop_idle_secs_rejects_above_u32() {
-        assert!(validate_auto_stop_idle_secs(u32::MAX as u64 + 1).is_err());
-    }
-
-    #[test]
-    fn test_validate_snooze_duration_accepts_dialog_presets() {
-        // The TUI dialog presets must all pass the validator; otherwise
-        // the API silently rejects what the UI offered. Presets:
-        // 1-6h (60-360 min), 24h (1 day), 1 week.
-        for &m in &[60u64, 120, 180, 240, 300, 360, 1440, 7 * 1440] {
-            assert!(
-                validate_snooze_duration(m).is_ok(),
-                "preset {m} min must pass validator"
-            );
+        for secs in [0, 3600, u32::MAX as u64] {
+            assert!(validate_auto_stop_idle_secs(secs).is_ok(), "{secs}s");
         }
+        assert!(validate_auto_stop_idle_secs(u32::MAX as u64 + 1).is_err());
     }
 
     #[test]
@@ -5320,41 +4950,28 @@ keep_count = 10
         assert_eq!(reparsed.rotation, RotationKind::Never);
     }
 
+    /// `volume_ignores_strategy` defaults to anonymous and both spellings
+    /// survive a serialize/parse round trip.
     #[test]
-    fn test_volume_ignores_strategy_defaults_to_anonymous() {
-        let config: SandboxConfig = toml::from_str("").unwrap();
-        assert_eq!(
-            config.volume_ignores_strategy,
-            VolumeIgnoresStrategy::Anonymous
-        );
-    }
-
-    #[test]
-    fn test_volume_ignores_strategy_named_roundtrip() {
-        let toml_str = r#"
-volume_ignores = ["node_modules"]
-volume_ignores_strategy = "named"
-"#;
-        let config: SandboxConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.volume_ignores_strategy, VolumeIgnoresStrategy::Named);
-        assert_eq!(config.volume_ignores, vec!["node_modules"]);
-
-        let serialized = toml::to_string(&config).unwrap();
-        let reparsed: SandboxConfig = toml::from_str(&serialized).unwrap();
-        assert_eq!(
-            reparsed.volume_ignores_strategy,
-            VolumeIgnoresStrategy::Named
-        );
-    }
-
-    #[test]
-    fn test_volume_ignores_strategy_anonymous_roundtrip() {
-        let toml_str = r#"volume_ignores_strategy = "anonymous""#;
-        let config: SandboxConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(
-            config.volume_ignores_strategy,
-            VolumeIgnoresStrategy::Anonymous
-        );
+    fn volume_ignores_strategy_spellings_round_trip() {
+        let cases = [
+            ("", VolumeIgnoresStrategy::Anonymous),
+            (
+                r#"volume_ignores_strategy = "anonymous""#,
+                VolumeIgnoresStrategy::Anonymous,
+            ),
+            (
+                "volume_ignores = [\"node_modules\"]\nvolume_ignores_strategy = \"named\"",
+                VolumeIgnoresStrategy::Named,
+            ),
+        ];
+        for (source, expected) in cases {
+            let config: SandboxConfig = toml::from_str(source).unwrap();
+            assert_eq!(config.volume_ignores_strategy, expected, "{source}");
+            let reparsed: SandboxConfig =
+                toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+            assert_eq!(reparsed.volume_ignores_strategy, expected, "{source}");
+        }
     }
 
     // Tests for the config.toml / state.toml split and update_config /
@@ -5400,39 +5017,32 @@ volume_ignores_strategy = "named"
         );
     }
 
+    /// App state lives in state.toml alone: `update_config` never writes an
+    /// `[app_state]` table into config.toml, and `Config::load` picks the
+    /// state up from state.toml.
     #[test]
     #[serial_test::serial]
-    fn update_config_strips_app_state_from_config_toml() {
+    fn app_state_is_written_to_state_toml_not_config_toml() {
         let _guard = crate::session::test_support::isolate_app_dir();
 
-        update_config(|c| {
-            c.app_state.has_seen_welcome = true;
-            c.default_profile = "x".to_string();
+        update_config(|config| {
+            config.app_state.has_seen_welcome = true;
+            config.default_profile = "x".to_string();
         })
         .unwrap();
-
         let raw = fs::read_to_string(config_path().unwrap()).unwrap();
         let table: toml::Table = raw.parse().unwrap();
-        assert!(
-            !table.contains_key("app_state"),
-            "app_state must never be written into config.toml: {raw}"
-        );
-    }
+        assert!(!table.contains_key("app_state"), "config.toml: {raw}");
 
-    #[test]
-    #[serial_test::serial]
-    fn config_load_reads_app_state_from_state_toml() {
-        let _guard = crate::session::test_support::isolate_app_dir();
-
-        update_app_state(|s| {
-            s.has_seen_welcome = true;
+        update_app_state(|state| {
+            state.has_seen_welcome = true;
         })
         .unwrap();
-
-        let config = Config::load().unwrap();
-        assert!(config.app_state.has_seen_welcome);
+        assert!(Config::load().unwrap().app_state.has_seen_welcome);
     }
 
+    /// With no state.toml, app state defaults rather than falling back to an
+    /// `[app_state]` table an older build left in config.toml.
     #[test]
     #[serial_test::serial]
     fn config_load_ignores_app_state_in_config_toml() {
@@ -5445,48 +5055,29 @@ volume_ignores_strategy = "named"
         )
         .unwrap();
 
-        // No state.toml exists, so app_state must default rather than fall
-        // back to the stale config.toml value.
-        let config = Config::load().unwrap();
-        assert!(
-            !config.app_state.has_seen_welcome,
-            "a stale [app_state] left in config.toml must never be consulted"
-        );
+        assert!(!Config::load().unwrap().app_state.has_seen_welcome);
     }
 
+    /// `update_app_state` applies the mutation, persists it, and hands back
+    /// whatever the closure returned.
     #[test]
     #[serial_test::serial]
-    fn update_app_state_roundtrip() {
+    fn update_app_state_persists_and_returns_the_closures_value() {
         let _guard = crate::session::test_support::isolate_app_dir();
 
-        update_app_state(|s| {
-            s.has_seen_welcome = true;
-            s.tips_seen = vec!["new-from-selection".to_string()];
-        })
-        .unwrap();
-
-        let loaded = AppStateConfig::load().unwrap();
-        assert!(loaded.has_seen_welcome);
-        assert_eq!(loaded.tips_seen, vec!["new-from-selection".to_string()]);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn update_app_state_applies_mutation_and_persists() {
-        let _guard = crate::session::test_support::isolate_app_dir();
-
-        let returned = update_app_state(|s| {
-            s.has_seen_web_tour = true;
+        let returned = update_app_state(|state| {
+            state.has_seen_welcome = true;
+            state.has_seen_web_tour = true;
+            state.tips_seen = vec!["new-from-selection".to_string()];
             42
         })
         .unwrap();
-        assert_eq!(
-            returned, 42,
-            "update_app_state must return the closure's value"
-        );
+        assert_eq!(returned, 42);
 
         let loaded = AppStateConfig::load().unwrap();
+        assert!(loaded.has_seen_welcome);
         assert!(loaded.has_seen_web_tour);
+        assert_eq!(loaded.tips_seen, vec!["new-from-selection".to_string()]);
     }
 
     #[test]

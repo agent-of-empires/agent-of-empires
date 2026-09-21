@@ -1,19 +1,13 @@
 // @vitest-environment jsdom
-//
-// Contract test for TerminalView's pending / error early-return
-// branches. The full mounted-terminal path is exercised by the
-// Playwright suites; this test just asserts the loading placeholder
-// and the error retry surface render correctly without touching the
-// xterm.js mount chain.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor, act } from "@testing-library/react";
 
 import type { SessionResponse } from "../../lib/types";
+import { makeSession as baseSession } from "./fixtures";
 
-// ── Mock the chain of dependencies the component pulls in so the
-// render stops at the early-return without trying to mount a real
-// terminal or open a WebSocket.
+// ── Mock the chain of dependencies the component pulls in so the render stops at the early-return without trying
+// to mount a real terminal or open a WebSocket.
 
 const ensureSession = vi.fn(async () => ({ ok: true }));
 const mockedContainerRef = { current: null } as const;
@@ -29,9 +23,7 @@ vi.mock("../../lib/api", () => ({
   ensureTerminal: vi.fn(),
 }));
 
-// The full hook is exercised by useTerminal.lifecycle.test.ts and the
-// Playwright suites. Stubbing it here keeps the component test fast
-// and free of jsdom canvas warnings.
+// The full hook is exercised by useTerminal.lifecycle.test.ts and the Playwright suites.
 vi.mock("../../hooks/useTerminal", () => ({
   useTerminal: () => ({
     containerRef: mockedContainerRef,
@@ -66,28 +58,8 @@ vi.mock("../../hooks/useMobileKeyboard", () => ({
 
 import { TerminalView } from "../TerminalView";
 
-function makeSession(overrides: Partial<SessionResponse> = {}): SessionResponse {
-  return {
-    id: "sess-1",
-    title: "test-session",
-    project_path: "/tmp/test",
-    group_path: "/tmp",
-    tool: "claude",
-    status: "Running",
-    yolo_mode: false,
-    created_at: new Date().toISOString(),
-    last_accessed_at: null,
-    last_error: null,
-    branch: null,
-    main_repo_path: null,
-    is_sandboxed: false,
-    has_terminal: true,
-    profile: "default",
-    workspace_repos: [],
-    claude_fullscreen: false,
-    ...overrides,
-  } as SessionResponse;
-}
+const makeSession = (overrides: Partial<SessionResponse> = {}) =>
+  baseSession({ id: "sess-1", title: "test-session", project_path: "/tmp/test", status: "Running", ...overrides });
 
 afterEach(() => {
   ensureSession.mockReset();
@@ -137,9 +109,7 @@ describe("TerminalView early-return states", () => {
       expect(screen.getByText("first fail")).toBeDefined();
     });
     ensureSession.mockResolvedValueOnce({ ok: false, message: "second fail" });
-    // The error branch only ever renders one button. Scope to it
-    // explicitly so this test does not accidentally pick up the
-    // reconnect-retry button that the ready branch may also render.
+    // The error branch only ever renders one button.
     const retry = container.querySelector("button");
     if (!retry) throw new Error("no retry button rendered");
     await act(async () => {

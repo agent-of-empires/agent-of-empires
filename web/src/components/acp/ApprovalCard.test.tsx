@@ -1,41 +1,25 @@
 // @vitest-environment jsdom
-//
-// Approval card rendering + decision routing. The card is the only
-// UI gate between the agent and a destructive action, so the test
-// pins:
-//   - destructive vs benign chrome distinguishable to a screen
-//     reader (role=alertdialog, AlertTriangle vs Shield, label),
-//   - benign branch: single-tap Allow / Always / Deny each route
-//     `onResolve` with the matching ApprovalDecision,
-//   - destructive branch: only Hold-to-allow + Deny; instant click
-//     does NOT resolve until LONG_PRESS_MS elapses,
-//   - args_preview rendering: parsed JSON → <dl> with `_aoe_*` keys
-//     hidden; non-object → raw <pre>,
-//   - offline + rolled-back states disable the action surface,
-//   - a destructive answer list keeps the hold on every allowing option,
-//   - choice branch (#3741): an agent that puts a question in the
-//     option list gets its own labels rendered, and picking one posts
-//     back that option_id instead of an allow-once guess.
+// The card is the only UI gate before a destructive tool runs, so hold semantics are pinned closely.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import { ApprovalCard } from "./ApprovalCard";
-import type { Approval, ApprovalDecision } from "../../lib/acpTypes";
+import type { Approval, ApprovalOption } from "../../lib/acpTypes";
 
 vi.mock("../../lib/connectionState", () => ({
   useServerDown: () => false,
   OFFLINE_TITLE: "Disconnected",
 }));
 
-function makeApproval(over: Partial<Approval> = {}): Approval {
+function makeApproval(over: Partial<Approval> = {}, args: unknown = { command: "ls -al" }, name = "Bash"): Approval {
   return {
     nonce: "n-1",
     tool_call: {
       id: "t-1",
-      name: "Bash",
+      name,
       kind: "execute",
-      args_preview: JSON.stringify({ command: "ls -al" }),
+      args_preview: typeof args === "string" ? args : JSON.stringify(args),
       started_at: "2026-05-21T00:00:00Z",
     },
     destructive: false,
@@ -44,489 +28,227 @@ function makeApproval(over: Partial<Approval> = {}): Approval {
   };
 }
 
+function mount(approval: Approval, onResolve = vi.fn().mockResolvedValue(undefined)) {
+  render(<ApprovalCard approval={approval} onResolve={onResolve} />);
+  return onResolve;
+}
+
+const header = () => screen.getByRole("button", { name: /Approval needed/i });
+const hold = (el: HTMLElement, ms: number, start: "mouseDown" | "touchStart" = "mouseDown") => {
+  fireEvent[start](el);
+  act(() => {
+    vi.advanceTimersByTime(ms);
+  });
+};
+
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
 });
 
-describe("ApprovalCard (benign)", () => {
-  it("renders the tool name and Approval-needed chrome", () => {
-    const onResolve = vi.fn().mockResolvedValue(undefined);
-    render(<ApprovalCard approval={makeApproval()} onResolve={onResolve} />);
+describe("ApprovalCard args", () => {
+  it("renders the chrome and a collapsed command preview with actions reachable", () => {
+    mount(makeApproval({}, { command: "ls -al", cwd: "/tmp" }));
     expect(screen.getByRole("alertdialog", { name: /Approval needed: Bash/i })).toBeTruthy();
     expect(screen.getByText("Approval needed")).toBeTruthy();
-    expect(screen.getByText("Bash")).toBeTruthy();
-  });
-
-  it("collapses to a command preview and hides args until expanded", () => {
-    const onResolve = vi.fn().mockResolvedValue(undefined);
-    render(
-      <ApprovalCard
-        approval={makeApproval({
-          tool_call: {
-            id: "t-1",
-            name: "Bash",
-            kind: "execute",
-            args_preview: JSON.stringify({ command: "ls -al", cwd: "/tmp" }),
-            started_at: "2026-05-21T00:00:00Z",
-          },
-        })}
-        onResolve={onResolve}
-      />,
-    );
-    // Command preview is in the collapsed header; the args <dl> is not.
     expect(screen.getByText("ls -al")).toBeTruthy();
     expect(screen.queryByText("cwd")).toBeNull();
-    expect(screen.queryByText("/tmp")).toBeNull();
-    // Action surface stays reachable without expanding.
     expect(screen.getByText("Allow")).toBeTruthy();
     expect(screen.getByText("Deny")).toBeTruthy();
   });
 
   it("collapses opencode filepath metadata to a path preview", () => {
-    const onResolve = vi.fn().mockResolvedValue(undefined);
-    render(
-      <ApprovalCard
-        approval={makeApproval({
-          tool_call: {
-            id: "t-1",
-            name: "external_directory",
-            kind: "other",
-            args_preview: JSON.stringify({ filepath: "/tmp/opencode", parentDir: "/tmp" }),
-            started_at: "2026-05-21T00:00:00Z",
-          },
-        })}
-        onResolve={onResolve}
-      />,
-    );
+    mount(makeApproval({}, { filepath: "/tmp/opencode", parentDir: "/tmp" }, "external_directory"));
     expect(screen.getByText("/tmp/opencode")).toBeTruthy();
     expect(screen.queryByText("filepath")).toBeNull();
   });
 
-  it("renders the args JSON as a key/value list once expanded", () => {
-    const onResolve = vi.fn().mockResolvedValue(undefined);
-    render(
-      <ApprovalCard
-        approval={makeApproval({
-          tool_call: {
-            id: "t-1",
-            name: "Bash",
-            kind: "execute",
-            args_preview: JSON.stringify({ command: "ls", cwd: "/tmp" }),
-            started_at: "2026-05-21T00:00:00Z",
-          },
-        })}
-        onResolve={onResolve}
-      />,
-    );
-    fireEvent.click(screen.getByRole("button", { name: /Approval needed/i }));
+  it("toggles a key/value list without _aoe_ bookkeeping keys", () => {
+    mount(makeApproval({}, { command: "ls", cwd: "/tmp", _aoe_parent_tool_call_id: "parent-123" }));
+    fireEvent.click(header());
     expect(screen.getByText("command")).toBeTruthy();
-    // "ls" shows in both the header preview and the expanded args row.
     expect(screen.getAllByText("ls")).toHaveLength(2);
-    expect(screen.getByText("cwd")).toBeTruthy();
     expect(screen.getByText("/tmp")).toBeTruthy();
-  });
-
-  it("toggles the args open and closed on header clicks", () => {
-    const onResolve = vi.fn().mockResolvedValue(undefined);
-    render(
-      <ApprovalCard
-        approval={makeApproval({
-          tool_call: {
-            id: "t-1",
-            name: "Bash",
-            kind: "execute",
-            args_preview: JSON.stringify({ command: "ls", cwd: "/tmp" }),
-            started_at: "2026-05-21T00:00:00Z",
-          },
-        })}
-        onResolve={onResolve}
-      />,
-    );
-    const header = screen.getByRole("button", { name: /Approval needed/i });
-    expect(screen.queryByText("cwd")).toBeNull();
-    fireEvent.click(header);
-    expect(screen.getByText("cwd")).toBeTruthy();
-    fireEvent.click(header);
-    expect(screen.queryByText("cwd")).toBeNull();
-  });
-
-  it("hides bookkeeping keys whose name starts with _aoe_ when expanded", () => {
-    const onResolve = vi.fn().mockResolvedValue(undefined);
-    render(
-      <ApprovalCard
-        approval={makeApproval({
-          tool_call: {
-            id: "t-1",
-            name: "Bash",
-            kind: "execute",
-            args_preview: JSON.stringify({
-              command: "ls",
-              _aoe_parent_tool_call_id: "parent-123",
-            }),
-            started_at: "2026-05-21T00:00:00Z",
-          },
-        })}
-        onResolve={onResolve}
-      />,
-    );
-    fireEvent.click(screen.getByRole("button", { name: /Approval needed/i }));
     expect(screen.queryByText("_aoe_parent_tool_call_id")).toBeNull();
     expect(screen.queryByText("parent-123")).toBeNull();
-    expect(screen.getByText("command")).toBeTruthy();
+    fireEvent.click(header());
+    expect(screen.queryByText("cwd")).toBeNull();
   });
 
-  it("falls back to a raw pre block when args_preview is not a JSON object", () => {
-    const onResolve = vi.fn().mockResolvedValue(undefined);
-    render(
-      <ApprovalCard
-        approval={makeApproval({
-          tool_call: {
-            id: "t-1",
-            name: "Bash",
-            kind: "execute",
-            args_preview: "raw text [truncated]",
-            started_at: "2026-05-21T00:00:00Z",
-          },
-        })}
-        onResolve={onResolve}
-      />,
-    );
-    fireEvent.click(screen.getByRole("button", { name: /Approval needed/i }));
+  it("falls back to a raw pre block for a non-object preview", () => {
+    mount(makeApproval({}, "raw text [truncated]"));
+    fireEvent.click(header());
     expect(screen.getByText("raw text [truncated]")).toBeTruthy();
   });
 
-  it("offers no expand toggle when there is no args body", () => {
-    const onResolve = vi.fn().mockResolvedValue(undefined);
-    render(
-      <ApprovalCard
-        approval={makeApproval({
-          tool_call: {
-            id: "t-1",
-            name: "Bash",
-            kind: "execute",
-            args_preview: JSON.stringify({ _aoe_title: "noop" }),
-            started_at: "2026-05-21T00:00:00Z",
-          },
-        })}
-        onResolve={onResolve}
-      />,
-    );
+  it("offers no toggle when there is no args body", () => {
+    mount(makeApproval({}, { _aoe_title: "noop" }));
     expect(screen.queryByRole("button", { name: /Approval needed/i })).toBeNull();
   });
 
-  it("routes the Allow button to onResolve('Allow')", async () => {
-    const onResolve = vi.fn().mockResolvedValue(undefined);
-    render(<ApprovalCard approval={makeApproval()} onResolve={onResolve} />);
-    fireEvent.click(screen.getByText("Allow"));
+  // Gemini confirm-required tools send no raw input at all.
+  it("shows an empty-args state instead of an empty block", () => {
+    mount(makeApproval({}, ""));
+    expect(screen.getByText("No raw args provided by agent.")).toBeTruthy();
+  });
+
+  it.each([
+    ["external_directory", "External directory access"],
+    ["some_future_kind", "some_future_kind"],
+  ])("humanizes permission identifier %s", (raw, shown) => {
+    mount(makeApproval({}, "", raw));
+    expect(screen.getByText(shown)).toBeTruthy();
+    expect(screen.getByRole("alertdialog", { name: `Approval needed: ${shown}` })).toBeTruthy();
+    if (raw !== shown) expect(screen.queryByText(raw)).toBeNull();
+  });
+});
+
+describe("ApprovalCard decisions", () => {
+  it.each([
+    ["Allow", "Allow"],
+    ["Always", "AllowAlways"],
+    ["Deny", "Deny"],
+  ])("benign %s resolves %s on a single tap", (button, decision) => {
+    const onResolve = mount(makeApproval());
+    fireEvent.click(screen.getByText(button));
     expect(onResolve).toHaveBeenCalledTimes(1);
-    expect(onResolve).toHaveBeenCalledWith<[ApprovalDecision, string | undefined]>("Allow", undefined);
-  });
-
-  it("routes Always to onResolve('AllowAlways')", () => {
-    const onResolve = vi.fn().mockResolvedValue(undefined);
-    render(<ApprovalCard approval={makeApproval()} onResolve={onResolve} />);
-    fireEvent.click(screen.getByText("Always"));
-    expect(onResolve).toHaveBeenCalledWith("AllowAlways", undefined);
-  });
-
-  it("routes Deny to onResolve('Deny')", () => {
-    const onResolve = vi.fn().mockResolvedValue(undefined);
-    render(<ApprovalCard approval={makeApproval()} onResolve={onResolve} />);
-    fireEvent.click(screen.getByText("Deny"));
-    expect(onResolve).toHaveBeenCalledWith("Deny", undefined);
+    expect(onResolve).toHaveBeenCalledWith(decision, undefined);
   });
 
   it("shows the rolled-back message when onResolve rejects", async () => {
-    const onResolve = vi.fn().mockRejectedValue(new Error("network"));
-    render(<ApprovalCard approval={makeApproval()} onResolve={onResolve} />);
+    mount(makeApproval(), vi.fn().mockRejectedValue(new Error("network")));
     await act(async () => {
       fireEvent.click(screen.getByText("Allow"));
     });
     expect(screen.getByText(/Could not reach the server/i)).toBeTruthy();
   });
-});
 
-describe("ApprovalCard (destructive)", () => {
-  beforeEach(() => {
-    vi.useFakeTimers();
-  });
-  afterEach(() => {
-    vi.useRealTimers();
-  });
-
-  it("renders the destructive chrome (AlertTriangle + 'Destructive action' label)", () => {
-    const onResolve = vi.fn().mockResolvedValue(undefined);
-    render(<ApprovalCard approval={makeApproval({ destructive: true })} onResolve={onResolve} />);
-    expect(screen.getByText("Destructive action")).toBeTruthy();
-    expect(screen.getByText("Hold to allow")).toBeTruthy();
-    expect(screen.queryByText("Always")).toBeNull();
-  });
-
-  it("defaults to expanded so the full command is in view", () => {
-    const onResolve = vi.fn().mockResolvedValue(undefined);
-    render(<ApprovalCard approval={makeApproval({ destructive: true })} onResolve={onResolve} />);
-    // The args <dl> renders without a click in the destructive branch.
-    expect(screen.getByText("command")).toBeTruthy();
-  });
-
-  it("does not approve on a quick click of Hold to allow", () => {
-    const onResolve = vi.fn().mockResolvedValue(undefined);
-    render(<ApprovalCard approval={makeApproval({ destructive: true })} onResolve={onResolve} />);
-    const btn = screen.getByText("Hold to allow");
-    fireEvent.mouseDown(btn);
-    act(() => {
-      vi.advanceTimersByTime(100);
+  describe("destructive", () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
     });
-    fireEvent.mouseUp(btn);
-    expect(onResolve).not.toHaveBeenCalled();
-  });
 
-  it("approves after a sustained 800ms hold", () => {
-    const onResolve = vi.fn().mockResolvedValue(undefined);
-    render(<ApprovalCard approval={makeApproval({ destructive: true })} onResolve={onResolve} />);
-    const btn = screen.getByText("Hold to allow");
-    fireEvent.mouseDown(btn);
-    act(() => {
-      vi.advanceTimersByTime(800);
+    it("expands by default, drops Always, and only allows after a full hold", () => {
+      const onResolve = mount(makeApproval({ destructive: true }));
+      expect(screen.getByText("Destructive action")).toBeTruthy();
+      expect(screen.getByText("command")).toBeTruthy();
+      expect(screen.queryByText("Always")).toBeNull();
+      const button = screen.getByText("Hold to allow");
+      hold(button, 100);
+      fireEvent.mouseUp(button);
+      expect(onResolve).not.toHaveBeenCalled();
+      hold(button, 800);
+      expect(onResolve).toHaveBeenCalledExactlyOnceWith("Allow", undefined);
     });
-    expect(onResolve).toHaveBeenCalledTimes(1);
-    expect(onResolve).toHaveBeenCalledWith("Allow", undefined);
-  });
 
-  it("routes Deny without requiring a hold even in destructive mode", () => {
-    const onResolve = vi.fn().mockResolvedValue(undefined);
-    render(<ApprovalCard approval={makeApproval({ destructive: true })} onResolve={onResolve} />);
-    fireEvent.click(screen.getByText("Deny"));
-    expect(onResolve).toHaveBeenCalledWith("Deny", undefined);
+    it("denies without a hold", () => {
+      const onResolve = mount(makeApproval({ destructive: true }));
+      fireEvent.click(screen.getByText("Deny"));
+      expect(onResolve).toHaveBeenCalledWith("Deny", undefined);
+    });
   });
 });
 
-describe("ApprovalCard (question option list)", () => {
-  function makeQuestion(over: Partial<Approval> = {}): Approval {
-    return makeApproval({
-      tool_call: {
-        id: "pi-ui-7",
-        name: "Pi select",
-        kind: "other",
-        args_preview: JSON.stringify({ message: "Which plan?" }),
-        started_at: "2026-05-21T00:00:00Z",
+describe("ApprovalCard option lists", () => {
+  const options = (names: string[], kind: ApprovalOption["kind"], prefix: string) =>
+    names.map((name, i) => ({ option_id: `${prefix}-${i}`, name, kind }));
+  const question = (over: Partial<Approval> = {}) =>
+    makeApproval(
+      {
+        choice: true,
+        options: options(["Option Alpha", "Option Bravo", "Option Charlie"], "allow_once", "choice"),
+        ...over,
       },
-      choice: true,
-      options: ["Option Alpha", "Option Bravo", "Option Charlie", "Option Delta"].map((name, i) => ({
-        option_id: `choice-${i}`,
-        name,
-        kind: "allow_once" as const,
-      })),
-      ...over,
-    });
-  }
+      { message: "Which plan?" },
+      "Pi select",
+    );
 
-  it("renders the agent's option labels instead of the Allow/Always trio", () => {
-    const onResolve = vi.fn().mockResolvedValue(undefined);
-    render(<ApprovalCard approval={makeQuestion()} onResolve={onResolve} />);
+  it("renders the agent's labels and question body instead of the trio, and posts the picked id", () => {
+    const onResolve = mount(question());
     expect(screen.getByRole("alertdialog", { name: /Question: Pi select/i })).toBeTruthy();
-    expect(screen.getByText("Question")).toBeTruthy();
-    for (const label of ["Option Alpha", "Option Bravo", "Option Charlie", "Option Delta"]) {
-      expect(screen.getByText(label)).toBeTruthy();
-    }
+    expect(screen.getByText("Which plan?")).toBeTruthy();
     expect(screen.queryByText("Allow")).toBeNull();
     expect(screen.queryByText("Always")).toBeNull();
-  });
-
-  it("posts back the picked option_id, not the first option", () => {
-    const onResolve = vi.fn().mockResolvedValue(undefined);
-    render(<ApprovalCard approval={makeQuestion()} onResolve={onResolve} />);
     fireEvent.click(screen.getByText("Option Charlie"));
-    expect(onResolve).toHaveBeenCalledTimes(1);
-    expect(onResolve).toHaveBeenCalledWith("Allow", "choice-2");
+    expect(onResolve).toHaveBeenCalledExactlyOnceWith("Allow", "choice-2");
   });
 
-  // A Deny with no option would be mapped onto the first reject-kind
-  // option server-side and sent as the user's answer, so dismissing has
-  // to cancel instead.
-  it("offers Dismiss, which cancels rather than denying", () => {
-    const onResolve = vi.fn().mockResolvedValue(undefined);
-    render(<ApprovalCard approval={makeQuestion()} onResolve={onResolve} />);
+  // A bare Deny would be mapped to the first reject-kind option and sent as an answer.
+  it("dismisses by cancelling, while an explicitly picked reject option still answers", () => {
+    const rejectList = () => question({ options: options(["Stop here", "Stop and revert"], "reject_once", "no") });
+    const dismissed = mount(rejectList());
     fireEvent.click(screen.getByText("Dismiss"));
-    expect(onResolve).toHaveBeenCalledWith("Cancelled", undefined);
-  });
-
-  it("dismisses a reject-kind answer list without picking one of its options", () => {
-    const onResolve = vi.fn().mockResolvedValue(undefined);
-    const rejectList = makeQuestion({
-      options: ["Stop here", "Stop and revert"].map((name, i) => ({
-        option_id: `no-${i}`,
-        name,
-        kind: "reject_once" as const,
-      })),
-    });
-    render(<ApprovalCard approval={rejectList} onResolve={onResolve} />);
-    fireEvent.click(screen.getByText("Dismiss"));
-    expect(onResolve).toHaveBeenCalledWith("Cancelled", undefined);
-    expect(onResolve).not.toHaveBeenCalledWith("Allow", "no-0");
-    expect(onResolve).not.toHaveBeenCalledWith("Deny", undefined);
-  });
-
-  it("still answers with an explicitly picked reject-kind option", () => {
-    const onResolve = vi.fn().mockResolvedValue(undefined);
-    const rejectList = makeQuestion({
-      options: ["Stop here", "Stop and revert"].map((name, i) => ({
-        option_id: `no-${i}`,
-        name,
-        kind: "reject_once" as const,
-      })),
-    });
-    render(<ApprovalCard approval={rejectList} onResolve={onResolve} />);
+    expect(dismissed).toHaveBeenCalledExactlyOnceWith("Cancelled", undefined);
+    cleanup();
+    const picked = mount(rejectList());
     fireEvent.click(screen.getByText("Stop and revert"));
-    expect(onResolve).toHaveBeenCalledWith("Allow", "no-1");
+    expect(picked).toHaveBeenCalledExactlyOnceWith("Allow", "no-1");
   });
 
-  it("shows the question body without needing an expand click", () => {
-    const onResolve = vi.fn().mockResolvedValue(undefined);
-    render(<ApprovalCard approval={makeQuestion()} onResolve={onResolve} />);
-    expect(screen.getByText("Which plan?")).toBeTruthy();
-  });
-
-  it("falls back to the trio when the server flagged a choice but sent no options", () => {
-    const onResolve = vi.fn().mockResolvedValue(undefined);
-    render(<ApprovalCard approval={makeQuestion({ options: [] })} onResolve={onResolve} />);
+  it("falls back to the trio when flagged as a choice with no options", () => {
+    mount(question({ options: [] }));
     expect(screen.getByText("Allow")).toBeTruthy();
     expect(screen.getByText("Deny")).toBeTruthy();
   });
-});
 
-describe("ApprovalCard (destructive question)", () => {
-  function makeDestructiveQuestion(): Approval {
-    return makeApproval({
-      destructive: true,
-      choice: true,
-      tool_call: {
-        id: "tc-9",
-        name: "Bash",
-        kind: "execute",
-        args_preview: JSON.stringify({ command: "rm -rf ./build" }),
-        started_at: "2026-05-21T00:00:00Z",
-      },
-      options: [
-        { option_id: "wipe", name: "Delete everything", kind: "allow_once" },
-        { option_id: "logs", name: "Delete only logs", kind: "allow_once" },
-      ],
+  describe("destructive", () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
     });
-  }
+    const destructive = () =>
+      mount(
+        makeApproval(
+          {
+            destructive: true,
+            choice: true,
+            options: [
+              { option_id: "wipe", name: "Delete everything", kind: "allow_once" },
+              { option_id: "logs", name: "Delete only logs", kind: "allow_once" },
+            ],
+          },
+          { command: "rm -rf ./build" },
+        ),
+      );
+    const option = (name: string) => screen.getByRole("button", { name });
 
-  beforeEach(() => {
-    vi.useFakeTimers();
-  });
-
-  afterEach(() => {
-    vi.useRealTimers();
-  });
-
-  // The card is the only gate before a destructive action, so an option
-  // list must not turn the 800ms hold into a single tap.
-  it("does not resolve on a quick click of a destructive option", () => {
-    const onResolve = vi.fn().mockResolvedValue(undefined);
-    render(<ApprovalCard approval={makeDestructiveQuestion()} onResolve={onResolve} />);
-    const option = screen.getByRole("button", { name: "Delete only logs" });
-    fireEvent.click(option);
-    fireEvent.mouseDown(option);
-    act(() => {
-      vi.advanceTimersByTime(400);
+    it("ignores taps and short holds, and answers with the held option after a full hold", () => {
+      const onResolve = destructive();
+      const logs = option("Delete only logs");
+      fireEvent.click(logs);
+      hold(logs, 400);
+      fireEvent.mouseUp(logs);
+      act(() => {
+        vi.advanceTimersByTime(1000);
+      });
+      expect(onResolve).not.toHaveBeenCalled();
+      hold(logs, 800);
+      expect(onResolve).toHaveBeenCalledExactlyOnceWith("Allow", "logs");
     });
-    fireEvent.mouseUp(option);
-    act(() => {
-      vi.advanceTimersByTime(1000);
+
+    // An orphaned timer would run the answer the user moved away from.
+    it("cancels an abandoned hold when a second one starts, and a released hold submits nothing", () => {
+      const onResolve = destructive();
+      const wipe = option("Delete everything");
+      hold(wipe, 700, "touchStart");
+      fireEvent.touchCancel(wipe);
+      act(() => {
+        vi.advanceTimersByTime(2000);
+      });
+      expect(onResolve).not.toHaveBeenCalled();
+
+      hold(wipe, 400, "touchStart");
+      hold(option("Delete only logs"), 400, "touchStart");
+      expect(onResolve).not.toHaveBeenCalled();
+      act(() => {
+        vi.advanceTimersByTime(400);
+      });
+      expect(onResolve).toHaveBeenCalledExactlyOnceWith("Allow", "logs");
     });
-    expect(onResolve).not.toHaveBeenCalled();
-  });
 
-  it("answers with the held option after a sustained hold", () => {
-    const onResolve = vi.fn().mockResolvedValue(undefined);
-    render(<ApprovalCard approval={makeDestructiveQuestion()} onResolve={onResolve} />);
-    fireEvent.mouseDown(screen.getByRole("button", { name: "Delete only logs" }));
-    act(() => {
-      vi.advanceTimersByTime(800);
+    it("keeps Dismiss a single click", () => {
+      const onResolve = destructive();
+      fireEvent.click(screen.getByText("Dismiss"));
+      expect(onResolve).toHaveBeenCalledWith("Cancelled", undefined);
     });
-    expect(onResolve).toHaveBeenCalledTimes(1);
-    expect(onResolve).toHaveBeenCalledWith("Allow", "logs");
-  });
-
-  // Two fingers on two options: the first hold must not survive the
-  // second. An orphaned timer keeps its own captured option, so it would
-  // run the answer the user moved away from.
-  it("does not submit an abandoned option when a second hold starts", () => {
-    const onResolve = vi.fn().mockResolvedValue(undefined);
-    render(<ApprovalCard approval={makeDestructiveQuestion()} onResolve={onResolve} />);
-    const wipe = screen.getByRole("button", { name: "Delete everything" });
-    const logs = screen.getByRole("button", { name: "Delete only logs" });
-
-    fireEvent.touchStart(wipe);
-    act(() => {
-      vi.advanceTimersByTime(400);
-    });
-    fireEvent.touchStart(logs);
-    // The abandoned hold's own 800ms would elapse here.
-    act(() => {
-      vi.advanceTimersByTime(400);
-    });
-    expect(onResolve).not.toHaveBeenCalled();
-
-    // The live hold still completes on its own schedule.
-    act(() => {
-      vi.advanceTimersByTime(400);
-    });
-    expect(onResolve).toHaveBeenCalledTimes(1);
-    expect(onResolve).toHaveBeenCalledWith("Allow", "logs");
-  });
-
-  it("does not submit after the hold is released", () => {
-    const onResolve = vi.fn().mockResolvedValue(undefined);
-    render(<ApprovalCard approval={makeDestructiveQuestion()} onResolve={onResolve} />);
-    const wipe = screen.getByRole("button", { name: "Delete everything" });
-    fireEvent.touchStart(wipe);
-    act(() => {
-      vi.advanceTimersByTime(700);
-    });
-    fireEvent.touchCancel(wipe);
-    act(() => {
-      vi.advanceTimersByTime(2000);
-    });
-    expect(onResolve).not.toHaveBeenCalled();
-  });
-
-  it("keeps Dismiss a single click even when destructive", () => {
-    const onResolve = vi.fn().mockResolvedValue(undefined);
-    render(<ApprovalCard approval={makeDestructiveQuestion()} onResolve={onResolve} />);
-    fireEvent.click(screen.getByText("Dismiss"));
-    expect(onResolve).toHaveBeenCalledWith("Cancelled", undefined);
-  });
-});
-
-describe("ApprovalCard (permission identifier humanization)", () => {
-  function permissionApproval(name: string): Approval {
-    return makeApproval({
-      tool_call: {
-        id: "t-1",
-        name,
-        kind: "other",
-        args_preview: "",
-        started_at: "2026-05-21T00:00:00Z",
-      },
-    });
-  }
-
-  it("humanizes a known permission identifier in the title and accessible name", () => {
-    const onResolve = vi.fn().mockResolvedValue(undefined);
-    render(<ApprovalCard approval={permissionApproval("external_directory")} onResolve={onResolve} />);
-    expect(screen.getByText("External directory access")).toBeTruthy();
-    expect(screen.getByRole("alertdialog", { name: /Approval needed: External directory access/i })).toBeTruthy();
-    // The raw protocol identifier is no longer shown to the user.
-    expect(screen.queryByText("external_directory")).toBeNull();
-  });
-
-  it("passes an unknown identifier through verbatim", () => {
-    const onResolve = vi.fn().mockResolvedValue(undefined);
-    render(<ApprovalCard approval={permissionApproval("some_future_kind")} onResolve={onResolve} />);
-    expect(screen.getByText("some_future_kind")).toBeTruthy();
   });
 });

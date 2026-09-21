@@ -4,18 +4,6 @@
 use super::*;
 
 /// One durable ownership protocol for every session lifecycle transition.
-///
-/// A transition acquires the per-instance lifecycle flock, then records a
-/// fresh generation under `Storage::update`. Terminal launch is the ordered
-/// exception: it first takes the app-global per-session title flock so title
-/// writers and launch cannot derive different tmux names. The durable
-/// reservation stays held through hooks, external side effects, and the
-/// exact-generation commit; callers may release outer flocks for reentrant hooks.
-/// `status` is presentation state and never proves ownership.
-///
-/// A crashed owner loses both the flock and, after the TTL, its reservation.
-/// Recovery may then acquire a newer generation; exact-generation commits
-/// ensure a late result can never mutate or clear that replacement.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum LifecycleOperation {
@@ -64,17 +52,11 @@ pub struct LifecycleReservation {
 }
 
 impl Instance {
-    /// Longer than any bounded hook, teardown, or worktree move. A crashed
-    /// owner cannot retain the reservation forever; a late owner is still
-    /// harmless because every commit is generation-checked.
+    /// Longer than any bounded hook, teardown, or worktree move. A crashed owner cannot retain the
+    /// reservation forever.
     pub const LIFECYCLE_RESERVATION_TTL: chrono::Duration = chrono::Duration::minutes(10);
 
     /// Acquire exclusive durable ownership of the next lifecycle generation.
-    ///
-    /// Even a reservation for the same operation belongs to a peer: operation
-    /// kind is not an identity. A caller that already owns a reservation must
-    /// retain its returned generation and use
-    /// [`Self::lifecycle_reservation_is_owned`] rather than reacquiring by kind.
     pub fn try_acquire_lifecycle_reservation(
         &mut self,
         operation: LifecycleOperation,
@@ -388,6 +370,14 @@ impl Instance {
 mod tests {
     use super::*;
 
+    fn held(op: LifecycleOperation, at: DateTime<Utc>) -> Option<LifecycleReservation> {
+        Some(LifecycleReservation {
+            op,
+            generation: 1,
+            at,
+        })
+    }
+
     #[test]
     #[serial_test::serial]
     fn lifecycle_status_commit_releases_the_acquired_generation() {
@@ -448,77 +438,49 @@ mod tests {
             (
                 "leased_peer",
                 Status::Starting,
-                Some(LifecycleReservation {
-                    op: LifecycleOperation::Launch,
-                    generation: 1,
-                    at: now,
-                }),
+                held(LifecycleOperation::Launch, now),
                 1,
                 false,
             ),
             (
                 "superseded",
                 Status::Idle,
-                Some(LifecycleReservation {
-                    op: LifecycleOperation::Launch,
-                    generation: 1,
-                    at: now,
-                }),
+                held(LifecycleOperation::Launch, now),
                 2,
                 true,
             ),
             (
                 "expired",
                 Status::Idle,
-                Some(LifecycleReservation {
-                    op: LifecycleOperation::Launch,
-                    generation: 1,
-                    at: stale,
-                }),
+                held(LifecycleOperation::Launch, stale),
                 1,
                 true,
             ),
             (
                 "purge",
                 Status::Idle,
-                Some(LifecycleReservation {
-                    op: LifecycleOperation::Purge,
-                    generation: 1,
-                    at: now,
-                }),
+                held(LifecycleOperation::Purge, now),
                 1,
                 false,
             ),
             (
                 "restore",
                 Status::Stopped,
-                Some(LifecycleReservation {
-                    op: LifecycleOperation::Restore,
-                    generation: 1,
-                    at: now,
-                }),
+                held(LifecycleOperation::Restore, now),
                 1,
                 false,
             ),
             (
                 "trash",
                 Status::Idle,
-                Some(LifecycleReservation {
-                    op: LifecycleOperation::Trash,
-                    generation: 1,
-                    at: now,
-                }),
+                held(LifecycleOperation::Trash, now),
                 1,
                 false,
             ),
             (
                 "capture",
                 Status::Running,
-                Some(LifecycleReservation {
-                    op: LifecycleOperation::Capture,
-                    generation: 1,
-                    at: now,
-                }),
+                held(LifecycleOperation::Capture, now),
                 1,
                 false,
             ),
@@ -571,11 +533,7 @@ mod tests {
         busy.source_profile = profile.to_string();
         busy.status = Status::Starting;
         busy.lifecycle_generation = 1;
-        busy.lifecycle_reservation = Some(LifecycleReservation {
-            op: LifecycleOperation::Launch,
-            generation: 1,
-            at: Utc::now(),
-        });
+        busy.lifecycle_reservation = held(LifecycleOperation::Launch, Utc::now());
         storage
             .update(|instances, _groups| {
                 instances.push(busy.clone());
@@ -634,9 +592,8 @@ mod tests {
             })
             .unwrap();
 
-        // The launch guard still recognizes the exact-generation reservation.
-        // A later launch failure must release it rather than stranding the
-        // marker until its TTL.
+        // The launch guard still recognizes the exact-generation reservation. A later launch
+        // failure must release it rather than stranding the marker until its TTL.
         inst.ensure_reservation_current_or_fail(&storage).unwrap();
         let error = anyhow::anyhow!("launch failed after status drift");
         inst.fail_reserved_launch(&storage, &error, false);

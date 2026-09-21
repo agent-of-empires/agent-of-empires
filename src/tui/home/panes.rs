@@ -14,21 +14,19 @@ impl HomeView {
         Ok(())
     }
 
-    /// Make sure the paired host-terminal tmux pane is alive and
-    /// ready to receive keystrokes. Mirrors `attach_terminal`: if the
-    /// session doesn't exist (or its pane has died), kill the
-    /// tombstone and spawn a fresh one with the requested size. Used
-    /// by `prepare_live_send` when the live target is the terminal.
+    fn cloned_instance(&self, session_id: &str) -> anyhow::Result<Instance> {
+        self.get_instance(session_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("session not found: {}", session_id))
+    }
+
+    /// Respawn the host-terminal pane when it is missing or dead, for live-send.
     pub(super) fn ensure_terminal_pane_ready(
         &mut self,
         session_id: &str,
         size: Option<(u16, u16)>,
     ) -> anyhow::Result<()> {
-        let inst = self
-            .get_instance(session_id)
-            .ok_or_else(|| anyhow::anyhow!("session not found: {}", session_id))?
-            .clone();
-        let term = inst.terminal_tmux_session()?;
+        let term = self.cloned_instance(session_id)?.terminal_tmux_session()?;
         if !term.exists() || term.is_pane_dead() {
             if term.exists() {
                 let _ = term.kill();
@@ -38,27 +36,20 @@ impl HomeView {
         Ok(())
     }
 
-    /// Container-shell counterpart of `ensure_terminal_pane_ready`,
-    /// used when the live-send target is the container terminal
-    /// (sandboxed sessions in container terminal mode).
+    /// Respawn the container-terminal pane when it is missing or dead, for live-send.
     pub(super) fn ensure_container_terminal_pane_ready(
         &mut self,
         session_id: &str,
         size: Option<(u16, u16)>,
     ) -> anyhow::Result<()> {
-        let inst = self
-            .get_instance(session_id)
-            .ok_or_else(|| anyhow::anyhow!("session not found: {}", session_id))?
-            .clone();
+        let inst = self.cloned_instance(session_id)?;
         if !inst.is_sandboxed() {
             anyhow::bail!("Cannot prepare container terminal for non-sandboxed session");
         }
         let term = inst.container_terminal_tmux_session()?;
         if !term.exists() || term.is_pane_dead() {
-            // A running container needs no move and the chokepoint skips it;
-            // otherwise the copy can take minutes, so it runs on the worker
-            // with the status line narrating it, and the send is not queued
-            // behind it.
+            // A stopped container may need a minutes-long store move first;
+            // it runs on the worker and the send is not queued behind it.
             if self.needs_store_move_before_launch(session_id)
                 && !crate::containers::DockerContainer::from_session_id(session_id)
                     .is_running()
@@ -77,25 +68,19 @@ impl HomeView {
         Ok(())
     }
 
-    /// Tool-pane counterpart of `ensure_terminal_pane_ready`: mirrors
-    /// `App::attach_tool_session`'s on-demand creation so live-send can
-    /// target a tool (lazygit, yazi, etc.) that hasn't been launched yet.
-    /// Used by `prepare_live_send` when the live target is `Tool(name)`.
+    /// Create the tool pane on demand so live-send can target a tool that
+    /// hasn't been launched yet.
     pub(super) fn ensure_tool_pane_ready(
         &mut self,
         session_id: &str,
         tool_name: &str,
         size: Option<(u16, u16)>,
     ) -> anyhow::Result<()> {
-        let inst = self
-            .get_instance(session_id)
-            .ok_or_else(|| anyhow::anyhow!("session not found: {}", session_id))?
-            .clone();
+        let inst = self.cloned_instance(session_id)?;
         let tool_config = self
             .tool_configs
             .get(tool_name)
-            .ok_or_else(|| anyhow::anyhow!("tool '{}' is not configured", tool_name))?
-            .clone();
+            .ok_or_else(|| anyhow::anyhow!("tool '{}' is not configured", tool_name))?;
         if tool_config.command.is_empty() {
             anyhow::bail!("Tool '{}' has no command configured", tool_name);
         }
@@ -114,10 +99,8 @@ impl HomeView {
         Ok(())
     }
 
-    /// Restart `id` on the restart worker and attach once it launches the
-    /// agent (see `take_restarted_attaches`). The cascade can pull a sandbox
-    /// image for minutes, so it must stay off the event loop. A restart
-    /// already in flight is joined rather than queued twice.
+    /// Restart `id` on the restart worker and attach once it launches (see
+    /// `take_restarted_attaches`). A restart already in flight is joined.
     pub fn restart_then_attach(
         &mut self,
         id: &str,
@@ -148,10 +131,10 @@ impl HomeView {
                 skip_on_launch,
                 bound_hooks: false,
                 discard_sandbox_container: false,
+                conversation_carry: None,
             });
     }
 
-    /// Get the terminal mode for a session (uses config default if not set)
     pub fn get_terminal_mode(&self, session_id: &str) -> TerminalMode {
         self.terminal_modes
             .get(session_id)
@@ -159,10 +142,17 @@ impl HomeView {
             .unwrap_or(self.default_terminal_mode)
     }
 
-    /// Toggle terminal mode between Container and Host for a session
+    /// The terminal a session's Terminal view shows: its chosen mode when
+    /// sandboxed, otherwise always the host terminal.
+    pub(super) fn effective_terminal_mode(&self, session_id: &str) -> TerminalMode {
+        match self.get_instance(session_id) {
+            Some(inst) if inst.is_sandboxed() => self.get_terminal_mode(session_id),
+            _ => TerminalMode::Host,
+        }
+    }
+
     pub fn toggle_terminal_mode(&mut self, session_id: &str) {
-        let current = self.get_terminal_mode(session_id);
-        let new_mode = match current {
+        let new_mode = match self.get_terminal_mode(session_id) {
             TerminalMode::Container => TerminalMode::Host,
             TerminalMode::Host => TerminalMode::Container,
         };

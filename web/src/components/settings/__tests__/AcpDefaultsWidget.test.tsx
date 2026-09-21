@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-//
-// Behavioral coverage for the rebuilt per-agent structured-view defaults widget
-// (#2631): dropdowns populated from the recall catalog, free-text fallback when
-// the catalog is empty, unverified preservation of stale values, per-model
-// thinking overrides, and pruning empty agent entries out of the saved map.
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";

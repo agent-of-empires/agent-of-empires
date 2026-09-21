@@ -5,18 +5,12 @@ interface FontSizeControlProps {
   value: number;
   onChange: (value: number) => void;
   description?: string;
-  /** Prefix for the slider/select `data-testid`s, so a settings panel with two
-   *  of these controls stays addressable in tests. */
   testIdPrefix: string;
 }
 
 const OPTIONS = Array.from({ length: MAX_FONT_SIZE - MIN_FONT_SIZE + 1 }, (_, i) => MIN_FONT_SIZE + i);
 
-/** Slider + px select pair shared by the terminal and conversation font-size
- *  settings. Both controls write the same value so they stay synchronized; the
- *  select offers every integer step in range. The range is not a prop: every
- *  font-size control in the dashboard spans {@link MIN_FONT_SIZE}-{@link
- *  MAX_FONT_SIZE}, and users compare the sliders side by side. */
+/** Synchronized slider and px select spanning MIN_FONT_SIZE to MAX_FONT_SIZE. */
 export function FontSizeControl({ label, value, onChange, description, testIdPrefix }: FontSizeControlProps) {
   return (
     <div>

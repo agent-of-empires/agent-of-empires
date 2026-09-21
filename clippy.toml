@@ -8,3 +8,10 @@
 #
 # The affected helpers live in src/server/api/.
 large-error-threshold = 192
+
+# AGENTS.md asks for table cases inside one test when setup is shared, and a
+# table's row type is a tuple of the inputs plus the expectation. Those tuples
+# score as "complex types" while being the clearest form the case can take, and
+# naming each one-use row type adds a line of noise per table. 350 clears the
+# test tables while still flagging genuinely tangled types in production code.
+type-complexity-threshold = 350

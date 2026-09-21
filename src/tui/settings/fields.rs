@@ -1,22 +1,13 @@
 //! Settings field definitions, built from the single-source schema.
 //!
-//! Every configurable field is declared once on its `Config` sub-struct via
-//! `#[derive(SettingsSection)]` (see `aoe-settings-derive`). This module turns
-//! the resulting [`FieldDescriptor`] list into renderable [`SettingField`]
-//! rows and applies edits back, instead of hand-wiring a `build_*_fields` /
-//! `apply_field_*` pair per field. Reads and writes go through the serialized
-//! `Config` JSON and the sparse profile/repo override JSON, so adding a config
-//! field never touches this file.
+//! [`FieldDescriptor`] rows become renderable [`SettingField`]s, read and
+//! written through the serialized `Config` JSON and the sparse override JSON,
+//! so adding a config field never touches this file.
 //!
-//! A handful of rows are not schema-backed and are injected explicitly:
-//! - the profile `Description` (profile-only, no global counterpart),
-//! - the lifecycle `hooks` (a repo-hook RCE surface, deliberately kept out of
-//!   the web-exposed schema), and
-//! - the host `environment` list (a root-level `Config` field).
-//!
-//! The `custom:*` widgets (theme picker, default-tool picker, utility-agent
-//! picker, sound volume, per-target logging matrix) keep bespoke value
-//! mapping here, keyed by the widget id from the schema.
+//! Injected explicitly because they are not schema-backed: the profile
+//! `Description`, the lifecycle `hooks` (kept out of the web-exposed schema,
+//! being a repo-hook RCE surface), and the root-level `environment` list.
+//! `custom:*` widgets keep bespoke value mapping here, keyed by widget id.
 
 use serde_json::{json, Value};
 
@@ -29,9 +20,8 @@ use crate::tui::styles::available_themes;
 
 use super::SettingsScope;
 
-/// Categories of settings. Each maps to a tab in the left-hand panel. The
-/// string returned by `SettingsCategory::schema_name` is matched against the
-/// per-field `category` emitted by the schema.
+/// Categories of settings, one per tab. `schema_name` matches the per-field
+/// `category` the schema emits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsCategory {
     Theme,
@@ -76,9 +66,8 @@ impl SettingsCategory {
         }
     }
 
-    /// The `category` string the schema emits for fields in this tab.
-    /// `Hooks` has no schema fields (lifecycle hooks are injected, not
-    /// schema-backed), so its name is only used for completeness.
+    /// The `category` string the schema emits for this tab. `Hooks` has no
+    /// schema fields, so its name is only for completeness.
     fn schema_name(&self) -> &'static str {
         match self {
             Self::Theme => "Theme",
@@ -120,12 +109,9 @@ impl HookField {
     }
 }
 
-/// Identity + apply metadata for a settings row.
-///
-/// `Schema` rows carry the dotted `section.field` path plus the widget and
-/// validation pulled straight from the descriptor, so apply/clear is a generic
-/// JSON-path write. The remaining variants are the non-schema rows the TUI
-/// injects (see the module docs) plus the section divider.
+/// Identity and apply metadata for a settings row. `Schema` rows carry the
+/// dotted `section.field` path, so apply/clear is a generic JSON-path write;
+/// the rest are the injected rows plus the section divider.
 #[derive(Debug, Clone)]
 pub enum FieldKind {
     Schema {
@@ -160,9 +146,8 @@ pub enum FieldValue {
     },
     List(Vec<String>),
     OptionalText(Option<String>),
-    /// Non-interactive section divider. The label carries the heading text and
-    /// the description the optional subtitle. Navigation skips it; apply/clear
-    /// no-op.
+    /// Non-interactive divider: label is the heading, description the
+    /// subtitle. Navigation skips it; apply/clear no-op.
     SectionHeader,
 }
 
@@ -176,7 +161,7 @@ pub struct SettingField {
     pub category: SettingsCategory,
     /// Whether this field has a profile/repo override.
     pub has_override: bool,
-    /// Display of the inherited (global/base) value; set when `has_override`.
+    /// The inherited value, set when `has_override`.
     pub inherited_display: Option<String>,
 }
 
@@ -217,8 +202,8 @@ impl SettingField {
         }
     }
 
-    /// Stable identifier used by the search overlay to relocate the cursor
-    /// after a jump, and by input handlers that special-case a specific field.
+    /// Stable identifier the search overlay jumps to and input handlers
+    /// special-case.
     pub fn ident(&self) -> String {
         match &self.kind {
             FieldKind::Schema { section, field, .. } => format!("{section}.{field}"),
@@ -279,9 +264,8 @@ impl SettingField {
             {
                 validate_snooze_duration(*n)
             }
-            // acp_defaults and smart_rename_model are edited as raw JSON; require
-            // a JSON object so a typo is rejected at commit instead of wiping the
-            // map.
+            // Edited as raw JSON; require an object so a typo is rejected at
+            // commit instead of wiping the map.
             (
                 FieldKind::Schema {
                     widget: WidgetKind::Custom { id },
@@ -321,20 +305,17 @@ impl SettingField {
 /// [`crate::session::config::settings_schema::validate_value`] the server applies.
 fn validate_field_value(kind: &ValidationKind, value: &FieldValue) -> Result<(), String> {
     let json = field_value_to_json_for_validation(value);
-    // A cleared optional field projects to JSON null. Clearing means "unset",
-    // which is always valid, so there's nothing to check: feeding null to a
-    // string validator would otherwise reject it as "expected a string". This
-    // mirrors the server's null-leaf handling in
-    // `settings_schema::validate_patch` (issue #2083).
+    // A cleared optional field projects to null, which means "unset" and is
+    // always valid; a string validator would reject it. Mirrors the server's
+    // null-leaf handling in `settings_schema::validate_patch`.
     if json.is_null() {
         return Ok(());
     }
     crate::session::config::settings_schema::validate_value(kind, &json).map_err(|e| e.reason)
 }
 
-/// Best-effort JSON projection of a `FieldValue` for validation. Selects pass
-/// their label (validation rules never gate select fields), lists pass their
-/// raw string entries.
+/// JSON projection of a `FieldValue` for validation. Selects pass their label,
+/// lists their raw entries.
 fn field_value_to_json_for_validation(value: &FieldValue) -> Value {
     match value {
         FieldValue::Bool(b) => json!(b),
@@ -438,9 +419,7 @@ fn value_from_json(widget: &WidgetKind, current: Option<&Value>) -> FieldValue {
             }
         }
         WidgetKind::List => FieldValue::List(json_to_list(current)),
-        // API v9 (#2897). dynamic_select and cron edit as a plain text value
-        // in the TUI for now (the resolver-backed picker and the object-list
-        // drill-down editor are the structured-editor follow-up); object_list
+        // dynamic_select and cron edit as plain text in the TUI; object_list
         // renders as its raw JSON array so it stays round-trippable.
         WidgetKind::DynamicSelect { .. } | WidgetKind::Cron => {
             FieldValue::Text(current.as_str().unwrap_or("").to_string())
@@ -477,13 +456,10 @@ fn json_to_list(current: &Value) -> Vec<String> {
     }
 }
 
-/// Built-in agents that can run a one-shot rename (a `oneshot_flag`) AND are
-/// installed on this host. The smart-rename agent picker offers only these, so
-/// a user cannot pick an agent the one-shot would just fail on. Probed in one
-/// batch (and served from the process-wide memo that startup warms) rather
-/// than per agent: field rebuilds are frequent, and a per-agent probe paid a
-/// login shell for every not-installed agent. Avoids the `Config::load` side
-/// effects of `AvailableTools::detect()`.
+/// Built-in agents with a `oneshot_flag` that are installed here, so the
+/// smart-rename picker cannot offer one the one-shot would fail on. Probed in
+/// one memoized batch: field rebuilds are frequent and a per-agent probe paid
+/// a login shell each time. Avoids `AvailableTools::detect()`'s `Config::load`.
 fn installed_oneshot_agents() -> Vec<String> {
     let defs: Vec<&crate::agents::AgentDef> = crate::agents::oneshot_capable_names()
         .into_iter()
@@ -529,9 +505,7 @@ fn custom_value_from_json(id: &str, current: &Value) -> FieldValue {
             FieldValue::Select { selected, options }
         }
         "acp-defaults" => {
-            // Edited as raw JSON in an inline field; validation on commit
-            // rejects anything that is not a JSON object, so a typo cannot
-            // wipe the map.
+            // Raw JSON inline; commit validation rejects non-objects.
             let text = if current.is_null() {
                 "{}".to_string()
             } else {
@@ -540,11 +514,9 @@ fn custom_value_from_json(id: &str, current: &Value) -> FieldValue {
             FieldValue::Text(text)
         }
         "smart-rename-model" => {
-            // A per-agent {agent: model} map, edited as raw JSON in the TUI
-            // (the web has a structured per-agent widget). This raw-JSON path is
-            // the only surface that can set the empty-string "force CLI default"
-            // value; the web widget removes a key on clear. Commit validation
-            // requires a JSON object so a typo cannot wipe the map.
+            // A per-agent {agent: model} map as raw JSON. The only surface
+            // that can set the empty-string "force CLI default" value, since
+            // the web widget removes a key on clear.
             let text = if current.is_null() {
                 "{}".to_string()
             } else {
@@ -552,8 +524,7 @@ fn custom_value_from_json(id: &str, current: &Value) -> FieldValue {
             };
             FieldValue::Text(text)
         }
-        // logging-targets is expanded into per-target rows during build and
-        // never lands here.
+        // logging-targets expands into per-target rows during build.
         _ => FieldValue::Text(String::new()),
     }
 }
@@ -562,8 +533,7 @@ fn custom_value_from_json(id: &str, current: &Value) -> FieldValue {
 // Writing: FieldValue -> JSON leaf
 // ---------------------------------------------------------------------------
 
-/// Compute the JSON leaf a field's value writes into config / override JSON.
-/// Returns `None` for rows that never write (section markers).
+/// The JSON leaf a field writes, `None` for rows that never write.
 fn field_value_to_json(kind: &FieldKind, value: &FieldValue) -> Option<Value> {
     match (kind, value) {
         (FieldKind::SectionMarker, _) => None,
@@ -586,8 +556,7 @@ fn field_value_to_json(kind: &FieldKind, value: &FieldValue) -> Option<Value> {
             },
             value,
         ) => Some(schema_value_to_json(widget, section, field, value)),
-        // LoggingTarget is applied via a dedicated path (mutates the targets
-        // map), not as a single leaf.
+        // LoggingTarget mutates the targets map via its own path.
         _ => None,
     }
 }
@@ -618,10 +587,9 @@ fn schema_value_to_json(
                 json!(items)
             }
         }
-        // API v9 (#2897): dynamic_select and cron round-trip as text;
-        // object_list parses its raw-JSON text back to an array (server
-        // validation rejects malformed input, so a parse failure stores null
-        // and surfaces as a validation error rather than corrupting the row).
+        // dynamic_select and cron round-trip as text; object_list parses its
+        // raw JSON back to an array, storing null on a parse failure so the
+        // row surfaces a validation error rather than corrupting.
         (WidgetKind::DynamicSelect { .. } | WidgetKind::Cron, FieldValue::Text(s)) => json!(s),
         (WidgetKind::ObjectList { .. }, FieldValue::Text(s)) => {
             serde_json::from_str::<Value>(s).unwrap_or(Value::Null)
@@ -644,10 +612,9 @@ fn custom_value_to_json(id: &str, value: &FieldValue) -> Value {
             }
         }
         ("smart-rename-agent", FieldValue::Select { selected, options }) => {
-            // Index 0 is "Same as session" (empty string); the rest are agent
-            // names (label == value). Persist from the rendered `options` so the
-            // saved value is exactly what the user picked, even if the installed
-            // set changed between render and save.
+            // Index 0 is "Same as session" (empty string), the rest agent
+            // names. Persist from the rendered `options`, so an installed-set
+            // change between render and save cannot shift the pick.
             if *selected == 0 {
                 json!("")
             } else {
@@ -666,8 +633,7 @@ fn custom_value_to_json(id: &str, value: &FieldValue) -> Value {
             if trimmed.is_empty() {
                 return json!({});
             }
-            // Commit-time validation guarantees a valid object here; fall back
-            // to an empty map rather than corrupt the leaf if it ever slips.
+            // Commit validation guarantees an object; empty map if it slips.
             match serde_json::from_str::<Value>(trimmed) {
                 Ok(v) if v.is_object() => v,
                 _ => json!({}),
@@ -678,8 +644,7 @@ fn custom_value_to_json(id: &str, value: &FieldValue) -> Value {
             if trimmed.is_empty() {
                 return json!({});
             }
-            // Commit-time validation guarantees a valid object here; fall back
-            // to an empty map rather than corrupt the leaf if it ever slips.
+            // Commit validation guarantees an object; empty map if it slips.
             match serde_json::from_str::<Value>(trimmed) {
                 Ok(v) if v.is_object() => v,
                 _ => json!({}),
@@ -693,10 +658,8 @@ fn custom_value_to_json(id: &str, value: &FieldValue) -> Value {
 // Building the rows for a category
 // ---------------------------------------------------------------------------
 
-/// Build fields for a category based on scope and current config values.
-///
-/// For Repo scope, `base` should be the resolved (global+profile merged)
-/// config and `overrides` the repo config converted to a `ProfileConfig`.
+/// Build a category's fields. In Repo scope `base` is the resolved
+/// global+profile config and `overrides` the repo config as a `ProfileConfig`.
 pub fn build_fields_for_category(
     category: SettingsCategory,
     scope: SettingsScope,
@@ -1174,9 +1137,20 @@ mod tests {
             .unwrap_or_else(|| panic!("missing field {ident}"))
     }
 
-    /// Whether a profile override sets `section.field`, checked via the
-    /// serialized (storage-agnostic) form so the test survives the sparse-JSON
-    /// storage flip.
+    fn build(
+        cat: SettingsCategory,
+        scope: SettingsScope,
+        profile: &ProfileConfig,
+    ) -> Vec<SettingField> {
+        build_fields_for_category(cat, scope, &Config::default(), profile)
+    }
+
+    fn idents(fields: &[SettingField]) -> Vec<String> {
+        fields.iter().map(|f| f.ident()).collect()
+    }
+
+    /// Whether a profile override sets `section.field`, checked through the
+    /// serialized form so the test survives a change of storage shape.
     fn has_override_path(profile: &ProfileConfig, section: &str, field: &str) -> bool {
         serde_json::to_value(profile)
             .ok()
@@ -1188,11 +1162,10 @@ mod tests {
         serde_json::from_value(value).expect("profile override deserializes")
     }
 
-    /// Clearing an optional field (empty input stores `None`) must validate:
-    /// "unset" is always allowed and must not surface as "expected a string"
-    /// (issue #2083). A set value is still checked against the schema rule.
     #[test]
     fn clearing_optional_field_validates_as_unset() {
+        // "Unset" is always allowed and must not surface as "expected a
+        // string"; a set value is still checked against the schema rule.
         let mut f = SettingField {
             kind: FieldKind::Schema {
                 section: "sandbox".to_string(),
@@ -1209,42 +1182,29 @@ mod tests {
             inherited_display: None,
         };
 
-        assert!(
-            f.validate().is_ok(),
-            "a cleared optional field should validate as unset"
-        );
-
-        f.value = FieldValue::OptionalText(Some("not-a-size".to_string()));
-        assert!(
-            f.validate().is_err(),
-            "a set-but-invalid value should still be rejected"
-        );
-
-        f.value = FieldValue::OptionalText(Some("512m".to_string()));
-        assert!(f.validate().is_ok(), "a set-and-valid value should pass");
+        for (value, ok) in [
+            (None, true),
+            (Some("not-a-size"), false),
+            (Some("512m"), true),
+        ] {
+            f.value = FieldValue::OptionalText(value.map(str::to_string));
+            assert_eq!(f.validate().is_ok(), ok, "{value:?}");
+        }
     }
 
     #[test]
-    fn repo_scope_hides_fields_a_repo_may_not_override() {
-        // A repo config cannot set the command-bearing session fields (#3154),
-        // so Repo scope must not offer them; Global scope still does.
-        let base = Config::default();
-        let overrides = ProfileConfig::default();
-        let repo_rows = build_fields_for_category(
+    fn repo_scope_hides_what_a_repo_may_not_override() {
+        let profile = ProfileConfig::default();
+        let repo = idents(&build(
             SettingsCategory::Agents,
             SettingsScope::Repo,
-            &base,
-            &overrides,
-        );
-        let global_rows = build_fields_for_category(
+            &profile,
+        ));
+        let global = idents(&build(
             SettingsCategory::Agents,
             SettingsScope::Global,
-            &base,
-            &overrides,
-        );
-
-        let ident_present =
-            |rows: &[SettingField], ident: &str| rows.iter().any(|f| f.ident() == ident);
+            &profile,
+        ));
         for denied in [
             "session.custom_agents",
             "session.agent_command_override",
@@ -1253,114 +1213,76 @@ mod tests {
             "session.default_tool",
             "session.agent_config_dir",
         ] {
+            let denied = denied.to_string();
             assert!(
-                !ident_present(&repo_rows, denied),
-                "{denied} must not be editable in Repo scope"
+                !repo.contains(&denied),
+                "{denied} must not be repo-editable"
             );
-            assert!(
-                ident_present(&global_rows, denied),
-                "{denied} must still be editable in Global scope"
-            );
+            assert!(global.contains(&denied), "{denied} stays global-editable");
         }
-        let allowed = "session.agent_detect_as";
-        assert!(
-            ident_present(&repo_rows, allowed),
-            "{allowed} stays repo-overridable"
-        );
-    }
+        assert!(repo.contains(&"session.agent_detect_as".to_string()));
 
-    /// #3229: no field under Repo scope for a category whose section is not
-    /// repo-overridable. Backs up the `categories_for_scope` tab-hide with a
-    /// builder-layer assertion so a direct call with Repo scope cannot yield
-    /// a field whose edit would strand at save time.
-    #[test]
-    fn repo_scope_yields_no_fields_for_tmux_or_sound() {
-        let base = Config::default();
-        let overrides = ProfileConfig::default();
+        // A category whose whole section is not repo-overridable yields no
+        // rows at all, so a direct Repo-scope call cannot produce a field
+        // whose edit would strand at save.
         for cat in [SettingsCategory::Tmux, SettingsCategory::Sound] {
-            let repo_rows = build_fields_for_category(cat, SettingsScope::Repo, &base, &overrides);
             assert!(
-                repo_rows.is_empty(),
-                "{cat:?} must yield zero repo-scope fields, got {} rows",
-                repo_rows.len()
+                build(cat, SettingsScope::Repo, &profile).is_empty(),
+                "{cat:?} must yield zero repo-scope fields"
             );
-            // Sanity: the category still has fields under Profile scope.
-            let profile_rows =
-                build_fields_for_category(cat, SettingsScope::Profile, &base, &overrides);
             assert!(
-                !profile_rows.is_empty(),
+                !build(cat, SettingsScope::Profile, &profile).is_empty(),
                 "{cat:?} must still have profile-scope fields"
             );
         }
     }
 
     #[test]
-    fn acp_defaults_custom_widget_round_trips_json() {
-        let current = json!({"opencode": {"model": "x", "effort": "high"}});
-        let fv = custom_value_from_json("acp-defaults", &current);
-        let FieldValue::Text(s) = &fv else {
-            panic!("acp-defaults must build a Text field");
-        };
-        assert_eq!(
-            custom_value_to_json("acp-defaults", &FieldValue::Text(s.clone())),
-            current,
-        );
-
-        // Empty text and a null current both resolve to an empty map, never a
-        // corrupt leaf.
-        assert_eq!(
-            custom_value_to_json("acp-defaults", &FieldValue::Text(String::new())),
-            json!({}),
-        );
-        assert!(matches!(
-            custom_value_from_json("acp-defaults", &Value::Null),
-            FieldValue::Text(t) if t == "{}"
-        ));
-
-        // Non-object JSON (which validation rejects before commit) degrades to
-        // an empty map rather than writing a string/array into the field.
-        assert_eq!(
-            custom_value_to_json("acp-defaults", &FieldValue::Text("[1,2]".to_string())),
-            json!({}),
-        );
-    }
-
-    #[test]
-    fn smart_rename_model_custom_widget_round_trips_json() {
-        let current = json!({"claude": "haiku", "codex": "gpt-5"});
-        let fv = custom_value_from_json("smart-rename-model", &current);
-        let FieldValue::Text(s) = &fv else {
-            panic!("smart-rename-model must build a Text field");
-        };
-        assert_eq!(
-            custom_value_to_json("smart-rename-model", &FieldValue::Text(s.clone())),
-            current,
-        );
-
-        // Empty text and a null current both resolve to an empty map.
-        assert_eq!(
-            custom_value_to_json("smart-rename-model", &FieldValue::Text(String::new())),
-            json!({}),
-        );
-        assert!(matches!(
-            custom_value_from_json("smart-rename-model", &Value::Null),
-            FieldValue::Text(t) if t == "{}"
-        ));
-
-        // Non-object JSON degrades to an empty map rather than corrupting the leaf.
-        assert_eq!(
-            custom_value_to_json(
-                "smart-rename-model",
-                &FieldValue::Text("\"oops\"".to_string())
+    fn raw_json_map_widgets_round_trip_and_degrade_to_an_empty_map() {
+        // (widget id, a representative value, a non-object that validation
+        // rejects before commit)
+        let cases = [
+            (
+                "acp-defaults",
+                json!({"opencode": {"model": "x", "effort": "high"}}),
+                "[1,2]",
             ),
-            json!({}),
-        );
+            (
+                "smart-rename-model",
+                json!({"claude": "haiku", "codex": "gpt-5"}),
+                "\"oops\"",
+            ),
+        ];
+        for (widget, current, not_an_object) in cases {
+            let FieldValue::Text(text) = custom_value_from_json(widget, &current) else {
+                panic!("{widget} must build a Text field");
+            };
+            assert_eq!(
+                custom_value_to_json(widget, &FieldValue::Text(text)),
+                current,
+                "{widget}"
+            );
+
+            // Empty text, a null current, and a non-object all resolve to an
+            // empty map rather than a corrupt leaf.
+            for text in [String::new(), not_an_object.to_string()] {
+                assert_eq!(
+                    custom_value_to_json(widget, &FieldValue::Text(text)),
+                    json!({}),
+                    "{widget}"
+                );
+            }
+            assert!(matches!(
+                custom_value_from_json(widget, &Value::Null),
+                FieldValue::Text(t) if t == "{}"
+            ));
+        }
     }
 
     #[test]
-    fn smart_rename_agent_widget_same_as_session_round_trips() {
+    fn smart_rename_agent_widget_persists_the_rendered_option() {
         // "Same as session" is index 0 and persists as the empty string,
-        // independent of which agents are installed on the test host.
+        // whatever agents this host has installed.
         assert!(matches!(
             custom_value_from_json("smart-rename-agent", &json!("")),
             FieldValue::Select { selected: 0, ref options } if options[0] == "Same as session"
@@ -1369,88 +1291,144 @@ mod tests {
             custom_value_from_json("smart-rename-agent", &Value::Null),
             FieldValue::Select { selected: 0, .. }
         ));
-        assert_eq!(
-            custom_value_to_json(
-                "smart-rename-agent",
-                &FieldValue::Select {
-                    selected: 0,
-                    options: vec!["Same as session".to_string()],
-                },
-            ),
-            json!(""),
-        );
-        // A non-zero index persists the rendered option's name verbatim (not a
-        // re-detected list), so the saved value cannot drift if availability
-        // changes between render and save.
-        assert_eq!(
-            custom_value_to_json(
-                "smart-rename-agent",
-                &FieldValue::Select {
-                    selected: 2,
-                    options: vec![
-                        "Same as session".to_string(),
-                        "claude".to_string(),
-                        "codex".to_string(),
-                    ],
-                },
-            ),
-            json!("codex"),
-        );
+
+        // A non-zero index persists the rendered option verbatim, so a change
+        // in availability between render and save cannot shift the value.
+        let options = vec![
+            "Same as session".to_string(),
+            "claude".to_string(),
+            "codex".to_string(),
+        ];
+        for (selected, want) in [(0, ""), (2, "codex")] {
+            assert_eq!(
+                custom_value_to_json(
+                    "smart-rename-agent",
+                    &FieldValue::Select {
+                        selected,
+                        options: options.clone(),
+                    },
+                ),
+                json!(want),
+            );
+        }
     }
 
     #[test]
-    fn profile_field_inherits_after_global_change() {
+    fn a_profile_row_shows_an_override_only_when_the_profile_sets_it() {
+        // (category, ident, the profile override that sets it)
+        let cases = [
+            (
+                SettingsCategory::Updates,
+                "updates.update_check_mode",
+                json!({"updates": {"update_check_mode": "off"}}),
+            ),
+            (
+                SettingsCategory::Worktree,
+                "worktree.enabled",
+                json!({"worktree": {"enabled": true}}),
+            ),
+        ];
+        for (cat, ident, override_json) in cases {
+            let inherited = build(cat, SettingsScope::Profile, &ProfileConfig::default());
+            assert!(!field(&inherited, ident).has_override, "{ident}");
+            assert!(
+                field(
+                    &build(cat, SettingsScope::Profile, &profile_from(override_json)),
+                    ident
+                )
+                .has_override,
+                "{ident}"
+            );
+        }
+
+        // A global change never promotes an inheriting profile row.
         let mut global = Config::default();
-        let profile = ProfileConfig::default();
-
-        let fields = build_fields_for_category(
-            SettingsCategory::Updates,
-            SettingsScope::Profile,
-            &global,
-            &profile,
-        );
-        assert!(!field(&fields, "updates.update_check_mode").has_override);
-
-        // Changing the global value must not promote the profile to "override".
         global.updates.update_check_mode = crate::session::config::UpdateCheckMode::Off;
         let fields = build_fields_for_category(
             SettingsCategory::Updates,
             SettingsScope::Profile,
             &global,
-            &profile,
+            &ProfileConfig::default(),
         );
-        assert!(
-            !field(&fields, "updates.update_check_mode").has_override,
-            "profile should inherit, not show an override, after a global change"
-        );
-    }
+        assert!(!field(&fields, "updates.update_check_mode").has_override);
 
-    #[test]
-    fn profile_field_shows_override_after_profile_change() {
-        let global = Config::default();
-        let profile = profile_from(json!({"updates": {"update_check_mode": "off"}}));
+        // Global rows read the global value.
+        global.worktree.enabled = true;
         let fields = build_fields_for_category(
-            SettingsCategory::Updates,
-            SettingsScope::Profile,
-            &global,
-            &profile,
-        );
-        assert!(field(&fields, "updates.update_check_mode").has_override);
-    }
-
-    #[test]
-    fn default_tool_options_include_all_registered_agents() {
-        let global = Config::default();
-        let profile = ProfileConfig::default();
-        let fields = build_fields_for_category(
-            SettingsCategory::Agents,
+            SettingsCategory::Worktree,
             SettingsScope::Global,
             &global,
+            &ProfileConfig::default(),
+        );
+        assert!(matches!(
+            field(&fields, "worktree.enabled").value,
+            FieldValue::Bool(true)
+        ));
+    }
+
+    #[test]
+    fn applying_a_profile_field_keeps_the_override_even_when_it_matches_global() {
+        // Only the `r` key clears an override, so re-applying a field that
+        // happens to equal the global value must not start inheriting.
+        let mut global = Config::default();
+        let mut profile = profile_from(json!({"updates": {"update_check_mode": "off"}}));
+        let f = field(
+            &build(SettingsCategory::Updates, SettingsScope::Profile, &profile),
+            "updates.update_check_mode",
+        )
+        .clone();
+        apply_field_to_config(&f, SettingsScope::Profile, &mut global, &mut profile);
+        assert!(has_override_path(&profile, "updates", "update_check_mode"));
+    }
+
+    #[test]
+    fn status_hook_rows_read_and_apply_in_both_scopes() {
+        let global_rows = build(
+            SettingsCategory::StatusHooks,
+            SettingsScope::Global,
+            &ProfileConfig::default(),
+        );
+        assert!(matches!(
+            &field(&global_rows, "status_hooks.on_waiting").value,
+            FieldValue::OptionalText(None)
+        ));
+
+        let profile = profile_from(json!({"status_hooks": {"on_waiting": "notify-send hi"}}));
+        let profile_rows = build(
+            SettingsCategory::StatusHooks,
+            SettingsScope::Profile,
             &profile,
         );
-        let options = match &field(&fields, "session.default_tool").value {
-            FieldValue::Select { options, .. } => options.clone(),
-            other => panic!("default tool should be a Select, got {other:?}"),
+        let f = field(&profile_rows, "status_hooks.on_waiting");
+        assert!(f.has_override);
+        assert!(matches!(
+            &f.value,
+            FieldValue::OptionalText(Some(v)) if v == "notify-send hi"
+        ));
+
+        let mut global = Config::default();
+        let mut profile = ProfileConfig::default();
+        let mut f = field(&global_rows, "status_hooks.on_waiting").clone();
+        f.value = FieldValue::OptionalText(Some("notify-send hi".to_string()));
+        apply_field_to_config(&f, SettingsScope::Global, &mut global, &mut profile);
+        assert_eq!(
+            global.status_hooks.on_waiting.as_deref(),
+            Some("notify-send hi")
+        );
+        apply_field_to_config(&f, SettingsScope::Profile, &mut global, &mut profile);
+        assert!(has_override_path(&profile, "status_hooks", "on_waiting"));
+    }
+
+    #[test]
+    fn default_tool_options_mirror_the_agent_registry() {
+        let fields = build(
+            SettingsCategory::Agents,
+            SettingsScope::Global,
+            &ProfileConfig::default(),
+        );
+        let FieldValue::Select { options, .. } = &field(&fields, "session.default_tool").value
+        else {
+            panic!("default tool should be a Select");
         };
         // Skip the leading "Auto" entry; the rest must mirror the registry.
         let tool_options: Vec<&str> = options.iter().skip(1).map(|s| s.as_str()).collect();
@@ -1464,227 +1442,83 @@ mod tests {
     }
 
     #[test]
-    fn apply_to_profile_always_stores_override_even_when_matching_global() {
-        // Toggling a profile field back to the global value must keep the
-        // override (the 'r' key is the only way to clear it), so the profile
-        // does not silently start inheriting again.
-        let mut global = Config::default();
-        let mut profile = profile_from(json!({"updates": {"update_check_mode": "off"}}));
-        let fields = build_fields_for_category(
-            SettingsCategory::Updates,
-            SettingsScope::Profile,
-            &global,
-            &profile,
-        );
-        // Re-apply the field as-is.
-        let f = field(&fields, "updates.update_check_mode").clone();
-        apply_field_to_config(&f, SettingsScope::Profile, &mut global, &mut profile);
-        assert!(
-            has_override_path(&profile, "updates", "update_check_mode"),
-            "override must be preserved after re-apply"
-        );
-    }
-
-    #[test]
-    fn worktree_enabled_reads_global_value() {
-        let mut global = Config::default();
-        global.worktree.enabled = true;
-        let profile = ProfileConfig::default();
-        let fields = build_fields_for_category(
-            SettingsCategory::Worktree,
-            SettingsScope::Global,
-            &global,
-            &profile,
-        );
-        assert!(matches!(
-            field(&fields, "worktree.enabled").value,
-            FieldValue::Bool(true)
-        ));
-    }
-
-    #[test]
-    fn worktree_enabled_profile_override() {
-        let global = Config::default();
-        let profile = profile_from(json!({"worktree": {"enabled": true}}));
-        let fields = build_fields_for_category(
-            SettingsCategory::Worktree,
-            SettingsScope::Profile,
-            &global,
-            &profile,
-        );
-        let f = field(&fields, "worktree.enabled");
-        assert!(f.has_override);
-        assert!(matches!(f.value, FieldValue::Bool(true)));
-    }
-
-    #[test]
-    fn status_hook_on_waiting_reads_default_and_override() {
-        let global = Config::default();
-
-        let fields = build_fields_for_category(
-            SettingsCategory::StatusHooks,
-            SettingsScope::Global,
-            &global,
-            &ProfileConfig::default(),
-        );
-        assert!(matches!(
-            &field(&fields, "status_hooks.on_waiting").value,
-            FieldValue::OptionalText(None)
-        ));
-
-        let profile = profile_from(json!({"status_hooks": {"on_waiting": "notify-send hi"}}));
-        let fields = build_fields_for_category(
-            SettingsCategory::StatusHooks,
-            SettingsScope::Profile,
-            &global,
-            &profile,
-        );
-        let f = field(&fields, "status_hooks.on_waiting");
-        assert!(f.has_override);
-        assert!(matches!(
-            &f.value,
-            FieldValue::OptionalText(Some(v)) if v == "notify-send hi"
-        ));
-    }
-
-    #[test]
-    fn status_hook_on_waiting_applies_global_and_profile() {
-        let mut global = Config::default();
-        let mut profile = ProfileConfig::default();
-        let mut f = field(
-            &build_fields_for_category(
-                SettingsCategory::StatusHooks,
-                SettingsScope::Global,
-                &global,
-                &profile,
-            ),
-            "status_hooks.on_waiting",
-        )
-        .clone();
-        f.value = FieldValue::OptionalText(Some("notify-send hi".to_string()));
-
-        apply_field_to_config(&f, SettingsScope::Global, &mut global, &mut profile);
-        assert_eq!(
-            global.status_hooks.on_waiting.as_deref(),
-            Some("notify-send hi")
-        );
-
-        apply_field_to_config(&f, SettingsScope::Profile, &mut global, &mut profile);
-        assert!(has_override_path(&profile, "status_hooks", "on_waiting"));
-    }
-
-    #[test]
-    fn acp_fields_have_advanced_section_marker() {
-        let global = Config::default();
-        let profile = ProfileConfig::default();
-        let fields = build_fields_for_category(
+    fn acp_fields_split_around_the_advanced_section_marker() {
+        let fields = build(
             SettingsCategory::Acp,
             SettingsScope::Global,
-            &global,
-            &profile,
+            &ProfileConfig::default(),
         );
-        let header_idx = fields
+        let header = fields
             .iter()
             .position(|f| matches!(f.value, FieldValue::SectionHeader))
             .expect("acp should contain an Advanced section header");
-        assert_eq!(fields[header_idx].label, "Advanced");
-        for ident in [
-            "acp.default_agent",
-            "acp.replay_events",
-            "acp.node_path",
-            "acp.show_tool_durations",
+        assert_eq!(fields[header].label, "Advanced");
+        for (ident, before) in [
+            ("acp.default_agent", true),
+            ("acp.replay_events", true),
+            ("acp.node_path", true),
+            ("acp.show_tool_durations", true),
+            ("acp.max_concurrent_workers", false),
+            ("acp.silent_orphan_grace_secs", false),
         ] {
             let pos = fields.iter().position(|f| f.ident() == ident).unwrap();
-            assert!(pos < header_idx, "{ident} must precede the Advanced header");
-        }
-        for ident in ["acp.max_concurrent_workers", "acp.silent_orphan_grace_secs"] {
-            let pos = fields.iter().position(|f| f.ident() == ident).unwrap();
-            assert!(pos > header_idx, "{ident} must follow the Advanced header");
+            assert_eq!(pos < header, before, "{ident}");
         }
     }
 
     #[test]
-    fn session_split_routes_fields_to_their_tabs() {
-        let global = Config::default();
+    fn each_session_field_lands_on_its_own_tab() {
         let profile = ProfileConfig::default();
-        let idents = |cat| -> Vec<String> {
-            build_fields_for_category(cat, SettingsScope::Global, &global, &profile)
-                .iter()
-                .map(|f| f.ident())
-                .collect()
-        };
+        let tab = |cat| idents(&build(cat, SettingsScope::Global, &profile));
 
-        let agents = idents(SettingsCategory::Agents);
-        for ident in [
-            "session.default_tool",
-            "session.agent_extra_args",
-            "session.agent_command_override",
-            "session.custom_agents",
-            "session.agent_detect_as",
-            "session.agent_status_hooks",
-        ] {
-            assert!(
-                agents.contains(&ident.to_string()),
-                "Agents missing {ident}"
-            );
+        // (tab, idents it must carry)
+        let expected = [
+            (
+                SettingsCategory::Agents,
+                &[
+                    "session.default_tool",
+                    "session.agent_extra_args",
+                    "session.agent_command_override",
+                    "session.custom_agents",
+                    "session.agent_detect_as",
+                    "session.agent_status_hooks",
+                ][..],
+            ),
+            (
+                SettingsCategory::Interaction,
+                &[
+                    "session.default_attach_mode",
+                    "session.new_session_mode",
+                    "session.click_action",
+                    "session.live_send_exit_chord",
+                    "session.mouse_capture",
+                    "session.host_tab_title",
+                    "session.show_session_colors",
+                ][..],
+            ),
+            (SettingsCategory::Session, &["environment"][..]),
+        ];
+        for (cat, wanted) in expected {
+            let rows = tab(cat);
+            for ident in wanted {
+                assert!(rows.contains(&ident.to_string()), "{cat:?} missing {ident}");
+            }
         }
 
-        let interaction = idents(SettingsCategory::Interaction);
-        for ident in [
-            "session.default_attach_mode",
-            "session.new_session_mode",
-            "session.click_action",
-            "session.live_send_exit_chord",
-            "session.mouse_capture",
-            "session.host_tab_title",
-            "session.show_session_colors",
-        ] {
-            assert!(
-                interaction.contains(&ident.to_string()),
-                "Interaction missing {ident}"
-            );
-        }
-
-        let session = idents(SettingsCategory::Session);
+        // And those moved off the Session tab stay off it.
+        let session = tab(SettingsCategory::Session);
         for ident in [
             "session.default_tool",
             "session.agent_extra_args",
             "session.default_attach_mode",
             "session.live_send_exit_chord",
         ] {
-            assert!(
-                !session.contains(&ident.to_string()),
-                "{ident} should have moved out of the Session tab"
-            );
+            assert!(!session.contains(&ident.to_string()), "{ident} moved off");
         }
-    }
 
-    #[test]
-    fn host_environment_row_present_in_session_tab() {
-        let global = Config::default();
-        let profile = ProfileConfig::default();
-        let fields = build_fields_for_category(
-            SettingsCategory::Session,
-            SettingsScope::Global,
-            &global,
-            &profile,
-        );
-        assert!(fields.iter().any(|f| f.ident() == "environment"));
-    }
-
-    #[test]
-    fn lifecycle_hooks_are_the_hooks_tab() {
-        let global = Config::default();
-        let profile = ProfileConfig::default();
-        let fields = build_fields_for_category(
-            SettingsCategory::Hooks,
-            SettingsScope::Global,
-            &global,
-            &profile,
-        );
-        let idents: Vec<String> = fields.iter().map(|f| f.ident()).collect();
+        // The Hooks tab is exactly the lifecycle hooks.
         assert_eq!(
-            idents,
+            tab(SettingsCategory::Hooks),
             vec!["hooks.on_create", "hooks.on_launch", "hooks.on_destroy"]
         );
     }

@@ -11,29 +11,15 @@ export function makeOptimisticSnoozedUntil(minutes: number): string {
   return new Date(Date.now() + minutes * 60_000).toISOString();
 }
 
-/** Optimistic triage override for a single sidebar row, keyed by workspace
- *  id in the sidebar's overlay map. Each field mirrors the three pieces of
- *  per-row state that used to live inside `SessionRow` as `useState`:
- *  `pinned` / `archived` use `boolean | null` where `null` means "no
- *  override, fall through to the server value"; `snoozedUntil` uses
- *  `string | null | undefined` where `undefined` means "no override",
- *  `null` means "pretend the server already unsnoozed", and a string means
- *  "pretend the server already snoozed until then". Lifting this out of the
- *  row is what lets a bulk action drive many rows from one place instead of
- *  reaching into N independent row components. See #1724. */
+/** Optimistic triage override for one row. `null` falls through to the server value; for `snoozedUntil`, `undefined` falls through and `null` means unsnoozed. */
 export interface OptimisticTriage {
   pinned: boolean | null;
   archived: boolean | null;
   snoozedUntil: string | null | undefined;
-  /** Optimistic unread override: `null` means "no override, use the server
-   *  value", `true`/`false` mean "pretend the server already flagged/cleared
-   *  it". Mirrors `pinned`/`archived`'s two-state-plus-null shape. */
   unread: boolean | null;
 }
 
-/** A row with no optimistic override. Shared frozen singleton so rows that
- *  are not mid-mutation all read the same object identity (keeps the
- *  memoized `SessionRow` from re-rendering on unrelated overlay changes). */
+/** Frozen singleton so rows without an override share one identity and memoized rows don't re-render. */
 export const EMPTY_OPTIMISTIC: OptimisticTriage = Object.freeze({
   pinned: null,
   archived: null,
@@ -41,11 +27,7 @@ export const EMPTY_OPTIMISTIC: OptimisticTriage = Object.freeze({
   unread: null,
 });
 
-/** Server-truth triage aggregates for a workspace, matching the exact
- *  per-row aggregators the sidebar renders with: pin/archive use `.some`
- *  across the workspace's sessions, snooze takes the first session that
- *  carries a `snoozed_until`. Kept here so the overlay reconciler and the
- *  row render agree on the same baseline. */
+/** The same aggregates the row renders with: any-session pin/archive, first session's snooze. */
 export function serverTriageOf(ws: Workspace): {
   isPinned: boolean;
   isArchived: boolean;
@@ -79,11 +61,7 @@ export function effectiveUnreadOf(optimistic: OptimisticTriage, serverUnread: bo
   return optimistic.unread ?? serverUnread;
 }
 
-/** True when an override has been caught up to by the server and can be
- *  dropped. Mirrors the three per-field reconciliation effects that used to
- *  live in `SessionRow`: a boolean override clears once it equals the
- *  server value; a snooze override clears when both sides are unsnoozed or
- *  both point at the same deadline (within the close-enough tolerance). */
+/** A boolean clears once it matches the server; a snooze clears when both are unsnoozed or the deadlines are close enough. */
 function fieldCaughtUp<T>(override: T | null, server: T): boolean {
   return override !== null && override === server;
 }
@@ -94,11 +72,7 @@ function snoozeCaughtUp(override: string | null | undefined, server: string | nu
   return server != null && snoozeTimestampCloseEnough(override, server);
 }
 
-/** Given the current overlay map and the latest workspaces, return a new map
- *  with any override the server has caught up to removed, dropping rows whose
- *  every field has reconciled. Returns the SAME map reference when nothing
- *  changed so callers can skip a state update (avoids a render loop when used
- *  from an effect). Pure: no React, fully unit-testable. */
+/** Drop overrides the server caught up to. Returns the same map when nothing changed, avoiding render loops. */
 export function reconcileOptimistic(
   map: ReadonlyMap<string, OptimisticTriage>,
   workspaces: readonly Workspace[],
@@ -112,9 +86,7 @@ export function reconcileOptimistic(
   const next = new Map<string, OptimisticTriage>();
   for (const [id, override] of map) {
     const server = serverById.get(id);
-    // Workspace vanished from the tree: keep the override until it either
-    // reappears (and reconciles) or the consumer prunes it; dropping it
-    // here would make a row flicker back to a stale state mid-refresh.
+    // Keep a vanished workspace's override so a mid-refresh row doesn't flicker back to stale state.
     if (!server) {
       next.set(id, override);
       continue;
@@ -140,9 +112,6 @@ export function reconcileOptimistic(
   return changed ? next : (map as Map<string, OptimisticTriage>);
 }
 
-/** Merge a partial override into an existing entry, preserving the fields the
- *  patch does not mention. Used by both single-row and bulk mutations to set
- *  the optimistic state before the request lands. */
 export function withOverride(prev: OptimisticTriage | undefined, patch: Partial<OptimisticTriage>): OptimisticTriage {
   return {
     pinned: patch.pinned !== undefined ? patch.pinned : (prev?.pinned ?? null),

@@ -1,24 +1,12 @@
-//! Test-only helpers for tmux integration tests.
-//!
-//! `TmuxTestSession` reserves a unique session name and tears the tmux
-//! session down on `Drop`, so a panicking `assert!`/`expect!` cannot leak a
-//! tmux session into the user's environment. Tests still call
-//! `tmux new-session` themselves (they need their own `-x`/`-y`/command and
-//! occasionally compound argv), so the guard does not create the session.
+//! Test-only tmux session guard and pane helpers.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// RAII guard that runs `tmux kill-session -t <name>` on drop. The guard
-/// owns the session name; tests call `guard.name()` wherever they need
-/// `&str`.
 pub(crate) struct TmuxTestSession {
     name: String,
 }
 
 impl TmuxTestSession {
-    /// Reserve a unique name of the form `<prefix>_<pid>_<n>`. `n` is a
-    /// process-local atomic counter so a single test can hold multiple
-    /// guards without collision.
     pub(crate) fn new(prefix: &str) -> Self {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -27,8 +15,6 @@ impl TmuxTestSession {
         }
     }
 
-    /// Guard an exact name derived by production naming code. The caller is
-    /// still responsible for choosing a unique name and creating the session.
     pub(crate) fn from_name(name: impl Into<String>) -> Self {
         Self { name: name.into() }
     }
@@ -40,8 +26,6 @@ impl TmuxTestSession {
 
 impl Drop for TmuxTestSession {
     fn drop(&mut self) {
-        // Best-effort, idempotent. Drop must not panic, so the Result is
-        // discarded: a missing tmux server or already-dead session is fine.
         let _ = crate::tmux::tmux_command()
             .args(["kill-session", "-t", &self.name])
             .output();
@@ -64,7 +48,6 @@ pub(crate) fn pane_field(target: &str, format: &str) -> String {
         .to_string()
 }
 
-/// Capture the sole pane's identity before adding windows or splits.
 pub(crate) fn only_pane_id(session_name: &str) -> String {
     let id = pane_field(session_name, "#{pane_id}");
     assert!(
@@ -74,7 +57,6 @@ pub(crate) fn only_pane_id(session_name: &str) -> String {
     id
 }
 
-/// Observe exec on the raw pane ID, independently of the API's target resolution.
 pub(crate) fn wait_for_pane_command(pane_id: &str, expected: &str) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
@@ -105,25 +87,32 @@ pub(crate) fn wait_for_pane_dead(pane_id: &str) {
     }
 }
 
+pub(crate) fn tmux_available() -> bool {
+    crate::tmux::tmux_command()
+        .arg("-V")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// Return early from a test when no tmux binary is usable.
+macro_rules! require_tmux {
+    () => {
+        if !$crate::tmux::test_helpers::tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+    };
+}
+pub(crate) use require_tmux;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn tmux_available() -> bool {
-        crate::tmux::tmux_command()
-            .arg("-V")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    }
-
     #[test]
     #[serial_test::serial]
     fn drop_kills_session() {
-        if !tmux_available() {
-            eprintln!("Skipping test: tmux not available");
-            return;
-        }
+        require_tmux!();
         let captured_name;
         {
             let guard = TmuxTestSession::new("aoe_test_guard_self");
@@ -160,9 +149,6 @@ mod tests {
         assert!(!exists, "session should be killed after guard drop");
     }
 
-    // No `#[serial_test::serial]`: this test only touches the in-process
-    // atomic counter, never tmux. Adding the attribute would needlessly
-    // serialize it against unrelated tmux-spawning tests.
     #[test]
     fn unique_names_within_process() {
         let a = TmuxTestSession::new("aoe_test_unique");

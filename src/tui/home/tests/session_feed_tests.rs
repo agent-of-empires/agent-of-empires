@@ -1,10 +1,8 @@
-/// Structured (ACP) rows get their status from the daemon, because nothing else
-/// can tell you what an ACP session is doing: they have no tmux pane, the tmux
-/// poller bails on them, and the daemon deliberately never persists their
-/// status to `sessions.json` (see the durability contract on
-/// `apply_acp_overlay_inplace`). Before this wiring existed the pill sat frozen
-/// at whatever creation or an explicit start/stop wrote, for the whole life of
-/// the session.
+/// Structured (ACP) rows get their status from the daemon, because nothing else can tell
+/// you what an ACP session is doing: they have no tmux pane, the tmux poller bails on them,
+/// and the daemon deliberately never persists their status (see the durability contract on
+/// `apply_acp_overlay_inplace`). Without this wiring the pill sat frozen at whatever
+/// creation or an explicit start/stop wrote.
 use super::*;
 use crate::session::Status;
 use crate::tui::session_feed::{DaemonStatusUpdate, SessionFeed, SessionFeedResult, SidebarSource};
@@ -67,9 +65,8 @@ fn daemon_status_moves_a_structured_row_off_idle() {
 #[test]
 #[serial]
 fn daemon_status_carries_the_waiting_state_for_a_pending_approval() {
-    // `derive_acp_status` maps ApprovalRequested/ElicitationRequested to
-    // Waiting; the whole point of the yellow pill is spotting a session
-    // blocked on you from the home list without opening it.
+    // `derive_acp_status` maps ApprovalRequested/ElicitationRequested to Waiting; the
+    // yellow pill exists to spot a session blocked on you from the home list.
     let mut env = create_test_env_empty();
     let id = structured_row(&mut env, Status::Running);
 
@@ -85,10 +82,9 @@ fn daemon_status_carries_the_waiting_state_for_a_pending_approval() {
 #[test]
 #[serial]
 fn daemon_status_clears_a_stale_error_message() {
-    // The pre-fix sandbox-dead branch left sandboxed structured rows at
-    // Idle with a phantom "Container is not running" hanging off them. The
-    // daemon's own `last_error` is authoritative, so applying it clears the
-    // leftover rather than letting it sit on the row for the session's life.
+    // The pre-fix sandbox-dead branch left sandboxed structured rows at Idle with a phantom
+    // "Container is not running". The daemon's `last_error` is authoritative, so applying it
+    // clears the leftover.
     let mut env = create_test_env_empty();
     let id = structured_row(&mut env, Status::Error);
     env.view.mutate_instance(&id, |inst| {
@@ -229,9 +225,8 @@ fn session_feed_setting_off_never_fetches_and_drops_an_in_flight_result() {
 #[test]
 #[serial]
 fn request_session_feed_refresh_is_a_no_op_without_structured_rows() {
-    // The daemon owns nothing on a terminal-only sidebar yet, so that view
-    // never talks to it; that would be one HTTP round trip per second for
-    // nothing.
+    // The daemon owns nothing on a terminal-only sidebar, so that view never talks to it;
+    // it would be one HTTP round trip a second for nothing.
     let mut env = create_test_env_empty();
     let mut inst = Instance::new("tmux-session", "/tmp/repo");
     inst.source_profile = "test".to_string();
@@ -303,11 +298,10 @@ fn request_session_feed_refresh_arms_and_disarms_the_in_flight_flag() {
     );
 }
 
-/// The regression that made this producer necessary in the first place,
-/// surviving in a reachable path: stopping a structured session persists
-/// `Stopped`, `open_structured_view` does not clear it, and
-/// `apply_status_update` drops every update whose row is `Stopped`. Without
-/// the explicit lift, the pill stays grey through the entire next turn.
+/// The regression that made this producer necessary, in a reachable path: stopping a
+/// structured session persists `Stopped`, `open_structured_view` does not clear it, and
+/// `apply_status_update` drops every update whose row is `Stopped`, so without the explicit
+/// lift the pill stays grey through the next turn.
 #[test]
 #[serial]
 fn daemon_status_lifts_a_locally_stopped_structured_row() {
@@ -324,9 +318,9 @@ fn daemon_status_lifts_a_locally_stopped_structured_row() {
     );
 }
 
-/// The other side of that lift: a daemon still reporting `Stopped` must not
-/// be turned into a wake-up. Only a non-Stopped reading, which the daemon
-/// emits only after `AcpSessionAssigned` heals its own row, counts.
+/// The other side of that lift: a daemon still reporting `Stopped` must not become a
+/// wake-up. Only a non-Stopped reading, which the daemon emits after `AcpSessionAssigned`
+/// heals its row, counts.
 #[test]
 #[serial]
 fn daemon_status_stopped_leaves_a_stopped_row_alone() {
@@ -342,10 +336,9 @@ fn daemon_status_stopped_leaves_a_stopped_row_alone() {
     );
 }
 
-/// A row mid-restart has its post-cascade `Instance` delivered by
-/// `apply_restart_results`; the daemon's copy landing inside that window
-/// races it. `pollable_instances` excludes these rows from the tmux
-/// producer, so this producer has to match.
+/// A row mid-restart has its post-cascade `Instance` delivered by `apply_restart_results`,
+/// so the daemon's copy landing in that window races it. `pollable_instances` excludes these
+/// rows from the tmux producer and this producer must match.
 #[test]
 #[serial]
 fn daemon_status_skips_a_row_mid_restart() {
@@ -379,12 +372,11 @@ fn daemon_status_skips_a_row_mid_recovery() {
     );
 }
 
-/// #3201: the daemon owns structured status and deliberately never
-/// persists it (`decide_passive_transition` returns `patch: None` for
-/// `is_structured()`). The TUI's passive writer must gate the same way, or
-/// a `Running`/`Error` stamped mid-turn survives a daemon stop and a TUI
-/// restart, with the tmux poller now bailing on structured rows so nothing
-/// heals it. The in-memory pill must still move.
+/// #3201: the daemon owns structured status and never persists it
+/// (`decide_passive_transition` returns `patch: None` for `is_structured()`), so the TUI's
+/// passive writer must gate the same way, or a `Running`/`Error` stamped mid-turn survives a
+/// daemon stop and a TUI restart with nothing left to heal it. The in-memory pill must still
+/// move.
 #[test]
 #[serial]
 fn daemon_status_does_not_persist_a_structured_row_to_disk() {
@@ -415,13 +407,12 @@ fn daemon_status_does_not_persist_a_structured_row_to_disk() {
     );
 }
 
-/// A structured row's turn-end is the daemon's to record, both halves of it,
-/// so the TUI writes neither field: the status is a daemon-side overlay with
-/// no durable owner (#3201), and the unread mark is written durably by the
-/// live ACP turn-end path (`should_mark_acp_unread`, #3181).
+/// A structured row's turn-end is the daemon's to record, both halves, so the TUI writes
+/// neither field: the status is a daemon-side overlay with no durable owner (#3201) and the
+/// unread mark is written by the live ACP turn-end path (#3181).
 ///
-/// The mark still reaches this row, from disk on the next reload;
-/// `merge_from_tui` has no `unread` arm, so a TUI save cannot clobber it.
+/// The mark still reaches this row from disk on the next reload; `merge_from_tui` has no
+/// `unread` arm, so a TUI save cannot clobber it.
 #[test]
 #[serial]
 fn tui_persists_neither_status_nor_unread_for_a_structured_turn_end() {
@@ -456,14 +447,12 @@ fn tui_persists_neither_status_nor_unread_for_a_structured_turn_end() {
     );
 }
 
-/// #3201: `last_error` reconciliation on a same-status daemon tick. An
-/// incoming `Some` is authoritative and always replaces the message, even
-/// without a status change (gating that write on a transition froze the
-/// first error on the row). An incoming `None` is not symmetric: the daemon
-/// tracks only ACP errors, so a same-status `None` tick must leave a
-/// locally-set message (e.g. the delete-failure text from
-/// `apply_deletion_results`) in place rather than wipe it. Clearing across a
-/// genuine transition is locked by `daemon_status_clears_a_stale_error_message`.
+/// #3201: `last_error` reconciliation on a same-status tick. An incoming `Some` is
+/// authoritative and always replaces the message, even without a status change, since gating
+/// that on a transition froze the first error. A `None` is not symmetric: the daemon tracks
+/// only ACP errors, so a same-status `None` must leave a locally-set message in place.
+/// Clearing across a genuine transition is locked by
+/// `daemon_status_clears_a_stale_error_message`.
 #[test]
 #[serial]
 fn daemon_status_reconciles_last_error_on_a_same_status_tick() {
@@ -504,11 +493,9 @@ fn daemon_status_reconciles_last_error_on_a_same_status_tick() {
     }
 }
 
-/// #3201: a snoozed row must stay live on the daemon path. Snooze is a
-/// user-facing triage marker, not a sink like archive or trash;
-/// `daemon_status_applies_to` deliberately excludes only archived and
-/// trashed rows, never snoozed. This locks against a future edit that adds
-/// a symmetric `!is_snoozed()` exclusion and silently freezes snoozed pills.
+/// #3201: a snoozed row stays live on the daemon path. Snooze is a triage marker, not a
+/// sink like archive or trash, so `daemon_status_applies_to` excludes only archived and
+/// trashed rows. Locks against a future symmetric `!is_snoozed()` exclusion.
 #[test]
 #[serial]
 fn daemon_status_applies_to_a_snoozed_structured_row() {
@@ -526,10 +513,9 @@ fn daemon_status_applies_to_a_snoozed_structured_row() {
     );
 }
 
-/// The daemon refresh returns early for archived and trashed rows, so a
-/// stale cached approval must be dropped exactly when the row transitions
-/// there: pressing the permission action on such a row would open an
-/// approval the resolver can only 404 on.
+/// The daemon refresh returns early for archived and trashed rows, so a stale cached
+/// approval must be dropped exactly at the transition: the permission action would otherwise
+/// open an approval the resolver can only 404 on.
 #[test]
 #[serial]
 fn daemon_update_clears_cached_approvals_when_a_row_is_sunk() {
@@ -549,9 +535,8 @@ fn daemon_update_clears_cached_approvals_when_a_row_is_sunk() {
             }
         });
 
-        // Empty daemon update after the transition: the refresh path
-        // returns before touching the cache, so the transition itself
-        // must drop it.
+        // Empty daemon update after the transition: the refresh path returns before
+        // touching the cache, so the transition itself must drop it.
         env.view
             .apply_daemon_status_update(update(&id, Status::Idle));
 
@@ -562,11 +547,10 @@ fn daemon_update_clears_cached_approvals_when_a_row_is_sunk() {
     }
 }
 
-/// #3201, reintroducing the #1868 / #2206 guard on the daemon path:
-/// `/api/sessions` returns archived and trashed rows, and the
-/// `is_archived()` short-circuit that protects the tmux producer lives in
-/// `update_status_with_metadata_inner`, a path the daemon overlay never
-/// reaches. A sunk row must not be restamped by the daemon reading.
+/// #3201, reintroducing the #1868 / #2206 guard on the daemon path: `/api/sessions` returns
+/// archived and trashed rows, and the `is_archived()` short-circuit protecting the tmux
+/// producer lives in `update_status_with_metadata_inner`, which the daemon overlay never
+/// reaches. A sunk row must not be restamped.
 #[test]
 #[serial]
 fn daemon_status_skips_a_sunk_structured_row() {

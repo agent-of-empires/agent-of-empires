@@ -4,59 +4,34 @@ use super::*;
 
 /// Ensure the main agent tmux session is alive, restarting it if dead.
 ///
-/// Mirrors the TUI's `attach_session` restart logic: checks the actual tmux
-/// state (exists / pane dead / running unexpected shell) and restarts the
-/// instance when needed. Returns the resulting status so the frontend can
-/// decide whether to proceed with the WebSocket attach.
+/// Mirrors the TUI's `attach_session` restart logic and returns the resulting
+/// status so the frontend can decide whether to proceed with the WebSocket
+/// attach. A per-instance mutex serializes ensure calls for one session, so two
+/// rapid POSTs cannot both decide "dead" and race on `tmux new-session`.
 ///
-/// Concurrency: a per-instance `tokio::sync::Mutex` serializes ensure calls
-/// for the same session so two rapid POSTs don't both decide "dead" and race
-/// on `tmux new-session`.
+/// In read-only mode the endpoint may report `alive` but returns 403 when a
+/// restart would be needed.
 ///
-/// Read-only: in read-only mode, the endpoint may report `alive` but will
-/// refuse to kill+restart a session. Returns 403 when a restart is needed.
-///
-/// Latency: bounded by `RESUME_PROBE_MAX` (~3s) per probe.
-///   * No-op (pane alive): inspect-only, ~tmux RTT.
-///   * Healthy resume: Tier-1 probe only, returns after the
-///     `RESUME_PROBE_POST_SHELL_GRACE` (~2s) shortcut. Shell-wrapper
-///     overrides charitably burn the full ~3s instead (see
-///     `Instance::probe_settle`).
-///   * Probe failure (resume pane dies): Tier-1 returns Dead fast
-///     (`pane_dead`/`!exists` is unambiguous), then `kill_clean` (~100ms
-///     macOS grace) and a typed 409 response preserving the sid.
-///
-/// HTTP clients should budget ~3-4s worst-case for the resume probe and
-/// configure timeouts accordingly.
+/// Latency is bounded by `RESUME_PROBE_MAX` (~3s) per probe, so HTTP clients
+/// should budget ~3-4s worst case for the resume probe.
 pub async fn ensure_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    // CityHall: only act on structured sessions this mode created; refuse a
-    // non-structured (or unknown) target so a locked-down client cannot
-    // respawn/destroy/edit an enumerated plain session. See #7.
     if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
         return resp;
     }
-    // Serialize concurrent ensure calls for the same session. The decision
-    // phase reads tmux state and the restart phase mutates it; any other
-    // ensure for this id must wait so both see a consistent view.
+    // Serialize concurrent ensure calls for the same session: the decision
+    // phase reads tmux state and the restart phase mutates it.
     let inst_lock = state.instance_lock(&id).await;
     let _guard = inst_lock.lock().await;
 
-    let instances = state.instances.read().await;
-    let Some(instance) = instances.iter().find(|i| i.id == id).cloned() else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "not_found"})),
-        )
-            .into_response();
+    let Some(instance) = find_instance(&state, &id).await else {
+        return bare_not_found();
     };
-    drop(instances);
 
-    // Inspect tmux + make the restart decision on a blocking thread. Refresh
-    // the cache first so rapid re-calls see the true current state (the
-    // background status poller only refreshes every 2s).
+    // Inspect tmux and decide on a blocking thread. Refresh the cache first so
+    // rapid re-calls see current state; the poller only refreshes every 2s.
     let decision_instance = instance.clone();
     let id_for_log = id.clone();
     let decision = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
@@ -71,7 +46,7 @@ pub async fn ensure_session(
             false
         } else if decision_instance.has_command_override() {
             // Custom command overrides run agents through wrapper scripts that
-            // look like shells to tmux. Don't restart based on shell detection.
+            // look like shells to tmux, so shell detection cannot decide here.
             false
         } else {
             !decision_instance.expects_shell() && tmux_session.is_pane_running_shell()
@@ -115,14 +90,11 @@ pub async fn ensure_session(
         // Read-only viewers must not kill + respawn a dead session. Signal
         // the frontend so it can show "session is stopped; ask an owner to
         // reattach" instead of silently replacing the agent process.
-        return (
+        return api_error(
             StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "read_only",
-                "message": "Session is stopped or errored. Restart requires write access.",
-            })),
-        )
-            .into_response();
+            "read_only",
+            "Session is stopped or errored. Restart requires write access.",
+        );
     }
 
     {
@@ -137,12 +109,11 @@ pub async fn ensure_session(
     let restart_result = tokio::task::spawn_blocking(
         move || -> Result<(Instance, crate::session::StartOutcome), Box<(Instance, anyhow::Error)>> {
             let mut inst = instance;
-            // `ensure_session` respawns on demand before a WS attach/send,
-            // the server-side analog of `ensure_pane_ready`: always `Allow`,
-            // ignoring `auto_resume_on_restart`, so attaching does not drop
-            // the agent's context. The instance-level cascade holds the
-            // lifecycle lock across final poller drain, exact-pane OMP
-            // capture, kill, and relaunch.
+            // `ensure_session` respawns on demand before a WS attach or send,
+            // so it is always `Allow`, ignoring `auto_resume_on_restart`, and
+            // attaching never drops the agent's context. The instance-level
+            // cascade holds the lifecycle lock across final poller drain,
+            // exact-pane OMP capture, kill and relaunch.
             match inst.restart_with_resume_policy(
                 None,
                 false,
@@ -203,14 +174,7 @@ pub async fn ensure_session(
                     inst.last_error = Some(msg.clone());
                 }
             }
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": "restart_failed",
-                    "message": msg,
-                })),
-            )
-                .into_response()
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "restart_failed", msg)
         }
         Err(e) => {
             tracing::error!(target: "http.api.sessions", "ensure_session panicked for {id}: {e}");
@@ -244,32 +208,21 @@ pub async fn ensure_terminal(
         )
             .into_response();
     }
-    // Serialize concurrent terminal-ensure calls for the same session so two
-    // parallel requests don't both try to create the same tmux session
-    // (the second would fail with "duplicate session"). Taken before the
-    // snapshot read so a concurrent mutation cannot land between the two and
-    // hand `spawn_blocking` a stale clone.
+    // Serialize concurrent terminal-ensure calls for the same session, or two
+    // parallel requests both try to create the same tmux session. Taken before
+    // the snapshot read so a concurrent mutation cannot hand `spawn_blocking` a
+    // stale clone.
     let inst_lock = state.instance_lock(&id).await;
     let _guard = inst_lock.lock().await;
 
-    let instances = state.instances.read().await;
-    let inst = match instances.iter().find(|i| i.id == id) {
-        Some(i) => i.clone(),
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "not_found"})),
-            )
-                .into_response();
-        }
+    let Some(inst) = find_instance(&state, &id).await else {
+        return bare_not_found();
     };
-    drop(instances);
 
-    // Index 0 has the in-memory `terminal_info.created` fast path; additional
-    // terminals (index >= 1) are queried straight from tmux. Either way the
-    // pane shell can exit (Ctrl+D, `exit`, SIGHUP from a destroyed tmux client,
-    // etc.) while the session keeps existing (we set `remain-on-exit on`), so a
-    // live-but-dead pane must be respawned the same way the TUI does on attach.
+    // Index 0 has the in-memory `terminal_info.created` fast path; later
+    // terminals are queried straight from tmux. Either way the pane shell can
+    // exit while the session keeps existing (`remain-on-exit on`), so a
+    // live-but-dead pane must be respawned the way the TUI does on attach.
     {
         let session = inst.terminal_tmux_session_indexed(index).ok();
         let known = if index == 0 {
@@ -322,19 +275,19 @@ pub async fn ensure_terminal(
         }
         Ok(Err(e)) => {
             tracing::error!(target: "http.api.sessions", "Terminal creation failed: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "create_failed", "message": "Failed to create terminal"})),
+                "create_failed",
+                "Failed to create terminal",
             )
-                .into_response()
         }
         Err(e) => {
             tracing::error!(target: "http.api.sessions", "Terminal creation panicked: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+                "internal",
+                "Internal server error",
             )
-                .into_response()
         }
     }
 }
@@ -362,22 +315,13 @@ pub async fn ensure_container_terminal(
     let inst_lock = state.instance_lock(&id).await;
     let _guard = inst_lock.lock().await;
 
-    let instances = state.instances.read().await;
-    let inst = match instances.iter().find(|i| i.id == id) {
-        Some(i) => i.clone(),
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "not_found"})),
-            )
-                .into_response();
-        }
+    let Some(inst) = find_instance(&state, &id).await else {
+        return bare_not_found();
     };
-    drop(instances);
 
-    // Same dead-pane rescue as `ensure_terminal`: an existing-but-dead
-    // pane would otherwise silently swallow every keystroke from the
-    // browser. Container terminals are always tmux-queried (no cache flag).
+    // Same dead-pane rescue as `ensure_terminal`: an existing-but-dead pane
+    // would silently swallow every keystroke from the browser. Container
+    // terminals are always tmux-queried.
     {
         let session = inst.container_terminal_tmux_session_indexed(index).ok();
         if session.as_ref().map(|s| s.exists()).unwrap_or(false) {
@@ -416,28 +360,27 @@ pub async fn ensure_container_terminal(
             .into_response(),
         Ok(Err(e)) => {
             tracing::error!(target: "http.api.sessions", "Container terminal creation failed: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "create_failed", "message": "Failed to create container terminal"})),
+                "create_failed",
+                "Failed to create container terminal",
             )
-                .into_response()
         }
         Err(e) => {
             tracing::error!(target: "http.api.sessions", "Container terminal creation panicked: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+                "internal",
+                "Internal server error",
             )
-                .into_response()
         }
     }
 }
 
-/// Kill an additional paired terminal (host + container) at `index`. Used when
-/// the web dashboard closes an extra terminal tab so its tmux shell does not
-/// leak for the session's lifetime. Index 0 is the primary terminal shared with
-/// the native TUI; closing it in the web UI only hides the pane (the TUI keeps
-/// its shell), so this endpoint rejects index 0. See #2437.
+/// Kill an additional paired terminal (host and container) at `index`, so a
+/// closed extra terminal tab does not leak its tmux shell for the session's
+/// lifetime. Index 0 is shared with the native TUI, which keeps its shell, so
+/// this endpoint rejects it (#2437).
 pub async fn kill_terminal(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -461,23 +404,13 @@ pub async fn kill_terminal(
     let inst_lock = state.instance_lock(&id).await;
     let _guard = inst_lock.lock().await;
 
-    let instances = state.instances.read().await;
-    let inst = match instances.iter().find(|i| i.id == id) {
-        Some(i) => i.clone(),
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "not_found"})),
-            )
-                .into_response();
-        }
+    let Some(inst) = find_instance(&state, &id).await else {
+        return bare_not_found();
     };
-    drop(instances);
 
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        // A missing session is success (the `kill_*` helpers no-op when the
-        // tmux session is absent); only a real tmux failure surfaces here, so
-        // the caller can retry instead of leaving an orphaned shell behind.
+        // A missing session is success, since the `kill_*` helpers no-op when
+        // the tmux session is absent; only a real tmux failure surfaces here.
         inst.kill_terminal_indexed(index)?;
         inst.kill_container_terminal_indexed(index)?;
         Ok(())
@@ -492,19 +425,19 @@ pub async fn kill_terminal(
             .into_response(),
         Ok(Err(e)) => {
             tracing::error!(target: "http.api.sessions", "Terminal kill failed: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "kill_failed", "message": "Failed to kill terminal"})),
+                "kill_failed",
+                "Failed to kill terminal",
             )
-                .into_response()
         }
         Err(e) => {
             tracing::error!(target: "http.api.sessions", "Terminal kill panicked: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+                "internal",
+                "Internal server error",
             )
-                .into_response()
         }
     }
 }

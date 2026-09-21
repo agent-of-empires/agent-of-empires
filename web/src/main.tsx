@@ -1,11 +1,8 @@
-// First: install global error capture so anything that throws during
-// the imports below gets reported to the server.
+// Import order matters: logging, then token capture, then legacy URL redirect.
 import "./logging-init";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
-// Imported first so the URL `?token=` capture runs before any fetch or render.
 import "./lib/token";
-// Migrate legacy `?session=X` URLs before the router mounts.
 import "./lib/legacySessionRedirect";
 import { BrowserRouter } from "react-router-dom";
 import App from "./App";

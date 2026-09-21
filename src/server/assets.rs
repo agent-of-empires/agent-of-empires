@@ -37,13 +37,8 @@ pub(super) async fn serve_public_file(
     serve_embedded_file(path, &headers)
 }
 
-/// The content-hashed entry bundle filename (`index-<hash>.js`) baked
-/// into the embedded `index.html`. This is the dashboard's build
-/// identity: the client compares its own entry script's filename
-/// against this value (via `GET /api/about`) and offers a reload when
-/// they differ. Installed PWAs (especially iOS) resume a long-lived
-/// page with no refresh affordance, so without this prompt a phone can
-/// keep running a stale dashboard for weeks after the binary updates.
+/// The content-hashed entry bundle filename (`index-<hash>.js`) baked into the embedded
+/// `index.html`. This is the dashboard's build identity.
 pub fn web_build_id() -> Option<&'static str> {
     static ID: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     ID.get_or_init(|| {
@@ -119,12 +114,7 @@ pub(super) fn serve_embedded_file(
     }
 }
 
-/// Cache policy for embedded dashboard files. Vite content-hashes
-/// everything under `assets/`, so those are immutable; everything else
-/// (index.html, sw.js, manifest, icons, fonts) must revalidate on every
-/// load or an installed PWA keeps booting a stale shell long after the
-/// binary shipped new assets. Revalidation is cheap: the ETag above
-/// turns it into a 304.
+/// Cache policy for embedded dashboard files.
 pub(super) fn cache_control_for(path: &str) -> &'static str {
     if is_content_hashed_asset(path) {
         "public, max-age=31536000, immutable"
@@ -133,13 +123,7 @@ pub(super) fn cache_control_for(path: &str) -> &'static str {
     }
 }
 
-/// True for `assets/<name>-<hash>.<ext>` where `<hash>` is a Rollup
-/// content hash: 8 chars (the default length) of the base64url
-/// alphabet, immediately preceded by `-`. The `assets/` prefix alone is
-/// not enough: should a non-hashed file ever land there through a Vite
-/// config change, a year of `immutable` would pin clients to it.
-/// Misclassifying a hashed file the other way is harmless; it just
-/// revalidates via ETag like everything else.
+/// True for `assets/<name>-<hash>.<ext>` where `<hash>` is a Rollup content hash.
 pub(super) fn is_content_hashed_asset(path: &str) -> bool {
     let Some(name) = path.strip_prefix("assets/") else {
         return false;
@@ -161,17 +145,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extract_web_build_id_finds_entry_bundle() {
+    fn extract_web_build_id_finds_the_entry_bundle_or_nothing() {
         let html = r#"<head><script type="module" crossorigin src="/assets/index-DKenwdW0.js"></script>
 <link rel="modulepreload" crossorigin href="/assets/vendor-Bx91yz.js"></head>"#;
         assert_eq!(
             extract_web_build_id(html).as_deref(),
             Some("index-DKenwdW0.js")
         );
-    }
-
-    #[test]
-    fn extract_web_build_id_none_without_entry() {
         assert_eq!(extract_web_build_id("<html><body>hi</body></html>"), None);
     }
 

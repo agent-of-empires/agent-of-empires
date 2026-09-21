@@ -1,7 +1,4 @@
-//! The unified `ContainerRuntime`. Shared behavior lives on `RuntimeBase`;
-//! this impl dispatches the four genuinely runtime-specific operations
-//! (existence probe, running-state probe, exec-command formatting, and
-//! batch status query) on a `RuntimeKind` discriminant.
+//! The unified `ContainerRuntime`: shared behavior lives on `RuntimeBase`, runtime-specific probes dispatch on `RuntimeKind`.
 
 use std::collections::HashMap;
 
@@ -75,9 +72,6 @@ impl ContainerRuntime {
     pub fn local_image_digest(&self, image: &str) -> Option<String> {
         match self.kind {
             RuntimeKind::Docker | RuntimeKind::Podman => {
-                // `RepoDigests` holds `repo@sha256:...` entries for the pulled
-                // manifest. One subprocess, newline-joined so a multi-registry
-                // image still lets us pick the entry matching this reference.
                 let mut cmd = self.base.command();
                 cmd.args([
                     "image",
@@ -93,8 +87,7 @@ impl ContainerRuntime {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 super::image_update::pick_repo_digest(image, &stdout)
             }
-            // Apple Container's `image inspect` doesn't expose a Docker-style
-            // repo digest; skip the staleness check there rather than guess.
+            // Apple's `image inspect` exposes no repo digest.
             RuntimeKind::AppleContainer => None,
         }
     }
@@ -118,13 +111,7 @@ impl ContainerRuntime {
     pub fn does_container_exist(&self, name: &str) -> Result<bool> {
         match self.kind {
             RuntimeKind::Docker | RuntimeKind::Podman => {
-                // `container inspect` (not `docker inspect`): pins the stderr
-                // wording DOCKER_MISSING captures in the runtime_base tests,
-                // so is_not_found classifies "absent" cleanly. Changing this
-                // argv or the per-runtime not_found / daemon_down /
-                // permission_denied markers without new fixtures silently
-                // breaks the classifier. See is_container_running above and
-                // the pinning comment at #2596 / #2652.
+                // `container inspect` stderr is what the `DOCKER_MISSING` fixture pins; changing argv needs new fixtures.
                 let mut cmd = self.base.command();
                 cmd.args(["container", "inspect", name]);
                 let output = self.base.probe_output(&mut cmd)?;
@@ -135,21 +122,7 @@ impl ContainerRuntime {
                 Ok(true)
             }
             RuntimeKind::AppleContainer => {
-                // Apple Container's `inspect` returns success(0) for
-                // non-existent containers, so we use `logs` which properly
-                // fails for missing containers. APPLE_MISSING captures
-                // Apple's absent-container stderr (from `rm/delete`);
-                // not_found_markers / daemon_down_markers /
-                // permission_denied_markers on RuntimeBase::APPLE_CONTAINER
-                // key off Apple's not-found style and are expected to match
-                // `logs` stderr by substring, though `logs` stderr has not
-                // been captured as a fixture. Switching argv here (or
-                // tightening the markers) needs new fixtures. Same
-                // silent-break risk as the Docker/Podman pinning comment
-                // above. See #2596.
-                // TODO: verify Apple `container logs` semantics on
-                //       stopped-but-existing containers (cf. #2730 for
-                //       fixture capture).
+                // Apple's `inspect` succeeds for missing containers; `logs` fails for them.
                 let mut cmd = self.base.command();
                 cmd.args(["logs", name]);
                 let output = self.base.probe_output(&mut cmd)?;
@@ -165,11 +138,7 @@ impl ContainerRuntime {
     pub fn is_container_running(&self, name: &str) -> Result<bool> {
         match self.kind {
             RuntimeKind::Docker | RuntimeKind::Podman => {
-                // `container inspect` (not the shorter `docker inspect`): the two
-                // subcommands emit different stderr for a missing container
-                // ("No such container" vs "No such object"), and DOCKER_MISSING
-                // in the runtime_base tests pins the former. Changing this argv
-                // silently breaks is_not_found classification. See #2596.
+                // `container inspect`, not `docker inspect`: the two word a missing container differently.
                 let mut cmd = self.base.command();
                 cmd.args(["container", "inspect", "-f", "{{.State.Running}}", name]);
                 let output = self.base.probe_output(&mut cmd)?;
@@ -183,16 +152,6 @@ impl ContainerRuntime {
                 Ok(stdout.trim() == "true")
             }
             RuntimeKind::AppleContainer => {
-                // Apple's `container inspect` is the only inspect subcommand
-                // (no `container container inspect`), and its stderr wording
-                // is pinned in RuntimeBase::APPLE_CONTAINER.not_found_markers:
-                // it covers both the inspect-specific shape
-                // (`container not found: <name>`) and the logs/delete shape
-                // (`container with ID <id> not found`). The classifier
-                // separately checks daemon_down_markers. Do not tighten this
-                // argv or either marker list without capturing new
-                // fixtures; same silent-break risk as the Docker/Podman
-                // comment above. See #2596.
                 let mut cmd = self.base.command();
                 cmd.args(["inspect", name]);
                 let output = self.base.probe_output(&mut cmd)?;
@@ -203,9 +162,6 @@ impl ContainerRuntime {
                 }
 
                 let out_json: Value = serde_json::from_slice(&output.stdout)
-                    // serde_json::Error::Display is single-line by construction
-                    // (format is "<code> at line N column M"); no sanitize_stderr
-                    // wrapping needed to preserve the single-line convention.
                     .map_err(|e| DockerError::InspectFailed(e.to_string()))?;
 
                 Self::apple_container_inspect_state(&out_json).map(|state| state == "running")
@@ -213,15 +169,8 @@ impl ContainerRuntime {
         }
     }
 
-    /// The runtime state string from Apple `container inspect` JSON.
-    ///
-    /// The CLI serialised `/0/status` as a bare string through 0.12.x; the
-    /// 1.0.0 ManagedResource cleanup nested it as an object whose `state`
-    /// field carries the same value (#3239). Both shapes are supported
-    /// because either CLI generation may be installed. Any other shape is
-    /// still Err, never Ok(false): a silently unparsed status would route to
-    /// Probe::NotRunning, the exact fail-open swallowing-existence-probe
-    /// hole (#2596) that the previous string-only guard existed to close.
+    /// Accepts both the 0.12.x bare-string and 1.0.0 object `status`; any other shape is Err
+    /// so a gate never fails open.
     fn apple_container_inspect_state(out_json: &Value) -> Result<&str> {
         let Some(status) = out_json.pointer("/0/status") else {
             return Err(DockerError::InspectFailed(
@@ -240,8 +189,6 @@ impl ContainerRuntime {
             })
     }
 
-    /// Read the runtime's authoritative container identifier after a create
-    /// command whose client-side timeout made its result indeterminate.
     fn inspect_container_id(&self, name: &str) -> Result<String> {
         let mut cmd = self.base.command();
         match self.kind {
@@ -349,15 +296,6 @@ impl ContainerRuntime {
         }
     }
 
-    /// The container's configured working directory (`Config.WorkingDir`), or
-    /// `None` if it can't be determined (container gone, inspect failed, or the
-    /// field is empty). Used to backfill the create-time-pinned workdir for
-    /// sandbox sessions that predate it (#2414). Works on stopped containers
-    /// too, since `inspect` reads static config.
-    ///
-    /// Apple's `container` CLI does not expose this via a stable `inspect`
-    /// field we rely on, so it returns `None` there and the caller keeps the
-    /// create-time value (or the live fallback for legacy sessions).
     pub fn container_working_dir(&self, name: &str) -> Option<String> {
         if !matches!(self.kind, RuntimeKind::Docker | RuntimeKind::Podman) {
             return None;
@@ -372,33 +310,36 @@ impl ContainerRuntime {
         (!wd.is_empty()).then_some(wd)
     }
 
+    /// `Ok(None)` means the runtime carries no labels, so the caller cannot tell.
+    fn label_matches(
+        &self,
+        name: &str,
+        key: &str,
+        predicate: impl FnOnce(Option<&str>) -> bool,
+    ) -> Result<Option<bool>> {
+        if !self.base.supports_labels {
+            return Ok(None);
+        }
+        let value = self.inspect_container_label(name, key)?;
+        Ok(Some(predicate(value.as_deref())))
+    }
+
     pub fn sandbox_store_generation_matches(&self, name: &str) -> Result<Option<bool>> {
-        if !self.base.supports_labels {
-            return Ok(None);
-        }
-        Ok(Some(
-            self.inspect_container_label(name, "com.agent-of-empires.sandbox-store-generation")?
-                .is_some_and(|value| value == "2"),
-        ))
+        self.label_matches(
+            name,
+            "com.agent-of-empires.sandbox-store-generation",
+            |value| value == Some("2"),
+        )
     }
 
-    /// Whether `name` was created for the agent `identity`. A container created
-    /// before the label existed matches, since its identity is unknown.
     pub fn agent_tool_matches(&self, name: &str, identity: &str) -> Result<Option<bool>> {
-        if !self.base.supports_labels {
-            return Ok(None);
-        }
-        Ok(Some(
-            self.inspect_container_label(
-                name,
-                crate::containers::container_interface::AGENT_TOOL_LABEL,
-            )?
-            .is_none_or(|value| value == identity),
-        ))
+        self.label_matches(
+            name,
+            crate::containers::container_interface::AGENT_TOOL_LABEL,
+            |value| value.is_none_or(|value| value == identity),
+        )
     }
 
-    /// Whether `name` was created with the shared credential mounts `config`
-    /// carries. An agent that shares none matches every container.
     pub fn shared_credential_mounts_match(
         &self,
         name: &str,
@@ -407,42 +348,26 @@ impl ContainerRuntime {
         if config.shared_credential_mounts.is_empty() {
             return Ok(Some(true));
         }
-        if !self.base.supports_labels {
-            return Ok(None);
-        }
         let expected = config.shared_credential_label();
-        Ok(Some(
-            self.inspect_container_label(
-                name,
-                crate::containers::container_interface::SHARED_CREDENTIAL_MOUNTS_LABEL,
-            )?
-            .is_some_and(|value| value == expected),
-        ))
+        self.label_matches(
+            name,
+            crate::containers::container_interface::SHARED_CREDENTIAL_MOUNTS_LABEL,
+            |value| value == Some(expected.as_str()),
+        )
     }
 
-    /// Whether `name` carries the shared credential label at all, as every
-    /// container created since its agent shared a credential file does.
     pub fn carries_shared_credential_label(&self, name: &str) -> Result<Option<bool>> {
-        if !self.base.supports_labels {
-            return Ok(None);
-        }
-        Ok(Some(
-            self.inspect_container_label(
-                name,
-                crate::containers::container_interface::SHARED_CREDENTIAL_MOUNTS_LABEL,
-            )?
-            .is_some(),
-        ))
+        self.label_matches(
+            name,
+            crate::containers::container_interface::SHARED_CREDENTIAL_MOUNTS_LABEL,
+            |value| value.is_some(),
+        )
     }
 
     pub fn mount_fingerprint_matches(&self, name: &str, expected: &str) -> Result<Option<bool>> {
-        if !self.base.supports_labels {
-            return Ok(None);
-        }
-        Ok(Some(
-            self.inspect_container_label(name, "com.agent-of-empires.mount-fingerprint")?
-                .is_some_and(|value| value == expected),
-        ))
+        self.label_matches(name, "com.agent-of-empires.mount-fingerprint", |value| {
+            value == Some(expected)
+        })
     }
 
     pub fn build_create_args(
@@ -504,16 +429,9 @@ impl ContainerRuntime {
 
     pub fn exec_command(&self, name: &str, options: Option<&str>, cmd: &str) -> String {
         match self.kind {
-            RuntimeKind::Docker | RuntimeKind::Podman => {
-                // Docker/Podman containers inherit a full PATH, so the command
-                // can be appended directly without wrapping in `sh -c`.
-                self.base.exec_command(name, options, cmd)
-            }
+            RuntimeKind::Docker | RuntimeKind::Podman => self.base.exec_command(name, options, cmd),
             RuntimeKind::AppleContainer => {
-                // Apple Container has a very limited initial PATH, so we wrap
-                // the command in `/bin/sh -c` to get a proper shell environment.
-                // Single-quote with escaped embedded quotes to avoid issues
-                // with double-quote metacharacters ($, `, \, !) in the command.
+                // Apple Container's initial PATH is minimal, so wrap in `/bin/sh -c`.
                 let escaped = cmd.replace('\'', "'\\''");
                 let cmd_str = format!("'{}'", escaped);
 
@@ -536,25 +454,13 @@ impl ContainerRuntime {
         }
     }
 
-    /// Argv for a non-interactive `exec` of `cmd` in `name`, spawned by the
-    /// caller, which keeps its own timeout and output capture.
-    ///
-    /// Unlike the shell string [`Self::exec_command`] builds for the tmux pane:
-    /// no `-it`, because the caller pipes stdout with stdin closed, and argv
-    /// rather than a shell string, so an untrusted argument is never
-    /// shell-parsed. An empty `workdir` omits `-w`.
     pub fn build_exec_argv(&self, name: &str, workdir: &str, cmd: &[String]) -> Vec<String> {
         match self.kind {
             RuntimeKind::Docker | RuntimeKind::Podman => {
                 self.base.build_exec_argv(name, workdir, cmd)
             }
             RuntimeKind::AppleContainer => {
-                // Same limited-PATH problem `exec_command` wraps for, but the
-                // command cannot be spliced into the shell string here: `cmd`
-                // carries untrusted text. `exec "$@"` re-execs the arguments the
-                // shell received positionally, so the shell only supplies PATH
-                // and every element survives verbatim. The `sh` after the script
-                // is `$0`; the command starts at `$1`.
+                // `exec "$@"` supplies PATH without shell-parsing the untrusted arguments.
                 let mut argv = self.base.build_exec_argv(name, workdir, &[]);
                 argv.extend([
                     "/bin/sh".to_string(),
@@ -572,10 +478,6 @@ impl ContainerRuntime {
         self.base.exec(name, cmd)
     }
 
-    /// Whether each container named with `prefix` is in the `running` state,
-    /// in a single subprocess call. Paused and restarting containers read as
-    /// not running here; use [`Self::batch_container_states`] where inspect's
-    /// `State.Running` is the question.
     pub fn batch_running_states(&self, prefix: &str) -> HashMap<String, bool> {
         self.batch_container_states(prefix)
             .into_iter()
@@ -583,10 +485,7 @@ impl ContainerRuntime {
             .collect()
     }
 
-    /// The listed state of every container named with `prefix`, in a single
-    /// subprocess call. Empty when the runtime cannot list (Apple's CLI has no
-    /// state column), so a caller must treat an absent name as unknown, not
-    /// as stopped.
+    /// Empty when the runtime cannot list, so an absent name means unknown, not stopped.
     pub fn batch_container_states(&self, prefix: &str) -> HashMap<String, ContainerState> {
         match self.kind {
             RuntimeKind::Docker | RuntimeKind::Podman => {
@@ -612,29 +511,16 @@ impl ContainerRuntime {
         }
     }
 
-    /// Resource usage of every running container named with `prefix`, in a
-    /// single subprocess call.
-    ///
-    /// `--no-stream` still costs seconds, because the runtime samples every
-    /// running container twice to produce a CPU delta; callers go through
-    /// [`super::stats::cached_stats`] rather than calling this on a UI cadence.
+    /// Slow: the runtime samples every container twice; use `stats::cached_stats`.
     pub fn batch_stats(&self, prefix: &str) -> super::stats::StatsMap {
         match self.kind {
             RuntimeKind::Docker | RuntimeKind::Podman => {
-                // Stats everything and prefix-filters the rows, unlike
-                // `batch_running_states`, which narrows with `--filter name=`.
-                // The asymmetry is deliberate: `stats` has no `--filter`, and
-                // naming containers positionally fails the whole call with
-                // "No such container" if any one of them is gone, which is a
-                // normal state for a session whose sandbox has stopped.
+                // `stats` has no `--filter`, and naming a gone container fails the whole call.
                 let mut cmd = self.base.command();
                 cmd.args([
                     "stats",
                     "--no-stream",
                     "--format",
-                    // A literal tab, not the `\t` escape: the argv reaches
-                    // the runtime without a shell, and Go template text is
-                    // emitted verbatim either way.
                     "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.PIDs}}",
                 ]);
                 let output = match self.base.probe_output(&mut cmd) {
@@ -644,8 +530,6 @@ impl ContainerRuntime {
 
                 super::stats::parse_stats_output(&String::from_utf8_lossy(&output.stdout), prefix)
             }
-            // Apple's `container` CLI has no stats subcommand, so a sandbox on
-            // that runtime reports unknown rather than a fabricated number.
             RuntimeKind::AppleContainer => {
                 let _ = prefix;
                 super::stats::StatsMap::new()
@@ -654,7 +538,6 @@ impl ContainerRuntime {
     }
 }
 
-/// A container's state as `ps --format {{.State}}` lists it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContainerState {
     Running,
@@ -663,7 +546,6 @@ pub enum ContainerState {
     Created,
     Exited,
     Dead,
-    /// A transitional (`removing`, `stopping`) or unrecognised state.
     Other,
 }
 
@@ -680,10 +562,7 @@ impl ContainerState {
         }
     }
 
-    /// Inspect's `State.Running`, which Moby keeps true while a container is
-    /// paused or restarting: the process is alive and its mounts are in use.
-    /// `None` for a state that says nothing certain either way, so a caller
-    /// that must not guess inspects the container instead.
+    /// Moby keeps `State.Running` true while paused or restarting.
     pub fn is_live(self) -> Option<bool> {
         match self {
             Self::Running | Self::Paused | Self::Restarting => Some(true),
@@ -693,8 +572,7 @@ impl ContainerState {
     }
 }
 
-/// Parse `{{.Names}}\t{{.State}}` lines. Docker and Podman's `--filter name=`
-/// matches substrings, so names are post-filtered to the exact prefix.
+/// `--filter name=` matches substrings, so names are post-filtered to the exact prefix.
 fn parse_batch_states(stdout: &str, prefix: &str) -> HashMap<String, ContainerState> {
     stdout
         .lines()
@@ -714,9 +592,6 @@ fn parse_batch_states(stdout: &str, prefix: &str) -> HashMap<String, ContainerSt
 mod tests {
     use super::*;
 
-    /// Every state the listing can report, including ones the parser has not
-    /// heard of. Paused and restarting are live, like `State.Running` says;
-    /// anything transitional stays undecided rather than reading as stopped.
     #[test]
     fn batch_listing_states_keep_inspect_liveness() {
         let listing = "aoe-sandbox-a\trunning\n\
@@ -745,7 +620,6 @@ mod tests {
             assert_eq!(states[name], state, "{name}");
             assert_eq!(state.is_live(), live, "{name}");
         }
-        // The health map keeps its strict reading: only `running` is running.
         let running: HashMap<String, bool> = states
             .iter()
             .map(|(name, state)| (name.clone(), *state == ContainerState::Running))
@@ -765,121 +639,53 @@ mod tests {
         }
     }
 
-    fn docker_if_available() -> Option<ContainerRuntime> {
-        let rt = ContainerRuntime::docker();
-        if !rt.is_available() || !rt.is_daemon_running() {
-            None
-        } else {
-            Some(rt)
-        }
-    }
-
-    fn apple_container_if_available() -> Option<ContainerRuntime> {
-        let rt = ContainerRuntime::apple_container();
-        if !rt.is_available() || !rt.is_daemon_running() {
-            None
-        } else {
-            Some(rt)
-        }
-    }
-
-    fn podman_if_available() -> Option<ContainerRuntime> {
-        let rt = ContainerRuntime::podman();
-        if !rt.is_available() || !rt.is_daemon_running() {
-            None
-        } else {
-            Some(rt)
-        }
-    }
-
-    // Pulls `hello-world` from a live registry, so it flakes on a transient
-    // pull failure or network hang in CI. Per the Docker-test convention,
-    // gate it behind `#[ignore]` so it only runs when explicitly requested.
-    #[test]
-    #[ignore = "pulls hello-world from a live registry; run with --ignored"]
-    fn test_image_exists_locally_with_common_image() {
-        for rt in [
-            docker_if_available(),
-            apple_container_if_available(),
-            podman_if_available(),
+    /// Every runtime installed and running on this host; empty in most CI images.
+    fn available_runtimes() -> Vec<ContainerRuntime> {
+        [
+            ContainerRuntime::docker(),
+            ContainerRuntime::apple_container(),
+            ContainerRuntime::podman(),
         ]
         .into_iter()
-        .flatten()
-        {
+        .filter(|rt| rt.is_available() && rt.is_daemon_running())
+        .collect()
+    }
+
+    const MISSING_IMAGE: &str = "nonexistent-image-that-does-not-exist:v999";
+
+    #[test]
+    #[ignore = "pulls hello-world from a live registry; run with --ignored"]
+    fn image_exists_locally_and_ensure_image_accept_a_pulled_image() {
+        for rt in available_runtimes() {
             rt.pull_image("hello-world").unwrap();
             assert!(rt.image_exists_locally("hello-world"));
-        }
-    }
-
-    #[test]
-    fn test_image_exists_locally_nonexistent() {
-        for rt in [
-            docker_if_available(),
-            apple_container_if_available(),
-            podman_if_available(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            assert!(!rt.image_exists_locally("nonexistent-image-that-does-not-exist:v999"));
-        }
-    }
-
-    // Pulls `hello-world` from a live registry; same flake risk as
-    // `test_image_exists_locally_with_common_image`, so gate it the same way.
-    #[test]
-    #[ignore = "pulls hello-world from a live registry; run with --ignored"]
-    fn test_ensure_image_uses_local_image() {
-        for rt in [
-            docker_if_available(),
-            apple_container_if_available(),
-            podman_if_available(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            rt.pull_image("hello-world").unwrap();
             assert!(rt.ensure_image("hello-world").is_ok());
         }
     }
 
     #[test]
-    fn test_ensure_image_fails_for_nonexistent_remote() {
-        for rt in [
-            docker_if_available(),
-            apple_container_if_available(),
-            podman_if_available(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            assert!(rt
-                .ensure_image("nonexistent-image-that-does-not-exist:v999")
-                .is_err());
+    fn image_exists_locally_and_ensure_image_reject_a_missing_image() {
+        for rt in available_runtimes() {
+            assert!(!rt.image_exists_locally(MISSING_IMAGE));
+            assert!(rt.ensure_image(MISSING_IMAGE).is_err());
         }
     }
 
     #[test]
     fn test_apple_container_inspect_shapes() {
         use serde_json::json;
-        // Both CLI generations (#3239) plus the drift shapes that must stay
-        // Err so lifecycle gates fail closed rather than fail open (#2596).
         let cases = [
             (json!([{"status": "running"}]), Some("running")),
             (json!([{"status": "stopped"}]), Some("stopped")),
-            // 1.0.0 ManagedResource shape, as emitted by container CLI 1.2.0
             (
                 json!([{"status": {"state": "running", "networks": [], "startedDate": "2026-08-04T10:36:08Z"}}]),
                 Some("running"),
             ),
             (json!([{"status": {"state": "stopped"}}]), Some("stopped")),
-            // object without a string `state`
             (json!([{"status": {"state": 3}}]), None),
             (json!([{"status": {"phase": "running"}}]), None),
-            // neither shape
             (json!([{"status": 3}]), None),
             (json!([{"status": null}]), None),
-            // missing entirely
             (json!([{}]), None),
             (json!([]), None),
         ];
@@ -942,33 +748,20 @@ mod tests {
     }
 
     #[test]
-    fn test_podman_runtime_uses_podman_binary() {
+    fn podman_runtime_matches_the_docker_compatible_surface() {
         let rt = ContainerRuntime::podman();
         assert_eq!(rt.kind, RuntimeKind::Podman);
         assert_eq!(rt.base.binary, "podman");
         assert_eq!(rt.base.name, "Podman");
-    }
-
-    #[test]
-    fn test_podman_supports_docker_compatible_features() {
-        // Podman is a drop-in for Docker, so it must support the same feature
-        // set the shared base relies on. If this regresses, the create-args
-        // builder will silently produce broken output for podman users.
-        let rt = ContainerRuntime::podman();
         assert!(rt.base.supports_read_only_volumes);
         assert!(rt.base.supports_remove_volumes);
         assert!(rt.base.supports_named_volumes);
         assert_eq!(rt.base.remove_subcommand, "rm");
         assert_eq!(rt.base.pull_prefix, &["pull"]);
-    }
-
-    #[test]
-    fn test_podman_exec_command_format_matches_docker() {
-        // The CLI surfaces this string to the user via tmux; it must not
-        // wrap the command in `sh -c` the way Apple Container does.
-        let rt = ContainerRuntime::podman();
-        let cmd = rt.exec_command("aoe-sandbox-test1234", None, "claude");
-        assert_eq!(cmd, "podman exec -it aoe-sandbox-test1234 claude");
+        assert_eq!(
+            rt.exec_command("aoe-sandbox-test1234", None, "claude"),
+            "podman exec -it aoe-sandbox-test1234 claude"
+        );
     }
 
     #[test]
@@ -984,8 +777,6 @@ mod tests {
         );
     }
 
-    /// A title one-shot argv: the agent, its flags, and a prompt full of shell
-    /// metacharacters as ONE element.
     fn oneshot_argv() -> Vec<String> {
         [
             "claude",
@@ -1049,14 +840,8 @@ mod tests {
                 "sh",
             ]
         );
-        // The shell program is a fixed literal and the command follows it as
-        // separate elements, so the prompt is never shell-parsed.
         assert_eq!(&argv[9..], &oneshot_argv()[..]);
 
-        // `printf` sits in /usr/bin on macOS and in /bin on most Linux
-        // images. The probe is about an absolute path running without a
-        // usable PATH, not about where that path happens to be, so resolve it
-        // rather than hardcoding one layout and failing on the other.
         let printf = ["/usr/bin/printf", "/bin/printf"]
             .into_iter()
             .find(|candidate| std::path::Path::new(candidate).exists())
@@ -1081,8 +866,6 @@ mod tests {
 
     #[test]
     fn build_exec_argv_never_requests_a_tty() {
-        // A TTY request against the piped, stdin-closed child smart rename
-        // spawns would fail or hang, unlike the tmux `exec_command` path.
         for rt in [
             ContainerRuntime::docker(),
             ContainerRuntime::podman(),

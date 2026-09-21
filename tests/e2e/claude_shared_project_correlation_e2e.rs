@@ -1,45 +1,22 @@
 //! Full-stack e2e: two Claude sessions sharing one project keep identities
-//! scoped to their own authoritative per-pane hook sidecars.
+//! scoped to their own authoritative per-pane hook sidecars. Without a sidecar
+//! a session keeps its launch-pinned UUID: shared transcript files are not an
+//! identity source.
 //!
-//! Variant 1 proves an empty thread resolves from its sidecar. Variant 2 proves
-//! shared transcript files are not an identity source: without a sidecar, the
-//! session retains its launch-pinned UUID while its peer resolves independently.
-//!
-//! `claude_poll_fn` runs inside whichever process owns the session's poller,
-//! and that process is the one that persists observations into `sessions.json`:
-//! the TUI drains via `apply_session_id_updates`, which calls the shared
-//! `drain_and_persist_session_ids` the daemon invokes directly. A `claude`
-//! session's poller is created in `finalize_launch`;
-//! the CLI process that launches the session exits right after, so its poller
-//! dies with it. The native TUI is the long-lived host used here: on startup it
-//! starts a poller for every already-live session it loads
-//! (`HomeView::new`, `src/tui/home/lifecycle.rs`), one at a time, and its tick drains
-//! each observation to disk.
-//!
-//! Sessions are created with `aoe add` and launched with `aoe session start`
-//! (a deterministic, blocking CLI launch that, unlike `aoe add -l`, attaches no
-//! controlling terminal) so both panes are already live when the TUI loads them;
-//! the TUI then only starts pollers (never relaunches), which sidesteps the
-//! concurrent startup-recovery cascade entirely. Each session is minted a fresh
-//! random Claude UUID at launch, DISTINCT from the shim UUID the hook publishes,
-//! so the only way `sessions.json` can end up holding the shim UUID is the
-//! mechanism under test; a revert leaves the launch-minted id (or `None`) and
-//! the positive assertion fails.
-//!
-//! Daemon-free (like the sibling `resume_fallback` e2e), so no feature gate.
-//! Run via:
-//!
-//! ```sh
-//! cargo test --features e2e-tests --test e2e -- claude_shared_project_correlation --nocapture
-//! ```
+//! The native TUI is the poller host (a CLI launcher exits and takes its poller
+//! with it), so sessions are created with `aoe add`, launched with
+//! `aoe session start`, and only then loaded by the TUI, which starts pollers
+//! without relaunching. Each launch mints a UUID distinct from the shim's, so a
+//! revert leaves the launch-minted id and the positive assertion fails.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-use serde_json::Value;
 use serial_test::parallel;
 
-use crate::harness::{app_dir_in, require_tmux, TuiTestHarness};
+use crate::harness::{
+    agent_session_id_of, app_dir_in, require_tmux, write_executable, TuiTestHarness,
+};
 
 // Shim UUIDs, one per session. These are what each session's own hook writes,
 // and what the poller must correlate back to that session.
@@ -76,31 +53,15 @@ fn encode_project_path(p: &str) -> String {
         .collect()
 }
 
-/// Parse the `  ID:      <id>` line that `aoe add` prints on success.
-fn parse_session_id(add_stdout: &str) -> String {
-    add_stdout
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("ID:"))
-        .map(|rest| rest.trim().to_string())
-        .unwrap_or_else(|| panic!("could not find session ID in `aoe add` output:\n{add_stdout}"))
-}
-
-/// Install a bespoke `claude` shim on PATH: `install_path_command` prepends a
-/// path-bin dir (ahead of the harness's default exit-0 `claude` stub) holding an
-/// exit-0 placeholder, which this overwrites with the real shim. On launch it
-/// publishes its own session UUID exactly as a real Claude session would:
-/// writing the sidecar through the real `aoe __extract-session-id` subcommand
-/// (never hand-writing the file, so the guard-anchored writer stays under test)
-/// and/or dropping a `<uuid>.jsonl` transcript. It then `exec sleep` so the pane
-/// stays live, which both keeps the tmux session visible to
-/// `build_exclusion_set`'s peer scan and holds the poller open.
+/// A `claude` shim that publishes its UUID the way a real session would: the
+/// sidecar through the real `aoe __extract-session-id` (so the guard-anchored
+/// writer stays under test) and/or a `<uuid>.jsonl` transcript, then stays
+/// alive so the pane and its poller do too.
 fn install_claude_shim(h: &mut TuiTestHarness) {
     let bin = h.install_path_command("claude");
     let aoe = env!("CARGO_BIN_EXE_aoe");
-    // If AOE_INSTANCE_ID is unset the launch-env contract broke; fail loudly
-    // (exit 3 + marker) rather than silently pass. The test writes the role file
-    // before launching, so the shim normally finds it on the first check; the
-    // bounded spin-wait is a safety net.
+    // A missing AOE_INSTANCE_ID or role means the launch-env contract broke, so
+    // the shim leaves a marker rather than passing silently.
     let script = format!(
         r#"#!/bin/sh
 if [ -z "$AOE_INSTANCE_ID" ]; then
@@ -133,16 +94,11 @@ printf '%s' "$UUID" > "$HOME/uuid-map/$AOE_INSTANCE_ID"
 exec sleep 600
 "#,
     );
-    let path = bin.join("claude");
-    std::fs::write(&path, &script).expect("write claude shim");
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod shim");
+    write_executable(&bin.join("claude"), &script);
 }
 
-/// Create a zero-byte reference file whose mtime is `secs_ago` in the past, for
-/// the shim to `touch -r` against. Setting the time from Rust keeps the jsonl
-/// ordering deterministic without any sleep, and `touch -r` is portable across
-/// macOS and Linux.
+/// Reference file `secs_ago` in the past for the shim to `touch -r`, which
+/// orders the transcripts deterministically without a sleep.
 fn make_mtime_ref(h: &TuiTestHarness, name: &str, secs_ago: u64) -> PathBuf {
     let path = h.home_path().join(name);
     let when = SystemTime::now() - Duration::from_secs(secs_ago);
@@ -166,9 +122,7 @@ fn write_role(
     let mtime_ref = mtime_ref
         .map(|p| p.display().to_string())
         .unwrap_or_default();
-    // The shim sources this file with `. "$ROLE"`. Values are controlled (fixed
-    // UUIDs, yes/no, and tempdir paths with no shell metacharacters), so
-    // single-quoting is sufficient and no embedded-quote escaping is needed.
+    // Sourced by the shim; the values carry no shell metacharacters.
     let body = format!(
         "SIDECAR='{}'\nJSONL='{}'\nUUID='{}'\nJSONL_DIR='{}'\nMTIME_REF='{}'\n",
         if spec.sidecar { "yes" } else { "no" },
@@ -178,26 +132,6 @@ fn write_role(
         mtime_ref,
     );
     std::fs::write(roles.join(instance_id), body).expect("write role file");
-}
-
-fn sessions_path(h: &TuiTestHarness) -> PathBuf {
-    app_dir_in(h.home_path()).join("profiles/default/sessions.json")
-}
-
-/// Read sessions.json while the poller host may be rewriting it.
-fn read_sessions(h: &TuiTestHarness) -> Value {
-    let content = std::fs::read_to_string(sessions_path(h)).unwrap_or_default();
-    serde_json::from_str(&content).unwrap_or(Value::Null)
-}
-
-fn agent_session_id_of(sessions: &Value, instance_id: &str) -> Option<String> {
-    sessions
-        .as_array()?
-        .iter()
-        .find(|r| r["id"].as_str() == Some(instance_id))?
-        .get("agent_session_id")?
-        .as_str()
-        .map(str::to_owned)
 }
 
 /// Wait until both persisted identities match their expected authoritative
@@ -212,7 +146,7 @@ fn await_expected_ids(
     let deadline = Instant::now() + CORRELATE_DEADLINE;
     let mut consecutive_ok = 0;
     loop {
-        let sessions = read_sessions(h);
+        let sessions = h.try_read_sessions();
         let a = agent_session_id_of(&sessions, id_a);
         let b = agent_session_id_of(&sessions, id_b);
         if a.as_deref() == Some(expected_a) && b.as_deref() == Some(expected_b) {
@@ -264,9 +198,8 @@ fn await_expected_ids(
     }
 }
 
-/// Assert the shim actually ran with the expected instance-to-UUID mapping
-/// (proves the launch env carried `AOE_INSTANCE_ID` and the shim executed its
-/// role, not just that the poller happened to persist the right string).
+/// The shim ran with the expected instance-to-UUID mapping, so the persisted id
+/// came from the mechanism under test rather than a coincidence.
 fn assert_shim_recorded(h: &TuiTestHarness, instance_id: &str, uuid: &str) {
     let mapped = std::fs::read_to_string(h.home_path().join("uuid-map").join(instance_id))
         .unwrap_or_else(|e| panic!("shim never recorded uuid-map for {instance_id}: {e}"));
@@ -277,10 +210,8 @@ fn assert_shim_recorded(h: &TuiTestHarness, instance_id: &str, uuid: &str) {
     );
 }
 
-/// Remove the per-instance hook directories on drop. The hook base
-/// (`/tmp/aoe-hooks-<euid>/`) lives outside `$HOME`, so the harness's tempdir
-/// teardown never sweeps it. Instance ids are unique per run, so this cannot
-/// collide with another test.
+/// The hook base (`/tmp/aoe-hooks-<euid>/`) lives outside `$HOME`, so the
+/// harness tempdir teardown never sweeps it.
 struct HookDirCleanup {
     euid: String,
     instance_ids: Vec<String>,
@@ -309,9 +240,8 @@ impl Drop for HookDirCleanup {
     }
 }
 
-/// Block until the shim for `instance_id` has recorded its uuid-map entry,
-/// proving it ran its role (wrote the sidecar and/or jsonl) before the poller
-/// host starts observing.
+/// Block until the shim recorded its uuid-map entry, which it writes last, so
+/// its sidecar and jsonl are already on disk.
 fn wait_for_shim(h: &TuiTestHarness, instance_id: &str) {
     let deadline = Instant::now() + SHIM_DEADLINE;
     while Instant::now() < deadline {
@@ -325,34 +255,6 @@ fn wait_for_shim(h: &TuiTestHarness, instance_id: &str) {
     panic!(
         "shim for {instance_id} never wrote its uuid-map entry within {SHIM_DEADLINE:?} \
          (AOE_INSTANCE_ID-missing marker: {missing_inst}, role-missing marker: {missing_role})"
-    );
-}
-
-/// Create a session with `aoe add` (no launch); returns the instance id.
-fn add_session(h: &TuiTestHarness, project: &str, spec: &SessionSpec) -> String {
-    let add = h.run_cli(&["add", project, "-t", spec.title, "-c", "claude"]);
-    assert!(
-        add.status.success(),
-        "aoe add {} failed.\nstdout: {}\nstderr: {}",
-        spec.title,
-        String::from_utf8_lossy(&add.stdout),
-        String::from_utf8_lossy(&add.stderr),
-    );
-    parse_session_id(&String::from_utf8_lossy(&add.stdout))
-}
-
-/// Launch a session's tmux pane with `aoe session start` (a deterministic,
-/// blocking CLI launch that, unlike `aoe add -l`, does not try to attach a
-/// controlling terminal). The role must already be on disk so the shim finds it
-/// on its first check.
-fn launch_session(h: &TuiTestHarness, instance_id: &str, title: &str) {
-    let start = h.run_cli(&["session", "start", instance_id]);
-    assert!(
-        start.status.success(),
-        "aoe session start {} failed.\nstdout: {}\nstderr: {}",
-        title,
-        String::from_utf8_lossy(&start.stdout),
-        String::from_utf8_lossy(&start.stderr),
     );
 }
 
@@ -376,34 +278,30 @@ fn run_shared_project_correlation(test_name: &str, spec_a: SessionSpec, spec_b: 
 
     let project = h.project_path();
     let project_str = project.to_str().expect("utf8 project path").to_string();
-    // The poller scans `<claude_home>/projects/<encoded-canonical-cwd>/`, where
-    // the cwd is the canonicalized project path (on macOS `/tmp` resolves to
-    // `/private/tmp`). Mirror that so the shim drops the jsonl where the poller
-    // looks.
+    // The poller scans `<claude_home>/projects/<encoded canonical cwd>/`.
     let canonical = std::fs::canonicalize(&project).unwrap_or_else(|_| project.clone());
     let jsonl_dir = claude_home
         .join("projects")
         .join(encode_project_path(&canonical.to_string_lossy()));
 
-    // Add both sessions (no launch) so their ids and sessions.json rows exist,
-    // and register cleanup BEFORE any launch can fail so a partial launch cannot
-    // leak a hook dir.
-    let id_a = add_session(&h, &project_str, &spec_a);
-    let id_b = add_session(&h, &project_str, &spec_b);
+    // Cleanup is registered before any launch so a partial launch leaks no hook dir.
+    let id_a = h.add_session(&[&project_str, "-t", spec_a.title, "-c", "claude"]);
+    let id_b = h.add_session(&[&project_str, "-t", spec_b.title, "-c", "claude"]);
     let _hook_cleanup = HookDirCleanup::new(vec![id_a.clone(), id_b.clone()]);
 
-    // Write both roles BEFORE launching, so each shim finds its role on its first
-    // check with no dependency on the other session's launch time.
+    // Both roles land before either launch, so each shim finds its own on the
+    // first check regardless of launch order.
     write_role(&h, &id_a, &spec_a, &jsonl_dir, ref_a.as_deref());
     write_role(&h, &id_b, &spec_b, &jsonl_dir, ref_b.as_deref());
 
-    launch_session(&h, &id_a, spec_a.title);
-    launch_session(&h, &id_b, spec_b.title);
+    // `session start` is a blocking launch that attaches no terminal.
+    h.run_cli_ok(&["session", "start", &id_a]);
+    h.run_cli_ok(&["session", "start", &id_b]);
 
     wait_for_shim(&h, &id_a);
     wait_for_shim(&h, &id_b);
 
-    let launched = read_sessions(&h);
+    let launched = h.try_read_sessions();
     let expected_a = if spec_a.sidecar {
         spec_a.uuid.to_string()
     } else {

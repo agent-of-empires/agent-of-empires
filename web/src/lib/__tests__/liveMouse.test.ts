@@ -11,7 +11,6 @@ describe("wheelMouseBytes", () => {
   });
 
   it("encodes legacy X10 wheel up/down (value + 32, ESC [ M prefix)", () => {
-    // wheel up = button 64 -> 0x60; col/row 3 -> 0x23.
     expect(wheelMouseBytes(true, false, 3, 3)).toEqual(bytes(0x1b, 0x5b, 0x4d, 64 + 32, 3 + 32, 3 + 32));
     expect(wheelMouseBytes(false, false, 3, 3)).toEqual(bytes(0x1b, 0x5b, 0x4d, 65 + 32, 3 + 32, 3 + 32));
   });
@@ -30,7 +29,6 @@ describe("buttonMouseBytes", () => {
     expect(buttonMouseBytes(0, false, false, true, 5, 7)).toEqual(ascii("\x1b[<0;5;7M"));
     expect(buttonMouseBytes(1, false, false, true, 5, 7)).toEqual(ascii("\x1b[<1;5;7M"));
     expect(buttonMouseBytes(2, false, false, true, 5, 7)).toEqual(ascii("\x1b[<2;5;7M"));
-    // Release keeps button identity but ends with lowercase m.
     expect(buttonMouseBytes(0, true, false, true, 5, 7)).toEqual(ascii("\x1b[<0;5;7m"));
   });
 
@@ -77,19 +75,15 @@ describe("wheelNotches", () => {
 
 describe("cursorLineIndex", () => {
   it("indexes the live edge when every line fits on screen", () => {
-    // 72-line composite fully visible: cursor row indexes directly.
     expect(cursorLineIndex(72, 72, 63)).toBe(63);
   });
 
   it("keeps the mapping when scrolled back (screenRows < lines.length)", () => {
-    // The viewport shows the LAST screenRows lines of the capture.
     expect(cursorLineIndex(120, 72, 0)).toBe(48);
     expect(cursorLineIndex(120, 72, 63)).toBe(111);
   });
 
   it("clamps the live edge at zero when the viewport is taller than the capture", () => {
-    // A short capture in a tall viewport must index from the top, not go
-    // negative (which the renderer reads as "no cursor").
     expect(cursorLineIndex(5, 72, 3)).toBe(3);
   });
 });
@@ -104,21 +98,14 @@ describe("pointerPaneCell", () => {
   });
 
   it("subtracts a non-zero pane origin", () => {
-    // Composite cell (10, 5) over a pane starting one row down: the app
-    // hears its own row 5, not the border row above it.
     expect(pointerPaneCell(10, 5, { cols: 164, rows: 71, left: 0, top: 1 })).toEqual({
       col: 10,
       row: 5,
     });
-    // A right-hand neighbour's columns (pane 0 spans composite 1-based
-    // cols 166..329 here) clamp into pane 0; the web surface clamps rather
-    // than drops forwarded events.
     expect(pointerPaneCell(340, 5, { cols: 164, rows: 71, left: 165, top: 1 })).toEqual({
       col: 164,
       row: 5,
     });
-    // Inside the neighbour-adjacent pane itself the origin subtraction lands
-    // on the app's own column.
     expect(pointerPaneCell(170, 5, { cols: 164, rows: 71, left: 165, top: 1 })).toEqual({
       col: 5,
       row: 5,

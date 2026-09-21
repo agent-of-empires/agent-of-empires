@@ -4,24 +4,17 @@
 use super::*;
 
 impl HomeView {
-    /// Whether the agent row is in a live status with its tmux pane up, so a
-    /// revive cascade (`ensure_pane_ready` / `prepare_live_send`) is expected
-    /// to be a fast no-op.
+    /// Whether the agent row is in a live status with its pane up, so a revive cascade
+    /// (`ensure_pane_ready` / `prepare_live_send`) is expected to be a fast no-op.
     ///
-    /// The `EnterLiveSend` / `SendMessage` handlers use this to skip the
-    /// "Reviving session..." toast frame for warm sessions: the toast claims a
-    /// bottom bar row, and for the frame(s) it is on screen the bottom-anchored
-    /// preview paints its content one row up (68 cached rows into 67 visible),
-    /// then drops back when the toast clears. On a warm entry that hop is the
-    /// only thing the toast ever shows the user; how long it lingers depends on
-    /// how slow the readiness re-checks happen to be, which is why it reads as
-    /// an intermittent "cursor jiggle" on live-view entry. Cold paths (dead
-    /// pane, Docker start, agent splash) keep the toast: there the feedback is
-    /// real and the reflow unavoidable.
+    /// The `EnterLiveSend` / `SendMessage` handlers use it to skip the "Reviving session..."
+    /// toast for warm sessions: the toast claims a bottom row, so while it shows, the
+    /// bottom-anchored preview paints one row up and drops back when it clears, which on a
+    /// warm entry is the only thing the toast ever shows and reads as a cursor jiggle. Cold
+    /// paths (dead pane, Docker start, agent splash) keep the toast.
     ///
-    /// `exists()` is cache-backed, so a stale cache can misclassify a
-    /// just-died pane as warm; the only cost is a missing toast over a
-    /// slower-than-expected revive, never a broken entry.
+    /// `exists()` is cache-backed, so a stale cache can call a just-died pane warm; the
+    /// only cost is a missing toast over a slow revive, never a broken entry.
     pub fn agent_pane_is_warm(&self, session_id: &str) -> bool {
         let Some(inst) = self.get_instance(session_id) else {
             return false;
@@ -37,10 +30,9 @@ impl HomeView {
         inst.tmux_session().is_ok_and(|s| s.exists())
     }
 
-    /// Whether the target pane is already live, so its entry can skip the
-    /// transient revive toast. Terminal and tool targets check their own pane's
-    /// existence and ignore the agent's status, because a stopped agent can
-    /// have a live paired terminal.
+    /// Whether the target pane is already live, so entry can skip the revive toast.
+    /// Terminal and tool targets check their own pane and ignore the agent's status,
+    /// because a stopped agent can have a live paired terminal.
     fn target_pane_is_warm(&self, session_id: &str, target: &live_send::LiveSendTarget) -> bool {
         let Some(inst) = self.get_instance(session_id) else {
             return false;
@@ -70,52 +62,43 @@ impl HomeView {
         self.target_pane_is_warm(session_id, &self.pending_send_target)
     }
 
-    /// Size to boot a cold/dead pane at on live-send entry: the visible
-    /// preview output rect when known, else the full terminal. Seeding the boot
-    /// here avoids an initial reflow; any post-toast geometry change is queued
-    /// through the size-owning worker. Falls back to the terminal size for the
-    /// rare entry with no prior preview frame, and to `None` if neither is
-    /// available so tmux keeps its default.
+    /// Size to boot a cold pane at on live-send entry: the visible preview output rect when
+    /// known, else the full terminal, so there is no initial reflow; any post-toast geometry
+    /// change is queued through the size-owning worker. `None` when neither is available, so
+    /// tmux keeps its default.
     pub(super) fn live_send_boot_size(&self) -> Option<(u16, u16)> {
         let pane = self.preview_pane_area;
         if pane.width > 0 && pane.height > 0 {
             Some((pane.width, pane.height))
         } else {
-            // A zero-dimension terminal size is as unusable as no size at all;
-            // drop it so the start path keeps tmux's default instead of being
-            // handed `-x 0`/`-y 0`.
+            // A zero-dimension terminal size is as unusable as none, so drop it and let
+            // the start path keep tmux's default rather than be handed `-x 0`.
             crate::terminal::get_size().filter(|(cols, rows)| *cols > 0 && *rows > 0)
         }
     }
 
-    /// Stage live-send mode against `session_id`. Mirrors
-    /// `execute_send_message`'s revive cascade so a cold-start (Docker
-    /// pull, agent splash) is handled before the user starts typing,
-    /// then installs `live_send` state so subsequent keystrokes are
-    /// captured by `handle_live_send_key`.
+    /// Stage live-send mode against `session_id`, mirroring `execute_send_message`'s revive
+    /// cascade so a cold start is handled before the user types, then installing
+    /// `live_send` state so later keystrokes reach `handle_live_send_key`.
     ///
-    /// Geometry is settled by the caller's post-toast draw. Render queues the
-    /// final `preview_pane_area` through `LiveSendWorker`, which verifies
-    /// size ownership before resizing; this preparation path never waits on
-    /// tmux merely to align the first frame.
+    /// Geometry is settled by the caller's post-toast draw: render queues the final
+    /// `preview_pane_area` through `LiveSendWorker`, which verifies size ownership first, so
+    /// this path never waits on tmux to align the first frame.
     ///
-    /// Returns `Err(())` if the pane could not be readied (`info_dialog` is
-    /// set with the underlying error so the caller only has to clear its toast).
+    /// `Err(())` when the pane could not be readied, with `info_dialog` already set so the
+    /// caller only has to clear its toast.
     pub fn prepare_live_send(&mut self, session_id: &str) -> Result<(), ()> {
         let target = std::mem::replace(
             &mut self.pending_live_send_target,
             live_send::LiveSendTarget::Agent,
         );
-        // Agent targets revive the agent pane via the full
-        // ensure_pane_ready cascade (Docker, splash, resume). Terminal
-        // targets are simpler: the paired terminal is a plain shell,
-        // so we just ensure the tmux session exists and re-spawn it if
-        // the pane has died (matches `attach_terminal`).
+        // Agent targets revive through the full ensure_pane_ready cascade (Docker, splash,
+        // resume); terminal targets just ensure the tmux session exists and re-spawn a dead
+        // pane, matching `attach_terminal`.
         //
-        // Boot every target at the size it will be shown at, not tmux's 80x24
-        // default. The first post-toast draw sends any settled geometry change
-        // through the size-owning worker, so startup never races an unowned
-        // synchronous resize. See `Instance::ensure_pane_ready_with_size`.
+        // Boot every target at the size it will be shown at rather than tmux's 80x24: the
+        // first post-toast draw sends any settled geometry change through the size-owning
+        // worker, so startup never races an unowned synchronous resize.
         let boot_size = self.live_send_boot_size();
         match &target {
             live_send::LiveSendTarget::Agent => {
@@ -173,10 +156,9 @@ impl HomeView {
         let inst = match self.get_instance(session_id) {
             Some(inst) => inst.clone(),
             None => {
-                // Defensive: ensure_pane_ready succeeded but the
-                // instance is gone (deleted by a peer process between
-                // those two calls). Without a dialog the user would
-                // press Tab and see nothing happen, with no clue why.
+                // Defensive: ensure_pane_ready succeeded but the instance is gone (a peer
+                // deleted it between the two calls). Without a dialog the user would press
+                // Tab and see nothing happen.
                 self.info_dialog = Some(InfoDialog::new(
                     "Live send failed",
                     "Session disappeared before live mode could start.",
@@ -211,15 +193,11 @@ impl HomeView {
                     .to_string()
             }
         };
-        // Switching live mode from session A to session B (click on a
-        // different row while already live): we need to drop the old
-        // worker BEFORE resetting the old session's window-size,
-        // otherwise any `Resize` still queued in the old worker can
-        // fire after the reset and flip the old pane back to manual
-        // sizing. The worker thread is intentionally not joined, so
-        // dropping its `Sender` is the only way to know its dispatch
-        // loop has finished (its `recv` returns Err and the thread
-        // exits on the next iteration).
+        // Switching live mode from one session to another must drop the old worker BEFORE
+        // resetting the old session's window-size, or a `Resize` still queued there can fire
+        // after the reset and flip the old pane back to manual sizing. The thread is not
+        // joined, so dropping its `Sender` is the only way to know its dispatch loop has
+        // finished.
         let prev_tmux_name = self
             .live_send
             .as_ref()
@@ -229,15 +207,11 @@ impl HomeView {
             // Drop worker first so its queued resizes (if any) drain
             // against the old session before we reset its sizing.
             self.live_send_worker = None;
-            // The capture worker is retargeted by the render reconcile, not
-            // here; but drop the previous session's cached previews so the
-            // first frames after the switch don't paint session A's content
-            // under session B's header while B's capture worker spins up.
-            // (The synchronous path got this for free via its cross-session
-            // kill-switch branch; the worker path applies content lazily,
-            // so clear it explicitly here.) All targets are cleared because
-            // a live-send switch can retarget to Terminal / ContainerTerminal
-            // too, and the view can be flipped to any of them right after.
+            // The render reconcile retargets the capture worker, but drop the previous
+            // session's cached previews here so the first frames after the switch don't
+            // paint session A's content under session B's header while B's worker spins up.
+            // All targets are cleared, since a switch can retarget to Terminal or
+            // ContainerTerminal and the view can flip to any of them right after.
             self.preview_cache = PreviewCache::default();
             self.terminal_preview_cache = PreviewCache::default();
             self.container_terminal_preview_cache = PreviewCache::default();
@@ -246,20 +220,15 @@ impl HomeView {
                 crate::tmux::Session::from_name(name).reset_size_to_latest_client();
             }
         }
-        // Parse the configured exit-chord list now so the per-keystroke
-        // dispatch path doesn't re-parse on every event. Config edits
-        // during live mode aren't possible (settings_view participates
-        // in has_dialog and lives in its own takeover), so a snapshot
-        // at entry time is sufficient.
+        // Parse the configured exit-chord list now so the per-keystroke path doesn't
+        // re-parse on every event. Config cannot be edited during live mode (settings_view
+        // participates in has_dialog), so an entry-time snapshot is sufficient.
         let resolved_config = resolve_config_or_warn(&self.config_profile());
         let exit_chord_spec = resolved_config.session.live_send_exit_chord;
         let exit_chords = live_send::parse_chord_list(&exit_chord_spec);
-        // The leader is a single chord, not a list. An empty configured
-        // value disables it (so every key, including the default `C-b`,
-        // passes straight through). A non-empty but unparseable value is
-        // treated as a typo and falls back to the default leader rather
-        // than silently dropping the feature, mirroring how the exit
-        // chord recovers from a bad spec.
+        // The leader is a single chord, not a list. An empty value disables it, so every
+        // key passes through; an unparseable value is treated as a typo and falls back to
+        // the default rather than silently dropping the feature, like the exit chord.
         let leader_spec = resolved_config.session.live_send_leader;
         let leader = if leader_spec.trim().is_empty() {
             None
@@ -284,43 +253,35 @@ impl HomeView {
         // Entering live-send means the user is now viewing this session, so
         // clear any unread marker.
         self.clear_unread_on_view(&inst.id);
-        // Ensure the long-lived preview capture worker exists so we can hand
-        // its waker to the send worker below. The worker isn't otherwise
-        // spawned here (it follows the displayed pane for every view, not
-        // just agent live-send, and is (re)targeted and retuned by
-        // `sync_preview_capture_worker` on the next render); but it's already
-        // running whenever a session was previewed before live-send entry,
-        // which is the common path. Spawning it now closes the rare cold gap.
+        // Ensure the long-lived preview capture worker exists so its waker can go to the
+        // send worker below. It is not otherwise spawned here (it follows the displayed pane
+        // for every view and is retargeted by `sync_preview_capture_worker` on the next
+        // render), but it is already running whenever a session was previewed before entry;
+        // spawning now closes the rare cold gap.
         if self.preview_capture_worker.is_none() {
             self.preview_capture_worker = Some(live_send::LiveCaptureWorker::spawn(
                 self.preview_wake.clone(),
             ));
         }
-        // Nudge the capture worker right after each dispatched keystroke
-        // batch so typed echo is captured immediately instead of waiting up
-        // to a full fast-cadence cycle. This keeps echo latency tied to
-        // actual input rather than the background capture phase.
+        // Nudge the capture worker after each dispatched batch so typed echo is captured
+        // immediately rather than a full fast-cadence cycle later.
         let capture_wake = self
             .preview_capture_worker
             .as_ref()
             .map(live_send::LiveCaptureWorker::waker);
-        // Spawn the background worker that dispatches translated
-        // keystrokes as one-shot `tmux send-keys` subprocesses (the
-        // pre-#1485 path; control-mode was tried as an optimization
-        // but turned out to be unreliable on real-world tmux setups
-        // and was removed in favor of this simpler model).
+        // Spawn the background worker that dispatches translated keystrokes as one-shot
+        // `tmux send-keys` subprocesses; control-mode was tried (#1485) and proved
+        // unreliable on real tmux setups.
         self.live_send_worker = Some(live_send::LiveSendWorker::spawn(tmux_name, capture_wake));
-        // Start every live-mode entry (including a switch from another
-        // session) with a disarmed leader menu, so a half-entered chord
-        // can't carry over from a prior target.
+        // Start every live-mode entry, including a switch from another session, with a
+        // disarmed leader menu so a half-entered chord can't carry over.
         self.live_send_pending_leader = false;
         // The first post-toast draw queues the settled geometry through the
         // size-owning worker, even when a prior session used the same size.
         self.live_send_last_resize = None;
         self.live_send_resize_retry_at = None;
-        // Live mode takes over the pane's size from here; drop the non-live
-        // resize bookkeeping so exiting re-asserts the preview geometry
-        // cleanly.
+        // Live mode takes over the pane's size from here, so drop the non-live resize
+        // bookkeeping and let exiting re-assert the preview geometry cleanly.
         self.clear_preview_pane_sync(session_id);
         self.stamp_last_accessed(session_id);
         Ok(())

@@ -4,23 +4,16 @@ use std::sync::Arc;
 
 use super::state::AppState;
 
-/// How often the serve daemon evaluates plain tmux sessions for idle
-/// auto-stop. Mirrors the acp reaper's cadence so a 2s status tick does
-/// not drive a storage + tmux sweep on every iteration.
+/// How often the serve daemon evaluates plain tmux sessions for idle auto-stop.
 pub(super) const SESSION_IDLE_REAP_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(60);
 
-/// Cap on concurrent `perform_stop` calls during one reap pass. `Instance::stop`
-/// can block ~10s on `docker stop`; without a bound, a fleet of sessions all
-/// crossing the threshold on the same tick would stampede the Docker daemon.
+/// Cap on concurrent `perform_stop` calls during one reap pass.
 pub(super) const SESSION_IDLE_REAP_MAX_CONCURRENT: usize = 4;
 
-/// Auto-stop plain (non-acp) tmux sessions that have been `Idle` past
-/// their per-profile `session.auto_stop_idle_secs` (#1690). Gated to run at
-/// most once per [`SESSION_IDLE_REAP_INTERVAL`]. Each candidate is claimed
-/// under the per-profile storage lock (so a concurrently running TUI cannot
-/// double-stop it) and stopped on a detached task with bounded concurrency,
-/// keeping the status poll loop responsive.
+/// Auto-stop plain (non-acp) tmux sessions that have been `Idle` past their per-profile
+/// `session.auto_stop_idle_secs`. Gated to run at most once per
+/// [`SESSION_IDLE_REAP_INTERVAL`].
 pub(super) async fn reap_idle_sessions(
     state: &Arc<AppState>,
     last_reap: &mut Option<std::time::Instant>,
@@ -30,8 +23,7 @@ pub(super) async fn reap_idle_sessions(
     }
     *last_reap = Some(std::time::Instant::now());
 
-    // Live attach state. If the tmux query fails, skip this pass entirely
-    // rather than risk reaping a session the user is attached to.
+    // Live attach state.
     let attached = match tokio::task::spawn_blocking(crate::tmux::attached_session_names).await {
         Ok(Ok(set)) => set,
         _ => return,
@@ -40,9 +32,7 @@ pub(super) async fn reap_idle_sessions(
     let now = chrono::Utc::now();
     let instances = { state.instances.read().await.clone() };
 
-    // Resolve each distinct profile's threshold once, off the async runtime:
-    // `resolve_config_or_warn` reads config files from disk, so building the
-    // map directly here would block the poll loop.
+    // Resolve each distinct profile's threshold once, off the async runtime.
     let profiles: Vec<String> = instances
         .iter()
         .filter(|inst| !inst.is_structured())

@@ -1,6 +1,5 @@
-/// Tests for the mode that opens a newly-created terminal-mode session. The
-/// default follows `default_attach_mode`, preserving historical behavior. An
-/// explicit mode applies only after creation.
+/// Tests for the mode that opens a newly created terminal-mode session: the default follows
+/// `default_attach_mode`, and an explicit mode applies only after creation.
 use super::*;
 use crate::session::config::{update_config, AttachMode, NewSessionMode};
 
@@ -56,10 +55,9 @@ fn resolves_new_session_mode() {
 #[test]
 #[serial]
 fn returns_none_for_missing_instance() {
-    // Race: the apply_creation_results return reaches the dispatch
-    // and the instance has been deleted in the meantime. `None`
-    // signals the caller to fall back to the structured view-aware
-    // attach_session path rather than try to attach to a ghost.
+    // Race: the apply_creation_results return reaches the dispatch after the instance was
+    // deleted, so `None` tells the caller to fall back to the structured-aware attach_session
+    // path rather than attach to a ghost.
     let env = create_test_env_empty();
     let mode = env.view.new_session_attach_mode("nonexistent-id");
     assert!(mode.is_none());
@@ -68,10 +66,8 @@ fn returns_none_for_missing_instance() {
 #[test]
 #[serial]
 fn returns_none_for_acp_session() {
-    // Acp sessions aren't tmux-backed; live mode has no target
-    // and tmux attach is a no-op. The resolver returns None so the
-    // dispatch picks the (no-op) fallback explicitly, regardless of
-    // what the user configured globally.
+    // Acp sessions aren't tmux-backed, so live mode has no target and tmux attach is a
+    // no-op; the resolver returns None so the dispatch picks the fallback explicitly.
     let mut env = create_test_env_empty();
     write_session_modes(AttachMode::LiveSend, NewSessionMode::MatchDefault);
     let id = add_session(&mut env.view, "acp-one");
@@ -82,11 +78,9 @@ fn returns_none_for_acp_session() {
     assert!(mode.is_none(), "structured view sessions must return None");
 }
 
-/// Build a minimal `NewSessionData` for the sync create path: no
-/// sandbox, no hooks (caller passes `None`), no worktree. This is
-/// the combination that bypasses `creation_poller` and runs
-/// `create_session` inline, which is the path that originally
-/// emitted `Action::AttachSession` and bypassed the attach-mode
+/// A minimal `NewSessionData` for the sync create path: no sandbox, no hooks, no worktree.
+/// That combination bypasses `creation_poller` and runs `create_session` inline, which is
+/// the path that originally emitted `Action::AttachSession` and bypassed the attach-mode
 /// setting.
 fn sync_path_session_data(project: &str) -> crate::tui::dialogs::NewSessionData {
     crate::tui::dialogs::NewSessionData {
@@ -115,14 +109,10 @@ fn sync_path_session_data(project: &str) -> crate::tui::dialogs::NewSessionData 
 #[test]
 #[serial]
 fn sync_create_path_emits_attach_after_create_not_attach_session() {
-    // Regression guard for the original bug. `Action::AttachSession`
-    // would skip the attach-mode dispatch; only
-    // `Action::AttachAfterCreate` routes through it. If a future
-    // refactor flips this back, the live-mode setting silently
-    // stops working on no-sandbox/no-hooks/no-worktree creates and
-    // the bug returns. e2e covers the live-mode end of the
-    // dispatch; this unit test covers the action plumbing without
-    // needing tmux.
+    // Regression guard: `Action::AttachSession` skips the attach-mode dispatch, and only
+    // `Action::AttachAfterCreate` routes through it, so a refactor flipping this back would
+    // silently stop the live-mode setting on plain creates. e2e covers the live-mode end;
+    // this covers the action plumbing without tmux.
     let mut env = create_test_env_empty();
     let project_dir = env._temp.path().join("sync-project");
     std::fs::create_dir_all(&project_dir).unwrap();

@@ -1,9 +1,6 @@
 import { usePushSubscription } from "../hooks/usePushSubscription";
 
-// Push-notifications settings section. Rendered inside SettingsView.
-// State machine lives in usePushSubscription; this component is a view
-// on top of it with a single Enable/Disable primary action and a
-// secondary test-send button when enabled.
+// Push-notifications settings section.
 
 export function NotificationSettings() {
   const { state, enable, disable, sendTest, resubscribe } = usePushSubscription();

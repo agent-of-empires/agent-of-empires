@@ -1,22 +1,18 @@
 //! The sidebar's subscription to the daemon's session list.
 //!
-//! `GET /api/sessions` is the read the web dashboard polls, fetched here
-//! through the shared [`crate::daemon::DaemonClient`] so both surfaces decode
-//! one wire contract. Each tick hands the home view either the daemon's rows
-//! or an unavailable report, and the home view projects the daemon-owned
-//! fields onto its rows (see `HomeView::apply_session_feed`).
+//! `GET /api/sessions` is the read the web dashboard polls, fetched through the
+//! shared [`crate::daemon::DaemonClient`] so both surfaces decode one wire
+//! contract. Each tick hands the home view the daemon's rows or an unavailable
+//! report, and the home view projects the daemon-owned fields onto its rows.
 //!
-//! The daemon-owned set is narrow while the TUI still writes durable session
-//! state: today it is the runtime status of structured (ACP) rows, which have
-//! no tmux pane and whose status the daemon never persists (see
-//! `apply_acp_overlay_inplace`). Terminal rows stay with the local tmux
-//! poller, which the daemon does not own yet.
+//! That set is narrow while the TUI still writes durable session state: today it
+//! is the runtime status of structured (ACP) rows, which have no tmux pane and
+//! whose status the daemon never persists. Terminal rows stay with the local
+//! tmux poller.
 //!
-//! No daemon reachable, or `session.daemon_sidebar` off, means the local
-//! session store serves the sidebar alone and daemon-owned state keeps its
-//! last value. That is not an error: a structured session cannot be running
-//! without a daemon (`require_daemon` refuses to auto-spawn), so there is no
-//! live status to miss.
+//! No reachable daemon, or `session.daemon_sidebar` off, means the local store
+//! serves the sidebar alone and daemon-owned state keeps its last value. That is
+//! not an error: a structured session cannot run without a daemon.
 
 use std::sync::mpsc::TryRecvError;
 
@@ -53,14 +49,12 @@ pub(crate) struct DaemonStatusUpdate {
     pub pending_approvals: Vec<crate::daemon::PendingApproval>,
 }
 
-/// Project the daemon's rows onto the structured sessions the TUI cares
-/// about. Pure so the wire-shape handling is testable without a daemon.
+/// Project the daemon's rows onto the structured sessions the TUI cares about.
+/// Pure, so the wire-shape handling is testable without a daemon.
 ///
-/// Terminal rows are dropped: the tmux poller owns those, and letting the
-/// daemon's copy through would give them two producers racing on
-/// alternating cycles. An unparseable `status` is dropped rather than
-/// coerced, so a newer daemon variant leaves the row alone instead of
-/// forcing it to a wrong value.
+/// Terminal rows are dropped: the tmux poller owns those, and a second producer
+/// would race it on alternating cycles. An unparseable `status` is dropped
+/// rather than coerced, so a newer daemon variant leaves the row alone.
 pub(crate) fn structured_updates(rows: &[SessionResponse]) -> Vec<DaemonStatusUpdate> {
     rows.iter()
         .filter(|row| row.view == View::Structured)
@@ -86,14 +80,10 @@ fn parse_ts(raw: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
 }
 
 async fn fetch_sessions() -> SessionFeedResult {
-    // `require_daemon` is the same resolver `open_structured_view` uses, so
-    // this feed and the view it feeds can never disagree about which daemon
-    // they are talking to, and neither spawns one as a side effect.
-    //
-    // Its `AOE_DAEMON_URL` branch is unreachable from here: `tui::run` swaps
-    // the whole app over to `remote_home::run_standalone` when that variable
-    // is set (`src/tui/mod.rs`), so the local home view this feed belongs to
-    // only ever runs against a local daemon.
+    // `require_daemon` is the resolver `open_structured_view` uses, so the feed
+    // and the view can never disagree about which daemon they talk to, and
+    // neither spawns one. Its `AOE_DAEMON_URL` branch is unreachable here:
+    // `tui::run` swaps to `remote_home::run_standalone` when that is set.
     let endpoint = match crate::acp::client::require_daemon().await {
         Ok(endpoint) => endpoint,
         Err(e) => {
@@ -117,15 +107,13 @@ async fn fetch_sessions() -> SessionFeedResult {
     }
 }
 
-/// Background thread that reads the session list from the daemon.
 pub struct SessionFeed {
     worker: Worker<(), SessionFeedResult>,
 }
 
 impl SessionFeed {
     pub fn new() -> Self {
-        // One current-thread runtime for the worker's lifetime. Building it
-        // per request would pay setup on every tick, and the TUI's own
+        // One current-thread runtime for the worker's lifetime; the TUI's own
         // runtime is not reachable from this thread.
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -149,9 +137,8 @@ impl SessionFeed {
         self.worker.request(());
     }
 
-    /// Try to receive a result without blocking. Surfaces `Disconnected` so
-    /// the caller can respawn: swallowing it would leave the in-flight flag
-    /// set forever and freeze every daemon-owned row.
+    /// Try to receive a result without blocking. Surfaces `Disconnected` so the
+    /// caller can respawn; swallowing it would freeze every daemon-owned row.
     pub(crate) fn try_recv(&self) -> Result<SessionFeedResult, TryRecvError> {
         self.worker.try_recv()
     }

@@ -214,51 +214,27 @@ mod tests {
         dir_guard::write_short(dir.as_fd(), "status", content.as_bytes()).unwrap();
     }
 
+    /// Every status token the hook snippets write, a trailing newline, an
+    /// unrecognised token, and no file at all.
     #[test]
     #[serial_test::serial(hook_base)]
-    fn test_read_running_status() {
+    fn read_hook_status_maps_only_the_known_tokens() {
         let (_g, _, _tmp) = BaseGuard::ready();
-        write_status_via_guard("read_running", "running");
-        assert_eq!(read_hook_status("read_running"), Some(Status::Running));
-    }
-
-    #[test]
-    #[serial_test::serial(hook_base)]
-    fn test_read_waiting_status() {
-        let (_g, _, _tmp) = BaseGuard::ready();
-        write_status_via_guard("read_waiting", "waiting");
-        assert_eq!(read_hook_status("read_waiting"), Some(Status::Waiting));
-    }
-
-    #[test]
-    #[serial_test::serial(hook_base)]
-    fn test_read_idle_status() {
-        let (_g, _, _tmp) = BaseGuard::ready();
-        write_status_via_guard("read_idle", "idle");
-        assert_eq!(read_hook_status("read_idle"), Some(Status::Idle));
-    }
-
-    #[test]
-    #[serial_test::serial(hook_base)]
-    fn test_read_error_status() {
-        let (_g, _, _tmp) = BaseGuard::ready();
-        write_status_via_guard("read_err", "error");
-        assert_eq!(read_hook_status("read_err"), Some(Status::Error));
-    }
-
-    #[test]
-    #[serial_test::serial(hook_base)]
-    fn test_read_waiting_with_newline() {
-        let (_g, _, _tmp) = BaseGuard::ready();
-        write_status_via_guard("read_nl", "waiting\n");
-        assert_eq!(read_hook_status("read_nl"), Some(Status::Waiting));
-    }
-
-    #[test]
-    #[serial_test::serial(hook_base)]
-    fn test_read_missing_file() {
-        let (_g, _, _tmp) = BaseGuard::ready();
-        assert_eq!(read_hook_status("nonexistent_instance_id"), None);
+        let cases = [
+            ("read_running", Some("running"), Some(Status::Running)),
+            ("read_waiting", Some("waiting"), Some(Status::Waiting)),
+            ("read_idle", Some("idle"), Some(Status::Idle)),
+            ("read_err", Some("error"), Some(Status::Error)),
+            ("read_nl", Some("waiting\n"), Some(Status::Waiting)),
+            ("read_unexpected", Some("something_else"), None),
+            ("read_absent", None, None),
+        ];
+        for (id, written, expected) in cases {
+            if let Some(content) = written {
+                write_status_via_guard(id, content);
+            }
+            assert_eq!(read_hook_status(id), expected, "{id}");
+        }
     }
 
     #[test]
@@ -289,14 +265,6 @@ mod tests {
         std::os::unix::fs::symlink("/nonexistent/target", base.join("dangling").join("status"))
             .unwrap();
         assert_eq!(read_hook_status("dangling"), None);
-    }
-
-    #[test]
-    #[serial_test::serial(hook_base)]
-    fn test_read_unexpected_content() {
-        let (_g, _, _tmp) = BaseGuard::ready();
-        write_status_via_guard("read_unexpected", "something_else");
-        assert_eq!(read_hook_status("read_unexpected"), None);
     }
 
     #[test]
@@ -363,53 +331,38 @@ mod tests {
         dir_guard::write_short(dir.as_fd(), "attention.json", body.as_bytes()).unwrap();
     }
 
+    /// The flag holds only while it is set and unexpired; an absent or
+    /// unparseable `attention.json` reads as not urgent.
     #[test]
     #[serial_test::serial(hook_base)]
-    fn test_read_hook_urgent_true() {
+    fn read_hook_urgent_holds_only_for_a_live_flag() {
         let (_g, _, _tmp) = BaseGuard::ready();
-        write_attention_json("urgent_true", r#"{"urgent":true,"urgent_reason":"x"}"#);
-        assert!(read_hook_urgent("urgent_true"));
-    }
-
-    #[test]
-    #[serial_test::serial(hook_base)]
-    fn test_read_hook_urgent_false_when_flag_missing() {
-        let (_g, _, _tmp) = BaseGuard::ready();
-        write_attention_json("urgent_missing", r#"{"tier":0}"#);
-        assert!(!read_hook_urgent("urgent_missing"));
-    }
-
-    #[test]
-    #[serial_test::serial(hook_base)]
-    fn test_read_hook_urgent_false_when_file_absent() {
-        let (_g, _, _tmp) = BaseGuard::ready();
-        assert!(!read_hook_urgent("urgent_no_file"));
-    }
-
-    #[test]
-    #[serial_test::serial(hook_base)]
-    fn test_read_hook_urgent_false_when_malformed_json() {
-        let (_g, _, _tmp) = BaseGuard::ready();
-        write_attention_json("urgent_bad_json", "{ this is not json");
-        assert!(!read_hook_urgent("urgent_bad_json"));
-    }
-
-    #[test]
-    #[serial_test::serial(hook_base)]
-    fn test_read_hook_urgent_false_when_expires_passed() {
-        let (_g, _, _tmp) = BaseGuard::ready();
-        write_attention_json("urgent_expired", r#"{"urgent":true,"urgent_expires_at":1}"#);
-        assert!(!read_hook_urgent("urgent_expired"));
-    }
-
-    #[test]
-    #[serial_test::serial(hook_base)]
-    fn test_read_hook_urgent_true_when_expires_future() {
-        let (_g, _, _tmp) = BaseGuard::ready();
-        let future = crate::util::now_secs() + 3600;
-        let body = format!(r#"{{"urgent":true,"urgent_expires_at":{}}}"#, future);
-        write_attention_json("urgent_future", &body);
-        assert!(read_hook_urgent("urgent_future"));
+        let future = format!(
+            r#"{{"urgent":true,"urgent_expires_at":{}}}"#,
+            crate::util::now_secs() + 3600
+        );
+        let cases = [
+            (
+                "urgent_true",
+                Some(r#"{"urgent":true,"urgent_reason":"x"}"#),
+                true,
+            ),
+            ("urgent_future", Some(future.as_str()), true),
+            ("urgent_missing", Some(r#"{"tier":0}"#), false),
+            ("urgent_bad_json", Some("{ this is not json"), false),
+            (
+                "urgent_expired",
+                Some(r#"{"urgent":true,"urgent_expires_at":1}"#),
+                false,
+            ),
+            ("urgent_no_file", None, false),
+        ];
+        for (id, body, expected) in cases {
+            if let Some(body) = body {
+                write_attention_json(id, body);
+            }
+            assert_eq!(read_hook_urgent(id), expected, "{id}");
+        }
     }
 
     fn write_session_id_sidecar(instance_id: &str, content: &str) {

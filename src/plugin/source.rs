@@ -1,31 +1,20 @@
 //! Parsing an external plugin install source.
-//!
-//! A source is either a GitHub slug (`gh:owner/repo` with an optional `@ref`)
-//! or a local directory path. Parsing is pure: it does not touch the network or
-//! the filesystem, so the same parser interprets a freshly typed argument and a
-//! source string read back from config on update.
 
 use std::path::PathBuf;
 
 use anyhow::{bail, Result};
 
-/// Where a plugin is installed from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PluginSource {
-    /// A GitHub repository, written `gh:owner/repo` with an optional `@ref`
-    /// (branch, tag, or commit).
     Github {
         owner: String,
         repo: String,
         reference: Option<String>,
     },
-    /// A local directory containing an `aoe-plugin.toml`.
     Local(PathBuf),
 }
 
 impl PluginSource {
-    /// Parse an install source argument. A `gh:` prefix selects GitHub;
-    /// anything else is treated as a local path.
     pub fn parse(input: &str) -> Result<Self> {
         let input = input.trim();
         if input.is_empty() {
@@ -55,9 +44,6 @@ impl PluginSource {
         }
     }
 
-    /// The canonical source string persisted in config and the lockfile. For
-    /// GitHub this drops the `@ref` (the ref is recorded separately); for a
-    /// local source it is the path.
     pub fn slug(&self) -> String {
         match self {
             PluginSource::Github { owner, repo, .. } => format!("gh:{owner}/{repo}"),
@@ -65,7 +51,6 @@ impl PluginSource {
         }
     }
 
-    /// The requested git ref, if any. Always `None` for a local source.
     pub fn reference(&self) -> Option<&str> {
         match self {
             PluginSource::Github { reference, .. } => reference.as_deref(),
@@ -73,9 +58,6 @@ impl PluginSource {
         }
     }
 
-    /// The clone URL for a GitHub source. The host base defaults to
-    /// `https://github.com` and is overridable via `AOE_GITHUB_CLONE_BASE` (a
-    /// GitHub Enterprise host, or a local path/`file://` base in tests).
     pub fn github_clone_url(&self) -> Option<String> {
         match self {
             PluginSource::Github { owner, repo, .. } => {

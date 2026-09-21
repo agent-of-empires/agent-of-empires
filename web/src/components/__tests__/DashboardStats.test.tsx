@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-//
-// Regression guard for #2489: the dashboard's returning-user summary must not
-// count trashed sessions. A session left in an Error state does not matter once
-// it is in the trash, so the "N errors" / "N sessions across M projects" line
-// has to exclude anything carrying `trashed_at`.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 

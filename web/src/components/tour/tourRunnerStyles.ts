@@ -1,24 +1,12 @@
 import type { ButtonType, Options, Styles } from "react-joyride";
 
-// react-joyride theming for the tour, kept in a non-component module so the
-// component file can stay fast-refresh clean while these stay unit-testable.
-// Only `import type` from react-joyride here, so this module does not pull the
-// engine into the bundle (TourRunner stays the sole runtime importer).
-//
-// Theme via the app's resolved-theme CSS variables (web/src/index.css) so the
-// tooltip tracks light vs dark instead of being pinned to dark hex. These land
-// as inline CSS styles, where var() resolves. The exception is overlayColor: it
-// is painted as an SVG fill attribute, where var() does not reliably resolve,
-// so the scrim stays a theme-agnostic translucent black.
+// Type-only joyride import keeps the engine out of the bundle. Colors use theme
+// CSS variables, except overlayColor: an SVG fill where var() does not resolve.
 export const TOUR_RUNNER_OPTIONS: Partial<Options> = {
   buttons: ["skip", "back", "primary"] as ButtonType[],
   showProgress: true,
   skipBeacon: true,
-  // Clicking the scrim is the only dismiss gesture react-joyride cannot report
-  // reliably in controlled mode: fired before a step settles (e.g. first paint
-  // under action=START, which skipBeacon keeps the overlay visible for), its
-  // close() emits no callback and leaves status=RUNNING, so the overlay strands
-  // with no event for us to end on (#2819). Make it inert; Skip and Escape stay.
+  // A scrim click can close without any callback in controlled mode, stranding the overlay.
   overlayClickAction: false,
   primaryColor: "var(--color-brand-600)",
   overlayColor: "rgba(0, 0, 0, 0.65)",

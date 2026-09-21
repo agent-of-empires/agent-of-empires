@@ -1,9 +1,86 @@
-//! Host and AoE-agent resource sampling for the TUI system-health views.
+//! Host and AoE-agent resource sampling for the system-health views, shared by
+//! the TUI strip and the web dashboard's strip.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use crate::session::{Instance, Status};
+
+/// Fraction used at or above which the reading is Critical.
+const HEADROOM_CRITICAL: f64 = 0.90;
+/// Fraction used at or above which the reading is Warn.
+const HEADROOM_WARN: f64 = 0.70;
+/// PSI `some` avg10 percent at or above which a present PSI signal reads Critical.
+const PSI_CRITICAL: f32 = 20.0;
+/// PSI `some` avg10 percent at or above which a present PSI signal reads Warn.
+const PSI_WARN: f32 = 5.0;
+
+/// Memory-pressure severity, worst-of across the available signals. Ordered
+/// ascending so the derived `Ord` lets callers fold inputs with `max`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PressureBand {
+    Ok,
+    Warn,
+    Critical,
+}
+
+impl PressureBand {
+    /// The band's wire and display name. Both dashboards spell a band from
+    /// this one mapping; the TUI upper-cases it for its status row.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PressureBand::Ok => "ok",
+            PressureBand::Warn => "warn",
+            PressureBand::Critical => "critical",
+        }
+    }
+}
+
+/// Classify a memory sample into a pressure band. Headroom is always an input;
+/// PSI (Linux) and the macOS pressure level contribute only when present, so a
+/// platform that omits a signal never has it read as a false all-clear. The
+/// worst band across the present inputs wins.
+pub fn pressure_band(mem: &MemorySample) -> PressureBand {
+    let mut band = band_from_headroom(mem.used_fraction());
+    if let Some(v) = mem.psi_mem_some_avg10 {
+        band = band.max(band_from_psi(v));
+    }
+    if let Some(v) = mem.psi_io_some_avg10 {
+        band = band.max(band_from_psi(v));
+    }
+    if let Some(level) = mem.macos_pressure_level {
+        band = band.max(band_from_macos(level));
+    }
+    band
+}
+
+fn band_from_headroom(used_fraction: f64) -> PressureBand {
+    if used_fraction >= HEADROOM_CRITICAL {
+        PressureBand::Critical
+    } else if used_fraction >= HEADROOM_WARN {
+        PressureBand::Warn
+    } else {
+        PressureBand::Ok
+    }
+}
+
+fn band_from_psi(some_avg10: f32) -> PressureBand {
+    if some_avg10 >= PSI_CRITICAL {
+        PressureBand::Critical
+    } else if some_avg10 >= PSI_WARN {
+        PressureBand::Warn
+    } else {
+        PressureBand::Ok
+    }
+}
+
+fn band_from_macos(level: u8) -> PressureBand {
+    match level {
+        4 => PressureBand::Critical,
+        2 => PressureBand::Warn,
+        _ => PressureBand::Ok,
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct MemorySample {
@@ -36,10 +113,7 @@ pub struct SystemSample {
     pub swap_used_bytes: u64,
 }
 
-/// One agent's resource usage. Every figure is optional because a sandboxed
-/// agent's numbers come from the container runtime, which may not have a
-/// sample yet (or at all, on a runtime without a stats command); reporting
-/// unknown is the honest reading, a zero would not be.
+/// Every figure is optional: an unknown reading is honest where a zero would not be.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AgentMetric {
     pub id: String,
@@ -47,8 +121,6 @@ pub struct AgentMetric {
     pub cpu_fraction: Option<f64>,
     pub rss_bytes: Option<u64>,
     pub procs: Option<usize>,
-    /// Measured inside a sandbox container rather than on the host process
-    /// tree. The memory figure is then the container's usage, not an RSS sum.
     pub sandboxed: bool,
 }
 
@@ -90,11 +162,7 @@ pub(crate) struct MetricsSampler {
     last_pane_roots: PaneRoots,
 }
 
-/// Pane metadata from the last successful `list-panes -a`, with the start
-/// identity of every root pid as seen in the process snapshot taken alongside
-/// it. A tick whose `list-panes` fails reuses the map, and the identity check
-/// keeps a pid that exited and was recycled during the outage from seeding a
-/// process-tree walk.
+/// Reused when `list-panes` fails; start identities stop a recycled pid from seeding a walk.
 #[derive(Default)]
 struct PaneRoots {
     panes: HashMap<String, crate::tmux::PaneMetadata>,
@@ -115,9 +183,6 @@ impl PaneRoots {
         Self { panes, start_ids }
     }
 
-    /// The live root pid of `inst`'s agent pane: resolved against this same
-    /// snapshot (a renamed session still matches), not dead, and still the
-    /// process it was when the snapshot was taken.
     fn root_for(&self, inst: &Instance, by_pid: &HashMap<u32, &ProcessRecord>) -> Option<u32> {
         let derived = crate::tmux::Session::generate_name(&inst.id, &inst.title);
         let name = crate::tmux::resolve_agent_session_name_in(&self.panes, &inst.id, &derived);
@@ -150,9 +215,7 @@ impl MetricsSampler {
         });
 
         let processes = process_snapshot();
-        // One `list-panes -a` for every pane root, instead of one
-        // `display-message` per session. `Err` means tmux could not answer, not
-        // that there are no panes, so the previous snapshot stands for that tick.
+        // `Err` means tmux could not answer, so the previous snapshot stands.
         if let Ok(panes) = crate::tmux::batch_pane_metadata() {
             self.last_pane_roots = PaneRoots::capture(panes, &processes);
         }
@@ -200,12 +263,8 @@ fn eligible_instance(inst: &Instance) -> bool {
         )
 }
 
-/// One row's figures: `(cpu_fraction, memory_bytes, procs)`.
 type RowFigures = (Option<f64>, Option<u64>, Option<usize>);
 
-/// The sandbox container backing `inst`, if it has one. Both agent populations
-/// route through this, so a tmux pane and a structured worker cannot disagree
-/// about whether a session is sandboxed.
 fn sandbox_container_name(inst: &Instance) -> Option<&str> {
     inst.sandbox_info
         .as_ref()
@@ -213,15 +272,10 @@ fn sandbox_container_name(inst: &Instance) -> Option<&str> {
         .map(|s| s.container_name.as_str())
 }
 
-/// Figures as the container runtime reports them, or all-unknown when it has
-/// no sample for this container: a cold cache, a stopped container, or a
-/// runtime with no stats command. Unknown renders "?"; a zero would read as a
-/// measured idle.
 fn container_figures(stats: &crate::containers::stats::StatsMap, name: &str) -> RowFigures {
     match stats.get(name) {
         Some(stats) => (
-            // `cpu_percent` is per-core (100 == one core saturated); the table
-            // reads as a share of the whole host, like the host rows.
+            // `cpu_percent` is per-core; the table shows a share of the whole host.
             Some(stats.cpu_percent / 100.0 / logical_cpus() as f64),
             Some(stats.mem_used_bytes),
             Some(stats.pids),
@@ -230,7 +284,6 @@ fn container_figures(stats: &crate::containers::stats::StatsMap, name: &str) -> 
     }
 }
 
-/// Figures summed over a host process tree.
 fn host_figures(
     pids: &[u32],
     by_pid: &HashMap<u32, &ProcessRecord>,
@@ -286,20 +339,13 @@ fn aggregate_agents(
             .filter(crate::process::worker_registry::is_record_live)
             .collect();
 
-    // Structured sessions are excluded from `eligible`, so their sandboxes
-    // have to be counted here or a host whose only sandbox runs under a
-    // structured worker would never fetch the map its row needs.
+    // Structured sessions are excluded from `eligible`, so count their sandboxes here.
     let sandboxed_worker = worker_records.iter().any(|rec| {
         instances
             .iter()
             .any(|i| i.id == rec.session_id && sandbox_container_name(i).is_some())
     });
 
-    // Skip the runtime's stats pass unless a sandbox session is loaded;
-    // `cached_stats` then hands back the last completed map without blocking.
-    // Not gated on the health surface being open: the sampler also runs for
-    // the compact strip and for the undiscovered-tip check, so a host with a
-    // sandbox pays one refresh per TTL whenever the TUI is sampling at all.
     let container_stats = (eligible.iter().any(|i| sandbox_container_name(i).is_some())
         || sandboxed_worker)
         .then(crate::containers::stats::cached_stats)
@@ -319,11 +365,8 @@ fn aggregate_agents(
                 stack.extend(children);
             }
         }
-        // The pid tree is still walked for a sandboxed session, so its pane
-        // processes are claimed and cannot be double-counted onto a neighbour,
-        // but its figures come from the container instead: the pane holds a
-        // `docker exec` client, while the agent runs in the container, off
-        // this process tree entirely.
+        // Walk the tree anyway so pane processes are claimed, but take figures from the container,
+        // where the agent actually runs.
         let sandbox_container = sandbox_container_name(inst);
         let (cpu_fraction, rss_bytes, procs) = match sandbox_container {
             Some(name) => container_figures(&container_stats, name),
@@ -357,9 +400,6 @@ fn aggregate_agents(
                 stack.extend(children);
             }
         }
-        // A sandboxed structured session wraps its agent in `docker exec` just
-        // as a tmux pane does (see `spawn_runner_detached`), so the host tree
-        // here is the runner shim plus that client, not the agent.
         let inst = instances.iter().find(|i| i.id == rec.session_id);
         let sandbox_container = inst.and_then(sandbox_container_name);
         let (cpu_fraction, rss_bytes, procs) = match sandbox_container {
@@ -465,15 +505,92 @@ mod tests {
         }
     }
 
+    fn sample_with_fraction(used_fraction: f64) -> MemorySample {
+        // total 1000 so available maps cleanly to the target fraction.
+        MemorySample {
+            total_bytes: 1000,
+            available_bytes: (1000.0 * (1.0 - used_fraction)).round() as u64,
+            ..MemorySample::default()
+        }
+    }
+
+    #[test]
+    fn pressure_band_from_headroom_only() {
+        let cases = [
+            (0.0, PressureBand::Ok),
+            (0.69, PressureBand::Ok),
+            (0.70, PressureBand::Warn),
+            (0.89, PressureBand::Warn),
+            (0.90, PressureBand::Critical),
+            (0.99, PressureBand::Critical),
+        ];
+        for (frac, expected) in cases {
+            assert_eq!(
+                pressure_band(&sample_with_fraction(frac)),
+                expected,
+                "headroom fraction {frac}"
+            );
+        }
+    }
+
+    #[test]
+    fn pressure_band_escalates_on_psi_when_headroom_calm() {
+        // Headroom alone is Ok (50% used); PSI drives the band up.
+        let mut mem = sample_with_fraction(0.50);
+        assert_eq!(pressure_band(&mem), PressureBand::Ok);
+
+        mem.psi_mem_some_avg10 = Some(6.0);
+        assert_eq!(pressure_band(&mem), PressureBand::Warn);
+
+        mem.psi_mem_some_avg10 = Some(25.0);
+        assert_eq!(pressure_band(&mem), PressureBand::Critical);
+
+        // io pressure alone (mem PSI absent) still escalates.
+        let mem_io = MemorySample {
+            psi_io_some_avg10: Some(25.0),
+            ..sample_with_fraction(0.50)
+        };
+        assert_eq!(pressure_band(&mem_io), PressureBand::Critical);
+    }
+
+    #[test]
+    fn pressure_band_from_macos_level() {
+        let cases = [
+            (1u8, PressureBand::Ok),
+            (2, PressureBand::Warn),
+            (4, PressureBand::Critical),
+        ];
+        for (level, expected) in cases {
+            let mem = MemorySample {
+                macos_pressure_level: Some(level),
+                ..sample_with_fraction(0.50)
+            };
+            assert_eq!(pressure_band(&mem), expected, "macos level {level}");
+        }
+    }
+
+    #[test]
+    fn pressure_band_takes_worst_of_inputs() {
+        // Critical headroom must not be softened by a calm PSI reading.
+        let mem = MemorySample {
+            psi_mem_some_avg10: Some(1.0),
+            ..sample_with_fraction(0.95)
+        };
+        assert_eq!(pressure_band(&mem), PressureBand::Critical);
+    }
+
+    #[test]
+    fn pressure_band_default_sample_is_ok() {
+        assert_eq!(pressure_band(&MemorySample::default()), PressureBand::Ok);
+    }
+
     #[test]
     fn root_for_requires_a_live_pane_whose_pid_kept_its_identity() {
         let inst = Instance::new("metrics-root", "/tmp/metrics-root");
         let name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
         let snapshot = [record(100, 7)];
-        // (pane, current processes, expected)
         let cases = [
             (pane(Some(100), false), vec![record(100, 7)], Some(100)),
-            // The pane died and its pid was handed to something else.
             (pane(Some(100), false), vec![record(100, 8)], None),
             (pane(Some(100), false), vec![], None),
             (pane(Some(100), true), vec![record(100, 7)], None),

@@ -341,23 +341,13 @@ struct SessionDetails {
     tool: String,
     command: String,
     status: String,
-    /// The same `live`/`archived`/`trashed` tag `aoe list --json` carries
-    /// (#3350/#3361), so a consumer does not have to fall back to `list` to
-    /// learn whether the session it just looked up is still around. `status`
-    /// cannot carry it: an archived session can be running, so the two are
-    /// independent and collapsing them loses one.
     state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     trashed_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     archived_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// Gated on [`Instance::is_snoozed`] exactly like `aoe list --json` and
-    /// the API: surfaced only while the deadline is in the future, so a row
-    /// whose snooze expired omits the key instead of advertising it.
     #[serde(skip_serializing_if = "Option::is_none")]
     snoozed_until: Option<chrono::DateTime<chrono::Utc>>,
-    /// Set iff the session is currently pinned for the web sidebar.
-    /// Independent of `state`, matching the API field from #1581.
     #[serde(skip_serializing_if = "Option::is_none")]
     pinned_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -404,11 +394,17 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::SetBase(args) => set_base(profile, args).await,
         SessionCommands::Snooze(args) => snooze_session(profile, args).await,
         SessionCommands::Unsnooze(args) => unsnooze_session(profile, args).await,
-        SessionCommands::Favorite(args) => favorite_session(profile, args).await,
-        SessionCommands::Unfavorite(args) => unfavorite_session(profile, args).await,
+        SessionCommands::Favorite(args) => {
+            mark_session(profile, args, "Favorited", Instance::favorite).await
+        }
+        SessionCommands::Unfavorite(args) => {
+            mark_session(profile, args, "Unfavorited", Instance::unfavorite).await
+        }
         SessionCommands::Color(args) => set_color_session(profile, args).await,
         SessionCommands::Archive(args) => archive_session(profile, args).await,
-        SessionCommands::Unarchive(args) => unarchive_session(profile, args).await,
+        SessionCommands::Unarchive(args) => {
+            mark_session(profile, args, "Unarchived", Instance::unarchive).await
+        }
         SessionCommands::Restore(args) => restore_session(profile, args).await,
         SessionCommands::Import(args) => import_sessions(profile, args).await,
         SessionCommands::ListTrash => list_trash(profile).await,
@@ -416,40 +412,31 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
     }
 }
 
-async fn favorite_session(profile: &str, args: SessionIdArgs) -> Result<()> {
+/// Flips one boolean marker on a session and reports it with `verb`.
+async fn mark_session(
+    profile: &str,
+    args: SessionIdArgs,
+    verb: &str,
+    apply: fn(&mut Instance),
+) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
     let title = storage.update(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
-            inst.favorite();
+            apply(inst);
             Ok(inst.title.clone())
         })
     })?;
-    println!("Favorited: {}", title);
-    Ok(())
-}
-
-async fn unfavorite_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::open_unwatched(profile)?;
-    let title = storage.update(|instances, _groups| {
-        super::patch_instance(instances, &args.identifier, |inst| {
-            inst.unfavorite();
-            Ok(inst.title.clone())
-        })
-    })?;
-    println!("Unfavorited: {}", title);
+    println!("{verb}: {title}");
     Ok(())
 }
 
 async fn set_color_session(profile: &str, args: SetColorArgs) -> Result<()> {
-    // `none`/`clear`/empty clears the label; anything else must be a palette
-    // member (validated inside `Instance::set_color`).
     let normalized = args.color.trim().to_lowercase();
     let new_color = match normalized.as_str() {
         "none" | "clear" | "" => None,
         other => Some(other.to_string()),
     };
 
-    // Patching an existing session never creates the profile (#148).
     let storage = Storage::open_unwatched(profile)?;
     let (title, color) = storage.update(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
@@ -469,14 +456,12 @@ async fn set_color_session(profile: &str, args: SetColorArgs) -> Result<()> {
 async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
 
-    // Phase 1 (unlocked): resolve identifier.
     let (instances, _groups) = storage.load_with_groups()?;
     let inst = super::resolve_session(&args.identifier, &instances)?;
     let id = inst.id.clone();
     let title = inst.title.clone();
     let inst = inst.clone();
 
-    // Serialize teardown and the archive commit as one lifecycle transition.
     let _lifecycle_lock = storage
         .acquire_instance_lifecycle_lock(&id)
         .context("failed to acquire instance archive lock")?;
@@ -487,8 +472,6 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
         inst.kill_ancillary_tmux_sessions_locked();
     }
 
-    // Archive under the lifecycle lock so the state and its generation bump are
-    // durable before the lock releases and a concurrent restart can observe them.
     let landed = storage.update(|instances, _groups| {
         if let Some(stored) = instances.iter_mut().find(|i| i.id == id) {
             stored.archive();
@@ -509,26 +492,9 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
     }
 }
 
-async fn unarchive_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::open_unwatched(profile)?;
-    let title = storage.update(|instances, _groups| {
-        super::patch_instance(instances, &args.identifier, |inst| {
-            inst.unarchive();
-            Ok(inst.title.clone())
-        })
-    })?;
-    println!("Unarchived: {}", title);
-    Ok(())
-}
-
 async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
 
-    // Resolve within the trashed subset only. The CLI advertises the argument
-    // as an id OR title, and a live or archived session can share a title/path
-    // with a trashed one; resolving against the full list would let that row
-    // win and make `untrash()` a silent no-op on an already-live session.
-    // See #2489.
     let (instances, _groups) = storage.load_with_groups()?;
     let trashed: Vec<_> = instances
         .iter()
@@ -559,10 +525,6 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         crate::session::claim::RestoreClaimDecision::Claimed(generation) => generation,
     };
 
-    // Move the worktree back to its pre-trash location before flipping the
-    // marker. Strict: if the original path is occupied or git refuses, leave
-    // the session trashed and surface the error rather than restoring it to
-    // the holding-area path.
     if let crate::session::trash::RestoreOutcome::Failed { reason } =
         crate::session::trash::restore_worktree_location(&mut inst)
     {
@@ -629,10 +591,6 @@ async fn list_trash(profile: &str) -> Result<()> {
 async fn empty_trash(profile: &str) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
 
-    // Snapshot the trashed sessions. Each row's selected-profile lifecycle
-    // lock is acquired immediately before its purge claim and retained through
-    // that row's durable finalize. Purge forces removal so a dirty worktree
-    // cannot keep an emptied session pinned in the trash.
     let (instances, _groups) = storage.load_with_groups()?;
     let mut trashed: Vec<_> = instances
         .iter()
@@ -642,8 +600,6 @@ async fn empty_trash(profile: &str) -> Result<()> {
     for instance in &mut trashed {
         instance.source_profile = storage.profile().to_string();
     }
-    // Deterministic order keeps concurrent batch reports stable. Each row is
-    // finalized before the next lock is acquired, so batches cannot deadlock.
     trashed.sort_by(|left, right| left.id.cmp(&right.id));
     if trashed.is_empty() {
         println!("Trash is empty.");
@@ -653,8 +609,6 @@ async fn empty_trash(profile: &str) -> Result<()> {
     let mut removed = 0usize;
     let mut restored_after_teardown = 0usize;
     let mut kept_for_retry = 0usize;
-    // Rows whose reservation was refused before teardown are benign and
-    // reported separately from restores that land after teardown began.
     let mut being_restored_elsewhere = 0usize;
     let mut being_purged_elsewhere = 0usize;
     for inst in &trashed {
@@ -725,9 +679,6 @@ async fn empty_trash(profile: &str) -> Result<()> {
         restored_after_teardown,
         kept_for_retry,
     };
-    // A restore that raced our teardown after it began is the only case that
-    // risks orphaned artifacts, so it gets the repair warning; benign
-    // being-restored-elsewhere rows (no teardown ran) do not.
     if outcome.restored_after_teardown > 0 {
         eprintln!(
             "Warning: {} session(s) were restored mid-purge after teardown began; kept the \
@@ -736,8 +687,6 @@ async fn empty_trash(profile: &str) -> Result<()> {
             outcome.restored_after_teardown
         );
     }
-    // Each figure is its own disjoint category, so the "restored mid-purge"
-    // count matches the warning above exactly (no summary/warning mismatch).
     let mut parts = vec![format!("purged {} session(s)", outcome.removed)];
     if outcome.kept_for_retry > 0 {
         parts.push(format!("kept {} for retry", outcome.kept_for_retry));
@@ -769,9 +718,6 @@ async fn empty_trash(profile: &str) -> Result<()> {
 async fn snooze_session(profile: &str, args: SnoozeArgs) -> Result<()> {
     let config = crate::session::config::profile_config::resolve_config(profile)?;
 
-    // `--minutes` overrides the profile default; otherwise use the
-    // configured `snooze_duration_minutes`. Validate either way so the
-    // on-disk config can't sneak in an out of range value.
     let raw_minutes = args
         .minutes
         .map(|m| m as u64)
@@ -805,39 +751,22 @@ async fn unsnooze_session(profile: &str, args: SessionIdArgs) -> Result<()> {
 async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
 
-    // Phase 1 (unlocked): snapshot the target by identifier, rehydrate
-    // `source_profile` so config resolution honors the right profile.
-    // `source_profile` is runtime-only (skip_serializing) so storage-loaded
-    // instances always come back blank.
     let (instances, _groups) = storage.load_with_groups()?;
     let inst = super::resolve_session(&args.identifier, &instances)?;
     bail_if_acp(inst, "start")?;
     let mut working = inst.clone();
     working.source_profile = profile.to_string();
 
-    // Snapshot the sid for the same reason `restart_session` does: a persisted
-    // `ResumeIntent::Cleared` (from `aoe session set-session-id <id> ""`) makes
-    // `acquire_session_id` drop it on this launch, but the abandoned rollout
-    // lingers and stays newest-by-mtime, so the fresh poller's immediate first
-    // poll can re-observe it and the drain below would silently revert the
-    // user's clear.
     let prior_sid = working.agent_session_id.clone();
 
-    // Launch orchestration owns its lifecycle locks and deliberately releases
-    // them while user hooks run.
     let _ = working.start_with_size_opts(crate::terminal::get_size(), false)?;
 
-    // Cleared on this launch, so the sid we came in with is abandoned.
     if working.agent_session_id.is_none() {
         if let Some(sid) = prior_sid {
             working.retroactive_capture_excludes.insert(sid);
         }
     }
 
-    // The CLI has no long-lived loop to drain the just-started session-id
-    // poller, so a capture-deferred agent would exit with agent_session_id unset
-    // and silently lose resume. Wait briefly for the poller and persist via the
-    // same drain the TUI/daemon use.
     let file_watch = crate::file_watch::FileWatchService::noop();
     crate::session::sync::capture_launched_session_id_blocking(
         &mut working,
@@ -849,8 +778,6 @@ async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let title = working.title.clone();
     let id = working.id.clone();
 
-    // Reacquire only for the final merge. The generation-aware merge rejects
-    // this working snapshot if a peer completed a newer lifecycle operation.
     let _merge_lock = storage
         .acquire_instance_lifecycle_lock(&id)
         .context("failed to acquire instance start merge lock")?;
@@ -878,11 +805,6 @@ async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     Ok(())
 }
 
-/// Acp-mode sessions are not backed by tmux; their ACP worker is owned
-/// by `aoe serve`'s supervisor (auto-spawned by the reconciler within ~2s
-/// of the session appearing on disk). Calling `start`/`stop`/`restart`
-/// from the CLI silently no-ops, which previously misled users into
-/// thinking the session was up. Bail loudly with the actual remediation.
 fn bail_if_acp(inst: &crate::session::Instance, verb: &str) -> Result<()> {
     if inst.is_structured() {
         bail!(
@@ -896,10 +818,6 @@ fn bail_if_acp(inst: &crate::session::Instance, verb: &str) -> Result<()> {
     Ok(())
 }
 
-/// Resolve the scan roots for `aoe session import`. Empty input means the
-/// current directory. Each root is canonicalized (falling back to the path as
-/// given if it does not resolve) so the component-aware filter compares against
-/// absolute paths.
 fn resolve_import_roots(paths: &[String]) -> Result<Vec<std::path::PathBuf>> {
     let raw: Vec<std::path::PathBuf> = if paths.is_empty() {
         vec![std::env::current_dir()?]
@@ -912,9 +830,6 @@ fn resolve_import_roots(paths: &[String]) -> Result<Vec<std::path::PathBuf>> {
         .collect())
 }
 
-/// True when `id` is already imported by some instance, so a re-run does not
-/// create duplicates. Checks the terminal resume target, the poller-observed
-/// id, and the structured-view id.
 fn already_imported(instances: &[Instance], id: &str) -> bool {
     instances.iter().any(|inst| {
         if inst.agent_session_id.as_deref() == Some(id) {
@@ -930,10 +845,6 @@ fn already_imported(instances: &[Instance], id: &str) -> bool {
     })
 }
 
-/// Build the AoE `Instance` for one discovered Claude session. Terminal imports
-/// pin `resume_intent` so the first launch emits `claude --resume <id>`;
-/// structured imports (serve only) seed the fields the reconciler reads to
-/// replay the transcript.
 fn build_import_instance(
     s: &crate::session::claude_import::ClaudeSessionSummary,
     structured: bool,
@@ -971,20 +882,15 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
 
     let structured = args.structured;
 
-    // Discover, then narrow to the requested paths unless --all.
     let mut discovered = scan_sessions();
     if !args.all {
         let roots = resolve_import_roots(&args.paths)?;
         discovered = sessions_under_paths(discovered, &roots);
     }
 
-    // A session whose recorded cwd no longer exists cannot be resumed:
-    // `claude --resume` resolves the transcript by cwd, so a dead cwd would
-    // silently start a fresh conversation. Skip and report those.
     let (candidates, missing_cwd): (Vec<_>, Vec<_>) =
         discovered.into_iter().partition(|s| s.cwd_exists);
 
-    // Dedupe against sessions already imported into this profile.
     let (existing, _groups) = Storage::open_unwatched(profile)?.load_with_groups()?;
     let candidate_count = candidates.len();
     let mut to_import: Vec<_> = candidates
@@ -993,7 +899,6 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
         .collect();
     let already = candidate_count - to_import.len();
 
-    // Bulk safety backstop; the picker cap also applies to the CLI.
     let capped = to_import.len() > MAX_SESSIONS;
     if capped {
         to_import.truncate(MAX_SESSIONS);
@@ -1054,7 +959,6 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
     let created_ids = storage.update(|all_instances, groups| {
         let mut ids = Vec::new();
         for s in &to_import {
-            // Re-check under the lock so a concurrent import does not duplicate.
             if already_imported(all_instances, &s.session_id) {
                 continue;
             }
@@ -1091,9 +995,6 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
     Ok(())
 }
 
-/// Start freshly imported terminal sessions, spawning each tmux pane. Mirrors
-/// `start_session`'s three-phase pattern; failures are reported per session and
-/// do not abort the rest.
 fn launch_imported(profile: &str, ids: &[String]) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
     let file_watch = crate::file_watch::FileWatchService::noop();
@@ -1104,8 +1005,6 @@ fn launch_imported(profile: &str, ids: &[String]) -> Result<()> {
         };
         let mut working = inst.clone();
         working.source_profile = profile.to_string();
-        // See `start_session`: a cleared sid whose rollout is still newest on
-        // disk would be re-adopted by the drain below.
         let prior_sid = working.agent_session_id.clone();
         if let Err(e) = working.start_with_size(crate::terminal::get_size()) {
             eprintln!("Warning: failed to start {}: {e}", working.title);
@@ -1116,7 +1015,6 @@ fn launch_imported(profile: &str, ids: &[String]) -> Result<()> {
                 working.retroactive_capture_excludes.insert(sid);
             }
         }
-        // Persist the poller-observed id before exit (see start_session).
         crate::session::sync::capture_launched_session_id_blocking(
             &mut working,
             &file_watch,
@@ -1135,17 +1033,9 @@ fn launch_imported(profile: &str, ids: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// CLI handler for `aoe session stop`.
-///
-/// Treats a docker inspect failure ([`crate::containers::Probe::Unknown`])
-/// as "possibly running" so the session stop proceeds rather than printing
-/// "Session is not running" against a container whose state cannot be
-/// confirmed. The `warn!` for the Unknown case is emitted inside
-/// [`crate::session::Instance::stop`], so this call site does not re-warn.
 async fn stop_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
 
-    // Resolve the identifier before the lifecycle-locked shutdown.
     let (instances, _groups) = storage.load_with_groups()?;
     let inst = super::resolve_session(&args.identifier, &instances)?;
     bail_if_acp(inst, "stop")?;
@@ -1168,9 +1058,6 @@ async fn stop_session(profile: &str, args: SessionIdArgs) -> Result<()> {
 
     working.stop()?;
 
-    // `Instance::stop` persisted Stopped while still holding the lifecycle
-    // lock. Only verify that a peer did not remove the row; writing status here
-    // would race a restart that linearized after the stop.
     let landed = storage.load()?.iter().any(|stored| stored.id == session_id);
     if !landed {
         bail!(
@@ -1201,9 +1088,6 @@ async fn restart_session_dispatch(profile: &str, args: RestartArgs) -> Result<()
 async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
 
-    // Phase 1 (unlocked): snapshot the targets. We don't hold the flock
-    // across the parallel restart fan-out below; phase 3 re-loads under
-    // the lock and merges by id.
     let (instances, _groups) = storage.load_with_groups()?;
     let target_ids = pick_targets_for_restart_all(&instances);
     if target_ids.is_empty() {
@@ -1215,11 +1099,6 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
     let size = crate::terminal::get_size();
     let parallel = parallel.max(1);
 
-    // Clone each target into its worker. `source_profile` is runtime-only
-    // (skip_serializing) so storage-loaded instances always come back
-    // blank; rehydrate it from the storage profile so start-time config
-    // resolution honors the right profile's overrides (sandbox.environment,
-    // on_launch hooks, etc.).
     let mut targets: Vec<crate::session::Instance> = Vec::with_capacity(total);
     for id in &target_ids {
         if let Some(inst) = instances.iter().find(|i| &i.id == id) {
@@ -1236,7 +1115,6 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
         Result<StartOutcome>,
     )> = tokio::task::JoinSet::new();
 
-    // Phase 2 (unlocked): parallel tmux restarts.
     for mut inst in targets {
         let permit_sem = semaphore.clone();
         join_set.spawn(async move {
@@ -1248,10 +1126,6 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
             let res = tokio::task::spawn_blocking(move || {
                 let prior_sid = inst.agent_session_id.clone();
                 let result = inst.restart_with_size(size);
-                // Drain the fresh poller so a fresh-relaunched capture-deferred
-                // agent persists its new agent_session_id. No-op for Resumed /
-                // ResumeFailed. In spawn_blocking: off the runtime, parallel,
-                // bounded by the semaphore.
                 if result.is_ok() {
                     if matches!(
                         result,
@@ -1307,11 +1181,6 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
         }
     }
 
-    // Phase 3 (locked, fast): merge each restarted instance by id into the
-    // freshly-loaded persisted state. Concurrent mutations to OTHER
-    // sessions during phase 2 (status updates from a parallel daemon
-    // poller, sibling CLI invocations, ...) are preserved because the
-    // closure receives the latest disk state.
     let orphaned: Vec<(String, String)> = storage.update(|instances, _groups| {
         let mut orphaned = Vec::new();
         for restarted_inst in restarted {
@@ -1329,7 +1198,6 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
         Ok(orphaned)
     })?;
 
-    // Sessions can share a title across paths; orphan filter keys on id.
     let orphaned_ids: HashSet<&String> = orphaned.iter().map(|(id, _)| id).collect();
     succeeded.retain(|(id, _)| !orphaned_ids.contains(id));
 
@@ -1366,13 +1234,6 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
     Ok(())
 }
 
-/// Sessions in `Deleting` or `Creating` are mid-transition; restarting them
-/// would race the deletion/boot path. Acp-mode sessions are skipped
-/// because their lifecycle is owned by `aoe serve`'s supervisor, not
-/// tmux: a CLI-side restart would no-op silently and (with the explicit
-/// bail in `restart_session`) flood `--all` with per-session errors.
-/// Everything else is fair game; agents have their own resume-or-restart
-/// logic on the next start.
 fn pick_targets_for_restart_all(instances: &[crate::session::Instance]) -> Vec<String> {
     use crate::session::Status;
     instances
@@ -1386,21 +1247,14 @@ fn pick_targets_for_restart_all(instances: &[crate::session::Instance]) -> Vec<S
 async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
 
-    // Phase 1 (unlocked): snapshot the target by identifier and
-    // rehydrate `source_profile` for config resolution.
     let (instances, _groups) = storage.load_with_groups()?;
     let inst = super::resolve_session(&args.identifier, &instances)?;
     bail_if_acp(inst, "restart")?;
     let mut working = inst.clone();
     working.source_profile = profile.to_string();
 
-    // Snapshot the sid before `restart_with_size` clears it on a forced-fresh
-    // path: the abandoned rollout lingers and stays newest-by-mtime, so the
-    // fresh poller can re-observe it. Excluded below so the drain rejects it.
     let prior_sid = working.agent_session_id.clone();
 
-    // Restart orchestration owns its lifecycle locks and releases them while
-    // user hooks run, so recursive same-id commands cannot deadlock.
     let outcome = working.restart_with_resume_policy(
         crate::terminal::get_size(),
         false,
@@ -1410,20 +1264,12 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let session_id = working.id.clone();
     let tool = working.tool.clone();
 
-    // Resolve the configured wake message (global default with per-profile
-    // override). Empty string is the documented opt-out: the restart still
-    // runs but no keys are sent.
     let wake_msg = crate::session::resolve_config(profile)
         .map(|c| c.session.restart_wake_message.clone())
         .unwrap_or_else(|_| "wake up: pick up what you were doing".to_string());
 
     let mut wake_succeeded = false;
     if !wake_msg.is_empty() && !matches!(outcome, StartOutcome::ResumeFailed { .. }) {
-        // Restart re-execs the agent at a blank prompt; nudge it back into
-        // its prior task. Wait for a real readiness signal when one is
-        // known for this agent, falling back to steady-state pane output
-        // otherwise, so the keys land as soon as the agent is at a prompt
-        // and don't get stranded mid-banner on slow machines.
         let tmux_session = crate::tmux::Session::new(&session_id, &title)?;
         tmux_session.wait_until_ready(
             std::time::Duration::from_secs(5),
@@ -1443,10 +1289,6 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         }
     }
 
-    // Restart starts a fresh session-id poller; a capture-deferred agent that
-    // relaunches fresh mints a new agent_session_id no CLI loop would drain.
-    // Same drain as `session start`; no-op for Resumed (sid kept) and
-    // ResumeFailed (poller cleared). After the wake wait, so it is usually ready.
     if matches!(
         outcome,
         StartOutcome::Fresh | StartOutcome::FreshAfterFailedResume { .. }
@@ -1463,8 +1305,6 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         true,
     );
 
-    // Reacquire only for the final generation-aware merge. A newer peer
-    // lifecycle wins instead of being overwritten by this snapshot.
     let _merge_lock = storage
         .acquire_instance_lifecycle_lock(&session_id)
         .context("failed to acquire instance restart merge lock")?;
@@ -1545,7 +1385,6 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
     let mut inst = if let Some(id) = &args.identifier {
         super::resolve_session(id, &instances)?.clone()
     } else {
-        // Auto-detect from tmux
         let current_session = std::env::var("TMUX_PANE")
             .ok()
             .and_then(|_| crate::tmux::get_current_session_name());
@@ -1564,13 +1403,8 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
     };
     inst.source_profile = storage.profile().to_string();
 
-    // Resolving the profile config installs the declarative status-rule
-    // registry for this profile; the status detection below never loads config
-    // itself, so a rules-having custom agent would otherwise report Idle.
     crate::session::config::profile_config::resolve_config_or_warn(profile);
 
-    // Refresh status from tmux so the output reflects current state
-    // rather than the stale persisted value.
     crate::tmux::refresh_session_cache();
     inst.update_status_once(None, None);
     let contended = crate::session::Instance::contended_capture_cwds(&instances);
@@ -1586,9 +1420,6 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
         println!("  Tool:    {}", inst.tool);
         println!("  Command: {}", inst.command);
         println!("  Status:  {:?}", inst.status);
-        // Only for a session that is not live: an archived or trashed row is
-        // otherwise indistinguishable here from a stopped one, and `status`
-        // cannot carry it (a session can be archived and running at once).
         if let Some(at) = inst.trashed_at.or(inst.archived_at) {
             println!(
                 "  State:   {} ({})",
@@ -1605,8 +1436,6 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
     Ok(())
 }
 
-/// `session show` lines naming `inst`'s parent and children (`aoe add -P`),
-/// by title when the related session is in `instances`.
 fn relationship_lines(
     inst: &crate::session::Instance,
     instances: &[crate::session::Instance],
@@ -1652,9 +1481,6 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
         }
     };
 
-    // Resolving the profile config installs the declarative status-rule
-    // registry for this profile; the status detection below never loads config
-    // itself, so a rules-having custom agent would otherwise report Idle.
     crate::session::config::profile_config::resolve_config_or_warn(profile);
 
     let tmux_session = crate::tmux::Session::new(&inst.id, &inst.title)?;
@@ -1663,9 +1489,6 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
         (String::new(), "stopped".to_string())
     } else {
         let raw = tmux_session.capture_pane(args.lines)?;
-        // The poller's two detection identities, resolved the same way: the
-        // manifest follows the `agent_detect_as` alias, while configured rules
-        // stay keyed to the session's own tool.
         let hook_alias =
             crate::tmux::status_rules::effective_detect_as(profile, &inst.tool, &inst.detect_as);
         let manifest_tool: &str = if hook_alias.is_empty() {
@@ -1681,9 +1504,6 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
                 age: crate::hooks::read_hook_status_age(&inst.id),
             }
         });
-        // The same rule table the poller runs, so `aoe session capture`
-        // reports what the dashboard would. A short `--lines` still detects
-        // against the window the rules expect.
         let status = if crate::tmux::detect::has_manifest(manifest_tool) {
             let status_raw;
             let status_content = if args.lines >= 50 {
@@ -1694,9 +1514,6 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
                     .unwrap_or_else(|_| raw.clone());
                 status_raw.as_str()
             };
-            // The pane title is a rule region like any other (Claude ranks it
-            // above every screen shape), so it has to be read here too; the
-            // poller gets it batched with the rest of the pane metadata.
             let osc_title = crate::tmux::utils::pane_title(tmux_session.name()).unwrap_or_default();
             crate::tmux::detect_with_rules(
                 profile,
@@ -1709,8 +1526,6 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
             .and_then(|d| d.status)
             .unwrap_or_default()
         } else {
-            // Configured rules outrank the hook file here as they do in the
-            // poller; `detect_status` runs them ahead of the built-in detector.
             let hook = hook.filter(|_| !crate::tmux::status_rules::has_rules(profile, &rules_tool));
             match hook {
                 Some(hook) => hook.status,
@@ -1763,9 +1578,6 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
 
     let storage = Storage::open_unwatched(profile)?;
 
-    // Phase 1 (unlocked): resolve the target id (auto-detect from tmux if
-    // no identifier given) and the old/new title pair so we can do the
-    // tmux rename outside the storage flock.
     let (instances, _groups) = storage.load_with_groups()?;
     let inst = if let Some(id) = &args.identifier {
         super::resolve_session(id, &instances)?.clone()
@@ -1791,10 +1603,6 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
     let title_requested = args.title.is_some();
     let session_lock_required = title_requested || args.rename_branch || args.branch.is_some();
 
-    // The initial load only resolves the requested row. Serialize every
-    // identity-changing rename from the fresh duplicate check through external
-    // effects and the durable commit. Existing-session mutations nest the
-    // per-session title and source lifecycle guards beneath the identity lock.
     let _identity_lock = acquire_session_identity_lock()?;
     let _session_title_lock = if session_lock_required {
         Some(
@@ -1818,11 +1626,6 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         .iter()
         .find(|instance| instance.id == id)
         .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
-    // Heal a `project_path` left stale by an external `git worktree move`
-    // before the duplicate-identity check and the container gate below derive
-    // anything from it. The tied branch of this command moves the worktree, so
-    // it needs the same repair as the standalone workdir edit; this is a fresh
-    // process per invocation, so no startup sweep has run for it (#2002).
     let mut inst = inst.clone();
     if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist(
         &storage,
@@ -1841,9 +1644,6 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
     let new_group = args.group.as_ref().map(|g| g.trim().to_string());
     let title_changed = old_title != effective_title;
 
-    // Tied mode (#1927): renaming an aoe-managed worktree session also moves
-    // its directory leaf to match the title (and optionally the branch), so
-    // the two cannot drift. Decided per-session from the resolved setting.
     let config = crate::session::config::profile_config::resolve_config_or_warn(profile);
     let tied = inst.tie_workdir_applies(config.session.tie_workdir_to_name);
     let tied_edit = args.branch.is_none() && tied && (args.title.is_some() || args.rename_branch);
@@ -1932,14 +1732,6 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         );
         let is_sandboxed = inst.is_sandboxed();
         if moves_worktree || renames_branch {
-            // Persisted status can lag the live tmux pane; recompute only when
-            // the request will mutate the checkout. A cwd/branch-stable title
-            // no-op must remain valid for an active session.
-            //
-            // Deliberately the holding entry point rather than
-            // `update_status_once`: a held proposal leaves the row on Running,
-            // so an ambiguous frame refuses the edit instead of moving a
-            // worktree out from under a live agent.
             let mut live = inst.clone();
             live.source_profile = profile.to_string();
             crate::tmux::refresh_session_cache();
@@ -1963,10 +1755,6 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
             },
         ) {
             Ok(outcome) => {
-                // The dir moved (path changed): a sandbox container created
-                // against the old path is now stale, so drop it to force a
-                // fresh create on next start. A branch-only edit leaves the
-                // path (and the mount) unchanged.
                 if outcome.new_path != std::path::Path::new(&current_path) {
                     crate::session::worktree_edit::discard_sandbox_container_after_move(
                         &id,
@@ -1976,8 +1764,6 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
                 new_path = Some(outcome.new_path.to_string_lossy().to_string());
                 new_branch = outcome.new_branch;
             }
-            // The title slug maps to the current leaf and no branch rename was
-            // requested: nothing to move, fall through to a plain title rename.
             Err(crate::session::worktree_edit::WorktreeEditError::Unchanged) => {}
             Err(e) => return Err(e.into()),
         }
@@ -1985,11 +1771,6 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         bail!("--rename-branch only applies to a tied aoe-managed worktree session (session.tie_workdir_to_name)");
     }
 
-    // Persist before rekeying the live tmux session. Re-resolve by id under
-    // the profile lock so concurrent mutations to other sessions are
-    // preserved. `create_group` is idempotent and only runs when the closure
-    // actually mutated `group_path`, so `groups.json` is rewritten only on
-    // real group changes (cf. `update`'s diff check).
     let persist = storage.update(|instances, groups| {
         let inst = instances
             .iter_mut()
@@ -2049,16 +1830,12 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
                     }
                 }
             }
-            // When the git move already landed, surface that the disk and
-            // metadata are out of sync rather than a bare persist error.
             if let Some(path) = &new_path {
                 bail!("Worktree was moved on disk to {path}, but persisting the new session metadata failed: {error}. Re-run to retry.");
             }
             return Err(error);
         }
     };
-    // Storage::update durably commits the identity and publishes its file-watch
-    // notification. Rekey needs only the per-session title/lifecycle guards.
     drop(_identity_lock);
 
     let committed_title_changed = title_requested && persisted_old_title != committed_title;
@@ -2101,6 +1878,21 @@ mod rename_tests {
     use super::{rename_session, rename_success_message, RenameArgs};
     use crate::session::{Instance, Status, Storage};
     use serial_test::serial;
+
+    fn args(
+        id: &str,
+        title: Option<&str>,
+        group: Option<&str>,
+        branch: Option<&str>,
+    ) -> RenameArgs {
+        RenameArgs {
+            identifier: Some(id.to_string()),
+            title: title.map(str::to_owned),
+            group: group.map(str::to_owned),
+            rename_branch: false,
+            branch: branch.map(str::to_owned),
+        }
+    }
 
     #[tokio::test]
     #[serial]
@@ -2182,13 +1974,7 @@ mod rename_tests {
         let before = serde_json::to_value(storage.load().unwrap()).unwrap();
         let shared = rename_session(
             "branch-only",
-            RenameArgs {
-                identifier: Some(id.clone()),
-                title: Some("Must not apply".into()),
-                group: None,
-                rename_branch: false,
-                branch: Some("blocked-shared".into()),
-            },
+            args(&id, Some("Must not apply"), None, Some("blocked-shared")),
         )
         .await
         .unwrap_err();
@@ -2215,18 +2001,9 @@ mod rename_tests {
             &["worktree", "remove", "--force", external.to_str().unwrap()],
         );
         for branch in ["olof/bemlo-123-task", "olof/bemlo-123-task"] {
-            rename_session(
-                "branch-only",
-                RenameArgs {
-                    identifier: Some(id.clone()),
-                    title: Some(branch.into()),
-                    group: None,
-                    rename_branch: false,
-                    branch: Some(branch.into()),
-                },
-            )
-            .await
-            .unwrap();
+            rename_session("branch-only", args(&id, Some(branch), None, Some(branch)))
+                .await
+                .unwrap();
         }
         let target = storage.load().unwrap().pop().unwrap();
         assert_eq!(target.project_path, worktree.to_str().unwrap());
@@ -2244,13 +2021,7 @@ mod rename_tests {
         for branch in ["bad name", "-option", "bad..name", "refs/heads/"] {
             assert!(rename_session(
                 "branch-only",
-                RenameArgs {
-                    identifier: Some(id.clone()),
-                    title: Some("Must not apply".into()),
-                    group: None,
-                    rename_branch: false,
-                    branch: Some(branch.into()),
-                },
+                args(&id, Some("Must not apply"), None, Some(branch)),
             )
             .await
             .is_err());
@@ -2293,13 +2064,7 @@ mod rename_tests {
         }
         let protected = rename_session(
             "branch-only",
-            RenameArgs {
-                identifier: Some(id.clone()),
-                title: None,
-                group: None,
-                rename_branch: false,
-                branch: Some("blocked-default".into()),
-            },
+            args(&id, None, None, Some("blocked-default")),
         )
         .await
         .unwrap_err();
@@ -2323,13 +2088,7 @@ mod rename_tests {
                 .unwrap();
             let shared = rename_session(
                 "branch-only",
-                RenameArgs {
-                    identifier: Some(id.clone()),
-                    title: Some("Must not apply".into()),
-                    group: None,
-                    rename_branch: false,
-                    branch: Some("would-change-peer".into()),
-                },
+                args(&id, Some("Must not apply"), None, Some("would-change-peer")),
             )
             .await
             .unwrap_err();
@@ -2348,13 +2107,7 @@ mod rename_tests {
             .unwrap();
         let error = rename_session(
             "branch-only",
-            RenameArgs {
-                identifier: Some(id),
-                title: Some("collision".into()),
-                group: None,
-                rename_branch: false,
-                branch: Some("main".into()),
-            },
+            args(&id, Some("collision"), None, Some("main")),
         )
         .await
         .unwrap_err();
@@ -2404,11 +2157,6 @@ mod rename_tests {
         );
     }
 
-    // Three duplicate-identity behaviors kept in one test on purpose: they
-    // share the costly setup that forces `#[serial]` (an isolated app dir plus
-    // a process-global `tie_workdir_to_name` config flip), so splitting them
-    // into three serial tests would triple that setup and the critical-path
-    // serial time for no added coverage. Each behavior asserts independently.
     #[tokio::test]
     #[serial]
     async fn rename_rejects_duplicate_pair_but_allows_group_only_change() {
@@ -2426,13 +2174,7 @@ mod rename_tests {
 
         let error = rename_session(
             "rename-duplicate",
-            RenameArgs {
-                identifier: Some(target_id.clone()),
-                title: Some("main branch".to_string()),
-                group: None,
-                rename_branch: false,
-                branch: None,
-            },
+            args(&target_id, Some("main branch"), None, None),
         )
         .await
         .unwrap_err();
@@ -2442,13 +2184,7 @@ mod rename_tests {
 
         rename_session(
             "rename-duplicate",
-            RenameArgs {
-                identifier: Some(target_id.clone()),
-                title: None,
-                group: Some("work".to_string()),
-                rename_branch: false,
-                branch: None,
-            },
+            args(&target_id, None, Some("work"), None),
         )
         .await
         .unwrap();
@@ -2460,9 +2196,6 @@ mod rename_tests {
             .unwrap();
         assert_eq!(target.title, "throwaway");
         assert_eq!(target.group_path, "work");
-        // In tied mode the duplicate identity uses the derived destination
-        // path, not the row's current worktree path. The collision must reject
-        // before any git side effect is attempted.
         let _tie_guard = crate::session::test_support::TieWorkdirToNameGuard::set(true);
         let existing = Instance::new("main branch", "/tmp/worktrees/main-branch");
         let mut tied = Instance::new("main branch", "/tmp/worktrees/drifted");
@@ -2483,13 +2216,7 @@ mod rename_tests {
 
         let error = rename_session(
             "rename-duplicate",
-            RenameArgs {
-                identifier: Some(tied_id.clone()),
-                title: Some("main branch".to_string()),
-                group: None,
-                rename_branch: false,
-                branch: None,
-            },
+            args(&tied_id, Some("main branch"), None, None),
         )
         .await
         .unwrap_err();
@@ -2505,10 +2232,6 @@ mod rename_tests {
         assert_eq!(tied.title, "main branch");
         assert_eq!(tied.project_path, "/tmp/worktrees/drifted");
 
-        // An explicit unchanged title still enters tied mode so a drifted
-        // directory can be repaired. When the directory and branch are already
-        // stable, however, it is a true no-op and must remain valid even if the
-        // persisted session is active.
         let mut active = Instance::new("Main Branch", "/tmp/worktrees/main-branch");
         active.status = Status::Running;
         active.worktree_info = Some(crate::session::WorktreeInfo {
@@ -2528,13 +2251,7 @@ mod rename_tests {
 
         rename_session(
             "rename-duplicate",
-            RenameArgs {
-                identifier: Some(active_id.clone()),
-                title: Some("Main Branch".to_string()),
-                group: None,
-                rename_branch: false,
-                branch: None,
-            },
+            args(&active_id, Some("Main Branch"), None, None),
         )
         .await
         .expect("active cwd-stable title no-op must succeed");
@@ -2548,9 +2265,6 @@ mod rename_tests {
         assert_eq!(active.project_path, "/tmp/worktrees/main-branch");
     }
 
-    /// #3739: the live-status gate must consult the command's profile rules;
-    /// storage-loaded rows carry no `source_profile`, so without it a
-    /// profile-local rule is skipped and a running agent reads as Idle.
     #[tokio::test]
     #[serial]
     async fn worktree_edit_consults_profile_status_rules() {
@@ -2562,8 +2276,6 @@ mod rename_tests {
         const AGENT: &str = "worktree-edit-rules-agent";
         let _guard = crate::session::test_support::isolate_app_dir();
         let _tie_guard = crate::session::test_support::TieWorkdirToNameGuard::set(false);
-        // Otherwise an empty `source_profile` resolves to the only profile,
-        // which is this one, and the rule matches anyway.
         crate::session::config::update_config(|config| {
             config.default_profile = "main".to_string();
         })
@@ -2692,11 +2404,6 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
         .iter()
         .find(|instance| instance.id == id)
         .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
-    // The recorded path can be stale: someone may have `git worktree move`d the
-    // directory outside aoe. Heal it from git before anything below derives a
-    // target path or a container gate from it, so those decisions are made
-    // against the live parent. Best-effort; a lookup failure just leaves the
-    // stale path, which `edit_worktree_workdir` then rejects as before (#2002).
     let mut inst = inst.clone();
     if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist(
         &storage,
@@ -2709,8 +2416,6 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
     let Some(worktree_info) = inst.worktree_info.clone() else {
         bail!("Session does not use a worktree");
     };
-    // When tied (#1927) the directory follows the title, so reject the
-    // standalone edit and point at the unified rename instead.
     if inst.tie_workdir_applies(
         crate::session::config::profile_config::resolve_config_or_warn(profile)
             .session
@@ -2735,20 +2440,10 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
     {
         return Err(duplicate_session_error(&inst.title));
     }
-    // Persisted status can lag the real tmux pane, and moving the worktree of
-    // a still-running session is unsafe. Recompute from live tmux state before
-    // enforcing the guard. The holding entry point, for the reason
-    // `rename_session` gives: an ambiguous frame must refuse the move.
     let mut live = inst.clone();
     live.source_profile = profile.to_string();
     crate::tmux::refresh_session_cache();
     live.update_status_with_metadata(None, None);
-    // A sandbox container keeps the worktree dir mounted even while the agent
-    // is Idle, so the move would fail. The gate drops a merely-stopped
-    // container to free the mount and only reports held for a live one, which
-    // the user has to stop, same as the active-status case. Gated on the
-    // directory actually moving so a no-op or branch-only edit does not discard
-    // a container for a move that never happens.
     let moves_worktree = crate::session::worktree_edit::worktree_move_required(
         std::path::Path::new(&current_path),
         args.name.trim(),
@@ -2771,9 +2466,6 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
             rename_branch: args.rename_branch,
         },
     )?;
-    // The dir moved (path changed): a sandbox container created against the old
-    // path is now stale, so drop it to force a fresh create on next start. A
-    // branch-only edit leaves the path (and the mount) unchanged.
     if outcome.new_path != std::path::Path::new(&current_path) {
         crate::session::worktree_edit::discard_sandbox_container_after_move(
             &id,
@@ -2812,14 +2504,12 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
 }
 
 async fn current_session(args: CurrentArgs) -> Result<()> {
-    // Auto-detect profile and session from tmux
     let current_session = std::env::var("TMUX_PANE")
         .ok()
         .and_then(|_| crate::tmux::get_current_session_name());
 
     let session_name = current_session.ok_or_else(|| anyhow::anyhow!("Not in a tmux session"))?;
 
-    // Search all profiles for this session
     let profiles = crate::session::list_profiles()?;
 
     for profile_name in &profiles {
@@ -2921,16 +2611,6 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
     Ok(())
 }
 
-/// `aoe session add-project <session> <path|name>`. See #3103.
-///
-/// Attaching converts the session into a multi-repo workspace, so unless it
-/// already is one its working directory moves. That means stopping it, doing the
-/// conversion, and starting it again, which is what
-/// `attach_project::quiesce_for_conversion` / `resume_after_conversion` do for
-/// every blocking surface. A live structured worker is signalled through the
-/// same restart marker `aoe acp restart` uses, because the supervisor lives in
-/// `aoe serve`; the marker is written after the persist so the daemon cannot
-/// respawn the worker into the directory the conversion is moving.
 async fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
     let instances = storage.load()?;
@@ -2939,12 +2619,6 @@ async fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
     let title = inst.title.clone();
     let is_sandboxed = inst.is_sandboxed();
 
-    // Attaching restarts the agent, so a turn in flight would lose its reply (or,
-    // in `Waiting`, a pending approval). The daemon refuses this on the
-    // event-log probe; the CLI has no handle on that store, so it uses the status
-    // set `blocks_worktree_edit` encodes for exactly this class of operation. The
-    // unambiguous states (Creating, Deleting, trashed, archived) are refused in
-    // `attach_project::plan`, shared with every other surface.
     if inst.status.blocks_worktree_edit() {
         bail!(
             "'{title}' has a turn in flight and attaching restarts the agent. Wait for it to \
@@ -2952,8 +2626,6 @@ async fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
         );
     }
 
-    // A path-shaped argument is used as-is; a bare name is a registry lookup,
-    // matching how `aoe add --projects` resolves its extras.
     let repo_path = if std::path::Path::new(&args.project).exists()
         || args.project.contains(std::path::MAIN_SEPARATOR)
     {
@@ -2973,8 +2645,6 @@ async fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
         crate::session::attach_project::ExistingBranch::Refuse
     };
 
-    // Validate before stopping anything: a refusal here must not cost the user a
-    // stopped session.
     let plan = crate::session::attach_project::plan(inst, profile, &repo_path, on_existing)?;
     let restarts = crate::session::attach_project::needs_restart(&plan, is_sandboxed);
     let quiesced = if restarts {
@@ -2987,8 +2657,6 @@ async fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
     let outcome = match crate::session::attach_project::attach_planned(&storage, &id, inst, plan) {
         Ok(outcome) => outcome,
         Err(e) => {
-            // The rollback already undid the filesystem half; bringing the
-            // session back is the only thing left that would otherwise persist.
             crate::session::attach_project::resume_after_conversion(&storage, &id, quiesced);
             return Err(e);
         }
@@ -3044,9 +2712,6 @@ async fn set_base(profile: &str, args: SetBaseArgs) -> Result<()> {
     let id = inst.id.clone();
     let title = inst.title.clone();
 
-    // Each repo in a workspace has its own base, so the target has to be
-    // named. Validating and writing against the first repo, as this used to,
-    // set a ref the other repos may not even have. See #3329.
     let target = resolve_base_target(inst, args.repo.as_deref())?;
 
     let new_value = if args.clear {
@@ -3076,10 +2741,6 @@ async fn set_base(profile: &str, args: SetBaseArgs) -> Result<()> {
             .find(|i| i.id == id)
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", args.identifier))?;
         match repo_name.as_deref() {
-            // The target was resolved from the copy loaded above, so a repo
-            // missing here means the session changed under us (the workspace
-            // was converted, the repo detached). Fail instead of dropping the
-            // write and printing success.
             Some(name) => {
                 let repo = stored
                     .workspace_info
@@ -3098,9 +2759,6 @@ async fn set_base(profile: &str, args: SetBaseArgs) -> Result<()> {
         Ok(())
     })?;
 
-    // Quoted here rather than in the format strings below: leaving the quotes
-    // out there and relying on the label to supply its own middle pair reads as
-    // unbalanced at a glance, even though it composes correctly.
     let label = match target.repo_name {
         Some(ref name) => format!("'{title}' / '{name}'"),
         None => format!("'{title}'"),
@@ -3112,18 +2770,12 @@ async fn set_base(profile: &str, args: SetBaseArgs) -> Result<()> {
     Ok(())
 }
 
-/// Which entry a `set-base` invocation writes, and the checkout its ref is
-/// validated against.
 #[derive(Debug)]
 struct BaseTarget {
-    /// Workspace repo name, or None for the session's own checkout.
     repo_name: Option<String>,
     validate_path: String,
 }
 
-/// Resolve `--repo` against a session. A workspace session must name one of
-/// its repos; a single-repo session must not name any, since the only entry
-/// it has is its own checkout.
 fn resolve_base_target(inst: &crate::session::Instance, repo: Option<&str>) -> Result<BaseTarget> {
     let names = || {
         inst.all_repos()
@@ -3222,21 +2874,28 @@ mod restart_args_tests {
     }
 
     #[test]
-    fn restart_with_identifier_still_parses() {
-        let cli = Cli::try_parse_from(["aoe", "restart", "claude-3"])
-            .expect("identifier-only must parse");
-        match cli.cmd {
-            SessionCommands::Restart(args) => {
-                assert!(!args.all);
-                assert_eq!(args.identifier.as_deref(), Some("claude-3"));
-                assert_eq!(args.parallel, 3);
-            }
-            _ => panic!("wrong subcommand"),
-        }
+    fn restart_parses_identifier_all_and_parallel() {
+        let restart = |argv: &[&str]| {
+            Cli::try_parse_from(argv).map(|cli| match cli.cmd {
+                SessionCommands::Restart(args) => (args.all, args.identifier, args.parallel),
+                _ => panic!("wrong subcommand"),
+            })
+        };
+        assert_eq!(
+            restart(&["aoe", "restart", "claude-3"]).unwrap(),
+            (false, Some("claude-3".to_string()), 3)
+        );
+        assert_eq!(
+            restart(&["aoe", "restart", "--all"]).unwrap(),
+            (true, None, 3)
+        );
+        assert_eq!(
+            restart(&["aoe", "restart", "--all", "--parallel", "5"]).unwrap(),
+            (true, None, 5)
+        );
+        assert!(restart(&["aoe", "restart", "claude-3", "--all"]).is_err());
     }
 
-    /// Refusing an existing branch is the default, because a same-named branch
-    /// in another repo can hold unrelated commits.
     #[test]
     fn add_project_parses_its_identifier_project_and_branch_opt_in() {
         let cases = [
@@ -3266,75 +2925,26 @@ mod restart_args_tests {
     }
 
     #[test]
-    fn restart_all_alone_parses() {
-        let cli = Cli::try_parse_from(["aoe", "restart", "--all"]).expect("--all alone must parse");
-        match cli.cmd {
-            SessionCommands::Restart(args) => {
-                assert!(args.all);
-                assert!(args.identifier.is_none());
-                assert_eq!(args.parallel, 3);
-            }
-            _ => panic!("wrong subcommand"),
-        }
-    }
-
-    #[test]
-    fn restart_all_with_parallel_parses() {
-        let cli = Cli::try_parse_from(["aoe", "restart", "--all", "--parallel", "5"])
-            .expect("--all --parallel must parse");
-        match cli.cmd {
-            SessionCommands::Restart(args) => {
-                assert!(args.all);
-                assert_eq!(args.parallel, 5);
-            }
-            _ => panic!("wrong subcommand"),
-        }
-    }
-
-    #[test]
-    fn restart_identifier_and_all_conflicts() {
-        let result = Cli::try_parse_from(["aoe", "restart", "claude-3", "--all"]);
-        assert!(
-            result.is_err(),
-            "passing both identifier and --all should error"
+    fn set_base_parses_branch_or_clear_but_not_both() {
+        let set_base = |argv: &[&str]| {
+            Cli::try_parse_from(argv).map(|cli| match cli.cmd {
+                SessionCommands::SetBase(args) => (args.identifier, args.branch, args.clear),
+                _ => panic!("wrong subcommand"),
+            })
+        };
+        assert_eq!(
+            set_base(&["aoe", "set-base", "claude-3", "upstream/main"]).unwrap(),
+            (
+                "claude-3".to_string(),
+                Some("upstream/main".to_string()),
+                false
+            )
         );
-    }
-
-    #[test]
-    fn set_base_with_branch_parses() {
-        let cli = Cli::try_parse_from(["aoe", "set-base", "claude-3", "upstream/main"])
-            .expect("set-base with branch must parse");
-        match cli.cmd {
-            SessionCommands::SetBase(args) => {
-                assert_eq!(args.identifier, "claude-3");
-                assert_eq!(args.branch.as_deref(), Some("upstream/main"));
-                assert!(!args.clear);
-            }
-            _ => panic!("wrong subcommand"),
-        }
-    }
-
-    #[test]
-    fn set_base_with_clear_parses() {
-        let cli = Cli::try_parse_from(["aoe", "set-base", "claude-3", "--clear"])
-            .expect("set-base --clear must parse");
-        match cli.cmd {
-            SessionCommands::SetBase(args) => {
-                assert_eq!(args.identifier, "claude-3");
-                assert!(args.branch.is_none());
-                assert!(args.clear);
-            }
-            _ => panic!("wrong subcommand"),
-        }
-    }
-
-    #[test]
-    fn set_base_branch_and_clear_conflicts() {
-        let result = Cli::try_parse_from(["aoe", "set-base", "claude-3", "main", "--clear"]);
-        assert!(
-            result.is_err(),
-            "passing both branch and --clear should error"
+        assert_eq!(
+            set_base(&["aoe", "set-base", "claude-3", "--clear"]).unwrap(),
+            ("claude-3".to_string(), None, true)
         );
+        assert!(set_base(&["aoe", "set-base", "claude-3", "main", "--clear"]).is_err());
     }
 }
 
@@ -3369,17 +2979,12 @@ mod set_base_target_tests {
     }
 
     #[test]
-    fn resolves_named_repo_and_validates_against_its_own_worktree() {
+    fn workspace_requires_a_known_repo_and_targets_its_own_worktree() {
         let inst = workspace_instance();
-        let t = resolve_base_target(&inst, Some("web")).expect("named repo resolves");
-        assert_eq!(t.repo_name.as_deref(), Some("web"));
-        // The bug this replaces validated every ref against repos[0].
-        assert_eq!(t.validate_path, "/ws/web");
-    }
+        let target = resolve_base_target(&inst, Some("web")).expect("named repo resolves");
+        assert_eq!(target.repo_name.as_deref(), Some("web"));
+        assert_eq!(target.validate_path, "/ws/web");
 
-    #[test]
-    fn rejects_unknown_repo_and_missing_repo_on_a_workspace() {
-        let inst = workspace_instance();
         let err = resolve_base_target(&inst, Some("nope"))
             .unwrap_err()
             .to_string();
@@ -3398,9 +3003,9 @@ mod set_base_target_tests {
     #[test]
     fn single_repo_session_targets_its_own_checkout() {
         let inst = Instance::new("solo", "/tmp/solo");
-        let t = resolve_base_target(&inst, None).expect("single repo resolves");
-        assert_eq!(t.repo_name, None);
-        assert_eq!(t.validate_path, "/tmp/solo");
+        let target = resolve_base_target(&inst, None).expect("single repo resolves");
+        assert_eq!(target.repo_name, None);
+        assert_eq!(target.validate_path, "/tmp/solo");
 
         let err = resolve_base_target(&inst, Some("api"))
             .unwrap_err()
@@ -3417,113 +3022,53 @@ mod target_filter_tests {
     use super::pick_targets_for_restart_all;
     use crate::session::{Instance, Status};
 
-    fn instance_with_status(id: &str, status: Status) -> Instance {
-        let mut inst = Instance::new(id, "/tmp");
-        inst.id = id.to_string();
-        inst.status = status;
-        inst
-    }
-
     #[test]
-    fn skips_deleting_and_creating() {
+    fn restart_all_skips_deleting_and_creating() {
+        let instance = |id: &str, status: Status| {
+            let mut inst = Instance::new(id, "/tmp");
+            inst.id = id.to_string();
+            inst.status = status;
+            inst
+        };
         let instances = vec![
-            instance_with_status("running", Status::Running),
-            instance_with_status("idle", Status::Idle),
-            instance_with_status("stopped", Status::Stopped),
-            instance_with_status("error", Status::Error),
-            instance_with_status("waiting", Status::Waiting),
-            instance_with_status("starting", Status::Starting),
-            instance_with_status("unknown", Status::Unknown),
-            instance_with_status("deleting", Status::Deleting),
-            instance_with_status("creating", Status::Creating),
+            instance("running", Status::Running),
+            instance("idle", Status::Idle),
+            instance("stopped", Status::Stopped),
+            instance("error", Status::Error),
+            instance("waiting", Status::Waiting),
+            instance("starting", Status::Starting),
+            instance("unknown", Status::Unknown),
+            instance("deleting", Status::Deleting),
+            instance("creating", Status::Creating),
         ];
         let mut picked = pick_targets_for_restart_all(&instances);
         picked.sort();
-        let mut expected = vec![
-            "error".to_string(),
-            "idle".to_string(),
-            "running".to_string(),
-            "starting".to_string(),
-            "stopped".to_string(),
-            "unknown".to_string(),
-            "waiting".to_string(),
-        ];
-        expected.sort();
-        assert_eq!(picked, expected);
-    }
-
-    #[test]
-    fn empty_input_yields_empty_targets() {
+        assert_eq!(
+            picked,
+            ["error", "idle", "running", "starting", "stopped", "unknown", "waiting"]
+        );
         assert!(pick_targets_for_restart_all(&[]).is_empty());
     }
 }
 
 #[cfg(test)]
-mod set_session_id_tests {
-    use super::{set_session_id, SetSessionIdArgs};
+mod session_mutation_tests {
+    use super::{set_color_session, set_session_id, SetColorArgs, SetSessionIdArgs};
     use crate::session::{Instance, ResumeIntent, Storage};
     use serial_test::serial;
     use tempfile::tempdir;
 
-    #[tokio::test]
-    #[serial]
-    async fn set_session_id_clears_resume_probe_failed_marker() {
-        let temp = tempdir().unwrap();
-        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+    const SID_A: &str = "11111111-1111-1111-1111-111111111111";
+    const SID_B: &str = "22222222-2222-2222-2222-222222222222";
 
-        let storage = Storage::new_unwatched("set-sid-clear-marker").unwrap();
-        let mut inst = Instance::new("marked_session", "/tmp/x");
-        inst.agent_session_id = Some("11111111-1111-1111-1111-111111111111".to_string());
-        inst.resume_probe_failed_sid = Some("11111111-1111-1111-1111-111111111111".to_string());
-        let id = inst.id.clone();
-        let on_disk = inst.clone();
-        storage
-            .update(|i, g| {
-                *i = vec![on_disk.clone()];
-                *g =
-                    crate::session::GroupTree::new_with_groups(std::slice::from_ref(&on_disk), &[])
-                        .get_all_groups();
-                Ok(())
-            })
-            .unwrap();
-
-        set_session_id(
-            "set-sid-clear-marker",
-            SetSessionIdArgs {
-                identifier: id.clone(),
-                session_id: "22222222-2222-2222-2222-222222222222".to_string(),
-            },
-        )
-        .await
-        .unwrap();
-
-        let loaded = storage.load().unwrap();
-        let inst_disk = loaded.iter().find(|i| i.id == id).unwrap();
-        assert_eq!(
-            inst_disk.resume_intent,
-            ResumeIntent::Use("22222222-2222-2222-2222-222222222222".to_string())
-        );
-        assert_eq!(inst_disk.resume_probe_failed_sid, None);
-    }
-}
-
-#[cfg(test)]
-mod set_color_tests {
-    use super::{set_color_session, SetColorArgs};
-    use crate::session::{Instance, Storage};
-    use serial_test::serial;
-    use tempfile::tempdir;
-
-    async fn seed(profile: &str) -> (Storage, String) {
+    fn seed(profile: &str, inst: Instance) -> (Storage, String) {
         let storage = Storage::new_unwatched(profile).unwrap();
-        let inst = Instance::new("color_session", "/tmp/x");
         let id = inst.id.clone();
-        let on_disk = inst.clone();
         storage
-            .update(|i, g| {
-                *i = vec![on_disk.clone()];
-                *g =
-                    crate::session::GroupTree::new_with_groups(std::slice::from_ref(&on_disk), &[])
+            .update(|rows, groups| {
+                *rows = vec![inst.clone()];
+                *groups =
+                    crate::session::GroupTree::new_with_groups(std::slice::from_ref(&inst), &[])
                         .get_all_groups();
                 Ok(())
             })
@@ -3531,99 +3076,40 @@ mod set_color_tests {
         (storage, id)
     }
 
+    fn stored(storage: &Storage, id: &str) -> Instance {
+        storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap()
+    }
+
     #[tokio::test]
     #[serial]
-    async fn set_color_persists_palette_value_and_clears() {
+    async fn set_session_id_replaces_intent_and_clears_the_resume_probe_marker() {
         let temp = tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
 
-        let (storage, id) = seed("set-color-ok").await;
+        let mut inst = Instance::new("marked_session", "/tmp/x");
+        inst.agent_session_id = Some(SID_A.to_string());
+        inst.resume_probe_failed_sid = Some(SID_A.to_string());
+        let (storage, id) = seed("set-sid-clear-marker", inst);
 
-        set_color_session(
-            "set-color-ok",
-            SetColorArgs {
+        set_session_id(
+            "set-sid-clear-marker",
+            SetSessionIdArgs {
                 identifier: id.clone(),
-                color: "Red".to_string(), // case-insensitive
+                session_id: SID_B.to_string(),
             },
         )
         .await
         .unwrap();
-        let loaded = storage.load().unwrap();
-        assert_eq!(
-            loaded.iter().find(|i| i.id == id).unwrap().color.as_deref(),
-            Some("red")
-        );
 
-        set_color_session(
-            "set-color-ok",
-            SetColorArgs {
-                identifier: id.clone(),
-                color: "none".to_string(),
-            },
-        )
-        .await
-        .unwrap();
-        let loaded = storage.load().unwrap();
-        assert_eq!(loaded.iter().find(|i| i.id == id).unwrap().color, None);
+        let row = stored(&storage, &id);
+        assert_eq!(row.resume_intent, ResumeIntent::Use(SID_B.to_string()));
+        assert_eq!(row.resume_probe_failed_sid, None);
     }
-
-    #[tokio::test]
-    #[serial]
-    async fn set_color_rejects_unknown_color() {
-        let temp = tempdir().unwrap();
-        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
-
-        let (storage, id) = seed("set-color-bad").await;
-
-        let result = set_color_session(
-            "set-color-bad",
-            SetColorArgs {
-                identifier: id.clone(),
-                color: "chartreuse".to_string(),
-            },
-        )
-        .await;
-        assert!(result.is_err(), "unknown color must error");
-        // The rejected write must not have touched disk.
-        let loaded = storage.load().unwrap();
-        assert_eq!(loaded.iter().find(|i| i.id == id).unwrap().color, None);
-    }
-
-    /// `session set-color -p <unknown>` refuses the profile instead of
-    /// creating it and then failing on the missing session (#148).
-    #[tokio::test]
-    #[serial]
-    async fn set_color_refuses_unknown_profile_without_vivifying_it() {
-        let _guard = crate::session::test_support::isolate_app_dir();
-        let profiles = crate::session::get_app_dir().unwrap().join("profiles");
-        std::fs::create_dir_all(profiles.join("real")).unwrap();
-
-        let result = set_color_session(
-            "ghost-profile",
-            SetColorArgs {
-                identifier: "whatever".to_string(),
-                color: "red".to_string(),
-            },
-        )
-        .await;
-        let msg = result.expect_err("unknown profile must error").to_string();
-        assert!(
-            msg.contains("does not exist"),
-            "expected the unknown-profile error, got: {msg}"
-        );
-        assert!(
-            !profiles.join("ghost-profile").exists(),
-            "set-color must not mint profiles/ghost-profile"
-        );
-    }
-}
-
-#[cfg(test)]
-mod acp_reject_tests {
-    use super::{set_session_id, SetSessionIdArgs};
-    use crate::session::{Instance, Storage};
-    use serial_test::serial;
-    use tempfile::tempdir;
 
     #[tokio::test]
     #[serial]
@@ -3631,48 +3117,92 @@ mod acp_reject_tests {
         let temp = tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
 
-        let storage = Storage::new_unwatched("acp-reject").unwrap();
         let mut inst = Instance::new("acp_session", "/tmp/x");
         inst.view = crate::session::View::Structured;
-        let id = inst.id.clone();
-        let on_disk = inst.clone();
-        storage
-            .update(|i, g| {
-                *i = vec![on_disk.clone()];
-                *g =
-                    crate::session::GroupTree::new_with_groups(std::slice::from_ref(&on_disk), &[])
-                        .get_all_groups();
-                Ok(())
-            })
-            .unwrap();
+        let (storage, id) = seed("acp-reject", inst);
 
-        let result = set_session_id(
+        let err = set_session_id(
             "acp-reject",
             SetSessionIdArgs {
                 identifier: id.clone(),
-                session_id: "11111111-1111-1111-1111-111111111111".to_string(),
+                session_id: SID_A.to_string(),
             },
         )
-        .await;
-
-        let err = result.expect_err("set-session-id must reject structured view-mode sessions");
-        let msg = format!("{:#}", err);
+        .await
+        .expect_err("set-session-id must reject structured view-mode sessions");
+        let msg = format!("{err:#}");
         assert!(
             msg.contains("acp"),
-            "error must mention structured view: {}",
-            msg
+            "error must mention structured view: {msg}"
         );
 
-        let loaded = storage.load().unwrap();
-        let inst_disk = loaded.iter().find(|i| i.id == id).unwrap();
+        let row = stored(&storage, &id);
         assert_eq!(
-            inst_disk.resume_intent,
-            crate::session::ResumeIntent::Default,
-            "rejected call must not mutate intent",
+            row.resume_intent,
+            ResumeIntent::Default,
+            "rejected call must not mutate intent"
         );
         assert_eq!(
-            inst_disk.agent_session_id, None,
-            "rejected call must not mutate sid",
+            row.agent_session_id, None,
+            "rejected call must not mutate sid"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn set_color_normalizes_clears_and_rejects_unknown_values() {
+        let temp = tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+
+        let (storage, id) = seed("set-color", Instance::new("color_session", "/tmp/x"));
+        let set = |color: &str| {
+            set_color_session(
+                "set-color",
+                SetColorArgs {
+                    identifier: id.clone(),
+                    color: color.to_string(),
+                },
+            )
+        };
+
+        set("Red")
+            .await
+            .expect("palette names are case-insensitive");
+        assert_eq!(stored(&storage, &id).color.as_deref(), Some("red"));
+
+        set("chartreuse")
+            .await
+            .expect_err("unknown color must error");
+        assert_eq!(stored(&storage, &id).color.as_deref(), Some("red"));
+
+        set("none").await.unwrap();
+        assert_eq!(stored(&storage, &id).color, None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn set_color_refuses_unknown_profile_without_vivifying_it() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let profiles = crate::session::get_app_dir().unwrap().join("profiles");
+        std::fs::create_dir_all(profiles.join("real")).unwrap();
+
+        let msg = set_color_session(
+            "ghost-profile",
+            SetColorArgs {
+                identifier: "whatever".to_string(),
+                color: "red".to_string(),
+            },
+        )
+        .await
+        .expect_err("unknown profile must error")
+        .to_string();
+        assert!(
+            msg.contains("does not exist"),
+            "expected the unknown-profile error, got: {msg}"
+        );
+        assert!(
+            !profiles.join("ghost-profile").exists(),
+            "set-color must not mint profiles/ghost-profile"
         );
     }
 }
@@ -3693,43 +3223,36 @@ mod import_tests {
     }
 
     #[test]
-    fn terminal_import_pins_resume_target() {
-        let s = summary("abc123-def456", "/home/me/proj", Some("Fix bug"));
-        let inst = build_import_instance(&s, false, "");
-        assert_eq!(inst.tool, "claude");
-        assert_eq!(inst.project_path, "/home/me/proj");
-        assert_eq!(inst.title, "Fix bug");
+    fn build_import_instance_pins_the_replay_target_for_each_view() {
+        let terminal = build_import_instance(
+            &summary("abc123-def456", "/home/me/proj", Some("Fix bug")),
+            false,
+            "",
+        );
+        assert_eq!(terminal.tool, "claude");
+        assert_eq!(terminal.project_path, "/home/me/proj");
+        assert_eq!(terminal.title, "Fix bug");
         assert_eq!(
-            inst.resume_intent,
+            terminal.resume_intent,
             ResumeIntent::Use("abc123-def456".to_string())
         );
+
+        let untitled = build_import_instance(
+            &summary("abcdef12-3456-7890", "/home/me/proj", None),
+            false,
+            "team/imports",
+        );
+        assert_eq!(untitled.title, "Claude import abcdef12");
+        assert_eq!(untitled.group_path, "team/imports");
+
+        let structured =
+            build_import_instance(&summary("sid-1", "/home/me/proj", Some("x")), true, "");
+        assert!(structured.is_structured());
+        assert_eq!(structured.acp_session_id.as_deref(), Some("sid-1"));
+        assert_eq!(structured.import_pending, Some(true));
+        assert_eq!(structured.resume_intent, ResumeIntent::Default);
     }
 
-    #[test]
-    fn title_falls_back_to_short_id() {
-        let s = summary("abcdef12-3456-7890", "/home/me/proj", None);
-        let inst = build_import_instance(&s, false, "team/imports");
-        assert_eq!(inst.title, "Claude import abcdef12");
-        assert_eq!(inst.group_path, "team/imports");
-    }
-
-    #[test]
-    fn structured_import_seeds_replay_fields() {
-        let s = summary("sid-1", "/home/me/proj", Some("x"));
-        let inst = build_import_instance(&s, true, "");
-        assert!(inst.is_structured());
-        assert_eq!(inst.acp_session_id.as_deref(), Some("sid-1"));
-        assert_eq!(inst.import_pending, Some(true));
-        // Structured imports do not pin a terminal resume target.
-        assert_eq!(inst.resume_intent, ResumeIntent::Default);
-    }
-
-    /// A row claims a conversation in one of three places, and a re-import
-    /// must see all of them: a terminal import pins `resume_intent`, the
-    /// poller writes `agent_session_id`, and a structured import seeds
-    /// `acp_session_id` while leaving `resume_intent` at `Default`. Missing
-    /// any one of them creates a second row claiming a conversation that is
-    /// already claimed.
     #[test]
     fn already_imported_matches_every_spelling_of_a_claim() {
         let mut by_resume = Instance::new("a", "/p");
@@ -3756,7 +3279,6 @@ mod import_tests {
 mod show_json_tests {
     use super::*;
 
-    /// #3472: plain `session show` names a parent by title and lists children.
     #[test]
     fn relationship_lines_name_parent_and_children() {
         let parent = Instance::new("orchestrator", "/repo");
@@ -3789,148 +3311,124 @@ mod show_json_tests {
         }
     }
 
-    /// #3350 gave `aoe list --json` a `state` tag and both timestamps;
-    /// `session show --json` was left behind, so a scripted consumer that
-    /// looked a session up by id could not tell an archived one from a live
-    /// one without a second `aoe list` shellout.
     #[test]
-    fn show_json_exposes_state_and_archived_at_for_an_archived_row() {
-        let mut inst = Instance::new("z", "/repo");
-        inst.archive();
-        let details = session_details(&inst, "p");
+    fn show_json_reports_state_and_only_the_timestamps_that_apply() {
+        let plain = Instance::new("z", "/repo");
+        let serialized = serde_json::to_string(&session_details(&plain, "p")).unwrap();
+        assert!(!serialized.contains("trashed_at"), "{serialized}");
+        assert!(!serialized.contains("archived_at"), "{serialized}");
+        assert!(serialized.contains("\"state\":\"live\""), "{serialized}");
+
+        let mut archived = Instance::new("z", "/repo");
+        archived.archive();
+        let details = session_details(&archived, "p");
         assert_eq!(details.state, "archived");
         assert!(details.archived_at.is_some());
         assert!(details.trashed_at.is_none());
-    }
 
-    /// `trash()` deliberately leaves `archived_at` alone so a restore is
-    /// faithful, so both keys can be present at once and `state` reports
-    /// `trashed`: the same precedence `list --json` reports, from the same
-    /// `state_tag`.
-    #[test]
-    fn show_json_reports_trashed_for_a_row_that_was_archived_first() {
-        let mut inst = Instance::new("z", "/repo");
-        inst.archive();
-        inst.trash();
-        let details = session_details(&inst, "p");
-        assert_eq!(details.state, "trashed");
+        let mut trashed = archived;
+        trashed.trash();
+        let details = session_details(&trashed, "p");
+        assert_eq!(
+            details.state, "trashed",
+            "trash outranks an earlier archive"
+        );
         assert!(details.trashed_at.is_some());
         assert!(details.archived_at.is_some());
     }
 
-    /// A live row must serialize exactly as wide as it did before, so a
-    /// consumer parsing today's output sees one new key (`state`) and no
-    /// `null` timestamps.
-    #[test]
-    fn show_json_omits_absent_timestamps_and_keeps_state_live() {
-        let inst = Instance::new("z", "/repo");
-        let serialized = serde_json::to_string(&session_details(&inst, "p")).unwrap();
-        assert!(!serialized.contains("trashed_at"), "{serialized}");
-        assert!(!serialized.contains("archived_at"), "{serialized}");
-        assert!(serialized.contains("\"state\":\"live\""), "{serialized}");
-    }
-
-    /// #3415: same four-timestamp mirror as `aoe list --json`, gated the
-    /// same way: the snooze key surfaces only while `is_snoozed()` holds,
-    /// the pin key whenever set, neither appears on a plain row, and
-    /// `state` stays the untouched bucket tag throughout.
     #[test]
     fn show_json_mirrors_the_api_snooze_and_pin_keys() {
         let now = chrono::Utc::now();
         let future = now + chrono::Duration::minutes(15);
         let past = now - chrono::Duration::minutes(15);
-
-        let mut snoozed = Instance::new("z", "/repo");
-        snoozed.snoozed_until = Some(future);
-
-        let mut expired = Instance::new("z", "/repo");
-        expired.snoozed_until = Some(past);
-
-        let mut pinned = Instance::new("z", "/repo");
-        pinned.pinned_at = Some(now);
-
-        // pin() and snooze() clear each other's marker, but peer store
-        // writes bypass the mutators, so a row can carry both at once
-        // and neither key may suppress the other.
-        let mut both = Instance::new("z", "/repo");
-        both.pinned_at = Some(now);
-        both.snoozed_until = Some(future);
-
-        // archive() clears a concurrent snooze through the mutators, but
-        // snooze() leaves archived_at alone, so archiving a row and then
-        // snoozing it persists the pair through ordinary CLI commands:
-        // the keys must stay independent of the bucket tag.
-        let mut sunk = Instance::new("z", "/repo");
-        sunk.archived_at = Some(now);
-        sunk.snoozed_until = Some(future);
-
-        // snoozed then trashed through ordinary commands: trash()
-        // preserves the sibling timestamps, so a triaged row must still
-        // report its deadline from the trash.
-        let mut trashed_snoozed = Instance::new("z", "/repo");
-        trashed_snoozed.snooze(30);
-        trashed_snoozed.trash();
-
-        // pinned for the web sidebar, then trashed the same way.
-        let mut trashed_pinned = Instance::new("z", "/repo");
-        trashed_pinned.pin();
-        trashed_pinned.trash();
-
-        // pin() clears archived_at through the mutators, but peer store
-        // writes bypass them: an archived row can still carry a pin.
-        let mut archived_pinned = Instance::new("z", "/repo");
-        archived_pinned.archived_at = Some(now);
-        archived_pinned.pinned_at = Some(now);
-
-        let plain = Instance::new("z", "/repo");
-
-        let cases = [
-            ("active snooze", &snoozed, true, false, "live"),
-            ("expired snooze", &expired, false, false, "live"),
-            ("pinned", &pinned, false, true, "live"),
-            ("plain row", &plain, false, false, "live"),
-            ("snoozed and archived", &sunk, true, false, "archived"),
-            ("pinned and snoozed", &both, true, true, "live"),
-            (
-                "trashed and snoozed",
-                &trashed_snoozed,
-                true,
-                false,
-                "trashed",
-            ),
-            (
-                "trashed and pinned",
-                &trashed_pinned,
-                false,
-                true,
-                "trashed",
-            ),
-            (
-                "pinned and archived",
-                &archived_pinned,
-                false,
-                true,
-                "archived",
-            ),
-        ];
-        for (label, inst, want_snooze, want_pin, want_state) in cases {
-            let value = serde_json::to_value(session_details(inst, "p")).unwrap();
-            assert_eq!(
+        let row = |f: &dyn Fn(&mut Instance)| {
+            let mut inst = Instance::new("z", "/repo");
+            f(&mut inst);
+            inst
+        };
+        let check = |label: &str, f: &dyn Fn(&mut Instance), snooze: bool, pin: bool, state| {
+            let value = serde_json::to_value(session_details(&row(f), "p")).unwrap();
+            let seen = (
                 value.get("snoozed_until").is_some(),
-                want_snooze,
-                "{label}: {value}"
-            );
-            assert_eq!(
                 value.get("pinned_at").is_some(),
-                want_pin,
-                "{label}: {value}"
+                value["state"].as_str(),
             );
-            assert_eq!(value["state"].as_str(), Some(want_state), "{label}");
-        }
+            assert_eq!(seen, (snooze, pin, Some(state)), "{label}: {value}");
+        };
 
-        // Value fidelity on the one row whose exact deadline we set:
-        // presence alone would accept a regression emitting any instant.
-        let active = serde_json::to_value(session_details(&snoozed, "p")).unwrap();
+        check("plain row", &|_| {}, false, false, "live");
+        check(
+            "active snooze",
+            &|i| i.snoozed_until = Some(future),
+            true,
+            false,
+            "live",
+        );
+        check(
+            "expired snooze",
+            &|i| i.snoozed_until = Some(past),
+            false,
+            false,
+            "live",
+        );
+        check("pinned", &|i| i.pinned_at = Some(now), false, true, "live");
+        check(
+            "snoozed and archived",
+            &|i| {
+                i.archived_at = Some(now);
+                i.snoozed_until = Some(future);
+            },
+            true,
+            false,
+            "archived",
+        );
+        check(
+            "pinned and snoozed",
+            &|i| {
+                i.pinned_at = Some(now);
+                i.snoozed_until = Some(future);
+            },
+            true,
+            true,
+            "live",
+        );
+        check(
+            "trashed and snoozed",
+            &|i| {
+                i.snooze(30);
+                i.trash();
+            },
+            true,
+            false,
+            "trashed",
+        );
+        check(
+            "trashed and pinned",
+            &|i| {
+                i.pin();
+                i.trash();
+            },
+            false,
+            true,
+            "trashed",
+        );
+        check(
+            "pinned and archived",
+            &|i| {
+                i.archived_at = Some(now);
+                i.pinned_at = Some(now);
+            },
+            false,
+            true,
+            "archived",
+        );
+
+        let active = serde_json::to_value(session_details(
+            &row(&|i| i.snoozed_until = Some(future)),
+            "p",
+        ))
+        .unwrap();
         assert_eq!(
             active["snoozed_until"],
             serde_json::to_value(future).unwrap()

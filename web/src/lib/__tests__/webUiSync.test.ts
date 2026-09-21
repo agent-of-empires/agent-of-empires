@@ -18,7 +18,6 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  // Reset the safeStorage chokepoint so tests don't leak the matcher/handler.
   configureStorageSync(
     () => false,
     () => {},
@@ -92,14 +91,11 @@ describe("hydrateWebUiStateFromServer", () => {
   });
 
   it("does NOT backfill (resurrect) local-only keys once the server is non-empty", async () => {
-    // The server has data (already synced once). A local-only key here can mean
-    // "deleted on another device", so it must not be pushed back up.
     localStorage.setItem("aoe-welcome-seen", "1");
     getWebUiState.mockResolvedValue({ "aoe-sidebar-axis": "group" });
 
     await hydrateWebUiStateFromServer();
 
-    // Server value applied; no backfill.
     expect(localStorage.getItem("aoe-sidebar-axis")).toBe("group");
     expect(patchWebUiState).not.toHaveBeenCalled();
   });
@@ -111,7 +107,6 @@ describe("hydrateWebUiStateFromServer", () => {
     await hydrateWebUiStateFromServer();
 
     expect(localStorage.getItem("aoe-sidebar-axis")).toBe("group");
-    // Nothing to backfill: the only synced key is already on the server.
     expect(patchWebUiState).not.toHaveBeenCalled();
   });
 

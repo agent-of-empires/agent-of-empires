@@ -7,8 +7,6 @@ describe("sessionRowChromeClass", () => {
   });
 
   it("keeps the active frame when the open session is also multi-selected", () => {
-    // Both states want a ring; the active frame has to win deterministically
-    // instead of leaving Tailwind to settle ring-1 vs ring-2 by source order.
     const chrome = sessionRowChromeClass(true, true);
     expect(chrome).toContain("ring-2 ring-inset ring-session-active");
     expect(chrome).not.toContain("ring-1");

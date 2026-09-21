@@ -1,37 +1,8 @@
-// Shared between `build.rs` (via `include!`) and the regression test in
-// `tests/build_version_rerun.rs` (via `#[path] mod`). Keep it free of
-// dependencies on the rest of the crate: build scripts compile in isolation.
+// Shared by `build.rs` (via `include!`) and `tests/build_version_rerun.rs`; keep it dependency-free.
 
-/// The git files cargo should watch so `AOE_BUILD_VERSION` is recomputed when
-/// the checkout's revision changes: `HEAD` for a checkout or a detached-HEAD
-/// move, and the per-worktree reflog `logs/HEAD` for everything that advances
-/// the branch `HEAD` points at (commit, pull, merge, rebase, reset), which
-/// leaves the `HEAD` file itself untouched.
-///
-/// `index` is deliberately not watched. It looks like the natural trigger for
-/// the dirty-flag suffix, but git rewrites its stat cache on a plain
-/// `git status` (racily-clean revalidation), not just on real staging, so a
-/// shell prompt or editor git integration running in the background made
-/// cargo recompile the lib + binary for a build with zero source changes.
-/// The cost is that the dirty suffix now lags: staging or editing files no
-/// longer refreshes it on its own, so a binary rebuilt after an edit can
-/// still report the flag computed at the last revision change. That was
-/// already true for unstaged edits before, and the flag is documented as
-/// coarse (see `emit_build_version` in `build.rs`).
-///
-/// Paths are resolved for the repository rooted at `dir` via
-/// `git rev-parse --git-path`, which is correct for both a normal checkout
-/// (`.git/HEAD`) and a git worktree, where `.git` is a file pointing at
-/// `<main>/.git/worktrees/<name>/` and the literal `.git/HEAD` path does not
-/// exist.
-///
-/// Only paths that exist on disk are returned. Cargo treats a missing
-/// `rerun-if-changed` input as perpetually stale, so handing it a path that
-/// does not exist rebuilds the lib + binary on every invocation; that is the
-/// exact failure that hardcoding `.git/HEAD` caused in a worktree (issue
-/// #1962). Returns an empty vec when git is unavailable or `dir` is not a git
-/// checkout (e.g. a source tarball), leaving the build version pinned to
-/// `CARGO_PKG_VERSION` with no spurious rerun trigger.
+/// Git files to watch so `AOE_BUILD_VERSION` is recomputed on a revision change: `HEAD` and
+/// the per-worktree `logs/HEAD`. `index` is not watched because a plain `git status` rewrites it.
+/// Only existing paths are returned: cargo treats a missing input as perpetually stale.
 pub fn git_watch_paths(dir: &std::path::Path) -> Vec<String> {
     ["HEAD", "logs/HEAD"]
         .iter()
@@ -40,8 +11,6 @@ pub fn git_watch_paths(dir: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
-/// Resolve a single per-worktree git file path via `git rev-parse --git-path`,
-/// run inside `dir`. `None` when git fails or the output is empty.
 fn git_path(dir: &std::path::Path, file: &str) -> Option<String> {
     let out = std::process::Command::new("git")
         .arg("-C")
@@ -60,11 +29,7 @@ fn git_path(dir: &std::path::Path, file: &str) -> Option<String> {
     }
 }
 
-/// True when `path` points at an existing file. `git rev-parse --git-path`
-/// returns an absolute path in a worktree and a path relative to `dir` (e.g.
-/// `.git/HEAD`) in a normal checkout, so relative paths are resolved against
-/// `dir`. `build.rs` runs with `dir = "."` and cargo's cwd at the package
-/// root, so the relative path it emits resolves identically there.
+/// Relative paths resolve against `dir`; worktrees yield absolute paths.
 fn watched_path_exists(dir: &std::path::Path, path: &str) -> bool {
     let p = std::path::Path::new(path);
     if p.is_absolute() {

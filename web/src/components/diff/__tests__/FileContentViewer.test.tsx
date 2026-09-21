@@ -1,8 +1,4 @@
 // @vitest-environment jsdom
-//
-// FileContentViewer contract (#3088): fetches the provenance-confined /file
-// endpoint and renders Markdown (rendered by default, Raw toggle) or a shiki
-// full-file view for other extensions, plus the binary notice.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -13,8 +9,14 @@ vi.mock("../../../hooks/useShikiTheme", () => ({
   useShikiTheme: () => ({ theme: "github-dark", appearance: "dark" }),
 }));
 
-vi.mock("../../../lib/snippetHighlighter", () => ({
-  highlightSnippet: vi.fn((code: string) => Promise.resolve(`<pre class="shiki"><code>${code}</code></pre>`)),
+// Stubbed: the whole-file view renders through `@pierre/diffs`, which needs a
+// real DOM and workers. This spec is about which branch is chosen, not paint.
+vi.mock("../FullFileViewer", () => ({
+  FullFileViewer: ({ content, filePath }: { content: string; filePath: string }) => (
+    <div data-testid="full-file" data-path={filePath}>
+      {content}
+    </div>
+  ),
 }));
 
 beforeEach(() => {
@@ -42,14 +44,14 @@ describe("FileContentViewer", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Raw" }));
     await waitFor(() => {
-      // Raw mode renders the shiki full-file view (or its <pre> fallback), which
-      // shows the literal source including the "#".
+      // Raw mode renders the whole-file view, which shows the literal source
+      // including the "#".
       expect(container.textContent).toContain("# Plan");
     });
     expect(container.querySelector("h1")).toBeNull();
   });
 
-  it("renders a non-markdown file via the shiki viewer (no toggle)", async () => {
+  it("renders a non-markdown file via the whole-file view (no toggle)", async () => {
     vi.spyOn(api, "getSessionFile").mockResolvedValue({
       content: "export const a = 1;",
       is_binary: false,

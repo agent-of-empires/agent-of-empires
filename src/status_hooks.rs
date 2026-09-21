@@ -12,13 +12,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::session::{Instance, Status};
 
-/// Milliseconds a status must remain stable before hook commands run, so
-/// rapid flickers (Running -> Waiting -> Running) don't fire spurious hooks.
+/// A status must stay stable this long before hooks run, so flickers do not fire them.
 #[cfg(not(test))]
 const DEFAULT_DEBOUNCE_MS: u64 = 100;
 
-/// Test-only override selecting synchronous dispatch or gated debounce workers.
-/// Mutating tests share the serial group with the recorded-launches buffer.
 #[cfg(test)]
 static TEST_DEBOUNCE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -223,8 +220,7 @@ fn spawn_transition_commands(
     commands: Vec<String>,
 ) {
     let context = StatusHookContext::from_instance(instance, old, new, changed_at);
-    // Keep one transition's commands in one worker so `on_change` cannot race
-    // ahead of the status-specific hook.
+    // One worker per transition so `on_change` cannot race ahead of the status hook.
     spawn_hook_commands(commands, context);
 }
 
@@ -274,7 +270,6 @@ fn run_debounced_transition(
     drop(state);
 
     let instance = instance.clone();
-    // Tests release the real worker explicitly instead of racing its deadline.
     #[cfg(test)]
     let gate = DEBOUNCE_WORKERS.with(|workers| {
         workers
@@ -352,13 +347,7 @@ fn spawn_hook_commands(commands: Vec<String>, context: StatusHookContext) {
     }
 }
 
-/// Upper bound on how long a single status hook may block its worker
-/// thread. A misconfigured hook (e.g. one that opens a foreground GUI
-/// app, hangs on stdin, or `tail -f`s a log) would otherwise leak the
-/// std::thread spawned in `spawn_hook_commands` for the life of the
-/// TUI. 30s is generous for sound players and notifier CLIs, short
-/// enough that a steady stream of long-stuck hooks doesn't accumulate
-/// indefinitely.
+/// Bounds how long a stuck hook can hold its worker thread.
 #[cfg(not(test))]
 const HOOK_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -384,9 +373,6 @@ fn run_hook_command_blocking(
             }
             None => {
                 if std::time::Instant::now() >= deadline {
-                    // Best-effort kill; if the child has already exited
-                    // between the try_wait above and here, kill is a
-                    // no-op error we don't care about.
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(std::io::Error::other(format!(
@@ -529,9 +515,7 @@ mod tests {
         assert_eq!(config.on_change.as_deref(), Some("~/bin/aoe-hook"));
     }
 
-    /// Regression: the schema used to expose `debounce_ms`. It is gone now
-    /// (the debounce is a fixed internal constant); configs read between
-    /// upgrade and migration must still deserialize cleanly.
+    /// `debounce_ms` was removed; configs that still carry it must deserialize.
     #[test]
     fn legacy_debounce_ms_is_ignored() {
         let config: StatusHookConfig = toml::from_str(

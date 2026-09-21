@@ -1,83 +1,30 @@
 // @vitest-environment jsdom
-//
-// End-to-end within MobileLiveTerminal: focusing/blurring the hidden input
-// must flip the rendered cursor cell's style, not just the parent's chrome
-// ring (#2684). The cell has to survive being focused, blurred, and
-// re-focused without drifting into a stuck state either way.
+// Input focus must reach the rendered cursor cell, not only the parent's chrome ring (#2684).
 
-import { createRef } from "react";
-import { describe, expect, it, vi, beforeAll } from "vitest";
-import { fireEvent, render } from "@testing-library/react";
-import { MobileLiveTerminal } from "../MobileLiveTerminal";
-import type { LiveFrame } from "../../hooks/useLiveTerminal";
+import { describe, expect, it, vi } from "vitest";
+import { fireEvent } from "@testing-library/react";
+import { installResizeObserver, liveFrame, renderLiveTerminal } from "./liveTerminalHarness";
 
 vi.mock("../../hooks/useWebSettings", () => ({
   useWebSettings: () => ({ settings: { mobileFontSize: 14, desktopFontSize: 14 }, update: vi.fn() }),
 }));
-
-beforeAll(() => {
-  globalThis.ResizeObserver = class {
-    observe() {}
-    unobserve() {}
-    disconnect() {}
-  } as unknown as typeof ResizeObserver;
-});
-
-const frame: LiveFrame = {
-  content: "$ \n",
-  rows: 3,
-  history: 1000,
-  cursor: { x: 2, y: 0 },
-  altScreen: false,
-  mouse: false,
-  mouseSgr: false,
-};
-
-function renderTerm() {
-  const inputRef = createRef<HTMLTextAreaElement>();
-  const utils = render(
-    <MobileLiveTerminal
-      frame={frame}
-      connected
-      active
-      reading={false}
-      sendResize={vi.fn()}
-      setWindow={vi.fn()}
-      setCadence={vi.fn()}
-      enterReading={vi.fn()}
-      returnToLive={vi.fn()}
-      sendData={vi.fn()}
-      typedWordRef={{ current: "" }}
-      uploadPastedImage={vi.fn()}
-      forwardWheel={vi.fn()}
-      forwardButton={vi.fn()}
-      ctrlActiveRef={createRef<boolean>() as React.RefObject<boolean>}
-      clearCtrl={vi.fn()}
-      inputRef={inputRef}
-      onInputFocusChange={vi.fn()}
-      bottomAlign
-      keyboardOpen={false}
-    />,
-  );
-  const cursorCell = () => utils.container.querySelector("[data-live-cursor]") as HTMLElement | null;
-  return { inputRef, cursorCell };
-}
+installResizeObserver();
 
 describe("MobileLiveTerminal cursor fill on focus", () => {
-  it("starts hollow, fills and blinks on focus, reverts to hollow (no blink) on blur", () => {
-    const { inputRef, cursorCell } = renderTerm();
-    expect(cursorCell()!.style.backgroundColor).toBe("");
-    expect(cursorCell()!.style.outline).toContain("var(--term-cursor");
-    expect(cursorCell()!.className).toBe("");
-
-    fireEvent.focus(inputRef.current!);
-    expect(cursorCell()!.style.backgroundColor).toContain("var(--term-cursor");
-    expect(cursorCell()!.style.outline).toBe("");
-    expect(cursorCell()!.className).toContain("animate-term-cursor-blink");
-
-    fireEvent.blur(inputRef.current!);
-    expect(cursorCell()!.style.backgroundColor).toBe("");
-    expect(cursorCell()!.style.outline).toContain("var(--term-cursor");
-    expect(cursorCell()!.className).toBe("");
+  it("starts hollow, fills and blinks on focus, and reverts on blur", () => {
+    const { container, input } = renderLiveTerminal({ frame: liveFrame({ cursor: { x: 2, y: 0 } }) });
+    const cell = () => container.querySelector("[data-live-cursor]") as HTMLElement;
+    const expectHollow = () => {
+      expect(cell().style.backgroundColor).toBe("");
+      expect(cell().style.outline).toContain("var(--term-cursor");
+      expect(cell().className).toBe("");
+    };
+    expectHollow();
+    fireEvent.focus(input());
+    expect(cell().style.backgroundColor).toContain("var(--term-cursor");
+    expect(cell().style.outline).toBe("");
+    expect(cell().className).toContain("animate-term-cursor-blink");
+    fireEvent.blur(input());
+    expectHollow();
   });
 });

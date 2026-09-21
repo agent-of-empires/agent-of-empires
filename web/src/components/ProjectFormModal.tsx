@@ -4,24 +4,17 @@ import { createProject, updateProject } from "../lib/api";
 import { DirectoryBrowser } from "./DirectoryBrowser";
 
 interface Props {
-  /** The project to edit, or null/undefined to add a new one. In edit mode
-   *  only the default base branch is mutable; path, name, and scope are
-   *  fixed (remove and re-add to change them). */
+  /** The project to edit, or null/undefined to add a new one. */
   initial?: ProjectInfo | null;
   onClose: () => void;
-  /** Called after a successful create/update so the caller can refresh the
-   *  registry. Awaited before the modal closes, so the section reflects the
-   *  change by the time the form disappears (matching the pin/unpin handlers).
-   *  May be sync or return a promise. */
+  /** Called after a successful create/update so the caller can refresh the registry. */
   onSaved: () => void | Promise<void>;
 }
 
 const lockedFieldClass =
   "w-full px-3 py-2 text-sm bg-surface-900/60 border border-surface-700/30 rounded-md text-text-dim cursor-not-allowed mb-3";
 
-// Add / edit form for a registered project, shared by the sidebar Projects
-// section. Lifted out of the former full-page ProjectsView so the same form
-// renders as a modal next to the sidebar. See #2212.
+// Add / edit form for a registered project, shared by the sidebar Projects section.
 export function ProjectFormModal({ initial, onClose, onSaved }: Props) {
   const isEdit = initial != null;
   const [path, setPath] = useState(initial?.path ?? "");

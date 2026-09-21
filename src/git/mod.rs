@@ -1,16 +1,4 @@
-//! Git worktree operations module.
-//!
-//! Layout:
-//!   - `remote`   — repo cloning, origin-URL parsing
-//!   - `worktree` — `GitWorktree` lifecycle, branch ops, template paths
-//!   - `diff`     — diff rendering for the UI
-//!   - `cleanup`  — stale-worktree cleanup
-//!   - `template` — path-template expansion
-//!   - this file  — module declarations, re-exports, and the shared
-//!     `open_repo_at` helper used by sibling submodules.
-//!
-//! `remote` and `worktree` were extracted from a single 1,797-line `mod.rs`;
-//! `diff`, `cleanup`, and `template` predate the split.
+//! Git repository and worktree operations.
 
 use std::ffi::OsStr;
 use std::path::Path;
@@ -21,6 +9,8 @@ pub mod diff;
 pub mod error;
 mod remote;
 pub mod template;
+#[cfg(test)]
+pub(crate) mod test_support;
 mod worktree;
 
 pub use remote::{
@@ -29,10 +19,8 @@ pub use remote::{
 };
 pub use worktree::{GitWorktree, WorktreeEntry};
 
-/// Open a git repository at the given path without searching parent directories.
-/// Unlike `git2::Repository::discover`, this does not walk up the directory tree,
-/// preventing unrelated ancestor repos (e.g., a dotfile-managed home directory)
-/// from being found.
+/// Open the repository at `path` without searching parents, so an unrelated
+/// ancestor repo (e.g. a dotfile-managed home) is never found.
 pub(crate) fn open_repo_at(path: &Path) -> std::result::Result<git2::Repository, git2::Error> {
     git2::Repository::open_ext(
         path,

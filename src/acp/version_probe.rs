@@ -17,8 +17,7 @@ pub enum ProbeStatus {
         raw: String,
         parsed: Version,
         /// stdout only, what the spawn-side tokenizer sees; stderr is
-        /// folded into `raw`. Bundle-backed suppression must judge
-        /// spawn's stream view, not this probe's lenient fold.
+        /// folded into `raw`.
         stdout_raw: String,
     },
     Unparseable {
@@ -89,18 +88,11 @@ pub fn extract_semver(raw: &str) -> Option<Version> {
 
 /// The spawn side's tokenizer (`path_copy_below_floor`): the first
 /// whitespace-delimited token that parses as strict semver once a
-/// leading `v` is stripped. The doctor's probe parser is more lenient
-/// (stderr folded in, punctuation-split tokens), so code that predicts
-/// what spawn will do must ask this exact predicate instead of reusing
-/// the lenient parse.
+/// leading `v` is stripped.
 pub fn whitespace_token_below_floor(raw: &str, min: Version) -> bool {
     whitespace_token_semver(raw).is_some_and(|found| found < min)
 }
 
-/// The strict token itself, for callers that need to compare against a
-/// floor in either direction (spawn keeps the PATH copy when this is
-/// `None`, and a pinned bundle only counts as backing when its own
-/// stdout parses at or above the floor).
 pub fn whitespace_token_semver(raw: &str) -> Option<Version> {
     raw.split_whitespace()
         .filter_map(|tok| Version::parse(tok.trim_start_matches('v')).ok())
@@ -114,9 +106,7 @@ pub async fn probe_binary_version(binary: &str) -> ProbeStatus {
     }
 }
 
-/// Probe an explicit executable path. Same budget and stream handling
-/// as [`probe_binary_version`], for callers that resolved the binary
-/// themselves (the pinned bundled copies never sit on PATH).
+/// Probe an explicit executable path.
 pub async fn probe_path_version(path: &std::path::Path) -> ProbeStatus {
     let child = tokio::process::Command::new(path)
         .arg("--version")
@@ -200,12 +190,7 @@ pub fn gates_needed_by_instances(instances: &[Instance]) -> Vec<VersionGate> {
     let registry = AgentRegistry::with_defaults();
     let mut seen = HashSet::new();
     let mut gates = Vec::new();
-    // Only host-run structured sessions gate on the host toolchain. A
-    // sandboxed session's adapter lives inside its container, so probing
-    // `claude-agent-acp --version` on the host would report Missing (the
-    // host never installs it) and emit a bogus "upgrade the ACP package"
-    // warning at every `aoe serve` boot. The in-container adapter is
-    // validated at handshake time by `agent_compat::validate` instead.
+    // Only host-run structured sessions gate on the host toolchain.
     for inst in instances
         .iter()
         .filter(|inst| inst.is_structured() && !inst.is_sandboxed())
@@ -269,30 +254,38 @@ mod tests {
         version_gate_for(ExpectedAgent::ClaudeAgentAcp).unwrap()
     }
 
-    #[test]
-    fn extract_semver_handles_realistic_outputs() {
-        assert_eq!(extract_semver("0.55.0").unwrap().to_string(), "0.55.0");
-        assert_eq!(
-            extract_semver("claude-agent-acp 0.55.0")
-                .unwrap()
-                .to_string(),
-            "0.55.0"
-        );
-        assert_eq!(extract_semver("v1.16.0").unwrap().to_string(), "1.16.0");
-        assert_eq!(
-            extract_semver("version=0.55.0-alpha.1")
-                .unwrap()
-                .to_string(),
-            "0.55.0-alpha.1"
-        );
-        assert!(extract_semver("not-semver").is_none());
+    /// A `ProbeStatus::Version` as the probe builds it from one raw line.
+    fn probed(raw: &str) -> ProbeStatus {
+        ProbeStatus::Version {
+            raw: raw.to_string(),
+            parsed: Version::parse(raw).unwrap(),
+            stdout_raw: raw.to_string(),
+        }
     }
 
-    /// This predicate IS the spawn-side decision, so its table pins the
-    /// strict tokenizer: whitespace-delimited, `v`-stripped, first
-    /// parseable token wins. Formats the lenient doctor parser accepts
-    /// (like `version=0.37.0`, split on punctuation) must read as
-    /// unproven here.
+    fn structured(name: &str, tool: &str) -> Instance {
+        let mut instance = Instance::new(name, &format!("/tmp/{name}"));
+        instance.view = View::Structured;
+        instance.tool = tool.to_string();
+        instance
+    }
+
+    #[test]
+    fn extract_semver_reads_the_first_version_like_token() {
+        // (raw output, parsed version)
+        let cases = [
+            ("0.55.0", Some("0.55.0")),
+            ("claude-agent-acp 0.55.0", Some("0.55.0")),
+            ("v1.16.0", Some("1.16.0")),
+            ("version=0.55.0-alpha.1", Some("0.55.0-alpha.1")),
+            ("not-semver", None),
+        ];
+        for (raw, want) in cases {
+            let got = extract_semver(raw).map(|v| v.to_string());
+            assert_eq!(got.as_deref(), want, "{raw:?}");
+        }
+    }
+
     #[test]
     fn whitespace_token_below_floor_mirrors_spawn_parsing() {
         let min = Version::parse(CLAUDE_AGENT_ACP_MIN_VERSION).unwrap();
@@ -303,8 +296,6 @@ mod tests {
             ("v0.37.0", true),
             ("0.55.0", false),
             ("0.56.0", false),
-            // Punctuation-joined output has no whitespace token that
-            // parses strictly: spawn keeps the PATH copy.
             ("version=0.37.0", false),
             ("0.37.0-beta.1", true),
             ("junk", false),
@@ -318,95 +309,47 @@ mod tests {
             );
         }
     }
-    #[test]
-    fn warning_for_probe_flags_only_unusable_versions() {
-        let gate = claude_gate();
-        assert!(matches!(
-            warning_for_probe(
-                gate,
-                &ProbeStatus::Version {
-                    raw: "0.0.1".to_string(),
-                    parsed: Version::parse("0.0.1").unwrap(),
-                    stdout_raw: "0.0.1".to_string(),
-                },
-            )
-            .unwrap()
-            .kind,
-            VersionWarningKind::BelowMinimum { .. }
-        ));
-        assert!(warning_for_probe(
-            gate,
-            &ProbeStatus::Version {
-                raw: CLAUDE_AGENT_ACP_MIN_VERSION.to_string(),
-                parsed: Version::parse(CLAUDE_AGENT_ACP_MIN_VERSION).unwrap(),
-                stdout_raw: CLAUDE_AGENT_ACP_MIN_VERSION.to_string(),
-            },
-        )
-        .is_none());
-        assert!(warning_for_probe(
-            gate,
-            &ProbeStatus::Version {
-                raw: "999.0.0".to_string(),
-                parsed: Version::parse("999.0.0").unwrap(),
-                stdout_raw: "999.0.0".to_string(),
-            },
-        )
-        .is_none());
-    }
 
     #[test]
-    fn warning_for_probe_covers_failed_probes() {
-        let gate = claude_gate();
-        assert!(matches!(
-            warning_for_probe(gate, &ProbeStatus::Missing).unwrap().kind,
-            VersionWarningKind::Missing
-        ));
-        assert!(matches!(
-            warning_for_probe(
-                gate,
-                &ProbeStatus::Unparseable {
+    fn warning_for_probe_flags_only_unusable_adapters() {
+        // (probe outcome, warning kind it raises)
+        let cases = [
+            (probed("0.0.1"), Some("below")),
+            (probed(CLAUDE_AGENT_ACP_MIN_VERSION), None),
+            (probed("999.0.0"), None),
+            (ProbeStatus::Missing, Some("missing")),
+            (
+                ProbeStatus::Unparseable {
                     raw: "weird".to_string(),
                 },
-            )
-            .unwrap()
-            .kind,
-            VersionWarningKind::Unparseable { .. }
-        ));
-        assert!(matches!(
-            warning_for_probe(gate, &ProbeStatus::TimedOut)
-                .unwrap()
-                .kind,
-            VersionWarningKind::TimedOut
-        ));
+                Some("unparseable"),
+            ),
+            (ProbeStatus::TimedOut, Some("timed_out")),
+        ];
+        for (status, want) in cases {
+            let got = warning_for_probe(claude_gate(), &status).map(|w| match w.kind {
+                VersionWarningKind::BelowMinimum { .. } => "below",
+                VersionWarningKind::Missing => "missing",
+                VersionWarningKind::Unparseable { .. } => "unparseable",
+                VersionWarningKind::Failed { .. } => "failed",
+                VersionWarningKind::TimedOut => "timed_out",
+            });
+            assert_eq!(got, want, "{status:?}");
+        }
     }
 
     #[test]
     fn gates_needed_by_instances_scopes_to_structured_sessions_and_dedupes() {
         let mut terminal = Instance::new("terminal", "/tmp/terminal");
         terminal.tool = "claude".to_string();
-
-        let mut structured_claude = Instance::new("structured", "/tmp/structured");
-        structured_claude.view = View::Structured;
-        structured_claude.tool = "claude".to_string();
-
-        let mut duplicate_claude = Instance::new("structured 2", "/tmp/structured-2");
-        duplicate_claude.view = View::Structured;
-        duplicate_claude.tool = "claude".to_string();
-
-        let mut structured_opencode = Instance::new("opencode", "/tmp/opencode");
-        structured_opencode.view = View::Structured;
-        structured_opencode.tool = "opencode".to_string();
-
-        let mut custom_agent = Instance::new("custom", "/tmp/custom");
-        custom_agent.view = View::Structured;
-        custom_agent.tool = "claude".to_string();
+        let mut custom_agent = structured("custom", "claude");
         custom_agent.agent_name = Some("custom-acp".to_string());
 
         let gates = gates_needed_by_instances(&[
             terminal,
-            structured_claude,
-            duplicate_claude,
-            structured_opencode,
+            structured("structured", "claude"),
+            structured("structured-2", "claude"),
+            structured("opencode", "opencode"),
             custom_agent,
         ]);
 
@@ -419,13 +362,7 @@ mod tests {
 
     #[test]
     fn gates_needed_by_instances_skips_sandboxed_sessions() {
-        // A sandboxed structured session runs its adapter inside the
-        // container; the host probe would falsely report it Missing. Only
-        // a host-run structured session on the same tool should contribute
-        // a gate. See the sandbox-only false-warning fix.
-        let mut sandboxed = Instance::new("sandboxed", "/tmp/sandboxed");
-        sandboxed.view = View::Structured;
-        sandboxed.tool = "claude".to_string();
+        let mut sandboxed = structured("sandboxed", "claude");
         sandboxed.sandbox_info = Some(crate::session::SandboxInfo {
             enabled: true,
             container_id: None,
@@ -442,10 +379,7 @@ mod tests {
         assert!(gates_needed_by_instances(&[sandboxed.clone()]).is_empty());
 
         // A host-run claude session alongside it still contributes its gate.
-        let mut host_claude = Instance::new("host", "/tmp/host");
-        host_claude.view = View::Structured;
-        host_claude.tool = "claude".to_string();
-        let gates = gates_needed_by_instances(&[sandboxed, host_claude]);
+        let gates = gates_needed_by_instances(&[sandboxed, structured("host", "claude")]);
         assert_eq!(gates.len(), 1);
         assert_eq!(gates[0].min_version, CLAUDE_AGENT_ACP_MIN_VERSION);
     }

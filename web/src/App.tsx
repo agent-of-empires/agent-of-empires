@@ -30,8 +30,7 @@ import { PluginUiProvider, usePluginUiEntries } from "./lib/pluginUiContext";
 import { buildSortValueMap, pluginSortSpecs } from "./lib/pluginUi";
 import type { PluginSortContext, SidebarSortMode } from "./lib/sidebarSort";
 import { nextAttentionSessionId, sessionNeedsAttention, workspaceIsTrashed } from "./lib/sidebarSort";
-import { useSidebarSortMode } from "./hooks/useSidebarSortMode";
-import { useSidebarAxis } from "./hooks/useSidebarAxis";
+import { useSidebarAxis, useSidebarSortMode } from "./hooks/useSidebarPrefs";
 import { repoGroupToSidebarGroup, type SidebarGroup } from "./lib/sidebarGroups";
 import { useProjects } from "./hooks/useProjects";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
@@ -51,7 +50,7 @@ import { useIsWideViewport } from "./hooks/useIsWideViewport";
 import type { RightPanelView } from "./lib/rightPanelView";
 import { usePaneLayout, dockTabs, dockGroups, dockOf, isActiveTab, isDockCollapsed } from "./lib/paneLayout";
 import { isPluginPaneId, resolvePaneIcon, usePluginPanes, type PluginPane } from "./lib/pluginPanes";
-import { PluginPaneBody } from "./components/plugin/PluginSlots";
+import { PluginPaneBody } from "./components/plugin/PluginPane";
 import { TOUR_ANCHORS, tourAnchor } from "./lib/tourSteps";
 import {
   deleteWorkspaceSessions,
@@ -95,6 +94,8 @@ import { IdleDecayWindowContext, parseIdleDecayWindowMs } from "./lib/idleDecay"
 import { parseUnreadIndicatorEnabled, UnreadIndicatorContext, useUnreadIndicatorEnabled } from "./lib/unreadIndicator";
 import { parseSessionRowTagMode, SessionRowTagContext, type SessionRowTagMode } from "./lib/sessionRowTag";
 import { parseSessionColorsEnabled, SessionColorsContext } from "./lib/sessionColors";
+import { fetchActiveProfileSettings } from "./lib/appSettings";
+import { parseSystemHealthEnabled, SystemHealthEnabledContext } from "./lib/systemHealth";
 import { toastBus, reportError } from "./lib/toastBus";
 import { isAbsolutePath, resolveToRepoRelative, type FileRef } from "./lib/fileRef";
 import { OPEN_SESSION_EVENT } from "./lib/sessionRoute";
@@ -105,7 +106,8 @@ import {
   forwardTerminalBeforeInput,
 } from "./lib/mobileKeyboardProxy";
 import { hydrateWebUiStateFromServer, initWebUiSync } from "./lib/webUiSync";
-import { WorkspaceSidebar, SnoozeModal } from "./components/WorkspaceSidebar";
+import { WorkspaceSidebar } from "./components/WorkspaceSidebar";
+import { SnoozeModal } from "./components/sidebar/SnoozeModal";
 import { DeleteSessionDialog } from "./components/DeleteSessionDialog";
 import { StopSessionDialog } from "./components/StopSessionDialog";
 import { SwitchViewDialog } from "./components/SwitchViewDialog";
@@ -182,16 +184,18 @@ export default function App() {
   const [unreadIndicatorEnabled, setUnreadIndicatorEnabled] = useState(true);
   const [sessionRowTagMode, setSessionRowTagMode] = useState<SessionRowTagMode>("branch");
   const [sessionColorsEnabled, setSessionColorsEnabled] = useState(true);
+  const [systemHealthEnabled, setSystemHealthEnabled] = useState(false);
 
   const applyAppSettings = useCallback((settings: Record<string, unknown> | null | undefined) => {
     setIdleDecayWindowMs(parseIdleDecayWindowMs(settings));
     setUnreadIndicatorEnabled(parseUnreadIndicatorEnabled(settings));
     setSessionRowTagMode(parseSessionRowTagMode(settings));
     setSessionColorsEnabled(parseSessionColorsEnabled(settings));
+    setSystemHealthEnabled(parseSystemHealthEnabled(settings));
   }, []);
 
   const refreshAppSettings = useCallback(async () => {
-    applyAppSettings(await fetchSettings());
+    applyAppSettings(await fetchActiveProfileSettings());
   }, [applyAppSettings]);
 
   useEffect(() => {
@@ -213,16 +217,18 @@ export default function App() {
     return () => window.removeEventListener(LOGIN_REQUIRED_EVENT, onLoginRequired);
   }, []);
 
+  // Settings are read once the login gate says they can be: on a
+  // login-required server an early read is rejected, and nothing would fetch
+  // again afterwards, so the whole session would run on defaults.
   useEffect(() => {
     loginStatus().then(({ required, authenticated }) => {
       setLoginRequired(required);
       setLoginAuthenticated(authenticated);
+      if (!required || authenticated) {
+        void refreshAppSettings();
+      }
     });
-  }, []);
-
-  useEffect(() => {
-    fetchSettings().then(applyAppSettings);
-  }, [applyAppSettings]);
+  }, [refreshAppSettings]);
 
   const handleTokenSuccess = () => {
     setTokenExpired(false);
@@ -230,11 +236,16 @@ export default function App() {
     loginStatus().then(({ required, authenticated }) => {
       setLoginRequired(required);
       setLoginAuthenticated(authenticated);
+      if (!required || authenticated) {
+        void refreshAppSettings();
+      }
     });
   };
 
   const handleLoginSuccess = () => {
     setLoginAuthenticated(true);
+    // First point at which settings are readable on a login-walled server.
+    void refreshAppSettings();
     // Reset dedup flags so a future session expiry can re-fire the event.
     resetTokenExpired();
   };
@@ -266,17 +277,19 @@ export default function App() {
       <UnreadIndicatorContext.Provider value={unreadIndicatorEnabled}>
         <SessionRowTagContext.Provider value={sessionRowTagMode}>
           <SessionColorsContext.Provider value={sessionColorsEnabled}>
-            {/* PluginUiProvider must sit above AppContent: AppContent itself reads
+            <SystemHealthEnabledContext.Provider value={systemHealthEnabled}>
+              {/* PluginUiProvider must sit above AppContent: AppContent itself reads
                 the plugin UI snapshot (usePluginPanes), so the provider can't live
                 inside its own return. */}
-            <PluginUiProvider>
-              <AppContent
-                loginRequired={loginRequired}
-                onLogout={handleLogout}
-                onSettingsRefresh={refreshAppSettings}
-              />
-            </PluginUiProvider>
-            <ElevationPrompt />
+              <PluginUiProvider>
+                <AppContent
+                  loginRequired={loginRequired}
+                  onLogout={handleLogout}
+                  onSettingsRefresh={refreshAppSettings}
+                />
+              </PluginUiProvider>
+              <ElevationPrompt />
+            </SystemHealthEnabledContext.Provider>
           </SessionColorsContext.Provider>
         </SessionRowTagContext.Provider>
       </UnreadIndicatorContext.Provider>

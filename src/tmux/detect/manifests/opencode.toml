@@ -26,8 +26,7 @@ region = "whole_recent"
 visible = true
 line_regex = ['(?i)\x{276F}(?:\s*|.* )[123]\.']
 
-# Parked at the input prompt. OpenCode's ready state is reported as Waiting
-# rather than Idle, which is what its callers have always seen.
+# Parked at the input prompt.
 [[rules]]
 extends = "input_prompt"
 id = "input_prompt"

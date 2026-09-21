@@ -1,25 +1,4 @@
 //! Live per-session control state, folded once at the publish choke point.
-//!
-//! Prompt dispatch (`super::dispatch`) needs the daemon's own `AcpState` on an
-//! HTTP request, but the WS folds are per-connection, so there was none to
-//! read. Rebuilding one from the event log per request measured 68ms at 20k
-//! events and 342ms at 100k, on a store whose retention default is unlimited,
-//! and it holds the event store's connection mutex for the whole scan, so it
-//! stalls event recording daemon-wide rather than only slowing the one caller.
-//!
-//! So the daemon keeps the fold hot: `ChannelSink::publish_persisted` applies
-//! each event to a cached `AcpState` as it records and broadcasts it, and a
-//! reader gets an O(1) clone. The log stays the source of truth; this is a
-//! projection of it that can always be thrown away and rebuilt.
-//!
-//! **A session is only ever cached by a full hydrate from the log.** A fold
-//! started mid-stream would miss the handshake events that sit near seq 1 and
-//! never repeat (`PromptCapabilities`, which is what tells dispatch the agent
-//! is steerable, #2805), so `apply_if_cached` deliberately no-ops on a session
-//! nothing has hydrated yet.
-//!
-//! Locking is per session: the map lock is held only long enough to clone a
-//! slot handle, so one session's hydrate never blocks another's publish.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -30,14 +9,11 @@ use super::state::{AcpState, Event};
 #[derive(Debug, Clone)]
 struct Cached {
     state: AcpState,
-    /// Highest seq folded in. `AcpState::apply_event` is not idempotent
-    /// (`ApprovalRequested` pushes unconditionally), so a repeated seq must be
-    /// dropped rather than applied twice.
+    /// Highest seq folded in.
     last_seq: u64,
 }
 
-/// Per-session slot. `None` means "not hydrated", which is the state every
-/// session starts in and returns to whenever the fold can no longer be trusted.
+/// Per-session slot.
 type Slot = Arc<Mutex<Option<Cached>>>;
 
 #[derive(Debug, Default)]
@@ -57,8 +33,7 @@ impl ControlStateCache {
         Self::default()
     }
 
-    /// The slot for `session_id`, creating an empty one if absent. The map
-    /// lock is released before the caller touches the slot.
+    /// The slot for `session_id`, creating an empty one if absent.
     fn slot(&self, session_id: &str) -> Slot {
         let mut map = lock(&self.sessions);
         Arc::clone(
@@ -68,15 +43,6 @@ impl ControlStateCache {
     }
 
     /// Fold `event` into the session's cached state, if it has one.
-    ///
-    /// Called from the publish choke point, which persists before it
-    /// broadcasts and publishes in seq order. The seq guard turns anything
-    /// that does not continue the sequence into an eviction rather than a
-    /// wrong fold: a forward gap means events were missed, and a backward jump
-    /// means the supervisor's per-session counter was reset (an
-    /// `acp_disable` / `acp_enable` round trip, or a session recreated under
-    /// the same id). Either way the log is authoritative and the next reader
-    /// rebuilds from it.
     pub fn apply_if_cached(&self, session_id: &str, seq: u64, event: &Event) {
         let slot = self.slot(session_id);
         let mut guard = lock(&slot);
@@ -99,22 +65,46 @@ impl ControlStateCache {
         cached.last_seq = seq;
     }
 
-    /// Drop a session's fold. Used when the event log behind it is deleted and
-    /// when a persist fails, since a projection of a log that is missing an
-    /// event is not a projection of that log.
+    /// Whether the session's cached state has an outstanding background
+    /// sub-agent, or `false` if nothing is cached. Used right after
+    /// `apply_if_cached` folds a `Stopped` or `BackgroundAgentCompleted`
+    /// event, to tell the sidebar status derivation whether a background
+    /// sub-agent is still keeping the session busy (#4001), and by live lag
+    /// recovery to override a stale seed event. This accessor itself never
+    /// hydrates: the live listener checks `is_hydrated` and calls
+    /// `SessionService::fold_control_state` on a miss before calling this, so
+    /// by the time it reads, a session the listener has seen an event for is
+    /// always hydrated. Lag recovery stays read-only and asks arbitrary
+    /// sessions, so a miss there may just mean the session was never opened.
+    /// Either way `false` is the same conservative verdict the derivation
+    /// fell back to before any of this existed.
+    pub fn has_active_background_agent(&self, session_id: &str) -> bool {
+        let slot = self.slot(session_id);
+        let guard = lock(&slot);
+        guard
+            .as_ref()
+            .is_some_and(|c| c.state.has_active_background_agent())
+    }
+
+    /// Whether the session's cached state has an active main turn, or
+    /// `false` if nothing is cached. Same rationale as
+    /// `has_active_background_agent`: this accessor never hydrates; the live
+    /// listener hydrates a cold session before calling it, lag recovery
+    /// stays read-only, and either way a miss reads as the same
+    /// quiet-session verdict as boot.
+    pub fn turn_active(&self, session_id: &str) -> bool {
+        let slot = self.slot(session_id);
+        let guard = lock(&slot);
+        guard.as_ref().is_some_and(|c| c.state.turn_active)
+    }
+
+    /// Drop a session's fold.
     pub fn forget(&self, session_id: &str) {
         let mut map = lock(&self.sessions);
         map.remove(session_id);
     }
 
     /// The session's control state, running `hydrate` on a miss.
-    ///
-    /// `hydrate` returns the state folded over the whole log plus the highest
-    /// seq it saw, and runs under the session's own slot lock, so a publish
-    /// for this session waits for it while other sessions carry on. Both
-    /// interleavings are safe: a publish that landed before the scan is
-    /// already in the returned state and is dropped by the `seq == last_seq`
-    /// guard, and one that lands after continues the sequence normally.
     pub fn get_or_hydrate(
         &self,
         session_id: &str,
@@ -133,8 +123,11 @@ impl ControlStateCache {
         state
     }
 
-    #[cfg(test)]
-    fn is_cached(&self, session_id: &str) -> bool {
+    /// Whether the session has a hydrated fold, with no locking beyond the
+    /// check itself. Lets a caller that can hydrate on demand (the live
+    /// listener, via `SessionService::fold_control_state`) skip that work on
+    /// every event and only pay for it on a cold session.
+    pub fn is_hydrated(&self, session_id: &str) -> bool {
         let slot = self.slot(session_id);
         let guard = lock(&slot);
         guard.is_some()
@@ -144,24 +137,11 @@ impl ControlStateCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::state::test_support::{prompt, stopped};
     use crate::acp::state::{AcpSessionId, AgentName};
 
     fn seed() -> AcpState {
         AcpState::new(AcpSessionId("s-1".into()), AgentName("claude".into()), None)
-    }
-
-    fn prompt() -> Event {
-        Event::UserPromptSent {
-            text: "go".into(),
-            attachments: Vec::new(),
-            prompt_id: None,
-        }
-    }
-
-    fn stopped() -> Event {
-        Event::Stopped {
-            reason: "end_turn".into(),
-        }
     }
 
     /// An un-hydrated session must not start folding mid-stream: the
@@ -171,8 +151,8 @@ mod tests {
     #[test]
     fn a_session_nothing_hydrated_stays_uncached() {
         let cache = ControlStateCache::new();
-        cache.apply_if_cached("s-1", 42, &prompt());
-        assert!(!cache.is_cached("s-1"));
+        cache.apply_if_cached("s-1", 42, &prompt("go"));
+        assert!(!cache.is_hydrated("s-1"));
 
         let mut hydrated = 0;
         let state = cache.get_or_hydrate("s-1", || {
@@ -183,8 +163,6 @@ mod tests {
         assert_eq!(hydrated, 1);
     }
 
-    /// The point of the cache: a hydrated session folds live and never scans
-    /// the log again.
     #[test]
     fn a_hydrated_session_folds_live_without_rehydrating() {
         let cache = ControlStateCache::new();
@@ -196,14 +174,14 @@ mod tests {
             hydrate_count();
             (seed(), 0)
         });
-        cache.apply_if_cached("s-1", 1, &prompt());
+        cache.apply_if_cached("s-1", 1, &prompt("go"));
         let state = cache.get_or_hydrate("s-1", || {
             hydrate_count();
             (seed(), 0)
         });
         assert!(state.turn_active, "the live fold reached the reader");
 
-        cache.apply_if_cached("s-1", 2, &stopped());
+        cache.apply_if_cached("s-1", 2, &stopped("end_turn"));
         let state = cache.get_or_hydrate("s-1", || {
             hydrate_count();
             (seed(), 0)
@@ -213,9 +191,6 @@ mod tests {
     }
 
     /// Anything that does not continue the sequence evicts rather than folds.
-    /// Applying a repeated `UserPromptSent` is harmless, but a repeated
-    /// `ApprovalRequested` would leave a second, unresolvable card, so the
-    /// guard is on the seq rather than on the event kind.
     #[test]
     fn a_break_in_the_sequence_evicts_instead_of_folding_wrong() {
         let cases: [(&str, u64, u64, bool); 4] = [
@@ -233,15 +208,13 @@ mod tests {
         for (name, first, second, still_cached) in cases {
             let cache = ControlStateCache::new();
             cache.get_or_hydrate("s-1", || (seed(), first - 1));
-            cache.apply_if_cached("s-1", first, &prompt());
-            cache.apply_if_cached("s-1", second, &stopped());
-            assert_eq!(cache.is_cached("s-1"), still_cached, "{name}");
+            cache.apply_if_cached("s-1", first, &prompt("go"));
+            cache.apply_if_cached("s-1", second, &stopped("end_turn"));
+            assert_eq!(cache.is_hydrated("s-1"), still_cached, "{name}");
         }
     }
 
-    /// A repeat must not double-apply. `ApprovalRequested` is the event that
-    /// makes this load-bearing: it pushes unconditionally, so folding it twice
-    /// leaves an approval card nothing can resolve.
+    /// A repeat must not double-apply.
     #[test]
     fn a_repeated_seq_is_not_folded_twice() {
         let approval = |nonce: &str| crate::acp::approvals::Approval {
@@ -273,17 +246,15 @@ mod tests {
         assert_eq!(state.pending_approvals.len(), 1);
     }
 
-    /// Forgetting a session drops the fold, so the id can be reused (a delete
-    /// and recreate) without inheriting the old conversation's turn flags.
     #[test]
     fn forget_drops_the_fold_so_a_reused_id_starts_clean() {
         let cache = ControlStateCache::new();
         cache.get_or_hydrate("s-1", || (seed(), 0));
-        cache.apply_if_cached("s-1", 1, &prompt());
+        cache.apply_if_cached("s-1", 1, &prompt("go"));
         assert!(cache.get_or_hydrate("s-1", || (seed(), 0)).turn_active);
 
         cache.forget("s-1");
-        assert!(!cache.is_cached("s-1"));
+        assert!(!cache.is_hydrated("s-1"));
         assert!(!cache.get_or_hydrate("s-1", || (seed(), 0)).turn_active);
     }
 }

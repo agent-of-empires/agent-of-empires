@@ -1,20 +1,4 @@
-//! Sound effects for agent state transitions
-//!
-//! Plays AoE II-style sounds when agent sessions change state.
-//! Users place .wav/.ogg files in the sounds directory:
-//!   - Linux: ~/.config/agent-of-empires/sounds/
-//!   - macOS: ~/.agent-of-empires/sounds/
-//!
-//! Expected filenames (any .wav/.ogg file works):
-//!   wololo.wav, rogan.wav, allhail.wav, monk.wav,
-//!   alarm.wav, start.wav
-//!
-//! Layout:
-//!   - `config`    — `SoundConfig`, volume helpers
-//!   - `discovery` — sounds directory + available-files probing
-//!   - `bundled`   — GitHub-hosted default sound pack installer
-//!   - `playback`  — afplay / paplay / aplay dispatch
-//!   - this file   — transition-to-sound glue
+//! Sound effects for agent state transitions, played from user .wav/.ogg files.
 
 mod bundled;
 mod config;
@@ -30,10 +14,7 @@ use rand::seq::IndexedRandom;
 
 use crate::session::Status;
 
-/// Resolve which sound name to play: the per-transition file when set,
-/// otherwise a random pick from the available files.
 fn resolve_sound_name(override_name: Option<&str>) -> Option<String> {
-    // Per-transition override takes priority
     if let Some(name) = override_name {
         if !name.is_empty() {
             return Some(name.to_string());
@@ -48,7 +29,6 @@ fn resolve_sound_name(override_name: Option<&str>) -> Option<String> {
     sounds.choose(&mut rng).cloned()
 }
 
-/// Play a sound for a state transition (if enabled and sounds are available)
 pub fn play_for_transition(old: Status, new: Status, config: &SoundConfig) {
     if !config.enabled || old == new {
         return;
@@ -84,7 +64,6 @@ mod tests {
     #[test]
     fn test_play_for_transition_disabled() {
         let config = SoundConfig::default();
-        // Should not panic even when disabled
         play_for_transition(Status::Idle, Status::Running, &config);
     }
 
@@ -94,7 +73,6 @@ mod tests {
             enabled: true,
             ..Default::default()
         };
-        // Same status - should be a no-op
         play_for_transition(Status::Running, Status::Running, &config);
     }
 
@@ -104,7 +82,6 @@ mod tests {
             enabled: true,
             ..Default::default()
         };
-        // Deleting transitions should be skipped
         play_for_transition(Status::Running, Status::Deleting, &config);
     }
 }

@@ -59,9 +59,6 @@ fn format_labeled(u: &ServeUrl) -> String {
     format!("{}\t{}", label, u.url)
 }
 
-/// Extract the `token` query parameter from a URL. Returns `None` if the
-/// URL has no query string or no `token=` key. Avoids pulling in a full
-/// URL parser for one parameter; the auth token has no special characters.
 fn extract_token(url: &str) -> Option<&str> {
     let query = url.split_once('?').map(|(_, q)| q)?;
     for pair in query.split('&') {

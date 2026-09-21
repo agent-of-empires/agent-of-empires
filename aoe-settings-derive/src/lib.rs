@@ -1,38 +1,4 @@
-//! `#[derive(SettingsSection)]` for agent-of-empires (#1692).
-//!
-//! Emits `fn settings_descriptors() -> Vec<FieldDescriptor>` for a config
-//! sub-struct so the field declaration plus its `#[setting(...)]` attributes
-//! are the single source of truth for every settings surface (TUI, web,
-//! server policy, validation). The generated code references
-//! `crate::session::config::settings_schema::*`, so the derive is only meant for use
-//! inside the `agent-of-empires` crate.
-//!
-//! Section attribute (`name` and `category` required):
-//! ```ignore
-//! #[setting_section(name = "acp", category = "Acp")]
-//! #[setting_section(name = "session", category = "Session", repo_default = "deny")]
-//! ```
-//! `repo_default` ("allow" | "deny", default "allow") is the repo-config
-//! policy every field in the section inherits unless it declares its own
-//! `repo = "..."`.
-//!
-//! Per-field attribute:
-//! ```ignore
-//! #[setting(label = "Acp enabled", widget = "toggle")]
-//! #[setting(label = "Node path", web = "local_only:host binary execution surface")]
-//! #[setting(skip)]   // not a user-facing setting
-//! ```
-//! Keys: `label`, `desc`, `category` (override the section default), `widget`,
-//! `min`, `max`, `step`, `multiline`, `mono`, `options` ("v:Label,v2:Label2"),
-//! `web` ("allow" | "elevation:reason" | "local_only:reason"),
-//! `repo` ("allow" | "deny": repo-config override policy; defaults to the
-//!   section's `repo_default`),
-//! `validate` (`"none"` | `"range:min[:max]"` | `"nonempty"` | `"memory_limit"` |
-//!   `"volume_list"` | `"env_list"` | `"port_mapping_list"` | `"capability_list"` |
-//!   `"security_opt_list"` | `"network"`),
-//! `global_only` (flag: field is shown but not profile-overridable),
-//! `skip` (flag: exclude the field from the schema entirely).
-//! When `desc` is omitted, the field's doc comment is used.
+//! `#[derive(SettingsSection)]`; attribute keys are documented in `docs/development/adding-settings.md`.
 
 use proc_macro::TokenStream;
 use quote::quote;
@@ -50,8 +16,6 @@ pub fn derive_settings_section(input: TokenStream) -> TokenStream {
 struct SectionMeta {
     name: String,
     category: String,
-    /// Repo-config policy inherited by fields with no `repo = "..."` of their
-    /// own. `RepoPolicy::Allow` unless the section declares otherwise.
     repo_default: proc_macro2::TokenStream,
 }
 
@@ -113,9 +77,6 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 profile_overridable: #overridable,
                 validation: #validation,
                 advanced: #advanced,
-                // Core fields always exist in the serialized Config via the
-                // struct Default, so they need no schema-carried default; only
-                // plugin fields set this.
                 default: ::core::option::Option::None,
             }
         });
@@ -123,9 +84,6 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 
     Ok(quote! {
         impl #ident {
-            /// Schema descriptors for this section, emitted by
-            /// `#[derive(SettingsSection)]`. The single source of truth for
-            /// how every surface renders and guards these fields.
             pub fn settings_descriptors() -> ::std::vec::Vec<crate::session::config::settings_schema::FieldDescriptor> {
                 use crate::session::config::settings_schema::{
                     FieldDescriptor, WidgetKind, WebWritePolicy, RepoPolicy, ValidationKind, SelectOption,
@@ -406,7 +364,6 @@ fn opt_i64(v: Option<i64>) -> proc_macro2::TokenStream {
     }
 }
 
-/// Collect `#[doc = "..."]` lines into a single trimmed description string.
 fn doc_comment(field: &syn::Field) -> Option<String> {
     let mut lines = Vec::new();
     for attr in &field.attrs {
@@ -428,7 +385,6 @@ fn doc_comment(field: &syn::Field) -> Option<String> {
     }
 }
 
-/// "max_concurrent_workers" -> "Max concurrent workers".
 fn humanize(field_name: &str) -> String {
     let spaced = field_name.replace('_', " ");
     let mut chars = spaced.chars();

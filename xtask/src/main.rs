@@ -1,4 +1,4 @@
-//! xtask - Development tasks for agent-of-empires
+//! xtask: development tasks for agent-of-empires.
 
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use std::collections::BTreeSet;
@@ -57,8 +57,6 @@ fn run_dev(_args: DevArgs) {
     std::process::exit(1);
 }
 
-/// Build the dashboard-enabled debug binary. Returns whether the build succeeded so
-/// the watch loop can keep the old backend running on a failed rebuild.
 #[cfg(unix)]
 fn build_web() -> bool {
     use std::process::Command;
@@ -73,8 +71,6 @@ fn build_web() -> bool {
         })
 }
 
-/// Whether a bind host keeps the dev servers off the network. Anything else
-/// (notably `0.0.0.0`) exposes them to other devices and warrants a warning.
 #[cfg(unix)]
 fn host_is_loopback(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1") || host.starts_with("127.")
@@ -85,8 +81,6 @@ fn child_exited(child: &mut std::process::Child) -> bool {
     matches!(child.try_wait(), Ok(Some(_)))
 }
 
-/// SIGTERM a child's process group, wait out a grace period, then SIGKILL the
-/// group if it is still alive. Reaps the child either way.
 #[cfg(unix)]
 fn terminate_group(child: &mut std::process::Child, grace: std::time::Duration) {
     use nix::sys::signal::{killpg, Signal};
@@ -110,8 +104,6 @@ fn terminate_group(child: &mut std::process::Child, grace: std::time::Duration) 
     let _ = child.wait();
 }
 
-/// Wait until the backend port is bindable again before respawning, so a restart
-/// does not race the old listener and fail with "address already in use".
 #[cfg(unix)]
 fn wait_for_port(port: u16, timeout: std::time::Duration) {
     use std::net::TcpListener;
@@ -126,10 +118,6 @@ fn wait_for_port(port: u16, timeout: std::time::Duration) {
     eprintln!("[xtask dev] port {port} still busy after waiting; respawning anyway");
 }
 
-/// Whether a changed path should trigger a backend rebuild: any `.rs` file, or
-/// the root `Cargo.toml` / `Cargo.lock`. The watch scope (src/ recursively plus
-/// the project root non-recursively) already excludes target/ and node_modules,
-/// so a plain extension and file-name check is enough.
 #[cfg(unix)]
 fn is_watch_relevant(path: &Path) -> bool {
     if path.extension().and_then(|e| e.to_str()) == Some("rs") {
@@ -141,15 +129,7 @@ fn is_watch_relevant(path: &Path) -> bool {
     )
 }
 
-/// Build the dashboard-enabled binary, then run it alongside the Vite dev server.
-/// Vite proxies `/api` and the AoE `/sessions/*` WebSocket relays to the
-/// backend via the `VITE_PROXY` env var it already honors. Each child runs in
-/// its own process group so a single Ctrl-C tears the whole tree down (npm
-/// spawns vite, vite may spawn esbuild) with no orphans.
-///
-/// With `--watch`, edits under `src/**` (plus `Cargo.toml` / `Cargo.lock`)
-/// rebuild the backend and restart `aoe serve`; the Vite child is left running
-/// so frontend HMR and the browser session survive the backend bounce.
+/// Each child runs in its own process group so one Ctrl-C tears the whole tree down.
 #[cfg(unix)]
 fn run_dev(args: DevArgs) {
     use std::os::unix::process::CommandExt;
@@ -158,13 +138,10 @@ fn run_dev(args: DevArgs) {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    // Build up front so build output doesn't interleave with Vite's startup
-    // and a broken build fails fast before either server comes up.
     if !build_web() {
         std::process::exit(1);
     }
 
-    // Honor CARGO_TARGET_DIR; cargo wrote the debug binary under it.
     let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string());
     let bin = Path::new(&target_dir).join("debug").join("aoe");
 
@@ -175,17 +152,9 @@ fn run_dev(args: DevArgs) {
             .expect("failed to install Ctrl-C handler");
     }
 
-    // Detach stdin from both children: each runs in its own (background)
-    // process group, so a TTY-driven raw-mode setup (Vite installs keypress
-    // shortcuts when stdin is a TTY) would raise SIGTTOU and suspend the
-    // child. Shutdown is driven by signals here, not per-server keystrokes,
-    // so neither child needs the terminal.
+    // Detach stdin: a background process group touching the TTY gets SIGTTOU.
     let serve_port = args.serve_port;
-    // The backend always stays on loopback: remote devices reach the dashboard
-    // through Vite, which proxies `/api` and the AoE `/sessions/*` WebSocket
-    // relays to the backend over 127.0.0.1. Binding it to a public interface
-    // would also trip `aoe serve`'s refusal to run `--no-auth` off-loopback
-    // without a proxy.
+    // The backend stays on loopback; remote devices reach it through Vite's proxy.
     let host = args.host.clone();
     let spawn_serve = || -> Child {
         Command::new(&bin)
@@ -196,11 +165,7 @@ fn run_dev(args: DevArgs) {
             .expect("failed to spawn `aoe serve`")
     };
 
-    // Clear any lingering serve already bound to the dev namespace before we
-    // spawn ours. An unclean prior `xtask dev` exit (or a stray dev daemon)
-    // leaves a serve PID file that makes the fresh foreground serve refuse to
-    // start with "already running", which then tears Vite down. Best-effort:
-    // ignore the "no daemon running" case and wait for the port to free up.
+    // A stale dev serve PID file would make the fresh serve refuse to start.
     {
         let stopped = Command::new(&bin)
             .args(["serve", "--stop"])
@@ -216,8 +181,6 @@ fn run_dev(args: DevArgs) {
         }
     }
 
-    // Tracked as an Option so a backend that exits under --watch can be marked
-    // dead and respawned on the next rebuild without tearing down Vite.
     let mut serve: Option<Child> = Some(spawn_serve());
 
     let mut vite = match Command::new("npm")
@@ -242,8 +205,6 @@ fn run_dev(args: DevArgs) {
     {
         Ok(child) => child,
         Err(e) => {
-            // serve is already up; tear its group down before bailing so we
-            // don't orphan a backend on the serve port.
             eprintln!("[xtask dev] failed to spawn `npm run dev`: {e}");
             if let Some(mut serve) = serve.take() {
                 terminate_group(&mut serve, Duration::from_secs(2));
@@ -271,8 +232,6 @@ fn run_dev(args: DevArgs) {
         );
     }
 
-    // Watch src/** plus the root Cargo.toml/Cargo.lock when --watch is set. The
-    // watcher must stay bound for the loop's lifetime; dropping it ends delivery.
     let (watch_tx, watch_rx) = std::sync::mpsc::channel::<()>();
     let _watcher = if args.watch {
         use notify::{RecursiveMode, Watcher};
@@ -284,9 +243,7 @@ fn run_dev(args: DevArgs) {
             }
         })
         .expect("failed to create file watcher");
-        // src/ recursively for .rs edits; the project root non-recursively so an
-        // editor's atomic-save rename-replace of Cargo.toml/Cargo.lock is caught
-        // (a direct file watch would detach when the inode is swapped).
+        // Watch the root non-recursively so an atomic-save rename of Cargo.toml is caught.
         watcher
             .watch(Path::new("src"), RecursiveMode::Recursive)
             .expect("failed to watch src/");
@@ -299,13 +256,9 @@ fn run_dev(args: DevArgs) {
         None
     };
 
-    // Trailing debounce: the first change arms a deadline; rapid follow-up saves
-    // (rustfmt, editor temp-file dances) collapse into a single rebuild.
     let debounce = Duration::from_millis(300);
     let mut rebuild_at: Option<Instant> = None;
 
-    // Supervise: stop on Ctrl-C, on Vite exiting, or (without --watch) on the
-    // backend exiting. Under --watch, rebuild and restart the backend on change.
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
@@ -356,8 +309,6 @@ fn run_dev(args: DevArgs) {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    // Signal each live process group: SIGTERM, brief grace, then SIGKILL so the
-    // ports are always freed even if a child ignores the term.
     terminate_group(&mut vite, Duration::from_secs(2));
     if let Some(mut child) = serve.take() {
         terminate_group(&mut child, Duration::from_secs(2));
@@ -376,19 +327,10 @@ fn generate_cli_docs() {
     println!("Generated CLI documentation at {}", output_path.display());
 }
 
-/// The clap command tree, flattened into the three questions the skill check
-/// asks of a command path it read out of a skill file.
 #[derive(Default)]
 struct CliTree {
-    /// Canonical `aoe <path>` subcommand paths.
     commands: BTreeSet<String>,
-    /// Paths that take a subcommand of their own, so a word after one of them
-    /// is a subcommand name. After any other path it is a positional argument.
     parents: BTreeSet<String>,
-    /// Paths reachable through a `#[command(alias = ...)]`. Accepted as input
-    /// but kept out of the advisory: `aoe ls` in a skill file is not a
-    /// documentation gap for `aoe list`, and aliases are absent from
-    /// `docs/cli/reference.md` on purpose.
     aliases: BTreeSet<String>,
 }
 
@@ -399,15 +341,8 @@ impl CliTree {
         tree
     }
 
-    /// Walks each spelling of each command, so a subcommand is recorded under
-    /// its parent's aliases as well as its parent's name. Recursing only under
-    /// the canonical name leaves `<alias> <sub>` in no set at all, and a parent
-    /// path followed by an unknown word reports as nonexistent: a red check on
-    /// correct documentation.
-    ///
-    /// `aliased` tracks whether any segment so far was an alias. One anywhere
-    /// in the path keeps the whole path out of the advisory, since `aoe grp
-    /// create` is not a documentation gap for `aoe group create`.
+    /// Walks every spelling of each command so `<alias> <sub>` resolves; any alias segment
+    /// keeps the path out of the advisory.
     fn walk(&mut self, cmd: &clap::Command, prefix: &str, aliased: bool) {
         for sub in cmd.get_subcommands() {
             if sub.get_name() == "help" {
@@ -443,16 +378,9 @@ impl CliTree {
     }
 }
 
-/// The spans of a markdown file where `aoe` is a command rather than the
-/// ordinary English word it also is in these files: fenced code blocks, and
-/// inline backtick spans in prose.
-///
-/// Spans are line-local, which is also what keeps the frontmatter's
-/// `name: aoe` from reading as an invocation of whatever the next line
-/// starts with.
+/// Fenced code and inline backtick spans only; spans are line-local.
 fn code_spans(content: &str) -> Vec<&str> {
-    // Only a shell fence holds commands. A `json` or `text` fence is data, and
-    // the `#` truncation below would read a payload as a shell comment.
+    // A `json` or `text` fence is data, and `#` truncation would misread a payload.
     fn is_shell_fence(info: &str) -> bool {
         matches!(
             info.trim(),
@@ -461,9 +389,7 @@ fn code_spans(content: &str) -> Vec<&str> {
     }
 
     let mut spans = Vec::new();
-    // `Some(is_shell)` while inside a fence. Tracking "inside" separately from
-    // "is shell" is what keeps a `json` fence's closing marker from reading as
-    // the opening of a shell one and inverting every fence after it.
+    // Tracks "inside" separately from "is shell" so a data fence's close cannot open a shell one.
     let mut fence: Option<bool> = None;
     for line in content.lines() {
         if let Some(info) = line.trim_start().strip_prefix("```") {
@@ -477,15 +403,10 @@ fn code_spans(content: &str) -> Vec<&str> {
             if !is_shell {
                 continue;
             }
-            // Truncated at `#`, which is a comment in every shell fence these
-            // files use. Prose naming a command is common there and is not an
-            // invocation; dropping the tail can only under-check, never
-            // redden a documentation edit.
+            // `#` starts a shell comment; dropping the tail can only under-check.
             spans.push(line.split('#').next().unwrap_or(line));
             continue;
         }
-        // An odd part count means the backticks pair up. Otherwise the spans
-        // on this line cannot be told from its prose, so it is skipped.
         let parts: Vec<&str> = line.split('`').collect();
         if parts.len() % 2 == 1 {
             spans.extend(parts.iter().skip(1).step_by(2));
@@ -494,8 +415,6 @@ fn code_spans(content: &str) -> Vec<&str> {
     spans
 }
 
-/// Every `aoe <words>` invocation in `content`'s code spans, as the words that
-/// were read rather than the prefix of them that happened to resolve.
 fn read_invocations(content: &str) -> Vec<Vec<String>> {
     let re = regex::Regex::new(r"\baoe[ \t]+([a-z][a-z0-9 \t-]*)").unwrap();
     let mut invocations = Vec::new();
@@ -503,9 +422,7 @@ fn read_invocations(content: &str) -> Vec<Vec<String>> {
         for cap in re.captures_iter(span) {
             let words: Vec<String> = cap[1]
                 .split_whitespace()
-                // A leading `-` is a flag, not a subcommand: the capture runs
-                // through `--json` and friends because `-` is a legal
-                // character inside a command name too.
+                // A leading `-` is a flag, not a subcommand.
                 .take_while(|w| {
                     !w.starts_with('-') && w.chars().all(|c| c.is_ascii_lowercase() || c == '-')
                 })
@@ -519,11 +436,8 @@ fn read_invocations(content: &str) -> Vec<Vec<String>> {
     invocations
 }
 
-/// Resolve one invocation against the CLI tree.
-///
-/// `Ok(Some(path))` is a canonical command to credit in the advisory,
-/// `Ok(None)` an alias or a bare prefix with nothing to credit, and `Err` the
-/// command text to report as nonexistent.
+/// `Ok(Some(path))` credits a canonical command, `Ok(None)` an alias or bare prefix, and
+/// `Err` is text to report as nonexistent.
 fn resolve_invocation(words: &[String], cli: &CliTree) -> Result<Option<String>, String> {
     let mut resolved: Option<(String, usize)> = None;
     let mut path = String::new();
@@ -541,9 +455,6 @@ fn resolve_invocation(words: &[String], cli: &CliTree) -> Result<Option<String>,
     let Some((resolved, consumed)) = resolved else {
         return Err(words[0].clone());
     };
-    // A word after a leaf command is a positional argument (`aoe group create
-    // mygroup`); after a command that takes subcommands it is a subcommand
-    // name, and an unknown one is the bug this check exists for.
     if cli.parents.contains(&resolved) {
         if let Some(next) = words.get(consumed) {
             return Err(format!("{resolved} {next}"));
@@ -552,8 +463,6 @@ fn resolve_invocation(words: &[String], cli: &CliTree) -> Result<Option<String>,
     Ok(cli.commands.contains(&resolved).then_some(resolved))
 }
 
-/// Check every `aoe ...` invocation in one skill file, returning the canonical
-/// commands to credit in the advisory and the nonexistent ones to report.
 fn check_invocations(content: &str, cli: &CliTree) -> (BTreeSet<String>, BTreeSet<String>) {
     let mut referenced = BTreeSet::new();
     let mut unknown = BTreeSet::new();
@@ -571,13 +480,10 @@ fn check_invocations(content: &str, cli: &CliTree) -> (BTreeSet<String>, BTreeSe
     (referenced, unknown)
 }
 
-/// How the skill's published version is sourced, which determines whether a
-/// top-level `version:` field is allowed in the frontmatter.
 enum VersionRule {
-    /// clawhub manages the version via `_meta.json` and the release workflow's
-    /// `--version` flag, so a static `version:` field would go stale: forbid it.
+    /// clawhub manages the version via `_meta.json`, so a static field would go stale.
     Forbidden,
-    /// The Hermes Skills Hub requires a top-level `version:` field: require it.
+    /// The Hermes Skills Hub requires a top-level `version:` field.
     Required,
 }
 
@@ -587,7 +493,6 @@ fn check_skill() {
         ("contrib/hermes-skill/SKILL.md", VersionRule::Required),
     ];
 
-    // Build the clap command tree once; shared across every skill file.
     let cli = CliTree::from_command(&agent_of_empires::cli::Cli::command());
 
     let mut has_error = false;
@@ -608,7 +513,6 @@ fn check_skill() {
         }
     }
 
-    // Advisory: CLI commands not referenced in any skill file.
     let mut missing_from_skill = Vec::new();
     for cli_cmd in &cli.commands {
         let mentioned = referenced.iter().any(|s| {
@@ -635,9 +539,6 @@ fn check_skill() {
     println!("Skill check passed.");
 }
 
-/// Validate one skill file's frontmatter version rule and command references.
-/// Referenced commands are accumulated into `referenced` for the shared
-/// advisory. Returns `true` if an error was found.
 fn check_skill_file(
     path_str: &str,
     content: &str,
@@ -716,25 +617,15 @@ mod skill_check_tests {
                 "Two `aoe list` and `aoe group` spans.",
                 &["aoe list", "aoe group"],
             ),
-            // Prose is not code: `aoe` is an ordinary word in these files.
             ("Use aoe list to see sessions.", &[]),
-            // One backtick cannot delimit a span, so the line is skipped.
             ("A stray ` and aoe list after it.", &[]),
-            // Line-local, so frontmatter cannot join two keys into a command.
             ("name: aoe\ndescription: something", &[]),
-            // A `#` comment inside a fence is prose about a command, not an
-            // invocation of one, so the tail is dropped.
             ("```sh\n# aoe list is the listing\n```", &[""]),
             ("```sh\naoe list # lists them\n```", &["aoe list "]),
-            // Neither tilde fences nor indented blocks are code context here.
             ("~~~\naoe list\n~~~", &[]),
             ("    aoe list", &[]),
-            // A non-shell fence is data. Reading it as commands turned a
-            // sample payload or a prose block into a red check.
             ("```json\n\"note\": \"aoe manages sessions\"\n```", &[]),
             ("```text\naoe makes it easy to run agents\n```", &[]),
-            // Its closing marker must not open a shell fence: that inverts
-            // every fence after it, which silently drops real coverage.
             (
                 "```json\n{}\n```\nprose aoe here\n```sh\naoe list\n```",
                 &["aoe list"],
@@ -748,36 +639,26 @@ mod skill_check_tests {
 
     #[test]
     fn invocations_resolve_credit_and_reject() {
-        // (content, credited commands, commands reported as nonexistent)
         let cases: &[(&str, &[&str], &[&str])] = &[
             ("`aoe list`", &["list"], &[]),
             ("`aoe session capture`", &["session capture"], &[]),
-            // #3479: none of these three could be reported before, and the
-            // middle one also suppressed every `aoe session *` advisory entry.
             ("`aoe totallybogus`", &[], &["totallybogus"]),
             ("`aoe session bogusverb`", &[], &["session bogusverb"]),
             ("`aoe session pin`", &[], &["session pin"]),
-            // A word after a leaf is a positional argument, not a subcommand.
             ("`aoe group create mygroup`", &["group create"], &[]),
             ("`aoe session capture my-id`", &["session capture"], &[]),
-            // An alias is accepted as input but credits no canonical command.
             ("`aoe ls`", &[], &[]),
             ("`aoe group ls`", &[], &[]),
-            // Flags and placeholders end the command path. A flag after a
-            // command that takes subcommands is still a flag.
             ("`aoe list --json`", &["list"], &[]),
             ("`aoe group --help`", &["group"], &[]),
             ("`aoe session --json`", &["session"], &[]),
             ("`aoe session capture <id>`", &["session capture"], &[]),
-            // A bare prefix is a real reference with nothing extra to check.
             ("`aoe session`", &["session"], &[]),
-            // Repeats report once.
             (
                 "`aoe totallybogus` and `aoe totallybogus`",
                 &[],
                 &["totallybogus"],
             ),
-            // Prose is not scanned, so neither half of this is read.
             ("Use aoe totallybogus freely.", &[], &[]),
         ];
         let cli = tree();
@@ -788,10 +669,6 @@ mod skill_check_tests {
         }
     }
 
-    /// A parent reached through an alias still has subcommands. Before this,
-    /// `walk` recursed only under the canonical name, so `grp create` was in
-    /// neither `commands` nor `aliases`, `grp` resolved as a parent, and the
-    /// trailing word reported as a command that does not exist.
     #[test]
     fn aliases_expand_into_their_subcommand_paths() {
         let cmd = clap::Command::new("aoe").subcommand(
@@ -808,11 +685,9 @@ mod skill_check_tests {
             set(&["group", "group create"]),
             "only the fully canonical paths belong in the advisory"
         );
-        // The parent rule still has to catch a bad subcommand under the alias.
         let (credited, unknown) = check_invocations("`aoe grp bogusverb`", &cli);
         assert!(credited.is_empty());
         assert_eq!(unknown, set(&["grp bogusverb"]));
-        // And a real one through the alias must stay silent.
         let (credited, unknown) = check_invocations("`aoe grp create mygroup`", &cli);
         assert!(credited.is_empty() && unknown.is_empty());
     }
@@ -821,8 +696,6 @@ mod skill_check_tests {
     fn aliases_are_read_from_the_clap_tree() {
         use clap::CommandFactory;
         let cli = CliTree::from_command(&agent_of_empires::cli::Cli::command());
-        // `collect_subcommand_paths` recorded `get_name()` only, so every
-        // `#[command(alias = ...)]` read as a nonexistent command (#3479).
         assert!(!cli.aliases.is_empty(), "the CLI declares command aliases");
         assert!(
             cli.aliases
@@ -839,27 +712,25 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn rust_sources_are_relevant() {
-        assert!(is_watch_relevant(Path::new("src/main.rs")));
-        assert!(is_watch_relevant(Path::new("src/server/mod.rs")));
-        assert!(is_watch_relevant(Path::new(
-            "/abs/agent-of-empires/src/tui/app.rs"
-        )));
-    }
-
-    #[test]
-    fn cargo_manifests_are_relevant() {
-        assert!(is_watch_relevant(Path::new("Cargo.toml")));
-        assert!(is_watch_relevant(Path::new("./Cargo.lock")));
-        assert!(is_watch_relevant(Path::new("/abs/repo/Cargo.toml")));
-    }
-
-    #[test]
-    fn unrelated_paths_are_ignored() {
-        assert!(!is_watch_relevant(Path::new("README.md")));
-        assert!(!is_watch_relevant(Path::new("target/debug/aoe")));
-        assert!(!is_watch_relevant(Path::new(".git/index")));
-        assert!(!is_watch_relevant(Path::new("Cargo.toml.swp")));
-        assert!(!is_watch_relevant(Path::new("web/src/App.tsx")));
+    fn only_rust_sources_and_cargo_manifests_trigger_a_rebuild() {
+        for relevant in [
+            "src/main.rs",
+            "src/server/mod.rs",
+            "/abs/agent-of-empires/src/tui/app.rs",
+            "Cargo.toml",
+            "./Cargo.lock",
+            "/abs/repo/Cargo.toml",
+        ] {
+            assert!(is_watch_relevant(Path::new(relevant)), "{relevant}");
+        }
+        for ignored in [
+            "README.md",
+            "target/debug/aoe",
+            ".git/index",
+            "Cargo.toml.swp",
+            "web/src/App.tsx",
+        ] {
+            assert!(!is_watch_relevant(Path::new(ignored)), "{ignored}");
+        }
     }
 }

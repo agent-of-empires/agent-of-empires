@@ -22,10 +22,7 @@ interface Props {
   onClose: () => void;
 }
 
-/** Mobile-only bottom sheet that promotes the chosen view into the single
- *  full-viewport main pane (#1452). Replaces the old slide-in right-panel
- *  overlay, which collapsed the paired terminal to zero height under the
- *  soft keyboard. */
+/** Mobile-only bottom sheet that promotes the chosen view into the single full-viewport main pane. */
 export function MobileRightPanelPicker({ open, active, pluginPanes, onSelect, onClose }: Props) {
   // Close on Escape, matching the other dismissible overlays.
   useEffect(() => {

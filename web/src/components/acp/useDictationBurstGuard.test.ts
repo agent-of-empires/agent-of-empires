@@ -1,16 +1,8 @@
 // @vitest-environment jsdom
-//
-// Imperative-side tests for useDictationBurstGuard, the iOS-Safari
-// dictation glue extracted from Composer.tsx (#1431). The pure
-// decideDictationAction matrix is covered separately by
-// Composer.dictation.test.ts; this file covers the hook wiring (refs,
-// burst timer, setText sink, unmount cleanup) without mounting the
-// whole composer + assistant-ui runtime.
-
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { renderHook, act } from "@testing-library/react";
 
-import { DICTATION_BURST_TIMEOUT_MS, useDictationBurstGuard } from "./useDictationBurstGuard";
+import { DICTATION_BURST_TIMEOUT_MS, decideDictationAction, useDictationBurstGuard } from "./useDictationBurstGuard";
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -188,5 +180,45 @@ describe("useDictationBurstGuard (#1431)", () => {
     });
     expect(setText).toHaveBeenCalledExactlyOnceWith("hello world");
     expect(calls).toBe(1);
+  });
+});
+
+describe("decideDictationAction", () => {
+  const active = { active: true, sinceMs: 1000 } as const;
+  const inactive = { active: false } as const;
+  const enter = {
+    next: { active: true, sinceMs: 1300 },
+    suppressUpstreamChange: true,
+    flushPending: false,
+    armTimeoutMs: DICTATION_BURST_TIMEOUT_MS,
+  };
+  const end = (flushPending: boolean) => ({
+    next: { active: false },
+    suppressUpstreamChange: false,
+    flushPending,
+    armTimeoutMs: null,
+  });
+  it.each([
+    [
+      "inactive replacement enters",
+      inactive,
+      { kind: "input", inputType: "insertReplacementText", nowMs: 1300 },
+      enter,
+    ],
+    ["active replacement extends", active, { kind: "input", inputType: "insertReplacementText", nowMs: 1300 }, enter],
+    ["active timeout flushes", active, { kind: "timeout", nowMs: 2300 }, end(true)],
+    ["active blur flushes", active, { kind: "blur" }, end(true)],
+    [
+      "active typing flushes without suppressing",
+      active,
+      { kind: "input", inputType: "insertText", nowMs: 1100 },
+      end(true),
+    ],
+    ["active backspace flushes", active, { kind: "input", inputType: "deleteContentBackward", nowMs: 1100 }, end(true)],
+    ["inactive typing is a no-op", inactive, { kind: "input", inputType: "insertText", nowMs: 1000 }, end(false)],
+    ["inactive blur is a no-op", inactive, { kind: "blur" }, end(false)],
+    ["stale timeout is a no-op", inactive, { kind: "timeout", nowMs: 5000 }, end(false)],
+  ] as const)("%s", (_label, prev, ev, expected) => {
+    expect(decideDictationAction(prev, ev)).toEqual(expected);
   });
 });

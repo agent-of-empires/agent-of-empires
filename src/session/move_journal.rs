@@ -1,27 +1,4 @@
-//! Durable journal for cross-profile session moves (#3459).
-//!
-//! `Storage::move_instances_to_inner` writes target rows before removing
-//! source rows, so a crash in between leaves the same session id in two
-//! profiles. This module is the evidence that arbitrates such states: one
-//! versioned JSON file per attempted move, stored under the source profile's
-//! directory (`.move-journal/` next to `sessions.json`), written (and fsynced)
-//! before the first mutation and deleted only after the move completed or a
-//! recovery pass consumed it.
-//!
-//! The journal lives with the source store instead of a global app-dir folder
-//! so its lifetime is bounded by exactly the stores it arbitrates between,
-//! and tests driving `Storage` at arbitrary paths stay hermetic without
-//! process-global coordination. Successfully completed or reconciled entries
-//! are consumed; permanently unusable entries intentionally remain for manual
-//! inspection and have no automatic GC.
-//!
-//! Winner policy: a valid, current-version journal entry is proof that a move
-//! was in flight between exactly the two recorded stores. Because the
-//! transaction publishes the target before touching the source, whichever
-//! store currently holds the id is the winner; the other copy loses. No
-//! iteration order is ever consulted. An entry that cannot be parsed or
-//! whose version differs is treated as insufficient evidence: the duplicate
-//! is surfaced for manual resolution instead of arbitrated.
+//! Durable journal for cross-profile session moves.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -68,9 +45,7 @@ fn journal_dir_for(sessions_path: &Path) -> PathBuf {
         .join(JOURNAL_DIR_NAME)
 }
 
-/// Persist one entry next to the source profile's `sessions.json` and return
-/// its path. The write is atomic and fsynced (file content plus parent
-/// directory), so once [`record`] returns Ok the entry survives a power loss.
+/// Persist one entry next to the source profile's `sessions.json` and return its path.
 pub(crate) fn record(entry: &MoveJournalEntry, source_sessions_path: &Path) -> Result<PathBuf> {
     record_with_sync(entry, source_sessions_path, sync_parent_directory)
 }
@@ -86,8 +61,6 @@ where
     let dir = journal_dir_for(source_sessions_path);
     fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
     // create_dir_all only makes the new journal directory itself visible.
-    // Sync its profile parent too so the .move-journal directory entry
-    // survives power loss before any profile mutation is allowed to run.
     sync(&dir)
         .with_context(|| format!("journal directory {} was not made durable", dir.display()))?;
     let nanos = std::time::SystemTime::now()
@@ -126,17 +99,13 @@ pub(crate) fn consume(path: &Path) -> Result<()> {
         .with_context(|| format!("removal of {} was not made durable", path.display()))
 }
 
-/// Result of scanning every loaded profile's journal directory. Entry results
-/// always name journal files; directory-list failures stay transient and
-/// separate, so callers never blacklist a directory as bad journal evidence.
+/// Result of scanning every loaded profile's journal directory.
 pub(crate) struct ScanResult {
     pub(crate) entries: Vec<(PathBuf, std::result::Result<MoveJournalEntry, String>)>,
     pub(crate) unreadable_dirs: Vec<(PathBuf, String)>,
 }
 
-/// Every journal file under each given profile directory paired with its parse
-/// outcome. Err covers unreadable files, malformed JSON, and wrong-version
-/// entries. Directory-listing failures are retried on later scans.
+/// Every journal file under each given profile directory paired with its parse outcome.
 pub(crate) fn scan(sessions_paths: impl IntoIterator<Item = PathBuf>) -> ScanResult {
     let mut result = ScanResult {
         entries: Vec::new(),

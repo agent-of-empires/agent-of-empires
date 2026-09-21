@@ -1,16 +1,8 @@
 import type { SessionResponse, SessionStatus } from "./types";
 
-/** How long a Stop-hooked Idle session keeps the freshness signal active
- *  (animated icon, fresh-idle color, "needs attention" bucketing).
- *  Default is 0: the dashboard does not light up freshly-stopped
- *  sessions, mirroring the Rust default for `Config.theme.idle_decay_minutes`.
- *
- *  Helpers below accept an optional `windowMs` override so a future
- *  client-side fetch of the server's configured value (#874) can opt in
- *  without changing the call sites. Pass a positive number to enable. */
+/** Freshness window for Stop-hooked Idle sessions; 0 (off) mirrors the Rust `theme.idle_decay_minutes` default. */
 export const IDLE_DECAY_WINDOW_MS = 0;
 
-/** Tailwind class for status dot background color by session status */
 export const STATUS_DOT_CLASS: Record<SessionStatus, string> = {
   Running: "bg-status-running",
   Waiting: "bg-status-waiting",
@@ -23,7 +15,6 @@ export const STATUS_DOT_CLASS: Record<SessionStatus, string> = {
   Creating: "bg-status-starting",
 };
 
-/** Tailwind class for status text color by session status */
 export const STATUS_TEXT_CLASS: Record<SessionStatus, string> = {
   Running: "text-status-running",
   Waiting: "text-status-waiting",
@@ -36,10 +27,7 @@ export const STATUS_TEXT_CLASS: Record<SessionStatus, string> = {
   Creating: "text-status-starting",
 };
 
-/** Milliseconds since this session most recently transitioned into Idle.
- *  Returns null for non-Idle sessions, sessions without an
- *  `idle_entered_at` timestamp (legacy state), or timestamps in the future
- *  (clock skew). */
+/** Null unless Idle with a non-future `idle_entered_at`. */
 export function idleAgeMs(session: Pick<SessionResponse, "status" | "idle_entered_at">): number | null {
   if (session.status !== "Idle") return null;
   if (!session.idle_entered_at) return null;
@@ -49,12 +37,7 @@ export function idleAgeMs(session: Pick<SessionResponse, "status" | "idle_entere
   return age >= 0 ? age : null;
 }
 
-/** True when the session is Idle and within `windowMs` of the Stop hook.
- *  Treated as "needs attention" alongside Waiting. Defaults to the
- *  module-level `IDLE_DECAY_WINDOW_MS` (0, i.e. off) so the freshness
- *  signal is opt-in across the dashboard. Pass a positive override to
- *  enable for a specific call site (or once #874 lands, fetch the
- *  server's configured value and thread it through). */
+/** Idle within `windowMs` of the Stop hook, which counts as needing attention. */
 export function isFreshIdle(
   session: Pick<SessionResponse, "status" | "idle_entered_at">,
   windowMs: number = IDLE_DECAY_WINDOW_MS,
@@ -64,17 +47,12 @@ export function isFreshIdle(
   return age !== null && age < windowMs;
 }
 
-/** Background-color class for a session's status dot. Returns the standard
- *  status class for non-Idle states; for Idle, picks a fresh / decayed tier
- *  based on `idle_entered_at`. Two tiers (rather than continuous color-mix)
- *  keeps the class set static so Tailwind's JIT picks them up reliably. */
+/** Idle picks a fresh or decayed tier; static classes keep Tailwind's JIT happy. */
 export function getStatusDotClass(
   session: Pick<SessionResponse, "status" | "idle_entered_at" | "dormant">,
   windowMs: number = IDLE_DECAY_WINDOW_MS,
 ): string {
-  // A dormant (idle-reaped, resumable) worker gets its own dim-amber dot,
-  // taking precedence over the raw status. The server only reports `dormant`
-  // true for a non-Stopped row, so a deliberate Stop still renders grey. See #2250.
+  // A dormant worker gets its own dim-amber dot; a deliberate Stop is never dormant.
   if (session.dormant) {
     return "bg-status-dormant";
   }
@@ -84,7 +62,6 @@ export function getStatusDotClass(
   return STATUS_DOT_CLASS[session.status] ?? "bg-status-idle";
 }
 
-/** Text-color class equivalent of `getStatusDotClass`. */
 export function getStatusTextClass(
   session: Pick<SessionResponse, "status" | "idle_entered_at" | "dormant">,
   windowMs: number = IDLE_DECAY_WINDOW_MS,
@@ -98,9 +75,7 @@ export function getStatusTextClass(
   return STATUS_TEXT_CLASS[session.status] ?? "text-status-idle";
 }
 
-/** Whether a session status means the agent is actively doing something or
- *  has just finished and is awaiting the user's next prompt. Fresh-idle is
- *  bucketed with active so dashboard counts and filters surface it. */
+/** Fresh-idle counts as active. */
 export function isSessionActive(
   session: Pick<SessionResponse, "status" | "idle_entered_at"> | SessionStatus,
   windowMs: number = IDLE_DECAY_WINDOW_MS,

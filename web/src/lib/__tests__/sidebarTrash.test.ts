@@ -1,9 +1,5 @@
 // @vitest-environment jsdom
 
-// Vitest coverage for the trash sidebar predicates (#2489): a workspace is
-// "trashed" only when every session carries trashed_at, and "sunk" counts
-// trashed alongside archived/snoozed.
-
 import { describe, expect, it } from "vitest";
 import type { SessionResponse, Workspace } from "../types";
 import { workspaceIsSunk, workspaceIsTrashed, workspaceTrashedAtMs } from "../sidebarSort";

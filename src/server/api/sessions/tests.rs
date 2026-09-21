@@ -1,12 +1,10 @@
 use super::*;
 
 /// `remove_instance` is the only way a row leaves `state.instances` on the
-/// delete path, so the epoch bump has to be tied to an actual removal
-/// rather than to reaching the call. Bumping unconditionally would spend
-/// an epoch on the final commit block after the structured purge's early
-/// removal already took the row, dropping a reload that was perfectly
-/// valid; not bumping at all leaves the window a stale reload uses to put
-/// a deleted row back.
+/// delete path, so the epoch bump must be tied to an actual removal: bumping
+/// unconditionally would spend an epoch on the final commit block after the
+/// early removal already took the row, and not bumping leaves a window a stale
+/// reload uses to put a deleted row back.
 #[test]
 fn remove_instance_bumps_the_epoch_only_when_it_removes_a_row() {
     let epoch = std::sync::atomic::AtomicU64::new(0);
@@ -27,9 +25,8 @@ fn remove_instance_bumps_the_epoch_only_when_it_removes_a_row() {
         vec!["keep"]
     );
 
-    // The structured purge reaches the final commit block after its early
-    // removal already took the row. Nothing left to remove, nothing to
-    // invalidate, so no epoch is spent.
+    // The final commit block runs after the early removal already took the
+    // row, so no epoch is spent.
     remove_instance(&mut instances, &doomed_id, &epoch);
     assert_eq!(read(), 1, "a no-op removal does not bump");
 
@@ -105,9 +102,9 @@ async fn rename_session_rejects_duplicate_and_preserves_newer_cache() {
             Ok(())
         })
         .unwrap();
-    // A user action can advance the live cache while the disk snapshot the
-    // rename will persist still has the older row. Publication must patch
-    // only rename-owned identity fields, not replace this favorite.
+    // A user action can advance the live cache while the disk snapshot still
+    // has the older row, so publication must patch only rename-owned identity
+    // fields.
     state
         .instances
         .write()
@@ -151,13 +148,7 @@ async fn rename_session_rejects_tied_drifted_path_collision() {
     existing.source_profile = "default".to_string();
     let mut drifted = Instance::new("main branch", "/tmp/worktrees/drifted");
     drifted.source_profile = "default".to_string();
-    drifted.worktree_info = Some(crate::session::WorktreeInfo {
-        branch: "main-branch".to_string(),
-        main_repo_path: "/tmp/repo".to_string(),
-        managed_by_aoe: true,
-        created_at: chrono::Utc::now(),
-        base_branch: None,
-    });
+    drifted.worktree_info = Some(worktree("main-branch", "/tmp/repo".to_string(), None));
     let drifted_id = drifted.id.clone();
     let (_storage, state) = build_rename_test_state(
         vec![existing.clone(), drifted.clone()],
@@ -339,9 +330,8 @@ mod workspace_deletion {
 
     #[test]
     fn duplicate_owner_still_removes_the_worktree() {
-        // #2536 review: ["owner", "owner"] must not delete the owner with
-        // sibling (record-only) flags and then skip the repeat. After
-        // dedupe the single owner entry keeps the real worktree flags.
+        // #2536 review: after dedupe the single owner entry keeps the real
+        // worktree flags rather than the record-only sibling ones.
         let ids = dedupe_session_ids(&["owner".to_string(), "owner".to_string()]);
         assert_eq!(ids, vec!["owner"]);
         let plan = order_workspace_deletion(&ids, &body());
@@ -365,8 +355,7 @@ mod cityhall_capability {
 
     #[test]
     fn builtin_agent_is_acp_capable() {
-        // Built-in ACP agents resolve via the registry without reading
-        // config, so the gate accepts them regardless of the project path.
+        // Built-in ACP agents resolve via the registry without reading config.
         assert!(agent_is_acp_capable(
             "default",
             std::path::Path::new("/nonexistent"),
@@ -379,10 +368,8 @@ mod cityhall_capability {
     #[serial]
     fn an_explicit_agent_name_keys_the_custom_acp_cmd_lookup() {
         // An explicit `agent_name` can point at a different `agent_acp_cmd`
-        // entry than `tool`, and `resolve_agent_spec` resolves the custom map
-        // by that same name. Keying this lookup off `tool` reported
-        // not-capable for an agent that spawns fine, which skipped the
-        // up-front 403 in favor of a late refusal at spawn.
+        // entry than `tool`, so keying the lookup off `tool` reported
+        // not-capable for an agent that spawns fine.
         let _tmp = isolate_app_dir();
         crate::session::config::update_config(|c| {
             c.session
@@ -414,11 +401,10 @@ mod cityhall_capability {
         ));
     }
 
-    /// Why `acp_enable` gates on this predicate and not on
-    /// `pick_agent_for_tool`: the default-agent fallback always names a
-    /// registry entry, so a post-fallback registry lookup reports every
-    /// tool capable and would switch a terminal-only session into a
-    /// structured one running some other agent.
+    /// Why `acp_enable` gates on this predicate and not `pick_agent_for_tool`:
+    /// the default-agent fallback always names a registry entry, so a
+    /// post-fallback lookup reports every tool capable and would switch a
+    /// terminal-only session into a structured one running some other agent.
     #[test]
     #[serial]
     fn the_default_agent_fallback_is_not_a_capability_signal() {
@@ -449,25 +435,57 @@ mod artifact_route {
     use axum::http::header;
     use serial_test::serial;
 
+    /// #2587: a type that can execute script as a top-level document must
+    /// download rather than render inline, because the frontend opens artifacts
+    /// via a same-origin blob URL. Passive types stay inline with `nosniff`.
     #[tokio::test]
     #[serial]
-    async fn serves_image_with_nosniff() {
+    async fn serves_passive_types_inline_and_scriptable_ones_as_attachments() {
         let _tmp = isolate_app_dir();
         let id = format!("art-{}", uuid::Uuid::new_v4());
         let dir = crate::session::artifacts::session_artifact_dir(&id).unwrap();
-        std::fs::write(dir.join("shot.png"), b"\x89PNG\r\n").unwrap();
-        let resp = serve_session_artifact(AxumPath((id, "shot.png".to_string())))
-            .await
-            .into_response();
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(
-            resp.headers().get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
-            "nosniff"
-        );
-        assert_eq!(
-            resp.headers().get(header::CONTENT_TYPE).unwrap(),
-            "image/png"
-        );
+
+        // (file name, bytes, content type, expected Content-Disposition)
+        let cases: [(&str, &[u8], &str, Option<&str>); 3] = [
+            ("shot.png", b"\x89PNG\r\n", "image/png", None),
+            (
+                "d.svg",
+                b"<svg xmlns='http://www.w3.org/2000/svg'></svg>",
+                "application/octet-stream",
+                Some("attachment"),
+            ),
+            (
+                "status.html",
+                b"<h1>hi</h1>",
+                "application/octet-stream",
+                Some("attachment"),
+            ),
+        ];
+
+        for (name, bytes, content_type, disposition) in cases {
+            std::fs::write(dir.join(name), bytes).unwrap();
+            let resp = serve_session_artifact(AxumPath((id.clone(), name.to_string())))
+                .await
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::OK, "{name}");
+            assert_eq!(
+                resp.headers().get(header::CONTENT_TYPE).unwrap(),
+                content_type,
+                "{name}"
+            );
+            assert_eq!(
+                resp.headers().get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
+                "nosniff",
+                "{name}"
+            );
+            assert_eq!(
+                resp.headers()
+                    .get(header::CONTENT_DISPOSITION)
+                    .map(|v| v.to_str().unwrap()),
+                disposition,
+                "{name}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -483,55 +501,6 @@ mod artifact_route {
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
         assert!(body.is_empty(), "unexpected body: {body:?}");
     }
-
-    #[tokio::test]
-    #[serial]
-    async fn serves_svg_as_attachment() {
-        // #2587: SVG can execute script as a top-level document, and the
-        // frontend opens artifacts via a same-origin blob URL, so SVG must
-        // download rather than render inline.
-        let _tmp = isolate_app_dir();
-        let id = format!("art-{}", uuid::Uuid::new_v4());
-        let dir = crate::session::artifacts::session_artifact_dir(&id).unwrap();
-        std::fs::write(
-            dir.join("d.svg"),
-            b"<svg xmlns='http://www.w3.org/2000/svg'></svg>",
-        )
-        .unwrap();
-        let resp = serve_session_artifact(AxumPath((id, "d.svg".to_string())))
-            .await
-            .into_response();
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(
-            resp.headers().get(header::CONTENT_TYPE).unwrap(),
-            "application/octet-stream"
-        );
-        assert_eq!(
-            resp.headers().get(header::CONTENT_DISPOSITION).unwrap(),
-            "attachment"
-        );
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn serves_html_as_attachment() {
-        let _tmp = isolate_app_dir();
-        let id = format!("art-{}", uuid::Uuid::new_v4());
-        let dir = crate::session::artifacts::session_artifact_dir(&id).unwrap();
-        std::fs::write(dir.join("status.html"), b"<h1>hi</h1>").unwrap();
-        let resp = serve_session_artifact(AxumPath((id, "status.html".to_string())))
-            .await
-            .into_response();
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(
-            resp.headers().get(header::CONTENT_TYPE).unwrap(),
-            "application/octet-stream"
-        );
-        assert_eq!(
-            resp.headers().get(header::CONTENT_DISPOSITION).unwrap(),
-            "attachment"
-        );
-    }
 }
 
 fn make_test_instance() -> Instance {
@@ -542,21 +511,29 @@ fn make_test_instance() -> Instance {
     inst
 }
 
-// Regression witness for #2603: the ACP-capability overlay and the
-// smart-rename indicator overlay share ONE per-request cache of the
-// resolved `SessionConfig` keyed by (profile, project_path). Three
-// instances covering two unique pairs must trigger exactly two calls
-// into `resolve_config_with_repo_or_warn`, not three (per row) and not
-// four (two independent per-overlay caches, the pre-#2603 state).
-// A non-built-in tool is used so the ACP overlay does not short-circuit
-// on the built-in registry (`SessionResponse` sets `acp_capable=true`
-// in the constructor for built-ins, which would skip the resolver
-// lookup and hide any regression in the ACP overlay).
-// #3058 review: the force_smart_rename preflight must resolve config with
-// the repo-aware resolver so a repo-local agent_command_override is honored.
-// Reverting to the profile-only resolver would miss the override and fall
-// through to the "no prompt yet" path (both are 409, so this asserts the
-// body message, not just the status).
+fn worktree(
+    branch: &str,
+    main_repo_path: impl Into<String>,
+    base_branch: Option<&str>,
+) -> crate::session::WorktreeInfo {
+    crate::session::WorktreeInfo {
+        branch: branch.to_string(),
+        main_repo_path: main_repo_path.into(),
+        managed_by_aoe: true,
+        created_at: chrono::Utc::now(),
+        base_branch: base_branch.map(str::to_string),
+    }
+}
+
+// Regression witness for #2603: the ACP-capability and smart-rename overlays
+// share ONE per-request `SessionConfig` cache keyed by (profile, project_path),
+// so three instances covering two unique pairs must trigger exactly two
+// resolver calls. A non-built-in tool is used so the ACP overlay does not
+// short-circuit on the built-in registry and hide a regression.
+// #3058 review: the preflight must resolve config with the repo-aware resolver
+// so a repo-local agent_command_override is honored; the profile-only resolver
+// would fall through to the "no prompt yet" path, which is also a 409, so this
+// asserts the body message rather than the status.
 #[tokio::test]
 #[serial_test::serial]
 async fn force_smart_rename_preflight_sees_command_override_but_not_from_a_repo() {
@@ -819,9 +796,8 @@ fn find_by_idempotency_key_matches_trashed_but_not_missing() {
 
 #[test]
 fn fork_from_builds_terminal_seed_for_claude() {
-    // A non-structured (terminal) fork resolves through the shared
-    // `terminal_fork_seed` helper; a claude parent id yields a Terminal
-    // seed whose child id is a fresh, valid session id.
+    // A non-structured fork resolves through `terminal_fork_seed`; a claude
+    // parent id yields a Terminal seed with a fresh, valid child id.
     let seed = resolve_create_fork_seed("claude", "parent-uuid", false)
         .expect("claude terminal fork allowed");
     match seed {
@@ -840,10 +816,9 @@ fn fork_from_builds_terminal_seed_for_claude() {
 
 #[test]
 fn fork_from_builds_structured_seed_when_view_is_structured() {
-    // A structured fork carries the parent's acp_session_id straight onto a
-    // Structured seed; the builder turns that into the one-shot
-    // fork_pending marker and the live session/fork handshake mints the
-    // child id. The terminal forkability check is intentionally skipped.
+    // A structured fork carries the parent's acp_session_id onto a Structured
+    // seed; the builder turns that into the one-shot fork_pending marker and the
+    // live session/fork handshake mints the child id.
     let seed = resolve_create_fork_seed("claude", "parent-acp-id", true)
         .expect("structured fork seed is always allowed at create time");
     assert_eq!(
@@ -941,9 +916,9 @@ fn both_import_and_fork_rejected() {
 
 #[test]
 fn invalid_fork_id_is_rejected_by_create_guard() {
-    // The create path gates `fork_from` on `is_valid_session_id` so a
-    // malformed id can't slip through to `build_fork_flags`, which fails
-    // closed (no fork flags) and would silently start a fresh session.
+    // `fork_from` is gated on `is_valid_session_id`, so a malformed id cannot
+    // reach `build_fork_flags`, which fails closed and would silently start a
+    // fresh session.
     use crate::session::capture::is_valid_session_id;
     assert!(!is_valid_session_id("../etc/passwd"));
     assert!(!is_valid_session_id("has spaces"));
@@ -1004,17 +979,15 @@ fn acp_can_fork_tracks_acp_capable_and_fork_strategy() {
     claude.tool = "claude".to_string();
     assert!(SessionResponse::from_instance(&claude, false).acp_can_fork);
 
-    // aoe-agent is ACP-capable (it is in the ACP registry) but declares no
-    // fork strategy, so it is NOT forkable. Gating the web Fork action on
-    // acp_session_id alone would offer a dead-end button for it; this is the
-    // signal that suppresses that.
+    // aoe-agent is ACP-capable but declares no fork strategy, so it is NOT
+    // forkable. Gating the web Fork action on acp_session_id alone would offer
+    // a dead-end button for it.
     let mut aoe_agent = make_test_instance();
     aoe_agent.tool = "aoe-agent".to_string();
     assert!(!SessionResponse::from_instance(&aoe_agent, false).acp_can_fork);
 
-    // codex has a real terminal fork strategy but its ACP adapter is not
-    // verified to implement `session/fork`, so the web signal must stay
-    // false rather than offer a fork the live handshake would refuse.
+    // codex has a terminal fork strategy but its ACP adapter is not verified
+    // to implement `session/fork`, so the web signal stays false.
     let mut codex = make_test_instance();
     codex.tool = "codex".to_string();
     assert!(!SessionResponse::from_instance(&codex, false).acp_can_fork);
@@ -1027,10 +1000,9 @@ fn acp_can_fork_tracks_acp_capable_and_fork_strategy() {
 
 #[test]
 fn trash_body_default_keeps_kill_pane_true() {
-    // #2523: a no-body trash request resolves through
-    // `unwrap_or_default()`. The derived `Default` would yield
-    // `kill_pane = false` and leave the pane running; the hand impl must
-    // match the serde field default.
+    // #2523: a no-body trash request resolves through `unwrap_or_default()`,
+    // and the derived `Default` would leave the pane running, so the hand impl
+    // must match the serde field default.
     assert!(TrashSessionBody::default().kill_pane);
 
     // An empty JSON object goes through serde, which honors the field
@@ -1045,10 +1017,9 @@ fn trash_body_default_keeps_kill_pane_true() {
 
 #[test]
 fn upsert_instance_replaces_same_id_instead_of_duplicating() {
-    // Race regression: `create_session` persists to disk before pushing
-    // the in-memory copy, so a `status_poll_loop` tick can load the row
-    // and insert it first. The handler's insert must replace that entry,
-    // not append a second one with the same id.
+    // `create_session` persists to disk before pushing the in-memory copy, so
+    // a `status_poll_loop` tick can insert the row first. The handler's insert
+    // must replace that entry, not append a duplicate id.
     let poll_loaded = make_test_instance();
     let id = poll_loaded.id.clone();
     let mut instances = vec![poll_loaded];
@@ -1083,11 +1054,9 @@ fn upsert_instance_appends_a_new_id() {
 }
 
 // Regression for #2363: a multi-repo workspace session carries
-// `workspace_info` and no `worktree_info`. The DTO must report
-// `has_cleanable_worktree: true` so the web delete dialog shows the
-// "Delete worktree" checkbox, while keeping `has_managed_worktree: false`
-// so worktree-only actions (sidebar "Edit workdir name", tie overlay) stay
-// hidden for workspace sessions.
+// `workspace_info` and no `worktree_info`, so the DTO must report
+// `has_cleanable_worktree: true` for the delete dialog's checkbox while keeping
+// `has_managed_worktree: false` so worktree-only actions stay hidden.
 #[test]
 fn from_instance_reports_managed_worktree_for_workspace_session() {
     let mut inst = make_test_instance();
@@ -1123,10 +1092,9 @@ fn from_instance_reports_managed_worktree_for_workspace_session() {
 #[test]
 #[serial_test::serial(hook_base)]
 fn from_instance_surfaces_hook_urgent_flag() {
-    // #1640: the web Attention sort needs `Instance::is_urgent()` on the
-    // wire. Write the hook-side attention.json the agent would emit and
-    // confirm it round-trips onto the response, then confirm a session
-    // with no hook file reports urgent: false.
+    // #1640: the web Attention sort needs `Instance::is_urgent()` on the wire.
+    // Write the hook-side attention.json the agent would emit and confirm it
+    // round-trips, then that a session with no hook file reports urgent: false.
     let (_g, _, _tmp_base) = crate::hooks::test_support::BaseGuard::ready();
     let inst = make_test_instance();
     let dir = crate::hooks::ensure_instance_dir_path(&inst.id)
@@ -1199,7 +1167,7 @@ fn public_create_session_error_hides_unsafe_messages() {
 }
 
 #[test]
-fn session_response_from_instance() {
+fn session_response_projects_core_instance_fields() {
     let inst = make_test_instance();
     let resp = SessionResponse::from_instance(&inst, false);
 
@@ -1216,7 +1184,6 @@ fn session_response_from_instance() {
 #[test]
 fn session_response_status_variants() {
     let mut inst = make_test_instance();
-
     for (status, expected) in [
         (Status::Running, "Running"),
         (Status::Waiting, "Waiting"),
@@ -1236,56 +1203,44 @@ fn session_response_status_variants() {
 #[test]
 fn session_response_dormant_reflects_shown_dormant() {
     let mut inst = make_test_instance();
-
-    // Live idle: not dormant.
     inst.status = Status::Idle;
     assert!(!SessionResponse::from_instance(&inst, false).dormant);
 
-    // Idle-reaped (marker set, status left Idle): dormant.
     inst.mark_idle_dormant();
     assert!(SessionResponse::from_instance(&inst, false).dormant);
 
-    // Deliberate stop (marker set AND Stopped): reports NOT dormant so the
-    // dashboard keeps the neutral Stopped dot. See #2250.
+    // A deliberate stop keeps the neutral Stopped dot rather than dormant (#2250).
     inst.status = Status::Stopped;
     assert!(!SessionResponse::from_instance(&inst, false).dormant);
 }
 
 #[test]
-fn session_response_branch_from_worktree() {
+fn session_response_surfaces_worktree_branch_and_bases() {
     let mut inst = make_test_instance();
-    assert!(SessionResponse::from_instance(&inst, false)
-        .branch
-        .is_none());
+    let resp = SessionResponse::from_instance(&inst, false);
+    assert!(resp.branch.is_none());
+    assert!(resp.base_branch.is_none());
 
-    inst.worktree_info = Some(crate::session::WorktreeInfo {
-        branch: "feature/test".to_string(),
-        main_repo_path: "/tmp/repo".to_string(),
-        managed_by_aoe: true,
-        created_at: chrono::Utc::now(),
-        base_branch: None,
-    });
+    inst.worktree_info = Some(worktree("feature/test", "/tmp/repo", None));
+    let resp = SessionResponse::from_instance(&inst, false);
+    assert_eq!(resp.branch.as_deref(), Some("feature/test"));
+    assert!(resp.base_branch.is_none());
+
+    inst.worktree_info = Some(worktree("feature/test", "/tmp/repo", Some("release-1.2")));
     assert_eq!(
         SessionResponse::from_instance(&inst, false)
-            .branch
+            .base_branch
             .as_deref(),
-        Some("feature/test")
-    );
-}
-
-#[test]
-fn session_response_surfaces_base_branch_override() {
-    let mut inst = make_test_instance();
-    // Default: no override -> field omitted from JSON.
-    let json = serde_json::to_value(SessionResponse::from_instance(&inst, false)).unwrap();
-    assert!(
-        json.get("base_branch_override").is_none(),
-        "base_branch_override should be omitted when None, got: {json}"
+        Some("release-1.2")
     );
 
     inst.base_branch_override = Some("upstream/main".to_string());
-    let resp = SessionResponse::from_instance(&inst, false);
-    assert_eq!(resp.base_branch_override.as_deref(), Some("upstream/main"));
+    assert_eq!(
+        SessionResponse::from_instance(&inst, false)
+            .base_branch_override
+            .as_deref(),
+        Some("upstream/main")
+    );
 }
 
 #[test]
@@ -1311,15 +1266,14 @@ fn resolve_diff_base_prefers_override_then_worktree_then_config_then_auto() {
         resolve_diff_base(None, None, Some("develop"), tmp.path()),
         "develop"
     );
-    // Auto-detect when nothing is set. The tmp dir is not a repo so
-    // `get_default_base_ref` returns Err -> "main" fallback.
+    // Auto-detect when nothing is set: the tmp dir is not a repo, so
+    // `get_default_base_ref` errors and falls back to "main".
     assert_eq!(resolve_diff_base(None, None, None, tmp.path()), "main");
 }
 
-/// Each workspace member carries its own override and recorded base, and
-/// the session-level `base_branch_override` does not leak into any of
-/// them. That leak is what made a multi-repo diff compare every repo
-/// against one ref. See #3329.
+/// Each workspace member carries its own override and recorded base, and the
+/// session-level `base_branch_override` does not leak into any of them. That
+/// leak made a multi-repo diff compare every repo against one ref (#3329).
 #[test]
 fn diff_repos_of_scopes_bases_per_workspace_repo() {
     fn repo(name: &str, base: Option<&str>, over: Option<&str>) -> crate::session::WorkspaceRepo {
@@ -1375,13 +1329,11 @@ fn diff_repos_of_scopes_bases_per_workspace_repo() {
     // override IS the session-level field.
     let mut single = make_test_instance();
     single.base_branch_override = Some("upstream/main".to_string());
-    single.worktree_info = Some(crate::session::WorktreeInfo {
-        branch: "feature/x".to_string(),
-        main_repo_path: "/src/only".to_string(),
-        managed_by_aoe: true,
-        created_at: chrono::Utc::now(),
-        base_branch: Some("develop".to_string()),
-    });
+    single.worktree_info = Some(worktree(
+        "feature/x",
+        "/src/only".to_string(),
+        Some("develop"),
+    ));
     let repos = diff_repos_of(&single);
     assert_eq!(repos.len(), 1);
     assert_eq!(repos[0].name, None);
@@ -1440,33 +1392,9 @@ fn apply_diff_base_override_writes_only_the_named_repo() {
 }
 
 #[test]
-fn session_response_surfaces_base_branch_when_set() {
-    let mut inst = make_test_instance();
-    inst.worktree_info = Some(crate::session::WorktreeInfo {
-        branch: "feature/test".to_string(),
-        main_repo_path: "/tmp/repo".to_string(),
-        managed_by_aoe: true,
-        created_at: chrono::Utc::now(),
-        base_branch: Some("release-1.2".to_string()),
-    });
-    let resp = SessionResponse::from_instance(&inst, false);
-    assert_eq!(resp.base_branch.as_deref(), Some("release-1.2"));
-
-    // Field is omitted from the wire JSON when None so old clients
-    // don't see a flood of nulls.
-    inst.worktree_info.as_mut().unwrap().base_branch = None;
-    let json = serde_json::to_value(SessionResponse::from_instance(&inst, false)).unwrap();
-    assert!(
-        json.get("base_branch").is_none(),
-        "base_branch should be omitted when None, got: {json}"
-    );
-}
-
-#[test]
 fn session_response_serializes_to_json() {
-    let inst = make_test_instance();
-    let json = serde_json::to_value(SessionResponse::from_instance(&inst, false)).unwrap();
-
+    let json =
+        serde_json::to_value(SessionResponse::from_instance(&make_test_instance(), false)).unwrap();
     assert!(json.get("id").is_some());
     assert_eq!(json["tool"], "claude");
     assert_eq!(json["status"], "Running");
@@ -1474,178 +1402,141 @@ fn session_response_serializes_to_json() {
     assert_eq!(json["claude_fullscreen"], false);
 }
 
+/// Optional fields stay off the wire until they are set, so old clients never
+/// see a flood of nulls.
 #[test]
-fn session_response_omits_empty_warnings() {
-    let inst = make_test_instance();
-    let resp = SessionResponse::from_instance(&inst, false);
-    assert!(resp.warnings.is_empty());
-
-    let json = serde_json::to_value(&resp).unwrap();
-    assert!(
-        json.get("warnings").is_none(),
-        "empty warnings should be omitted from the JSON body, got: {json}"
-    );
-}
-
-#[test]
-fn session_response_serializes_populated_warnings() {
-    let inst = make_test_instance();
-    let mut resp = SessionResponse::from_instance(&inst, false);
-    resp.warnings = vec![
-        "post-checkout hook failed for repo-a".to_string(),
-        "post-checkout hook failed for repo-b".to_string(),
+fn session_response_omits_unset_optional_fields() {
+    let cases: [(&str, fn(&mut Instance)); 5] = [
+        ("base_branch", |i| {
+            i.worktree_info = Some(worktree("feature/test", "/tmp/repo", Some("release-1.2")))
+        }),
+        ("base_branch_override", |i| {
+            i.base_branch_override = Some("upstream/main".to_string())
+        }),
+        ("pinned_at", |i| i.pin()),
+        ("archived_at", |i| i.archive()),
+        ("snoozed_until", |i| i.snooze(30)),
     ];
 
-    let json = serde_json::to_value(&resp).unwrap();
-    let warnings = json
-        .get("warnings")
-        .expect("warnings should appear in JSON when populated");
-    let arr = warnings
-        .as_array()
-        .expect("warnings should serialize as a JSON array");
-    assert_eq!(arr.len(), 2);
-    assert_eq!(arr[0], "post-checkout hook failed for repo-a");
-    assert_eq!(arr[1], "post-checkout hook failed for repo-b");
-}
-
-#[test]
-fn claude_fullscreen_set_for_claude_when_enabled() {
-    let resp = SessionResponse::from_instance(&make_test_instance(), true);
-    assert_eq!(resp.tool, "claude");
-    assert!(resp.claude_fullscreen);
-}
-
-#[test]
-fn session_response_surfaces_pinned_at() {
-    let mut inst = make_test_instance();
-
-    // Default: no pin -> field omitted from the JSON body.
-    let json = serde_json::to_value(SessionResponse::from_instance(&inst, false)).unwrap();
-    assert!(
-        json.get("pinned_at").is_none(),
-        "pinned_at should be omitted when None, got: {json}"
-    );
-
-    inst.pin();
-    let resp = SessionResponse::from_instance(&inst, false);
-    assert!(resp.pinned_at.is_some(), "pinned_at must surface when set");
-    let json = serde_json::to_value(&resp).unwrap();
-    assert!(
-        json.get("pinned_at").is_some(),
-        "pinned_at must appear in JSON when set"
-    );
-}
-
-#[test]
-fn session_response_surfaces_archived_at() {
-    let mut inst = make_test_instance();
-    let json = serde_json::to_value(SessionResponse::from_instance(&inst, false)).unwrap();
-    assert!(json.get("archived_at").is_none());
-
-    inst.archive();
-    let resp = SessionResponse::from_instance(&inst, false);
-    assert!(resp.archived_at.is_some());
-}
-
-#[test]
-fn session_response_gates_snoozed_until_on_active_snooze() {
-    let mut inst = make_test_instance();
-
-    // Not snoozed -> field omitted.
-    let resp = SessionResponse::from_instance(&inst, false);
-    assert!(resp.snoozed_until.is_none());
-
-    // Active snooze -> field surfaced.
-    inst.snooze(30);
-    let resp = SessionResponse::from_instance(&inst, false);
-    assert!(resp.snoozed_until.is_some());
-
-    // Expired snooze -> stays on disk for the next mutation to rewrite,
-    // but the API gates on `is_snoozed()` so the wire value is None.
-    // This prevents the web from rendering "snoozed 0m" on rows that
-    // have already woken on the server.
-    inst.snoozed_until = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
-    let resp = SessionResponse::from_instance(&inst, false);
-    assert!(
-        resp.snoozed_until.is_none(),
-        "expired snooze must be filtered out on the wire even though the persisted field stays set"
-    );
-}
-
-#[test]
-fn update_pin_body_parses() {
-    let body: UpdatePinBody = serde_json::from_str(r#"{"pinned": true}"#).unwrap();
-    assert!(body.pinned);
-    let body: UpdatePinBody = serde_json::from_str(r#"{"pinned": false}"#).unwrap();
-    assert!(!body.pinned);
-}
-
-#[test]
-fn update_archive_body_defaults_kill_pane_to_true() {
-    let body: UpdateArchiveBody = serde_json::from_str(r#"{"archived": true}"#).unwrap();
-    assert!(body.archived);
-    assert!(
-        body.kill_pane,
-        "kill_pane must default to true so callers that omit the field get TUI/CLI parity"
-    );
-
-    let body: UpdateArchiveBody =
-        serde_json::from_str(r#"{"archived": true, "kill_pane": false}"#).unwrap();
-    assert!(body.archived);
-    assert!(!body.kill_pane);
-}
-
-#[test]
-fn update_snooze_body_parses_minutes_and_null() {
-    let body: UpdateSnoozeBody = serde_json::from_str(r#"{"minutes": 60}"#).unwrap();
-    assert_eq!(body.minutes, Some(60));
-
-    // `{"minutes": null}` and an empty body both mean unsnooze.
-    let body: UpdateSnoozeBody = serde_json::from_str(r#"{"minutes": null}"#).unwrap();
-    assert_eq!(body.minutes, None);
-    let body: UpdateSnoozeBody = serde_json::from_str(r#"{}"#).unwrap();
-    assert_eq!(body.minutes, None);
-}
-
-#[test]
-fn update_snooze_validates_against_shared_bounds() {
-    // The handler uses `validate_snooze_duration` to reject 0 and >
-    // SNOOZE_MAX_MINUTES. Mirror the assertions here so a regression in
-    // the validator shape (or in the dialog presets at
-    // src/tui/dialogs/snooze_duration.rs) is caught locally.
-    assert!(crate::session::validate_snooze_duration(0).is_err());
-    for &m in &[60u64, 120, 180, 240, 300, 360, 1440, 7 * 1440] {
+    for (field, set) in cases {
+        let mut inst = make_test_instance();
+        let json = serde_json::to_value(SessionResponse::from_instance(&inst, false)).unwrap();
         assert!(
-            crate::session::validate_snooze_duration(m).is_ok(),
-            "preset {m} min must pass validator (matches TUI dialog presets)"
+            json.get(field).is_none(),
+            "{field} must be omitted while unset, got: {json}"
+        );
+
+        set(&mut inst);
+        let json = serde_json::to_value(SessionResponse::from_instance(&inst, false)).unwrap();
+        assert!(
+            json.get(field).is_some(),
+            "{field} must appear once set, got: {json}"
         );
     }
 }
 
 #[test]
-fn claude_fullscreen_unset_for_non_claude_even_when_enabled() {
+fn session_response_warnings_omitted_when_empty_and_listed_when_set() {
+    let mut resp = SessionResponse::from_instance(&make_test_instance(), false);
+    assert!(resp.warnings.is_empty());
+    let json = serde_json::to_value(&resp).unwrap();
+    assert!(
+        json.get("warnings").is_none(),
+        "empty warnings must be omitted, got: {json}"
+    );
+
+    resp.warnings = vec![
+        "post-checkout hook failed for repo-a".to_string(),
+        "post-checkout hook failed for repo-b".to_string(),
+    ];
+    let json = serde_json::to_value(&resp).unwrap();
+    assert_eq!(
+        json["warnings"],
+        serde_json::json!([
+            "post-checkout hook failed for repo-a",
+            "post-checkout hook failed for repo-b"
+        ])
+    );
+}
+
+/// An expired snooze stays on disk for the next mutation to rewrite, but the
+/// wire value is gated on `is_snoozed()` so the web never renders "snoozed 0m".
+#[test]
+fn session_response_gates_snoozed_until_on_active_snooze() {
     let mut inst = make_test_instance();
-    inst.tool = "cursor".to_string();
-    let resp = SessionResponse::from_instance(&inst, true);
-    assert!(!resp.claude_fullscreen);
+    inst.snooze(30);
+    assert!(SessionResponse::from_instance(&inst, false)
+        .snoozed_until
+        .is_some());
+
+    inst.snoozed_until = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
+    assert!(SessionResponse::from_instance(&inst, false)
+        .snoozed_until
+        .is_none());
 }
 
 #[test]
-fn claude_fullscreen_unset_when_setting_disabled() {
-    let resp = SessionResponse::from_instance(&make_test_instance(), false);
-    assert!(!resp.claude_fullscreen);
+fn claude_fullscreen_needs_both_claude_and_the_setting() {
+    for (tool, enabled, expected) in [
+        ("claude", true, true),
+        ("claude", false, false),
+        ("cursor", true, false),
+    ] {
+        let mut inst = make_test_instance();
+        inst.tool = tool.to_string();
+        assert_eq!(
+            SessionResponse::from_instance(&inst, enabled).claude_fullscreen,
+            expected,
+            "tool={tool} enabled={enabled}"
+        );
+    }
+}
+
+#[test]
+fn update_bodies_parse_with_their_defaults() {
+    for (body, expected) in [
+        (r#"{"pinned": true}"#, true),
+        (r#"{"pinned": false}"#, false),
+    ] {
+        let parsed: UpdatePinBody = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed.pinned, expected);
+    }
+
+    // kill_pane defaults to true so callers that omit it get TUI/CLI parity.
+    let archive: UpdateArchiveBody = serde_json::from_str(r#"{"archived": true}"#).unwrap();
+    assert!(archive.archived && archive.kill_pane);
+    let archive: UpdateArchiveBody =
+        serde_json::from_str(r#"{"archived": true, "kill_pane": false}"#).unwrap();
+    assert!(!archive.kill_pane);
+
+    // `{"minutes": null}` and an empty body both mean unsnooze.
+    for (body, expected) in [
+        (r#"{"minutes": 60}"#, Some(60)),
+        (r#"{"minutes": null}"#, None),
+        ("{}", None),
+    ] {
+        let parsed: UpdateSnoozeBody = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed.minutes, expected);
+    }
+}
+
+/// Mirrors the TUI snooze dialog presets, so a regression in the shared
+/// validator shape is caught here too.
+#[test]
+fn update_snooze_validates_against_shared_bounds() {
+    assert!(crate::session::validate_snooze_duration(0).is_err());
+    for &m in &[60u64, 120, 180, 240, 300, 360, 1440, 7 * 1440] {
+        assert!(
+            crate::session::validate_snooze_duration(m).is_ok(),
+            "preset {m} min must pass the validator"
+        );
+    }
 }
 
 #[test]
 fn rename_updates_title_without_changing_worktree_branch() {
     let mut inst = make_test_instance();
-    inst.worktree_info = Some(crate::session::WorktreeInfo {
-        branch: "feature/test".to_string(),
-        main_repo_path: "/tmp/repo".to_string(),
-        managed_by_aoe: true,
-        created_at: chrono::Utc::now(),
-        base_branch: None,
-    });
+    inst.worktree_info = Some(worktree("feature/test", "/tmp/repo".to_string(), None));
 
     apply_session_title_rename(&mut inst, "Renamed Session".to_string());
 
@@ -1661,13 +1552,7 @@ fn title_only_rename_cache_patch_preserves_newer_path_and_branch() {
     let mut cached = make_test_instance();
     cached.title = "Old title".to_string();
     cached.project_path = "/tmp/worktrees/concurrent".to_string();
-    cached.worktree_info = Some(crate::session::WorktreeInfo {
-        branch: "concurrent-branch".to_string(),
-        main_repo_path: "/tmp/repo".to_string(),
-        managed_by_aoe: true,
-        created_at: chrono::Utc::now(),
-        base_branch: None,
-    });
+    cached.worktree_info = Some(worktree("concurrent-branch", "/tmp/repo".to_string(), None));
 
     apply_session_rename_cache_patch(
         &mut cached,
@@ -1699,13 +1584,7 @@ fn title_only_rename_cache_patch_preserves_newer_path_and_branch() {
 fn tied_rename_cache_patch_publishes_owned_path_and_branch() {
     let mut cached = make_test_instance();
     cached.project_path = "/tmp/worktrees/concurrent".to_string();
-    cached.worktree_info = Some(crate::session::WorktreeInfo {
-        branch: "concurrent-branch".to_string(),
-        main_repo_path: "/tmp/repo".to_string(),
-        managed_by_aoe: true,
-        created_at: chrono::Utc::now(),
-        base_branch: None,
-    });
+    cached.worktree_info = Some(worktree("concurrent-branch", "/tmp/repo".to_string(), None));
 
     apply_session_rename_cache_patch(
         &mut cached,
@@ -1748,17 +1627,15 @@ async fn rename_session_distinguishes_cwd_stable_title_and_branch_changes() {
     title_only.id = title_id.clone();
     title_only.status = Status::Running;
     title_only.view = crate::session::View::Structured;
-    title_only.worktree_info = Some(crate::session::WorktreeInfo {
-        branch: "my-session".to_string(),
-        main_repo_path: paths
+    title_only.worktree_info = Some(worktree(
+        "my-session",
+        paths
             .path()
             .join("missing-repo")
             .to_string_lossy()
             .into_owned(),
-        managed_by_aoe: true,
-        created_at: chrono::Utc::now(),
-        base_branch: None,
-    });
+        None,
+    ));
 
     let mut branch_only = Instance::new(
         "Branch Only",
@@ -1766,17 +1643,15 @@ async fn rename_session_distinguishes_cwd_stable_title_and_branch_changes() {
     );
     branch_only.id = branch_id.clone();
     branch_only.status = Status::Running;
-    branch_only.worktree_info = Some(crate::session::WorktreeInfo {
-        branch: "existing-branch".to_string(),
-        main_repo_path: paths
+    branch_only.worktree_info = Some(worktree(
+        "existing-branch",
+        paths
             .path()
             .join("missing-repo")
             .to_string_lossy()
             .into_owned(),
-        managed_by_aoe: true,
-        created_at: chrono::Utc::now(),
-        base_branch: None,
-    });
+        None,
+    ));
 
     let (_storage, state) = build_rename_test_state(
         vec![title_only.clone(), branch_only.clone()],
@@ -1853,13 +1728,11 @@ async fn rename_session_distinguishes_cwd_stable_title_and_branch_changes() {
 #[tokio::test]
 #[serial_test::serial]
 async fn rename_session_quiesces_structured_worker_only_when_its_cwd_moves() {
-    // Invariant #2260: a live structured-view worker is pinned to its cwd,
-    // so a tied rename that MOVES the worktree directory must stop the
-    // worker first (else it crash-loops at the pulled-out path), while a
-    // rename that leaves the cwd in place must NOT interrupt it. The
-    // quiesce runs before the git edit, so the cwd-moving assertion holds
-    // even though the edit itself then fails on a fixture with no real
-    // worktree to move: what #2260 pins is that the worker is gone by then.
+    // Invariant #2260: a live structured worker is pinned to its cwd, so a
+    // tied rename that MOVES the worktree must stop the worker first, while one
+    // that leaves the cwd in place must not interrupt it. The quiesce runs
+    // before the git edit, so the assertion holds even though the edit then
+    // fails on a fixture with no real worktree to move.
     let _app_dir = crate::session::test_support::isolate_app_dir();
 
     struct Case {
@@ -1895,22 +1768,20 @@ async fn rename_session_quiesces_structured_worker_only_when_its_cwd_moves() {
             project_path.to_str().expect("UTF-8 temp path"),
         );
         inst.id = case.id.to_string();
-        // Idle, not Running: a structured session the user "stopped" sits
-        // at Idle yet still owns a live worker, which is exactly the gap
-        // `blocks_worktree_edit` misses and quiesce closes.
+        // Idle, not Running: a structured session the user "stopped" sits at
+        // Idle yet still owns a live worker, the gap `blocks_worktree_edit`
+        // misses and quiesce closes.
         inst.status = Status::Idle;
         inst.view = crate::session::View::Structured;
-        inst.worktree_info = Some(crate::session::WorktreeInfo {
-            branch: case.leaf.to_string(),
-            main_repo_path: paths
+        inst.worktree_info = Some(worktree(
+            case.leaf,
+            paths
                 .path()
                 .join("missing-repo")
                 .to_string_lossy()
                 .into_owned(),
-            managed_by_aoe: true,
-            created_at: chrono::Utc::now(),
-            base_branch: None,
-        });
+            None,
+        ));
 
         let (_storage, state) = build_rename_test_state(vec![inst.clone()], vec![inst]);
         state.acp_supervisor.test_insert_worker(case.id).await;
@@ -1945,11 +1816,9 @@ async fn rename_session_quiesces_structured_worker_only_when_its_cwd_moves() {
 #[serial_test::serial]
 async fn set_worktree_name_quiesces_structured_worker_only_when_its_cwd_moves() {
     // The standalone-endpoint mirror of the rename_session gate above: both
-    // stop a live structured-view worker only when the edit actually moves
-    // the worktree cwd (#2260), never for a cwd-stable or branch-only edit.
-    // The quiesce precedes the git edit, so the cwd-moving assertion holds
-    // even though the edit itself then fails on a fixture with no real
-    // worktree to move: what #2260 pins is that the worker is gone by then.
+    // stop a live structured worker only when the edit actually moves the cwd
+    // (#2260). The quiesce precedes the git edit, so the assertion holds even
+    // though the edit then fails on a fixture with no real worktree.
     let _app_dir = crate::session::test_support::isolate_app_dir();
     // set_worktree_name refuses a tied managed worktree (tied callers must
     // go through rename_session), so untie the profile to reach the worker
@@ -2003,17 +1872,15 @@ async fn set_worktree_name_quiesces_structured_worker_only_when_its_cwd_moves() 
         inst.source_profile = "test".to_string();
         inst.status = Status::Idle;
         inst.view = crate::session::View::Structured;
-        inst.worktree_info = Some(crate::session::WorktreeInfo {
-            branch: case.leaf.to_string(),
-            main_repo_path: paths
+        inst.worktree_info = Some(worktree(
+            case.leaf,
+            paths
                 .path()
                 .join("missing-repo")
                 .to_string_lossy()
                 .into_owned(),
-            managed_by_aoe: true,
-            created_at: chrono::Utc::now(),
-            base_branch: None,
-        });
+            None,
+        ));
 
         let storage = Storage::new_unwatched("test").unwrap();
         storage
@@ -2056,13 +1923,7 @@ fn worktree_name_edit_updates_path_and_optionally_branch() {
     let mut inst = make_test_instance();
     inst.project_path = "/tmp/repo-worktrees/old".to_string();
     inst.title = "My Session".to_string();
-    inst.worktree_info = Some(crate::session::WorktreeInfo {
-        branch: "old".to_string(),
-        main_repo_path: "/tmp/repo".to_string(),
-        managed_by_aoe: true,
-        created_at: chrono::Utc::now(),
-        base_branch: None,
-    });
+    inst.worktree_info = Some(worktree("old", "/tmp/repo".to_string(), None));
 
     // Path-only edit leaves the branch and title untouched.
     apply_worktree_name_edit(&mut inst, "/tmp/repo-worktrees/new", None);
@@ -2086,12 +1947,10 @@ fn worktree_name_edit_updates_path_and_optionally_branch() {
 #[test]
 #[serial_test::serial]
 fn apply_post_restart_sync_propagates_agent_session_id() {
-    // Models the rapid double-restart case: in-memory state is stale
-    // (agent_session_id = None) because the 2s status poller hasn't
-    // refreshed yet, while the just-finished restart produced a Claude
-    // UUID via acquire_session_id. The sync must propagate that ID so a
-    // second ensure_session within the poller window doesn't generate a
-    // fresh UUID and orphan the persisted Claude conversation.
+    // The rapid double-restart case: in-memory state is stale because the 2s
+    // poller has not refreshed, while the just-finished restart produced a
+    // Claude UUID. The sync must propagate it, or a second ensure_session inside
+    // the poller window mints a fresh UUID and orphans the conversation.
     let mut live = make_test_instance();
     live.status = Status::Stopped;
     live.last_error = Some("prior failure".to_string());
@@ -2207,10 +2066,9 @@ fn apply_post_restart_identity_sync_clears_repair_backoff_when_restart_poller_ru
 
 #[test]
 fn apply_post_restart_sync_overwrites_stale_session_id() {
-    // If somehow the in-memory ID was non-None and the start path
-    // produced a different (newer) ID, the sync must use the newer one.
-    // Belt-and-suspenders: in practice acquire_session_id reuses an
-    // existing ID, but the contract here is "started wins."
+    // When the in-memory id is non-None and the start path produced a newer
+    // one, `started` wins. In practice acquire_session_id reuses the existing
+    // id, but that is the contract.
     let mut live = make_test_instance();
     live.agent_session_id = Some("stale-id".to_string());
     let before = live.clone();
@@ -2431,106 +2289,47 @@ fn send_message_post_restart_save_preserves_peer_sid_write() {
     assert!(disk.last_accessed_at.is_some());
 }
 
+/// A tool name must resolve to a built-in agent, or to a custom agent whose
+/// configured command is non-empty.
 #[test]
 #[serial_test::serial]
-fn session_tool_identity_accepts_builtin_agent() {
-    let temp_home = tempfile::tempdir().unwrap();
-    let _home = crate::session::test_support::isolate_app_dir_at(temp_home.path());
-    let project = tempfile::tempdir().unwrap();
+fn session_tool_identity_accepts_builtins_and_non_empty_custom_agents() {
+    // (custom_agents config body, agent, expected)
+    let cases = [
+        ("", "claude", true),
+        (
+            "remote-claude = \"ssh -t host claude\"",
+            "remote-claude",
+            true,
+        ),
+        ("", "surprise-agent", false),
+        ("remote-claude = \"\"", "remote-claude", false),
+        ("remote-claude = \"   \"", "remote-claude", false),
+    ];
 
-    assert!(validate_session_tool_identity(
-        "claude",
-        "default",
-        project.path()
-    ));
+    for (custom_agents, agent, expected) in cases {
+        let temp_home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp_home.path());
+        let app_dir = crate::session::get_app_dir().expect("isolated app dir");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        if !custom_agents.is_empty() {
+            std::fs::write(
+                app_dir.join("config.toml"),
+                format!("[session.custom_agents]\n{custom_agents}\n"),
+            )
+            .unwrap();
+        }
+        let project = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            validate_session_tool_identity(agent, "default", project.path()),
+            expected,
+            "agent={agent} custom_agents={custom_agents:?}"
+        );
+    }
 }
 
-#[test]
-#[serial_test::serial]
-fn session_tool_identity_accepts_non_empty_configured_custom_agent() {
-    let temp_home = tempfile::tempdir().unwrap();
-    let _home = crate::session::test_support::isolate_app_dir_at(temp_home.path());
-    let app_dir = crate::session::get_app_dir().expect("isolated app dir");
-    std::fs::create_dir_all(&app_dir).unwrap();
-    std::fs::write(
-        app_dir.join("config.toml"),
-        r#"
-            [session.custom_agents]
-            remote-claude = "ssh -t host claude"
-        "#,
-    )
-    .unwrap();
-    let project = tempfile::tempdir().unwrap();
-
-    assert!(validate_session_tool_identity(
-        "remote-claude",
-        "default",
-        project.path()
-    ));
-}
-
-#[test]
-#[serial_test::serial]
-fn session_tool_identity_rejects_unknown_agent() {
-    let temp_home = tempfile::tempdir().unwrap();
-    let _home = crate::session::test_support::isolate_app_dir_at(temp_home.path());
-    let project = tempfile::tempdir().unwrap();
-
-    assert!(!validate_session_tool_identity(
-        "surprise-agent",
-        "default",
-        project.path()
-    ));
-}
-
-#[test]
-#[serial_test::serial]
-fn session_tool_identity_rejects_empty_custom_agent_command() {
-    let temp_home = tempfile::tempdir().unwrap();
-    let _home = crate::session::test_support::isolate_app_dir_at(temp_home.path());
-    let app_dir = crate::session::get_app_dir().expect("isolated app dir");
-    std::fs::create_dir_all(&app_dir).unwrap();
-    std::fs::write(
-        app_dir.join("config.toml"),
-        r#"
-            [session.custom_agents]
-            remote-claude = ""
-        "#,
-    )
-    .unwrap();
-    let project = tempfile::tempdir().unwrap();
-
-    assert!(!validate_session_tool_identity(
-        "remote-claude",
-        "default",
-        project.path()
-    ));
-}
-
-#[test]
-#[serial_test::serial]
-fn session_tool_identity_rejects_whitespace_only_custom_agent_command() {
-    let temp_home = tempfile::tempdir().unwrap();
-    let _home = crate::session::test_support::isolate_app_dir_at(temp_home.path());
-    let app_dir = crate::session::get_app_dir().expect("isolated app dir");
-    std::fs::create_dir_all(&app_dir).unwrap();
-    std::fs::write(
-        app_dir.join("config.toml"),
-        r#"
-            [session.custom_agents]
-            remote-claude = "   "
-        "#,
-    )
-    .unwrap();
-    let project = tempfile::tempdir().unwrap();
-
-    assert!(!validate_session_tool_identity(
-        "remote-claude",
-        "default",
-        project.path()
-    ));
-}
-
+/// A custom agent declared under one profile is invisible from another.
 #[test]
 #[serial_test::serial]
 fn session_tool_identity_uses_requested_profile() {
@@ -2627,15 +2426,15 @@ fn delete_race_state_for(ids: &[&str]) -> std::sync::Arc<crate::server::AppState
     crate::server::test_support::build_test_app_state(instances)
 }
 
-/// #3650: prompt submission moved off `instance_lock`, so a permanent
-/// delete that takes only `instance_lock` no longer excludes a queue drain
-/// that snapshotted an idle turn and is on its way to `send_turn`. The
-/// delete would then stop the worker, purge the transcript and remove the
-/// worktree under a delivery already in flight.
+/// #3650: prompt submission moved off `instance_lock`, so a permanent delete
+/// that takes only `instance_lock` no longer excludes a queue drain that
+/// snapshotted an idle turn and is on its way to `send_turn`. The delete would
+/// then stop the worker, purge the transcript and remove the worktree under a
+/// delivery already in flight.
 ///
 /// Each permanent-delete path is checked the same way: hold the session's
-/// submission guard (standing in for that drain) and assert the delete
-/// parks before any teardown, then completes once the guard drops.
+/// submission guard and assert the delete parks before any teardown, then
+/// completes once the guard drops.
 #[tokio::test]
 async fn permanent_deletion_waits_for_an_in_flight_submission() {
     let _home = crate::session::test_support::isolate_app_dir();
@@ -2803,16 +2602,12 @@ async fn the_retention_purge_takes_submission_before_the_instance_lock() {
     );
 }
 
-/// #3650's barrier applies to every handler that stops a worker, not just
-/// the ones that delete a session. `drain_queued_prompts_once` reads the
-/// status and the trashed/archived/snoozed flags once under the submission
-/// guard and only then reaches `send_turn`, which respawns a worker it
-/// finds gone. So a stop that lands inside that window is undone: the user
-/// presses Stop and the session comes back running the queued prompt.
-///
-/// Before #3639 the drain held `instance_lock` across delivery and these
-/// four handlers were excluded by it. They take the submission guard now
-/// for the same reason `attach_project` and the tied renames do.
+/// #3650's barrier applies to every handler that stops a worker, not only the
+/// ones that delete. `drain_queued_prompts_once` reads status and the
+/// trashed/archived/snoozed flags once under the submission guard and only then
+/// reaches `send_turn`, which respawns a worker it finds gone, so a stop landing
+/// inside that window is undone. Before #3639 the drain held `instance_lock`
+/// across delivery and excluded these four handlers.
 #[tokio::test]
 async fn worker_stopping_handlers_wait_for_an_in_flight_submission() {
     let _app_dir = crate::session::test_support::isolate_app_dir();
@@ -2883,10 +2678,10 @@ async fn worker_stopping_handlers_wait_for_an_in_flight_submission() {
     }
 }
 
-/// #3651: `prompt_submission` auto-vivifies a registry entry for whatever
-/// id it is handed and nothing prunes it, so every externally reachable
-/// mutation that claims it must prove the session exists first. Otherwise
-/// an authenticated client grows daemon memory with random ids.
+/// #3651: `prompt_submission` auto-vivifies a registry entry for whatever id it
+/// is handed and nothing prunes it, so every externally reachable mutation must
+/// prove the session exists first, or an authenticated client can grow daemon
+/// memory with random ids.
 #[tokio::test]
 async fn session_mutations_allocate_no_prompt_lock_for_an_unknown_id() {
     let state = crate::server::test_support::build_test_app_state(Vec::new());
@@ -3090,14 +2885,9 @@ async fn send_message_refreshes_instance_after_instance_lock() {
         StatusCode::NOT_FOUND
     );
 }
-// ── validate_diff_path: security regression tests ──────────────────────────
-//
-// Regression for a path-traversal vulnerability in the first cut of the
-// `/api/sessions/{id}/diff/file?path=...` endpoint. Any authenticated user
-// could pass `?path=/etc/passwd` or `?path=../../etc/shadow` and have the
-// server dump the file contents in a diff response. The validator must
-// reject absolute paths, parent-dir traversal, and any path that isn't in
-// the set of actually-changed files.
+// Regression for a path-traversal vulnerability in the first cut of
+// `/api/sessions/{id}/diff/file?path=...`, where any authenticated user could
+// pass `?path=/etc/passwd` and have the server dump it in a diff response.
 
 use crate::git::diff::{DiffFile, FileStatus};
 use std::path::PathBuf;
@@ -3117,68 +2907,53 @@ fn changed(paths: &[&str]) -> Vec<DiffFile> {
 }
 
 #[test]
-fn validate_diff_path_rejects_absolute() {
+fn validate_diff_path_rejects_unsafe_shapes() {
     let dir = TempDir::new().unwrap();
-    let err = validate_diff_path(
-        dir.path(),
-        std::path::Path::new("/etc/passwd"),
-        &changed(&["src/main.rs"]),
-    )
-    .unwrap_err();
-    assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    for path in [
+        "/etc/passwd",
+        "../../etc/passwd",
+        "src/../../etc/passwd",
+        "",
+    ] {
+        let err = validate_diff_path(
+            dir.path(),
+            std::path::Path::new(path),
+            &changed(&["src/main.rs"]),
+        )
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST, "path={path:?}");
+    }
 }
 
+/// An in-repo file that exists but is not in the changed set is accepted for the
+/// full-file fallback (#1810), flagged `is_changed = false`. A changed file
+/// deleted from disk stays diffable, so the validator falls back to the
+/// non-canonical path when `canonicalize()` fails.
 #[test]
-fn validate_diff_path_rejects_parent_dir() {
-    let dir = TempDir::new().unwrap();
-    let err = validate_diff_path(
-        dir.path(),
-        std::path::Path::new("../../etc/passwd"),
-        &changed(&["src/main.rs"]),
-    )
-    .unwrap_err();
-    assert_eq!(err.0, StatusCode::BAD_REQUEST);
-}
-
-#[test]
-fn validate_diff_path_rejects_parent_dir_in_middle() {
-    let dir = TempDir::new().unwrap();
-    let err = validate_diff_path(
-        dir.path(),
-        std::path::Path::new("src/../../etc/passwd"),
-        &changed(&["src/main.rs"]),
-    )
-    .unwrap_err();
-    assert_eq!(err.0, StatusCode::BAD_REQUEST);
-}
-
-#[test]
-fn validate_diff_path_rejects_empty() {
-    let dir = TempDir::new().unwrap();
-    let err = validate_diff_path(dir.path(), std::path::Path::new(""), &[]).unwrap_err();
-    assert_eq!(err.0, StatusCode::BAD_REQUEST);
-}
-
-#[test]
-fn validate_diff_path_accepts_unchanged_existing_file() {
-    // An in-repo file that exists on disk but is not in the changed set is
-    // now accepted for the full-file fallback (#1810), flagged
-    // `is_changed = false`. The tracked-blob gate that blocks `.git/` and
-    // gitignored secrets lives in compute_unchanged_file_contents, not here.
+fn validate_diff_path_accepts_in_repo_and_changed_files() {
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("existing.txt"), "hello").unwrap();
-    let (_, is_changed) = validate_diff_path(
-        dir.path(),
-        std::path::Path::new("existing.txt"),
-        &changed(&["src/main.rs"]),
-    )
-    .unwrap();
-    assert!(!is_changed);
+    std::fs::write(dir.path().join("changed.txt"), "hello").unwrap();
+
+    // (requested path, changed set, expected is_changed)
+    for (path, changed_set, expected) in [
+        ("existing.txt", &["src/main.rs"][..], false),
+        ("changed.txt", &["changed.txt"][..], true),
+        ("deleted.txt", &["deleted.txt"][..], true),
+    ] {
+        let (_, is_changed) = validate_diff_path(
+            dir.path(),
+            std::path::Path::new(path),
+            &changed(changed_set),
+        )
+        .unwrap_or_else(|e| panic!("{path} should validate, got {:?}", e.0));
+        assert_eq!(is_changed, expected, "path={path}");
+    }
 }
 
+/// Not in the changed set and not on disk: nothing to show.
 #[test]
 fn validate_diff_path_rejects_nonexistent_unchanged_file() {
-    // Not in the changed set and not on disk: nothing to show.
     let dir = TempDir::new().unwrap();
     let err = validate_diff_path(
         dir.path(),
@@ -3190,60 +2965,24 @@ fn validate_diff_path_rejects_nonexistent_unchanged_file() {
 }
 
 #[test]
-fn validate_diff_path_accepts_changed_file() {
-    let dir = TempDir::new().unwrap();
-    std::fs::write(dir.path().join("changed.txt"), "hello").unwrap();
-    let (_, is_changed) = validate_diff_path(
-        dir.path(),
-        std::path::Path::new("changed.txt"),
-        &changed(&["changed.txt"]),
-    )
-    .unwrap();
-    assert!(is_changed);
+fn truncate_title_truncates_on_character_boundaries() {
+    // (input, limit, expected)
+    for (input, limit, expected) in [
+        ("hello", 10, "hello"),
+        ("hello", 5, "hello"),
+        ("abcdefghij", 5, "abcd\u{2026}"),
+        // Each snowman is 3 bytes and 1 char, so the split must be by character.
+        (
+            "\u{2603}\u{2603}\u{2603}\u{2603}\u{2603}",
+            3,
+            "\u{2603}\u{2603}\u{2026}",
+        ),
+    ] {
+        let out = truncate_title(input, limit);
+        assert_eq!(out, expected, "input={input} limit={limit}");
+        assert!(out.chars().count() <= limit);
+    }
 }
-
-#[test]
-fn validate_diff_path_accepts_deleted_file() {
-    // A file that has been deleted on disk but is in the changed set
-    // (status: Deleted) should still be diffable so the user can see
-    // what was removed. canonicalize() on the joined path will fail,
-    // so the validator must fall back to the non-canonical path.
-    let dir = TempDir::new().unwrap();
-    let (_, is_changed) = validate_diff_path(
-        dir.path(),
-        std::path::Path::new("deleted.txt"),
-        &changed(&["deleted.txt"]),
-    )
-    .unwrap();
-    assert!(is_changed);
-}
-
-#[test]
-fn truncate_title_returns_unchanged_under_limit() {
-    assert_eq!(truncate_title("hello", 10), "hello");
-}
-
-#[test]
-fn truncate_title_returns_unchanged_at_exact_limit() {
-    assert_eq!(truncate_title("hello", 5), "hello");
-}
-
-#[test]
-fn truncate_title_appends_ellipsis_when_over_limit() {
-    let out = truncate_title("abcdefghij", 5);
-    assert_eq!(out, "abcd…");
-    assert_eq!(out.chars().count(), 5);
-}
-
-#[test]
-fn truncate_title_counts_characters_not_bytes() {
-    // Multi-byte input: each ☃ is 3 bytes, 1 char. Truncating to 3
-    // chars must split on character boundary, not byte offset.
-    let out = truncate_title("☃☃☃☃☃", 3);
-    assert_eq!(out, "☃☃…");
-    assert_eq!(out.chars().count(), 3);
-}
-
 #[test]
 fn session_response_serializes_unread_marker() {
     use crate::session::Instance;
@@ -3271,92 +3010,75 @@ fn step(
 }
 
 #[test]
-fn plan_summary_counts_done_steps_only() {
+fn plan_summary_counts_done_and_picks_the_first_non_done_step() {
     use crate::acp::state::PlanStepStatus::*;
-    let plan = crate::acp::state::Plan {
-        plan_id: "p1".into(),
-        version: 1,
-        steps: vec![
-            step("a", "alpha", Done),
-            step("b", "beta", Done),
-            step("c", "gamma", InProgress),
-            step("d", "delta", Pending),
-        ],
-    };
-    let s = plan_summary_from_plan(plan);
-    assert_eq!(s.total, 4);
-    assert_eq!(s.completed, 2);
-    assert_eq!(s.current_step_title.as_deref(), Some("gamma"));
+
+    // (steps, expected total, completed, current step title)
+    let cases: Vec<(Vec<_>, u32, u32, Option<&str>)> = vec![
+        (
+            vec![
+                step("a", "alpha", Done),
+                step("b", "beta", Done),
+                step("c", "gamma", InProgress),
+                step("d", "delta", Pending),
+            ],
+            4,
+            2,
+            Some("gamma"),
+        ),
+        // The first non-Done wins even when a later step is InProgress,
+        // matching the helper's `find(..)`.
+        (
+            vec![
+                step("a", "alpha", Done),
+                step("b", "beta", Pending),
+                step("c", "gamma", InProgress),
+            ],
+            3,
+            1,
+            Some("beta"),
+        ),
+        (
+            vec![step("a", "alpha", Done), step("b", "beta", Done)],
+            2,
+            2,
+            None,
+        ),
+        (vec![], 0, 0, None),
+    ];
+
+    for (steps, total, completed, current) in cases {
+        let plan = crate::acp::state::Plan {
+            plan_id: "p1".into(),
+            version: 1,
+            steps,
+        };
+        let s = plan_summary_from_plan(plan);
+        assert_eq!(s.total, total);
+        assert_eq!(s.completed, completed);
+        assert_eq!(s.current_step_title.as_deref(), current);
+    }
 }
 
 #[test]
-fn plan_summary_current_step_skips_done_picks_first_non_done() {
-    use crate::acp::state::PlanStepStatus::*;
-    // First non-Done is the first Pending; InProgress later doesn't
-    // override (matches the helper's `find(..)` semantics).
+fn plan_summary_truncates_a_long_current_step_title() {
+    use crate::acp::state::PlanStepStatus::Pending;
     let plan = crate::acp::state::Plan {
         plan_id: "p1".into(),
         version: 1,
-        steps: vec![
-            step("a", "alpha", Done),
-            step("b", "beta", Pending),
-            step("c", "gamma", InProgress),
-        ],
+        steps: vec![step("a", &"x".repeat(120), Pending)],
     };
-    let s = plan_summary_from_plan(plan);
-    assert_eq!(s.current_step_title.as_deref(), Some("beta"));
-}
-
-#[test]
-fn plan_summary_none_when_all_done() {
-    use crate::acp::state::PlanStepStatus::*;
-    let plan = crate::acp::state::Plan {
-        plan_id: "p1".into(),
-        version: 1,
-        steps: vec![step("a", "alpha", Done), step("b", "beta", Done)],
-    };
-    let s = plan_summary_from_plan(plan);
-    assert_eq!(s.completed, 2);
-    assert_eq!(s.total, 2);
-    assert!(s.current_step_title.is_none());
-}
-
-#[test]
-fn plan_summary_truncates_long_current_step_title() {
-    use crate::acp::state::PlanStepStatus::*;
-    let long_title: String = "x".repeat(120);
-    let plan = crate::acp::state::Plan {
-        plan_id: "p1".into(),
-        version: 1,
-        steps: vec![step("a", &long_title, Pending)],
-    };
-    let s = plan_summary_from_plan(plan);
-    let t = s.current_step_title.unwrap();
-    assert_eq!(t.chars().count(), 80);
-    assert!(t.ends_with('…'));
-}
-
-#[test]
-fn plan_summary_empty_steps_yields_zero_total() {
-    let plan = crate::acp::state::Plan {
-        plan_id: "p1".into(),
-        version: 1,
-        steps: vec![],
-    };
-    let s = plan_summary_from_plan(plan);
-    assert_eq!(s.total, 0);
-    assert_eq!(s.completed, 0);
-    assert!(s.current_step_title.is_none());
+    let title = plan_summary_from_plan(plan).current_step_title.unwrap();
+    assert_eq!(title.chars().count(), 80);
+    assert!(title.ends_with('\u{2026}'));
 }
 
 // --- persist_session_update (the persist-first contract from #1589) ---
 //
-// The five session-mutation PATCH handlers route every write through
-// this helper and only touch memory after it returns `Ok`, so disk and
-// memory cannot diverge on a write failure. Full-handler coverage is
-// impractical (AppState has no test constructor), so these lock the
-// helper's two guarantees directly: a success durably writes, and every
-// storage failure surfaces as `Err`.
+// The session-mutation PATCH handlers route every write through this helper and
+// only touch memory after it returns `Ok`. Full-handler coverage is impractical
+// (AppState has no test constructor), so these lock its two guarantees: a
+// success durably writes, and every storage failure surfaces as `Err`.
 
 #[test]
 #[serial_test::serial]
@@ -3438,10 +3160,9 @@ async fn persist_session_update_surfaces_storage_error() {
     assert!(result.is_err(), "a storage failure must surface as Err");
 }
 
-// Group edit (#1726): the persisted instance's group_path is the only
-// thing that changes; the groups Vec is left alone (the group list is
-// derived from instance group_path, exactly like create_session). Set
-// and clear both round-trip to disk.
+// Group edit (#1726): only the persisted instance's group_path changes; the
+// groups Vec is left alone, since the group list is derived from instance
+// group_path exactly as in create_session.
 #[tokio::test]
 #[serial_test::serial]
 async fn group_edit_set_and_clear_round_trip_to_disk() {
@@ -3529,10 +3250,9 @@ fn project_with_on_create_hooks(commands: &[&str]) -> tempfile::TempDir {
 #[test]
 #[serial_test::serial]
 fn resolve_hook_plan_refuses_untrusted_repo_hooks() {
-    // Bug #2066: the web API used to skip hooks entirely. The plan must now
-    // refuse an untrusted repo with hooks unless trust_hooks is passed, so
-    // the caller can prompt rather than silently get an un-bootstrapped
-    // worktree.
+    // #2066: the web API used to skip hooks entirely. The plan must refuse an
+    // untrusted repo with hooks unless trust_hooks is passed, so the caller can
+    // prompt rather than silently get an un-bootstrapped worktree.
     let temp_home = tempfile::tempdir().unwrap();
     let _home = crate::session::test_support::isolate_app_dir_at(temp_home.path());
     let _app_dir = crate::session::get_app_dir().expect("isolated app dir");
@@ -3599,72 +3319,53 @@ fn resolve_hook_plan_trusts_and_runs_with_trust_hooks() {
     );
 }
 
+/// None of these refuse a create. A scratch session has no repo config anchor,
+/// so it skips the repo trust check entirely (matching the CLI scratch branch),
+/// and an untrusted `.mcp.json` is gated by the supervisor at spawn rather than
+/// here, so blocking creation on it would be stricter than the CLI.
 #[test]
 #[serial_test::serial]
-fn resolve_hook_plan_absent_hooks_is_ok() {
-    // A repo with no hooks (and no global hooks) is never refused.
-    let temp_home = tempfile::tempdir().unwrap();
-    let _home = crate::session::test_support::isolate_app_dir_at(temp_home.path());
-    let _app_dir = crate::session::get_app_dir().expect("isolated app dir");
-    let project = tempfile::tempdir().unwrap();
+fn resolve_hook_plan_refuses_nothing_without_untrusted_repo_hooks() {
+    // (label, repo has untrusted on_create hooks, repo has .mcp.json, scratch)
+    for (label, hooks, mcp, scratch) in [
+        ("no hooks at all", false, false, false),
+        ("scratch pointed at untrusted hooks", true, false, true),
+        ("untrusted mcp without hooks", false, true, false),
+    ] {
+        let temp_home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp_home.path());
+        let _app_dir = crate::session::get_app_dir().expect("isolated app dir");
 
-    let plan = resolve_create_hook_plan("default", project.path(), false, false)
-        .expect("no hooks means no trust needed");
-    assert!(plan.on_create.is_empty());
-    assert!(plan.trust_write.is_none());
-}
+        let hooked;
+        let plain;
+        let project = if hooks {
+            hooked = project_with_on_create_hooks(&["echo nope"]);
+            hooked.path()
+        } else {
+            plain = tempfile::tempdir().unwrap();
+            plain.path()
+        };
+        if mcp {
+            std::fs::write(
+                project.join(".mcp.json"),
+                r#"{"mcpServers": {"foo": {"command": "echo"}}}"#,
+            )
+            .unwrap();
+        }
 
-#[test]
-#[serial_test::serial]
-fn resolve_hook_plan_scratch_skips_repo_trust() {
-    // Scratch sessions have no repo config anchor; even pointing at a path
-    // with untrusted hooks must not refuse (matches the CLI scratch branch).
-    let temp_home = tempfile::tempdir().unwrap();
-    let _home = crate::session::test_support::isolate_app_dir_at(temp_home.path());
-    let _app_dir = crate::session::get_app_dir().expect("isolated app dir");
-    let project = project_with_on_create_hooks(&["echo nope"]);
-
-    let plan = resolve_create_hook_plan("default", project.path(), true, false)
-        .expect("scratch must skip the repo trust check");
-    assert!(
-        plan.on_create.is_empty(),
-        "no global hooks, so scratch resolves to nothing"
-    );
-    assert!(plan.trust_write.is_none());
-}
-
-#[test]
-#[serial_test::serial]
-fn resolve_hook_plan_does_not_block_on_untrusted_mcp_without_hooks() {
-    // A repo with an untrusted `.mcp.json` but no hooks must NOT be refused:
-    // the supervisor gates MCP at spawn, so blocking creation here would be
-    // stricter than the CLI. The session is created with MCP left untrusted.
-    let temp_home = tempfile::tempdir().unwrap();
-    let _home = crate::session::test_support::isolate_app_dir_at(temp_home.path());
-    let _app_dir = crate::session::get_app_dir().expect("isolated app dir");
-    let project = tempfile::tempdir().unwrap();
-    std::fs::write(
-        project.path().join(".mcp.json"),
-        r#"{"mcpServers": {"foo": {"command": "echo"}}}"#,
-    )
-    .unwrap();
-
-    let plan = resolve_create_hook_plan("default", project.path(), false, false)
-        .expect("untrusted MCP without hooks must not block creation");
-    assert!(plan.on_create.is_empty());
-    assert!(
-        plan.trust_write.is_none(),
-        "MCP is left untrusted when the caller did not opt in"
-    );
+        let plan = resolve_create_hook_plan("default", project, scratch, false)
+            .unwrap_or_else(|e| panic!("{label} must not refuse: {e:#}"));
+        assert!(plan.on_create.is_empty(), "{label}");
+        assert!(plan.trust_write.is_none(), "{label}");
+    }
 }
 
 #[test]
 #[serial_test::serial]
 fn resolve_hook_plan_inherits_trust_across_worktrees() {
-    // Secondary half of #2066: hook trust is keyed on the main repo
-    // (check_repo_trust resolves a worktree path back to it), so a worktree
-    // created from an already-trusted repo inherits that trust without a
-    // fresh prompt, even with trust_hooks: false.
+    // Secondary half of #2066: hook trust is keyed on the main repo, so a
+    // worktree created from an already-trusted repo inherits that trust without
+    // a fresh prompt, even with trust_hooks: false.
     let temp_home = tempfile::tempdir().unwrap();
     let _home = crate::session::test_support::isolate_app_dir_at(temp_home.path());
     let _app_dir = crate::session::get_app_dir().expect("isolated app dir");
@@ -3746,10 +3447,9 @@ async fn list_sessions_projects_pending_approvals_only_for_running_workers() {
         .record(&id, 1, &Event::ApprovalRequested { approval })
         .expect("record pending approval");
 
-    // No live worker: the durable log has an unresolved nonce, but the
-    // invariant is that a pending nonce only exists on a running worker.
-    // Projecting it would surface a phantom approval the resolver can only
-    // 404 on, so the gate must keep it hidden.
+    // No live worker: the durable log has an unresolved nonce, but a pending
+    // nonce only exists on a running worker, so projecting it would surface a
+    // phantom approval the resolver can only 404 on.
     let response = list_sessions(
         axum::extract::State(state.clone()),
         axum::extract::Query(ListSessionsQuery { state: None }),

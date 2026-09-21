@@ -1,11 +1,4 @@
 // @vitest-environment jsdom
-//
-// Regression test for the bug where diff line content was invisible
-// while Shiki was loading (or had silently failed). The previous
-// implementation gated the content span with `opacity-0` until
-// `highlightPending` flipped, which left text invisible forever when
-// the async highlighter rejected. Plain text must render unconditionally;
-// token colors layer on top once tokenization completes.
 
 import { describe, expect, it } from "vitest";
 import { render } from "@testing-library/react";

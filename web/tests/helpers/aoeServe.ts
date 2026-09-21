@@ -24,7 +24,7 @@ import { expect } from "@playwright/test";
 import { setTimeout as delay } from "node:timers/promises";
 import { once } from "node:events";
 import { isolateEnv } from "./isolatedEnv";
-import { initWorkingRepo } from "./gitFixture";
+import { commitAll, initWorkingRepo, writeFiles } from "./gitFixture";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -43,52 +43,19 @@ export interface SpawnOptions {
   extraArgs?: string[];
   /** Override the spawn timeout (default 10s). */
   spawnTimeoutMs?: number;
-  /**
-   * When true and `authMode === "passphrase"`, the harness POSTs
-   * `/api/login` itself after boot to mint a session cookie + record
-   * the device binding secret. Useful for fixtures that need a
-   * pre-authed browser context (e.g. a future acp-under-passphrase
-   * spec). Defaults to false: specs that drive LoginPage end-to-end
-   * (the `auth-login-passphrase` spec) want to start with no cookie
-   * so the LoginPage actually renders.
-   */
+  /** Passphrase mode: log in after boot so `seedAuth` can pre-authenticate the browser. */
   preloginViaHarness?: boolean;
-  /**
-   * Token mode only. Sets `AOE_TEST_TOKEN_LIFETIME_SECS` on the server
-   * subprocess; in debug builds the daemon enables the rotation task
-   * even outside `--remote` and uses this lifetime. Ignored when
-   * authMode !== "token".
-   */
+  /** Token mode: token lifetime (debug builds rotate even without `--remote`). */
   tokenLifetimeSecs?: number;
-  /**
-   * Token mode only. Sets `AOE_TEST_TOKEN_GRACE_SECS`. Defaults to the
-   * production 300s; specs that assert "old rejected past grace" pass a
-   * small value (e.g. 2) so the assertion lands inside a Playwright run.
-   */
+  /** Token mode: grace period for the previous token (production default 300s). */
   tokenGraceSecs?: number;
-  /**
-   * When true, install `fakeAcpAgent.mjs` as the `claude` / `aoe-agent`
-   * shim instead of the tail-f-dev-null stub, and flip the structured view
-   * master enable flag via `PATCH /api/acp/master` after the server
-   * boots.
-   */
+  /** Install `fakeAcpAgent.mjs` as every agent shim instead of an idle stub. */
   acp?: boolean;
-  /** Optional path to a FAKE_ACP_SCRIPT for structured view tests. */
-  fakeAcpScript?: string;
-  /** Extra environment variables exported in the fake-ACP shim. Lets
-   *  structured view tests toggle behavior on the fake agent (e.g. force a
-   *  rejection of session/set_config_option) without writing a full
-   *  scripted turn file. */
-  extraEnv?: Record<string, string>;
-  /**
-   * Runs after the isolated $HOME tree is set up and the fake shim is on
-   * PATH, but BEFORE `aoe serve` spawns. Use to call `aoe add` so the
-   * server picks up the session record in-memory on boot (a post-spawn
-   * `aoe add` would write to disk but the running server's
-   * `state.instances` cache would never reload). The callback receives
-   * the same env vars the server will run with, ready to pass straight
-   * to `child_process.spawnSync(..., { env: seedEnv.env })`.
-   */
+  /** FAKE_ACP_SCRIPT path, or a script object written into the isolated HOME. */
+  fakeAcpScript?: string | object;
+  /** Extra env exported in the fake-ACP shim; a function receives the isolated HOME. */
+  extraEnv?: Record<string, string> | ((home: string) => Record<string, string>);
+  /** Seeds state before `aoe serve` boots; the server never reloads sessions added later. */
   seedFn?: (seedEnv: {
     home: string;
     shimBin: string;
@@ -102,81 +69,27 @@ export interface SpawnOptions {
 export interface ServeHandle {
   baseUrl: string;
   port: number;
-  /** Root of the isolated filesystem tree (HOME / XDG / TMPDIR / TMUX_TMPDIR). */
   home: string;
-  /** Directory prepended to PATH (contains the fake `claude` shim). */
   shimBin: string;
-  /**
-   * The exact env (isolated HOME / XDG bases / TMPDIR / PATH with the
-   * shim) the daemon and seed ran with. Specs that drive `aoe` CLI
-   * subprocesses against the same isolated state (e.g. `aoe session rename`
-   * from a peer process) MUST pass this as `spawnSync(..., { env })`. Passing
-   * `undefined` inherits the Playwright worker's env, which points at the
-   * real `~/.config` and makes the CLI miss the seeded session.
-   */
+  /** The isolated env; pass it to any `aoe` CLI subprocess or it reads the real config. */
   env: NodeJS.ProcessEnv;
   proc: ChildProcess;
   authMode: AuthMode;
   passphrase?: string;
-  /**
-   * Token-mode only: the 64-char hex token the daemon wrote to
-   * `serve.token` after boot. Specs append it as `?token=<value>` on
-   * navigation or attach it as a Bearer header for direct fetches.
-   */
   authToken?: string;
-  /**
-   * Token-mode only: filesystem path to `serve.token` under the
-   * isolated HOME. Specs that need to read the rotated token re-read
-   * this file; the daemon rewrites it on every rotation.
-   */
+  /** Token mode: rewritten on every rotation. */
   tokenFile?: string;
-  /**
-   * Set when `authMode === "passphrase"` and the harness has minted a
-   * session via POST /api/login. Callers (typically the Playwright fixture)
-   * inject this cookie into the browser context before navigation.
-   */
   sessionCookie?: { name: string; value: string };
-  /**
-   * Stable base64url device binding secret the harness used at login time.
-   * Specs that drive auth flows from the browser side need to seed the
-   * same value into `localStorage` under `aoe-device-binding-secret`.
-   */
   deviceBindingSecret?: string;
-  /**
-   * The tmux session prefix the running binary uses. Debug-mode builds
-   * (`debug_assertions=true`, set by both `cargo build` and `cargo build
-   * --profile dev-release`) use `aoe_dev_`; release builds use `aoe_`.
-   * Specs that need to assert on tmux session names should compose this
-   * with the session title rather than hard-coding `aoe_`.
-   */
+  /** `aoe_dev_` for debug builds, `aoe_` for release. */
   tmuxPrefix: "aoe_" | "aoe_dev_";
-  /**
-   * The tmux socket the running binary uses (`AOE_TMUX_SOCKET`). Specs that
-   * inspect sessions with a raw `tmux` call MUST pass `-S <this>`; debug
-   * builds ignore `TMUX_TMPDIR` and route tmux through this socket (#2608).
-   */
+  /** Raw `tmux` calls must pass `-S <tmuxSocket>`. */
   tmuxSocket: string;
   stop(): Promise<void>;
-  /**
-   * Kill the running `aoe serve` proc and respawn it with the same args
-   * on the same port. Used by connectivity-recovery specs (disconnect
-   * banner) that need to observe the dashboard's `setServerDown(true)`
-   * path on SIGTERM and then `setServerDown(false)` once the server is
-   * back. The captured port is reused after the dead listener releases
-   * it on `exit`. Token-mode reads the freshly written `serve.token`
-   * and updates `handle.authToken`. Does NOT re-run passphrase
-   * `preloginViaHarness` or structured view master enable; specs that need
-   * those across a restart should call `spawnAoeServe` again.
-   */
+  /** Kill and respawn on the same port; does not repeat harness login or structured view enable. */
   restart(): Promise<void>;
 }
 
-/**
- * Fetch and unwrap `GET /api/sessions`. As of #1171 the response shape is
- * `{ sessions: SessionResponse[], workspace_ordering: string[] }`. Callers
- * typically want only the sessions array, so this helper hides the
- * envelope change so a future shape tweak is one edit away.
- */
 export async function listSessions(
   baseUrl: string,
 ): Promise<Array<{ id: string; title: string; status: string; [k: string]: unknown }>> {
@@ -190,14 +103,7 @@ export async function listSessions(
   throw new Error(`GET /api/sessions returned an unexpected shape: ${JSON.stringify(body).slice(0, 200)}`);
 }
 
-/**
- * Poll `GET /api/sessions` until at least one session is present, and
- * return the snapshot the poll settled on. The list is a cache the
- * daemon reconciles on a 2s tick (see `waitForView` below), so a fresh
- * `listSessions()` issued right after a poll that already saw the
- * session can come back empty; reading the array from inside the poll
- * removes that second, racy fetch.
- */
+/** Return the first non-empty sessions snapshot; a second fetch can race the daemon's reconcile tick. */
 export async function waitForSessions(
   baseUrl: string,
   timeout = 15_000,
@@ -220,24 +126,8 @@ export async function waitForSessions(
 }
 
 /**
- * Poll `GET /api/sessions` until the given session's `view` reaches
- * `expected`. The sessions list is a cache the daemon reconciles on a
- * 2s tick, so a disk snapshot taken just before an endpoint's write
- * can briefly clobber the in-memory view before self-correcting; a
- * bare `expect(sessions.find(...).view === expected)` on the very
- * next `listSessions()` after a view-mutating endpoint is the flake
- * shape. The endpoint's own response body remains the authoritative
- * synchronous check; use this helper for reads that go back through
- * the sessions list.
- *
- * The server omits the `view` field for `Terminal` sessions (serde
- * `skip_serializing_if`); this helper treats a missing field on a
- * present session as `"terminal"` so callers pass one of two
- * symmetric string values. A missing session (unknown or deleted id)
- * is not coerced: the callback throws, and since `expect.poll`
- * propagates a thrown callback immediately (only a failed matcher is
- * retried), this fails fast on a bad or never-created id rather than
- * false-passing `.toBe("terminal")`.
+ * Poll a session's view through the reconciled sessions cache. A missing `view` means terminal;
+ * an unknown session throws, which fails the poll immediately.
  */
 export async function waitForView(
   baseUrl: string,
@@ -265,30 +155,45 @@ export async function waitForView(
 }
 
 /**
- * Returns a `seedFn` for `spawnAoeServe` that:
- *   1. git-inits a fresh project dir under the isolated HOME.
- *   2. runs `aoe add <projectDir> -t <title> -c <tool>` against the same env.
- *
- * Must run BEFORE serve spawns so the server picks up the session record
- * in-memory on boot. A post-spawn `aoe add` writes to disk but the running
- * server's `state.instances` cache never reloads, so subsequent
- * `GET /api/sessions` returns an empty list.
+ * A `seedFn` that creates `~/<subdir>` (a git repo unless `git: false`), commits `committed`, writes
+ * `files` uncommitted, runs `prepare`, and registers the directory with `aoe add`.
  */
 export function seedSessionViaAoeAdd(opts: {
   title: string;
   tool?: string;
   subdir?: string;
+  git?: boolean;
+  committed?: Record<string, string>;
+  files?: Record<string, string>;
+  prepare?: (projectDir: string, env: NodeJS.ProcessEnv) => void;
+  /** Bash script run as the agent via `--cmd-override`, by absolute path so no real agent is resolved. */
+  agentScript?: string;
 }): (seedEnv: { home: string; shimBin: string; env: NodeJS.ProcessEnv }) => void {
-  return ({ home, env }) => {
+  return ({ home, shimBin, env }) => {
     const projectDir = join(home, opts.subdir ?? "project");
-    initWorkingRepo(projectDir, env);
-    const addRes = spawnSync(resolveAoeBinary(), ["add", projectDir, "-t", opts.title, "-c", opts.tool ?? "claude"], {
-      env,
-    });
+    if (opts.git === false) mkdirSync(projectDir, { recursive: true });
+    else initWorkingRepo(projectDir, env);
+    if (opts.committed) {
+      writeFiles(projectDir, opts.committed);
+      commitAll(projectDir, "baseline", env);
+    }
+    if (opts.files) writeFiles(projectDir, opts.files);
+    opts.prepare?.(projectDir, env);
+    const args = ["add", projectDir, "-t", opts.title, "-c", opts.tool ?? "claude"];
+    if (opts.agentScript) {
+      const script = join(shimBin, `${opts.title}-agent`);
+      writeFileSync(script, opts.agentScript, { mode: 0o755 });
+      args.push("--cmd-override", script);
+    }
+    const addRes = spawnSync(resolveAoeBinary(), args, { env });
     if (addRes.status !== 0) {
       throw new Error(`aoe add failed: status=${addRes.status} stderr=${addRes.stderr?.toString() ?? "<none>"}`);
     }
   };
+}
+
+export function fakeAcpScriptPath(home: string): string {
+  return join(home, "fake-acp-script.json");
 }
 
 export function resolveAoeBinary(): string {
@@ -301,43 +206,17 @@ export function resolveAoeBinary(): string {
   return join(repoRoot, "target", "release", "aoe");
 }
 
-/**
- * Map a resolved aoe binary path to the tmux session prefix the binary
- * will use. The Rust side sets the prefix at compile time based on
- * `cfg!(debug_assertions)`; we can't query it from JS, so we derive it
- * from the build directory in the path. CI passes the binary via
- * `AOE_E2E_BINARY` so this works in CI; locally it falls through to the
- * debug/release fallback in `resolveAoeBinary`.
- */
 export function tmuxPrefixFor(binaryPath: string): "aoe_" | "aoe_dev_" {
   return binaryPath.includes("/target/debug/") ? "aoe_dev_" : "aoe_";
 }
 
-/**
- * The tmux socket path the harness pins via `AOE_TMUX_SOCKET`, under the
- * test's isolated tmux tmpdir. The daemon and every spec that shells out to a
- * raw `tmux` must agree on this: debug builds ignore `TMUX_TMPDIR` and route
- * tmux through an explicit `-S <socket>` (#2608).
- */
 export function tmuxSocketPath(home: string): string {
   return join(home, "tmux", "aoe.sock");
 }
 
 /**
- * Resolve where the daemon will write `serve.token` (and other serve.*
- * state files) under the test's isolated filesystem tree. Mirrors the
- * Rust `get_app_dir_path` logic at `src/session/mod.rs:83`: Linux uses
- * `$XDG_CONFIG_HOME/agent-of-empires[-dev]`. Debug builds carry the `-dev`
- * suffix, derived from the binary path the same way as `tmuxPrefixFor`.
- *
- * macOS/Windows go through `session::macos_app_dir` (#1948), whose precedence
- * is: the XDG path if it exists, else the legacy `~/.agent-of-empires` if that
- * exists, else the XDG path whenever `XDG_CONFIG_HOME` is set, else legacy.
- * The harness always sets `XDG_CONFIG_HOME` on an isolated tree, so a fresh
- * test home resolves to the XDG path, NOT the legacy one. Returning the legacy
- * path unconditionally here pointed specs at a directory the daemon never
- * touches, which reads as a passing no-op on macOS while CI (Linux) took the
- * correct branch.
+ * Mirrors the daemon's app dir: XDG on Linux; elsewhere XDG if present, then legacy if present,
+ * then XDG whenever XDG_CONFIG_HOME is set (always true for the harness).
  */
 export function appDirFor(home: string, xdg: string, binaryPath: string): string {
   const suffix = binaryPath.includes("/target/debug/") ? "-dev" : "";
@@ -523,12 +402,6 @@ async function stopTerminalProcesses(
   }
 }
 
-/**
- * Wait for `serve.token` to appear in the daemon's app dir, then read
- * it. The daemon writes the token early in startup, so by the time
- * `waitForServer` resolves it is on disk; the loop is a small safety
- * net for systems where fs writes lag the listen socket by a few ms.
- */
 async function readTokenFile(tokenPath: string, deadlineMs: number): Promise<string> {
   const { readFile } = await import("node:fs/promises");
   const deadline = Date.now() + deadlineMs;
@@ -548,8 +421,7 @@ async function readTokenFile(tokenPath: string, deadlineMs: number): Promise<str
 }
 
 function portFor(workerIndex: number, parallelIndex: number, attempt: number): number {
-  // 5200 + worker*100 + parallel + attempt*7 covers ~14 retries per
-  // (worker, parallel) slot before colliding with the next slot.
+  // About 14 retries per (worker, parallel) slot before colliding with the next slot.
   return 5200 + workerIndex * 100 + parallelIndex + attempt * 7;
 }
 
@@ -587,13 +459,7 @@ async function waitForServer(
 }
 
 function writeFakeClaudeShim(binDir: string): void {
-  // Dashboard tracer specs only need the tmux pane to stay open with a
-  // long-running process. Structured view specs swap this for the ACP agent shim
-  // via `writeFakeAcpShim`. Install shims for the built-in agents the
-  // wizard UI surfaces (claude / codex / gemini); the agent picker
-  // filters by `which <binary>` (src/tmux/mod.rs::is_agent_available),
-  // so without these the picker only offers claude and persistence
-  // specs that pick a non-default tool would hang on a missing button.
+  // The wizard only offers agents whose binary is on PATH.
   const script = "#!/bin/bash\nexec tail -f /dev/null\n";
   for (const name of ["claude", "codex", "gemini", "opencode"]) {
     const path = join(binDir, name);
@@ -608,20 +474,8 @@ function writeFakeAcpShim(
   fakeAcpDebugLog: string,
   extraEnv: Record<string, string> | undefined,
 ): void {
-  // The structured view supervisor resolves the agent through `AgentRegistry`
-  // (src/acp/agent_registry.rs): the `claude` tool key maps to
-  // command `claude-agent-acp`, not `claude`. `resolve_agent_command`
-  // walks $PATH and node-version dirs, so without a `claude-agent-acp`
-  // entry in the shim dir the supervisor falls through to the real
-  // installed adapter, which then surfaces "Authentication required"
-  // on the first prompt. Shim every name a structured view test can land on.
-  //
-  // The shim also re-exports diagnostic env vars (FAKE_ACP_SCRIPT,
-  // FAKE_ACP_DEBUG_LOG) so they reach the node child even when the
-  // daemon -> runner spawn chain does not propagate every env from
-  // the parent (observed in CI: seedEnv vars set on `aoe serve` do
-  // not all reach the runner-spawned fake-ACP child, so relying on
-  // process.env in fakeAcpAgent.mjs alone is unreliable).
+  // Shim every command the supervisor can resolve (claude maps to claude-agent-acp), or it finds a
+  // real adapter. Env is re-exported because the daemon to runner chain drops some variables.
   const fakeAgentJs = resolve(__dirname, "fakeAcpAgent.mjs");
   const scriptLines: string[] = [];
   if (fakeAcpScript) {
@@ -634,18 +488,8 @@ function writeFakeAcpShim(
     scriptLines.push(`export ${key}=${JSON.stringify(value)}`);
   }
   for (const name of ["claude", "claude-agent-acp", "aoe-agent", "opencode", "codex", "codex-acp"]) {
-    // The agent_compat gate keys its version floor off the spawned binary
-    // name. When the fake stands in for opencode it must report opencode's
-    // handshake (name + a version at or above the opencode floor), or the
-    // gate rejects it and the opencode live specs fail; FAKE_ACP_IMPERSONATE
-    // tells fakeAcpAgent.mjs which identity to present.
-    //
-    // `codex` (the native CLI) is shimmed alongside `codex-acp` (the ACP
-    // adapter the supervisor actually spawns) because the wizard's agent
-    // picker only renders agents whose native binary is detected on PATH
-    // (`AvailableTools::detect` -> `DetectionMethod::Which("codex")`). Without
-    // a `codex` shim the picker button never appears and codex-selecting specs
-    // time out, even though the ACP spawn resolves `codex-acp`.
+    // The version gate keys off the binary name, so impersonate that agent's handshake. The native
+    // `codex` shim makes the wizard offer codex even though the supervisor spawns `codex-acp`.
     const perName =
       name === "opencode"
         ? [...scriptLines, "export FAKE_ACP_IMPERSONATE=opencode"]
@@ -660,7 +504,7 @@ function writeFakeAcpShim(
   }
 }
 
-async function loginWithPassphrase(
+export async function loginWithPassphrase(
   baseUrl: string,
   passphrase: string,
   deviceBindingSecret: string,
@@ -677,7 +521,6 @@ async function loginWithPassphrase(
     throw new Error(`POST /api/login failed: ${res.status} ${await res.text()}`);
   }
   const setCookie = res.headers.get("set-cookie") ?? "";
-  // axum returns a single Set-Cookie; cookie name we want is "aoe_session".
   const match = /aoe_session=([^;]+)/.exec(setCookie);
   if (!match) {
     throw new Error(`POST /api/login did not set aoe_session cookie. Set-Cookie was: ${setCookie}`);
@@ -693,29 +536,8 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
     );
   }
 
-  // realpathSync resolves any symlinks in the tmpdir path (on macOS,
-  // `/var/folders/...` lives under `/private/var/...`). The server's
-  // `/api/filesystem/browse` endpoint canonicalizes the requested path
-  // and checks `starts_with(dirs::home_dir())`; if HOME is the un-
-  // canonicalized form, that check fails on macOS and any browse call
-  // against the test's HOME tree returns "outside the home directory".
-  //
-  // Use `/tmp/...` as the base instead of `tmpdir()`. On macOS,
-  // `tmpdir()` resolves to `/private/var/folders/<hash>/T/...` (~95
-  // chars). After we append `/.agent-of-empires-dev/acp-workers/
-  // <session_id>.sock` (~60 chars) we blow past the 104-byte
-  // `sun_path` limit on Darwin unix sockets and the runner's
-  // `UnixListener::bind` fails with ENAMETOOLONG. Because the runner
-  // writes its stderr to /dev/null, the failure surfaces as "runner
-  // socket … did not appear within Ns" (the daemon's wait_for_socket
-  // poll never sees a socket appear) instead of a typed bind error.
-  // `/tmp` is a stable, short, world-writable directory on every
-  // supported OS we target; using it caps the path well under
-  // sun_path on Darwin (104) and Linux (108). See macOS sun_path
-  // <sys/un.h>.
-  // Windows has no `/tmp`; fall back to `tmpdir()` there. `sun_path`
-  // is a POSIX-only limit, so the Darwin short-path workaround does
-  // not apply to win32 either.
+  // Canonical so the browse endpoint's home check passes on macOS, and under /tmp so runner
+  // socket paths stay within the 104-byte Darwin sun_path limit.
   const shortBase = process.platform === "win32" ? tmpdir() : "/tmp";
   const home = realpathSync(mkdtempSync(join(shortBase, `aoe-pw-w${opts.workerIndex}-p${opts.parallelIndex}-`)));
   const xdg = join(home, "config");
@@ -732,7 +554,18 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
   writeFileSync(join(appDir, "config.toml"), "[app_state]\nhas_acknowledged_agent_hooks = true\n");
   const fakeAcpDebugLog = join(home, "fake-acp.log");
   if (opts.acp) {
-    writeFakeAcpShim(shimBin, opts.fakeAcpScript, fakeAcpDebugLog, opts.extraEnv);
+    let script = opts.fakeAcpScript;
+    if (script !== undefined && typeof script !== "string") {
+      const path = fakeAcpScriptPath(home);
+      writeFileSync(path, JSON.stringify(script));
+      script = path;
+    }
+    writeFakeAcpShim(
+      shimBin,
+      script,
+      fakeAcpDebugLog,
+      typeof opts.extraEnv === "function" ? opts.extraEnv(home) : opts.extraEnv,
+    );
   } else {
     writeFakeClaudeShim(shimBin);
   }
@@ -744,47 +577,16 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
     // read their config and data from. See `isolatedEnv.ts`.
     ...isolateEnv(process.env, { home, xdgConfig: xdg, xdgData, tmp, tmuxTmp }),
     PATH: `${shimBin}:${process.env.PATH ?? ""}`,
-    // Lift the runner-socket appearance deadline. The `aoe
-    // __acp-runner` shim re-execs the debug `aoe` binary, which
-    // under v8 coverage + 3 parallel workers + tmux + a fake-ACP node
-    // subprocess can take >10s to bind its unix listener on a
-    // contended runner. The production 10s default in
-    // `runner_socket_deadline()` covers cold caches; tests need
-    // headroom or `acp_enable` fails with `runner socket … did
-    // not appear within 10s` (deterministic on slower local + CI
-    // machines, never on hot caches). Honored only in debug builds.
+    // Debug-only: a contended runner under coverage can take over 10s to bind its socket.
     AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS: "60000",
     // Teardown revokes the registry lease and waits for this runner-owned watchdog.
     AOE_ACP_WATCHDOG_POLL_MS: "100",
-    // FAKE_ACP_DEBUG_LOG is *also* re-exported by the shim itself
-    // (see writeFakeAcpShim) because the daemon -> runner -> node
-    // spawn chain on CI Linux did not propagate this env var from
-    // process.env alone. Keeping it on seedEnv too is harmless and
-    // covers any future caller that bypasses the shim path.
     FAKE_ACP_DEBUG_LOG: fakeAcpDebugLog,
-    // Daemon log level. AOE_LOG_LEVEL only accepts a single level
-    // string (trace|debug|info|warn|error); see LogLevel::parse in
-    // src/logging.rs. The default `info` is sufficient for the
-    // post-mortem attachments; `trace` was used briefly to diagnose
-    // the XDG_CONFIG_HOME bug but adds enough I/O pressure on CI to
-    // cause unrelated REST flakes (e.g. settings PATCH failing
-    // under contention and triggering an optimistic-update revert).
-    // Override via process env if a future investigation needs it.
+    // trace adds enough I/O to cause unrelated REST flakes on CI.
     AOE_LOG_LEVEL: process.env.AOE_LOG_LEVEL ?? "info",
-    // Suppress the first-load telemetry consent modal. Every live spec boots
-    // a fresh HOME where `has_responded_to_telemetry` is false, so the modal
-    // (`telemetry-modal-title`, a z-50 full-screen backdrop) would otherwise
-    // intercept pointer events and time out every `click`. `DO_NOT_TRACK`
-    // makes `/api/telemetry/status` report `do_not_track: true`, which App.tsx
-    // treats as "never auto-show the modal". The consent flow itself is
-    // covered by the Vitest + RTL contract tests, not the live suite. A future
-    // live spec that exercises the modal can unset this in its own env.
+    // Suppresses the telemetry consent modal, whose backdrop would intercept every click.
     DO_NOT_TRACK: process.env.DO_NOT_TRACK ?? "1",
-    // Pin the tmux socket explicitly. Debug builds otherwise route tmux
-    // through `<app_dir>/tmux.sock` and ignore TMUX_TMPDIR (#2608), so specs
-    // that inspect sessions with a raw `tmux` call must target this same
-    // socket (see `tmuxSocketPath`) rather than the default one under
-    // TMUX_TMPDIR.
+    // Debug builds ignore TMUX_TMPDIR, so pin the socket raw tmux calls use.
     AOE_TMUX_SOCKET: tmuxSocketPath(home),
   };
 
@@ -806,15 +608,7 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
     if (authMode === "none") args.push("--no-auth");
     if (authMode === "token") args.push("--auth", "token");
     if (authMode === "passphrase") {
-      // `--passphrase X` alone leaves the auth mode at the default
-      // (Token + passphrase as 2FA). The Playwright browser has no
-      // token, so `/api/login/status` 401s on the no-token branch in
-      // `auth_middleware` before any login-exempt or loopback-bypass
-      // check, and the SPA renders TokenEntryPage instead of LoginPage.
-      // `--auth=passphrase` switches the server into the
-      // `run_passphrase_wall` path where `/api/login` and
-      // `/api/login/status` are login-exempt, so the SPA can bootstrap
-      // and LoginPage actually renders. See #1230.
+      // `--passphrase` alone keeps token auth with a passphrase second factor, which renders TokenEntryPage.
       args.push("--auth", "passphrase");
     }
     if (passphrase) args.push("--passphrase", passphrase);

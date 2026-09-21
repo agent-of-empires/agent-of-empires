@@ -31,9 +31,8 @@ impl HomeView {
             .is_some_and(Instance::sandbox_store_move_pending)
     }
 
-    /// Whether a launch of `id` must first move its store. False once, for
-    /// the launch a move handed back after finding the container up; see
-    /// `store_move_bypass`.
+    /// Whether a launch of `id` must first move its store. False once, for the launch a move
+    /// handed back after finding the container up; see `store_move_bypass`.
     pub(crate) fn needs_store_move_before_launch(&mut self, id: &str) -> bool {
         if self.store_move_bypass.as_deref() == Some(id) {
             self.store_move_bypass = None;
@@ -42,9 +41,9 @@ impl HomeView {
         self.sandbox_store_move_pending(id)
     }
 
-    /// Start moving `id`'s sandbox store on the worker; `resume` runs once it
-    /// has moved. Refused, returning `false`, while another move is in
-    /// flight: the status line already says what is happening.
+    /// Start moving `id`'s sandbox store on the worker, running `resume` once it has moved.
+    /// Returns `false` while another move is in flight, since the status line already says
+    /// what is happening.
     pub(crate) fn begin_store_move(&mut self, id: &str, resume: Option<Action>) -> bool {
         if self.store_move_in_flight.is_some() {
             return false;
@@ -64,10 +63,9 @@ impl HomeView {
         true
     }
 
-    /// Drain the move's progress into the status line and apply its result:
-    /// a moved store re-reads the row and hands back the resume action, a
-    /// store that could not move or a failed move explains itself in a
-    /// dialog instead.
+    /// Drain the move's progress into the status line and apply its result: a moved store
+    /// re-reads the row and hands back the resume action, while a store that could not move
+    /// explains itself in a dialog.
     pub(crate) fn poll_store_move(&mut self) -> StoreMovePoll {
         use std::sync::mpsc::TryRecvError;
 
@@ -109,10 +107,10 @@ impl HomeView {
             resume,
         } = result;
         match outcome {
-            // The container was up, so the launch proceeds on the shared
-            // store. Only a launch handed back here may pass the gate: a move
-            // started with nothing to resume must not exempt a later launch,
-            // by which time the container may have stopped.
+            // The container was up, so the launch proceeds on the shared store. Only a
+            // launch handed back here may pass the gate: a move started with nothing to
+            // resume must not exempt a later launch, by which time the container may have
+            // stopped.
             Ok(false) => {
                 self.store_move_bypass = resume.is_some().then_some(session_id);
                 poll.resume = resume;

@@ -1,7 +1,4 @@
 //! Instance creation and cleanup utilities.
-//!
-//! This module provides shared logic for building new session instances,
-//! used by both synchronous (TUI operations) and asynchronous (background poller) code paths.
 
 use std::{
     collections::HashSet,
@@ -29,9 +26,7 @@ pub struct InstanceParams {
     pub worktree_enabled: bool,
     pub worktree_branch: Option<String>,
     pub create_new_branch: bool,
-    /// Branch to base a freshly-created worktree branch on. Only honored
-    /// when `create_new_branch` is true. `None` falls back to the
-    /// repository's detected default branch. See #948.
+    /// Branch to base a freshly-created worktree branch on.
     pub base_branch: Option<String>,
     pub sandbox: bool,
     /// The sandbox image to use. Required when sandbox is true.
@@ -46,16 +41,11 @@ pub struct InstanceParams {
     pub command_override: String,
     /// Additional repository paths for multi-repo workspace mode
     pub extra_repo_paths: Vec<String>,
-    /// Per-repo base branches as `(selector, base)` pairs, from
-    /// `aoe add --repo-base <selector>=<ref>` or the web wizard. The
-    /// selector is a repo directory name or one of the paths in `path` /
-    /// `extra_repo_paths`. Outranks `base_branch`, which stays the base for
-    /// every repo that no pair names. See #3329.
+    /// Per-repo base branches as `(selector, base)` pairs, from `aoe add --repo-base
+    /// <selector>=<ref>` or the web wizard.
     pub repo_base_branches: Vec<(String, String)>,
-    /// Scratch session: ignore `path`, provision a fresh directory under
-    /// `<app_dir>/scratch/<id>/`, and persist `instance.scratch = true` so
-    /// the deletion path removes the directory. Mutually exclusive with
-    /// worktree/workspace and with non-empty `extra_repo_paths`.
+    /// Scratch session: ignore `path`, provision a fresh directory under `<app_dir>/scratch/<id>/`,
+    /// and persist `instance.scratch = true` so the deletion path removes the directory.
     pub scratch: bool,
     /// One-shot fork seed. When `Some`, the freshly-built instance is set up
     /// to fork its parent on first launch instead of starting fresh.
@@ -99,9 +89,8 @@ fn normalize_base(s: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Resolve a repo's effective base branch with precedence:
-/// explicit session base > per-project default > global/profile default.
-/// `None` means "auto-detect the repo's default branch".
+/// Resolve a repo's effective base branch with precedence: explicit session base > per-project
+/// default > global/profile default.
 pub(crate) fn resolve_base_branch(
     session: Option<&str>,
     project: Option<&str>,
@@ -112,11 +101,7 @@ pub(crate) fn resolve_base_branch(
         .or_else(|| normalize_base(global))
 }
 
-/// Resolve one repo's effective base branch, consulting its registered
-/// per-project default. The registry stores each project at its repo root, so
-/// the lookup keys on `find_main_repo(repo_path)`; `repo_path` itself may be a
-/// subdirectory or a worktree, which would miss a root-keyed entry. Precedence:
-/// explicit session base > per-project default > global/profile default.
+/// Resolve one repo's effective base branch, consulting its registered per-project default.
 fn resolve_repo_base_branch(
     repo_path: &std::path::Path,
     session: Option<&str>,
@@ -131,15 +116,6 @@ fn resolve_repo_base_branch(
 }
 
 /// Match `(selector, base)` pairs to the repos a session is being built from.
-///
-/// A selector is either a repo's directory name (what every other surface
-/// calls it: the diff panel, `aoe list --json`, `set-base --repo`) or the
-/// literal path the caller passed. Returns a map keyed by the same `PathBuf`
-/// the spec builder uses, so a lookup there is exact.
-///
-/// An unmatched or ambiguous selector is an error rather than a silent
-/// no-op: a typo would otherwise fork the worktree from the wrong base and
-/// only show up as a confusing diff much later. See #3329.
 pub(crate) fn resolve_repo_base_selectors(
     repos: &[PathBuf],
     pairs: &[(String, String)],
@@ -184,16 +160,13 @@ pub(crate) fn resolve_repo_base_selectors(
     Ok(out)
 }
 
-/// Map of canonical repo path to configured default base branch for every
-/// registered project (global + profile) that sets one. Used to fill in the
-/// per-project layer of `resolve_repo_base_branch` for the launch repo and any
-/// extra repos when building a session.
+/// Map of canonical repo path to configured default base branch for every registered project
+/// (global + profile) that sets one.
 pub(crate) fn project_base_branches(profile: &str) -> std::collections::HashMap<String, String> {
     crate::session::projects::load_merged(profile)
         .unwrap_or_else(|e| {
-            // Don't fork worktrees from the wrong base in silence: if the
-            // registry can't be read, log it so the missing per-project
-            // defaults are explainable instead of mysterious.
+            // Don't fork worktrees from the wrong base in silence: if the registry can't be read,
+            // log it so the missing per-project defaults are explainable instead of mysterious.
             tracing::warn!(
                 target: "session.create",
                 "Failed to load project registry for base-branch defaults; \
@@ -214,20 +187,14 @@ pub(crate) fn project_base_branches(profile: &str) -> std::collections::HashMap<
         .collect()
 }
 
-/// One repository in a multi-repo workspace, paired with the base branch its
-/// freshly-created worktree branch should fork from. `base_branch` is the
-/// fully resolved value (`None` means auto-detect the repo's default branch);
-/// callers apply the session > per-project > global precedence before building
-/// this list.
+/// One repository in a multi-repo workspace, paired with the base branch its freshly-created
+/// worktree branch should fork from.
 pub struct WorkspaceRepoSpec {
     pub path: PathBuf,
     pub base_branch: Option<String>,
 }
 
 /// Create a multi-repo workspace with worktrees for each repository.
-///
-/// Validates repo paths, detects name collisions, creates worktrees inside
-/// a shared workspace directory, and rolls back on any error.
 pub fn create_workspace(
     primary: &WorkspaceRepoSpec,
     extra_repos: &[WorkspaceRepoSpec],
@@ -247,9 +214,7 @@ pub fn create_workspace(
     let workspace_dir = workspace_path.to_string_lossy().to_string();
     std::fs::create_dir_all(&workspace_path)?;
 
-    // (canonicalized path, resolved base branch) for the primary repo followed
-    // by every extra repo. The primary path is left as the caller passed it;
-    // extras are canonicalized to match how they are stored/compared.
+    // (canonicalized path, resolved base branch) for the primary repo followed by every extra repo.
     let all_repos: Vec<(PathBuf, Option<String>)> =
         std::iter::once((primary.path.clone(), primary.base_branch.clone()))
             .chain(extra_repos.iter().map(|r| {
@@ -326,11 +291,7 @@ pub fn create_workspace(
         });
     }
 
-    // Run create_worktree for every repo concurrently. Each worktree lives in
-    // a different directory and uses a different main repo, so the operations
-    // are independent. Network IO (git fetch + git submodule update) dominates
-    // each step, so fanning out cuts wall time roughly to that of the slowest
-    // repo.
+    // Run create_worktree for every repo concurrently.
     let create_start = std::time::Instant::now();
     let parallel_results: Vec<std::result::Result<Vec<String>, String>> =
         std::thread::scope(|scope| {
@@ -402,14 +363,11 @@ pub fn create_workspace(
                     worktree_path: plan.worktree_subdir.to_string_lossy().to_string(),
                     main_repo_path: plan.main_repo_path.to_string_lossy().to_string(),
                     managed_by_aoe: true,
-                    // The builder always creates the branch it names, so branch
-                    // and worktree ownership coincide for a repo present at
-                    // creation. Only `attach_project` can set this.
+                    // The builder always creates the branch it names, so branch and worktree
+                    // ownership coincide for a repo present at creation.
                     branch_preexisting: false,
-                    // The ref this repo's branch was forked from, so the diff
-                    // view can default to it per repo (#3329). Recorded only
-                    // when the branch was created here; `create_worktree`
-                    // ignores the base when checking out an existing branch.
+                    // The ref this repo's branch was forked from, so the diff view can default to
+                    // it per repo.
                     base_branch: create_new_branch
                         .then(|| plan.base_branch.clone())
                         .flatten(),
@@ -448,10 +406,6 @@ pub fn create_workspace(
 }
 
 /// Build an instance with all setup (worktree resolution, sandbox config).
-///
-/// This does NOT start the instance or create Docker containers - that happens
-/// separately via `instance.start()`. This separation allows for proper cleanup
-/// if starting fails.
 pub fn build_instance(
     params: InstanceParams,
     existing_titles: &[&str],
@@ -489,9 +443,9 @@ pub fn build_instance(
         }
     }
 
-    // Scratch sessions have no project repo, so config resolution falls
-    // back to global+profile defaults (`Path::new("")` makes
-    // `resolve_config_with_repo` skip the repo-config layer cleanly).
+    // Scratch sessions have no project repo, so config resolution falls back to global+profile
+    // defaults (`Path::new("")` makes `resolve_config_with_repo` skip the repo-config layer
+    // cleanly).
     let config_path = if params.scratch {
         std::path::PathBuf::new()
     } else {
@@ -504,10 +458,8 @@ pub fn build_instance(
         });
 
     let mut final_path = if params.scratch {
-        // Provisioning happens after `Instance::new` so we can key the
-        // directory on the generated instance id. Leave `final_path` empty
-        // for now; the worktree/workspace and path-existence blocks below
-        // are gated on the same flag.
+        // Provisioning happens after `Instance::new` so we can key the directory on the generated
+        // instance id.
         String::new()
     } else {
         PathBuf::from(&params.path)
@@ -564,19 +516,15 @@ pub fn build_instance(
             let global_default = config.worktree.default_base_branch.as_deref();
             let project_bases = project_base_branches(profile);
 
-            // An explicit per-repo base outranks every shared layer, which is
-            // the point: one repo forks from develop while the others fork from
-            // their own epic branches. See #3329.
+            // An explicit per-repo base outranks every shared layer, which is the point: one repo
+            // forks from develop while the others fork from their own epic branches.
             let mut all_paths = vec![primary_path.clone()];
             all_paths.extend(params.extra_repo_paths.iter().map(PathBuf::from));
             let per_repo = resolve_repo_base_selectors(&all_paths, &params.repo_base_branches)?;
             let base_for = |path: &PathBuf| {
                 per_repo.get(path).cloned().or_else(|| {
-                    // Every repo, including the launch repo, otherwise forks
-                    // from its own registered per-project default when no
-                    // explicit session base is given. Keyed by repo root so a
-                    // launch path inside a subdirectory still matches a
-                    // root-registered project.
+                    // Every repo, including the launch repo, otherwise forks from its own
+                    // registered per-project default when no explicit session base is given.
                     resolve_repo_base_branch(path, session_base, &project_bases, global_default)
                 })
             };
@@ -614,11 +562,8 @@ pub fn build_instance(
             // Single worktree mode (existing logic)
             let path = PathBuf::from(&params.path);
             if !GitWorktree::is_git_repo(&path) {
-                // Typed error (not a bare `bail!` string) so the web handler's
-                // whitelist forwards an actionable message instead of the
-                // opaque "Failed to create session". The context keeps the
-                // fuller tip for callers that surface the anyhow chain (CLI,
-                // TUI).
+                // Typed error (not a bare `bail!` string) so the web handler's whitelist forwards
+                // an actionable message instead of the opaque "Failed to create session".
                 return Err(anyhow::Error::new(GitError::NotAGitRepo).context(format!(
                     "Worktree mode requires a git repository, but this path is not one: {}\n\
                      Tip: start an in-place session (no worktree) here, or point at a git repository.",
@@ -684,17 +629,13 @@ pub fn build_instance(
                     return Err(GitError::WorktreeAlreadyExists(worktree_path.clone()).into());
                 }
 
-                // One repo, so a per-repo base can only name this one. Resolved
-                // anyway rather than ignored, so a typo'd selector fails loudly
-                // instead of quietly forking from the wrong base.
+                // One repo, so a per-repo base can only name this one.
                 let per_repo = resolve_repo_base_selectors(
                     std::slice::from_ref(&main_repo_path),
                     &params.repo_base_branches,
                 )?;
-                // The launch repo otherwise forks from its registered
-                // per-project default when no explicit session base is given
-                // (then global/profile, then auto-detect). Keyed by repo root
-                // via the shared helper.
+                // The launch repo otherwise forks from its registered per-project default when no
+                // explicit session base is given (then global/profile, then auto-detect).
                 let project_bases = project_base_branches(profile);
                 let base = per_repo.get(&main_repo_path).cloned().or_else(|| {
                     resolve_repo_base_branch(
@@ -725,11 +666,8 @@ pub fn build_instance(
         }
     }
 
-    // For scratch sessions, `final_path` is intentionally empty here; the
-    // scratch directory is provisioned below after `Instance::new` runs (we
-    // need the instance id to name the directory). For all other sessions,
-    // catch the typed-a-bad-path case before tmux silently falls back to
-    // the home directory.
+    // For scratch sessions, `final_path` is intentionally empty here; the scratch directory is
+    // provisioned below after `Instance::new` runs (we need the instance id to name the directory).
     if !params.scratch {
         let final_path_buf = PathBuf::from(&final_path);
         if !final_path_buf.exists() {
@@ -794,10 +732,7 @@ pub fn build_instance(
     }
 
     if params.sandbox {
-        // Surface env-resolution warnings up-front. `collect_environment`
-        // silently drops entries whose host source var is unset (typo,
-        // shell sourcing gap, daemon's frozen env). Without this check
-        // the value is missing in the container with no UI signal.
+        // Surface env-resolution warnings up-front.
         let effective_env: &[String] = if params.extra_env.is_empty() {
             &config.sandbox.environment
         } else {
@@ -837,9 +772,9 @@ pub fn build_instance(
             crate::session::ForkSeed::Structured {
                 parent_acp_session_id,
             } => {
-                // Structured fork: force the structured view, seed the parent
-                // for the ACP session/fork handshake, and replay history into
-                // the (empty) event store on first connect.
+                // Structured fork: force the structured view, seed the parent for the ACP
+                // session/fork handshake, and replay history into the (empty) event store on first
+                // connect.
                 instance.view = crate::session::View::Structured;
                 instance.fork_pending = Some(parent_acp_session_id);
                 instance.import_pending = Some(true);
@@ -948,32 +883,19 @@ fn cleanup_created_worktree(
 }
 
 /// Clean up resources created during a failed or cancelled instance build.
-///
-/// Runtime resources always belong to the losing build and are stopped first,
-/// so a sandbox bind mount cannot block worktree removal. `protected_owner`
-/// is the persisted row that won a final uniqueness race; filesystem and Git
-/// resources referenced by that row are retained.
 pub fn cleanup_instance(
     instance: &Instance,
     created_worktree: Option<&CreatedWorktree>,
     created_workspace_worktrees: &[CreatedWorktree],
     protected_owner: Option<&Instance>,
 ) {
-    // The loser may never have reached storage, so lifecycle-coordinated stop
-    // cannot reserve its row. Tear down only tmux resources named by its id.
-    // There is no per-build poller/monitor thread to stop here: the build
-    // path's only extra threads are the scoped worktree-creation threads that
-    // join before `build_instance` returns, and the async creation poller's
-    // build thread has already finished delivering its result before a rollback
-    // reaches this helper. So the tmux (below) and container (further down)
-    // teardown reclaim every runtime resource with no thread left running.
+    // The loser may never have reached storage, so lifecycle-coordinated stop cannot reserve its
+    // row.
     instance.kill_all_tmux_sessions_without_lifecycle_row();
 
     if let Some(sandbox) = &instance.sandbox_info {
         if sandbox.enabled {
-            // Direct idempotent teardown, never gated on a separate existence
-            // probe. This must precede filesystem cleanup because the
-            // container bind-mounts the worktree.
+            // Direct idempotent teardown, never gated on a separate existence probe.
             let container = containers::DockerContainer::from_session_id(&instance.id);
             if let containers::Teardown::Failed(e) = container.teardown(&instance.id) {
                 tracing::warn!(target: "session.create", "Failed to clean up container: {}", e);
@@ -985,12 +907,9 @@ pub fn cleanup_instance(
         owner: protected_owner,
     };
 
-    // Scratch dirs are provisioned eagerly inside `build_instance`
-    // (well before this helper's other cleanup targets exist), so an
-    // abort between provisioning and the caller finishing the session
-    // would otherwise leak the directory on disk. Guard the removal
-    // through `is_scratch_path` so a tampered `project_path` cannot
-    // wipe unrelated app data.
+    // Scratch dirs are provisioned eagerly inside `build_instance` (well before this helper's other
+    // cleanup targets exist), so an abort between provisioning and the caller finishing the session
+    // would otherwise leak the directory on disk.
     if instance.scratch {
         let scratch_path = PathBuf::from(&instance.project_path);
         if !protection.references_path(&scratch_path)
@@ -1021,22 +940,14 @@ pub fn cleanup_instance(
     }
 }
 
-/// Structured-view (ACP) helpers for the TUI create paths. The web create
-/// path does the equivalent inline in `src/server/api/sessions/create.rs` (it also
-/// handles explicit agent / model / import fields the TUI wizard doesn't
-/// expose), and the CLI in `src/cli/add.rs` with bail-vs-downgrade semantics
-/// keyed on how explicit the user's flag was. Keep the three in sync.
+/// Structured-view (ACP) helpers for the TUI create paths.
 pub mod structured {
     use super::Instance;
 
-    /// True when `tool` can back a structured-view session: it resolves in
-    /// the ACP agent registry, the resolved config declares a parsable
-    /// `[session.agent_acp_cmd]` command for it, or it is a custom agent that
-    /// inherits a registry-backed base through `[session.agent_detect_as]`
-    /// (e.g. a Claude wrapper that only overrides profile/oauth locations).
-    /// Mirrors the server create path's capability re-validation; deliberately
-    /// NOT the configured-default fallback (`pick_acp_agent_name`), which
-    /// would make every tool look capable.
+    /// True when `tool` can back a structured-view session: it resolves in the ACP agent registry,
+    /// the resolved config declares a parsable `[session.agent_acp_cmd]` command for it, or it is a
+    /// custom agent that inherits a registry-backed base through `[session.agent_detect_as]` (e.g.
+    /// a Claude wrapper that only overrides profile/oauth locations).
     pub fn tool_acp_capable(tool: &str, config: &crate::session::Config) -> bool {
         crate::acp::agent_registry::AgentRegistry::with_defaults()
             .get(tool)
@@ -1049,16 +960,9 @@ pub mod structured {
             || crate::acp::inherited_acp_base(tool, &config.session.agent_detect_as).is_some()
     }
 
-    /// Pre-create validation for an explicit structured-view choice from the
-    /// new-session wizard, run BEFORE any worktree / scratch / container is
-    /// provisioned so a refusal can't orphan resources (same ordering as the
-    /// CLI's precondition). Returns a user-facing message on refusal.
-    ///
-    /// The adapter-on-PATH check only runs when the user has no command
-    /// override for the tool: an override swaps the binary the spawn will
-    /// actually exec (see #1910), and second-guessing it here could refuse a
-    /// working setup. With an override, a genuinely missing adapter surfaces
-    /// as the structured view's startup-error banner instead.
+    /// Pre-create validation for an explicit structured-view choice from the new-session wizard,
+    /// run BEFORE any worktree / scratch / container is provisioned so a refusal can't orphan
+    /// resources (same ordering as the CLI's precondition).
     pub fn validate_structured_choice(
         tool: &str,
         command_override: &str,
@@ -1102,12 +1006,8 @@ pub mod structured {
         Ok(())
     }
 
-    /// Apply a validated structured-view choice to a freshly-built instance:
-    /// set the persisted view and pin the per-agent default model, the same
-    /// post-build step the web create handler runs. Re-validates capability
-    /// defensively (downgrading to terminal with a warning) so a caller that
-    /// skipped [`validate_structured_choice`] can't persist a structured
-    /// session no agent can serve.
+    /// Apply a validated structured-view choice to a freshly-built instance: set the persisted view
+    /// and pin the per-agent default model, the same post-build step the web create handler runs.
     pub fn apply_structured_choice(instance: &mut Instance) {
         let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
             &instance.source_profile,
@@ -1123,9 +1023,8 @@ pub mod structured {
             return;
         }
         instance.view = crate::session::View::Structured;
-        // Pin the per-agent default model so the composer shows it and the
-        // session stays on it (mirrors the CLI and web create paths). The
-        // wizard sets no explicit model, so the default is the only input.
+        // Pin the per-agent default model so the composer shows it and the session stays on it
+        // (mirrors the CLI and web create paths).
         let defaults = config.acp.acp_defaults_for(&instance.tool);
         instance.agent_model = crate::session::config::resolve_spawn_model_effort(
             defaults,
@@ -1194,9 +1093,7 @@ pub(crate) fn collect_taken_branches_for_derived_dedupe(
     taken
 }
 
-/// Origin of an effective worktree branch name. The builder uses this to decide
-/// whether collisions with existing branches should be resolved by suffixing
-/// (Derived) or surfaced as an error (Explicit).
+/// Origin of an effective worktree branch name.
 #[derive(Debug, Clone)]
 pub(crate) enum BranchSource {
     /// User typed this name explicitly. Treat conflicts as a hard error.
@@ -1215,21 +1112,16 @@ fn resolve_worktree_branch(
     }
     Some(
         match worktree_branch.map(str::trim).filter(|b| !b.is_empty()) {
-            // Defense-in-depth: even if the frontend slug missed a forbidden
-            // char (or the caller is a CLI/API user typing a title-shaped
-            // string into the branch field), sanitise here so libgit2 never
-            // sees a value it'll reject with InvalidSpec. `/` is preserved
-            // since it's the legal namespace separator in git refs.
+            // Defense-in-depth: even if the frontend slug missed a forbidden char (or the caller is
+            // a CLI/API user typing a title-shaped string into the branch field), sanitise here so
+            // libgit2 never sees a value it'll reject with InvalidSpec.
             Some(b) => BranchSource::Explicit(git_sanitize_branch_name(b)),
             None => BranchSource::Derived(branch_name_from_title(final_title)),
         },
     )
 }
 
-/// Replace characters that git ref names cannot contain (per
-/// `git-check-ref-format(1)`) with '-'. Unlike `branch_name_from_title`
-/// this keeps the user's casing and preserves '/' so `feat/auth`-style
-/// branches survive when the user types them explicitly.
+/// Replace characters that git ref names cannot contain (per `git-check-ref-format(1)`) with '-'.
 pub(crate) fn git_sanitize_branch_name(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut last_was_dash = false;
@@ -1250,10 +1142,9 @@ pub(crate) fn git_sanitize_branch_name(s: &str) -> String {
     }
     // Disallowed multi-char sequences: ".." and "@{".
     let mut out = out.replace("..", "-").replace("@{", "-");
-    // Strip the ".lock" suffix from every slash-separated component, not
-    // just the last one; git-check-ref-format(1) rejects any component
-    // ending in ".lock" (e.g. `foo.lock/bar` is just as invalid as
-    // `foo.lock`).
+    // Strip the ".lock" suffix from every slash-separated component, not just the last one;
+    // git-check-ref-format(1) rejects any component ending in ".lock" (e.g. `foo.lock/bar` is just
+    // as invalid as `foo.lock`).
     out = out
         .split('/')
         .map(|mut seg| {
@@ -1280,8 +1171,6 @@ pub(crate) fn git_sanitize_branch_name(s: &str) -> String {
 }
 
 /// Find the next branch name not present in `taken`.
-/// If `base` is free, returns it unchanged. Otherwise appends `-2`, `-3`, …
-/// until a free name is found.
 fn branch_collision_key(branch: &str) -> String {
     branch.to_ascii_lowercase()
 }
@@ -1313,9 +1202,6 @@ fn dedupe_branch_name(base: &str, taken: &HashSet<String>) -> String {
 }
 
 /// Map Latin ligatures and stroked letters to their conventional ASCII expansions.
-/// NFKD decomposition handles accented characters (é → e + combining acute, then
-/// the combining mark is dropped by the ASCII filter), but ligatures and stroked
-/// letters have no canonical decomposition, so we expand them here.
 fn expand_ligature(c: char) -> Option<&'static str> {
     Some(match c {
         'ß' => "ss",
@@ -1342,11 +1228,8 @@ pub(crate) fn branch_name_from_title(title: &str) -> String {
     let mut last_was_dash = false;
 
     let mut push_processed = |ch: char| {
-        // Preserve '/' as git's namespace separator (so a title like
-        // `jacob/feature-1` yields a branch `jacob/feature-1`). The worktree
-        // folder leaf is sanitized separately via `sanitize_branch_name`, so
-        // the slash never reaches a path. Never emit a leading, trailing, or
-        // doubled slash; trim any pending dash before it.
+        // Preserve '/' as git's namespace separator (so a title like `jacob/feature-1` yields a
+        // branch `jacob/feature-1`).
         if ch == '/' {
             while branch.ends_with('-') {
                 branch.pop();
@@ -1429,38 +1312,25 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_title_with_worktree_uses_branch_name() {
-        let title = resolve_title("", Some("feature-auth"), true, &[], &HashSet::new()).unwrap();
-        assert_eq!(title, "feature-auth");
-    }
-
-    #[test]
-    fn test_empty_title_without_worktree_uses_civilization() {
-        let title = resolve_title("", None, false, &[], &HashSet::new()).unwrap();
-        assert!(
-            civilizations::CIVILIZATIONS.contains(&title.as_str()),
-            "Expected a civilization name, got: {}",
-            title
+    fn resolve_title_prefers_explicit_then_branch_then_civilization() {
+        let taken = HashSet::new();
+        assert_eq!(
+            resolve_title("My Session", Some("feature-auth"), true, &[], &taken).unwrap(),
+            "My Session"
         );
-    }
-
-    #[test]
-    fn test_provided_title_with_worktree_keeps_title() {
-        let title = resolve_title(
-            "My Session",
-            Some("feature-auth"),
-            true,
-            &[],
-            &HashSet::new(),
-        )
-        .unwrap();
-        assert_eq!(title, "My Session");
-    }
-
-    #[test]
-    fn test_provided_title_without_worktree_keeps_title() {
-        let title = resolve_title("Custom Name", None, false, &[], &HashSet::new()).unwrap();
-        assert_eq!(title, "Custom Name");
+        assert_eq!(
+            resolve_title("Custom Name", None, false, &[], &taken).unwrap(),
+            "Custom Name"
+        );
+        assert_eq!(
+            resolve_title("", Some("feature-auth"), true, &[], &taken).unwrap(),
+            "feature-auth"
+        );
+        let generated = resolve_title("", None, false, &[], &taken).unwrap();
+        assert!(
+            civilizations::CIVILIZATIONS.contains(&generated.as_str()),
+            "expected a civilization name, got: {generated}"
+        );
     }
 
     #[test]
@@ -1513,169 +1383,102 @@ mod tests {
     }
 
     #[test]
-    fn test_worktree_branch_derived_from_title_when_name_empty() {
-        let branch = resolve_worktree_branch(true, None, "Fix Login Flow").unwrap();
-        assert!(matches!(branch, BranchSource::Derived(ref s) if s == "fix-login-flow"));
-    }
-
-    #[test]
-    fn test_worktree_branch_preserves_explicit_name() {
-        // The git-safe sanitiser leaves valid refs alone: '/' is a legal
-        // namespace separator, so `feat/auth` survives unchanged.
-        let branch = resolve_worktree_branch(true, Some("feat/auth"), "Fix Login Flow").unwrap();
-        assert!(matches!(branch, BranchSource::Explicit(ref s) if s == "feat/auth"));
-    }
-
-    #[test]
-    fn test_worktree_branch_sanitizes_explicit_with_spaces() {
-        // Without this, the value reaches libgit2 and surfaces as the opaque
-        // 'reference name … is not valid' InvalidSpec error in the dashboard.
-        let branch =
-            resolve_worktree_branch(true, Some("Exploration and issues v2"), "Fix Login Flow")
-                .unwrap();
+    fn resolve_worktree_branch_cases() {
+        let branch = |name: Option<&str>| resolve_worktree_branch(true, name, "Fix Login Flow");
+        assert!(matches!(branch(None), Some(BranchSource::Derived(s)) if s == "fix-login-flow"));
         assert!(
-            matches!(branch, BranchSource::Explicit(ref s) if s == "Exploration-and-issues-v2")
+            matches!(branch(Some("feat/auth")), Some(BranchSource::Explicit(s)) if s == "feat/auth")
+        );
+        assert!(
+            matches!(branch(Some("Exploration and issues v2")), Some(BranchSource::Explicit(s)) if s == "Exploration-and-issues-v2")
+        );
+        assert!(
+            resolve_worktree_branch(false, Some("feat/auth"), "Fix Login Flow").is_none(),
+            "no worktree means no branch to resolve"
         );
     }
 
     #[test]
-    fn test_git_sanitize_branch_name_passes_through_valid_refs() {
-        assert_eq!(git_sanitize_branch_name("feat/auth"), "feat/auth");
-        assert_eq!(git_sanitize_branch_name("release-1.2.3"), "release-1.2.3");
-        assert_eq!(
-            git_sanitize_branch_name("user_name/topic"),
-            "user_name/topic"
-        );
+    fn git_sanitize_branch_name_cases() {
+        for (input, want) in [
+            // Valid refs pass through untouched.
+            ("feat/auth", "feat/auth"),
+            ("release-1.2.3", "release-1.2.3"),
+            ("user_name/topic", "user_name/topic"),
+            // Characters git forbids in a ref.
+            ("has spaces", "has-spaces"),
+            ("a:b?c*d", "a-b-c-d"),
+            ("ref^name", "ref-name"),
+            ("a..b", "a-b"),
+            ("a@{b", "a-b"),
+            // Trimmed edges.
+            ("  hello  ", "hello"),
+            ("-leading", "leading"),
+            (".hidden", "hidden"),
+            ("/foo", "foo"),
+            ("foo/", "foo"),
+            // `.lock` is stripped per component, however many are stacked.
+            ("foo.lock", "foo"),
+            ("foo.lock/bar", "foo/bar"),
+            ("feat/release.lock/v2", "feat/release/v2"),
+            ("foo.lock.lock", "foo"),
+            ("feat/release.lock.lock/v2.lock.lock", "feat/release/v2"),
+            // Nothing usable, or a ref with a reserved meaning of its own.
+            ("", "session"),
+            ("@", "session"),
+            ("HEAD", "session"),
+        ] {
+            assert_eq!(git_sanitize_branch_name(input), want, "input {input:?}");
+        }
     }
 
     #[test]
-    #[serial_test::serial]
-    fn test_git_sanitize_branch_name_replaces_forbidden_chars() {
-        assert_eq!(git_sanitize_branch_name("has spaces"), "has-spaces");
-        assert_eq!(git_sanitize_branch_name("a:b?c*d"), "a-b-c-d");
-        assert_eq!(git_sanitize_branch_name("ref^name"), "ref-name");
-        assert_eq!(git_sanitize_branch_name("a..b"), "a-b");
-        assert_eq!(git_sanitize_branch_name("a@{b"), "a-b");
+    fn branch_name_from_title_cases() {
+        for (title, want) in [
+            // Git-hostile punctuation.
+            ("Fix: login @ mobile #42", "fix-login-mobile-42"),
+            ("feat/auth.refactor", "feat/auth-refactor"),
+            // Slashes are kept as path separators but never doubled or dangling.
+            ("jacob/feature-1", "jacob/feature-1"),
+            ("/leading", "leading"),
+            ("trailing/", "trailing"),
+            ("a//b", "a/b"),
+            ("a / b", "a/b"),
+            // Latin diacritics and ligatures fold to ASCII.
+            ("café fix", "cafe-fix"),
+            ("naïve solution", "naive-solution"),
+            ("Straße", "strasse"),
+            ("Łódź", "lodz"),
+            ("crème brûlée", "creme-brulee"),
+            ("œuvre", "oeuvre"),
+            // Scripts with no ASCII folding drop out.
+            ("测试", "session"),
+            ("🚀 ship", "ship"),
+        ] {
+            assert_eq!(branch_name_from_title(title), want, "title {title:?}");
+        }
     }
 
     #[test]
-    fn test_git_sanitize_branch_name_trims_edges() {
-        assert_eq!(git_sanitize_branch_name("  hello  "), "hello");
-        assert_eq!(git_sanitize_branch_name("-leading"), "leading");
-        assert_eq!(git_sanitize_branch_name(".hidden"), "hidden");
-        assert_eq!(git_sanitize_branch_name("/foo"), "foo");
-        assert_eq!(git_sanitize_branch_name("foo/"), "foo");
-        assert_eq!(git_sanitize_branch_name("foo.lock"), "foo");
-        assert_eq!(git_sanitize_branch_name(""), "session");
-    }
-
-    #[test]
-    fn test_git_sanitize_branch_name_strips_interior_lock_suffix() {
-        // git-check-ref-format rejects ANY slash-separated component ending
-        // in ".lock", not just the trailing one.
-        assert_eq!(git_sanitize_branch_name("foo.lock/bar"), "foo/bar");
-        assert_eq!(
-            git_sanitize_branch_name("feat/release.lock/v2"),
-            "feat/release/v2"
-        );
-        assert_eq!(git_sanitize_branch_name("foo.lock.lock"), "foo");
-        assert_eq!(
-            git_sanitize_branch_name("feat/release.lock.lock/v2.lock.lock"),
-            "feat/release/v2"
-        );
-    }
-
-    #[test]
-    fn test_git_sanitize_branch_name_rejects_special_complete_refs() {
-        // git-check-ref-format also rejects special complete ref names; fall
-        // back to "session" rather than producing a name libgit2 will refuse.
-        assert_eq!(git_sanitize_branch_name("@"), "session");
-        assert_eq!(git_sanitize_branch_name("HEAD"), "session");
-    }
-
-    #[test]
-    fn test_worktree_branch_disabled_without_worktree() {
-        assert!(resolve_worktree_branch(false, Some("feat/auth"), "Fix Login Flow").is_none());
-    }
-
-    #[test]
-    fn test_branch_name_from_title_sanitizes_git_hostile_chars() {
-        assert_eq!(
-            branch_name_from_title("Fix: login @ mobile #42"),
-            "fix-login-mobile-42"
-        );
-        // '/' is the legal git namespace separator and is preserved; '.' is
-        // still folded to '-'.
-        assert_eq!(
-            branch_name_from_title("feat/auth.refactor"),
-            "feat/auth-refactor"
-        );
-    }
-
-    #[test]
-    fn test_branch_name_from_title_preserves_slashes() {
-        // The motivating case: a `user/topic` title keeps its slash in the
-        // branch, while the worktree folder leaf is sanitized elsewhere.
-        assert_eq!(branch_name_from_title("jacob/feature-1"), "jacob/feature-1");
-        // No leading, trailing, or doubled slash; dashes around a slash are
-        // trimmed.
-        assert_eq!(branch_name_from_title("/leading"), "leading");
-        assert_eq!(branch_name_from_title("trailing/"), "trailing");
-        assert_eq!(branch_name_from_title("a//b"), "a/b");
-        assert_eq!(branch_name_from_title("a / b"), "a/b");
-    }
-
-    #[test]
-    fn test_branch_name_from_title_folds_latin_diacritics() {
-        assert_eq!(branch_name_from_title("café fix"), "cafe-fix");
-        assert_eq!(branch_name_from_title("naïve solution"), "naive-solution");
-        assert_eq!(branch_name_from_title("Straße"), "strasse");
-        assert_eq!(branch_name_from_title("Łódź"), "lodz");
-        assert_eq!(branch_name_from_title("crème brûlée"), "creme-brulee");
-        assert_eq!(branch_name_from_title("œuvre"), "oeuvre");
-    }
-
-    #[test]
-    fn test_branch_name_from_title_drops_unsupported_scripts() {
-        // CJK and emoji are not in the Latin transliteration table, so they're
-        // stripped (current best-effort behavior). The "session" fallback kicks in
-        // when nothing usable remains.
-        assert_eq!(branch_name_from_title("测试"), "session");
-        assert_eq!(branch_name_from_title("🚀 ship"), "ship");
-    }
-
-    #[test]
-    fn test_dedupe_branch_name_returns_base_when_free() {
-        let taken = std::collections::HashSet::new();
-        assert_eq!(dedupe_branch_name("fix-bug", &taken), "fix-bug");
-    }
-
-    #[test]
-    fn test_dedupe_branch_name_appends_suffix_on_collision() {
+    fn dedupe_branch_name_suffixes_past_every_taken_name() {
         let mut taken = HashSet::new();
+        assert_eq!(dedupe_branch_name("fix-bug", &taken), "fix-bug");
+
         taken.insert("fix-bug".to_string());
         assert_eq!(dedupe_branch_name("fix-bug", &taken), "fix-bug-2");
 
-        taken.insert("fix-bug-2".to_string());
-        taken.insert("fix-bug-3".to_string());
+        taken.extend(["fix-bug-2".to_string(), "fix-bug-3".to_string()]);
         assert_eq!(dedupe_branch_name("fix-bug", &taken), "fix-bug-4");
-    }
 
-    #[test]
-    fn test_dedupe_branch_name_matches_case_insensitively() {
-        let mut taken = HashSet::new();
         taken.insert("Tatars".to_string());
-
-        assert_eq!(dedupe_branch_name("tatars", &taken), "tatars-2");
+        assert_eq!(
+            dedupe_branch_name("tatars", &taken),
+            "tatars-2",
+            "collisions are case-insensitive"
+        );
     }
 
-    /// Init a non-bare repo named `name` inside its own TempDir with one
-    /// commit. Returns the TempDir (path is the repo root).
     fn init_repo_with_commit(name: &str) -> tempfile::TempDir {
-        // We want the directory's file_name to be `name` so the parallel
-        // error message references it. TempDir uses random suffixes, so we
-        // create a wrapping TempDir and then a known-named subdir inside it
-        // by leveraging tempfile::Builder.
         let parent = tempfile::Builder::new()
             .prefix("aoe-test-")
             .tempdir()
@@ -1698,10 +1501,6 @@ mod tests {
 
     #[test]
     fn test_create_workspace_reports_all_concurrent_failures() {
-        // Two repos that each only have a "main"/"master" branch. Asking for
-        // a non-existent branch with create_new_branch=false makes both
-        // create_worktree calls fail in parallel; the bail! message must
-        // include both repo names.
         let parent_a = init_repo_with_commit("repo-a-fail");
         let parent_b = init_repo_with_commit("repo-b-fail");
         let repo_a = parent_a.path().join("repo-a-fail");
@@ -1750,8 +1549,6 @@ mod tests {
 
     #[test]
     fn test_create_workspace_single_failure_keeps_simple_message() {
-        // One bad repo; the message should NOT use the multi-error format
-        // (no "(N repos):" prefix) and SHOULD use the singular phrasing.
         let parent_a = init_repo_with_commit("repo-solo-fail");
         let repo_a = parent_a.path().join("repo-solo-fail");
         let workspaces_root = tempfile::TempDir::new().unwrap();
@@ -1791,24 +1588,19 @@ mod tests {
 
     #[test]
     fn resolve_base_branch_precedence() {
-        // Explicit session base wins over everything.
         assert_eq!(
             resolve_base_branch(Some("session"), Some("project"), Some("global")),
             Some("session".to_string())
         );
-        // Per-project default fills in when there is no session base.
         assert_eq!(
             resolve_base_branch(None, Some("project"), Some("global")),
             Some("project".to_string())
         );
-        // Global/profile default is the last configured layer.
         assert_eq!(
             resolve_base_branch(None, None, Some("global")),
             Some("global".to_string())
         );
-        // Nothing set means auto-detect.
         assert_eq!(resolve_base_branch(None, None, None), None);
-        // Empty/whitespace at any layer is treated as unset and skipped.
         assert_eq!(
             resolve_base_branch(Some("   "), Some(""), Some("global")),
             Some("global".to_string())
@@ -1824,20 +1616,16 @@ mod tests {
         let mut bases = std::collections::HashMap::new();
         bases.insert(key, "develop".to_string());
 
-        // No explicit session base: the launch repo forks from its registered
-        // per-project default.
         assert_eq!(
             resolve_repo_base_branch(&root, None, &bases, Some("global")),
             Some("develop".to_string())
         );
 
-        // Explicit session base still wins over the per-project default.
         assert_eq!(
             resolve_repo_base_branch(&root, Some("hotfix"), &bases, Some("global")),
             Some("hotfix".to_string())
         );
 
-        // No registered entry for this repo: fall back to the global default.
         let empty = std::collections::HashMap::new();
         assert_eq!(
             resolve_repo_base_branch(&root, None, &empty, Some("global")),
@@ -1847,9 +1635,6 @@ mod tests {
 
     #[test]
     fn resolve_repo_base_branch_matches_when_launching_from_a_worktree() {
-        // A session launched from a linked worktree of the registered repo
-        // still resolves the project default, because find_main_repo maps the
-        // worktree back to its main repo (the registry's key).
         let (parent, _tip) = init_repo_with_branch("proj", "release");
         let root = parent.path().join("proj");
         let main_wt = GitWorktree::new(root.clone()).unwrap();
@@ -1868,9 +1653,6 @@ mod tests {
         );
     }
 
-    /// Create a repo with `main` plus a second branch holding a distinct
-    /// commit. Returns the parent TempDir and the second branch's tip oid so a
-    /// test can assert a worktree forked from it instead of `main`.
     fn init_repo_with_branch(name: &str, branch: &str) -> (tempfile::TempDir, git2::Oid) {
         let parent = tempfile::Builder::new()
             .prefix("aoe-test-")
@@ -1892,7 +1674,6 @@ mod tests {
             .commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
             .unwrap();
 
-        // Branch off and add a distinct commit so the tip differs from `main`.
         let base = repo.find_commit(base_commit).unwrap();
         repo.branch(branch, &base, false).unwrap();
         std::fs::write(dir.join("RELEASE.md"), "release\n").unwrap();
@@ -1912,8 +1693,6 @@ mod tests {
 
     #[test]
     fn create_workspace_honors_per_repo_base_branch() {
-        // The extra repo's worktree should fork from its own configured base
-        // branch, while the primary repo forks from its default branch.
         let (parent_primary, _) = init_repo_with_branch("primary", "release");
         let (parent_extra, extra_release_tip) = init_repo_with_branch("extra", "release");
         let primary = parent_primary.path().join("primary");
@@ -1955,8 +1734,6 @@ mod tests {
             extra_release_tip,
             "extra repo worktree should branch from its configured `release` base"
         );
-        // The base the branch was forked from is recorded per repo, which is
-        // what lets the diff view default to the right ref for each one (#3329).
         assert_eq!(extra_repo.base_branch.as_deref(), Some("release"));
         assert_eq!(
             result
@@ -1982,10 +1759,6 @@ mod tests {
         }
     }
 
-    /// A repo whose branch aoe did not create has no base of its own: the base
-    /// argument is ignored when checking out an existing branch, so recording
-    /// it would make "reset to default" compare against a ref that was never
-    /// this checkout's base. See #3329.
     #[test]
     fn create_workspace_records_no_base_when_attaching_an_existing_branch() {
         let (parent_primary, _) = init_repo_with_branch("primary", "feature-x");
@@ -2057,7 +1830,6 @@ mod tests {
             PathBuf::from("/elsewhere/web"),
         ];
 
-        // Directory name and full path both resolve, and whitespace is trimmed.
         let out = resolve_repo_base_selectors(
             &repos,
             &[
@@ -2077,22 +1849,17 @@ mod tests {
         );
         assert!(!out.contains_key(&PathBuf::from("/src/app")));
 
-        // No pairs is the common case and must stay cheap and quiet.
         assert!(resolve_repo_base_selectors(&repos, &[]).unwrap().is_empty());
 
         let cases = [
-            // A typo would otherwise fork from the wrong base and only show up
-            // much later as a confusing diff.
             (
                 vec![("nope".to_string(), "develop".to_string())],
                 "No repo named",
             ),
-            // Empty base.
             (
                 vec![("api".to_string(), "  ".to_string())],
                 "No base branch",
             ),
-            // Same repo twice.
             (
                 vec![
                     ("api".to_string(), "develop".to_string()),
@@ -2108,11 +1875,6 @@ mod tests {
             assert!(err.contains(expected), "got: {err}");
         }
 
-        // A selector matches on the leaf of whatever path it is given, so
-        // callers must pass repo roots. Handing it a subdirectory would make
-        // the documented selector (the repo's own name) fail to match, which
-        // is exactly what `aoe add` got wrong when it keyed by the launch path
-        // rather than `find_main_repo`'s result.
         let subdir = vec![PathBuf::from("/src/api/crates/core")];
         assert!(
             resolve_repo_base_selectors(&subdir, &[("api".to_string(), "develop".to_string())])
@@ -2125,9 +1887,6 @@ mod tests {
         )
         .is_ok());
 
-        // Two repos sharing a directory name are ambiguous by name. The
-        // workspace builder rejects that pair later anyway, but the base
-        // selector must not silently pick one.
         let dupes = vec![PathBuf::from("/a/api"), PathBuf::from("/b/api")];
         let err = resolve_repo_base_selectors(&dupes, &[("api".to_string(), "x".to_string())])
             .expect_err("ambiguous name")
@@ -2190,9 +1949,6 @@ mod tests {
         )
         .unwrap();
         let project = tempfile::tempdir().unwrap();
-        // resolve_config inside build_instance installs this config's
-        // agent_detect_as into the process-global registry; restore the
-        // prior entries afterwards.
         let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
 
         let result = build_instance(
@@ -2363,8 +2119,6 @@ mod tests {
         let inst = build_instance(params, &[], &[], "default")
             .unwrap()
             .instance;
-        // The pre-pinned child id lives in agent_session_id; the parent rides on
-        // the one-shot Fork intent.
         assert_eq!(inst.agent_session_id.as_deref(), Some("child-uuid"));
         assert!(
             matches!(
@@ -2407,16 +2161,9 @@ mod tests {
         let inst = build_instance(params, &[], &[], "default")
             .unwrap()
             .instance;
-        // The structured arm forces the structured view and sets the two paired
-        // one-shot markers: fork_pending carries the parent for session/fork,
-        // and import_pending replays history into the fresh event store. A
-        // regression on any of the three should fail here, not only in the
-        // aggregate structured e2e.
         assert_eq!(inst.view, crate::session::View::Structured);
         assert_eq!(inst.fork_pending.as_deref(), Some("parent-acp-id"));
         assert_eq!(inst.import_pending, Some(true));
-        // Structured fork does not pre-pin an agent id (the adapter mints the
-        // child id at handshake) and leaves the terminal Fork intent unset.
         assert!(inst.agent_session_id.is_none());
         assert!(!matches!(
             inst.resume_intent,
@@ -2435,8 +2182,6 @@ mod tests {
             ("structured", build_instance_applies_structured_fork_seed),
         ];
 
-        // serial_test 4's default-key lock is reentrant: the wrapper must call
-        // each serialized test directly to inspect state after its guard drops.
         for (label, run) in cases {
             let _cleanup = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
             let mut sentinels = crate::session::Config::default();
@@ -2497,11 +2242,6 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn build_instance_worktree_on_non_git_path_returns_typed_not_a_git_repo() {
-        // A worktree requested on a plain (non-git) folder must fail with the
-        // typed GitError::NotAGitRepo, not a bare `bail!` string. The web
-        // handler only forwards an actionable message for whitelisted typed
-        // GitError variants, so a string bail would surface the opaque
-        // "Failed to create session" instead.
         let temp_home = tempfile::tempdir().unwrap();
         let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
         let app_dir = isolated_app_dir(temp_home.path());

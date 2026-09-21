@@ -1,15 +1,11 @@
-//! Dialog for answering a session's pending permission prompt.
+//! Answer a session's pending permission prompt.
 //!
-//! Two paths share this dialog. For a terminal session it answers the CLI's
-//! "Do you want to proceed?" style prompt by sending the exact keystrokes a
-//! human would type, without attaching: AoE never parses pane content to
-//! detect or validate the prompt (see `AgentDef.permission_response`); the
-//! user has already seen it on the pane before opening this dialog. For a
-//! structured (ACP) session it resolves a daemon-reported approval nonce
-//! through ACP, and the body shows the tool, target, and destructive flag
-//! from the daemon's projection so the user sees what they are answering
-//! without entering the structured view. The Allow Always choice is offered
-//! when the terminal agent's mapping has one, and always on the ACP path.
+//! A terminal session gets the exact keystrokes a human would type, without
+//! attaching: AoE never parses pane content to detect or validate the prompt,
+//! and the user has already seen it on the pane. A structured session resolves
+//! the daemon-reported approval nonce through ACP, showing the tool, target
+//! and destructive flag from its projection. Allow Always is offered whenever
+//! the agent's mapping has it, and always on the ACP path.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
@@ -18,19 +14,15 @@ use ratatui::widgets::*;
 use super::DialogResult;
 use crate::tui::styles::{has_min_contrast, Theme};
 
-/// WCAG contrast floor for the focused choice's foreground against the
-/// dialog's background. `2.5` is the tightest a builtin clears
-/// (catppuccin-latte, at 2.64); a custom theme with a duller `accent` falls
-/// back to `theme.text` instead of rendering an illegible focused default.
+/// Contrast floor for the focused choice against the dialog background. The
+/// tightest builtin clears 2.64; a duller custom `accent` falls back to
+/// `theme.text` rather than rendering illegibly.
 const MIN_FOCUSED_CONTRAST_RATIO: f32 = 2.5;
 
-/// Style for the focused choice: `theme.accent` bold on the dialog's own
-/// background, the same fg-only treatment `components::buttons::render_yes_no`
-/// gives its focused button. `theme.selection` is a background surface token
-/// (see DESIGN.md); as a foreground it sits within ~1.7:1 of every builtin
-/// theme's background, so the focused choice would read as the dimmest item
-/// on the row. Unfocused choices drop to `theme.dimmed` so focus is carried
-/// by the brightness gap, not by a background block.
+/// Focused choice: bold `theme.accent`, the fg-only treatment `render_yes_no`
+/// gives its focused button. `theme.selection` is a background token and as a
+/// foreground would make the focused choice the dimmest item on the row, so
+/// focus is carried by the gap to `theme.dimmed` instead.
 fn focused_choice_style(theme: &Theme) -> Style {
     let fg = if has_min_contrast(theme.accent, theme.background, MIN_FOCUSED_CONTRAST_RATIO) {
         theme.accent
@@ -40,7 +32,6 @@ fn focused_choice_style(theme: &Theme) -> Style {
     Style::default().fg(fg).bold()
 }
 
-/// Style for the choices that are not focused.
 fn unfocused_choice_style(theme: &Theme) -> Style {
     Style::default().fg(theme.dimmed)
 }
@@ -62,10 +53,8 @@ struct StructuredApprovalDetail {
 pub struct PermissionResponseDialog {
     session_title: String,
     choices: Vec<(&'static str, PermissionResponseChoice)>,
-    /// Index of the focused choice within `choices`.
     focused: usize,
-    /// Whether `choices` includes `AllowAlways`; computed once in `new`
-    /// instead of re-scanning `choices` from `handle_key` and `render`.
+    /// Whether `choices` includes `AllowAlways`, computed once in `new`.
     supports_allow_always: bool,
     /// `Some` for a structured ACP approval: the dialog shows what is being
     /// approved and drops the terminal-only "raw keystrokes" guidance, which
@@ -151,18 +140,9 @@ impl PermissionResponseDialog {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let dialog_area = super::centered_rect(area, 56, 9);
-        frame.render_widget(Clear, dialog_area);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.accent))
-            .title(" Respond to Permission Prompt ")
-            .title_style(Style::default().fg(theme.accent).bold());
-
-        let inner = block.inner(dialog_area);
-        frame.render_widget(block, dialog_area);
+        let block =
+            super::toned_dialog_block(" Respond to Permission Prompt ", theme.accent, theme.accent);
+        let (_, inner) = super::render_dialog_frame(frame, area, 56, 9, block);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -245,98 +225,77 @@ impl PermissionResponseDialog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyModifiers;
+    use crate::tui::dialogs::test_keys::key;
 
-    /// Non-empty stand-in for a real agent's `allow_always` mapping. `Some(&[])`
-    /// would also satisfy `.is_some()` but reads as "supported with zero
+    /// Stand-in for a real agent's `allow_always` mapping. `Some(&[])` would
+    /// also satisfy `.is_some()` but reads as "supported with zero
     /// keystrokes", a footgun if copy-pasted into a real `AgentDef`.
     const ALLOW_ALWAYS: Option<&[crate::agents::KeyToken]> =
         Some(&[crate::agents::KeyToken::Literal("2")]);
 
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
+    fn dialog() -> PermissionResponseDialog {
+        PermissionResponseDialog::new("test", ALLOW_ALWAYS)
     }
 
     #[test]
-    fn enter_submits_focused_default_allow() {
-        let mut dialog = PermissionResponseDialog::new("test", ALLOW_ALWAYS);
-        let result = dialog.handle_key(key(KeyCode::Enter));
+    fn each_choice_has_a_direct_key_and_a_focus_path() {
+        // (key, the choice it submits outright)
+        for (code, want) in [
+            (KeyCode::Char('a'), PermissionResponseChoice::Allow),
+            (KeyCode::Char('A'), PermissionResponseChoice::AllowAlways),
+            (KeyCode::Char('d'), PermissionResponseChoice::Deny),
+            // Allow is focused when the dialog opens.
+            (KeyCode::Enter, PermissionResponseChoice::Allow),
+        ] {
+            assert!(
+                matches!(dialog().handle_key(key(code)), DialogResult::Submit(got) if got == want),
+                "{code:?}"
+            );
+        }
+
+        // The arrows cycle focus in both directions, wrapping.
+        for (code, want) in [
+            (KeyCode::Right, PermissionResponseChoice::AllowAlways),
+            (KeyCode::Left, PermissionResponseChoice::Deny),
+        ] {
+            let mut d = dialog();
+            d.handle_key(key(code));
+            assert!(
+                matches!(d.handle_key(key(KeyCode::Enter)), DialogResult::Submit(got) if got == want),
+                "{code:?}"
+            );
+        }
+
         assert!(matches!(
-            result,
-            DialogResult::Submit(PermissionResponseChoice::Allow)
+            dialog().handle_key(key(KeyCode::Esc)),
+            DialogResult::Cancel
         ));
     }
 
     #[test]
-    fn a_submits_allow_directly() {
-        let mut dialog = PermissionResponseDialog::new("test", ALLOW_ALWAYS);
-        let result = dialog.handle_key(key(KeyCode::Char('a')));
+    fn an_agent_without_allow_always_neither_shows_nor_accepts_it() {
+        let mut d = PermissionResponseDialog::new("test", None);
+        assert_eq!(d.choices.len(), 2);
         assert!(matches!(
-            result,
-            DialogResult::Submit(PermissionResponseChoice::Allow)
+            d.handle_key(key(KeyCode::Char('A'))),
+            DialogResult::Continue
         ));
-    }
-
-    #[test]
-    fn shift_a_submits_allow_always_directly() {
-        let mut dialog = PermissionResponseDialog::new("test", ALLOW_ALWAYS);
-        let result = dialog.handle_key(key(KeyCode::Char('A')));
+        d.handle_key(key(KeyCode::Right));
         assert!(matches!(
-            result,
-            DialogResult::Submit(PermissionResponseChoice::AllowAlways)
-        ));
-    }
-
-    #[test]
-    fn d_submits_deny_directly() {
-        let mut dialog = PermissionResponseDialog::new("test", ALLOW_ALWAYS);
-        let result = dialog.handle_key(key(KeyCode::Char('d')));
-        assert!(matches!(
-            result,
+            d.handle_key(key(KeyCode::Enter)),
             DialogResult::Submit(PermissionResponseChoice::Deny)
         ));
     }
 
     #[test]
-    fn right_cycles_focus_and_enter_submits_it() {
-        let mut dialog = PermissionResponseDialog::new("test", ALLOW_ALWAYS);
-        dialog.handle_key(key(KeyCode::Right));
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        assert!(matches!(
-            result,
-            DialogResult::Submit(PermissionResponseChoice::AllowAlways)
-        ));
-    }
-
-    #[test]
-    fn left_wraps_focus_backward() {
-        let mut dialog = PermissionResponseDialog::new("test", ALLOW_ALWAYS);
-        dialog.handle_key(key(KeyCode::Left));
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        assert!(matches!(
-            result,
-            DialogResult::Submit(PermissionResponseChoice::Deny)
-        ));
-    }
-
-    #[test]
-    fn esc_cancels() {
-        let mut dialog = PermissionResponseDialog::new("test", ALLOW_ALWAYS);
-        let result = dialog.handle_key(key(KeyCode::Esc));
-        assert!(matches!(result, DialogResult::Cancel));
-    }
-
-    /// The focused choice paints a foreground on the dialog's own background,
-    /// so its color has to be a foreground token. Every builtin's `accent`
-    /// clears 2.5:1 against that theme's background (catppuccin-latte is the
-    /// tightest at 2.64); a background surface token such as `theme.selection`
-    /// lands between 1.10:1 and 1.71:1 and would fail here.
-    #[test]
-    fn focused_choice_fg_stays_legible_on_every_builtin_background() {
+    fn the_focused_choice_stays_legible_on_every_builtin_background() {
+        // It paints a foreground on the dialog's own background, so its color
+        // has to be a foreground token: every builtin's `accent` clears the
+        // ratio, while a background surface token such as `theme.selection`
+        // lands between 1.10:1 and 1.71:1 and would fail here.
         for name in crate::tui::styles::builtin_theme_names() {
             let theme = crate::tui::styles::load_theme(name);
             let style = focused_choice_style(&theme);
-
             let fg = style.fg.expect("focused choice must set a foreground");
             assert!(
                 crate::tui::styles::has_min_contrast(
@@ -357,37 +316,16 @@ mod tests {
                 "{name}: focused and unfocused choices must differ"
             );
         }
-    }
 
-    /// A custom theme's `accent` isn't validated for contrast on load; if
-    /// it's too close to the background, the focused choice falls back to
-    /// `theme.text` rather than rendering illegible.
-    #[test]
-    fn focused_choice_style_falls_back_to_text_for_low_contrast_accent() {
+        // A custom theme's `accent` is not contrast-checked on load, so one
+        // too close to the background falls back to `theme.text`.
         let mut theme = crate::tui::styles::load_theme_with_mode("empire", false);
         theme.accent = theme.background;
-
-        let style = focused_choice_style(&theme);
-
-        assert_eq!(style.fg, Some(theme.text));
+        assert_eq!(focused_choice_style(&theme).fg, Some(theme.text));
     }
 
     #[test]
-    fn allow_always_unsupported_is_skipped_and_shift_a_is_noop() {
-        let mut dialog = PermissionResponseDialog::new("test", None);
-        assert_eq!(dialog.choices.len(), 2);
-        let result = dialog.handle_key(key(KeyCode::Char('A')));
-        assert!(matches!(result, DialogResult::Continue));
-        dialog.handle_key(key(KeyCode::Right));
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        assert!(matches!(
-            result,
-            DialogResult::Submit(PermissionResponseChoice::Deny)
-        ));
-    }
-
-    #[test]
-    fn structured_dialog_keeps_approval_context_visible_with_long_labels() {
+    fn the_approval_context_survives_labels_too_long_for_the_dialog() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
@@ -405,13 +343,13 @@ mod tests {
             terminal
                 .draw(|f| dialog.render(f, f.area(), &theme))
                 .unwrap();
-            let out = terminal.backend().buffer().content().iter().fold(
-                String::new(),
-                |mut acc, cell| {
-                    acc.push_str(cell.symbol());
-                    acc
-                },
-            );
+            let out: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
             for context in [
                 "session-one",
                 "Bash",

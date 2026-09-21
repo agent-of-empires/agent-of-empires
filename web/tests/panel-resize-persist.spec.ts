@@ -1,9 +1,6 @@
-// User stories: drag the sidebar / right-panel resize handles; the new
-// width persists to localStorage and survives a reload. Ported from the
-// live acp-stories (sidebar-resize-persist, right-panel-resize-persist);
-// both flows are pure client state (global mousemove/mouseup handlers
-// writing "aoe-sidebar-width" / "aoe-split-ratio"), so the stubbed /api
-// surface reproduces them faithfully.
+// Dragging the sidebar and right-panel resize handles persists the new width to
+// localStorage and survives a reload. Both are pure client state written by
+// global mousemove/mouseup handlers, so stubbed /api reproduces them.
 
 import { test, expect } from "./helpers/mockedTest";
 import { installSidebarMocks } from "./helpers/sidebarMocks";

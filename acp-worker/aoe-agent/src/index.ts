@@ -73,8 +73,10 @@ async function handlePrompt(
       abortSignal,
     });
 
+    const update = (update: Record<string, unknown>) =>
+      client.notify("session/update", { sessionId: params.sessionId, update });
+
     let assistantBuffer = "";
-    const toolCallTitles = new Map<string, string>();
     for await (const part of result.fullStream) {
       if (abortSignal.aborted) break;
       switch (part.type) {
@@ -85,55 +87,34 @@ async function handlePrompt(
             "";
           if (!delta) break;
           assistantBuffer += delta;
-          await client.notify("session/update", {
-            sessionId: params.sessionId,
-            update: {
-              sessionUpdate: "agent_message_chunk",
-              content: { type: "text", text: delta },
-            },
+          await update({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: delta },
           });
           break;
         }
         case "tool-call": {
-          const id = part.toolCallId;
           const name = part.toolName;
-          toolCallTitles.set(id, name);
-          await client.notify("session/update", {
-            sessionId: params.sessionId,
-            update: {
-              sessionUpdate: "tool_call",
-              toolCallId: id,
-              title: name,
-              kind: classifyKind(name),
-              status: "pending",
-              rawInput: part.input as Record<string, unknown>,
-            },
+          await update({
+            sessionUpdate: "tool_call",
+            toolCallId: part.toolCallId,
+            title: name,
+            kind: classifyKind(name),
+            status: "pending",
+            rawInput: part.input as Record<string, unknown>,
           });
           break;
         }
-        case "tool-result": {
-          const id = part.toolCallId;
-          await client.notify("session/update", {
-            sessionId: params.sessionId,
-            update: {
-              sessionUpdate: "tool_call_update",
-              toolCallId: id,
-              status: "completed",
-              rawOutput: serialiseToolOutput(part.output),
-            },
-          });
-          break;
-        }
+        case "tool-result":
         case "tool-error": {
-          const id = part.toolCallId;
-          await client.notify("session/update", {
-            sessionId: params.sessionId,
-            update: {
-              sessionUpdate: "tool_call_update",
-              toolCallId: id,
-              status: "failed",
-              rawOutput: { error: String(part.error) },
-            },
+          const failed = part.type === "tool-error";
+          await update({
+            sessionUpdate: "tool_call_update",
+            toolCallId: part.toolCallId,
+            status: failed ? "failed" : "completed",
+            rawOutput: failed
+              ? { error: String(part.error) }
+              : serialiseToolOutput(part.output),
           });
           break;
         }
@@ -188,10 +169,7 @@ async function handlePrompt(
         sessionId: params.sessionId,
         update: {
           sessionUpdate: "agent_message_chunk",
-          content: {
-            type: "text",
-            text: `\n[aoe-agent error] ${message}\n`,
-          },
+          content: { type: "text", text: `\n[aoe-agent error] ${message}\n` },
         },
       })
       .catch(() => undefined);
@@ -282,22 +260,30 @@ function serialiseToolOutput(output: unknown): Record<string, unknown> {
 }
 
 /**
- * Map an `AOE_AGENT_MODEL` id onto a provider. Anthropic, OpenAI and
- * Google only, by bare prefix or an explicit `provider:` prefix.
- * Anything else hits the Anthropic fallback, so local-model ids are not
- * a valid configuration until an openai-compatible branch exists.
+ * Map an `AOE_AGENT_MODEL` id onto a provider by bare prefix or an explicit
+ * `provider:` prefix. Anything else hits the Anthropic fallback, so
+ * local-model ids are not a valid configuration until an openai-compatible
+ * branch exists.
  */
 function pickModel(modelId: string) {
-  if (modelId.startsWith("claude-") || modelId.startsWith("anthropic:")) {
-    return anthropic(modelId.replace(/^anthropic:/, ""));
-  }
-  if (modelId.startsWith("gpt-") || modelId.startsWith("openai:")) {
-    return openai(modelId.replace(/^openai:/, ""));
-  }
-  if (modelId.startsWith("gemini-") || modelId.startsWith("google:")) {
-    return google(modelId.replace(/^google:/, ""));
+  const providers = [
+    { bare: "claude-", tag: "anthropic:", make: anthropic },
+    { bare: "gpt-", tag: "openai:", make: openai },
+    { bare: "gemini-", tag: "google:", make: google },
+  ];
+  for (const { bare, tag, make } of providers) {
+    if (modelId.startsWith(tag)) return make(modelId.slice(tag.length));
+    if (modelId.startsWith(bare)) return make(modelId);
   }
   return anthropic(modelId);
+}
+
+function startSession(sessionId: string, messages: ModelMessage[]): void {
+  sessions.set(sessionId, {
+    pendingPrompt: null,
+    modelId: process.env.AOE_AGENT_MODEL ?? DEFAULT_MODEL,
+    messages,
+  });
 }
 
 function randomHexId(): string {
@@ -339,12 +325,7 @@ function main() {
           );
         }
       }
-      const modelId = process.env.AOE_AGENT_MODEL ?? DEFAULT_MODEL;
-      sessions.set(sessionId, {
-        pendingPrompt: null,
-        modelId,
-        messages: [],
-      });
+      startSession(sessionId, []);
       return { sessionId };
     })
     .onRequest("session/load", async ({ params }) => {
@@ -352,11 +333,7 @@ function main() {
       const artifactDir = process.env.AOE_ARTIFACT_DIR;
       if (!artifactDir) throw new Error("Session persistence is unavailable");
       const messages = await loadTranscript(artifactDir, params.sessionId);
-      sessions.set(params.sessionId, {
-        pendingPrompt: null,
-        modelId: process.env.AOE_AGENT_MODEL ?? DEFAULT_MODEL,
-        messages,
-      });
+      startSession(params.sessionId, messages);
       return {};
     })
     .onRequest("session/set_mode", () => ({}))

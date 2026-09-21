@@ -1,41 +1,14 @@
-//! Migration v024: backfill the `detect_as` status-detection alias onto
-//! sessions created while their tool had no `[session.agent_detect_as]` entry.
+//! Migration v024: backfill `detect_as` on sessions created while their tool
+//! had no `[session.agent_detect_as]` entry, which left the alias empty
+//! forever and froze their status at Idle.
 //!
-//! `Instance::detect_as` is resolved once at session build and persisted. A
-//! session created before its custom agent was added to
-//! `[session.agent_detect_as]` therefore stores an empty alias forever, and
-//! nothing re-resolved it. With no alias, `status_rules::detection_tool`
-//! reports the custom tool name, which has neither configured rules nor a
-//! built-in detector, so `detect_status_from_content_in` returns its
-//! `Status::Idle` fallback on every pane capture: the session's status freezes
-//! at Idle and never moves to Running again.
-//!
-//! `status_rules::effective_detect_as` now consults the live config when the
-//! stored field is empty, so detection is already correct without this
-//! migration. This exists because `detect_as` has consumers beyond status
-//! detection (sandbox agent selection, hook install, container config), and
-//! leaving a field wrong on disk means every future reader has to know to
-//! distrust it. Per `AGENTS.md > Data Migrations` the stored data gets fixed
-//! rather than accumulating read-side shims.
-//!
-//! The runtime fallback is not made redundant by this: this is a one-shot, and
-//! a session built after it runs but before its tool is added to
-//! `[session.agent_detect_as]` lands in exactly the same state. The migration
-//! fixes the rows that exist; the fallback keeps the next ones correct.
-//!
-//! The converse is also true: because a non-empty stored alias wins over the
-//! registry, backfilling a row converts a value the fallback was tracking live
-//! into a fixed pin, so a later retarget or removal of the entry no longer
-//! reaches it. That is deliberate: it is the same state a session built with the
-//! entry in place would have had.
-//!
-//! ## Failure policy
-//!
-//! Per `AGENTS.md > Data Migrations`, a returned `Err` aborts boot. A
-//! sessions.json that fails to read or parse is logged and skipped: an
-//! unreadable or corrupt file must not block boot or spam every launch, and
-//! this backfill is best-effort, since the runtime fallback covers detection
-//! either way. Only `get_app_dir` and directory-read failures propagate.
+//! `status_rules::effective_detect_as` already falls back to the live config,
+//! but `detect_as` also drives sandbox agent selection, hook install and
+//! container config, so the stored field is fixed rather than distrusted by
+//! every reader. Backfilling pins the alias, so a later retarget of the entry
+//! no longer reaches the row: that is the state a session built with the entry
+//! in place would have had. A sessions.json that fails to read or parse is
+//! logged and skipped.
 
 use anyhow::Result;
 use std::collections::HashMap;

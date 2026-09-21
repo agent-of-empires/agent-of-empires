@@ -1,20 +1,5 @@
-//! The single privacy boundary for telemetry.
-//!
-//! Every free-form string that could carry user content (agent command,
-//! model name) is coerced here against a closed allowlist before it can
-//! reach a payload. Raw values never leave this module: an agent that is
-//! not a recognised built-in becomes `"custom"`, and a model string that
-//! matches no known family becomes a coarse bucket (`"other"` / `"unset"`).
-//!
-//! The agent allowlist is derived from [`crate::agents::AGENTS`] rather than
-//! hardcoded, so adding a built-in agent keeps the sanitizer in sync without
-//! a second edit. Anything outside that set collapses to `"custom"`.
+//! The telemetry privacy boundary: free-form strings are coerced to closed vocabularies here.
 
-/// Bucket for an agent identifier (`tool` / `detect_as`).
-///
-/// Returns the canonical built-in name when the input matches a known agent
-/// (case-insensitive, by canonical name or alias); otherwise `"custom"`. An
-/// empty input is treated as unknown and returns `"custom"`.
 pub fn agent_bucket(agent: &str) -> String {
     let trimmed = agent.trim();
     if trimmed.is_empty() {
@@ -31,16 +16,10 @@ pub fn agent_bucket(agent: &str) -> String {
     "custom".to_string()
 }
 
-/// How a family needle is matched against a model string.
 #[derive(Clone, Copy)]
 enum Needle {
-    /// Plain substring. Safe for distinctive needles long enough not to collide
-    /// (`claude`, `gpt`, `gemini`, ...).
     Substr(&'static str),
-    /// Whole-token match: the needle must equal a token of the model string when
-    /// split on non-alphanumeric boundaries. Required for the 2-char OpenAI
-    /// tokens (`o1` / `o3` / `o4`) so `o3-mini` buckets as openai but `kilo3` or
-    /// `macro1` do not. `o3` is a token of `o3-mini` but not of `kilo3`.
+    /// Whole-token match for short needles, so `o3-mini` is openai but `kilo3` is not.
     Token(&'static str),
 }
 
@@ -55,24 +34,13 @@ impl Needle {
     }
 }
 
-/// Coarse family bucket for a model string. Never emits the raw value; maps
-/// to a small fixed vocabulary so an internal/custom model name can't leak.
-///
-/// `None` or empty → `"unset"`. A string matching no known family → `"other"`.
 pub fn model_bucket(model: Option<&str>) -> &'static str {
     let Some(model) = model.map(str::trim).filter(|s| !s.is_empty()) else {
         return "unset";
     };
     let lower = model.to_ascii_lowercase();
     use Needle::{Substr, Token};
-    // Manually maintained, privacy-preserving allowlist. Unlike `agent_bucket`,
-    // which derives from `crate::agents::AGENTS`, there is no in-repo source of
-    // model names to generate this from, so adding a newly common public family
-    // is a deliberate release chore: add a `(family, &[needle...])` row here.
-    // A model matching no row buckets as `"other"` and its raw name never
-    // leaves this function, so unknowns are coarse-counted, never leaked. Watch
-    // the `other` rate in the model-bucket telemetry (PostHog) to know when this
-    // list has drifted and needs a new family. See `docs/telemetry.md`.
+    // No in-repo source of model names; unmatched models bucket as `other`, so watch that rate.
     const FAMILIES: &[(&str, &[Needle])] = &[
         (
             "claude",
@@ -114,44 +82,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn known_agents_keep_canonical_name() {
-        assert_eq!(agent_bucket("claude"), "claude");
-        assert_eq!(agent_bucket("CLAUDE"), "claude");
-        assert_eq!(agent_bucket("codex"), "codex");
-        assert_eq!(agent_bucket("gemini"), "gemini");
-        assert_eq!(agent_bucket("opencode"), "opencode");
+    fn agent_bucket_keeps_known_names_and_collapses_the_rest_to_custom() {
+        for (raw, bucket) in [
+            ("claude", "claude"),
+            ("CLAUDE", "claude"),
+            ("codex", "codex"),
+            ("gemini", "gemini"),
+            ("opencode", "opencode"),
+            ("/usr/local/bin/my-secret-agent", "custom"),
+            ("acme-internal-llm", "custom"),
+            ("", "custom"),
+            ("   ", "custom"),
+        ] {
+            assert_eq!(agent_bucket(raw), bucket, "{raw:?}");
+        }
     }
 
     #[test]
-    fn unknown_agent_collapses_to_custom() {
-        // A custom command or an internal wrapper must never surface verbatim.
-        assert_eq!(agent_bucket("/usr/local/bin/my-secret-agent"), "custom");
-        assert_eq!(agent_bucket("acme-internal-llm"), "custom");
-        assert_eq!(agent_bucket(""), "custom");
-        assert_eq!(agent_bucket("   "), "custom");
+    fn model_bucket_maps_families_and_reports_unset_separately_from_other() {
+        for (raw, bucket) in [
+            (Some("claude-opus-4-8"), "claude"),
+            (Some("gpt-5"), "openai"),
+            (Some("o3-mini"), "openai"),
+            (Some("gemini-2.5-pro"), "gemini"),
+            (Some("qwen3-coder"), "qwen"),
+            (None, "unset"),
+            (Some(""), "unset"),
+            (Some("   "), "unset"),
+            (Some("acme-internal-v2"), "other"),
+        ] {
+            assert_eq!(model_bucket(raw), bucket, "{raw:?}");
+        }
     }
 
-    #[test]
-    fn model_buckets_map_to_families() {
-        assert_eq!(model_bucket(Some("claude-opus-4-8")), "claude");
-        assert_eq!(model_bucket(Some("gpt-5")), "openai");
-        assert_eq!(model_bucket(Some("o3-mini")), "openai");
-        assert_eq!(model_bucket(Some("gemini-2.5-pro")), "gemini");
-        assert_eq!(model_bucket(Some("qwen3-coder")), "qwen");
-    }
-
-    #[test]
-    fn model_bucket_unset_and_other() {
-        assert_eq!(model_bucket(None), "unset");
-        assert_eq!(model_bucket(Some("")), "unset");
-        assert_eq!(model_bucket(Some("   ")), "unset");
-        // An internal/unknown model name must collapse to "other", not leak.
-        assert_eq!(model_bucket(Some("acme-internal-v2")), "other");
-    }
-
-    // #1876: the short OpenAI tokens o1/o3/o4 are matched on a boundary, not as a
-    // bare substring, so a name that merely contains those two chars adjacent
-    // does not over-count as openai.
     #[test]
     fn short_openai_tokens_do_not_false_positive() {
         for name in [
@@ -169,10 +132,6 @@ mod tests {
         }
     }
 
-    // #1878 user story (maintainer visibility): a model from an unlisted family
-    // is not silently swallowed. It buckets as the observable `"other"`
-    // discriminator, which the snapshot reports as a non-zero count, so the
-    // allowlist drift is visible in the aggregate instead of vanishing.
     #[test]
     fn unknown_family_is_observable_as_other() {
         for name in [
@@ -190,10 +149,6 @@ mod tests {
         }
     }
 
-    // #1878 user story (privacy): no raw model name, nor any reversible form of
-    // it, escapes the sanitizer. Whatever is fed in, the output is always one of
-    // the fixed, closed vocabulary, so an internal or sensitive model name can
-    // never reach a payload.
     #[test]
     fn output_is_always_from_the_closed_vocabulary() {
         const VOCAB: &[&str] = &[

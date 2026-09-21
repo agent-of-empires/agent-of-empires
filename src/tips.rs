@@ -1,89 +1,40 @@
-//! Tips engine: a small registry of "did you know" hints surfaced in the UI.
-//!
-//! This module is pure data plus selection logic, with no rendering or I/O, so
-//! every surface renders from one catalog. The TUI consumes it today; because
-//! it lives in the shared lib (not under `tui`), the daemon can expose the same
-//! catalog to the web dashboard later with no rework.
-//!
-//! Two kinds of tips:
-//! - **Rotation** tips are always eligible and surface passively (the badge +
-//!   the tips list). They never interrupt.
-//! - **Earned** tips become eligible only once a behavior signal fires, and may
-//!   pop once on their own, so a hint shows up exactly when it would help.
-//!
-//! Seen state lives in `config.app_state.tips_seen` and the on/off preference
-//! in `config.session.show_tips`, so both are shared across surfaces and
-//! survive restarts.
+//! Tips catalog and selection logic, shared by every surface. Rotation tips are always
+//! eligible; earned tips need a behavior signal and may pop once.
 
-/// Behavior signals an earned tip's trigger can inspect. Sourced from
-/// `config.app_state`; add a field here when a new earned tip needs a new
-/// signal.
 #[derive(Debug, Clone, Default)]
 pub struct TipSignals {
-    /// How many times the new-session dialog has been opened while a project
-    /// or session was selected. Drives the "new from selection" earned tip
-    /// (the discoverability fix for #2262).
     pub new_session_with_selection_count: u32,
-    /// Whether the user has already used `N` (new-from-selection). Once true,
-    /// the tip teaching it is suppressed; they've discovered the feature.
     pub used_new_from_selection: bool,
-    /// Whether concurrent load has earned the System Health discovery tip.
     pub system_health_tip_earned: bool,
-    /// Whether the user has already opened the detailed System Health view.
     pub used_system_health: bool,
 }
 
-/// Number of `new_session_with_selection` opens before the "new from
-/// selection" tip becomes eligible. Set so a brand-new user isn't nudged on
-/// their first session, but someone who keeps opening `n` with a row selected
-/// eventually learns about `N`.
 pub const NEW_FROM_SELECTION_TIP_THRESHOLD: u32 = 3;
 pub const SYSTEM_HEALTH_AGENT_THRESHOLD: usize = 6;
 pub const SYSTEM_HEALTH_SAMPLE_THRESHOLD: u8 = 3;
 
-/// Which surface a tip is meant for. A tip lists every surface it applies to in
-/// [`Tip::surfaces`], so keyboard-only hints (the `N` shortcut) stay out of the
-/// web dashboard and web-only hints (installing the PWA) stay out of the TUI.
-/// All eligibility queries take a surface so each surface only ever sees its
-/// own tips.
+/// A tip shows only on the surfaces it lists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TipSurface {
-    /// The terminal UI.
     Tui,
-    /// The web dashboard (`aoe serve`).
     Web,
 }
 
-/// When a tip becomes eligible to surface.
 pub enum TipTrigger {
-    /// Always eligible. Surfaced passively via the badge + tips list; never
-    /// pops on its own.
     Rotation,
-    /// Eligible only once the predicate (reading [`TipSignals`]) returns true.
-    /// Earned tips may pop once, in addition to appearing in the list.
     Earned(fn(&TipSignals) -> bool),
 }
 
-/// A single tip.
 pub struct Tip {
-    /// Stable identity, used as the persistence key in `tips_seen`. Never
-    /// reuse or renumber an id, or a user's seen-state would point at the
-    /// wrong tip.
+    /// Persistence key in `tips_seen`: never reuse or renumber.
     pub id: &'static str,
-    /// One-line summary shown in the list (and as the badge's headline).
     pub title: &'static str,
-    /// Longer explanation shown when the tip is focused in the list.
     pub body: &'static str,
-    /// What makes this tip eligible to surface.
     pub trigger: TipTrigger,
-    /// Surfaces this tip applies to. A tip never shows on a surface it doesn't
-    /// list, so a query for one surface can't leak another surface's tips.
     pub surfaces: &'static [TipSurface],
 }
 
 impl Tip {
-    /// Whether this tip is eligible to surface on `surface` given the current
-    /// signals: it must apply to the surface and its trigger must fire.
     fn is_eligible(&self, surface: TipSurface, signals: &TipSignals) -> bool {
         self.surfaces.contains(&surface)
             && match self.trigger {
@@ -92,15 +43,12 @@ impl Tip {
             }
     }
 
-    /// Whether this tip is allowed to pop on its own (earned tips only).
     pub fn is_earned(&self) -> bool {
         matches!(self.trigger, TipTrigger::Earned(_))
     }
 }
 
 fn earned_new_from_selection(signals: &TipSignals) -> bool {
-    // Only nudge users who keep opening `n` with a selection AND haven't yet
-    // discovered `N` for themselves.
     !signals.used_new_from_selection
         && signals.new_session_with_selection_count >= NEW_FROM_SELECTION_TIP_THRESHOLD
 }
@@ -109,7 +57,6 @@ fn earned_system_health(signals: &TipSignals) -> bool {
     signals.system_health_tip_earned && !signals.used_system_health
 }
 
-/// The full catalog, in display order.
 pub fn catalog() -> &'static [Tip] {
     CATALOG
 }
@@ -118,14 +65,11 @@ static CATALOG: &[Tip] = &[
     Tip {
         id: "new-from-selection",
         title: "Reuse the selected session's settings",
-        // `{new_from_selection}` is substituted with the live keybinding label
-        // by the tips overlay, so it stays correct in strict-hotkey mode (where
-        // the chord is Ctrl+N rather than Shift+N).
+        // `{placeholder}` keys are substituted with the live chord by the tips overlay.
         body: "Tired of choosing the directory, profile, and group every time? Press \
                {new_from_selection} on the home view to start a new session that inherits \
                all of them from the session you have selected.",
         trigger: TipTrigger::Earned(earned_new_from_selection),
-        // Teaches a keyboard shortcut, so it only makes sense in the TUI.
         surfaces: &[TipSurface::Tui],
     },
     Tip {
@@ -140,18 +84,12 @@ static CATALOG: &[Tip] = &[
     Tip {
         id: "install-dashboard-pwa",
         title: "Install the dashboard as an app",
-        // Browser-neutral wording: the engine can't know the user's browser or
-        // whether the dashboard is already installed.
         body: "You can install the dashboard as an app for quick access. In your browser, \
                use the install option (Install Agent of Empires in Chrome, or Add to Home \
                Screen on iOS) to keep it one tap away and keep notifications working.",
         trigger: TipTrigger::Rotation,
-        // About the web dashboard's PWA install, irrelevant to the TUI.
         surfaces: &[TipSurface::Web],
     },
-    // Web feature-discovery tips. These describe web gestures (right-click,
-    // pickers, the wizard), so they are web-only; the TUI teaches the same
-    // features through its help screen and the keyboard tips below.
     Tip {
         id: "pin-sessions",
         title: "Keep important sessions on top",
@@ -212,9 +150,6 @@ static CATALOG: &[Tip] = &[
         trigger: TipTrigger::Rotation,
         surfaces: &[TipSurface::Web],
     },
-    // TUI keyboard-shortcut tips. Keys are written as `{placeholder}` and the
-    // tips overlay substitutes the live chord (correct in strict-hotkey mode);
-    // see `resolve_body` in `src/tui/dialogs/tips.rs`.
     Tip {
         id: "tui-core-views",
         title: "Switch views fast",
@@ -243,20 +178,14 @@ static CATALOG: &[Tip] = &[
     },
 ];
 
-/// Whether `id` is the id of a tip in the catalog. Used to reject unknown ids
-/// before persisting them to the shared seen list.
 pub fn id_in_catalog(id: &str) -> bool {
     catalog().iter().any(|tip| tip.id == id)
 }
 
-/// Whether `id` is present in the seen list.
 fn is_seen(seen: &[String], id: &str) -> bool {
     seen.iter().any(|s| s == id)
 }
 
-/// Tips eligible to surface on `surface` given the current signals, ignoring
-/// seen-state, in catalog order. The tips list shows these (seen ones marked);
-/// the badge and pops use the `*_unseen` variants below.
 pub fn eligible(surface: TipSurface, signals: &TipSignals) -> Vec<&'static Tip> {
     catalog()
         .iter()
@@ -264,9 +193,6 @@ pub fn eligible(surface: TipSurface, signals: &TipSignals) -> Vec<&'static Tip> 
         .collect()
 }
 
-/// Tips eligible to surface on `surface` for a user who has already seen
-/// `seen`, given the current signals, in catalog order. Callers should
-/// additionally honor the `session.show_tips` setting before showing anything.
 pub fn eligible_unseen(
     surface: TipSurface,
     seen: &[String],
@@ -278,13 +204,10 @@ pub fn eligible_unseen(
         .collect()
 }
 
-/// Count of eligible, unseen tips on `surface`. Drives the badge.
 pub fn unseen_count(surface: TipSurface, seen: &[String], signals: &TipSignals) -> usize {
     eligible_unseen(surface, seen, signals).len()
 }
 
-/// The first earned tip eligible and unseen on `surface`, i.e. one that may pop
-/// on its own right now. Rotation tips never pop, so they are excluded here.
 pub fn next_earned_pop(
     surface: TipSurface,
     seen: &[String],
@@ -336,14 +259,12 @@ mod tests {
     #[test]
     fn earned_tip_suppressed_once_n_used() {
         let tip = by_id("new-from-selection").unwrap();
-        // Over threshold but the user already discovered N: stay ineligible.
         let used = TipSignals {
             new_session_with_selection_count: NEW_FROM_SELECTION_TIP_THRESHOLD + 5,
             used_new_from_selection: true,
             ..TipSignals::default()
         };
         assert!(!tip.is_eligible(TipSurface::Tui, &used));
-        // The earned tip drops out, but rotation TUI tips remain.
         let unseen: Vec<&str> = eligible_unseen(TipSurface::Tui, &[], &used)
             .iter()
             .map(|t| t.id)
@@ -370,8 +291,6 @@ mod tests {
 
     #[test]
     fn unseen_count_tracks_eligibility_and_seen() {
-        // Earning the N tip adds exactly one to the TUI count, regardless of how
-        // many rotation tips ship alongside it.
         let base = unseen_count(TipSurface::Tui, &[], &signals(0));
         assert_eq!(
             unseen_count(
@@ -382,7 +301,6 @@ mod tests {
             base + 1
         );
 
-        // Once seen, it drops back to the baseline.
         let seen = vec!["new-from-selection".to_string()];
         assert_eq!(
             unseen_count(
@@ -414,10 +332,8 @@ mod tests {
 
     #[test]
     fn next_earned_pop_only_when_eligible_and_unseen() {
-        // Below threshold: nothing to pop.
         assert!(next_earned_pop(TipSurface::Tui, &[], &signals(0)).is_none());
 
-        // At threshold: the new-from-selection tip pops.
         let pop = next_earned_pop(
             TipSurface::Tui,
             &[],
@@ -425,7 +341,6 @@ mod tests {
         );
         assert_eq!(pop.map(|t| t.id), Some("new-from-selection"));
 
-        // Once seen, it no longer pops even when eligible.
         let seen = vec!["new-from-selection".to_string()];
         assert!(next_earned_pop(
             TipSurface::Tui,
@@ -444,8 +359,6 @@ mod tests {
 
     #[test]
     fn surfaces_do_not_leak_across() {
-        // The keyboard-shortcut tip is TUI-only; the PWA tip is web-only. Each
-        // surface sees its own and never the other's, even when eligible.
         let earned = signals(NEW_FROM_SELECTION_TIP_THRESHOLD);
 
         let web = eligible(TipSurface::Web, &earned);
@@ -459,21 +372,17 @@ mod tests {
 
     #[test]
     fn web_rotation_tips_are_eligible_by_default() {
-        // Web tips are all rotation, so a brand-new web user sees every one of
-        // them with no signals, and seeing one drops it from the count.
         let all = web_unseen_ids(&[], &signals(0));
         assert!(all.contains(&"install-dashboard-pwa"));
         assert!(all.len() > 1, "more than just the PWA tip ships on the web");
         let seen = vec!["install-dashboard-pwa".to_string()];
         assert_eq!(web_unseen_ids(&seen, &signals(0)).len(), all.len() - 1);
-        // No web tip is earned, so nothing pops on its own.
         assert!(next_earned_pop(TipSurface::Web, &[], &signals(0)).is_none());
     }
 
     #[test]
     fn web_tips_carry_no_keybinding_placeholders() {
-        // Web bodies are rendered as-is by the server (no placeholder resolver),
-        // so a `{...}` would leak raw into the dashboard.
+        // Web bodies render as-is, so a `{...}` placeholder would leak into the dashboard.
         for tip in catalog() {
             if tip.surfaces.contains(&TipSurface::Web) {
                 assert!(!tip.body.contains('{'), "{} has a placeholder", tip.id);

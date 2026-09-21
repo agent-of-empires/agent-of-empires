@@ -1,56 +1,79 @@
 // @vitest-environment jsdom
-//
-// FullFileViewer contract (#1810): the full-file fallback shown when an
-// agent-cited file has no diff against the base. Verifies it
-//   - highlights the file via the shared shiki highlighter for a known
-//     language and injects the resulting markup,
-//   - falls back to a plain <pre> with the raw content for an unknown
-//     extension (highlighter never runs),
-//   - drops stale highlighted markup when the rendered file changes, so a
-//     switch can't keep painting the previous file's html.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, waitFor } from "@testing-library/react";
+import { cleanup, render } from "@testing-library/react";
 import { FullFileViewer } from "../FullFileViewer";
 
 vi.mock("../../../hooks/useShikiTheme", () => ({
   useShikiTheme: () => ({ theme: "github-dark", appearance: "dark" }),
 }));
 
-vi.mock("../../../lib/snippetHighlighter", () => ({
-  highlightSnippet: vi.fn((code: string) => Promise.resolve(`<pre class="shiki"><code>${code}</code></pre>`)),
+vi.mock("../pierre/DiffWorkerPoolProvider", () => ({
+  DiffWorkerPoolProvider: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+}));
+
+// Stubbed: the renderer touches the DOM and spins up workers, neither of
+// which runs under jsdom. The stand-in surfaces what it was handed; the real
+// gutter is covered by the live Playwright suite.
+vi.mock("@pierre/diffs/react", () => ({
+  Virtualizer: ({ children }: { children: React.ReactNode }) => <div data-testid="virtualizer">{children}</div>,
+  File: ({
+    file,
+    options,
+  }: {
+    file: { name: string; contents: string };
+    options: { theme: string; disableLineNumbers?: boolean };
+  }) => (
+    <div
+      data-testid="pierre-file"
+      data-name={file.name}
+      data-theme={options.theme}
+      data-line-numbers={String(options.disableLineNumbers !== true)}
+    >
+      {file.contents}
+    </div>
+  ),
 }));
 
 afterEach(cleanup);
 
 describe("FullFileViewer", () => {
-  it("highlights a known-language file and injects the markup", async () => {
-    const { container } = render(<FullFileViewer content="export const a = 1;\n" filePath="src/a.ts" />);
-    await waitFor(() => {
-      expect(container.querySelector("pre.shiki")).toBeTruthy();
-    });
-    expect(container.textContent).toContain("export const a = 1;");
+  it("hands the file name and text to the renderer with line numbers enabled", () => {
+    const { getByTestId } = render(<FullFileViewer content={"a\nb\n"} filePath="src/a.ts" />);
+    const rendered = getByTestId("pierre-file");
+    expect(rendered.dataset.name).toBe("src/a.ts");
+    expect(rendered.textContent).toBe("a\nb\n");
+    expect(rendered.dataset.lineNumbers).toBe("true");
+    expect(rendered.dataset.theme).toBe("github-dark");
   });
 
-  it("renders a plain pre for an unknown extension", async () => {
-    const { container } = render(<FullFileViewer content="just text" filePath="notes.unknownext" />);
-    // No grammar resolves, so the highlighter never produces markup.
-    await waitFor(() => {
-      expect(container.querySelector("pre")).toBeTruthy();
-    });
-    expect(container.querySelector("pre.shiki")).toBeNull();
-    expect(container.textContent).toContain("just text");
+  it("re-keys the view on a file switch so the previous file's instance is not reused", () => {
+    const { getByTestId, rerender } = render(<FullFileViewer content="first" filePath="src/a.ts" />);
+    const first = getByTestId("virtualizer");
+    rerender(<FullFileViewer content="second" filePath="src/b.ts" />);
+    const second = getByTestId("virtualizer");
+    expect(second).not.toBe(first);
+    expect(getByTestId("pierre-file").textContent).toBe("second");
   });
 
-  it("drops stale highlighted markup when the file changes", async () => {
-    const { container, rerender } = render(<FullFileViewer content="export const a = 1;\n" filePath="src/a.ts" />);
-    await waitFor(() => {
-      expect(container.querySelector("pre.shiki")).toBeTruthy();
-    });
-    // Switch to an unknown-language file: the retained markup must clear so the
-    // viewer doesn't paint the previous file's contents.
-    rerender(<FullFileViewer content="plain b" filePath="src/b.unknownext" />);
-    expect(container.querySelector("pre.shiki")).toBeNull();
-    expect(container.textContent).toContain("plain b");
+  it("re-keys when the same path's content changes, so rows are remeasured", () => {
+    const { getByTestId, rerender } = render(<FullFileViewer content={"a\nb"} filePath="src/a.ts" />);
+    const first = getByTestId("virtualizer");
+    rerender(<FullFileViewer content={"a\nb\nc"} filePath="src/a.ts" />);
+    expect(getByTestId("virtualizer")).not.toBe(first);
+  });
+
+  it("re-keys on an equal-length edit, which a length-only key would miss", () => {
+    const { getByTestId, rerender } = render(<FullFileViewer content={"a\nb"} filePath="src/a.ts" />);
+    const first = getByTestId("virtualizer");
+    rerender(<FullFileViewer content={"ab\n"} filePath="src/a.ts" />);
+    expect(getByTestId("virtualizer")).not.toBe(first);
+  });
+
+  it("keeps the view mounted when nothing changed", () => {
+    const { getByTestId, rerender } = render(<FullFileViewer content={"a\nb"} filePath="src/a.ts" />);
+    const first = getByTestId("virtualizer");
+    rerender(<FullFileViewer content={"a\nb"} filePath="src/a.ts" />);
+    expect(getByTestId("virtualizer")).toBe(first);
   });
 });

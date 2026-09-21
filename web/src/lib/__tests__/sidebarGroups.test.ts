@@ -1,12 +1,4 @@
 // @vitest-environment node
-//
-// Unit tests for the sidebar group view-model (#1234). The render path
-// consumes SidebarGroup; these tests pin the two builders that produce it:
-// repoGroupToSidebarGroup (repo axis adapter) and buildSessionGroups (the
-// user-group axis). The load-bearing case is the per-session split: a
-// workspace whose sessions span groups must render once per group with a
-// sliced session set, a distinct render key, and the real workspace id
-// preserved for actions.
 
 import { describe, expect, it } from "vitest";
 
@@ -20,6 +12,7 @@ import {
   repoGroupToSidebarGroup,
   sidebarGroupHasLiveWorkspace,
   UNGROUPED_GROUP_ID,
+  type SidebarGroup,
 } from "../sidebarGroups";
 import { MULTI_REPO_GROUP_ID, SCRATCH_GROUP_ID } from "../../hooks/useRepoGroups";
 import type { SidebarSortMode } from "../sidebarSort";
@@ -46,11 +39,7 @@ function session(over: Partial<SessionResponse> = {}): SessionResponse {
     has_managed_worktree: false,
     has_terminal: true,
     profile: "default",
-    cleanup_defaults: {
-      delete_worktree: false,
-      delete_branch: false,
-      delete_sandbox: false,
-    },
+    cleanup_defaults: { delete_worktree: false, delete_branch: false, delete_sandbox: false },
     remote_owner: null,
     notify_on_waiting: null,
     notify_on_idle: null,
@@ -62,7 +51,7 @@ function session(over: Partial<SessionResponse> = {}): SessionResponse {
   };
 }
 
-function workspace(id: string, sessions: SessionResponse[], over: Partial<Workspace> = {}): Workspace {
+function workspace(id: string, sessions: SessionResponse[]): Workspace {
   return {
     id,
     branch: null,
@@ -72,473 +61,244 @@ function workspace(id: string, sessions: SessionResponse[], over: Partial<Worksp
     primaryAgent: "claude",
     status: "idle",
     sessions,
+  };
+}
+
+/** A one-session workspace in `group_path`. */
+const ws = (id: string, group_path: string, over: Partial<SessionResponse> = {}) =>
+  workspace(id, [session({ id: `${id}-s`, group_path, ...over })]);
+
+function repoGroup(id: string, over: Partial<RepoGroup> = {}): RepoGroup {
+  return {
+    id,
+    repoPath: id,
+    displayName: id,
+    defaultDisplayName: id,
+    alias: null,
+    color: null,
+    remoteOwner: null,
+    remoteOwnerKey: over.remoteOwner ? `${over.remoteOwner}@example.com` : null,
+    workspaces: [ws(`${id}-w`, "")],
+    status: "idle",
+    collapsed: false,
+    registeredProjects: [],
     ...over,
   };
 }
+
+const archived = { archived_at: "2025-01-02T00:00:00Z" };
+const wsIds = (group: SidebarGroup) => group.workspaces.map((v) => v.workspace.id);
 
 const build = (
   workspaces: Workspace[],
   isCollapsed: (id: string) => boolean = () => false,
   sortMode: SidebarSortMode = "lastActivity",
-) =>
-  buildSessionGroups(workspaces, {
-    idleDecayWindowMs: IDLE_DECAY_WINDOW_MS,
-    sortMode,
-    isCollapsed,
-  });
+) => buildSessionGroups(workspaces, { idleDecayWindowMs: IDLE_DECAY_WINDOW_MS, sortMode, isCollapsed });
 
 describe("buildSessionGroups", () => {
-  it("orders within-group rows by attention when sortMode is attention (#1640)", () => {
+  it("orders rows by attention when sortMode is attention (#1640)", () => {
     const groups = build(
       [
-        workspace("w-running", [session({ id: "r", group_path: "feature", status: "Running" })]),
-        workspace("w-waiting", [session({ id: "w", group_path: "feature", status: "Waiting" })]),
-        workspace("w-idle", [session({ id: "i", group_path: "feature", status: "Idle" })]),
+        ws("w-running", "feature", { status: "Running" }),
+        ws("w-waiting", "feature", { status: "Waiting" }),
+        ws("w-idle", "feature", { status: "Idle" }),
       ],
       () => false,
       "attention",
     );
-    const feature = groups.find((g) => g.id === "feature")!;
-    expect(feature.workspaces.map((v) => v.workspace.id)).toEqual(["w-waiting", "w-idle", "w-running"]);
+    expect(wsIds(groups[0]!)).toEqual(["w-waiting", "w-idle", "w-running"]);
   });
 
-  it("buckets workspaces by group_path, named groups alphabetical", () => {
-    const groups = build([
-      workspace("w1", [session({ id: "s1", group_path: "refactor" })]),
-      workspace("w2", [session({ id: "s2", group_path: "feature" })]),
-    ]);
-    expect(groups.map((g) => g.id)).toEqual(["feature", "refactor"]);
+  it("buckets by group_path alphabetically with Ungrouped last", () => {
+    const groups = build([ws("w1", "refactor"), ws("w0", ""), ws("w2", "feature"), ws("w3", "   ")]);
+    expect(groups.map((g) => g.id)).toEqual(["feature", "refactor", UNGROUPED_GROUP_ID]);
     expect(groups.every((g) => g.kind === "sessionGroup")).toBe(true);
     expect(groups[0]!.groupPath).toBe("feature");
+    expect(groups[2]).toMatchObject({ displayName: "Ungrouped", groupPath: "" });
+    expect(wsIds(groups[2]!)).toEqual(["w0", "w3"]);
   });
 
-  it("collects empty group_path into Ungrouped, pinned to the bottom", () => {
-    const groups = build([
-      workspace("w1", [session({ id: "s1", group_path: "" })]),
-      workspace("w2", [session({ id: "s2", group_path: "feature" })]),
-    ]);
-    expect(groups.map((g) => g.id)).toEqual(["feature", UNGROUPED_GROUP_ID]);
-    const ungrouped = groups.find((g) => g.id === UNGROUPED_GROUP_ID)!;
-    expect(ungrouped.displayName).toBe("Ungrouped");
-    expect(ungrouped.groupPath).toBe("");
-  });
-
-  it("splits a workspace whose sessions span groups, slicing sessions", () => {
-    const groups = build([
+  it("splits a workspace whose sessions span groups, keeping its real id", () => {
+    const [feature, fix] = build([
       workspace("w1", [session({ id: "a", group_path: "feature" }), session({ id: "b", group_path: "fix" })]),
     ]);
-    expect(groups.map((g) => g.id)).toEqual(["feature", "fix"]);
-
-    const feature = groups.find((g) => g.id === "feature")!;
-    const fix = groups.find((g) => g.id === "fix")!;
-    expect(feature.workspaces).toHaveLength(1);
-    expect(fix.workspaces).toHaveLength(1);
-
-    // Real workspace id preserved for actions; render keys distinct.
-    expect(feature.workspaces[0]!.workspace.id).toBe("w1");
-    expect(fix.workspaces[0]!.workspace.id).toBe("w1");
-    expect(feature.workspaces[0]!.key).not.toBe(fix.workspaces[0]!.key);
-
-    // Each view carries only its group's sessions.
-    expect(feature.workspaces[0]!.workspace.sessions.map((s) => s.id)).toEqual(["a"]);
-    expect(fix.workspaces[0]!.workspace.sessions.map((s) => s.id)).toEqual(["b"]);
-  });
-
-  it("trims and normalizes whitespace-only group_path into Ungrouped", () => {
-    const groups = build([workspace("w1", [session({ id: "s1", group_path: "   " })])]);
-    expect(groups.map((g) => g.id)).toEqual([UNGROUPED_GROUP_ID]);
-  });
-
-  it("buckets paths that differ only by leading/trailing slashes together", () => {
-    const groups = build([
-      workspace("w1", [session({ id: "a", group_path: "feature" })]),
-      workspace("w2", [session({ id: "b", group_path: "feature/" })]),
-      workspace("w3", [session({ id: "c", group_path: "/feature" })]),
-    ]);
-    expect(groups.map((g) => g.id)).toEqual(["feature"]);
-    expect(groups[0]!.workspaces.map((v) => v.workspace.id)).toEqual(["w1", "w2", "w3"]);
-  });
-
-  it("flattens a nested path into the display name instead of truncating to the leaf", () => {
-    const groups = build([workspace("w1", [session({ id: "s1", group_path: "feature/auth" })])]);
-    expect(groups[0]!.id).toBe("feature/auth");
-    expect(groups[0]!.displayName).toBe("feature / auth");
-  });
-
-  it("keeps sibling nested groups distinct instead of colliding on a shared leaf", () => {
-    const groups = build([
-      workspace("w1", [session({ id: "a", group_path: "pushforward/PRs" })]),
-      workspace("w2", [session({ id: "b", group_path: "chargeunpacker/PRs" })]),
-    ]);
-    expect(groups.map((g) => g.displayName)).toEqual(["chargeunpacker / PRs", "pushforward / PRs"]);
-  });
-
-  it("reflects collapse state from the isCollapsed lookup", () => {
-    const groups = build([workspace("w1", [session({ id: "s1", group_path: "feature" })])], (id) => id === "feature");
-    expect(groups[0]!.collapsed).toBe(true);
-  });
-
-  it("session groups expose no repo-only affordances", () => {
-    const groups = build([workspace("w1", [session({ id: "s1", group_path: "feature" })])]);
-    expect(groups[0]!.capabilities).toEqual({
-      appearance: false,
-      reorder: false,
-      create: "generic",
-    });
-  });
-});
-
-describe("repoGroupToSidebarGroup", () => {
-  function repoGroup(over: Partial<RepoGroup> = {}): RepoGroup {
-    return {
-      id: "/repo-a",
-      repoPath: "/repo-a",
-      displayName: "repo-a",
-      defaultDisplayName: "repo-a",
-      alias: null,
-      color: null,
-      remoteOwner: null,
-      remoteOwnerKey: null,
-      workspaces: [workspace("w1", [session({ id: "s1" })])],
-      status: "idle",
-      collapsed: false,
-      registeredProjects: [],
-      ...over,
-    };
-  }
-
-  it("maps a real repo group with repo capabilities and id-based keys", () => {
-    const sg = repoGroupToSidebarGroup(repoGroup());
-    expect(sg.kind).toBe("repo");
-    expect(sg.repoPath).toBe("/repo-a");
-    expect(sg.capabilities).toEqual({
-      appearance: true,
-      reorder: true,
-      create: "repo",
-    });
-    expect(sg.workspaces[0]!.key).toBe("w1");
-    expect(sg.workspaces[0]!.workspace.id).toBe("w1");
-  });
-
-  it("gives synthetic repo buckets a generic create action", () => {
-    const sg = repoGroupToSidebarGroup(repoGroup({ id: MULTI_REPO_GROUP_ID, repoPath: MULTI_REPO_GROUP_ID }));
-    expect(sg.capabilities.create).toBe("generic");
-    expect(sg.capabilities.appearance).toBe(true);
-  });
-});
-
-describe("buildNestedSidebarGroups", () => {
-  function repoGroup(over: Partial<RepoGroup> = {}): RepoGroup {
-    return {
-      id: "/repo-a",
-      repoPath: "/repo-a",
-      displayName: "repo-a",
-      defaultDisplayName: "repo-a",
-      alias: null,
-      color: null,
-      remoteOwner: null,
-      remoteOwnerKey: null,
-      workspaces: [],
-      status: "idle",
-      collapsed: false,
-      registeredProjects: [],
-      ...over,
-    };
-  }
-
-  const buildNested = (
-    repoGroups: RepoGroup[],
-    isSubgroupCollapsed: (repoId: string, groupPath: string) => boolean = () => false,
-    sortMode: SidebarSortMode = "lastActivity",
-  ) =>
-    buildNestedSidebarGroups(repoGroups, {
-      idleDecayWindowMs: IDLE_DECAY_WINDOW_MS,
-      sortMode,
-      isSubgroupCollapsed,
-    });
-
-  it("keeps the repo header and nests its user groups underneath", () => {
-    const nested = buildNested([
-      repoGroup({
-        workspaces: [
-          workspace("w1", [session({ id: "a", group_path: "feature" })]),
-          workspace("w2", [session({ id: "b", group_path: "fix" })]),
-        ],
-      }),
-    ]);
-    expect(nested).toHaveLength(1);
-    expect(nested[0]!.repo.kind).toBe("repo");
-    expect(nested[0]!.repo.repoPath).toBe("/repo-a");
-    expect(nested[0]!.subgroups.map((sg) => sg.id)).toEqual(["feature", "fix"]);
-    expect(nested[0]!.subgroups.every((sg) => sg.kind === "sessionGroup")).toBe(true);
-  });
-
-  it("drops manual reorder on the repo header (nested axis has no order)", () => {
-    const nested = buildNested([
-      repoGroup({
-        workspaces: [workspace("w1", [session({ id: "a", group_path: "x" })])],
-      }),
-    ]);
-    expect(nested[0]!.repo.capabilities.reorder).toBe(false);
-    // Other repo affordances stay intact.
-    expect(nested[0]!.repo.capabilities.appearance).toBe(true);
-    expect(nested[0]!.repo.capabilities.create).toBe("repo");
-  });
-
-  it("puts ungrouped sessions in an Ungrouped subgroup within the repo", () => {
-    const nested = buildNested([
-      repoGroup({
-        workspaces: [
-          workspace("w1", [session({ id: "a", group_path: "feature" })]),
-          workspace("w2", [session({ id: "b", group_path: "" })]),
-        ],
-      }),
-    ]);
-    const ids = nested[0]!.subgroups.map((sg) => sg.id);
-    expect(ids).toEqual(["feature", UNGROUPED_GROUP_ID]);
-    const ungrouped = nested[0]!.subgroups.find((sg) => sg.id === UNGROUPED_GROUP_ID)!;
-    expect(ungrouped.groupPath).toBe("");
-  });
-
-  it("slices a split workspace per subgroup with the real id preserved", () => {
-    const nested = buildNested([
-      repoGroup({
-        workspaces: [
-          workspace("w1", [session({ id: "a", group_path: "feature" }), session({ id: "b", group_path: "fix" })]),
-        ],
-      }),
-    ]);
-    const [feature, fix] = nested[0]!.subgroups;
-    expect(feature!.workspaces[0]!.workspace.id).toBe("w1");
-    expect(fix!.workspaces[0]!.workspace.id).toBe("w1");
+    expect([feature!.id, fix!.id]).toEqual(["feature", "fix"]);
+    expect([wsIds(feature!), wsIds(fix!)]).toEqual([["w1"], ["w1"]]);
     expect(feature!.workspaces[0]!.key).not.toBe(fix!.workspaces[0]!.key);
     expect(feature!.workspaces[0]!.workspace.sessions.map((s) => s.id)).toEqual(["a"]);
     expect(fix!.workspaces[0]!.workspace.sessions.map((s) => s.id)).toEqual(["b"]);
   });
 
-  it("keys subgroup collapse on (repoId, groupPath), not group id alone", () => {
+  it("buckets paths differing only by surrounding slashes together", () => {
+    const groups = build([ws("w1", "feature"), ws("w2", "feature/"), ws("w3", "/feature")]);
+    expect(groups.map((g) => g.id)).toEqual(["feature"]);
+    expect(wsIds(groups[0]!)).toEqual(["w1", "w2", "w3"]);
+  });
+
+  it("shows the full nested path so sibling leaves stay distinct", () => {
+    const groups = build([ws("w1", "pushforward/PRs"), ws("w2", "chargeunpacker/PRs")]);
+    expect(groups.map((g) => [g.id, g.displayName])).toEqual([
+      ["chargeunpacker/PRs", "chargeunpacker / PRs"],
+      ["pushforward/PRs", "pushforward / PRs"],
+    ]);
+  });
+
+  it("reflects collapse state and exposes no repo-only affordances", () => {
+    const [group] = build([ws("w1", "feature")], (id) => id === "feature");
+    expect(group!.collapsed).toBe(true);
+    expect(group!.capabilities).toEqual({ appearance: false, reorder: false, create: "generic" });
+  });
+
+  it("reports liveness", () => {
+    expect(sidebarGroupHasLiveWorkspace(build([ws("w1", "feature", archived)])[0]!)).toBe(false);
+    expect(sidebarGroupHasLiveWorkspace(build([ws("w1", "feature")])[0]!)).toBe(true);
+  });
+});
+
+describe("repoGroupToSidebarGroup", () => {
+  it("maps a real repo with repo capabilities and id keys", () => {
+    const sg = repoGroupToSidebarGroup(repoGroup("/repo-a"));
+    expect(sg).toMatchObject({ kind: "repo", repoPath: "/repo-a" });
+    expect(sg.capabilities).toEqual({ appearance: true, reorder: true, create: "repo" });
+    expect(sg.workspaces[0]).toMatchObject({ key: "/repo-a-w", workspace: { id: "/repo-a-w" } });
+  });
+
+  it("gives synthetic buckets a generic create action", () => {
+    expect(repoGroupToSidebarGroup(repoGroup(MULTI_REPO_GROUP_ID)).capabilities).toMatchObject({
+      create: "generic",
+      appearance: true,
+    });
+  });
+});
+
+describe("buildNestedSidebarGroups", () => {
+  const buildNested = (
+    repoGroups: RepoGroup[],
+    isSubgroupCollapsed: (repoId: string, groupPath: string) => boolean = () => false,
+  ) =>
+    buildNestedSidebarGroups(repoGroups, {
+      idleDecayWindowMs: IDLE_DECAY_WINDOW_MS,
+      sortMode: "lastActivity",
+      isSubgroupCollapsed,
+    });
+
+  it("nests user groups under the repo header, which loses manual reorder", () => {
+    const [nested] = buildNested([
+      repoGroup("/repo-a", { workspaces: [ws("w1", "feature"), ws("w2", ""), ws("w3", "fix")] }),
+    ]);
+    expect(nested!.repo).toMatchObject({ kind: "repo", repoPath: "/repo-a" });
+    expect(nested!.repo.capabilities).toEqual({ appearance: true, reorder: false, create: "repo" });
+    expect(nested!.subgroups.map((sg) => [sg.id, sg.kind, sg.groupPath])).toEqual([
+      ["feature", "sessionGroup", "feature"],
+      ["fix", "sessionGroup", "fix"],
+      [UNGROUPED_GROUP_ID, "sessionGroup", ""],
+    ]);
+  });
+
+  it("slices a split workspace per subgroup with the real id preserved", () => {
+    const split = workspace("w1", [
+      session({ id: "a", group_path: "feature" }),
+      session({ id: "b", group_path: "fix" }),
+    ]);
+    const [feature, fix] = buildNested([repoGroup("/repo-a", { workspaces: [split] })])[0]!.subgroups;
+    expect([wsIds(feature!), wsIds(fix!)]).toEqual([["w1"], ["w1"]]);
+    expect(feature!.workspaces[0]!.key).not.toBe(fix!.workspaces[0]!.key);
+    expect(feature!.workspaces[0]!.workspace.sessions.map((s) => s.id)).toEqual(["a"]);
+  });
+
+  it("keys subgroup collapse on (repoId, groupPath)", () => {
     const nested = buildNested(
       [
-        repoGroup({
-          id: "/repo-a",
-          repoPath: "/repo-a",
-          workspaces: [workspace("w1", [session({ id: "a", group_path: "feature" })])],
-        }),
-        repoGroup({
-          id: "/repo-b",
-          repoPath: "/repo-b",
-          workspaces: [
-            workspace("w2", [session({ id: "b", group_path: "feature" })], {
-              projectPath: "/repo-b",
-            }),
-          ],
-        }),
+        repoGroup("/repo-a", { workspaces: [ws("w1", "feature")] }),
+        repoGroup("/repo-b", { workspaces: [ws("w2", "feature")] }),
       ],
       (repoId, groupPath) => repoId === "/repo-a" && groupPath === "feature",
     );
-    // Same group path in two repos collapses independently.
-    expect(nested[0]!.subgroups[0]!.collapsed).toBe(true);
-    expect(nested[1]!.subgroups[0]!.collapsed).toBe(false);
+    expect(nested.map((n) => n.subgroups[0]!.collapsed)).toEqual([true, false]);
   });
 
   it("reports liveness from any live subgroup row", () => {
-    const allSunk = buildNested([
-      repoGroup({
-        workspaces: [
-          workspace("w1", [
-            session({
-              id: "a",
-              group_path: "feature",
-              archived_at: "2025-01-02T00:00:00Z",
-            }),
-          ]),
-        ],
-      }),
+    const [sunk, live] = buildNested([
+      repoGroup("/a", { workspaces: [ws("w1", "feature", archived)] }),
+      repoGroup("/b", { workspaces: [ws("w2", "feature")] }),
     ]);
-    expect(nestedSidebarGroupHasLiveWorkspace(allSunk[0]!)).toBe(false);
-
-    const live = buildNested([
-      repoGroup({
-        workspaces: [workspace("w1", [session({ id: "a", group_path: "feature" })])],
-      }),
-    ]);
-    expect(nestedSidebarGroupHasLiveWorkspace(live[0]!)).toBe(true);
+    expect(nestedSidebarGroupHasLiveWorkspace(sunk!)).toBe(false);
+    expect(nestedSidebarGroupHasLiveWorkspace(live!)).toBe(true);
   });
 });
 
 describe("buildOrgGroups", () => {
-  function repoGroup(over: Partial<RepoGroup> = {}): RepoGroup {
-    return {
-      id: "/repo-a",
-      repoPath: "/repo-a",
-      displayName: "repo-a",
-      defaultDisplayName: "repo-a",
-      alias: null,
-      color: null,
-      remoteOwner: null,
-      remoteOwnerKey: over.remoteOwner ? `${over.remoteOwner}@example.com` : null,
-      workspaces: [workspace("w1", [session({ id: "s1" })])],
-      status: "idle",
-      collapsed: false,
-      registeredProjects: [],
-      ...over,
-    };
-  }
-
   const buildOrg = (
     repoGroups: RepoGroup[],
     isRepoCollapsed: (orgId: string, repoId: string) => boolean = () => false,
     isOrgCollapsed: (orgId: string) => boolean = () => false,
   ) => buildOrgGroups(repoGroups, { isOrgCollapsed, isRepoCollapsed });
 
-  it("buckets repos sharing the same remote owner together", () => {
+  it("buckets by host-scoped owner, alphabetically, with No organization last", () => {
     const orgs = buildOrg([
-      repoGroup({ id: "/repo-a", repoPath: "/repo-a", remoteOwner: "acme" }),
-      repoGroup({ id: "/repo-b", repoPath: "/repo-b", remoteOwner: "acme" }),
+      repoGroup("/repo-z", { remoteOwner: "zeta-corp" }),
+      repoGroup("/repo-none"),
+      repoGroup("/repo-a", { remoteOwner: "acme" }),
+      repoGroup("/repo-b", { remoteOwner: "acme" }),
+      repoGroup(MULTI_REPO_GROUP_ID),
+      repoGroup(SCRATCH_GROUP_ID),
     ]);
-    expect(orgs).toHaveLength(1);
-    expect(orgs[0]!.org.id).toBe("acme@example.com");
-    expect(orgs[0]!.repos.map((r) => r.id)).toEqual(["/repo-a", "/repo-b"]);
+    expect(orgs.map((o) => [o.org.id, o.repos.map((r) => r.id)])).toEqual([
+      ["acme@example.com", ["/repo-a", "/repo-b"]],
+      ["zeta-corp@example.com", ["/repo-z"]],
+      [NO_ORG_GROUP_ID, ["/repo-none", MULTI_REPO_GROUP_ID, SCRATCH_GROUP_ID]],
+    ]);
+    expect(orgs[2]!.org).toMatchObject({ displayName: "No organization", remoteOwner: null });
   });
 
-  it("keeps same-named owners on different hosts as separate buckets", () => {
-    // Regression for the #3284 review: bucketing by the bare owner instead
-    // of the host-scoped key would merge GitHub "acme" and GitLab "acme"
-    // into one group and one bulk-archive scope.
+  it("keeps same-named owners on different hosts apart", () => {
     const orgs = buildOrg([
-      repoGroup({ id: "/repo-gh", repoPath: "/repo-gh", remoteOwner: "acme", remoteOwnerKey: "acme@github.com" }),
-      repoGroup({ id: "/repo-gl", repoPath: "/repo-gl", remoteOwner: "acme", remoteOwnerKey: "acme@gitlab.com" }),
+      repoGroup("/repo-gh", { remoteOwner: "acme", remoteOwnerKey: "acme@github.com" }),
+      repoGroup("/repo-gl", { remoteOwner: "acme", remoteOwnerKey: "acme@gitlab.com" }),
     ]);
-    expect(orgs).toHaveLength(2);
-    expect(orgs.map((o) => o.org.id)).toEqual(["acme@github.com", "acme@gitlab.com"]);
-    // Both headers still display the bare owner.
-    expect(orgs.every((o) => o.org.displayName === "acme")).toBe(true);
-    expect(orgs[0]!.repos.map((r) => r.id)).toEqual(["/repo-gh"]);
-    expect(orgs[1]!.repos.map((r) => r.id)).toEqual(["/repo-gl"]);
+    expect(orgs.map((o) => [o.org.id, o.org.displayName, o.repos.map((r) => r.id)])).toEqual([
+      ["acme@github.com", "acme", ["/repo-gh"]],
+      ["acme@gitlab.com", "acme", ["/repo-gl"]],
+    ]);
   });
 
-  it("collects a null remoteOwner, and the Multi-repo / Scratch synthetic buckets, into No organization", () => {
-    const orgs = buildOrg([
-      repoGroup({ id: "/repo-a", repoPath: "/repo-a", remoteOwner: null }),
-      repoGroup({ id: MULTI_REPO_GROUP_ID, repoPath: MULTI_REPO_GROUP_ID, remoteOwner: null }),
-      repoGroup({ id: SCRATCH_GROUP_ID, repoPath: SCRATCH_GROUP_ID, remoteOwner: null }),
-    ]);
-    expect(orgs).toHaveLength(1);
-    expect(orgs[0]!.org.id).toBe(NO_ORG_GROUP_ID);
-    expect(orgs[0]!.org.displayName).toBe("No organization");
-    expect(orgs[0]!.org.remoteOwner).toBeNull();
-    expect(orgs[0]!.repos.map((r) => r.id)).toEqual(["/repo-a", MULTI_REPO_GROUP_ID, SCRATCH_GROUP_ID]);
-  });
-
-  it("sorts org buckets alphabetically with No organization pinned last", () => {
-    const orgs = buildOrg([
-      repoGroup({ id: "/repo-z", repoPath: "/repo-z", remoteOwner: "zeta-corp" }),
-      repoGroup({ id: "/repo-none", repoPath: "/repo-none", remoteOwner: null }),
-      repoGroup({ id: "/repo-a", repoPath: "/repo-a", remoteOwner: "acme" }),
-    ]);
-    expect(orgs.map((o) => o.org.id)).toEqual(["acme@example.com", "zeta-corp@example.com", NO_ORG_GROUP_ID]);
-  });
-
-  it("respects per-(org, repo) collapse state, independent of the flat repo axis", () => {
-    const orgs = buildOrg(
-      [
-        repoGroup({ id: "/repo-a", repoPath: "/repo-a", remoteOwner: "acme", collapsed: false }),
-        repoGroup({ id: "/repo-b", repoPath: "/repo-b", remoteOwner: "acme", collapsed: true }),
-      ],
+  it("keys collapse per org and per (org, repo), independent of the repo axis", () => {
+    const [org] = buildOrg(
+      [repoGroup("/repo-a", { remoteOwner: "acme" }), repoGroup("/repo-b", { remoteOwner: "acme", collapsed: true })],
       (orgId, repoId) => orgId === "acme@example.com" && repoId === "/repo-a",
+      (orgId) => orgId === "acme@example.com",
     );
-    const repos = orgs[0]!.repos;
-    // The lookup, not the flat-axis `collapsed` field on the input, wins.
-    expect(repos.find((r) => r.id === "/repo-a")!.collapsed).toBe(true);
-    expect(repos.find((r) => r.id === "/repo-b")!.collapsed).toBe(false);
+    expect(org!.org.collapsed).toBe(true);
+    expect(org!.repos.map((r) => r.collapsed)).toEqual([true, false]);
   });
 
-  it("collapses the org header from the isOrgCollapsed lookup", () => {
-    const orgs = buildOrg([repoGroup({ remoteOwner: "acme" })], undefined, (orgId) => orgId === "acme@example.com");
-    expect(orgs[0]!.org.collapsed).toBe(true);
-  });
-
-  it("drops manual reorder on member repos (org axis has no order)", () => {
-    const orgs = buildOrg([repoGroup({ remoteOwner: "acme" })]);
-    expect(orgs[0]!.repos[0]!.capabilities.reorder).toBe(false);
-    expect(orgs[0]!.repos[0]!.capabilities.appearance).toBe(true);
-  });
-
-  it("aggregates the org header's workspaces across its member repos", () => {
-    const orgs = buildOrg([
-      repoGroup({
-        id: "/repo-a",
-        repoPath: "/repo-a",
-        remoteOwner: "acme",
-        workspaces: [workspace("w1", [session({ id: "s1" })])],
-      }),
-      repoGroup({
-        id: "/repo-b",
-        repoPath: "/repo-b",
-        remoteOwner: "acme",
-        workspaces: [workspace("w2", [session({ id: "s2" })])],
-      }),
-    ]);
-    expect(orgs[0]!.org.workspaces.map((v) => v.workspace.id)).toEqual(["w1", "w2"]);
-  });
-});
-
-describe("sidebarGroupHasLiveWorkspace", () => {
-  it("is false when every workspace is sunk", () => {
-    const groups = build([
-      workspace("w1", [
-        session({
-          id: "s1",
-          group_path: "feature",
-          archived_at: "2025-01-02T00:00:00Z",
-        }),
-      ]),
-    ]);
-    expect(sidebarGroupHasLiveWorkspace(groups[0]!)).toBe(false);
-  });
-
-  it("is true when at least one workspace is live", () => {
-    const groups = build([workspace("w1", [session({ id: "s1", group_path: "feature" })])]);
-    expect(sidebarGroupHasLiveWorkspace(groups[0]!)).toBe(true);
+  it("drops manual reorder on member repos and aggregates their workspaces", () => {
+    const [org] = buildOrg([repoGroup("/a", { remoteOwner: "acme" }), repoGroup("/b", { remoteOwner: "acme" })]);
+    expect(org!.repos[0]!.capabilities).toMatchObject({ reorder: false, appearance: true });
+    expect(wsIds(org!.org)).toEqual(["/a-w", "/b-w"]);
   });
 });
 
 describe("archivableWorkspaces", () => {
-  it("returns members whose primary session is not archived", () => {
-    const groups = build([
-      workspace("w-live", [session({ id: "a", group_path: "feature" })]),
-      workspace("w-archived", [session({ id: "b", group_path: "feature", archived_at: "2025-01-02T00:00:00Z" })]),
-    ]);
-    const feature = groups.find((g) => g.id === "feature")!;
-    expect(archivableWorkspaces(feature).map((ws) => ws.id)).toEqual(["w-live"]);
-  });
-
-  it("includes snoozed-but-not-archived members (archive sweeps them in)", () => {
-    const groups = build([
-      workspace("w-snoozed", [session({ id: "a", group_path: "feature", snoozed_until: "2999-01-01T00:00:00Z" })]),
-    ]);
-    const feature = groups.find((g) => g.id === "feature")!;
-    expect(archivableWorkspaces(feature).map((ws) => ws.id)).toEqual(["w-snoozed"]);
-  });
-
-  it("is empty once every member is archived", () => {
-    const groups = build([
-      workspace("w1", [session({ id: "a", group_path: "feature", archived_at: "2025-01-02T00:00:00Z" })]),
-    ]);
-    const feature = groups.find((g) => g.id === "feature")!;
-    expect(archivableWorkspaces(feature)).toHaveLength(0);
-  });
-
-  it("keys off the primary session, ignoring archived siblings", () => {
-    // A workspace whose primary session is live is archivable even if a
-    // later session is already archived; triage acts on sessions[0].
-    const groups = build([
-      workspace("w1", [
-        session({ id: "a", group_path: "feature" }),
-        session({ id: "b", group_path: "feature", archived_at: "2025-01-02T00:00:00Z" }),
-      ]),
-    ]);
-    const feature = groups.find((g) => g.id === "feature")!;
-    expect(archivableWorkspaces(feature).map((ws) => ws.id)).toEqual(["w1"]);
+  it.each<[string, Workspace[], string[]]>([
+    ["skips archived primaries", [ws("w-live", "feature"), ws("w-archived", "feature", archived)], ["w-live"]],
+    [
+      "includes snoozed members",
+      [ws("w-snoozed", "feature", { snoozed_until: "2999-01-01T00:00:00Z" })],
+      ["w-snoozed"],
+    ],
+    ["is empty once every member is archived", [ws("w1", "feature", archived)], []],
+    [
+      "keys off the primary session",
+      [
+        workspace("w1", [
+          session({ id: "a", group_path: "feature" }),
+          session({ id: "b", group_path: "feature", ...archived }),
+        ]),
+      ],
+      ["w1"],
+    ],
+  ])("%s", (_name, workspaces, expected) => {
+    expect(archivableWorkspaces(build(workspaces)[0]!).map((w) => w.id)).toEqual(expected);
   });
 });

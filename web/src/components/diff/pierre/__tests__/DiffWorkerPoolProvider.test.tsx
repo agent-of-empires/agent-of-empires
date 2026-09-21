@@ -1,14 +1,4 @@
 // @vitest-environment jsdom
-//
-// A highlighter worker that dies at load used to blank the diff pane forever:
-// `@pierre/diffs@1.2.12` never settles `initialize()` in that case, so the
-// renderer waits on a pool that will never drain. See #3362. The provider must
-// notice the worker error and drop the pool so the renderer falls back to
-// main-thread highlighting.
-//
-// `WorkerPoolContextProvider` is mocked to call the factory the way the real
-// pool does, since the real one only builds workers once a renderer triggers
-// initialization, which does not happen under jsdom.
 
 import { act, render, screen } from "@testing-library/react";
 import { useEffect, useRef } from "react";

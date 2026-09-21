@@ -15,10 +15,6 @@ interface Handlers {
   onPointerLeave: (e: ReactPointerEvent) => void;
 }
 
-// Press to tap (fires once on release); press and hold to repeat the same
-// vertical arrow; drag horizontally mid-press to emit horizontal arrows
-// instead. Dominant axis wins on diagonal drags. Emits an "axis change"
-// callback so callers can show a visual hint.
 export function useLongPressDrag(opts: {
   onRepeat: () => void;
   onHorizontal: (direction: "left" | "right") => void;
@@ -81,7 +77,6 @@ export function useLongPressDrag(opts: {
       if (!pressed.current) return;
       const dx = e.clientX - startX.current;
       const dy = e.clientY - startY.current;
-      // Dominant axis wins on diagonal drags.
       const horizontal = Math.abs(dx) > Math.abs(dy) && Math.abs(dx) > HORIZONTAL_THRESHOLD;
       const next: DragAxis = horizontal ? (dx > 0 ? "horizontal-right" : "horizontal-left") : "vertical";
       if (next !== axis.current) {
@@ -92,9 +87,6 @@ export function useLongPressDrag(opts: {
     [onAxisChange],
   );
 
-  // Short press + release with no horizontal drag and no interval emits
-  // fires a single "tap" — the same effect as one repeat. Long-press that
-  // triggered the interval suppresses the tap.
   const onPointerUp = useCallback(() => {
     if (pressed.current && !emitted.current && axis.current === "vertical") {
       onRepeat();

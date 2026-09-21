@@ -13,7 +13,6 @@ function stubCanvas(installed: Set<string>) {
   const ctx = {
     font: "",
     measureText() {
-      // font looks like `48px monospace` or `48px "Name", monospace`.
       const m = this.font.match(/^\d+px (?:"([^"]+)", )?(\S+)$/);
       const name = m?.[1];
       const baseline = m?.[2] ?? "monospace";

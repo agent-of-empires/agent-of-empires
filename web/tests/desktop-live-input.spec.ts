@@ -2,11 +2,7 @@ import { test, expect } from "./helpers/mockedTest";
 import { mockTerminalApis } from "./helpers/terminal-mocks";
 import { clickSidebarSession } from "./helpers/sidebar";
 
-// Regression: on a fine-pointer desktop the unified live view must be
-// interactive, not view-only. The rendered pane is plain (non-focusable) DOM
-// text, so clicking it blurred the hidden input to <body> and keystrokes went
-// nowhere; the session looked read-only. A plain click must (re)focus the
-// input so typing reaches the pane. (#2115 follow-up to the xterm removal.)
+// #2115: clicking the non-focusable rendered pane must refocus the hidden input so typing reaches the pane.
 test.describe("Desktop live terminal input", () => {
   test.use({ viewport: { width: 1280, height: 800 }, hasTouch: false });
 
@@ -16,21 +12,16 @@ test.describe("Desktop live terminal input", () => {
     await clickSidebarSession(page, "pinch-test");
     await page.locator("[data-live-terminal]").first().waitFor({ state: "visible", timeout: 10_000 });
 
-    // Click into the terminal body (the instinctive "I want to type here"),
-    // which previously blurred focus to <body>.
     await page.locator("[data-live-terminal]").first().click();
     await expect(page.locator('textarea[aria-label="Live terminal input"]').first()).toBeFocused();
 
-    // Typing now produces input bytes on the live WS (binary frames).
     const before = handle.liveInput.length;
     await page.keyboard.type("ls");
     await expect.poll(() => Buffer.concat(handle.liveInput.slice(before)).toString()).toBe("ls");
   });
 
   test("the focused pane is marked selected, like the TUI's active border", async ({ page }) => {
-    // On a multi-pane desktop it must be obvious which box keystrokes go to.
-    // LiveTerminalView frames the focused pane with the teal `terminal-active`
-    // ring and flags it `data-pane-focused`; blurring drops the marker.
+    // The focused pane gets the terminal-active ring and data-pane-focused.
     await mockTerminalApis(page);
     await page.goto("/");
     await clickSidebarSession(page, "pinch-test");
@@ -46,9 +37,7 @@ test.describe("Desktop live terminal input", () => {
   });
 
   test("Ctrl+V pastes as a bracketed paste instead of sending a literal ^V", async ({ page }) => {
-    // The Ctrl+letter chord handler used to swallow Ctrl+V into a ^V (0x16) to
-    // tmux and preventDefault the keydown, blocking the browser's paste event.
-    // It must now fall through so the native paste reaches onPaste. (#2384)
+    // #2384: Ctrl+V falls through to the native paste event instead of sending ^V.
     const handle = await mockTerminalApis(page);
     await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
     await page.goto("/");
@@ -69,8 +58,7 @@ test.describe("Desktop live terminal input", () => {
   });
 
   test("Alt+V reaches the terminal as a Meta-v sequence", async ({ page }) => {
-    // Codex uses Alt+V as an image-paste shortcut in terminal mode. The live
-    // terminal must send the same bytes a native terminal sends: ESC + v.
+    // Codex's Alt+V image paste: ESC + v, like a native terminal.
     const handle = await mockTerminalApis(page);
     await page.goto("/");
     await clickSidebarSession(page, "pinch-test");
@@ -85,19 +73,14 @@ test.describe("Desktop live terminal input", () => {
   });
 
   test("Ctrl+Shift+C copies the terminal selection without sending ^C", async ({ page }) => {
-    // The hidden input is focused, so the browser's own copy targets the empty
-    // textarea; the handler reads the rendered DOM selection and copies it
-    // explicitly. Plain Ctrl+C stays SIGINT. (#2384)
+    // #2384: Ctrl+Shift+C copies the DOM selection; the focused hidden input would copy nothing, and Ctrl+C stays SIGINT.
     const handle = await mockTerminalApis(page);
     await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
     await page.goto("/");
     await clickSidebarSession(page, "pinch-test");
     await page.locator("[data-live-content]").first().waitFor({ state: "visible", timeout: 10_000 });
 
-    // The component requests a wider scrollback window after mount, so a second
-    // frame arrives with history rows. Wait for the content to stop changing
-    // before selecting; otherwise the captured Range drifts onto a row that
-    // renders in the later frame and the clipboard no longer matches `selected`.
+    // A second, wider frame arrives after mount; select only once content stops changing.
     let prevContent = "";
     await expect
       .poll(
@@ -111,9 +94,6 @@ test.describe("Desktop live terminal input", () => {
       )
       .toBe(true);
 
-    // Focus the input the way a user does (click the pane), then select a
-    // rendered terminal row. The selection lives in the DOM while the hidden
-    // input keeps focus, which is exactly the state Ctrl+Shift+C must read.
     await page.locator("[data-live-terminal]").first().click();
     const selected = await page.evaluate(() => {
       const content = document.querySelector("[data-live-content]")!;
@@ -167,11 +147,7 @@ test.describe("Desktop live terminal input", () => {
   });
 
   test("Shift+Tab sends backtab (CSI Z), not a plain Tab", async ({ page }) => {
-    // The keydown handler keyed only on e.key === "Tab" and always returned
-    // "\t", dropping the Shift. Shift+Tab must reach the agent as the backtab
-    // sequence \x1b[Z, which is what the TUI's live_send already emits for BTab.
-    // Without it, apps that read backtab (e.g. Claude Code's permission-mode
-    // cycle) never see Shift+Tab in the web terminal.
+    // Shift+Tab sends backtab (\x1b[Z), which Claude Code's mode cycle reads.
     const handle = await mockTerminalApis(page);
     await page.goto("/");
     await clickSidebarSession(page, "pinch-test");
@@ -188,9 +164,7 @@ test.describe("Desktop live terminal input", () => {
   });
 
   test("renders at the desktop font size, not the small mobile default", async ({ page }) => {
-    // The live view used to always read `mobileFontSize` (default 8px), so on
-    // desktop it came up tiny and ignored the dashboard's terminal font-size
-    // control. A fine pointer must use `desktopFontSize` (default 14px).
+    // A fine pointer uses desktopFontSize (14px), not mobileFontSize.
     await mockTerminalApis(page);
     await page.goto("/");
     await clickSidebarSession(page, "pinch-test");
