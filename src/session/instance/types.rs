@@ -16,6 +16,11 @@ pub struct TerminalInfo {
     pub created: bool,
 }
 
+// Generating this one logs "failed to parse serde attribute: deny_unknown_fields"
+// under `cargo test`. ts-rs is right to ignore it: the attribute constrains
+// what Rust accepts when decoding, and TypeScript has nothing to say about it.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AuxiliaryTarget {
@@ -24,6 +29,8 @@ pub enum AuxiliaryTarget {
     Tool { tool_name: String },
 }
 
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PanePresence {
@@ -35,6 +42,8 @@ pub enum PanePresence {
 }
 
 /// Native handoff requires Alive and the same name as the preparation receipt.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneObservation {
     #[serde(default)]
@@ -43,6 +52,8 @@ pub struct PaneObservation {
     pub tmux_session: Option<String>,
 }
 
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuxiliaryObservation {
     pub target: AuxiliaryTarget,
@@ -54,6 +65,8 @@ pub struct AuxiliaryObservation {
 /// rendering (plan panels, tool-call cards, approvals); `Terminal` streams
 /// the raw tmux/PTY through xterm.js. `Terminal` is the conservative
 /// deserialization default; session creation sets the value explicitly.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum View {

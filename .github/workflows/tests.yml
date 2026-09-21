@@ -133,14 +133,14 @@ jobs:
         run: |
           echo "TMPDIR=${TMPDIR:-unset}"
           cargo test
-      # That run rewrites the dashboard's copy of the live-stream types from
-      # src/daemon/live.rs (ts-rs). A diff means the Rust side moved and the
-      # committed TypeScript did not.
-      - name: Check generated live-stream types are committed
+      # That run rewrites the dashboard's copies of the wire types from the
+      # Rust ones (ts-rs). A diff means the Rust side moved and the committed
+      # TypeScript did not.
+      - name: Check generated wire types are committed
         if: matrix.leg == 'core-rest'
         run: |
-          git diff --exit-code web/src/lib/liveWire.ts \
-            || (echo "::error::web/src/lib/liveWire.ts is stale. Run 'cargo test --lib daemon::live' and commit." && exit 1)
+          git diff --exit-code web/src/lib/liveWire.ts web/src/lib/apiWire.ts \
+            || (echo "::error::Generated wire types are stale. Run 'cargo test --lib export_bindings' and commit." && exit 1)
       # bare-core: the three no-default-features feature corners. `web` is not
       # a default feature, so these runs are also the dashboard-off compile
       # gate that keeps the `cfg(feature = "web")` sites from rotting.

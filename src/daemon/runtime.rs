@@ -210,3 +210,76 @@ pub enum RuntimeFrame<T = RuntimeSnapshot> {
     /// local owner. See [`CreationProgress`].
     Creation(Vec<CreationProgress>),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn capabilities() -> RuntimeCapabilities {
+        RuntimeCapabilities {
+            mutations: true,
+            native_interaction: true,
+        }
+    }
+
+    /// The stream's handshake compares `protocol_version` by exact equality,
+    /// so an accidental rename of the envelope or of a frame kind is not a
+    /// degraded client, it is a client that cannot connect at all. Unlike the
+    /// REST bodies, nothing here is generated into a second language, so this
+    /// is the only thing standing between a rename and a silent break.
+    #[test]
+    fn the_runtime_envelope_is_what_a_connecting_client_matches_on() {
+        let hello = RuntimeFrame::<RuntimeSnapshot>::Hello(RuntimeInfo {
+            protocol_version: RUNTIME_PROTOCOL_VERSION,
+            epoch: "e1".into(),
+            namespace: "ns".into(),
+            tmux_socket: None,
+            local_owner: true,
+            profiles: vec!["default".into()],
+            read_only: false,
+            cityhall_mode: false,
+            health: RuntimeHealth::Healthy,
+            interaction_capabilities: capabilities(),
+        });
+        let json = serde_json::to_value(&hello).unwrap();
+        assert_eq!(json["kind"], "hello");
+        assert_eq!(json["data"]["protocol_version"], 1);
+        assert_eq!(json["data"]["epoch"], "e1");
+
+        let creation = RuntimeFrame::<RuntimeSnapshot>::Creation(Vec::new());
+        assert_eq!(serde_json::to_value(&creation).unwrap()["kind"], "creation");
+    }
+
+    /// The snapshot nests its cursor and flattens its contents, so a client
+    /// reads `data.cursor.revision` but `data.sessions`. The asymmetry is easy
+    /// to invert while editing either struct, and inverting it moves every
+    /// field a subscriber reads.
+    #[test]
+    fn a_snapshot_nests_its_cursor_and_flattens_its_contents() {
+        let snapshot = RuntimeSnapshot {
+            cursor: RuntimeCursor {
+                epoch: "e1".into(),
+                revision: 7,
+            },
+            contents: RuntimeContents {
+                health: RuntimeHealth::Healthy,
+                capabilities: capabilities(),
+                default_profile: "default".into(),
+                sessions: Vec::new(),
+                profiles: Vec::new(),
+                workspace_ordering: Vec::new(),
+                global_projects: Vec::new(),
+            },
+        };
+        let json = serde_json::to_value(RuntimeFrame::Snapshot(snapshot)).unwrap();
+        assert_eq!(json["kind"], "snapshot");
+        assert_eq!(json["data"]["cursor"]["epoch"], "e1");
+        assert_eq!(json["data"]["cursor"]["revision"], 7);
+        assert_eq!(json["data"]["default_profile"], "default");
+        assert!(
+            json["data"]["sessions"].is_array(),
+            "contents are flattened"
+        );
+        assert!(json["data"]["contents"].is_null());
+    }
+}

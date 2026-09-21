@@ -1,252 +1,26 @@
-import type { RateLimitInfo } from "./acpTypes";
+import type { SessionResponse as WireSessionResponse } from "./apiWire";
+
+// The REST contract's types are generated from the Rust ones; re-exported here
+// so callers keep importing them from the module they always did.
+export type {
+  AcpWorkerState,
+  CleanupDefaults,
+  ContextResumeAvailability,
+  ContextResumeIndeterminateReason,
+  ContextResumeUnavailableReason,
+  PlanSummary,
+  WorkspaceRepoSummary,
+} from "./apiWire";
 import type { RepoColor } from "./repoAppearance";
 import type { AgentLifecycleInfo } from "./agentProfiles";
 
-/** Session data returned by the API */
-export interface SessionResponse {
-  id: string;
-  title: string;
-  project_path: string;
-  /** Absolute host path of the session's managed artifact directory; the
-   *  transcript maps agent-emitted artifact paths under it (or the fixed
-   *  sandbox mount) to the authenticated artifact route. See #2587. */
-  artifact_dir: string;
-  group_path: string;
-  tool: string;
+/** One session as the daemon reports it. Generated from `src/daemon/wire.rs`
+ *  into `apiWire.ts`; `status` is narrowed here to the values this dashboard
+ *  renders, because the wire carries a plain string so that a client older
+ *  than a status still parses the row. */
+export type SessionResponse = Omit<WireSessionResponse, "status"> & {
   status: SessionStatus;
-  /** True when the session's structured-view worker was auto-stopped for
-   *  inactivity (resumable/dormant), as opposed to a deliberate Stop. Lets the
-   *  sidebar render a distinct dormant dot instead of a live-idle one. A
-   *  deliberate Stop keeps `status: "Stopped"` and reports `false`. See #2250. */
-  dormant: boolean;
-  yolo_mode: boolean;
-  created_at: string;
-  last_accessed_at: string | null;
-  /** Wall-clock time of the most recent transition into Idle. Used by the
-   *  dashboard to fade a freshly-stopped session's color toward neutral.
-   *  Distinct from `last_accessed_at`: viewing or messaging a session bumps
-   *  `last_accessed_at` but leaves `idle_entered_at` alone. */
-  idle_entered_at: string | null;
-  last_error: string | null;
-  branch: string | null;
-  main_repo_path: string | null;
-  /** Base branch the worktree was created from when AoE managed the
-   *  creation. null for sessions attached to a pre-existing branch or
-   *  those that took the repo's default branch. See #948. */
-  base_branch?: string | null;
-  /** Per-session override for the diff base. When set, the sidebar
-   *  diff compares the worktree against this ref instead of the
-   *  auto-detected default. Edited via the `vs <ref>` chip in the
-   *  diff header. See #970. */
-  base_branch_override?: string | null;
-  is_sandboxed: boolean;
-  /** True when the session was created in scratch mode (`aoe add
-   *  --scratch` or the wizard toggle). The `project_path` points
-   *  at an auto-provisioned directory under `<app_dir>/scratch/<id>/`,
-   *  and the deletion path removes it (unless the user opts in to
-   *  keeping the directory). The wizard's Recent-projects list filters
-   *  scratch sessions out. */
-  scratch: boolean;
-  /** True when the session is marked as a user favorite. Mirrors
-   *  `Instance::is_favorited()` server-side. The sidebar pins favorited
-   *  rows and prepends a `*` marker. Toggled via the TUI `f`/`F` keybind
-   *  or `aoe session favorite|unfavorite`. */
-  favorited: boolean;
-  /** Per-session color label (`red` / `amber` / `green`), or null / undefined
-   *  when unset. Rendered as a colored status dot in the sidebar for
-   *  at-a-glance agent status signaling. Set via the sidebar context menu or
-   *  `aoe session color <id> <color>`. See #2383. */
-  color?: string | null;
-  /** True when the agent has flagged this session as urgent via the
-   *  `attention-urgent` hook. Mirrors `Instance::is_urgent()` server-side
-   *  (false for archived / snoozed sessions). The sidebar's Attention sort
-   *  floats urgent rows above non-urgent ones within their triage tier.
-   *  Optional so older payloads and test fixtures without the field read as
-   *  not-urgent. See #1640. */
-  urgent?: boolean;
-  /** RFC3339 timestamp at which the session was web-pinned, or null /
-   *  undefined when not pinned. Distinct from `favorited`: favorite is
-   *  the TUI within-tier attention-sort signal; pin is the hard
-   *  top-of-sort surfacing primitive used by the web sidebar. Derive
-   *  `isPinned = pinned_at != null` client-side; no separate boolean is
-   *  exposed (the timestamp itself is the source of truth). See #1581. */
-  pinned_at?: string | null;
-  /** RFC3339 timestamp; null when not archived. Sinks into "Snoozed &
-   *  archived"; archive tears down all tmux. See #1581, #1868. */
-  archived_at?: string | null;
-  /** RFC3339 timestamp at which an active snooze expires, or null /
-   *  undefined when not snoozed. The server gates this on
-   *  `Instance::is_snoozed()` so an expired snooze that is still on disk
-   *  comes back as null on the wire; the web therefore only needs to
-   *  treat any non-null value as an active snooze. See #1581. */
-  snoozed_until?: string | null;
-  /** RFC3339 timestamp at which the session was moved to trash, or null /
-   *  undefined when not trashed. Trashed sessions are bucketed into a
-   *  dedicated Trash section with restore and permanent-delete actions; they
-   *  are excluded from the active and archived buckets. See #2489. */
-  trashed_at?: string | null;
-  /** Unread marker mirroring `Instance::unread`: `true` when the session
-   *  needs attention (a finished turn the user hasn't engaged with, or a
-   *  manual flag), false / undefined when read. The sidebar paints an unread
-   *  accent and offers a right-click "Mark as read/unread" toggle, both gated
-   *  on the `session.unread_indicator` setting. The chip is suppressed for the
-   *  session currently open, which also clears the marker. */
-  unread?: boolean;
-  has_managed_worktree: boolean;
-  /** True when deleting this session has aoe-managed worktree state to clean
-   *  up, covering single-repo worktrees AND multi-repo workspaces. Only the
-   *  delete dialog's worktree/branch checkboxes read this; worktree-only
-   *  actions (Edit workdir) keep reading `has_managed_worktree`. Always sent
-   *  by the server; optional only so existing test fixtures need not set it. */
-  has_cleanable_worktree?: boolean;
-  /** True when renaming this session also moves its worktree directory (the
-   *  resolved `session.tie_workdir_to_name` for an aoe-managed worktree). The
-   *  sidebar uses this to collapse the standalone "edit workdir name" action
-   *  into the unified rename. Populated by the list endpoint. See #1927. */
-  tie_workdir_to_name?: boolean;
-  has_terminal: boolean;
-  profile: string;
-  cleanup_defaults: CleanupDefaults;
-  remote_owner: string | null;
-  /** Host-scoped identity for `remote_owner` ("owner@host"): the org axis
-   *  buckets by this instead of the bare owner, so same-named owners on
-   *  different hosts (GitHub "acme" vs GitLab "acme") never merge into one
-   *  group. `remote_owner` stays the display label. `null` whenever
-   *  `remote_owner` is `null`. */
-  remote_owner_key: string | null;
-  /** Per-session push-notification overrides. null means "inherit the
-   *  server default" for that event type; boolean is an explicit toggle. */
-  notify_on_waiting: boolean | null;
-  notify_on_idle: boolean | null;
-  notify_on_error: boolean | null;
-  /** True when this session uses ACP acp rendering instead of a
-   *  tmux-backed PTY. Absent on builds without the acp feature. */
-  view?: "structured" | "terminal";
-  /** Daemon-derived continuity state for the next lifecycle transition.
-   *  Optional because older daemons do not report it. */
-  context_resume?: ContextResumeAvailability;
-  /** Live acp worker lifecycle. `absent` for tmux sessions or
-   *  acp sessions whose worker has not been spawned yet; `resuming`
-   *  while the reconciler is mid-spawn or mid-attach; `running` once
-   *  the supervisor holds a live worker. Drives the sidebar `Resuming…`
-   *  chip and the per-session banner in the acp view. See #1088. */
-  acp_worker_state?: AcpWorkerState;
-  /** The provider rate limit the daemon has this session parked on, from
-   *  its durable event-store park. Absent when not parked. Drives the
-   *  sidebar badge, replacing the browser-side mirror that went stale when
-   *  a session resumed with no tab open (#3514). */
-  rate_limit?: RateLimitInfo;
-  /** Whether `[acp] rate_limit_auto_resume` is on for the session's
-   *  profile, so the rate-limit banner can say whether the park ends by
-   *  itself. */
-  rate_limit_auto_resume?: boolean;
-  /** Smart-rename indicator for structured view sessions. `pending`: still
-   *  default-named and eligible, will auto-name on the next prompt; `running`:
-   *  a one-shot title call is in flight; `inactive`/absent otherwise. Drives
-   *  the sidebar auto-name chip. See session::smart_rename. */
-  smart_rename?: "inactive" | "pending" | "running";
-  /** True when the session still carries its auto-generated civilization name.
-   *  Gates the sidebar "Auto-name now" action, which only re-runs smart rename
-   *  on a still-default session. More reliable than `smart_rename` for this: a
-   *  timed-out one-shot stays `pending` while an unusable-output one goes
-   *  `inactive`, but both leave the name default and recoverable. Populated by
-   *  the session list; absent on single-session responses. */
-  default_name?: boolean;
-  /** True when this session's agent can run in acp: a built-in with
-   *  an ACP adapter, or a custom agent whose profile config declares a
-   *  valid `agent_acp_cmd`. The terminal view's "switch to acp"
-   *  affordance reads this instead of a hardcoded tool list. Absent on
-   *  builds without the acp feature. */
-  acp_capable?: boolean;
-  /** The session's captured ACP session id, present only once the structured
-   *  view worker has minted one. The sidebar passes this as `fork_from` on a
-   *  structured fork create and gates the "Fork" action on it together with
-   *  `acp_can_fork`. Absent for terminal sessions and structured ones whose
-   *  worker has not minted an id yet. */
-  acp_session_id?: string;
-  /** The session's resolved ACP registry key (`agent_name` when set, else
-   *  `tool`), matching the `name` entries `/api/acp/agents` returns. The
-   *  structured view's switch-agent modal uses this as the current-agent
-   *  fallback before the first `AgentSwitched` event lands (which is the only
-   *  event that populates the reduced `state.agent`), so it can gray out the
-   *  running backend on a never-switched session. See #2803. */
-  acp_agent?: string;
-  /** Whether switching this session between terminal and structured view
-   *  preserves the conversation (only claude pairings share one CLI-resumable
-   *  transcript). Server-computed via `agents::acp_transcript_cli_resumable`;
-   *  the dashboard reads this instead of recomputing it. Absent (read as false)
-   *  for non-preserving pairings. */
-  keeps_context?: boolean;
-  /** Slash-command aliases that reset the conversation for this session's
-   *  agent (claude `/clear`, codex/opencode `/new`). Server-owned from the
-   *  Rust `AgentProfile::clear_aliases`; the composer's `/` palette and the
-   *  queued-prompt clear-boundary hint read this instead of a client-side
-   *  per-agent mirror. Absent (read as empty) for agents with no clear alias. */
-  clear_aliases?: string[];
-  /** True when this session's agent can run a structured ACP `session/fork`:
-   *  it maps to a built-in ACP adapter verified to implement the handshake
-   *  (today claude alone). Resume-only ACP agents (e.g. `aoe-agent`, which
-   *  advertises `loadSession` but not `session/fork`) are ACP-capable yet not
-   *  forkable, so the sidebar gates "Fork" on this together with
-   *  `acp_session_id` and a resume-only row never shows a dead-end button.
-   *  Absent (read as not-forkable) for terminal sessions and non-forkable
-   *  agents. */
-  acp_can_fork?: boolean;
-  /** True when this is a Claude Code session AND the user has enabled
-   *  Claude's fullscreen renderer (`tui: "fullscreen"` in
-   *  ~/.claude/settings.json). The mobile rendering path uses this to
-   *  skip scrollback-tracking workarounds that target tmux copy-mode. */
-  claude_fullscreen: boolean;
-  /** Repos in the multi-repo workspace. Empty array for single-repo sessions. */
-  workspace_repos: WorkspaceRepoSummary[];
-  /** Non-fatal warnings emitted during worktree creation (e.g. post-checkout
-   *  hook failures where the worktree was created successfully anyway). Only
-   *  populated on the create-session response; absent on subsequent fetches. */
-  warnings?: string[];
-  /** Latest plan snapshot summarised for the sidebar. Present only on
-   *  acp sessions whose agent has emitted a Plan. See #1061. */
-  plan_summary?: PlanSummary;
-  /** Absolute RFC3339 timestamp at which the agent's pending
-   *  `ScheduleWakeup` fires. Cleared once a fresh user prompt lands
-   *  after the scheduling call. Present only on acp sessions
-   *  whose agent has called `ScheduleWakeup` since the last prompt.
-   *  See #1091. */
-  next_wakeup_at?: string;
-  /** Reason the agent provided when scheduling the wakeup. Only set
-   *  when `next_wakeup_at` is also set. */
-  next_wakeup_reason?: string;
-  /** True when the acp session has an armed `Monitor` (a background
-   *  watch). Drives a static "monitoring" sidebar badge. Cleared once a
-   *  fresh user prompt lands after the monitor was armed. */
-  monitor_active?: boolean;
-  /** The `description` the agent gave the `Monitor` tool, shown as the
-   *  badge tooltip. Only set when `monitor_active` is true. */
-  monitor_description?: string;
-}
-
-export interface PlanSummary {
-  /** First non-completed step's title, truncated server-side. */
-  current_step_title: string | null;
-  /** Count of steps with status `Done`. */
-  completed: number;
-  /** Total step count. */
-  total: number;
-}
-
-export interface WorkspaceRepoSummary {
-  name: string;
-  source_path: string;
-  branch: string;
-}
-
-export interface CleanupDefaults {
-  delete_worktree: boolean;
-  delete_branch: boolean;
-  delete_sandbox: boolean;
-  /** Resolved `session.delete_to_trash`: the delete dialog defaults to
-   *  "Move to Trash" when true, permanent delete when false. See #2489. */
-  delete_to_trash: boolean;
-}
+};
 
 export type SessionStatus =
   | "Running"
@@ -258,23 +32,6 @@ export type SessionStatus =
   | "Unknown"
   | "Deleting"
   | "Creating";
-
-export type ContextResumeUnavailableReason =
-  | "agent_unsupported"
-  | "sandbox_unsupported"
-  | "command_unsupported"
-  | "forced_fresh"
-  | "invalid_target"
-  | "fork_pending"
-  | "previous_failure"
-  | "no_target";
-
-export type ContextResumeIndeterminateReason = "runtime_check_required" | "agent_handshake_required";
-
-export type ContextResumeAvailability =
-  | { state: "available" }
-  | { state: "indeterminate"; reason: ContextResumeIndeterminateReason }
-  | { state: "unavailable"; reason: ContextResumeUnavailableReason };
 
 /** WebSocket control messages sent from browser to server */
 export interface ResizeMessage {
@@ -622,10 +379,6 @@ export interface ClaudeSessionSummary {
   last_modified_ms: number;
   cwd_exists: boolean;
 }
-
-/** Live ACP worker lifecycle, mirrored from
- *  crate::daemon::AcpWorkerState. See #1088. */
-export type AcpWorkerState = "absent" | "resuming" | "running" | "stopping";
 
 // --- Settings schema (single source of truth, see #1692) ---
 //

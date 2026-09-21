@@ -1727,7 +1727,7 @@ export const SessionRow = memo(function SessionRow({
                       <span>{formatSnoozeRemainingShort(effectiveSnoozedUntil)}</span>
                     </span>
                   )}
-                  <ContextResumeBadge availability={navigationSession?.context_resume} />
+                  <ContextResumeBadge availability={navigationSession?.context_resume ?? undefined} />
                   {firstSession?.view === "structured" && firstSession.acp_worker_state === "resuming" && (
                     <span
                       title="Structured view worker is resuming"

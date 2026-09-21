@@ -1914,7 +1914,7 @@ function AppContent({
                         key={activeSessionId}
                         sessionId={activeSessionId!}
                         acpWorkerState={activeSession.acp_worker_state ?? "absent"}
-                        rateLimitAutoResume={activeSession.rate_limit_auto_resume}
+                        rateLimitAutoResume={activeSession.rate_limit_auto_resume ?? undefined}
                         tool={activeSession.tool}
                         acpAgent={activeSession.acp_agent ?? null}
                         clearAliases={activeSession.clear_aliases}

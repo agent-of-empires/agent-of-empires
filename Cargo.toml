@@ -252,7 +252,7 @@ cargo-husky = { version = "1", default-features = false, features = ["precommit-
 # Writes the dashboard's copy of the live-stream wire types from the Rust
 # ones (`src/daemon/live.rs`) when the lib tests run. Test-only: the derive is
 # behind `cfg(test)`, so no released binary links it.
-ts-rs = "12"
+ts-rs = { version = "12", features = ["chrono-impl"] }
 # Test-only tower dep for `ServiceExt::oneshot`, so the DNS-rebinding gate
 # (#2735) can be driven through the real router without binding a socket.
 tower = { version = "0.5", features = ["util"] }

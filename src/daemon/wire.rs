@@ -435,6 +435,8 @@ where
 /// with the web composer and the prompt-request DTO in `protocol.rs`,
 /// so renaming a variant breaks the build on both sides rather than
 /// silently dropping attachments.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PromptAttachmentKind {
@@ -473,6 +475,8 @@ impl PromptAttachmentKind {
 /// `GET /acp/attachments/{id}`. Keeping bytes out of the event log
 /// is what stops `event_json` (and every WS replay frame) from bloating
 /// to megabytes per screenshot. See #1000 / #965.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PromptAttachmentRef {
     pub id: String,
@@ -482,6 +486,9 @@ pub struct PromptAttachmentRef {
     pub name: Option<String>,
     /// Decoded byte length, for the UI to show a size hint without
     /// fetching the blob.
+    // A JSON number on the wire; ts-rs maps u64 to `bigint`, which
+    // `JSON.parse` never produces.
+    #[cfg_attr(test, ts(type = "number"))]
     pub size: u64,
 }
 
@@ -496,12 +503,17 @@ pub struct PromptAttachmentRef {
 /// seq-keyed retention prune, since a queued prompt has no event seq yet) and
 /// are reloaded at drain time, so a queued screenshot does not bloat the
 /// session file.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QueuedPromptEntry {
     /// Client-minted stable id, unchanged across edits. Doubles as the
     /// optimistic-echo reconcile key on the client.
     pub id: String,
     /// Server-assigned monotonic order; the queue drains by ascending `seq`.
+    // A JSON number on the wire; ts-rs maps u64 to `bigint`, which
+    // `JSON.parse` never produces.
+    #[cfg_attr(test, ts(type = "number"))]
     pub seq: u64,
     pub text: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -520,6 +532,8 @@ pub struct QueuedPromptEntry {
 /// or mid-attach. Deliberately not persisted to the structured view event log:
 /// daemon lifecycle is ephemeral, transcript replay should not carry
 /// it. See #1088.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AcpWorkerState {
@@ -536,6 +550,8 @@ pub enum AcpWorkerState {
     Stopping,
 }
 
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextResumeUnavailableReason {
@@ -549,6 +565,8 @@ pub enum ContextResumeUnavailableReason {
     NoTarget,
 }
 
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextResumeIndeterminateReason {
@@ -558,6 +576,8 @@ pub enum ContextResumeIndeterminateReason {
 
 /// Whether the daemon can preserve agent context during a future authorized
 /// lifecycle transition. This is not current start eligibility.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum ContextResumeAvailability {
@@ -575,6 +595,8 @@ pub enum ContextResumeAvailability {
 /// resolver and shows `tool_name` / `target` / `destructive` so the user
 /// sees what they are answering without entering the structured view. No
 /// dashboard surface renders this; the web client ignores the field.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct PendingApproval {
     pub nonce: String,
@@ -591,6 +613,8 @@ pub struct PendingApproval {
 }
 
 /// One session from the daemon. Only `id` is required when decoding.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionResponse {
     pub id: String,
@@ -616,6 +640,9 @@ pub struct SessionResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifecycle_reservation: Option<crate::session::LifecycleReservation>,
     #[serde(default)]
+    // A JSON number on the wire; ts-rs maps u64 to `bigint`, which
+    // `JSON.parse` never produces.
+    #[cfg_attr(test, ts(type = "number"))]
     pub lifecycle_generation: u64,
     /// True when the session's structured-view worker was auto-stopped for
     /// inactivity (resumable/dormant), as opposed to a deliberate Stop. Lets
@@ -932,6 +959,8 @@ pub struct SessionResponse {
     pub monitor_description: Option<String>,
 }
 
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct PlanSummary {
     /// First non-completed step's title, truncated to ~80 chars so the
@@ -943,6 +972,8 @@ pub struct PlanSummary {
     pub total: u32,
 }
 
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkspaceRepoSummary {
     pub name: String,
@@ -962,6 +993,8 @@ pub struct WorkspaceRepoSummary {
     pub base_branch_override: Option<String>,
 }
 
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct CleanupDefaults {
     pub delete_worktree: bool,
@@ -1012,6 +1045,37 @@ mod tests {
         assert_eq!(row.context_resume, None);
 
         assert!(serde_json::from_str::<SessionResponse>(r#"{"title":"no id"}"#).is_err());
+    }
+
+    /// The generated `web/src/lib/apiWire.ts` pins the field *names*: a rename
+    /// shows up there as a committed diff. What it cannot pin is the spelling
+    /// of a value, which is what an external `curl` consumer and this
+    /// project's own hooks match on, so those are pinned here.
+    #[test]
+    fn the_rest_row_spells_its_enums_the_way_older_clients_match_on() {
+        let row: SessionResponse = serde_json::from_str(
+            r#"{"id":"a","status":"Running","view":"structured",
+                "acp_worker_state":"resuming","smart_rename":"pending"}"#,
+        )
+        .unwrap();
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(json["status"], "Running");
+        assert_eq!(json["view"], "structured");
+        assert_eq!(json["acp_worker_state"], "resuming");
+        assert_eq!(json["smart_rename"], "pending");
+
+        // Two nested objects the dashboard reads through rather than flattened
+        // onto the row, where a field could collide with one of the row's own.
+        assert!(json["cleanup_defaults"].is_object());
+        assert_eq!(json["cleanup_defaults"]["delete_to_trash"], false);
+
+        let resuming: SessionResponse = serde_json::from_str(
+            r#"{"id":"a","context_resume":{"state":"unavailable","reason":"agent_unsupported"}}"#,
+        )
+        .unwrap();
+        let json = serde_json::to_value(&resuming).unwrap();
+        assert_eq!(json["context_resume"]["state"], "unavailable");
+        assert_eq!(json["context_resume"]["reason"], "agent_unsupported");
     }
 
     #[test]

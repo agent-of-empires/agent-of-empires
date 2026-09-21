@@ -16,6 +16,8 @@ use super::*;
 /// A crashed owner loses both the flock and, after the TTL, its reservation.
 /// Recovery may then acquire a newer generation; exact-generation commits
 /// ensure a late result can never mutate or clear that replacement.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum LifecycleOperation {
@@ -58,9 +60,14 @@ impl std::fmt::Display for LifecycleReservationError {
 
 impl std::error::Error for LifecycleReservationError {}
 
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LifecycleReservation {
     pub op: LifecycleOperation,
+    // A JSON number on the wire; ts-rs maps u64 to `bigint`, which
+    // `JSON.parse` never produces.
+    #[cfg_attr(test, ts(type = "number"))]
     pub generation: u64,
     pub at: DateTime<Utc>,
 }

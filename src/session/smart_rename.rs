@@ -30,6 +30,8 @@ pub const MAX_CONCURRENT: usize = 2;
 /// Per-session smart-rename state surfaced to the dashboard so the sidebar can
 /// show that a session will be (or is being) auto-named. `Inactive` for
 /// sessions that are not eligible or already renamed.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SmartRenameState {
