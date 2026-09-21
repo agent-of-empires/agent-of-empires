@@ -33,7 +33,6 @@ import {
   ScrollText,
   Sparkles,
   SquareTerminal,
-  Trash,
   Trash2,
   X,
 } from "lucide-react";
@@ -726,7 +725,7 @@ function TrashMenu({
                     aria-label="Empty Trash"
                     className="inline-flex h-7 items-center gap-1.5 rounded-md border border-status-error/30 bg-status-error/10 px-2.5 text-[12px] font-medium text-status-error/85 hover:border-status-error/50 hover:bg-status-error/15 hover:text-status-error cursor-pointer transition-colors"
                   >
-                    <Trash className="h-3.5 w-3.5 shrink-0" />
+                    <Trash2 className="h-3.5 w-3.5 shrink-0" />
                     Empty Trash
                   </button>
                 )}
