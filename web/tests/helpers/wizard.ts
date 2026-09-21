@@ -75,6 +75,8 @@ export interface WizardMockOptions {
 /** Mock every API the dashboard and wizard read. Returns the create-session POST bodies in order. */
 export async function mockWizardApis(page: Page, opts: WizardMockOptions = {}) {
   const created: Record<string, unknown>[] = [];
+  const projects =
+    opts.projects ?? (opts.sessions === undefined ? [{ name: "example", path: "/tmp/example", scope: "global" }] : []);
   await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   for (const path of ["themes", "groups", "devices"])
     await page.route(`**/api/${path}`, (r) => r.fulfill({ json: [] }));
@@ -84,9 +86,11 @@ export async function mockWizardApis(page: Page, opts: WizardMockOptions = {}) {
     const profile = new URL(r.request().url()).searchParams.get("profile");
     return r.fulfill({ json: (profile && opts.profileSettings?.[profile]) || opts.settings || {} });
   });
-  await page.route("**/api/profiles", (r) => r.fulfill({ json: opts.profiles ?? [] }));
+  await page.route("**/api/profiles", (r) =>
+    r.fulfill({ json: opts.profiles ?? [{ name: "default", is_default: true }] }),
+  );
   await page.route("**/api/recent-projects", (r) => r.fulfill({ json: { projects: [] } }));
-  await page.route("**/api/projects**", (r) => r.fulfill({ json: opts.projects ?? [] }));
+  await page.route("**/api/projects**", (r) => r.fulfill({ json: projects }));
   await page.route("**/api/docker/status", (r) =>
     r.fulfill({ json: { available: !!opts.docker, runtime: opts.docker ? "docker" : null } }),
   );

@@ -207,12 +207,12 @@ test.describe("passphrase mode", () => {
     expect((await getJson(settingsUrl, servePreauthed))?.theme?.name).toBe("dracula");
   });
 
-  test("sandbox image change requires elevation for remote callers, not loopback", async ({ servePreauthed, page }) => {
-    const profile = await defaultProfile(servePreauthed);
-    await bootDashboard(page, servePreauthed);
-    // From the page, so the SPA's interceptor sees a 403 and opens the prompt. A TEST-NET-3
-    // X-Forwarded-For from a loopback socket resolves as a remote caller.
-    const patchImage = (image: string, xff?: string) =>
+  test("sandbox image change requires elevation for remote callers, not loopback", async ({
+    servePreauthed,
+    spawnServe,
+    page,
+  }) => {
+    const patchImage = (profile: string, image: string, xff?: string) =>
       page.evaluate(
         async ({ profile, image, xff }) =>
           (
@@ -224,24 +224,33 @@ test.describe("passphrase mode", () => {
           ).status,
         { profile, image, xff },
       );
-    const savedImage = async () =>
-      (await getJson(`${servePreauthed.baseUrl}/api/profiles/${encodeURIComponent(profile)}/settings`, servePreauthed))
-        ?.sandbox?.default_image;
 
-    // #2610: loopback is trusted and must not loop the prompt.
-    expect(await patchImage("ghcr.io/example/img:local-trusted")).toBe(200);
+    const localProfile = await defaultProfile(servePreauthed);
+    await bootDashboard(page, servePreauthed);
+    expect(await patchImage(localProfile, "ghcr.io/example/img:local-trusted")).toBe(200);
     await expect(confirmPassphraseDialog(page)).toHaveCount(0);
 
-    expect(await patchImage("ghcr.io/example/img:tampered", "203.0.113.10")).toBe(403);
+    const proxied = await spawnServe({
+      authMode: "passphrase",
+      preloginViaHarness: true,
+      extraArgs: ["--behind-proxy", "--allowed-host", "127.0.0.1"],
+    });
+    const proxiedProfile = await defaultProfile(proxied);
+    await bootDashboard(page, proxied);
+    const savedImage = async () =>
+      (await getJson(`${proxied.baseUrl}/api/profiles/${encodeURIComponent(proxiedProfile)}/settings`, proxied))
+        ?.sandbox?.default_image;
+
+    // The SPA sees the remote caller's 403 and opens the elevation prompt.
+    expect(await patchImage(proxiedProfile, "ghcr.io/example/img:tampered", "203.0.113.10")).toBe(403);
     const dialog = confirmPassphraseDialog(page);
     await expect(dialog).toBeVisible({ timeout: 5_000 });
     expect((await savedImage()) ?? "").not.toBe("ghcr.io/example/img:tampered");
 
-    // Elevation is per session, so the remote retry succeeds.
-    await dialog.locator('input[type="password"]').fill(servePreauthed.passphrase!);
+    await dialog.locator('input[type="password"]').fill(proxied.passphrase!);
     await dialog.getByRole("button", { name: /Confirm/i }).click();
     await expect(dialog).toHaveCount(0, { timeout: 5_000 });
-    expect(await patchImage("ghcr.io/example/img:elevated", "203.0.113.10")).toBe(200);
+    expect(await patchImage(proxiedProfile, "ghcr.io/example/img:elevated", "203.0.113.10")).toBe(200);
     expect(await savedImage()).toBe("ghcr.io/example/img:elevated");
   });
 });

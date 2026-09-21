@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
+use serde_json::Value;
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
@@ -205,6 +206,87 @@ pub fn wait_for_port(port: u16, timeout: Duration) -> bool {
         std::thread::sleep(Duration::from_millis(100));
     }
     false
+}
+
+/// Poll `probe` until it returns `Ok`; panic with its last error at the deadline.
+pub fn wait_until<T>(
+    timeout: Duration,
+    interval: Duration,
+    mut probe: impl FnMut() -> Result<T, String>,
+) -> T {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let last = match probe() {
+            Ok(value) => return value,
+            Err(last) => last,
+        };
+        if Instant::now() >= deadline {
+            panic!("timed out after {timeout:?}: {last}");
+        }
+        std::thread::sleep(interval);
+    }
+}
+
+pub fn write_executable(path: &Path, content: &str) {
+    std::fs::write(path, content).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .unwrap_or_else(|e| panic!("chmod {}: {e}", path.display()));
+    }
+}
+
+/// Create a git repo with one empty commit on `main`, isolated from user git config.
+pub fn init_git_repo(path: &Path) {
+    std::fs::create_dir_all(path).expect("create repo dir");
+    for args in [
+        &["init", "-q", "-b", "main"][..],
+        &["commit", "--allow-empty", "-q", "-m", "init"],
+    ] {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test.com")
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+pub fn session_by_title<'a>(sessions: &'a Value, title: &str) -> &'a Value {
+    sessions
+        .as_array()
+        .and_then(|arr| arr.iter().find(|s| s["title"].as_str() == Some(title)))
+        .unwrap_or_else(|| panic!("no session titled '{title}' in sessions.json"))
+}
+
+pub fn agent_session_id_of(sessions: &Value, instance_id: &str) -> Option<String> {
+    sessions
+        .as_array()?
+        .iter()
+        .find(|r| r["id"].as_str() == Some(instance_id))?
+        .get("agent_session_id")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// Parse the `ID: <id>` line `aoe add` prints on success.
+pub fn parse_session_id(add_stdout: &str) -> String {
+    add_stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("ID:"))
+        .map(|rest| rest.trim().to_string())
+        .unwrap_or_else(|| panic!("could not find session ID in `aoe add` output:\n{add_stdout}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1237,13 +1319,153 @@ last_seen_version = "{}"
         }
     }
 
-    /// Tear down the whole tmux server on this test's private socket. Unlike
-    /// `kill-session -t <name>`, this also reaps every extra session the test
-    /// spawned on the same socket (tool, terminal, container-terminal, and
-    /// pre-created agent sessions), so no session and no server process, plus
-    /// the child agents/`sleep`s they hold, leak past the test. The socket is
-    /// unique per test (`home_dir/tmux.sock`), so this can never touch another
-    /// test's server. Best-effort: a missing server is not an error.
+    /// `new_in_tmp` with the fake ACP agent running `script`.
+    #[cfg(unix)]
+    pub fn new_acp(test_name: &str, script: &str) -> Self {
+        let mut harness = Self::new_in_tmp(test_name);
+        let script_path = harness.home_path().join("fake-acp-script.json");
+        std::fs::write(&script_path, script).expect("write fake-acp script");
+        harness.install_acp_shim(&script_path);
+        harness.stop_daemon_on_drop();
+        harness
+    }
+
+    /// `tmux -S <harness socket>`.
+    pub fn tmux(&self) -> Command {
+        let mut command = Command::new("tmux");
+        command.arg("-S").arg(&self.socket_path);
+        command
+    }
+
+    fn tmux_ok(&self, args: &[&str], what: &str) {
+        let output = self.tmux().args(args).output().expect(what);
+        assert!(
+            output.status.success(),
+            "{what} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    pub fn tmux_has_session(&self, name: &str) -> bool {
+        self.tmux()
+            .args(["has-session", "-t", name])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    pub fn tmux_kill_session(&self, name: &str) {
+        let _ = self.tmux().args(["kill-session", "-t", name]).output();
+    }
+
+    /// Send a key without the input barrier used by ordinary TUI interactions.
+    pub fn send_keys_unfenced(&self, keys: &str) {
+        assert!(self.spawned, "must call spawn_tui() or spawn() first");
+        self.tmux_ok(&["send-keys", "-t", &self.session_name, keys], "send-keys");
+    }
+
+    /// Start `aoe serve --daemon --no-auth` on a free port and wait for it to bind.
+    pub fn start_daemon(&self) -> u16 {
+        self.start_daemon_with(&["--no-auth"])
+    }
+
+    pub fn start_daemon_with(&self, args: &[&str]) -> u16 {
+        let port = pick_free_port();
+        let port_string = port.to_string();
+        self.run_cli_ok(&[&["serve", "--daemon", "--port", &port_string], args].concat());
+        assert!(
+            wait_for_port(port, Duration::from_secs(10)),
+            "daemon never bound port {port}"
+        );
+        port
+    }
+
+    /// Run `aoe add <args>` and return the new session id.
+    pub fn add_session(&self, args: &[&str]) -> String {
+        parse_session_id(&self.run_cli_ok(&[&["add"], args].concat()))
+    }
+
+    pub fn start_structured_session(&self, title: &str) -> (u16, String) {
+        let project = self.project_path();
+        init_git_repo(&project);
+        let port = self.start_daemon();
+        let id = self.add_session(&[
+            project.to_str().unwrap(),
+            "-t",
+            title,
+            "-c",
+            "claude",
+            "--structured-view",
+        ]);
+        (port, id)
+    }
+
+    /// Retry `aoe acp prompt` while the worker starts and handshakes.
+    pub fn prompt_until_accepted(&self, session_id: &str, text: &str, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let output = self.run_cli(&["acp", "prompt", session_id, text]);
+            if output.status.success() {
+                return;
+            }
+            if Instant::now() >= deadline {
+                let processes = self.run_cli(&["ps", "--acp", "--dead", "--json"]);
+                panic!(
+                    "structured view worker never accepted a prompt within {timeout:?}.\n\
+                     last prompt stdout: {}\n last prompt stderr: {}\n ps --acp: {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                    String::from_utf8_lossy(&processes.stdout),
+                );
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+
+    pub fn append_config(&self, toml: &str) {
+        let path = app_dir_in(self.home_path()).join("config.toml");
+        let seeded = std::fs::read_to_string(&path).expect("read seeded config");
+        std::fs::write(&path, format!("{seeded}\n{toml}\n")).expect("write config.toml");
+    }
+
+    pub fn sessions_path(&self) -> PathBuf {
+        app_dir_in(self.home_path()).join("profiles/default/sessions.json")
+    }
+
+    pub fn read_sessions(&self) -> Value {
+        let path = self.sessions_path();
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        serde_json::from_str(&content).expect("invalid sessions JSON")
+    }
+
+    pub fn try_read_sessions(&self) -> Value {
+        let content = std::fs::read_to_string(self.sessions_path()).unwrap_or_default();
+        serde_json::from_str(&content).unwrap_or(Value::Null)
+    }
+
+    pub fn run_cli_ok(&self, args: &[&str]) -> String {
+        let output = self.run_cli(args);
+        assert!(
+            output.status.success(),
+            "aoe {args:?} failed.\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    pub fn run_cli_err(&self, args: &[&str]) -> String {
+        let output = self.run_cli(args);
+        assert!(
+            !output.status.success(),
+            "aoe {args:?} unexpectedly succeeded.\nstdout: {}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    }
+
+    /// Tear down every session on this test's private tmux socket.
     fn kill_server(&self) {
         let _ = Command::new("tmux")
             .arg("-S")
