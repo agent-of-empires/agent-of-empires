@@ -256,7 +256,7 @@ pub struct Instance {
     /// Retired native contexts and their transaction-owned fresh-start notices.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) sandbox_content_resets:
-        Vec<crate::migrations::v030_isolate_sandbox_content::SandboxContentReset>,
+        Vec<crate::migrations::v031_isolate_sandbox_content::SandboxContentReset>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_info: Option<TerminalInfo>,

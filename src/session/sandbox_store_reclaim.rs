@@ -32,7 +32,7 @@
 //!   Widening that name filter would break the guarantee.
 
 use crate::migrations::v027_isolate_sandbox_stores as v027;
-use crate::migrations::v030_isolate_sandbox_content as content;
+use crate::migrations::v031_isolate_sandbox_content as content;
 use crate::session::anchored_fs::AnchoredDir;
 use anyhow::{bail, Context, Result};
 use serde_json::Value;

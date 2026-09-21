@@ -105,6 +105,13 @@ enum WorkerKind {
     Stdio,
 }
 
+#[derive(Clone)]
+pub(super) struct PendingContextReset {
+    pub(super) profile: String,
+    pub(super) reason: String,
+    pub(super) transactions: Vec<String>,
+}
+
 struct WorkerHandle {
     client: Arc<AcpClient>,
     drain_task: JoinHandle<()>,

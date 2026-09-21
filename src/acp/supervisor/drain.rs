@@ -16,8 +16,9 @@ use super::launch::{
 };
 use super::teardown::{settle_lease, tear_down_replacement, tear_down_runner, wait_for_exit};
 use super::{
-    lock_recover, next_seq, BroadcastSink, Launcher, ResumeReservation, SeqMap, SharedSet,
-    Supervisor, WorkerKind, Workers, MAX_RESPAWNS_IN_WINDOW, RESPAWN_BACKOFF, RESTART_WINDOW,
+    lock_recover, next_seq, BroadcastSink, Launcher, PendingContextReset, ResumeReservation,
+    SeqMap, SharedSet, Supervisor, WorkerKind, Workers, MAX_RESPAWNS_IN_WINDOW, RESPAWN_BACKOFF,
+    RESTART_WINDOW,
 };
 use crate::acp::acp_client::{AcpError, SpawnConfig};
 use crate::acp::runner_lifecycle::{
@@ -32,6 +33,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         session_id: String,
         lease: Lease,
         inbound: mpsc::Receiver<Event>,
+        context_reset: Option<PendingContextReset>,
     ) -> JoinHandle<()> {
         let drain = Drain {
             session_id,
@@ -44,6 +46,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             launcher: Arc::clone(&self.launcher),
             notify: Arc::clone(&self.worker_notify),
             startup_failures: Arc::clone(&self.startup_failures),
+            context_reset,
         };
         crate::task_util::spawn_supervised(
             "supervisor.drain",
@@ -64,6 +67,7 @@ struct Drain<S> {
     launcher: Launcher,
     notify: Arc<tokio::sync::Notify>,
     startup_failures: SharedSet,
+    context_reset: Option<PendingContextReset>,
 }
 
 /// What a worker's event stream said before it closed.
@@ -95,7 +99,7 @@ impl<S: BroadcastSink> Drain<S> {
         self.sink.publish(&self.session_id, seq, &event);
     }
 
-    async fn run(self, mut lease: Lease, mut inbound: mpsc::Receiver<Event>) {
+    async fn run(mut self, mut lease: Lease, mut inbound: mpsc::Receiver<Event>) {
         loop {
             let end = self.pump(&mut inbound, lease.epoch()).await;
             warn!(
@@ -140,7 +144,7 @@ impl<S: BroadcastSink> Drain<S> {
     }
 
     /// Publish events until the worker's channel closes.
-    async fn pump(&self, inbound: &mut mpsc::Receiver<Event>, generation: u64) -> StreamEnd {
+    async fn pump(&mut self, inbound: &mut mpsc::Receiver<Event>, generation: u64) -> StreamEnd {
         let mut end = StreamEnd::default();
         let mut established = false;
         while let Some(event) = inbound.recv().await {
@@ -155,6 +159,57 @@ impl<S: BroadcastSink> Drain<S> {
                 },
                 Event::AgentStartupError { .. } if !established => end.startup_failed = true,
                 Event::AcpSessionAssigned { acp_session_id } => {
+                    if let Some(pending) = self.context_reset.take() {
+                        self.sink.publish_from_worker(
+                            &self.session_id,
+                            next_seq(&self.next_seqs, &self.session_id),
+                            &Event::SessionContextReset {
+                                reason: pending.reason,
+                            },
+                            generation,
+                        );
+                        let id = self.session_id.clone();
+                        let assigned = acp_session_id.clone();
+                        let acknowledged = tokio::task::spawn_blocking(move || {
+                            crate::migrations::v031_isolate_sandbox_content::acknowledge_context_reset(
+                                &pending.profile,
+                                &id,
+                                crate::migrations::v031_isolate_sandbox_content::NativeContextView::Structured,
+                                generation,
+                                &pending.transactions,
+                                Some(&assigned),
+                            )
+                        }).await;
+                        let failure = match acknowledged {
+                            Ok(Ok(())) => None,
+                            Ok(Err(error)) => Some(error.to_string()),
+                            Err(error) => Some(error.to_string()),
+                        };
+                        if let Some(error) = failure {
+                            end.startup_failed = true;
+                            self.sink.publish_from_worker(
+                                &self.session_id,
+                                next_seq(&self.next_seqs, &self.session_id),
+                                &Event::AgentStartupError {
+                                    message: format!(
+                                        "Could not commit the isolated native context: {error}"
+                                    ),
+                                },
+                                generation,
+                            );
+                            let client = self
+                                .workers
+                                .lock()
+                                .await
+                                .get(&self.session_id)
+                                .filter(|handle| handle.lease.epoch() == generation)
+                                .map(|handle| Arc::clone(&handle.client));
+                            if let Some(client) = client {
+                                let _ = client.shutdown().await;
+                            }
+                            continue;
+                        }
+                    }
                     established = true;
                     self.with_cached_config(|config| {
                         info!(
@@ -698,7 +753,7 @@ mod tests {
                 .test_install_handle(id, client, WorkerKind::Attached, None)
                 .await;
             let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(16);
-            let drain = sup.start_drain_task(id.into(), lease, inbound_rx);
+            let drain = sup.start_drain_task(id.into(), lease, inbound_rx, None);
             inbound_tx
                 .send(Event::AcpSessionAssigned {
                     acp_session_id: "acp-1".into(),
@@ -785,7 +840,7 @@ mod tests {
             .test_install_handle(id, client, WorkerKind::Attached, None)
             .await;
         let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(16);
-        let drain = sup.start_drain_task(id.into(), lease, inbound_rx);
+        let drain = sup.start_drain_task(id.into(), lease, inbound_rx, None);
         drop(inbound_tx);
         tokio::time::timeout(Duration::from_secs(5), drain)
             .await
@@ -832,7 +887,7 @@ mod tests {
             let sup = Supervisor::new(sink.clone());
             let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(16);
             let lease = sup.test_install_stdio(id).await;
-            let drain = sup.start_drain_task(id.into(), lease, inbound_rx);
+            let drain = sup.start_drain_task(id.into(), lease, inbound_rx, None);
             for event in &events {
                 inbound_tx.send(event.clone()).await.unwrap();
             }
@@ -907,7 +962,7 @@ mod tests {
             )
             .await;
         let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(4);
-        let drain = sup.start_drain_task("s-resp".into(), lease, inbound_rx);
+        let drain = sup.start_drain_task("s-resp".into(), lease, inbound_rx, None);
         drop(inbound_tx);
 
         gate.entered.notified().await;

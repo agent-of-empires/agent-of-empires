@@ -86,7 +86,7 @@ impl Instance {
     /// container launch first copies that store; see [`Self::move_sandbox_store`].
     pub fn sandbox_store_move_pending(&self) -> bool {
         self.is_sandboxed()
-            && !crate::migrations::v030_isolate_sandbox_content::instance_ready(self)
+            && !crate::migrations::v031_isolate_sandbox_content::instance_ready(self)
                 .unwrap_or(false)
     }
 
@@ -136,7 +136,7 @@ impl Instance {
         }
         self.warn_legacy_agent_config_mounts();
         let _transition_lock =
-            crate::migrations::v030_isolate_sandbox_content::admit_fresh_instance(self)?;
+            crate::migrations::v031_isolate_sandbox_content::admit_fresh_instance(self)?;
 
         // A container built for another agent mounts that agent's config.
         // Decide on the disk row and a resolved profile: a stale in-memory copy

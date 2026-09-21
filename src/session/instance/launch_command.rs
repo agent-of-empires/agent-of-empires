@@ -336,7 +336,7 @@ impl Instance {
     pub(super) fn prepare_launch_command(&mut self) -> Result<PreparedLaunch> {
         let sandbox_context_reset = match self.resolved_agent() {
             Some(agent) => {
-                crate::migrations::v030_isolate_sandbox_content::prepare_terminal_launch_context(
+                crate::migrations::v031_isolate_sandbox_content::prepare_terminal_launch_context(
                     self, agent.name,
                 )?
             }

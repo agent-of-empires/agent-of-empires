@@ -14,7 +14,7 @@ impl Instance {
     }
 
     pub(crate) fn try_retroactive_capture(&self) -> Option<String> {
-        if !crate::migrations::v030_isolate_sandbox_content::instance_ready(self).ok()? {
+        if !crate::migrations::v031_isolate_sandbox_content::instance_ready(self).ok()? {
             return None;
         }
         let (capture, context) = self.resolved_session_support()?;

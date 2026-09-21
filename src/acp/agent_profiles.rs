@@ -24,6 +24,8 @@ pub struct AgentProfile {
     /// ACP session-mode id that means "bypass all permission prompts"
     /// (the wizard's "Auto-approve" / profile `yolo_mode_default`).
     pub yolo_mode_id: Option<&'static str>,
+    /// Native agent whose on-disk configuration carries conversation state.
+    pub native_config_agent: Option<&'static str>,
 }
 
 impl AgentProfile {
@@ -84,6 +86,7 @@ pub const DEFAULT: AgentProfile = AgentProfile {
     supports_wakeup_tools: false,
     emits_heartbeat_keepalives: false,
     yolo_mode_id: None,
+    native_config_agent: None,
 };
 
 /// Claude via `claude-agent-acp`.
@@ -96,6 +99,7 @@ pub const CLAUDE: AgentProfile = AgentProfile {
     supports_wakeup_tools: true,
     emits_heartbeat_keepalives: true,
     yolo_mode_id: Some("bypassPermissions"),
+    native_config_agent: Some("claude"),
 };
 
 /// Legacy alias key carried by older session records (`agent_name="claude-code"`).
@@ -110,6 +114,7 @@ pub const CODEX: AgentProfile = AgentProfile {
     clear_aliases: &["/new"],
     clear_requires_driven_reset: true,
     yolo_mode_id: Some("agent-full-access"),
+    native_config_agent: Some("codex"),
     ..DEFAULT
 };
 
@@ -118,6 +123,7 @@ pub const CODEX: AgentProfile = AgentProfile {
 pub const OPENCODE: AgentProfile = AgentProfile {
     key: "opencode",
     clear_aliases: &["/new"],
+    native_config_agent: Some("opencode"),
     ..DEFAULT
 };
 
@@ -126,18 +132,21 @@ pub const OPENCODE: AgentProfile = AgentProfile {
 pub const GEMINI: AgentProfile = AgentProfile {
     key: "gemini",
     yolo_mode_id: Some("yolo"),
+    native_config_agent: Some("gemini"),
     ..DEFAULT
 };
 
 /// Mistral Vibe via bundled `vibe-acp`.
 pub const VIBE: AgentProfile = AgentProfile {
     key: "vibe",
+    native_config_agent: Some("vibe"),
     ..DEFAULT
 };
 
 /// Pi coding agent via `pi-acp`.
 pub const PI: AgentProfile = AgentProfile {
     key: "pi",
+    native_config_agent: Some("pi"),
     ..DEFAULT
 };
 
@@ -145,6 +154,7 @@ pub const PI: AgentProfile = AgentProfile {
 pub const OMP: AgentProfile = AgentProfile {
     key: "omp",
     clear_aliases: &["/new"],
+    native_config_agent: Some("omp"),
     ..DEFAULT
 };
 
@@ -153,12 +163,14 @@ pub const KIMI: AgentProfile = AgentProfile {
     key: "kimi",
     clear_aliases: &["/new"],
     yolo_mode_id: Some("yolo"),
+    native_config_agent: Some("kimi"),
     ..DEFAULT
 };
 
 /// PrimeIntellect Prime Agent via native `prime-agent --mode acp`.
 pub const PRIME_AGENT: AgentProfile = AgentProfile {
     key: "prime-agent",
+    native_config_agent: Some("prime-agent"),
     ..DEFAULT
 };
 

@@ -244,7 +244,7 @@ impl Instance {
         &mut self,
         omp_metadata: Option<OmpCaptureMetadata>,
     ) -> PollerStart {
-        if !crate::migrations::v030_isolate_sandbox_content::instance_ready(self).unwrap_or(false) {
+        if !crate::migrations::v031_isolate_sandbox_content::instance_ready(self).unwrap_or(false) {
             self.session_id_poller = None;
             return PollerStart::NotApplicable;
         }
@@ -664,10 +664,10 @@ mod tests {
     /// roots admission proves.
     fn admit_fixture_content(inst: &Instance) {
         let app = crate::session::get_app_dir().unwrap();
-        for root in crate::migrations::v030_isolate_sandbox_content::instance_roots(inst).unwrap() {
+        for root in crate::migrations::v031_isolate_sandbox_content::instance_roots(inst).unwrap() {
             std::fs::create_dir_all(&root.path).unwrap();
             let roles: Vec<&str> = root.roles.iter().map(String::as_str).collect();
-            crate::migrations::v030_isolate_sandbox_content::certify_test_content(
+            crate::migrations::v031_isolate_sandbox_content::certify_test_content(
                 &app, &inst.id, &root.path, &roles,
             )
             .unwrap();

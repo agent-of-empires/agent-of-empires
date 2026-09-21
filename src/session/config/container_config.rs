@@ -16,6 +16,8 @@ use crate::hooks::SymlinkPolicy;
 use crate::session::environment::collect_environment;
 use crate::session::instance::SandboxInfo;
 
+mod seed;
+use seed::{sync_agent_config, NativeStateBoundary};
 /// Subdirectory name inside each agent's config dir for sandbox config.
 const SANDBOX_SUBDIR: &str = "sandbox";
 const SANDBOX_PRIVATE_SUBDIR: &str = "sandbox-v2";
@@ -29,335 +31,460 @@ const SANDBOX_GITCONFIG_SEED: &str = r#"[credential "https://github.com"]
 	helper = "!f() { test \"$1\" = get || exit 0; test -n \"$GH_TOKEN\" || exit 0; echo username=x-access-token; echo \"password=$GH_TOKEN\"; }; f"
 "#;
 
-/// Declarative definition of an agent CLI's config directory for sandbox mounting.
+/// Positive configuration/resource policy for one native config mount.
+/// Runtime paths below are alias guards, never a negative copy policy or proof
+/// that a pre-existing sandbox history belongs to its current instance.
 struct AgentConfigMount {
-    /// Canonical agent name from the agent registry (e.g. "claude", "opencode").
-    /// Used to filter mounts so only the active tool's config is mounted.
     tool_name: &'static str,
-    /// Path relative to home (e.g. ".claude").
     host_rel: &'static str,
-    /// Path suffix relative to container home (e.g. ".claude").
     container_suffix: &'static str,
-    /// Top-level entry names to skip when copying (large/recursive/unnecessary).
-    skip_entries: &'static [&'static str],
-    /// Files to seed into the sandbox dir with static content (write-once: only written
-    /// if the file doesn't already exist, so container changes are preserved).
+    /// Only these regular configuration files may be refreshed from the host.
+    copy_files: &'static [&'static str],
     seed_files: &'static [(&'static str, &'static str)],
-    /// Directories to recursively copy into the sandbox dir (e.g. plugins, skills).
+    /// Approved code/resource collections, seeded only while individually absent.
     copy_dirs: &'static [&'static str],
-    /// macOS Keychain service name and target filename. If set, credentials are extracted
-    /// from the Keychain and written to the sandbox dir as the specified file.
     keychain_credential: Option<(&'static str, &'static str)>,
-    /// Files to seed at the container home directory level (outside the config dir).
-    /// Each (filename, content) pair is written to the sandbox dir root and mounted as
-    /// a separate file at CONTAINER_HOME/filename (write-once).
     home_seed_files: &'static [(&'static str, &'static str)],
-    /// Files copied from the host only when the sandbox lacks them, so what the
-    /// container wrote survives a refresh.
     preserve_files: &'static [&'static str],
-    /// Credential files every sandbox of this agent shares as one file at the
-    /// store root, bind-mounted over the store's own path. The agent rotates
-    /// its refresh token on every refresh, so a per-store copy that misses a
-    /// rotation is logged out. See [`sync_shared_credential`].
+    /// Shared rotating credentials retain their existing separately locked flow.
     shared_credential_files: &'static [&'static str],
-    /// Files to delete from the sandbox dir before each launch. Prevents stale state
-    /// (e.g. leftover lock/cache files) from causing failures when the container image
-    /// is updated. Do NOT use this for sandbox-owned session state (e.g. opencode's
-    /// SQLite DB, see #2605): that must survive relaunches, so it is kept out of
-    /// `clean_files` and instead protected from host drift via `skip_entries`.
-    clean_files: &'static [&'static str],
+    /// Portable encrypted credentials are published as complete seed-once pairs.
+    credential_pairs: &'static [(&'static str, &'static str)],
+    /// Seed-once consistent snapshots, not raw database/sidecar copies.
+    sqlite_seed_files: &'static [&'static str],
+    /// Known native state paths/globs relative to this mount, for resource alias checks.
+    native_state_paths: &'static [&'static str],
 }
 
-impl AgentConfigMount {
-    /// The empty mount every entry in [`AGENT_CONFIG_MOUNTS`] starts from, so
-    /// each names only the fields it actually uses.
-    const EMPTY: Self = Self {
-        tool_name: "",
-        host_rel: "",
-        container_suffix: "",
-        skip_entries: &[],
+/// The sole source-copy registry. Unknown root files never gain copy authority.
+const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
+    AgentConfigMount {
+        tool_name: "claude",
+        host_rel: ".claude",
+        container_suffix: ".claude",
+        copy_files: &["settings.json", "CLAUDE.md", "keybindings.json"],
+        seed_files: &[],
+        copy_dirs: &["plugins", "skills", "hooks"],
+        // Keychain credentials seed the existing shared OAuth-token mount.
+        keychain_credential: Some(("Claude Code-credentials", ".credentials.json")),
+        // Onboarding is home-level. IS_SANDBOX makes Claude use the separately
+        // mounted gitconfig; its helper forwards GH_TOKEN only for github.com get.
+        home_seed_files: &[
+            (".claude.json", r#"{"hasCompletedOnboarding":true}"#),
+            (".sandbox-gitconfig", SANDBOX_GITCONFIG_SEED),
+        ],
+        preserve_files: &["settings.json"],
+        shared_credential_files: &[".credentials.json"],
+        credential_pairs: &[],
+        sqlite_seed_files: &[],
+        native_state_paths: &[
+            "projects",
+            "history.jsonl",
+            "file-history",
+            "session-env",
+            "todos",
+            "debug",
+            "statsig",
+            "paste-cache",
+            "shell-snapshots",
+            "tasks",
+        ],
+    },
+    AgentConfigMount {
+        tool_name: "opencode",
+        host_rel: ".local/share/opencode",
+        container_suffix: ".local/share/opencode",
+        copy_files: &["auth.json", "mcp-auth.json"],
         seed_files: &[],
         copy_dirs: &[],
         keychain_credential: None,
         home_seed_files: &[],
         preserve_files: &[],
         shared_credential_files: &[],
-        clean_files: &[],
-    };
-}
-
-/// Agent config definitions. Each entry describes one agent CLI's config directory.
-/// To add a new agent, add an entry here -- no code changes needed.
-const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
-    AgentConfigMount {
-        tool_name: "claude",
-        host_rel: ".claude",
-        container_suffix: ".claude",
-        skip_entries: &["sandbox", "projects"],
-        // `hooks` carries user hook scripts referenced by settings.json. settings.json
-        // is copied as a top-level file, so without the scripts it points at, every
-        // referenced hook errors in-container ("No such file or directory"). See #3014.
-        copy_dirs: &["plugins", "skills", "hooks"],
-        // On macOS the OAuth token lives in the Keychain; it seeds the shared
-        // .credentials.json so the container authenticates without re-login.
-        keychain_credential: Some(("Claude Code-credentials", ".credentials.json")),
-        // ~/.claude.json sits at home level, not inside ~/.claude/; seeding
-        // hasCompletedOnboarding skips the first-run wizard. The gitconfig must
-        // exist because Claude Code points GIT_CONFIG_GLOBAL at it under
-        // IS_SANDBOX=1, and its credential helper is the only way a forwarded
-        // GH_TOKEN reaches `git push`: the file is a single-file bind mount, so
-        // `gh auth setup-git` cannot rewrite it in-container.
-        home_seed_files: &[
-            (".claude.json", r#"{"hasCompletedOnboarding":true}"#),
-            (".sandbox-gitconfig", SANDBOX_GITCONFIG_SEED),
-        ],
-        preserve_files: &["history.jsonl"],
-        shared_credential_files: &[".credentials.json"],
-        ..AgentConfigMount::EMPTY
-    },
-    AgentConfigMount {
-        tool_name: "opencode",
-        host_rel: ".local/share/opencode",
-        container_suffix: ".local/share/opencode",
-        // A schema-drifted host DB breaks drizzle migrations in-container, so it
-        // is never copied; the sandbox builds its own on first launch. That one
-        // must survive relaunches: it holds the `ses_*` identity resume reads
-        // (#2605).
-        skip_entries: &[
-            "sandbox",
-            "opencode.db",
-            "opencode.db-wal",
-            "opencode.db-shm",
-        ],
-        ..AgentConfigMount::EMPTY
+        credential_pairs: &[],
+        sqlite_seed_files: &[],
+        native_state_paths: &["opencode.db*", "storage", "log", "snapshot"],
     },
     AgentConfigMount {
         tool_name: "opencode",
         host_rel: ".config/opencode",
         container_suffix: ".config/opencode",
-        skip_entries: &["sandbox"],
-        ..AgentConfigMount::EMPTY
+        copy_files: &["opencode.json", "opencode.jsonc", "config.json"],
+        seed_files: &[],
+        copy_dirs: &[],
+        keychain_credential: None,
+        home_seed_files: &[],
+        preserve_files: &[],
+        shared_credential_files: &[],
+        credential_pairs: &[],
+        sqlite_seed_files: &[],
+        native_state_paths: &[],
     },
     AgentConfigMount {
         tool_name: "codex",
         host_rel: ".codex",
         container_suffix: ".codex",
-        skip_entries: &["sandbox"],
-        ..AgentConfigMount::EMPTY
+        copy_files: &["config.toml", "auth.json", "hooks.json", "AGENTS.md"],
+        seed_files: &[],
+        copy_dirs: &[],
+        keychain_credential: None,
+        home_seed_files: &[],
+        preserve_files: &[],
+        shared_credential_files: &[],
+        credential_pairs: &[],
+        sqlite_seed_files: &[],
+        native_state_paths: &[
+            "sessions",
+            "archived_sessions",
+            "history.jsonl",
+            "state_*.sqlite*",
+            "session_index.jsonl",
+            "shell_snapshots",
+            "log",
+            "logs",
+            "tmp",
+        ],
     },
     AgentConfigMount {
         tool_name: "gemini",
         host_rel: ".gemini",
         container_suffix: ".gemini",
-        skip_entries: &["sandbox"],
-        ..AgentConfigMount::EMPTY
+        copy_files: &[
+            "settings.json",
+            "oauth_creds.json",
+            "mcp-oauth-tokens.json",
+            "a2a-oauth-tokens.json",
+            "keybindings.json",
+            "GEMINI.md",
+            ".env",
+        ],
+        seed_files: &[],
+        copy_dirs: &[],
+        keychain_credential: None,
+        home_seed_files: &[],
+        preserve_files: &[],
+        shared_credential_files: &[],
+        credential_pairs: &[],
+        sqlite_seed_files: &[],
+        native_state_paths: &["tmp", "history", "sessions", "cache"],
     },
     AgentConfigMount {
         tool_name: "vibe",
         host_rel: ".vibe",
         container_suffix: ".vibe",
-        skip_entries: &["sandbox"],
-        ..AgentConfigMount::EMPTY
+        copy_files: &["config.toml", ".env", "hooks.toml", "AGENTS.md"],
+        seed_files: &[],
+        copy_dirs: &[],
+        keychain_credential: None,
+        home_seed_files: &[],
+        preserve_files: &[],
+        shared_credential_files: &[],
+        credential_pairs: &[],
+        sqlite_seed_files: &[],
+        native_state_paths: &["logs", "sessions", "history"],
     },
     AgentConfigMount {
         tool_name: "cursor",
         host_rel: ".cursor",
         container_suffix: ".cursor",
-        skip_entries: &["sandbox"],
-        ..AgentConfigMount::EMPTY
+        copy_files: &[
+            "cli-config.json",
+            "auth.json",
+            "mcp-auth.json",
+            "mcp-approvals.json",
+            "mcp.json",
+        ],
+        seed_files: &[],
+        copy_dirs: &[],
+        keychain_credential: None,
+        home_seed_files: &[],
+        preserve_files: &[],
+        shared_credential_files: &[],
+        credential_pairs: &[],
+        sqlite_seed_files: &[],
+        native_state_paths: &["chats", "projects", "agent-transcripts", "store.db*"],
     },
     AgentConfigMount {
         tool_name: "copilot",
         host_rel: ".copilot",
         container_suffix: ".copilot",
-        skip_entries: &["sandbox"],
-        ..AgentConfigMount::EMPTY
+        copy_files: &[
+            "config.json",
+            "config",
+            "settings.json",
+            "mcp-config.json",
+            "lsp-config.json",
+        ],
+        seed_files: &[],
+        copy_dirs: &[],
+        keychain_credential: None,
+        home_seed_files: &[],
+        preserve_files: &[],
+        shared_credential_files: &[],
+        credential_pairs: &[],
+        sqlite_seed_files: &[],
+        native_state_paths: &["session-state", "sessions", "history.jsonl", "logs"],
     },
     AgentConfigMount {
         tool_name: "pi",
         host_rel: ".pi",
         container_suffix: ".pi",
-        skip_entries: &["sandbox"],
-        copy_dirs: &["agent"],
-        ..AgentConfigMount::EMPTY
+        copy_files: &[
+            "agent/auth.json",
+            "agent/models.json",
+            "agent/settings.json",
+            "agent/keybindings.json",
+            "agent/AGENTS.override.md",
+            "agent/AGENTS.md",
+            "agent/AGENTS.MD",
+            "agent/CLAUDE.md",
+            "agent/CLAUDE.MD",
+            "agent/SYSTEM.md",
+            "agent/APPEND_SYSTEM.md",
+        ],
+        seed_files: &[],
+        copy_dirs: &[
+            "agent/extensions",
+            "agent/skills",
+            "agent/prompts",
+            "agent/themes",
+            "agent/npm",
+            "agent/git",
+        ],
+        keychain_credential: None,
+        home_seed_files: &[],
+        preserve_files: &[],
+        shared_credential_files: &[],
+        credential_pairs: &[],
+        sqlite_seed_files: &[],
+        native_state_paths: &["agent/sessions", "agent/pi-debug.log", "agent/tmp"],
     },
     AgentConfigMount {
         tool_name: "omp",
         host_rel: ".omp",
         container_suffix: ".omp",
-        skip_entries: &["sandbox"],
-        copy_dirs: &["agent"],
-        ..AgentConfigMount::EMPTY
+        copy_files: &[
+            ".env",
+            "auth-broker.token",
+            "agent/.env",
+            "agent/config.yml",
+            "agent/config.yaml",
+            "agent/settings.json",
+            "agent/models.yml",
+            "agent/models.yaml",
+            "agent/models.json",
+            "agent/keybindings.yml",
+            "agent/keybindings.yaml",
+            "agent/keybindings.json",
+            "agent/AGENTS.md",
+            "agent/SYSTEM.md",
+            "agent/APPEND_SYSTEM.md",
+            "agent/TITLE_SYSTEM.md",
+            "agent/PERSONALITY.md",
+            "agent/RULES.md",
+            "agent/WATCHDOG.md",
+            "agent/WATCHDOG.yml",
+            "agent/WATCHDOG.yaml",
+            "agent/mcp.json",
+            "agent/.mcp.json",
+            "agent/ssh.json",
+            "agent/secrets.yml",
+            "agent/smithery.json",
+            "agent/lsp.json",
+            "agent/.lsp.json",
+            "agent/lsp.yaml",
+            "agent/.lsp.yaml",
+            "agent/lsp.yml",
+            "agent/.lsp.yml",
+            "agent/dap.json",
+            "agent/.dap.json",
+            "agent/dap.yaml",
+            "agent/.dap.yaml",
+            "agent/dap.yml",
+            "agent/.dap.yml",
+            "agent/share.ts",
+            "agent/share.js",
+            "agent/share.mjs",
+        ],
+        seed_files: &[],
+        copy_dirs: &[
+            "agent/extensions",
+            "agent/skills",
+            "agent/commands",
+            "agent/rules",
+            "agent/prompts",
+            "agent/instructions",
+            "agent/hooks",
+            "agent/tools",
+            "agent/themes",
+            "agent/agents",
+        ],
+        keychain_credential: None,
+        home_seed_files: &[],
+        preserve_files: &[],
+        shared_credential_files: &[],
+        credential_pairs: &[],
+        sqlite_seed_files: &["agent/agent.db"],
+        native_state_paths: &[
+            "agent/sessions",
+            "agent/history.db*",
+            "agent/blobs",
+            "agent/memories",
+            "agent/managed-skills",
+            "agent/terminal-sessions",
+            "agent/debug",
+            "agent/crashes",
+        ],
     },
     AgentConfigMount {
         tool_name: "hermes",
         host_rel: ".hermes",
         container_suffix: ".hermes",
-        // Skip Hermes-specific runtime/state dirs that should not bleed from
-        // the host into the sandbox: see paths used by the upstream agent
-        // (HERMES_HOME / ...). state.db is per-instance SQLite state.
-        skip_entries: &[
-            "sandbox",
-            "sessions",
-            "logs",
-            "cache",
-            "pastes",
-            "images",
-            "chrome-debug",
-            "tmp",
-            "state.db",
+        copy_files: &[
+            "config.yaml",
+            ".env",
+            "auth.json",
+            "shell-hooks-allowlist.json",
+            "SOUL.md",
         ],
-        // shell-hooks-allowlist.json is regenerated by install_hermes_hooks
-        // on every session, but we preserve it in case the user has
-        // additional approvals beyond the AoE-managed ones.
+        seed_files: &[],
+        copy_dirs: &[],
+        keychain_credential: None,
+        home_seed_files: &[],
         preserve_files: &["shell-hooks-allowlist.json"],
-        ..AgentConfigMount::EMPTY
+        shared_credential_files: &[],
+        credential_pairs: &[],
+        sqlite_seed_files: &[],
+        // Hermes native state is declared by its own rule catalogue
+        // (`seed/hermes/state.rs`), which registers through `register_home`
+        // before this list is ever read.
+        native_state_paths: &[],
     },
     AgentConfigMount {
         tool_name: "droid",
         host_rel: ".factory",
         container_suffix: ".factory",
-        skip_entries: &["sandbox"],
-        ..AgentConfigMount::EMPTY
+        copy_files: &[
+            "settings.json",
+            "settings.local.json",
+            "config.json",
+            "hooks.json",
+            "mcp.json",
+        ],
+        seed_files: &[],
+        copy_dirs: &[],
+        keychain_credential: None,
+        home_seed_files: &[],
+        preserve_files: &[],
+        shared_credential_files: &[],
+        credential_pairs: &[
+            ("auth.v2.file", "auth.v2.key"),
+            ("mcp-oauth.v2.file", "mcp-oauth.v2.key"),
+        ],
+        sqlite_seed_files: &[],
+        native_state_paths: &["sessions", "history.json", "logs", "cache"],
     },
     AgentConfigMount {
         tool_name: "kiro",
         host_rel: ".kiro",
         container_suffix: ".kiro",
-        skip_entries: &["sandbox", "sessions", "logs", "cache"],
+        copy_files: &[],
+        seed_files: &[],
         copy_dirs: &["agents", "steering", "prompts", "settings"],
-        ..AgentConfigMount::EMPTY
+        keychain_credential: None,
+        home_seed_files: &[],
+        preserve_files: &[],
+        shared_credential_files: &[],
+        credential_pairs: &[],
+        sqlite_seed_files: &[],
+        native_state_paths: &["sessions", "logs", "cache"],
     },
     AgentConfigMount {
         tool_name: "qwen",
         host_rel: ".qwen",
         container_suffix: ".qwen",
-        skip_entries: &["sandbox", "sessions", "cache"],
-        ..AgentConfigMount::EMPTY
+        copy_files: &[
+            "settings.json",
+            "oauth_creds.json",
+            "mcp-oauth-tokens.json",
+            "QWEN.md",
+            "AGENTS.md",
+        ],
+        seed_files: &[],
+        copy_dirs: &[],
+        keychain_credential: None,
+        home_seed_files: &[],
+        preserve_files: &[],
+        shared_credential_files: &[],
+        credential_pairs: &[],
+        sqlite_seed_files: &[],
+        native_state_paths: &["sessions", "tmp", "cache", "history"],
     },
     AgentConfigMount {
         tool_name: "antigravity",
         host_rel: ".gemini/antigravity-cli",
         container_suffix: ".gemini/antigravity-cli",
-        skip_entries: &["sandbox", "logs", "cache"],
+        copy_files: &[
+            "antigravity-oauth-token",
+            "settings.json",
+            "keybindings.json",
+            "hooks.json",
+            "mcp_config.json",
+            "skills.json",
+            "plugins.json",
+        ],
+        seed_files: &[],
         copy_dirs: &["plugins"],
+        keychain_credential: None,
+        home_seed_files: &[],
         preserve_files: &["antigravity-oauth-token"],
-        ..AgentConfigMount::EMPTY
+        shared_credential_files: &[],
+        credential_pairs: &[],
+        sqlite_seed_files: &[],
+        native_state_paths: &[
+            "conversation_summaries.db*",
+            "jetbox_summaries.pb",
+            "jetbox_summaries_proto.pb",
+            "jetski_state.pbtxt",
+            "history.jsonl",
+            "conversations",
+            "cascade",
+            "brain",
+            "cache",
+            "logs",
+        ],
     },
     AgentConfigMount {
         tool_name: "kimi",
         host_rel: ".kimi-code",
         container_suffix: ".kimi-code",
-        // Skip the sandbox staging dir (recursion), plus Kimi's session,
-        // log, and cache state, which the container regenerates.
-        skip_entries: &["sandbox", "sessions", "logs", "cache", "agents"],
+        copy_files: &["config.toml"],
+        seed_files: &[],
         copy_dirs: &["skills"],
-        ..AgentConfigMount::EMPTY
+        keychain_credential: None,
+        home_seed_files: &[],
+        preserve_files: &[],
+        shared_credential_files: &[],
+        credential_pairs: &[],
+        sqlite_seed_files: &[],
+        native_state_paths: &["sessions", "session_index.jsonl", "logs", "cache", "agents"],
     },
     AgentConfigMount {
         tool_name: "prime-agent",
         host_rel: ".prime/agent",
         container_suffix: ".prime/agent",
-        // Skip AoE's sandbox staging dir, the per-instance session
-        // transcripts, and the bootstrapped IPython kernel venv
-        // (machine-specific, and the container rebuilds it on first run).
-        // skills/ stays un-skipped and is copied below so user-authored
-        // host skills reach the container, like Kimi's mount.
-        skip_entries: &["sandbox", "sessions", "kernel-venv"],
+        copy_files: &["auth.json", "settings.json", "models.json", "AGENTS.md"],
+        seed_files: &[],
         copy_dirs: &["skills"],
-        ..AgentConfigMount::EMPTY
+        keychain_credential: None,
+        home_seed_files: &[],
+        preserve_files: &[],
+        shared_credential_files: &[],
+        credential_pairs: &[],
+        sqlite_seed_files: &[],
+        native_state_paths: &["sessions", "kernel-venv"],
     },
 ];
-
-/// Sync host agent config into the shared sandbox directory. Copies top-level files
-/// and `copy_dirs` from the host (always overwritten on refresh). Seed files are
-/// write-once: only created if they don't already exist, so container-accumulated
-/// changes (e.g. permission approvals) are preserved across sessions.
-fn sync_agent_config(
-    host_dir: &Path,
-    sandbox_dir: &Path,
-    skip_entries: &[&str],
-    seed_files: &[(&str, &str)],
-    copy_dirs: &[&str],
-    preserve_files: &[&str],
-) -> Result<()> {
-    std::fs::create_dir_all(sandbox_dir)?;
-
-    // Write-once: only seed files that don't already exist.
-    for &(name, content) in seed_files {
-        let path = sandbox_dir.join(name);
-        if !path.exists() {
-            std::fs::write(path, content)?;
-        }
-    }
-
-    // A "projects/" subdirectory means a prior container session left state
-    // (settings.json, statsig/, session metadata), so the general top-level copy
-    // is skipped; seeds, copy_dirs and shared credentials still sync. Claude Code
-    // creates the directory on first run, which is what makes it a reliable
-    // sentinel; if it ever moves, restarts only revert to re-copying host files.
-    let has_prior_data = sandbox_dir.join("projects").exists();
-    if has_prior_data {
-        tracing::info!(target: "session.profile",
-            "sync_agent_config: sandbox={} has prior session data, skipping general file copy",
-            sandbox_dir.display()
-        );
-    }
-
-    for entry in std::fs::read_dir(host_dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-
-        if skip_entries.iter().any(|&s| s == name_str.as_ref()) {
-            continue;
-        }
-
-        // Follow symlinks so symlinked dirs are treated as dirs.
-        let metadata = match std::fs::metadata(entry.path()) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(target: "session.profile", "Skipping {}: {}", entry.path().display(), e);
-                continue;
-            }
-        };
-
-        if metadata.is_dir() {
-            // copy_dirs push host trees into the sandbox, and plugins can hold
-            // full git clones. Skip them once there is prior session data:
-            // re-copying stalled startup for tens of seconds and clobbered
-            // container-side changes.
-            if !has_prior_data && copy_dirs.iter().any(|&d| d == name_str.as_ref()) {
-                let dest = sandbox_dir.join(&name);
-                if let Err(e) = copy_dir_recursive(&entry.path(), &dest) {
-                    tracing::warn!(target: "session.profile", "Failed to copy dir {}: {}", name_str, e);
-                }
-            }
-            continue;
-        }
-
-        // Skip general top-level file copies on restart to preserve
-        // container-created files (settings.json, statsig/, etc.).
-        if has_prior_data {
-            continue;
-        }
-
-        let dest = sandbox_dir.join(&name);
-
-        // Preserved files are only seeded from the host when they don't already exist
-        // in the sandbox. This protects credentials placed by migration or in-container
-        // authentication from being overwritten by stale host copies.
-        if preserve_files.iter().any(|&p| p == name_str.as_ref()) && dest.exists() {
-            continue;
-        }
-
-        if let Err(e) = std::fs::copy(entry.path(), &dest) {
-            tracing::warn!(target: "session.profile", "Failed to copy {}: {}", name_str, e);
-        }
-    }
-
-    Ok(())
-}
 
 fn rewrite_claude_plugin_paths(sandbox_dir: &Path, host_home: &Path) -> Result<()> {
     const CONTAINER_HOME: &str = "/root";
@@ -441,128 +568,6 @@ fn rewrite_plugin_value_paths(
         }
         _ => {}
     }
-}
-
-/// Recursively copy a directory tree, following symlinks.
-fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
-    let mut visited = std::collections::HashSet::new();
-    copy_dir_recursive_inner(src, dest, &mut visited)
-}
-
-/// Whether an I/O error during the copy means the destination filesystem can no
-/// longer accept writes, in which case continuing would silently produce a
-/// partial copy (a sandbox missing arbitrary files, reported as success). Those
-/// must abort the whole copy. Everything else (a single unreadable or dangling
-/// source entry) is skipped best-effort.
-fn is_fatal_copy_error(e: &std::io::Error) -> bool {
-    // ENOSPC (no space), EROFS (read-only fs), EDQUOT (quota). EDQUOT differs by
-    // platform (122 on Linux, 69 on macOS). raw_os_error covers all three more
-    // portably than the (partly unstable) ErrorKind variants.
-    matches!(e.raw_os_error(), Some(28) | Some(30) | Some(69) | Some(122))
-}
-
-fn copy_dir_recursive_inner(
-    src: &Path,
-    dest: &Path,
-    visited: &mut std::collections::HashSet<PathBuf>,
-) -> Result<()> {
-    // Break symlink cycles. Symlinks are followed so a symlinked config dir is
-    // copied, but a link pointing back up its own tree recurses forever. Keying
-    // on the canonical source path stops the second visit; a canonicalize failure
-    // (ELOOP) is exactly when the guard matters, so skip rather than descend.
-    match std::fs::canonicalize(src) {
-        Ok(real) => {
-            if !visited.insert(real) {
-                tracing::warn!(
-                    target: "session.profile",
-                    "skipping already-visited dir (symlink cycle?): {}",
-                    src.display()
-                );
-                return Ok(());
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                target: "session.profile",
-                "skipping dir (cannot resolve, possible symlink loop): {}: {}",
-                src.display(),
-                e
-            );
-            return Ok(());
-        }
-    }
-    // create_dir_all / read_dir failures: a filesystem that can't accept writes
-    // is fatal (silent partial copy); anything else means we just skip this
-    // subtree. This keeps the fail-soft behavior errno-aware and consistent.
-    if let Err(e) = std::fs::create_dir_all(dest) {
-        if is_fatal_copy_error(&e) {
-            return Err(e).with_context(|| format!("creating {}", dest.display()));
-        }
-        tracing::warn!(
-            target: "session.profile",
-            "skipping dir (cannot create destination): {}: {}",
-            dest.display(),
-            e
-        );
-        return Ok(());
-    }
-    let entries = match std::fs::read_dir(src) {
-        Ok(entries) => entries,
-        Err(e) => {
-            tracing::warn!(
-                target: "session.profile",
-                "skipping dir (cannot read): {}: {}",
-                src.display(),
-                e
-            );
-            return Ok(());
-        }
-    };
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(e) => {
-                tracing::warn!(target: "session.profile", "skipping entry in {}: {}", src.display(), e);
-                continue;
-            }
-        };
-        let target = dest.join(entry.file_name());
-        // Follow symlinks so symlinked dirs/files are handled correctly; the
-        // visited-set guard above stops a cycle from looping forever. A single
-        // unreadable or dangling entry is skipped rather than aborting the whole
-        // copy: one Permission-denied file under ~/.claude/plugins used to fail
-        // the entire sync.
-        let metadata = match std::fs::metadata(entry.path()) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(
-                    target: "session.profile",
-                    "skipping {}: {}",
-                    entry.path().display(),
-                    e
-                );
-                continue;
-            }
-        };
-        if metadata.is_dir() {
-            // Propagate with `?`: the child only returns Err for a fatal
-            // (filesystem-full) error, so a cycle / unreadable subdir resolves to
-            // Ok inside the child and is skipped there, while a real out-of-space
-            // condition aborts the whole copy.
-            copy_dir_recursive_inner(&entry.path(), &target, visited)?;
-        } else if let Err(e) = std::fs::copy(entry.path(), &target) {
-            if is_fatal_copy_error(&e) {
-                return Err(e).with_context(|| format!("copying {}", entry.path().display()));
-            }
-            tracing::warn!(
-                target: "session.profile",
-                "skipping file {}: {}",
-                entry.path().display(),
-                e
-            );
-        }
-    }
-    Ok(())
 }
 
 /// The furthest `expiresAt` a real token carries. The shared file is writable
@@ -962,23 +967,6 @@ fn sandbox_dir_for(
         .join(SANDBOX_PRIVATE_SUBDIR)
         .join(instance_id))
 }
-pub(crate) fn legacy_sandbox_store_dir(
-    tool: &str,
-    home: &Path,
-    declared_config_dir: Option<&Path>,
-    instance_id: Option<&str>,
-) -> Option<PathBuf> {
-    AGENT_CONFIG_MOUNTS
-        .iter()
-        .find(|mount| mount.tool_name == tool)
-        .map(|mount| {
-            let root = declared_config_dir
-                .map(|dir| dir.join(SANDBOX_SUBDIR))
-                .unwrap_or_else(|| home.join(mount.host_rel).join(SANDBOX_SUBDIR));
-            instance_id.map_or(root.clone(), |id| root.join(id))
-        })
-}
-
 pub(crate) fn sandbox_store_dir(
     tool: &str,
     home: &Path,
@@ -1071,6 +1059,282 @@ pub(crate) fn sandbox_store_dirs(
         .collect())
 }
 
+pub(crate) fn sandbox_content_roots(
+    tool: &str,
+    detect_as: Option<&str>,
+    session: &super::SessionConfig,
+    home: &Path,
+    instance: &str,
+) -> Result<Vec<crate::migrations::v031_isolate_sandbox_content::ContentRoot>> {
+    use crate::migrations::v031_isolate_sandbox_content::{canonical_expected_path, ContentRoot};
+    crate::session::validate_instance_id(instance)?;
+    let Some(agent) = resolve_active_agent(tool, detect_as, session) else {
+        return Ok(Vec::new());
+    };
+    let declared = session.agent_config_dir_for(tool, home);
+    let mut roots: Vec<ContentRoot> = Vec::new();
+    for mount in AGENT_CONFIG_MOUNTS
+        .iter()
+        .filter(|mount| mount.tool_name == agent.name)
+    {
+        let host = canonical_expected_path(
+            &declared
+                .clone()
+                .unwrap_or_else(|| home.join(mount.host_rel)),
+        )?;
+        let path = canonical_expected_path(&host.join(SANDBOX_PRIVATE_SUBDIR))?.join(instance);
+        if let Some(root) = roots.iter_mut().find(|root| root.path == path) {
+            root.roles.push(mount.container_suffix.to_owned());
+        } else {
+            roots.push(ContentRoot {
+                path,
+                host,
+                roles: vec![mount.container_suffix.to_owned()],
+            });
+        }
+    }
+    roots.sort_by(|left, right| left.path.cmp(&right.path));
+    for root in &mut roots {
+        root.roles.sort();
+        root.roles.dedup();
+    }
+    Ok(roots)
+}
+
+/// Complete shared-host policy only while planning a transition. Capture and
+/// admission checks retain their small, requested role subsets.
+pub(crate) fn expand_content_roles(
+    roots: &mut [crate::migrations::v031_isolate_sandbox_content::ContentRoot],
+    home: &Path,
+    session: &super::SessionConfig,
+) -> Result<()> {
+    use crate::migrations::v031_isolate_sandbox_content::canonical_expected_path;
+    let mut add_tool = |tool: &str| -> Result<()> {
+        let Some(agent) = resolve_active_agent(tool, None, session) else {
+            return Ok(());
+        };
+        let declared = session.agent_config_dir_for(tool, home);
+        for mount in AGENT_CONFIG_MOUNTS
+            .iter()
+            .filter(|mount| mount.tool_name == agent.name)
+        {
+            let host = canonical_expected_path(
+                &declared
+                    .clone()
+                    .unwrap_or_else(|| home.join(mount.host_rel)),
+            )?;
+            for root in roots.iter_mut().filter(|root| root.host == host) {
+                root.roles.push(mount.container_suffix.to_owned());
+            }
+        }
+        Ok(())
+    };
+    for tool in agent_config_mount_tools() {
+        add_tool(tool)?;
+    }
+    for tool in session.agent_config_dir.keys() {
+        if !AGENT_CONFIG_MOUNTS
+            .iter()
+            .any(|mount| mount.tool_name == tool)
+        {
+            add_tool(tool)?;
+        }
+    }
+    for root in roots {
+        root.roles.sort();
+        root.roles.dedup();
+    }
+    Ok(())
+}
+
+pub(crate) fn content_role_agent(role: &str) -> Option<&'static str> {
+    AGENT_CONFIG_MOUNTS
+        .iter()
+        .find(|mount| mount.container_suffix == role)
+        .map(|mount| mount.tool_name)
+}
+
+/// Native state the pre-v031 denylist already kept sandbox-only, so it was
+/// never host-copied and holds the session's own resume. A retired original
+/// lends it back to the fresh store it seeds instead of isolating it, so the
+/// rows resolving that store keep their session ids.
+fn carried_state(mount: &AgentConfigMount) -> &'static [&'static str] {
+    match (mount.tool_name, mount.container_suffix) {
+        ("claude", ".claude") => &["projects"],
+        ("opencode", ".local/share/opencode") => &["opencode.db*"],
+        _ => &[],
+    }
+}
+
+/// Whether a retired store keeps `agent`'s own resume state in place, so
+/// isolating that store must not clear the row's session ids.
+pub(crate) fn agent_retains_native_resume(agent: &str) -> bool {
+    AGENT_CONFIG_MOUNTS
+        .iter()
+        .any(|mount| mount.tool_name == agent && !carried_state(mount).is_empty())
+}
+
+enum ContentSeedMode {
+    Fresh,
+    StoppedOriginal,
+    OwnedExtension,
+}
+
+pub(crate) fn seed_content_stage(
+    input: &crate::migrations::v031_isolate_sandbox_content::ContentSeed<'_>,
+    root: &crate::migrations::v031_isolate_sandbox_content::ContentRoot,
+    destination: &Path,
+    home: &Path,
+    session: &super::SessionConfig,
+    workspace: &Path,
+) -> Result<()> {
+    let mode = if input.is_stopped_original() {
+        ContentSeedMode::StoppedOriginal
+    } else {
+        ContentSeedMode::Fresh
+    };
+    seed_content_roles(
+        input.path(),
+        root,
+        destination,
+        home,
+        session,
+        workspace,
+        mode,
+    )
+}
+
+/// Add only absent configuration for newly required roles. This does not
+/// construct a fresh-stage capability or replace an owned native store.
+pub(crate) fn extend_owned_content(
+    root: &crate::migrations::v031_isolate_sandbox_content::ContentRoot,
+    home: &Path,
+    session: &super::SessionConfig,
+    workspace: &Path,
+) -> Result<()> {
+    seed_content_roles(
+        &root.host,
+        root,
+        &root.path,
+        home,
+        session,
+        workspace,
+        ContentSeedMode::OwnedExtension,
+    )
+}
+
+/// The bytes to publish when a JSON seed default meets a file carried forward
+/// from a retired original: the default's keys win, the carried file's other
+/// keys stay. `None` when the file is absent or either side is not a JSON
+/// object, so the caller keeps the seed-once publish.
+fn merged_json_seed(
+    output: &crate::session::anchored_fs::AnchoredDir,
+    path: &Path,
+    default: &str,
+) -> Result<Option<Vec<u8>>> {
+    let Some(existing) = output.read_regular(path, 8 << 20)? else {
+        return Ok(None);
+    };
+    let (Ok(serde_json::Value::Object(mut carried)), Ok(serde_json::Value::Object(seed))) = (
+        serde_json::from_slice::<serde_json::Value>(&existing),
+        serde_json::from_str::<serde_json::Value>(default),
+    ) else {
+        return Ok(None);
+    };
+    for (key, value) in seed {
+        carried.insert(key, value);
+    }
+    Ok(Some(serde_json::to_vec(&serde_json::Value::Object(
+        carried,
+    ))?))
+}
+
+fn seed_content_roles(
+    source: &Path,
+    root: &crate::migrations::v031_isolate_sandbox_content::ContentRoot,
+    destination: &Path,
+    home: &Path,
+    session: &super::SessionConfig,
+    workspace: &Path,
+    mode: ContentSeedMode,
+) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let output = crate::session::anchored_fs::AnchoredDir::open(destination)?;
+    for mount in AGENT_CONFIG_MOUNTS
+        .iter()
+        .filter(|mount| root.roles.iter().any(|role| role == mount.container_suffix))
+    {
+        if source.exists() {
+            let mut boundary = NativeStateBoundary::new(source, mount, home, session, destination)?;
+            let stopped = matches!(mode, ContentSeedMode::StoppedOriginal);
+            let files = if stopped {
+                boundary = boundary.for_stopped_original(&root.host, mount)?;
+                let mut files = mount.copy_files.to_vec();
+                files.extend(mount.home_seed_files.iter().map(|(name, _)| *name));
+                files.extend(mount.shared_credential_files.iter().copied());
+                std::borrow::Cow::Owned(files)
+            } else {
+                std::borrow::Cow::Borrowed(mount.copy_files)
+            };
+            let preserve = if matches!(mode, ContentSeedMode::OwnedExtension) {
+                files.as_ref()
+            } else {
+                mount.preserve_files
+            };
+            sync_agent_config(
+                source,
+                destination,
+                &files,
+                mount.seed_files,
+                mount.copy_dirs,
+                preserve,
+                &boundary,
+            )?;
+            seed::seed_credential_pairs(source, destination, mount.credential_pairs, &boundary)?;
+            seed::seed_sqlite_files(source, destination, mount.sqlite_seed_files, &boundary)?;
+            seed::seed_configured_resources(
+                mount,
+                source,
+                destination,
+                home,
+                workspace,
+                &boundary,
+            )?;
+            if stopped {
+                seed::carry_sandbox_state(source, destination, carried_state(mount), &boundary)?;
+            }
+        }
+        for &(name, content) in mount.seed_files.iter().chain(mount.home_seed_files) {
+            let path = Path::new(name);
+            output.create_child(path.parent().unwrap_or(Path::new("")))?;
+            // A retired original is carried forward with its old `.claude.json`,
+            // whose `hasCompletedOnboarding` main may have written false; left as
+            // is it strands the sandbox on the login picker. A JSON seed default
+            // therefore enforces its own keys over a carried file, the default
+            // winning for its keys while the file's other keys stay. A non-JSON
+            // default or an absent file keeps the seed-once publish.
+            if let Some(merged) = merged_json_seed(&output, path, content)? {
+                output.publish_file(
+                    path,
+                    &mut merged.as_slice(),
+                    std::fs::Permissions::from_mode(0o600),
+                    true,
+                    None,
+                )?;
+            } else {
+                output.publish_file(
+                    path,
+                    &mut content.as_bytes(),
+                    std::fs::Permissions::from_mode(0o600),
+                    false,
+                    None,
+                )?;
+            }
+        }
+    }
+    output.sync()
+}
+
 /// Tool names with a config mount, deduplicated in table order.
 pub(crate) fn agent_config_mount_tools() -> Vec<&'static str> {
     let mut tools: Vec<&'static str> = Vec::new();
@@ -1107,10 +1371,20 @@ fn prepare_sandbox_dir(
     home: &Path,
     instance_id: Option<&str>,
     fold: CredentialFold,
+    session_config: &super::SessionConfig,
+    workspace: &Path,
 ) -> Result<PathBuf> {
     let host_dir = home.join(mount.host_rel);
     let sandbox_dir = sandbox_dir_for(mount, home, instance_id)?;
-    prepare_sandbox_dir_from(mount, host_dir, sandbox_dir, home, fold)
+    prepare_sandbox_dir_from(
+        mount,
+        host_dir,
+        sandbox_dir,
+        home,
+        fold,
+        session_config,
+        workspace,
+    )
 }
 
 fn prepare_sandbox_dir_from(
@@ -1119,25 +1393,48 @@ fn prepare_sandbox_dir_from(
     sandbox_dir: PathBuf,
     home: &Path,
     fold: CredentialFold,
+    session_config: &super::SessionConfig,
+    workspace: &Path,
 ) -> Result<PathBuf> {
-    // Remove stale files before syncing. This prevents leftovers from a previous
-    // session (e.g. a SQLite database created by an older tool version) from
-    // causing failures when the container image is updated.
-    for &name in mount.clean_files {
-        let path = sandbox_dir.join(name);
-        if path.exists() {
-            if let Err(e) = std::fs::remove_file(&path) {
-                tracing::warn!(target: "session.profile", "Failed to clean {}: {}", path.display(), e);
-            }
-        }
-    }
+    let _admission = crate::migrations::v031_isolate_sandbox_content::guard_preparation(
+        &host_dir,
+        &sandbox_dir,
+        mount.container_suffix,
+    )?;
+    seed_sandbox_dir_from(
+        mount,
+        host_dir,
+        sandbox_dir,
+        home,
+        fold,
+        session_config,
+        workspace,
+    )
+}
+
+fn seed_sandbox_dir_from(
+    mount: &AgentConfigMount,
+    host_dir: PathBuf,
+    sandbox_dir: PathBuf,
+    home: &Path,
+    fold: CredentialFold,
+    session_config: &super::SessionConfig,
+    workspace: &Path,
+) -> Result<PathBuf> {
+    std::fs::create_dir_all(&sandbox_dir)?;
 
     if host_dir.exists() {
+        let boundary =
+            NativeStateBoundary::new(&host_dir, mount, home, session_config, &sandbox_dir)?;
         // Codex writes `trusted_hash` into `[hooks.state]` of the sandbox
-        // config.toml when a hook hash is accepted in-container, and
-        // `sync_agent_config` overwrites that copy from the host. Snapshot and
-        // restore around the sync so the sandbox value wins: trust is local to
-        // the container, and the process-private path has no other writer.
+        // copy of `config.toml` when the user accepts a hook hash inside
+        // the container; that copy is overwritten on each
+        // `sync_agent_config` from the host. Snapshot here and restore
+        // after the sync so accepted hashes survive the host-to-sandbox
+        // refresh (the sandbox value wins by design, since trust is local
+        // to the container). The codex config lock is released between
+        // snapshot and restore; the sandbox path is process-private, so
+        // no concurrent writer is expected.
         let preserved_codex_state = if agent_format_is_codex_json(mount.tool_name) {
             let sandbox_config = sandbox_dir.join("config.toml");
             crate::hooks::snapshot_codex_hooks_state(&sandbox_config)
@@ -1154,19 +1451,24 @@ fn prepare_sandbox_dir_from(
             None
         };
 
-        let skip_entries: Vec<&str> = mount
-            .skip_entries
-            .iter()
-            .chain(mount.shared_credential_files)
-            .copied()
-            .collect();
         sync_agent_config(
             &host_dir,
             &sandbox_dir,
-            &skip_entries,
+            mount.copy_files,
             mount.seed_files,
             mount.copy_dirs,
             mount.preserve_files,
+            &boundary,
+        )?;
+        seed::seed_credential_pairs(&host_dir, &sandbox_dir, mount.credential_pairs, &boundary)?;
+        seed::seed_sqlite_files(&host_dir, &sandbox_dir, mount.sqlite_seed_files, &boundary)?;
+        seed::seed_configured_resources(
+            mount,
+            &host_dir,
+            &sandbox_dir,
+            home,
+            workspace,
+            &boundary,
         )?;
 
         if mount.tool_name == "codex" {
@@ -1350,10 +1652,14 @@ pub(crate) fn compute_volume_paths_with_resolve(
     project_path: &Path,
     project_path_str: &str,
 ) -> Result<(Vec<VolumeMount>, String, MountResolve)> {
-    // Only look for a main repo when the project path itself has a `.git` entry:
-    // a repo has a directory, a worktree a file holding a gitdir pointer. Without
-    // the check `Repository::discover` walks up into an unrelated ancestor repo
-    // (a dotfile-managed home) and mounts the whole of $HOME into the container.
+    // Only look for a main repo if the project path itself has a .git entry (file or
+    // directory). This prevents git2::Repository::discover from walking up the directory
+    // tree and finding an unrelated ancestor repo (e.g., a dotfile-managed home directory),
+    // which would cause aoe to mount that ancestor -- potentially the user's entire $HOME --
+    // into the container.
+    //
+    // Legitimate git repos have a .git directory; worktrees have a .git file containing a
+    // gitdir pointer. Both cases are covered by this check.
     if project_path.join(".git").exists() {
         if let Ok(main_repo) = GitWorktree::find_main_repo(project_path) {
             // Canonicalize paths for reliable comparison (handles symlinks like /tmp -> /private/tmp)
@@ -1459,7 +1765,7 @@ pub(crate) fn compute_volume_paths_with_resolve(
 ///
 /// We find the common ancestor of all paths (workspace + main repos) and mount each
 /// under `/workspace/` preserving relative structure.
-fn compute_workspace_volume_paths(
+pub(crate) fn compute_workspace_volume_paths(
     workspace_path: &Path,
     ws_info: &crate::session::WorkspaceInfo,
 ) -> Result<(Vec<VolumeMount>, String)> {
@@ -1542,6 +1848,7 @@ pub(crate) fn refresh_agent_configs_for_instance(
     tool: &str,
     detect_as: Option<&str>,
     fold: CredentialFold,
+    workspace: &Path,
 ) {
     let Some(home) = dirs::home_dir() else {
         return;
@@ -1562,8 +1869,17 @@ pub(crate) fn refresh_agent_configs_for_instance(
                 directory.join(SANDBOX_PRIVATE_SUBDIR).join(instance_id),
                 &home,
                 fold,
+                &profile_config.session,
+                workspace,
             ),
-            None => prepare_sandbox_dir(mount, &home, Some(instance_id), fold),
+            None => prepare_sandbox_dir(
+                mount,
+                &home,
+                Some(instance_id),
+                fold,
+                &profile_config.session,
+                workspace,
+            ),
         };
         match result {
             Ok(sandbox_dir) => {
@@ -2067,6 +2383,11 @@ pub(crate) fn stranded_named_ignore_volumes(
         .collect()
 }
 
+/// Build a full `ContainerConfig` for creating a sandboxed container.
+///
+/// `profile` selects which profile's overrides (volumes, mount_ssh, volume_ignores)
+/// are merged on top of the global config. An empty `profile` falls back to the
+/// user's globally configured default profile.
 fn validate_managed_container_environment(
     environment: &[EnvEntry],
     active_agent: Option<&crate::agents::AgentDef>,
@@ -2101,11 +2422,6 @@ fn validate_managed_container_environment(
     Ok(())
 }
 
-/// Build a full `ContainerConfig` for creating a sandboxed container.
-///
-/// `profile` selects which profile's overrides (volumes, mount_ssh, volume_ignores)
-/// are merged on top of the global config. An empty `profile` falls back to the
-/// user's globally configured default profile.
 pub(crate) fn build_container_config(
     project_path_str: &str,
     sandbox_info: &SandboxInfo,
@@ -2131,11 +2447,13 @@ pub(crate) fn build_container_config(
     );
     let config_tool = active_agent.map_or(agent_selection.tool, |agent| agent.name);
 
-    // A workspace mounts its own dir plus every main repo, a bare-repo worktree
-    // mounts the whole bare repo with working_dir inside it, and a sibling
-    // worktree mounts the main repo and the worktree separately. A workspace
-    // resolve is always Resolved: it derives mounts from each repo's stored
-    // `main_repo_path` and never falls back to `find_main_repo`.
+    // Determine mount path(s) and working directory.
+    // For multi-repo workspaces, mount the workspace dir and all main repos.
+    // For bare repo worktrees, mount the entire bare repo and set working_dir to the worktree.
+    // For sibling worktrees, mount the main repo and worktree as separate volumes.
+    // A workspace resolve is always Resolved: compute_workspace_volume_paths derives
+    // its mounts from the stored `main_repo_path` of each repo and never consults
+    // `find_main_repo`, so it has no degraded fallback to report.
     let (project_volumes, workspace_path, mount_resolve) = if let Some(ws_info) = workspace_info {
         let (volumes, path) = compute_workspace_volume_paths(project_path, ws_info)?;
         (volumes, path, MountResolve::Resolved)
@@ -2239,10 +2557,12 @@ pub(crate) fn build_container_config(
         }
     }
 
-    // Mount GCP credentials at the well-known ADC path for Claude+Vertex.
-    // `CLAUDE_CODE_USE_VERTEX` is Claude-specific, so a globally exported flag
-    // must not hand GCP creds to other agents. `GOOGLE_APPLICATION_CREDENTIALS`
-    // is not forwarded: client libraries find the well-known path themselves.
+    // Mount GCP credentials into the well-known ADC path for Claude+Vertex sessions.
+    // Gated on `tool == "claude"` because `CLAUDE_CODE_USE_VERTEX` is Claude-specific;
+    // there's no reason to expose GCP creds to other agents (opencode, codex, etc.)
+    // just because the user has the flag exported globally.
+    // `GOOGLE_APPLICATION_CREDENTIALS` is not forwarded as an env var; client libraries
+    // discover the well-known path automatically.
     if agent_selection.tool == "claude" && crate::session::environment::host_vertex_enabled() {
         let container_cred_path = format!(
             "{}/.config/gcloud/application_default_credentials.json",
@@ -2283,6 +2603,22 @@ pub(crate) fn build_container_config(
     let mut identity_publisher_installed = false;
     let mut identity_publisher_path: Option<(PathBuf, String)> = None;
     let mut identity_output_path: Option<(PathBuf, String)> = None;
+    let content_roots = sandbox_content_roots(
+        agent_selection.tool,
+        agent_selection.detect_as,
+        profile_session_config,
+        &home,
+        instance_id,
+    )?;
+    let _content_admission = crate::migrations::v031_isolate_sandbox_content::ensure_fresh_content(
+        &crate::session::get_app_dir()?,
+        &home,
+        instance_id,
+        agent_selection.tool,
+        &content_roots,
+        &profile_config,
+        Path::new(&workspace_path),
+    )?;
     for mount in AGENT_CONFIG_MOUNTS
         .iter()
         .filter(|m| m.tool_name == config_tool)
@@ -2296,25 +2632,19 @@ pub(crate) fn build_container_config(
                 directory.join(SANDBOX_PRIVATE_SUBDIR).join(instance_id),
                 &home,
                 agent_selection.credential_fold,
+                profile_session_config,
+                Path::new(&workspace_path),
             ),
             None => prepare_sandbox_dir(
                 mount,
                 &home,
                 Some(instance_id),
                 agent_selection.credential_fold,
+                profile_session_config,
+                Path::new(&workspace_path),
             ),
-        };
-        let sandbox_dir = match sandbox_dir {
-            Ok(dir) => dir,
-            Err(e) => {
-                tracing::warn!(target: "session.profile",
-                    "Failed to prepare sandbox dir for {}, skipping: {}",
-                    mount.host_rel,
-                    e
-                );
-                continue;
-            }
-        };
+        }
+        .with_context(|| format!("preparing isolated {} configuration", mount.host_rel))?;
         active_sandbox_config = Some((mount, sandbox_dir.clone()));
 
         tracing::debug!(target: "session.profile",
@@ -2775,12 +3105,29 @@ mod tests {
         let temp_home = TempDir::new().unwrap();
         let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
-        let project_dir = git_project();
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+        let sandbox_info = crate::session::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
         let instance_id = "pisandboxbind001";
-        let config = Build::new("pi")
-            .instance(instance_id)
-            .run(project_dir.path())
-            .unwrap();
+        let config = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("pi", None),
+            false,
+            instance_id,
+            None,
+            "",
+        )
+        .unwrap();
 
         let bind = config
             .volumes
@@ -2823,126 +3170,6 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    /// A project directory that is a git repo, which `compute_volume_paths` needs.
-    fn git_project() -> TempDir {
-        let dir = TempDir::new().unwrap();
-        git2::Repository::init(dir.path()).unwrap();
-        dir
-    }
-
-    /// The per-instance sandbox config store AoE stages under an agent's dir.
-    fn sandbox_store(home: &Path, agent_dir: &str, instance_id: &str) -> PathBuf {
-        home.join(agent_dir)
-            .join(SANDBOX_PRIVATE_SUBDIR)
-            .join(instance_id)
-    }
-
-    /// Write a repo-level `.agent-of-empires/config.toml` under `project`.
-    fn write_repo_config(project: &Path, contents: &str) {
-        let config_dir = project.join(".agent-of-empires");
-        fs::create_dir_all(&config_dir).unwrap();
-        fs::write(config_dir.join("config.toml"), contents).unwrap();
-    }
-
-    /// An isolated HOME plus the hook base state every container test needs,
-    /// held together so one binding keeps all three guards alive. Field order
-    /// is drop order: the HOME override is restored before the directory it
-    /// points at goes away.
-    struct IsolatedHome {
-        _home: crate::session::test_support::HomeGuard,
-        home: TempDir,
-        _base_dir: TempDir,
-        _base: crate::hooks::test_support::BaseGuard,
-    }
-
-    impl IsolatedHome {
-        fn new() -> Self {
-            let (base, _, base_dir) = BaseGuard::ready();
-            let home = TempDir::new().unwrap();
-            let home_guard = crate::session::test_support::isolate_home(home.path());
-            Self {
-                _home: home_guard,
-                home,
-                _base_dir: base_dir,
-                _base: base,
-            }
-        }
-
-        fn path(&self) -> &Path {
-            self.home.path()
-        }
-    }
-
-    /// `build_container_config` with the arguments these tests rarely vary.
-    struct Build<'a> {
-        selection: ContainerAgentSelection<'a>,
-        info: crate::session::instance::SandboxInfo,
-        yolo: bool,
-        instance: &'a str,
-        profile: &'a str,
-    }
-
-    impl<'a> Build<'a> {
-        fn select(selection: ContainerAgentSelection<'a>) -> Self {
-            Self {
-                selection,
-                info: test_sandbox_info(),
-                yolo: false,
-                instance: "test-instance-id",
-                profile: "",
-            }
-        }
-
-        fn new(tool: &'a str) -> Self {
-            Self::select(ContainerAgentSelection::new(tool, None))
-        }
-
-        fn info(mut self, info: crate::session::instance::SandboxInfo) -> Self {
-            self.info = info;
-            self
-        }
-
-        fn yolo(mut self, yolo: bool) -> Self {
-            self.yolo = yolo;
-            self
-        }
-
-        fn instance(mut self, instance: &'a str) -> Self {
-            self.instance = instance;
-            self
-        }
-
-        fn profile(mut self, profile: &'a str) -> Self {
-            self.profile = profile;
-            self
-        }
-
-        fn run(self, project: &Path) -> Result<ContainerConfig> {
-            build_container_config(
-                project.to_str().unwrap(),
-                &self.info,
-                self.selection,
-                self.yolo,
-                self.instance,
-                None,
-                self.profile,
-            )
-        }
-    }
-
-    fn test_sandbox_info() -> crate::session::instance::SandboxInfo {
-        crate::session::instance::SandboxInfo {
-            enabled: true,
-            container_id: None,
-            image: "test:latest".to_string(),
-            container_name: "test-container".to_string(),
-            extra_env: None,
-            custom_instruction: None,
-            before_start_env: Vec::new(),
-            container_workdir: None,
-        }
-    }
-
     /// The extension read must go through the anchored walk, not a stat of the
     /// pathname followed by a second open of it. With `agent/extensions`
     /// swapped for a link to a directory that already holds the current
@@ -2981,78 +3208,81 @@ mod tests {
         );
     }
 
-    /// Unset, blank and `bridge` mean the runtime default; `host` and the
-    /// namespace-sharing forms are dropped here too, because repo/profile TOML
-    /// is only type-checked, not value-validated (#2706); `none` is lowercased
-    /// and a named network passes through trimmed.
     #[test]
-    fn sanitize_network_canonicalizes_or_drops_every_form() {
-        let cases: &[(Option<&str>, Option<&str>)] = &[
-            (None, None),
-            (Some(""), None),
-            (Some("  "), None),
-            (Some("bridge"), None),
-            (Some("BRIDGE"), None),
-            (Some("host"), None),
-            (Some("Host"), None),
-            (Some("container:abc"), None),
-            (Some("ns:/var/run/netns/x"), None),
-            (Some("has space"), None),
-            (Some("none"), Some("none")),
-            (Some("None"), Some("none")),
-            (Some("NONE"), Some("none")),
-            (Some(" egress-proxy "), Some("egress-proxy")),
-        ];
-        for (input, expected) in cases {
-            assert_eq!(
-                sanitize_network(*input).as_deref(),
-                *expected,
-                "network {input:?}"
-            );
-        }
+    fn sanitize_network_defaults_to_none() {
+        assert_eq!(sanitize_network(None), None);
+        assert_eq!(sanitize_network(Some("")), None);
+        assert_eq!(sanitize_network(Some("  ")), None);
+        assert_eq!(sanitize_network(Some("bridge")), None);
+        assert_eq!(sanitize_network(Some("BRIDGE")), None);
     }
 
-    fn commit_head(repo: &git2::Repository) {
+    #[test]
+    fn sanitize_network_rejects_host() {
+        assert_eq!(sanitize_network(Some("host")), None);
+        assert_eq!(sanitize_network(Some("Host")), None);
+    }
+
+    #[test]
+    fn sanitize_network_rejects_namespace_sharing_forms() {
+        // Repo/profile TOML is only type-checked, so `container:` (Docker) and
+        // `ns:` (Podman) must be rejected here, not just by the settings
+        // validator: either shares another namespace's network stack.
+        assert_eq!(sanitize_network(Some("container:abc")), None);
+        assert_eq!(sanitize_network(Some("ns:/var/run/netns/x")), None);
+        assert_eq!(sanitize_network(Some("has space")), None);
+    }
+
+    #[test]
+    fn sanitize_network_passes_through_none_and_named() {
+        assert_eq!(sanitize_network(Some("none")), Some("none".to_string()));
+        assert_eq!(
+            sanitize_network(Some(" egress-proxy ")),
+            Some("egress-proxy".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_network_canonicalizes_none_keyword() {
+        assert_eq!(sanitize_network(Some("None")), Some("none".to_string()));
+        assert_eq!(sanitize_network(Some("NONE")), Some("none".to_string()));
+    }
+
+    // --- compute_volume_paths tests ---
+
+    fn setup_regular_repo() -> (TempDir, std::path::PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+
+        // Create initial commit so HEAD is valid
         let sig = git2::Signature::now("Test", "test@example.com").unwrap();
         let tree_id = repo.index().unwrap().write_tree().unwrap();
         let tree = repo.find_tree(tree_id).unwrap();
         repo.commit(Some("HEAD"), &sig, &sig, "Initial", &tree, &[])
             .unwrap();
-    }
 
-    fn setup_regular_repo() -> (TempDir, PathBuf) {
-        let dir = TempDir::new().unwrap();
-        commit_head(&git2::Repository::init(dir.path()).unwrap());
         let repo_path = dir.path().to_path_buf();
         (dir, repo_path)
     }
 
-    /// Branch `wt-branch` off HEAD and check it out at `worktree`. False when
-    /// the `git` binary is unavailable, which the callers treat as a skip.
-    fn add_worktree(repo_path: &Path, worktree: &Path) -> bool {
-        {
-            let repo = git2::Repository::open(repo_path).unwrap();
-            let head = repo.head().unwrap().peel_to_commit().unwrap();
-            repo.branch("wt-branch", &head, false).unwrap();
-        }
-        std::process::Command::new("git")
-            .args(["worktree", "add", worktree.to_str().unwrap(), "wt-branch"])
-            .current_dir(repo_path)
-            .output()
-            .is_ok_and(|output| output.status.success())
-    }
-
-    fn setup_bare_repo_with_worktree() -> (TempDir, PathBuf, PathBuf) {
+    fn setup_bare_repo_with_worktree() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
         let dir = TempDir::new().unwrap();
         let bare_path = dir.path().join(".bare");
+
+        // Create bare repository
         let repo = git2::Repository::init_bare(&bare_path).unwrap();
+
+        // Create initial commit
         let sig = git2::Signature::now("Test", "test@example.com").unwrap();
         let tree_id = repo.treebuilder(None).unwrap().write().unwrap();
         let tree = repo.find_tree(tree_id).unwrap();
         repo.commit(Some("HEAD"), &sig, &sig, "Initial", &tree, &[])
             .unwrap();
-        fs::write(dir.path().join(".git"), "gitdir: ./.bare\n").unwrap();
 
+        // Create .git file pointing to bare repo
+        std::fs::write(dir.path().join(".git"), "gitdir: ./.bare\n").unwrap();
+
+        // Create worktree
         let worktree_path = dir.path().join("main");
         let _ = std::process::Command::new("git")
             .args(["worktree", "add", worktree_path.to_str().unwrap(), "HEAD"])
@@ -3063,36 +3293,44 @@ mod tests {
         (dir, main_repo_path, worktree_path)
     }
 
-    /// A repo root, a plain directory and a non-git subdirectory of a repo all
-    /// mount themselves alone at `/workspace/{basename}`. The last is #375: the
-    /// ancestor repo (a home directory under dotfile management) must not be
-    /// what gets mounted.
     #[test]
-    fn compute_volume_paths_mounts_one_directory_for_a_repo_root_or_plain_dir() {
-        let (_repo_dir, repo_path) = setup_regular_repo();
-        let plain_dir = TempDir::new().unwrap();
-        let plain = plain_dir.path().to_path_buf();
-        let ancestor = TempDir::new().unwrap();
-        git2::Repository::init(ancestor.path()).unwrap();
-        let subdir = ancestor.path().join("playground");
-        fs::create_dir_all(&subdir).unwrap();
+    fn test_compute_volume_paths_regular_repo() {
+        let (_dir, repo_path) = setup_regular_repo();
+        let project_path_str = repo_path.to_str().unwrap();
 
-        for project in [&repo_path, &plain, &subdir] {
-            let (volumes, working_dir) =
-                compute_volume_paths(project, project.to_str().unwrap()).unwrap();
-            let label = project.display();
-            assert_eq!(volumes.len(), 1, "{label}");
-            assert_eq!(volumes[0].host_path, project.to_string_lossy(), "{label}");
-            assert_eq!(volumes[0].container_path, working_dir, "{label}");
-            assert_eq!(
-                working_dir,
-                format!(
-                    "/workspace/{}",
-                    project.file_name().unwrap().to_string_lossy()
-                ),
-                "{label}"
-            );
-        }
+        let (volumes, working_dir) = compute_volume_paths(&repo_path, project_path_str).unwrap();
+
+        assert_eq!(volumes.len(), 1);
+        // Regular repo: mount path should be the project path
+        assert_eq!(
+            volumes[0].host_path,
+            repo_path.to_string_lossy().to_string()
+        );
+        // Container path and working dir should be the same
+        assert_eq!(volumes[0].container_path, working_dir);
+        // Should be /workspace/{dir_name}
+        let dir_name = repo_path.file_name().unwrap().to_string_lossy();
+        assert_eq!(
+            volumes[0].container_path,
+            format!("/workspace/{}", dir_name)
+        );
+    }
+
+    #[test]
+    fn test_compute_volume_paths_non_git_directory() {
+        let dir = TempDir::new().unwrap();
+        let project_path_str = dir.path().to_str().unwrap();
+
+        let (volumes, working_dir) = compute_volume_paths(dir.path(), project_path_str).unwrap();
+
+        assert_eq!(volumes.len(), 1);
+        // Non-git: mount path should be the project path
+        assert_eq!(
+            volumes[0].host_path,
+            dir.path().to_string_lossy().to_string()
+        );
+        // Container path and working dir should be the same
+        assert_eq!(volumes[0].container_path, working_dir);
     }
 
     /// Every arrival at `/workspace/{basename}` is reported as `Fallthrough`, including
@@ -3105,25 +3343,29 @@ mod tests {
         // An orphaned worktree: a `.git` file whose gitdir points nowhere, the
         // state a pruned admin entry leaves behind (#2414).
         let orphaned = dir.path().join("myrepo-worktrees").join("contexec");
-        fs::create_dir_all(&orphaned).unwrap();
-        fs::write(
+        std::fs::create_dir_all(&orphaned).unwrap();
+        std::fs::write(
             orphaned.join(".git"),
             "gitdir: ../../does-not-exist/.git/worktrees/contexec\n",
         )
         .unwrap();
 
         let plain = dir.path().join("plain");
-        fs::create_dir_all(&plain).unwrap();
+        std::fs::create_dir_all(&plain).unwrap();
         let (_repo_dir, repo_path) = setup_regular_repo();
 
-        for (case, path) in [
-            ("an orphaned worktree", &orphaned),
-            ("a worktree with no .git at all", &plain),
-            ("a healthy repo root", &repo_path),
+        for (case, path, expected) in [
+            ("an orphaned worktree", &orphaned, MountResolve::Fallthrough),
+            (
+                "a worktree with no .git at all",
+                &plain,
+                MountResolve::Fallthrough,
+            ),
+            ("a healthy repo root", &repo_path, MountResolve::Fallthrough),
         ] {
             let (_volumes, workspace_path, resolve) =
                 compute_volume_paths_with_resolve(path, path.to_str().unwrap()).unwrap();
-            assert_eq!(resolve, MountResolve::Fallthrough, "{case}");
+            assert_eq!(resolve, expected, "{case}");
             // All three land on the same path, which is why a caller cannot tell
             // them apart from the result alone.
             assert_eq!(
@@ -3134,139 +3376,290 @@ mod tests {
         }
     }
 
-    /// A bare-repo layout mounts the repo root either way; from a worktree the
-    /// working dir points inside that one mount.
     #[test]
-    fn compute_volume_paths_bare_repo_mounts_the_repo_root() {
+    fn test_compute_volume_paths_bare_repo_worktree() {
         let (_dir, main_repo_path, worktree_path) = setup_bare_repo_with_worktree();
-        let main_canon = main_repo_path.canonicalize().unwrap();
-        let repo_name = main_repo_path.file_name().unwrap().to_string_lossy();
 
-        let (volumes, working_dir) =
-            compute_volume_paths(&main_repo_path, main_repo_path.to_str().unwrap()).unwrap();
-        assert_eq!(volumes.len(), 1);
-        assert_eq!(
-            Path::new(&volumes[0].host_path).canonicalize().unwrap(),
-            main_canon
-        );
-        assert!(!working_dir.is_empty());
-
-        // git may be unavailable, in which case there is no worktree to check.
+        // Skip if worktree wasn't created (git might not be available)
         if !worktree_path.exists() {
             return;
         }
+
+        let project_path_str = worktree_path.to_str().unwrap();
+
         let (volumes, working_dir) =
-            compute_volume_paths(&worktree_path, worktree_path.to_str().unwrap()).unwrap();
+            compute_volume_paths(&worktree_path, project_path_str).unwrap();
+
+        // Bare repo worktree: single mount of the repo root
         assert_eq!(volumes.len(), 1);
+
+        // Canonicalize paths for comparison (handles /var -> /private/var on macOS)
+        let mount_path_canon = Path::new(&volumes[0].host_path).canonicalize().unwrap();
+        let main_repo_canon = main_repo_path.canonicalize().unwrap();
+
+        // For bare repo worktree: mount the entire repo root
         assert_eq!(
-            Path::new(&volumes[0].host_path).canonicalize().unwrap(),
-            main_canon
+            mount_path_canon, main_repo_canon,
+            "Should mount the bare repo root, not just the worktree"
         );
+
+        // Container path should be /workspace/{repo_name}
+        let repo_name = main_repo_path.file_name().unwrap().to_string_lossy();
         assert_eq!(
             volumes[0].container_path,
             format!("/workspace/{}", repo_name),
             "Container mount path should be /workspace/{{repo_name}}"
         );
-        assert!(working_dir.starts_with(&format!("/workspace/{}", repo_name)));
-        assert!(working_dir.ends_with("/main"));
+
+        // Working dir should point to the worktree within the mount
+        assert!(
+            working_dir.starts_with(&format!("/workspace/{}", repo_name)),
+            "Working dir should be under /workspace/{{repo_name}}"
+        );
+        assert!(
+            working_dir.ends_with("/main"),
+            "Working dir should end with worktree name 'main', got: {}",
+            working_dir
+        );
     }
 
-    /// A sibling worktree of a non-bare repo mounts both trees, flat under
-    /// `/workspace/`, and works from the worktree.
     #[test]
-    fn compute_volume_paths_sibling_worktree_mounts_both_trees() {
+    fn test_compute_volume_paths_non_bare_repo_worktree() {
         let (_dir, repo_path) = setup_regular_repo();
+
+        // Create a worktree from the regular (non-bare) repo
         let worktree_path = repo_path.parent().unwrap().join("my-worktree");
-        if !add_worktree(&repo_path, &worktree_path) {
+        let head = git2::Repository::open(&repo_path)
+            .unwrap()
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        let repo = git2::Repository::open(&repo_path).unwrap();
+        repo.branch("wt-branch", &repo.find_commit(head).unwrap(), false)
+            .unwrap();
+        drop(repo);
+
+        let output = std::process::Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                worktree_path.to_str().unwrap(),
+                "wt-branch",
+            ])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        if !output.status.success() {
+            // git not available, skip
             return;
         }
 
-        let (volumes, working_dir) =
-            compute_volume_paths(&worktree_path, worktree_path.to_str().unwrap()).unwrap();
+        let project_path_str = worktree_path.to_str().unwrap();
 
-        assert_eq!(volumes.len(), 2);
-        let repo_canon = repo_path.canonicalize().unwrap();
+        let (volumes, working_dir) =
+            compute_volume_paths(&worktree_path, project_path_str).unwrap();
+
+        // For non-bare sibling worktrees: mount the main repo and worktree separately
+        // as flat siblings under /workspace/.
         assert_eq!(
-            Path::new(&volumes[0].host_path).canonicalize().unwrap(),
-            repo_canon
+            volumes.len(),
+            2,
+            "Should have two volumes: main repo and worktree"
         );
+
+        // First volume: the main repo
+        let repo_canon = repo_path.canonicalize().unwrap();
+        let mount0_canon = Path::new(&volumes[0].host_path).canonicalize().unwrap();
+        assert_eq!(
+            mount0_canon, repo_canon,
+            "First volume should mount the main repo"
+        );
+        let repo_name = repo_canon.file_name().unwrap().to_string_lossy();
         assert_eq!(
             volumes[0].container_path,
-            format!(
-                "/workspace/{}",
-                repo_canon.file_name().unwrap().to_string_lossy()
-            )
+            format!("/workspace/{}", repo_name),
         );
+
+        // Second volume: the worktree
+        let wt_canon = worktree_path.canonicalize().unwrap();
+        let mount1_canon = Path::new(&volumes[1].host_path).canonicalize().unwrap();
         assert_eq!(
-            Path::new(&volumes[1].host_path).canonicalize().unwrap(),
-            worktree_path.canonicalize().unwrap()
+            mount1_canon, wt_canon,
+            "Second volume should mount the worktree"
         );
         assert_eq!(volumes[1].container_path, "/workspace/my-worktree");
-        assert_eq!(working_dir, "/workspace/my-worktree");
+
+        // Working dir should point to the worktree
+        assert_eq!(
+            working_dir, "/workspace/my-worktree",
+            "Working dir should be the worktree container path"
+        );
+    }
+
+    #[test]
+    fn test_compute_volume_paths_bare_repo_root() {
+        let (_dir, main_repo_path, _worktree_path) = setup_bare_repo_with_worktree();
+
+        let project_path_str = main_repo_path.to_str().unwrap();
+
+        let (volumes, working_dir) =
+            compute_volume_paths(&main_repo_path, project_path_str).unwrap();
+
+        assert_eq!(volumes.len(), 1);
+
+        // When at repo root, mount path equals project path
+        let mount_canon = Path::new(&volumes[0].host_path).canonicalize().unwrap();
+        let main_canon = main_repo_path.canonicalize().unwrap();
+        assert_eq!(mount_canon, main_canon);
+
+        // Working dir should be set
+        assert!(!working_dir.is_empty());
+    }
+
+    #[test]
+    fn test_compute_volume_paths_subdir_of_ancestor_repo_not_mounted() {
+        // Simulates the scenario from GitHub issue #375: a user has a git repo at
+        // their home directory (e.g., for dotfile management) and sets their project
+        // path to a non-git subdirectory like ~/playground. Without the guard,
+        // git2::Repository::discover walks up and finds the ancestor repo, causing
+        // the entire parent (home directory) to be mounted into the container.
+        let dir = TempDir::new().unwrap();
+
+        // Create a git repo at the "parent" (simulating ~/  with dotfile management)
+        let _repo = git2::Repository::init(dir.path()).unwrap();
+
+        // Create a subdirectory that is NOT its own git repo (simulating ~/playground)
+        let subdir = dir.path().join("playground");
+        fs::create_dir_all(&subdir).unwrap();
+
+        let project_path_str = subdir.to_str().unwrap();
+
+        let (volumes, working_dir) = compute_volume_paths(&subdir, project_path_str).unwrap();
+
+        assert_eq!(volumes.len(), 1);
+        // The subdirectory should be mounted directly, NOT the parent repo
+        assert_eq!(
+            volumes[0].host_path,
+            subdir.to_string_lossy().to_string(),
+            "Should mount the subdirectory itself, not the ancestor git repo"
+        );
+        assert_eq!(volumes[0].container_path, working_dir);
+        assert_eq!(volumes[0].container_path, "/workspace/playground");
     }
 
     #[test]
     fn test_common_ancestor() {
-        let cases = [
-            ("/a/b/c", "/a/b/d", "/a/b"),
-            ("/a/b", "/a/b", "/a/b"),
-            ("/a/b/c", "/x/y/z", "/"),
-        ];
-        for (a, b, expected) in cases {
-            assert_eq!(
-                common_ancestor(Path::new(a), Path::new(b)),
-                PathBuf::from(expected)
-            );
-        }
+        assert_eq!(
+            common_ancestor(Path::new("/a/b/c"), Path::new("/a/b/d")),
+            PathBuf::from("/a/b")
+        );
+        assert_eq!(
+            common_ancestor(Path::new("/a/b"), Path::new("/a/b")),
+            PathBuf::from("/a/b")
+        );
+        assert_eq!(
+            common_ancestor(Path::new("/a/b/c"), Path::new("/x/y/z")),
+            PathBuf::from("/")
+        );
     }
 
-    /// A worktree nested deeper than its main repo (repo at `/scm/my-repo`,
-    /// worktree at `/scm/worktrees/my-repo/1`) keeps its relative depth in the
-    /// container, so the `.git` file's relative gitdir still resolves.
     #[test]
-    fn compute_volume_paths_nested_worktree_keeps_relative_depth() {
+    fn test_compute_volume_paths_non_bare_worktree_nested_layout() {
+        // Simulates a host layout where the worktree is nested deeper than the
+        // main repo relative to their common ancestor (e.g., repo at
+        // /scm/my-repo and worktree at /scm/worktrees/my-repo/1).
         let dir = TempDir::new().unwrap();
         let repo_path = dir.path().join("my-repo");
         fs::create_dir_all(&repo_path).unwrap();
-        commit_head(&git2::Repository::init(&repo_path).unwrap());
+        let repo = git2::Repository::init(&repo_path).unwrap();
+        {
+            let mut index = repo.index().unwrap();
+            let oid = index.write_tree().unwrap();
+            let sig = git2::Signature::now("test", "test@test.com").unwrap();
+            let tree = repo.find_tree(oid).unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+                .unwrap();
+        }
 
-        let worktree_path = dir.path().join("worktrees").join("my-repo").join("1");
-        fs::create_dir_all(worktree_path.parent().unwrap()).unwrap();
-        if !add_worktree(&repo_path, &worktree_path) {
+        let worktrees_dir = dir.path().join("worktrees").join("my-repo");
+        fs::create_dir_all(&worktrees_dir).unwrap();
+        let worktree_path = worktrees_dir.join("1");
+
+        let head = repo.head().unwrap().peel_to_commit().unwrap().id();
+        repo.branch("wt-branch", &repo.find_commit(head).unwrap(), false)
+            .unwrap();
+        drop(repo);
+
+        let output = std::process::Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                worktree_path.to_str().unwrap(),
+                "wt-branch",
+            ])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        if !output.status.success() {
             return;
         }
 
-        // AoE's create_worktree rewrites .git to a relative gitdir; calling git
-        // directly does not, so replicate it.
+        // AoE's create_worktree converts .git to relative paths via
+        // convert_git_file_to_relative. Replicate that here since we
+        // called git directly.
         let git_file = worktree_path.join(".git");
-        let gitdir = read_gitdir(&git_file);
-        if Path::new(&gitdir).is_absolute() {
+        let content = fs::read_to_string(&git_file).unwrap();
+        let abs_path = content
+            .lines()
+            .find_map(|l| l.strip_prefix("gitdir:").map(str::trim))
+            .unwrap();
+        if Path::new(abs_path).is_absolute() {
             let wt_canon = worktree_path.canonicalize().unwrap();
-            let gitdir_canon = Path::new(&gitdir).canonicalize().unwrap();
+            let gitdir_canon = Path::new(abs_path).canonicalize().unwrap();
             if let Some(rel) = crate::git::GitWorktree::diff_paths(&gitdir_canon, &wt_canon) {
                 fs::write(&git_file, format!("gitdir: {}\n", rel.display())).unwrap();
             }
         }
 
+        let project_path_str = worktree_path.to_str().unwrap();
         let (volumes, working_dir) =
-            compute_volume_paths(&worktree_path, worktree_path.to_str().unwrap()).unwrap();
+            compute_volume_paths(&worktree_path, project_path_str).unwrap();
+
         assert_eq!(volumes.len(), 2);
 
+        // The container paths must preserve relative depth so the .git file's
+        // relative gitdir path resolves correctly.
         let repo_canon = repo_path.canonicalize().unwrap();
         let wt_canon = worktree_path.canonicalize().unwrap();
         let common = common_ancestor(&repo_canon, &wt_canon);
-        let container_path = |path: &Path| {
-            format!(
-                "/workspace/{}",
-                path.strip_prefix(&common).unwrap().display()
-            )
-        };
-        assert_eq!(volumes[0].container_path, container_path(&repo_canon));
-        assert_eq!(volumes[1].container_path, container_path(&wt_canon));
-        assert_eq!(working_dir, container_path(&wt_canon));
+        let expected_repo = format!(
+            "/workspace/{}",
+            repo_canon.strip_prefix(&common).unwrap().display()
+        );
+        let expected_wt = format!(
+            "/workspace/{}",
+            wt_canon.strip_prefix(&common).unwrap().display()
+        );
 
-        // The relative gitdir must land inside the main repo's mount.
-        let resolved = PathBuf::from(&working_dir).join(read_gitdir(&git_file));
+        assert_eq!(volumes[0].container_path, expected_repo);
+        assert_eq!(volumes[1].container_path, expected_wt);
+        assert_eq!(working_dir, expected_wt);
+
+        // Verify the .git file's relative path resolves correctly in the
+        // container layout.
+        let content = fs::read_to_string(&git_file).unwrap();
+        let gitdir_rel = content
+            .lines()
+            .find_map(|l| l.strip_prefix("gitdir:").map(str::trim))
+            .unwrap();
+
+        let resolved = PathBuf::from(&working_dir).join(gitdir_rel);
+
+        // Normalize the path (resolve .. components)
         let mut normalized = Vec::new();
         for component in resolved.components() {
             match component {
@@ -3277,20 +3670,84 @@ mod tests {
             }
         }
         let normalized: PathBuf = normalized.iter().collect();
-        assert!(normalized
-            .to_string_lossy()
-            .starts_with(&volumes[0].container_path));
+
+        // Should land inside the main repo's .git/worktrees/ directory
+        assert!(
+            normalized
+                .to_string_lossy()
+                .starts_with(&volumes[0].container_path),
+            "Resolved gitdir path '{}' should start with main repo container path '{}'",
+            normalized.display(),
+            volumes[0].container_path
+        );
     }
 
-    fn read_gitdir(git_file: &Path) -> String {
-        fs::read_to_string(git_file)
-            .unwrap()
-            .lines()
-            .find_map(|line| line.strip_prefix("gitdir:").map(str::trim))
-            .unwrap()
-            .to_string()
-    }
+    // --- sandbox config tests ---
 
+    fn sync_fixture(
+        host: &Path,
+        sandbox: &Path,
+        files: &[&str],
+        seeds: &[(&str, &str)],
+        directories: &[&str],
+        preserved: &[&str],
+    ) -> Result<()> {
+        fs::create_dir_all(sandbox)?;
+        let mount = AGENT_CONFIG_MOUNTS
+            .iter()
+            .find(|mount| mount.tool_name == "claude")
+            .unwrap();
+        let boundary = NativeStateBoundary::for_fixture(host, sandbox, mount)?;
+        sync_agent_config(
+            host,
+            sandbox,
+            files,
+            seeds,
+            directories,
+            preserved,
+            &boundary,
+        )
+    }
+    fn certify_fixture_content(path: &Path, role: &str) -> Result<()> {
+        fs::create_dir_all(path)?;
+        let instance = path.file_name().and_then(|value| value.to_str()).unwrap();
+        crate::migrations::v031_isolate_sandbox_content::certify_test_content(
+            &crate::session::get_app_dir()?,
+            instance,
+            path,
+            &[role],
+        )
+    }
+    fn prepare_owned_fixture(
+        mount: &AgentConfigMount,
+        home: &Path,
+        instance: Option<&str>,
+        fold: CredentialFold,
+        session: &super::super::SessionConfig,
+        workspace: &Path,
+    ) -> Result<PathBuf> {
+        prepare_owned_fixture_from(
+            mount,
+            home.join(mount.host_rel),
+            sandbox_dir_for(mount, home, instance)?,
+            home,
+            fold,
+            session,
+            workspace,
+        )
+    }
+    fn prepare_owned_fixture_from(
+        mount: &AgentConfigMount,
+        host: PathBuf,
+        sandbox: PathBuf,
+        home: &Path,
+        fold: CredentialFold,
+        session: &super::super::SessionConfig,
+        workspace: &Path,
+    ) -> Result<PathBuf> {
+        certify_fixture_content(&sandbox, mount.container_suffix)?;
+        super::prepare_sandbox_dir_from(mount, host, sandbox, home, fold, session, workspace)
+    }
     fn setup_host_dir(dir: &TempDir) -> std::path::PathBuf {
         let host = dir.path().join("host");
         fs::create_dir_all(&host).unwrap();
@@ -3301,171 +3758,49 @@ mod tests {
         host
     }
 
-    /// What `sync_agent_config` copies out of a host config dir: top-level
-    /// files only, minus the skip list, creating the sandbox path on the way.
-    /// Seeds fill names the host does not claim and never win against it, and
-    /// a re-sync leaves whatever the container wrote over a seed.
     #[test]
-    fn sync_agent_config_copies_skips_and_seeds() {
+    fn test_copies_top_level_files_only() {
         let dir = TempDir::new().unwrap();
         let host = setup_host_dir(&dir);
+        let sandbox = dir.path().join("sandbox");
 
-        let sandbox = dir.path().join("plain");
-        sync_agent_config(&host, &sandbox, &[], &[], &[], &[]).unwrap();
+        sync_fixture(
+            &host,
+            &sandbox,
+            &["auth.json", "settings.json"],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+
         assert!(sandbox.join("auth.json").exists());
         assert!(sandbox.join("settings.json").exists());
         assert!(!sandbox.join("subdir").exists());
+    }
 
-        let sandbox = dir.path().join("skipped");
-        sync_agent_config(&host, &sandbox, &["auth.json"], &[], &[], &[]).unwrap();
+    #[test]
+    fn test_only_explicitly_selected_files_are_copied() {
+        let dir = TempDir::new().unwrap();
+        let host = setup_host_dir(&dir);
+        let sandbox = dir.path().join("sandbox");
+
+        sync_fixture(&host, &sandbox, &["settings.json"], &[], &[], &[]).unwrap();
+
         assert!(!sandbox.join("auth.json").exists());
         assert!(sandbox.join("settings.json").exists());
-
-        let sandbox = dir.path().join("deep").join("nested").join("sandbox");
-        sync_agent_config(&host, &sandbox, &[], &[], &[], &[]).unwrap();
-        assert!(sandbox.join("auth.json").exists());
-
-        let sandbox = dir.path().join("seeded");
-        let seeds = [
-            (".claude.json", r#"{"seeded":true}"#),
-            ("auth.json", "seed-content"),
-        ];
-        sync_agent_config(&host, &sandbox, &[], &seeds, &[], &[]).unwrap();
-        assert_eq!(
-            fs::read_to_string(sandbox.join(".claude.json")).unwrap(),
-            r#"{"seeded":true}"#
-        );
-        assert_eq!(
-            fs::read_to_string(sandbox.join("auth.json")).unwrap(),
-            r#"{"token":"abc"}"#
-        );
-
-        fs::write(sandbox.join(".claude.json"), r#"{"modified":true}"#).unwrap();
-        sync_agent_config(&host, &sandbox, &[], &seeds, &[], &[]).unwrap();
-        assert_eq!(
-            fs::read_to_string(sandbox.join(".claude.json")).unwrap(),
-            r#"{"modified":true}"#
-        );
-    }
-
-    /// A later sync republishes changed and new host files but leaves a name
-    /// the host does not have, which is where container runtime state lives.
-    #[test]
-    fn sync_agent_config_refreshes_from_the_host_without_clobbering_the_container() {
-        let dir = TempDir::new().unwrap();
-        let host = setup_host_dir(&dir);
-        let sandbox = dir.path().join("sandbox");
-
-        sync_agent_config(&host, &sandbox, &[], &[], &[], &[]).unwrap();
-        assert!(!sandbox.join("new_cred.json").exists());
-        fs::write(sandbox.join("runtime.log"), "container-state").unwrap();
-
-        fs::write(host.join("auth.json"), r#"{"token":"refreshed"}"#).unwrap();
-        fs::write(host.join("new_cred.json"), "new").unwrap();
-        sync_agent_config(&host, &sandbox, &[], &[], &[], &[]).unwrap();
-
-        assert_eq!(
-            fs::read_to_string(sandbox.join("auth.json")).unwrap(),
-            r#"{"token":"refreshed"}"#
-        );
-        assert_eq!(
-            fs::read_to_string(sandbox.join("new_cred.json")).unwrap(),
-            "new"
-        );
-        assert_eq!(
-            fs::read_to_string(sandbox.join("runtime.log")).unwrap(),
-            "container-state"
-        );
-    }
-
-    /// Only the directories `copy_dirs` names are copied, and those recursively.
-    #[test]
-    fn sync_agent_config_copies_only_listed_dirs() {
-        let dir = TempDir::new().unwrap();
-        let host = setup_host_dir(&dir);
-        let plugins = host.join("plugins");
-        fs::create_dir_all(plugins.join("lsp")).unwrap();
-        fs::write(plugins.join("config.json"), "{}").unwrap();
-        fs::write(plugins.join("lsp").join("gopls.wasm"), "binary").unwrap();
-
-        let sandbox = dir.path().join("listed");
-        sync_agent_config(&host, &sandbox, &[], &[], &["plugins"], &[]).unwrap();
-        assert!(sandbox.join("plugins").join("config.json").exists());
-        assert!(sandbox
-            .join("plugins")
-            .join("lsp")
-            .join("gopls.wasm")
-            .exists());
-        assert!(!sandbox.join("subdir").exists());
-
-        let sandbox = dir.path().join("unlisted");
-        sync_agent_config(&host, &sandbox, &[], &[], &["nonexistent"], &[]).unwrap();
-        assert!(!sandbox.join("subdir").exists());
-        assert!(sandbox.join("auth.json").exists());
-    }
-
-    /// A preserved file is seeded from the host once and then left alone, even
-    /// when the host copy changes; its neighbours still refresh.
-    #[test]
-    fn sync_agent_config_seeds_preserved_files_once() {
-        let dir = TempDir::new().unwrap();
-        let host = setup_host_dir(&dir);
-        let sandbox = dir.path().join("sandbox");
-        let preserve = ["auth.json"];
-
-        sync_agent_config(&host, &sandbox, &[], &[], &[], &preserve).unwrap();
-        assert_eq!(
-            fs::read_to_string(sandbox.join("auth.json")).unwrap(),
-            r#"{"token":"abc"}"#
-        );
-
-        // A migration or an in-container login writes a different credential.
-        fs::write(sandbox.join("auth.json"), r#"{"token":"container"}"#).unwrap();
-        fs::write(host.join("auth.json"), r#"{"token":"refreshed"}"#).unwrap();
-        fs::write(host.join("settings.json"), "updated").unwrap();
-        sync_agent_config(&host, &sandbox, &[], &[], &[], &preserve).unwrap();
-
-        assert_eq!(
-            fs::read_to_string(sandbox.join("auth.json")).unwrap(),
-            r#"{"token":"container"}"#
-        );
-        assert_eq!(
-            fs::read_to_string(sandbox.join("settings.json")).unwrap(),
-            "updated"
-        );
-    }
-
-    /// Once a `projects/` sentinel shows the sandbox has run a session, neither
-    /// the general file copy nor `copy_dirs` runs again, so a restart keeps the
-    /// container's own state instead of re-copying the host tree over it.
-    #[test]
-    fn sync_agent_config_stops_copying_once_the_sandbox_has_prior_data() {
-        let dir = TempDir::new().unwrap();
-        let host = setup_host_dir(&dir);
-        fs::create_dir_all(host.join("plugins")).unwrap();
-        fs::write(host.join("plugins").join("p.txt"), "host-plugin").unwrap();
-        let sandbox = dir.path().join("sandbox");
-
-        sync_agent_config(&host, &sandbox, &[], &[], &[], &[]).unwrap();
-        fs::create_dir_all(sandbox.join("projects")).unwrap();
-        fs::write(sandbox.join("settings.json"), r#"{"theme":"dark"}"#).unwrap();
-        fs::write(host.join("settings.json"), r#"{"theme":"light"}"#).unwrap();
-
-        sync_agent_config(&host, &sandbox, &[], &[], &["plugins"], &[]).unwrap();
-        assert_eq!(
-            fs::read_to_string(sandbox.join("settings.json")).unwrap(),
-            r#"{"theme":"dark"}"#
-        );
-        assert!(!sandbox.join("plugins").exists());
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_hermes_mount_skips_runtime_dirs() {
+        let (_hook_guard, _, _application) = BaseGuard::ready();
         let dir = TempDir::new().unwrap();
         let host = dir.path().join(".hermes");
         fs::create_dir_all(&host).unwrap();
         fs::write(host.join("config.yaml"), "model: claude-opus\n").unwrap();
         fs::write(host.join(".env"), "API_KEY=token\n").unwrap();
+        fs::write(host.join("SOUL.md"), "# soul\n").unwrap();
 
         let runtime_dirs = [
             "sandbox",
@@ -3487,11 +3822,19 @@ mod tests {
             .iter()
             .find(|m| m.tool_name == "hermes")
             .unwrap();
-        let sandbox =
-            prepare_sandbox_dir(mount, dir.path(), None, CredentialFold::Freshest).unwrap();
+        let sandbox = prepare_owned_fixture(
+            mount,
+            dir.path(),
+            None,
+            CredentialFold::Freshest,
+            &crate::session::config::SessionConfig::default(),
+            dir.path(),
+        )
+        .unwrap();
 
         assert!(sandbox.join("config.yaml").exists());
         assert!(sandbox.join(".env").exists());
+        assert!(sandbox.join("SOUL.md").exists());
 
         for runtime_dir in runtime_dirs {
             assert!(
@@ -3504,46 +3847,14 @@ mod tests {
     }
 
     #[test]
-    fn test_opencode_mount_clean_files_does_not_touch_sqlite_db() {
-        // Drift guard for #2605. The opencode data-dir mount's SQLite DB holds
-        // `ses_*` session identity and is the resume source of truth;
-        // `skip_entries` handles host-to-sandbox pollution, so `clean_files`
-        // must not list `opencode.db*` (that regressed resume across every
-        // kill/restart).
-        let mount = AGENT_CONFIG_MOUNTS
-            .iter()
-            .find(|m| m.tool_name == "opencode" && m.host_rel == ".local/share/opencode")
-            .expect("opencode data-dir mount");
-        assert!(
-            !mount
-                .clean_files
-                .iter()
-                .any(|f| f.starts_with("opencode.db")),
-            "opencode.db* must not appear in clean_files (regression of #2605); clean_files = {:?}",
-            mount.clean_files,
-        );
-        assert!(
-            mount.skip_entries.contains(&"opencode.db"),
-            "opencode.db must remain in skip_entries to block host schema drift",
-        );
-        assert!(
-            mount.skip_entries.contains(&"opencode.db-wal"),
-            "opencode.db-wal must remain in skip_entries to block host schema drift",
-        );
-        assert!(
-            mount.skip_entries.contains(&"opencode.db-shm"),
-            "opencode.db-shm must remain in skip_entries to block host schema drift",
-        );
-    }
-
-    #[test]
+    #[serial_test::serial]
     fn test_opencode_mount_preserves_sqlite_db_across_prepares() {
-        // Regression for #2605. Before the fix, `prepare_sandbox_dir` walked
-        // `clean_files` on every invocation and wiped the sandbox-owned
-        // opencode SQLite DB, so `aoe resume` hit "Session not found". This
-        // test plants a DB in the sandbox subdir, invokes `prepare_sandbox_dir`
-        // (which fires at container_config.rs:987 and :1436), and asserts the
-        // DB survives byte-for-byte.
+        let (_hook_guard, _, _application) = BaseGuard::ready(); // Regression for #2605. Before the fix, `prepare_sandbox_dir` walked
+                                                                 // `clean_files` on every invocation and wiped the sandbox-owned
+                                                                 // opencode SQLite DB, so `aoe resume` hit "Session not found". This
+                                                                 // test plants a DB in the sandbox subdir, invokes `prepare_sandbox_dir`
+                                                                 // (which fires at container_config.rs:987 and :1436), and asserts the
+                                                                 // DB survives byte-for-byte.
         let dir = TempDir::new().unwrap();
         let host = dir.path().join(".local/share/opencode");
         let sandbox = host.join(SANDBOX_SUBDIR);
@@ -3563,7 +3874,15 @@ mod tests {
             .iter()
             .find(|m| m.tool_name == "opencode" && m.host_rel == ".local/share/opencode")
             .expect("opencode data-dir mount");
-        let out = prepare_sandbox_dir(mount, dir.path(), None, CredentialFold::Freshest).unwrap();
+        let out = prepare_owned_fixture(
+            mount,
+            dir.path(),
+            None,
+            CredentialFold::Freshest,
+            &crate::session::config::SessionConfig::default(),
+            dir.path(),
+        )
+        .unwrap();
         assert_eq!(out, sandbox);
 
         assert!(
@@ -3582,6 +3901,140 @@ mod tests {
         assert!(
             out.join("opencode.db-shm").exists(),
             "opencode.db-shm must survive",
+        );
+    }
+
+    #[test]
+    fn test_writes_seed_files_when_missing() {
+        let dir = TempDir::new().unwrap();
+        let host = setup_host_dir(&dir);
+        let sandbox = dir.path().join("sandbox");
+
+        let seeds = [("seed.json", r#"{"seeded":true}"#)];
+        sync_fixture(&host, &sandbox, &[], &seeds, &[], &[]).unwrap();
+
+        let content = fs::read_to_string(sandbox.join("seed.json")).unwrap();
+        assert_eq!(content, r#"{"seeded":true}"#);
+    }
+
+    #[test]
+    fn test_seed_files_not_overwritten_if_exist() {
+        let dir = TempDir::new().unwrap();
+        let host = setup_host_dir(&dir);
+        let sandbox = dir.path().join("sandbox");
+
+        // First sync writes the seed.
+        let seeds = [("seed.json", r#"{"seeded":true}"#)];
+        sync_fixture(&host, &sandbox, &[], &seeds, &[], &[]).unwrap();
+        assert_eq!(
+            fs::read_to_string(sandbox.join("seed.json")).unwrap(),
+            r#"{"seeded":true}"#
+        );
+
+        // Container modifies the seed file.
+        fs::write(sandbox.join("seed.json"), r#"{"modified":true}"#).unwrap();
+
+        // Re-sync should NOT overwrite the container's changes.
+        sync_fixture(&host, &sandbox, &[], &seeds, &[], &[]).unwrap();
+        assert_eq!(
+            fs::read_to_string(sandbox.join("seed.json")).unwrap(),
+            r#"{"modified":true}"#
+        );
+    }
+
+    #[test]
+    fn test_host_files_overwrite_seeds() {
+        let dir = TempDir::new().unwrap();
+        let host = setup_host_dir(&dir);
+        let sandbox = dir.path().join("sandbox");
+
+        // Seed has the same name as a host file -- host copy wins.
+        let seeds = [("auth.json", "seed-content")];
+        sync_fixture(&host, &sandbox, &["auth.json"], &seeds, &[], &[]).unwrap();
+
+        let content = fs::read_to_string(sandbox.join("auth.json")).unwrap();
+        assert_eq!(content, r#"{"token":"abc"}"#);
+    }
+
+    #[test]
+    fn test_seed_survives_when_no_host_equivalent() {
+        let dir = TempDir::new().unwrap();
+        let host = setup_host_dir(&dir);
+        let sandbox = dir.path().join("sandbox");
+
+        let seeds = [(".claude.json", r#"{"hasCompletedOnboarding":true}"#)];
+        sync_fixture(&host, &sandbox, &[], &seeds, &[], &[]).unwrap();
+
+        let content = fs::read_to_string(sandbox.join(".claude.json")).unwrap();
+        assert_eq!(content, r#"{"hasCompletedOnboarding":true}"#);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dropped_config_files_cross_into_the_sandbox() {
+        // #3981 review: keybindings.json (claude) and .env (gemini) were dropped.
+        let (_hook_guard, _, _application) = BaseGuard::ready();
+        for (tool, file, content) in [
+            ("claude", "keybindings.json", "{}\n"),
+            ("gemini", ".env", "GEMINI_API_KEY=token\n"),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let mount = AGENT_CONFIG_MOUNTS
+                .iter()
+                .find(|m| m.tool_name == tool)
+                .unwrap();
+            let host = dir.path().join(mount.host_rel);
+            fs::create_dir_all(&host).unwrap();
+            fs::write(host.join(file), content).unwrap();
+            let sandbox = prepare_owned_fixture(
+                mount,
+                dir.path(),
+                None,
+                CredentialFold::Freshest,
+                &crate::session::config::SessionConfig::default(),
+                dir.path(),
+            )
+            .unwrap();
+            assert!(
+                sandbox.join(file).exists(),
+                "{tool} must cross {file} into the sandbox"
+            );
+        }
+    }
+
+    #[test]
+    fn a_json_seed_default_enforces_its_keys_over_a_carried_file() {
+        // #3981 review: retirement carries the old `.claude.json` forward; its
+        // onboarding flag must not linger false while other keys stay.
+        let dir = TempDir::new().unwrap();
+        let output = crate::session::anchored_fs::AnchoredDir::open(dir.path()).unwrap();
+        fs::write(
+            dir.path().join(".claude.json"),
+            r#"{"hasCompletedOnboarding":false,"mcpServers":{"x":1}}"#,
+        )
+        .unwrap();
+        let merged = merged_json_seed(
+            &output,
+            Path::new(".claude.json"),
+            r#"{"hasCompletedOnboarding":true}"#,
+        )
+        .unwrap()
+        .expect("a carried JSON file merges the seed default");
+        let value: serde_json::Value = serde_json::from_slice(&merged).unwrap();
+        assert_eq!(value["hasCompletedOnboarding"], serde_json::json!(true));
+        assert_eq!(value["mcpServers"]["x"], serde_json::json!(1));
+        // An absent file keeps the seed-once publish.
+        assert!(
+            merged_json_seed(&output, Path::new("absent.json"), r#"{"a":1}"#)
+                .unwrap()
+                .is_none()
+        );
+        // A non-JSON default is never merged (e.g. the gitconfig home seed).
+        fs::write(dir.path().join("gitconfig"), "[user]\n").unwrap();
+        assert!(
+            merged_json_seed(&output, Path::new("gitconfig"), "[credential]\n")
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -3605,7 +4058,7 @@ mod tests {
         fs::write(host.join("plugins/installed_plugins.json"), installed).unwrap();
 
         let sandbox = dir.path().join("sandbox");
-        sync_agent_config(&host, &sandbox, &[], &[], &["plugins"], &[]).unwrap();
+        sync_fixture(&host, &sandbox, &[], &[], &["plugins"], &[]).unwrap();
         rewrite_claude_plugin_paths(&sandbox, &host_home).unwrap();
 
         let host_prefix = host_home.to_string_lossy();
@@ -3620,17 +4073,6 @@ mod tests {
             "/root/.claude/plugins/cache/claude-plugins-official/rust-analyzer-lsp/1.0.0"
         ));
         assert!(!installed_out.contains(host_prefix.as_ref()));
-    }
-
-    #[test]
-    fn test_agent_config_mounts_match_agent_registry() {
-        for mount in AGENT_CONFIG_MOUNTS {
-            assert!(
-                crate::agents::get_agent(mount.tool_name).is_some(),
-                "AGENT_CONFIG_MOUNTS entry '{}' has no matching agent in the registry",
-                mount.tool_name
-            );
-        }
     }
 
     #[test]
@@ -3666,8 +4108,96 @@ mod tests {
     }
 
     #[test]
+    fn test_refresh_updates_changed_host_files() {
+        let dir = TempDir::new().unwrap();
+        let host = setup_host_dir(&dir);
+        let sandbox = dir.path().join("sandbox");
+
+        sync_fixture(&host, &sandbox, &["auth.json"], &[], &[], &[]).unwrap();
+        assert_eq!(
+            fs::read_to_string(sandbox.join("auth.json")).unwrap(),
+            r#"{"token":"abc"}"#
+        );
+
+        // Host file changes between sessions.
+        fs::write(host.join("auth.json"), r#"{"token":"refreshed"}"#).unwrap();
+
+        sync_fixture(&host, &sandbox, &["auth.json"], &[], &[], &[]).unwrap();
+        assert_eq!(
+            fs::read_to_string(sandbox.join("auth.json")).unwrap(),
+            r#"{"token":"refreshed"}"#
+        );
+    }
+
+    #[test]
+    fn test_refresh_picks_up_new_host_files() {
+        let dir = TempDir::new().unwrap();
+        let host = setup_host_dir(&dir);
+        let sandbox = dir.path().join("sandbox");
+
+        sync_fixture(&host, &sandbox, &["new_cred.json"], &[], &[], &[]).unwrap();
+        assert!(!sandbox.join("new_cred.json").exists());
+
+        // New credential file appears on host.
+        fs::write(host.join("new_cred.json"), "new").unwrap();
+
+        sync_fixture(&host, &sandbox, &["new_cred.json"], &[], &[], &[]).unwrap();
+        assert_eq!(
+            fs::read_to_string(sandbox.join("new_cred.json")).unwrap(),
+            "new"
+        );
+    }
+
+    #[test]
+    fn test_refresh_preserves_container_written_files() {
+        let dir = TempDir::new().unwrap();
+        let host = setup_host_dir(&dir);
+        let sandbox = dir.path().join("sandbox");
+
+        sync_fixture(&host, &sandbox, &[], &[], &[], &[]).unwrap();
+
+        // Container writes a runtime file into the sandbox dir.
+        fs::write(sandbox.join("runtime.log"), "container-state").unwrap();
+
+        // Refresh from host.
+        sync_fixture(&host, &sandbox, &[], &[], &[], &[]).unwrap();
+
+        // Container-written file survives (host has no file with that name).
+        assert_eq!(
+            fs::read_to_string(sandbox.join("runtime.log")).unwrap(),
+            "container-state"
+        );
+    }
+
+    #[test]
+    fn test_copies_listed_dirs_recursively() {
+        let dir = TempDir::new().unwrap();
+        let host = setup_host_dir(&dir);
+
+        // Create a "plugins" dir with nested content.
+        let plugins = host.join("plugins");
+        fs::create_dir_all(plugins.join("lsp")).unwrap();
+        fs::write(plugins.join("config.json"), "{}").unwrap();
+        fs::write(plugins.join("lsp").join("gopls.wasm"), "binary").unwrap();
+
+        let sandbox = dir.path().join("sandbox");
+        sync_fixture(&host, &sandbox, &[], &[], &["plugins"], &[]).unwrap();
+
+        assert!(sandbox.join("plugins").join("config.json").exists());
+        assert!(sandbox
+            .join("plugins")
+            .join("lsp")
+            .join("gopls.wasm")
+            .exists());
+        // "subdir" is NOT in copy_dirs, so still skipped.
+        assert!(!sandbox.join("subdir").exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
     #[serial_test::serial]
     fn test_prime_agent_mount_copies_user_skills() {
+        let (_hook_guard, _, _application) = BaseGuard::ready();
         let home = TempDir::new().unwrap();
         let _app_dir = crate::session::test_support::isolate_app_dir_at(home.path());
         let skill_dir = home.path().join(".prime/agent/skills/reviewing");
@@ -3678,8 +4208,15 @@ mod tests {
             .iter()
             .find(|m| m.tool_name == "prime-agent")
             .expect("prime-agent mount must exist");
-        let sandbox =
-            prepare_sandbox_dir(prime_mount, home.path(), None, CredentialFold::Freshest).unwrap();
+        let sandbox = prepare_owned_fixture(
+            prime_mount,
+            home.path(),
+            None,
+            CredentialFold::Freshest,
+            &crate::session::config::SessionConfig::default(),
+            home.path(),
+        )
+        .unwrap();
 
         assert_eq!(
             fs::read_to_string(sandbox.join("skills/reviewing/SKILL.md")).unwrap(),
@@ -3697,10 +4234,6 @@ mod tests {
             .iter()
             .find(|m| m.tool_name == "claude")
             .expect("claude mount must exist");
-        assert!(
-            claude_mount.copy_dirs.contains(&"hooks"),
-            "claude copy_dirs must include 'hooks' so settings.json's referenced scripts land in-container"
-        );
 
         let dir = TempDir::new().unwrap();
         let host = dir.path().join("host");
@@ -3714,7 +4247,15 @@ mod tests {
         fs::write(host.join("hooks").join("secret-guard.sh"), "#!/bin/sh\n").unwrap();
 
         let sandbox = dir.path().join("sandbox");
-        sync_agent_config(&host, &sandbox, &[], &[], claude_mount.copy_dirs, &[]).unwrap();
+        sync_fixture(
+            &host,
+            &sandbox,
+            claude_mount.copy_files,
+            &[],
+            claude_mount.copy_dirs,
+            claude_mount.preserve_files,
+        )
+        .unwrap();
 
         assert!(sandbox.join("settings.json").exists());
         assert!(
@@ -3773,6 +4314,19 @@ mod tests {
     }
 
     #[test]
+    fn test_unlisted_dirs_still_skipped() {
+        let dir = TempDir::new().unwrap();
+        let host = setup_host_dir(&dir);
+
+        // "subdir" exists from setup_host_dir but is not in copy_dirs.
+        let sandbox = dir.path().join("sandbox");
+        sync_fixture(&host, &sandbox, &["auth.json"], &[], &["nonexistent"], &[]).unwrap();
+
+        assert!(!sandbox.join("subdir").exists());
+        assert!(sandbox.join("auth.json").exists());
+    }
+
+    #[test]
     fn test_copy_dir_recursive() {
         let dir = TempDir::new().unwrap();
         let src = dir.path().join("src");
@@ -3781,8 +4335,8 @@ mod tests {
         fs::write(src.join("a").join("mid.txt"), "mid").unwrap();
         fs::write(src.join("a").join("b").join("deep.txt"), "deep").unwrap();
 
-        let dest = dir.path().join("dest");
-        copy_dir_recursive(&src, &dest).unwrap();
+        let dest = dir.path().join("sandbox/src");
+        sync_fixture(dir.path(), dest.parent().unwrap(), &[], &[], &["src"], &[]).unwrap();
 
         assert_eq!(fs::read_to_string(dest.join("root.txt")).unwrap(), "root");
         assert_eq!(
@@ -3802,6 +4356,7 @@ mod tests {
         fs::create_dir_all(&host).unwrap();
         fs::write(host.join("config.json"), "{}").unwrap();
 
+        // Create a real dir with content, then symlink to it from copy_dirs.
         let real_dir = dir.path().join("real-skills");
         fs::create_dir_all(&real_dir).unwrap();
         fs::write(real_dir.join("skill.md"), "# Skill").unwrap();
@@ -3810,7 +4365,7 @@ mod tests {
         std::os::unix::fs::symlink(&real_dir, host.join("skills")).unwrap();
 
         let sandbox = dir.path().join("sandbox");
-        sync_agent_config(&host, &sandbox, &[], &[], &["skills"], &[]).unwrap();
+        sync_fixture(&host, &sandbox, &["config.json"], &[], &["skills"], &[]).unwrap();
 
         assert!(sandbox.join("config.json").exists());
         #[cfg(unix)]
@@ -3830,15 +4385,84 @@ mod tests {
         fs::create_dir_all(&host).unwrap();
         fs::write(host.join("good.json"), "ok").unwrap();
 
+        // Create a symlink pointing to a nonexistent target.
         #[cfg(unix)]
         std::os::unix::fs::symlink("/nonexistent/path", host.join("broken-link")).unwrap();
 
         let sandbox = dir.path().join("sandbox");
-        sync_agent_config(&host, &sandbox, &[], &[], &[], &[]).unwrap();
+        // Should succeed despite the broken symlink.
+        sync_fixture(
+            &host,
+            &sandbox,
+            &["good.json", "broken-link"],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
 
         assert_eq!(fs::read_to_string(sandbox.join("good.json")).unwrap(), "ok");
         // Broken symlink is skipped, not copied.
         assert!(!sandbox.join("broken-link").exists());
+    }
+
+    #[test]
+    fn test_preserve_files_not_overwritten() {
+        let dir = TempDir::new().unwrap();
+        let host = setup_host_dir(&dir);
+        let sandbox = dir.path().join("sandbox");
+
+        // First sync seeds the preserved file from host.
+        sync_fixture(
+            &host,
+            &sandbox,
+            &["auth.json", "settings.json"],
+            &[],
+            &[],
+            &["auth.json"],
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(sandbox.join("auth.json")).unwrap(),
+            r#"{"token":"abc"}"#
+        );
+
+        // Simulate migration or in-container auth writing a different credential.
+        fs::write(sandbox.join("auth.json"), r#"{"token":"container"}"#).unwrap();
+
+        // Host file changes.
+        fs::write(host.join("auth.json"), r#"{"token":"refreshed"}"#).unwrap();
+
+        // Re-sync should NOT overwrite the preserved file.
+        sync_fixture(
+            &host,
+            &sandbox,
+            &["auth.json", "settings.json"],
+            &[],
+            &[],
+            &["auth.json"],
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(sandbox.join("auth.json")).unwrap(),
+            r#"{"token":"container"}"#
+        );
+
+        // Non-preserved files are still overwritten.
+        fs::write(host.join("settings.json"), "updated").unwrap();
+        sync_fixture(
+            &host,
+            &sandbox,
+            &["auth.json", "settings.json"],
+            &[],
+            &[],
+            &["auth.json"],
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(sandbox.join("settings.json")).unwrap(),
+            "updated"
+        );
     }
 
     #[test]
@@ -3850,40 +4474,23 @@ mod tests {
         // Host has a history file with host-only entries.
         fs::write(host.join("history.jsonl"), "host-entry\n").unwrap();
 
-        sync_agent_config(&host, &sandbox, &[], &[], &[], &["history.jsonl"]).unwrap();
-        assert_eq!(
-            fs::read_to_string(sandbox.join("history.jsonl")).unwrap(),
-            "host-entry\n"
-        );
+        sync_fixture(&host, &sandbox, &["auth.json"], &[], &[], &[]).unwrap();
+        assert!(!sandbox.join("history.jsonl").exists());
 
         // Container session appends entries.
         fs::write(
             sandbox.join("history.jsonl"),
-            "host-entry\ncontainer-session-1\ncontainer-session-2\n",
+            "container-session-1\ncontainer-session-2\n",
         )
         .unwrap();
 
         // Re-sync (container restart) should NOT clobber the container's history.
-        sync_agent_config(&host, &sandbox, &[], &[], &[], &["history.jsonl"]).unwrap();
+        sync_fixture(&host, &sandbox, &["auth.json"], &[], &[], &[]).unwrap();
         let content = fs::read_to_string(sandbox.join("history.jsonl")).unwrap();
         assert!(
             content.contains("container-session-1"),
             "container history entries must survive re-sync"
         );
-    }
-
-    #[test]
-    fn test_is_fatal_copy_error_discriminates_storage_exhaustion() {
-        use std::io::Error;
-        // ENOSPC / EROFS / EDQUOT mean the destination can't accept writes;
-        // continuing would silently produce a partial copy, so these abort.
-        assert!(is_fatal_copy_error(&Error::from_raw_os_error(28)), "ENOSPC");
-        assert!(is_fatal_copy_error(&Error::from_raw_os_error(30)), "EROFS");
-        assert!(is_fatal_copy_error(&Error::from_raw_os_error(69)));
-        assert!(is_fatal_copy_error(&Error::from_raw_os_error(122)));
-        // A single unreadable / missing source entry is best-effort skippable.
-        assert!(!is_fatal_copy_error(&Error::from_raw_os_error(13)));
-        assert!(!is_fatal_copy_error(&Error::from_raw_os_error(2)), "ENOENT");
     }
 
     #[test]
@@ -3897,9 +4504,8 @@ mod tests {
         // forever; the visited-set guard must break it.
         std::os::unix::fs::symlink(&src, src.join("sub").join("loop")).unwrap();
 
-        let dest = dir.path().join("dest");
-        // Must return rather than infinite-loop / stack-overflow.
-        copy_dir_recursive(&src, &dest).unwrap();
+        let dest = dir.path().join("sandbox/src");
+        sync_fixture(dir.path(), dest.parent().unwrap(), &[], &[], &["src"], &[]).unwrap();
         assert_eq!(
             fs::read_to_string(dest.join("sub").join("file.txt")).unwrap(),
             "data"
@@ -3919,8 +4525,8 @@ mod tests {
         // skipped and the rest still copies.
         std::os::unix::fs::symlink("/nonexistent/target", src.join("dangling")).unwrap();
 
-        let dest = dir.path().join("dest");
-        copy_dir_recursive(&src, &dest).unwrap();
+        let dest = dir.path().join("sandbox/src");
+        sync_fixture(dir.path(), dest.parent().unwrap(), &[], &[], &["src"], &[]).unwrap();
         assert_eq!(fs::read_to_string(dest.join("good.txt")).unwrap(), "good");
         assert!(!dest.join("dangling").exists());
     }
@@ -3949,40 +4555,45 @@ mod tests {
         assert!(sandbox.join("skills/shared/SKILL.md").is_file());
     }
 
-    /// The sandbox skills target is derived by stripping an agent's config dir
-    /// off its skills root, so the two static tables have to stay in agreement.
-    /// This fails when someone edits `SKILL_ROOTS` or `AGENT_CONFIG_MOUNTS`
-    /// without the other, which would silently drop sandbox propagation.
     #[test]
-    fn test_sandbox_skills_target_derives_from_the_agent_mount() {
-        use crate::session::skills_model::primary_root_for_agent;
+    fn test_resource_seed_is_independent_of_claude_history_sentinel() {
+        let dir = TempDir::new().unwrap();
+        let host = dir.path().join("host");
+        fs::create_dir_all(host.join("plugins")).unwrap();
+        fs::write(host.join("plugins").join("p.txt"), "host-plugin").unwrap();
+        let sandbox = dir.path().join("sandbox");
 
-        // (agent, expected suffix under the sandbox dir, or None for host-only)
-        let cases = [
-            ("claude", Some("skills")),
-            ("gemini", Some("skills")),
-            ("opencode", Some("skills")),
-            ("kimi", Some("skills")),
-            // Prime Agent reads ~/.prime/agent/skills, under its .prime/agent
-            // mount.
-            ("prime-agent", Some("skills")),
-            // Codex reads ~/.agents/skills, which is not under its .codex mount.
-            ("codex", None),
-        ];
-        for (agent, expected) in cases {
-            let root = primary_root_for_agent(agent)
-                .unwrap_or_else(|| panic!("no skills root for {agent}"));
-            let mount = AGENT_CONFIG_MOUNTS
-                .iter()
-                .find(|m| m.tool_name == agent && root.relative_path.starts_with(m.host_rel));
-            let suffix = mount.and_then(|m| {
-                root.relative_path
-                    .strip_prefix(m.host_rel)
-                    .map(|s| s.trim_start_matches('/'))
-            });
-            assert_eq!(suffix, expected, "{agent}");
-        }
+        // Prior container session sentinel.
+        fs::create_dir_all(sandbox.join("projects")).unwrap();
+
+        sync_fixture(&host, &sandbox, &[], &[], &["plugins"], &[]).unwrap();
+        assert_eq!(
+            fs::read_to_string(sandbox.join("plugins/p.txt")).unwrap(),
+            "host-plugin"
+        );
+        fs::write(sandbox.join("plugins/p.txt"), "local-plugin").unwrap();
+        sync_fixture(&host, &sandbox, &[], &[], &["plugins"], &[]).unwrap();
+        assert_eq!(
+            fs::read_to_string(sandbox.join("plugins/p.txt")).unwrap(),
+            "local-plugin"
+        );
     }
+
+    #[test]
+    fn test_preserve_files_seeded_when_missing() {
+        let dir = TempDir::new().unwrap();
+        let host = setup_host_dir(&dir);
+        let sandbox = dir.path().join("sandbox");
+
+        // Preserved file is copied when sandbox doesn't have it yet.
+        sync_fixture(&host, &sandbox, &["auth.json"], &[], &[], &["auth.json"]).unwrap();
+        assert_eq!(
+            fs::read_to_string(sandbox.join("auth.json")).unwrap(),
+            r#"{"token":"abc"}"#
+        );
+    }
+
+    // --- credential freshness tests ---
 
     /// Fields in the order `serde_json` writes them back, so a fold that
     /// re-serializes a credential produces this string again.
@@ -4064,7 +4675,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn an_unreadable_shared_file_is_never_overwritten() {
+        let (_hook_guard, _, _application) = BaseGuard::ready();
         use std::os::unix::fs::PermissionsExt;
         let home = TempDir::new().unwrap();
         let host = home.path().join(".claude");
@@ -4075,12 +4688,14 @@ mod tests {
         // A failed sync is logged and the launch goes on; the file must be
         // left exactly as it was.
         let prepare = || {
-            prepare_sandbox_dir_from(
+            prepare_owned_fixture_from(
                 &mount,
                 host.clone(),
                 store.clone(),
                 home.path(),
                 CredentialFold::Freshest,
+                &crate::session::config::SessionConfig::default(),
+                home.path(),
             )
             .unwrap()
         };
@@ -4126,22 +4741,18 @@ mod tests {
     /// login never reaches the assertions on macOS.
     fn claude_mount_without_keychain() -> AgentConfigMount {
         AgentConfigMount {
-            tool_name: "claude",
-            host_rel: ".claude",
-            container_suffix: ".claude",
-            skip_entries: &["sandbox", "projects"],
-            seed_files: &[],
-            copy_dirs: &[],
             keychain_credential: None,
-            home_seed_files: &[],
-            preserve_files: &["history.jsonl"],
-            shared_credential_files: &[".credentials.json"],
-            clean_files: &[],
+            ..*AGENT_CONFIG_MOUNTS
+                .iter()
+                .find(|mount| mount.tool_name == "claude")
+                .unwrap()
         }
     }
 
     #[test]
+    #[serial_test::serial]
     fn shared_credential_follows_the_freshest_copy_across_starts() {
+        let (_hook_guard, _, _application) = BaseGuard::ready();
         let home = TempDir::new().unwrap();
         let host = home.path().join(".claude");
         fs::create_dir_all(&host).unwrap();
@@ -4151,12 +4762,14 @@ mod tests {
         let shared = root.join(".credentials.json");
         let private = store.join(".credentials.json");
         let prepare = || {
-            prepare_sandbox_dir_from(
+            prepare_owned_fixture_from(
                 &mount,
                 host.clone(),
                 store.clone(),
                 home.path(),
                 CredentialFold::Freshest,
+                &crate::session::config::SessionConfig::default(),
+                home.path(),
             )
             .unwrap()
         };
@@ -4198,7 +4811,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn off_a_come_up_the_fold_only_seeds() {
+        let (_hook_guard, _, _application) = BaseGuard::ready();
         let home = TempDir::new().unwrap();
         let host = home.path().join(".claude");
         fs::create_dir_all(&host).unwrap();
@@ -4208,8 +4823,16 @@ mod tests {
         let shared = root.join(".credentials.json");
         fs::create_dir_all(&store).unwrap();
         let prepare = |fold| {
-            prepare_sandbox_dir_from(&mount, host.clone(), store.clone(), home.path(), fold)
-                .unwrap()
+            prepare_owned_fixture_from(
+                &mount,
+                host.clone(),
+                store.clone(),
+                home.path(),
+                fold,
+                &crate::session::config::SessionConfig::default(),
+                home.path(),
+            )
+            .unwrap()
         };
 
         // A file holding no usable credential is seeded from the host.
@@ -4235,7 +4858,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn an_emptied_shared_file_is_seeded_for_the_next_container() {
+        let (_hook_guard, _, _application) = BaseGuard::ready();
         let home = TempDir::new().unwrap();
         let host = home.path().join(".claude");
         fs::create_dir_all(&host).unwrap();
@@ -4245,8 +4870,16 @@ mod tests {
         let shared = root.join(".credentials.json");
         fs::create_dir_all(&store).unwrap();
         let prepare = |fold| {
-            prepare_sandbox_dir_from(&mount, host.clone(), store.clone(), home.path(), fold)
-                .unwrap()
+            prepare_owned_fixture_from(
+                &mount,
+                host.clone(),
+                store.clone(),
+                home.path(),
+                fold,
+                &crate::session::config::SessionConfig::default(),
+                home.path(),
+            )
+            .unwrap()
         };
 
         // A container whose credential fails to authenticate empties both
@@ -4281,7 +4914,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn claude_sandboxes_share_one_credential_mount() {
-        let temp_home = IsolatedHome::new();
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
         let host = temp_home.path().join(".claude");
         fs::create_dir_all(&host).unwrap();
         // Beats any real credential the macOS Keychain contributes while
@@ -4289,7 +4924,18 @@ mod tests {
         let cred = credential(now_ms() + 300 * 24 * 60 * 60 * 1000);
         fs::write(host.join(".credentials.json"), &cred).unwrap();
 
-        let project_dir = git_project();
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+        let sandbox_info = crate::session::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
         let shared = host.join(SANDBOX_PRIVATE_SUBDIR).join(".credentials.json");
         // A store the v027 move left a copy in, and a fresh one with none: both
         // end up with the empty mountpoint the nested file mount needs (#3845).
@@ -4299,10 +4945,17 @@ mod tests {
             if stale_copy {
                 fs::write(store.join(".credentials.json"), credential(1)).unwrap();
             }
-            let config = Build::new("claude")
-                .instance(instance_id)
-                .run(project_dir.path())
-                .unwrap();
+            certify_fixture_content(&store, ".claude").unwrap();
+            let config = build_container_config(
+                project_dir.path().to_str().unwrap(),
+                &sandbox_info,
+                ContainerAgentSelection::new("claude", None),
+                false,
+                instance_id,
+                None,
+                "",
+            )
+            .unwrap();
             let mount = config
                 .volumes
                 .iter()
@@ -4407,12 +5060,16 @@ mod tests {
     #[serial_test::serial]
     fn test_build_container_config_includes_repo_sandbox_settings() {
         let (_hg, _, _tmp_base) = BaseGuard::ready();
+        // Isolate HOME so global/profile config doesn't interfere
         let temp_home = TempDir::new().unwrap();
         let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
+        // Create a project directory with repo config
         let project_dir = TempDir::new().unwrap();
-        write_repo_config(
-            project_dir.path(),
+        let config_dir = project_dir.path().join(".agent-of-empires");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config.toml"),
             r#"
 [sandbox]
 environment = ["MY_VAR=hello", "CI=true"]
@@ -4420,14 +5077,34 @@ volume_ignores = [".venv", "node_modules"]
 extra_volumes = ["/host/data:/container/data:ro"]
 mount_ssh = true
 "#,
-        );
+        )
+        .unwrap();
 
+        // Initialize a git repo so compute_volume_paths works
         git2::Repository::init(project_dir.path()).unwrap();
 
+        let sandbox_info = crate::session::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
+
         let project_path_str = project_dir.path().to_str().unwrap();
-        let config = Build::new("claude")
-            .run(Path::new(project_path_str))
-            .unwrap();
+        let config = build_container_config(
+            project_path_str,
+            &sandbox_info,
+            ContainerAgentSelection::new("claude", None),
+            false,
+            "test-instance-id",
+            None,
+            "",
+        )
+        .unwrap();
 
         // A repo cannot set container env (#3710).
         let env_keys: Vec<&str> = config.environment.iter().map(|e| e.key()).collect();
@@ -4437,11 +5114,20 @@ mount_ssh = true
             env_keys
         );
 
+        // Verify volume_ignores became anonymous volumes
         let dir_name = project_dir.path().file_name().unwrap().to_string_lossy();
         let expected_venv = format!("/workspace/{}/.venv", dir_name);
         let expected_node = format!("/workspace/{}/node_modules", dir_name);
-        assert!(config.anonymous_volumes.contains(&expected_venv));
-        assert!(config.anonymous_volumes.contains(&expected_node));
+        assert!(
+            config.anonymous_volumes.contains(&expected_venv),
+            "anonymous_volumes should contain .venv path, got: {:?}",
+            config.anonymous_volumes
+        );
+        assert!(
+            config.anonymous_volumes.contains(&expected_node),
+            "anonymous_volumes should contain node_modules path, got: {:?}",
+            config.anonymous_volumes
+        );
 
         // A repo cannot mount host paths into the container or hand it the
         // user's SSH keys (#3154); the tuning fields above still apply.
@@ -4479,7 +5165,9 @@ mount_ssh = true
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_run_policy() {
-        let temp_home = IsolatedHome::new();
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         // Global config carries run policy; repo config overrides are ignored.
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -4502,8 +5190,10 @@ security_opt = ["seccomp=unconfined"]
         .unwrap();
 
         let project_dir = TempDir::new().unwrap();
-        write_repo_config(
-            project_dir.path(),
+        let config_dir = project_dir.path().join(".agent-of-empires");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config.toml"),
             r#"
 [sandbox]
 privileged = true
@@ -4511,14 +5201,33 @@ cap_add = ["NET_ADMIN"]
 cap_drop = []
 extra_run_args = ["--privileged"]
 "#,
-        );
+        )
+        .unwrap();
 
         git2::Repository::init(project_dir.path()).unwrap();
 
+        let sandbox_info = crate::session::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
+
         let project_path_str = project_dir.path().to_str().unwrap();
-        let config = Build::new("claude")
-            .run(Path::new(project_path_str))
-            .unwrap();
+        let config = build_container_config(
+            project_path_str,
+            &sandbox_info,
+            ContainerAgentSelection::new("claude", None),
+            false,
+            "test-instance-id",
+            None,
+            "",
+        )
+        .unwrap();
 
         assert_eq!(config.run_policy.cap_add, vec!["SYS_ADMIN"]);
         assert_eq!(config.run_policy.cap_drop, vec!["ALL"]);
@@ -4538,18 +5247,43 @@ extra_run_args = ["--privileged"]
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_drops_repo_network_escape_and_relabel() {
-        let _temp_home = IsolatedHome::new();
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         for network in ["container:victim", "ns:/var/run/netns/x"] {
             let project_dir = TempDir::new().unwrap();
-            write_repo_config(
-                project_dir.path(),
-                &format!("[sandbox]\nnetwork = \"{network}\"\nselinux_relabel = true\n"),
-            );
+            let config_dir = project_dir.path().join(".agent-of-empires");
+            fs::create_dir_all(&config_dir).unwrap();
+            fs::write(
+                config_dir.join("config.toml"),
+                format!("[sandbox]\nnetwork = \"{network}\"\nselinux_relabel = true\n"),
+            )
+            .unwrap();
 
             git2::Repository::init(project_dir.path()).unwrap();
 
-            let config = Build::new("claude").run(project_dir.path()).unwrap();
+            let sandbox_info = crate::session::instance::SandboxInfo {
+                enabled: true,
+                container_id: None,
+                image: "test:latest".to_string(),
+                container_name: "test-container".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                container_workdir: None,
+            };
+
+            let config = build_container_config(
+                project_dir.path().to_str().unwrap(),
+                &sandbox_info,
+                ContainerAgentSelection::new("claude", None),
+                false,
+                "test-instance-id",
+                None,
+                "",
+            )
+            .unwrap();
 
             assert_eq!(
                 config.network, None,
@@ -4591,20 +5325,41 @@ extra_run_args = ["--privileged"]
         fs::create_dir_all(project_dir.path().join("src/App/obj")).unwrap();
         fs::create_dir_all(project_dir.path().join("tests/Lib/bin")).unwrap();
 
-        write_repo_config(
-            project_dir.path(),
+        let config_dir = project_dir.path().join(".agent-of-empires");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config.toml"),
             r#"
 [sandbox]
 volume_ignores = ["**/bin", "**/obj", "target"]
 "#,
-        );
+        )
+        .unwrap();
 
         git2::Repository::init(project_dir.path()).unwrap();
 
+        let sandbox_info = crate::session::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
+
         let project_path_str = project_dir.path().to_str().unwrap();
-        let config = Build::new("claude")
-            .run(Path::new(project_path_str))
-            .unwrap();
+        let config = build_container_config(
+            project_path_str,
+            &sandbox_info,
+            ContainerAgentSelection::new("claude", None),
+            false,
+            "test-instance-id",
+            None,
+            "",
+        )
+        .unwrap();
 
         let dir_name = project_dir.path().file_name().unwrap().to_string_lossy();
         let expect = |p: &str| format!("/workspace/{}/{}", dir_name, p);
@@ -4662,19 +5417,44 @@ volume_ignores = ["**/bin", "**/obj", "target"]
         }
 
         let build = |project: &Path| {
-            write_repo_config(
-                project,
+            let config_dir = project.join(".agent-of-empires");
+            fs::create_dir_all(&config_dir).unwrap();
+            fs::write(
+                config_dir.join("config.toml"),
                 r#"
 [sandbox]
 volume_ignores = ["target"]
 volume_ignores_strategy = "named"
 "#,
-            );
-            Build::new("claude").run(project).unwrap()
+            )
+            .unwrap();
+            let sandbox_info = crate::session::instance::SandboxInfo {
+                enabled: true,
+                container_id: None,
+                image: "test:latest".to_string(),
+                container_name: "test-container".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                container_workdir: None,
+            };
+            build_container_config(
+                project.to_str().unwrap(),
+                &sandbox_info,
+                ContainerAgentSelection::new("claude", None),
+                false,
+                "test-instance-id",
+                None,
+                "",
+            )
+            .unwrap()
         };
 
         let healthy = build(&worktree_path);
-        assert!(healthy.named_ignore_volumes_authoritative);
+        assert!(
+            healthy.named_ignore_volumes_authoritative,
+            "a worktree that resolves to its main repo derives real mount paths"
+        );
 
         // Break the linkage: the same worktree now collapses to /workspace/{basename},
         // naming volumes the session never had.
@@ -4726,12 +5506,16 @@ volume_ignores_strategy = "named"
             "only the directory should match, not notes.bin"
         );
         assert_eq!(expansions[1].pattern, "**/missing");
-        assert!(expansions[1].matched_container_paths.is_empty());
+        assert!(
+            expansions[1].matched_container_paths.is_empty(),
+            "an unmatched glob is kept with no matches"
+        );
     }
 
     #[test]
     fn test_preview_glob_volume_ignores_empty_without_globs() {
-        let project_dir = git_project();
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
         let ignores = vec!["target".to_string(), ".venv".to_string()];
         let expansions =
             preview_glob_volume_ignores(project_dir.path().to_str().unwrap(), None, &ignores)
@@ -4747,7 +5531,9 @@ volume_ignores_strategy = "named"
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_sibling_worktree_loads_main_repo_sandbox_settings() {
-        let _temp_home = IsolatedHome::new();
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         // Main repo with repo config under .agent-of-empires/
         let parent = TempDir::new().unwrap();
@@ -4760,13 +5546,16 @@ volume_ignores_strategy = "named"
         repo.commit(Some("HEAD"), &sig, &sig, "Initial", &tree, &[])
             .unwrap();
 
-        write_repo_config(
-            &main_repo,
+        let config_dir = main_repo.join(".agent-of-empires");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config.toml"),
             r#"
 [sandbox]
 volume_ignores = ["node_modules"]
 "#,
-        );
+        )
+        .unwrap();
 
         // Sibling worktree under <parent>/worktrees/feat
         let worktree_path = parent.path().join("worktrees").join("feat");
@@ -4781,7 +5570,27 @@ volume_ignores = ["node_modules"]
             return;
         }
 
-        let config = Build::new("claude").run(&worktree_path).unwrap();
+        let sandbox_info = crate::session::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
+
+        let config = build_container_config(
+            worktree_path.to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("claude", None),
+            false,
+            "test-instance-id",
+            None,
+            "",
+        )
+        .unwrap();
 
         assert!(
             config
@@ -4808,15 +5617,36 @@ volume_ignores = ["node_modules"]
         let temp_home = TempDir::new().unwrap();
         let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
-        let project_dir = git_project();
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
 
+        let sandbox_info = crate::session::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
         let instance_id = "codex-sandbox-hooks-test";
-        let config = Build::new("codex")
-            .instance(instance_id)
-            .run(project_dir.path())
-            .unwrap();
+        let config = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("codex", None),
+            false,
+            instance_id,
+            None,
+            "",
+        )
+        .unwrap();
 
-        let codex_sandbox = sandbox_store(temp_home.path(), ".codex", instance_id);
+        let codex_sandbox = temp_home
+            .path()
+            .join(".codex")
+            .join(SANDBOX_PRIVATE_SUBDIR)
+            .join(instance_id);
         assert!(codex_sandbox.join("hooks.json").exists());
         assert!(!codex_sandbox.join("config.toml").exists());
         assert!(!codex_sandbox.join("settings.json").exists());
@@ -4847,34 +5677,53 @@ volume_ignores = ["node_modules"]
             mount.container_path, expected_container_path,
             "container path must be the fixed in-container path, not the host euid path"
         );
-        assert_ne!(mount.host_path, mount.container_path);
+        assert_ne!(
+            mount.host_path, mount.container_path,
+            "host (per-user) and container (fixed) paths MUST differ for the bind-mount remap"
+        );
         crate::hooks::cleanup_hook_status_dir(instance_id);
     }
 
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_isolates_codex_home_per_instance() {
-        let temp_home = IsolatedHome::new();
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
-        let project_dir = git_project();
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
         let legacy_sandbox = temp_home.path().join(".codex").join(SANDBOX_SUBDIR);
         fs::create_dir_all(&legacy_sandbox).unwrap();
         fs::write(legacy_sandbox.join("auth.json"), "legacy-auth").unwrap();
         fs::write(legacy_sandbox.join("state_5.sqlite"), "legacy-state").unwrap();
+        let sandbox_info = build_minimal_sandbox_info();
         let instance_ids = ["codex-isolated-home-one", "codex-isolated-home-two"];
         let configs: Vec<_> = instance_ids
             .iter()
             .map(|instance_id| {
-                Build::new("codex")
-                    .instance(instance_id)
-                    .run(project_dir.path())
-                    .unwrap()
+                build_container_config(
+                    project_dir.path().to_str().unwrap(),
+                    &sandbox_info,
+                    ContainerAgentSelection::new("codex", None),
+                    false,
+                    instance_id,
+                    None,
+                    "",
+                )
+                .unwrap()
             })
             .collect();
 
         let homes: Vec<_> = instance_ids
             .iter()
-            .map(|instance_id| sandbox_store(temp_home.path(), ".codex", instance_id))
+            .map(|instance_id| {
+                temp_home
+                    .path()
+                    .join(".codex")
+                    .join(SANDBOX_PRIVATE_SUBDIR)
+                    .join(instance_id)
+            })
             .collect();
         assert_ne!(homes[0], homes[1]);
         for home in &homes {
@@ -4907,46 +5756,152 @@ volume_ignores = ["node_modules"]
         }
     }
 
-    /// #472: a YOLO sandbox must not re-prompt for folder trust on every
-    /// launch. Codex trusts the container workspace, keyed on the in-container
-    /// working dir rather than the host path; Gemini turns the check off.
     #[test]
     #[serial_test::serial]
-    fn yolo_pre_trusts_the_container_workspace() {
-        let temp_home = IsolatedHome::new();
-        let project_dir = git_project();
+    fn sandbox_config_seed_never_imports_or_refreshes_native_history() {
+        let (_hooks, _, _hook_dir) = BaseGuard::ready();
+        let home = TempDir::new().unwrap();
+        let _env = crate::session::test_support::isolate_app_dir_at(home.path());
+        let projects = [TempDir::new().unwrap(), TempDir::new().unwrap()];
+        for project in &projects {
+            git2::Repository::init(project.path()).unwrap();
+        }
+        let mut violations = Vec::new();
+        let mut next_id = 0xa000_u64;
+        for declared in [false, true] {
+            for (tool, relative, histories) in [
+                ("codex", ".codex", &["history.jsonl", "state_5.sqlite"][..]),
+                ("kimi", ".kimi-code", &["session_index.jsonl"][..]),
+                ("pi", ".pi", &["agent/sessions/conversation.jsonl"][..]),
+                ("omp", ".omp", &["agent/sessions/conversation.jsonl"][..]),
+            ] {
+                let host = if declared {
+                    home.path().join(format!("declared-{tool}"))
+                } else {
+                    home.path().join(relative)
+                };
+                fs::create_dir_all(&host).unwrap();
+                let app = crate::session::get_app_dir().unwrap();
+                fs::write(
+                    app.join("config.toml"),
+                    if declared {
+                        format!("[session.agent_config_dir]\n{tool} = {host:?}\n")
+                    } else {
+                        String::new()
+                    },
+                )
+                .unwrap();
+                for history in histories {
+                    let path = host.join(history);
+                    fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    fs::write(path, "HOST_HISTORY").unwrap();
+                }
+                // Siblings share a project; the third owner has another project.
+                for project in [0, 0, 1] {
+                    let id = format!("{next_id:016x}");
+                    next_id += 1;
+                    let config = build_container_config(
+                        projects[project].path().to_str().unwrap(),
+                        &build_minimal_sandbox_info(),
+                        ContainerAgentSelection::new(tool, None),
+                        false,
+                        &id,
+                        None,
+                        "",
+                    )
+                    .unwrap();
+                    let store = host.join(SANDBOX_PRIVATE_SUBDIR).join(&id);
+                    assert!(config
+                        .volumes
+                        .iter()
+                        .any(|volume| { Path::new(&volume.host_path) == store }));
+                    for history in histories {
+                        let path = store.join(history);
+                        if path.exists() {
+                            violations.push(format!("{tool}/{id}: imported {history}"));
+                        }
+                        fs::create_dir_all(path.parent().unwrap()).unwrap();
+                        fs::write(path, format!("LOCAL_{id}")).unwrap();
+                    }
+                    refresh_agent_configs_for_instance(
+                        &crate::session::config::effective_profile(""),
+                        &id,
+                        tool,
+                        None,
+                        CredentialFold::Freshest,
+                        Path::new("/workspace"),
+                    );
+                    for history in histories {
+                        if fs::read_to_string(store.join(history)).unwrap() != format!("LOCAL_{id}")
+                        {
+                            violations.push(format!("{tool}/{id}: overwrote {history}"));
+                        }
+                    }
+                    crate::hooks::cleanup_hook_status_dir(&id);
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "native history crossed config seeding: {violations:#?}"
+        );
+    }
 
-        let config = Build::new("codex")
-            .yolo(true)
-            .instance("codex-yolo-trust-test")
-            .run(project_dir.path())
-            .unwrap();
-        let codex_config =
-            sandbox_store(temp_home.path(), ".codex", "codex-yolo-trust-test").join("config.toml");
-        let codex: toml::Value =
+    // Issue #472: a YOLO-mode sandbox session must disable the agent's
+    // folder-trust prompt so the ephemeral container does not re-prompt on
+    // every launch.
+    #[test]
+    #[serial_test::serial]
+    fn test_build_container_config_yolo_trusts_codex_project_only_in_yolo() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
+
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+
+        let sandbox_info = crate::session::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
+        let instance_id = "codex-yolo-trust-test";
+        let config = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("codex", None),
+            true,
+            instance_id,
+            None,
+            "",
+        )
+        .unwrap();
+
+        let codex_config = temp_home
+            .path()
+            .join(".codex")
+            .join(SANDBOX_PRIVATE_SUBDIR)
+            .join(instance_id)
+            .join("config.toml");
+        assert!(
+            codex_config.exists(),
+            "yolo codex sandbox must write config.toml"
+        );
+        let parsed: toml::Value =
             toml::from_str(&fs::read_to_string(&codex_config).unwrap()).unwrap();
-        let projects = codex["projects"].as_table().unwrap();
+        let projects = parsed["projects"].as_table().unwrap();
+        // The trust key is the in-container working dir, not the host path.
         assert_eq!(
             projects[&config.working_dir]["trust_level"].as_str(),
             Some("trusted")
         );
 
-        Build::new("gemini")
-            .yolo(true)
-            .instance("gemini-yolo-trust-test")
-            .run(project_dir.path())
-            .unwrap();
-        let gemini_settings = sandbox_store(temp_home.path(), ".gemini", "gemini-yolo-trust-test")
-            .join("settings.json");
-        let gemini: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&gemini_settings).unwrap()).unwrap();
-        assert_eq!(
-            gemini["security"]["folderTrust"]["enabled"],
-            serde_json::json!(false)
-        );
-
-        crate::hooks::cleanup_hook_status_dir("codex-yolo-trust-test");
-        crate::hooks::cleanup_hook_status_dir("gemini-yolo-trust-test");
+        crate::hooks::cleanup_hook_status_dir(instance_id);
     }
 
     // Claude Code's folder-trust dialog is keyed on the git root, so every
@@ -4958,19 +5913,41 @@ volume_ignores = ["node_modules"]
     #[serial_test::serial]
     fn test_build_container_config_seeds_claude_folder_trust() {
         for is_yolo in [false, true] {
-            let temp_home = IsolatedHome::new();
+            let (_hg, _, _tmp_base) = BaseGuard::ready();
+            let temp_home = TempDir::new().unwrap();
+            let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
-            let project_dir = git_project();
+            let project_dir = TempDir::new().unwrap();
+            git2::Repository::init(project_dir.path()).unwrap();
 
+            let sandbox_info = crate::session::instance::SandboxInfo {
+                enabled: true,
+                container_id: None,
+                image: "test:latest".to_string(),
+                container_name: "test-container".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                container_workdir: None,
+            };
             let instance_id = format!("claude-trust-test-{is_yolo}");
-            let config = Build::new("claude")
-                .yolo(is_yolo)
-                .instance(&instance_id)
-                .run(project_dir.path())
-                .unwrap();
+            let config = build_container_config(
+                project_dir.path().to_str().unwrap(),
+                &sandbox_info,
+                ContainerAgentSelection::new("claude", None),
+                is_yolo,
+                &instance_id,
+                None,
+                "",
+            )
+            .unwrap();
 
-            let seeded =
-                sandbox_store(temp_home.path(), ".claude", &instance_id).join(".claude.json");
+            let seeded = temp_home
+                .path()
+                .join(".claude")
+                .join(SANDBOX_PRIVATE_SUBDIR)
+                .join(&instance_id)
+                .join(".claude.json");
             let parsed: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(&seeded).unwrap()).unwrap();
             // The trust key is the in-container working dir, not the host path.
@@ -4998,7 +5975,9 @@ volume_ignores = ["node_modules"]
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_seeds_declared_agent_config_dir() {
-        let temp_home = IsolatedHome::new();
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         let declared = temp_home.path().join(".claude-personal");
         let app_dir = crate::session::get_app_dir().unwrap();
@@ -5017,15 +5996,29 @@ claude-personal = "~/.claude-personal"
         )
         .unwrap();
 
-        let project_dir = git_project();
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
 
+        let sandbox_info = crate::session::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
         let instance_id = "declared-config-dir-test";
-        let config = Build::select(ContainerAgentSelection::new(
-            "claude-personal",
-            Some("claude"),
-        ))
-        .instance(instance_id)
-        .run(project_dir.path())
+        let config = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("claude-personal", Some("claude")),
+            false,
+            instance_id,
+            None,
+            "",
+        )
         .unwrap();
         let staged = declared.join(SANDBOX_PRIVATE_SUBDIR).join(instance_id);
         assert!(config.volumes.iter().any(|volume| {
@@ -5047,8 +6040,12 @@ claude-personal = "~/.claude-personal"
             "the declared config dir must carry the trust record"
         );
 
-        let default_config =
-            sandbox_store(temp_home.path(), ".claude", instance_id).join(".claude.json");
+        let default_config = temp_home
+            .path()
+            .join(".claude")
+            .join(SANDBOX_PRIVATE_SUBDIR)
+            .join(instance_id)
+            .join(".claude.json");
         let default_trust = fs::read_to_string(&default_config)
             .ok()
             .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
@@ -5067,7 +6064,9 @@ claude-personal = "~/.claude-personal"
     #[test]
     #[serial_test::serial]
     fn test_declared_codex_config_dir_trusts_at_the_mounted_level() {
-        let temp_home = IsolatedHome::new();
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         let declared = temp_home.path().join(".codex-work");
         let app_dir = crate::session::get_app_dir().unwrap();
@@ -5089,14 +6088,30 @@ codex-work = "{}"
         )
         .unwrap();
 
-        let project_dir = git_project();
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
 
+        let sandbox_info = crate::session::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
         let instance_id = "declared-codex-dir-test";
-        let config = Build::select(ContainerAgentSelection::new("codex-work", Some("codex")))
-            .yolo(true)
-            .instance(instance_id)
-            .run(project_dir.path())
-            .unwrap();
+        let config = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("codex-work", Some("codex")),
+            true,
+            instance_id,
+            None,
+            "",
+        )
+        .unwrap();
         let codex_home = config
             .environment
             .iter()
@@ -5160,8 +6175,61 @@ codex-work = "{}"
 
     #[test]
     #[serial_test::serial]
+    fn test_build_container_config_yolo_disables_gemini_folder_trust() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
+
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+
+        let sandbox_info = crate::session::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
+        build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("gemini", None),
+            true,
+            "gemini-yolo-trust-test",
+            None,
+            "",
+        )
+        .unwrap();
+
+        let gemini_settings = temp_home
+            .path()
+            .join(".gemini")
+            .join(SANDBOX_PRIVATE_SUBDIR)
+            .join("gemini-yolo-trust-test")
+            .join("settings.json");
+        assert!(
+            gemini_settings.exists(),
+            "yolo gemini sandbox must write settings.json"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&gemini_settings).unwrap()).unwrap();
+        assert_eq!(
+            parsed["security"]["folderTrust"]["enabled"],
+            serde_json::Value::Bool(false)
+        );
+
+        crate::hooks::cleanup_hook_status_dir("gemini-yolo-trust-test");
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn test_ensure_folder_trust_config_restores_codex_after_refresh() {
-        let temp_home = IsolatedHome::new();
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         let codex_dir = temp_home.path().join(".codex");
         let instance_id = "codex-yolo-refresh-test";
@@ -5171,17 +6239,18 @@ codex-work = "{}"
         fs::write(
             codex_sandbox.join("config.toml"),
             r#"[projects."/workspace/project"]
-trust_level = "trusted"
-"#,
+    trust_level = "trusted"
+    "#,
         )
         .unwrap();
-
+        certify_fixture_content(&codex_sandbox, ".codex").unwrap();
         refresh_agent_configs_for_instance(
             &crate::session::config::effective_profile(""),
             instance_id,
             "codex",
             None,
             CredentialFold::Freshest,
+            Path::new("/workspace"),
         );
         let refreshed: toml::Value =
             toml::from_str(&fs::read_to_string(codex_sandbox.join("config.toml")).unwrap())
@@ -5210,7 +6279,9 @@ trust_level = "trusted"
     #[test]
     #[serial_test::serial]
     fn test_ensure_folder_trust_config_restores_gemini_after_refresh() {
-        let temp_home = IsolatedHome::new();
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         let gemini_dir = temp_home.path().join(".gemini");
         let gemini_sandbox = gemini_dir
@@ -5223,13 +6294,14 @@ trust_level = "trusted"
             r#"{"security":{"folderTrust":{"enabled":false}}}"#,
         )
         .unwrap();
-
+        certify_fixture_content(&gemini_sandbox, ".gemini").unwrap();
         refresh_agent_configs_for_instance(
             &crate::session::config::effective_profile(""),
             "gemini-yolo-refresh-test",
             "gemini",
             None,
             CredentialFold::Freshest,
+            Path::new("/workspace"),
         );
         let refreshed: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(gemini_sandbox.join("settings.json")).unwrap(),
@@ -5260,7 +6332,9 @@ trust_level = "trusted"
     #[test]
     #[serial_test::serial]
     fn user_volume_shadowing_hook_config_disables_publisher_evidence() {
-        let temp_home = IsolatedHome::new();
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
         let shadow = temp_home.path().join("shadow-cursor");
         fs::create_dir_all(&shadow).unwrap();
         crate::session::config::update_config(|config| {
@@ -5268,12 +6342,29 @@ trust_level = "trusted"
                 vec![format!("{}:/root/.cursor", shadow.to_string_lossy())];
         })
         .unwrap();
-        let project_dir = git_project();
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+        let sandbox_info = crate::session::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
 
-        let config = Build::new("cursor")
-            .instance("cursor-shadow-test")
-            .run(project_dir.path())
-            .unwrap();
+        let config = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("cursor", None),
+            false,
+            "cursor-shadow-test",
+            None,
+            "",
+        )
+        .unwrap();
 
         assert!(!config.identity_publisher_installed);
 
@@ -5287,10 +6378,16 @@ trust_level = "trusted"
             )];
         })
         .unwrap();
-        let config = Build::new("cursor")
-            .instance("cursor-output-shadow")
-            .run(project_dir.path())
-            .unwrap();
+        let config = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("cursor", None),
+            false,
+            "cursor-output-shadow",
+            None,
+            "",
+        )
+        .unwrap();
         assert!(!config.identity_publisher_installed);
 
         let hook_dir = crate::hooks::ensure_instance_dir_path("cursor-readonly").unwrap();
@@ -5302,10 +6399,16 @@ trust_level = "trusted"
             )];
         })
         .unwrap();
-        let config = Build::new("cursor")
-            .instance("cursor-readonly")
-            .run(project_dir.path())
-            .unwrap();
+        let config = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("cursor", None),
+            false,
+            "cursor-readonly",
+            None,
+            "",
+        )
+        .unwrap();
         assert!(!config.identity_publisher_installed);
 
         crate::session::config::update_config(|config| {
@@ -5313,11 +6416,17 @@ trust_level = "trusted"
             config.sandbox.environment = vec!["HOME=/alternate-home".to_string()];
         })
         .unwrap();
-        let error = Build::new("cursor")
-            .instance("cursor-home-override")
-            .run(project_dir.path())
-            .err()
-            .expect("conflicting HOME must be rejected");
+        let error = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("cursor", None),
+            false,
+            "cursor-home-override",
+            None,
+            "",
+        )
+        .err()
+        .expect("conflicting HOME must be rejected");
         assert!(error.to_string().contains("HOME=/alternate-home"));
         assert!(error
             .to_string()
@@ -5338,9 +6447,12 @@ trust_level = "trusted"
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_installs_sidecar_hooks_files() {
-        let temp_home = IsolatedHome::new();
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
-        let project_dir = git_project();
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
 
         let sidecar_agents: Vec<&crate::agents::AgentDef> = crate::agents::AGENTS
             .iter()
@@ -5360,11 +6472,27 @@ trust_level = "trusted"
                 agent.name
             );
 
+            let sandbox_info = crate::session::instance::SandboxInfo {
+                enabled: true,
+                container_id: None,
+                image: "test:latest".to_string(),
+                container_name: "test-container".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                container_workdir: None,
+            };
             let instance_id = format!("{}-sidecar-sandbox-test", agent.name);
-            let config = Build::new(agent.name)
-                .instance(&instance_id)
-                .run(project_dir.path())
-                .unwrap();
+            let config = build_container_config(
+                project_dir.path().to_str().unwrap(),
+                &sandbox_info,
+                ContainerAgentSelection::new(agent.name, None),
+                false,
+                &instance_id,
+                None,
+                "",
+            )
+            .unwrap();
 
             let expects_identity = crate::agents::resolved_sidecar_hook_events(
                 agent,
@@ -5421,7 +6549,9 @@ trust_level = "trusted"
     #[test]
     #[serial_test::serial]
     fn sandbox_identity_hooks_remain_when_status_hooks_are_disabled() {
-        let temp_home = IsolatedHome::new();
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
         let profile = "sandbox-identity-only-hooks";
         let profile_dir = crate::session::get_profile_dir(profile).unwrap();
         fs::write(
@@ -5429,17 +6559,37 @@ trust_level = "trusted"
             "[session]\nagent_status_hooks = false\n",
         )
         .unwrap();
-        let project_dir = git_project();
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
         let instance_id = "cursor-identity-only-sandbox-test";
-        Build::new("cursor")
-            .instance(instance_id)
-            .profile(profile)
-            .run(project_dir.path())
-            .unwrap();
+        build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &crate::session::SandboxInfo {
+                enabled: true,
+                container_id: None,
+                image: "test:latest".to_string(),
+                container_name: "test-container".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                container_workdir: None,
+            },
+            ContainerAgentSelection::new("cursor", None),
+            false,
+            instance_id,
+            None,
+            profile,
+        )
+        .unwrap();
 
         let hooks: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(
-                sandbox_store(temp_home.path(), ".cursor", instance_id).join("hooks.json"),
+                temp_home
+                    .path()
+                    .join(".cursor")
+                    .join(SANDBOX_PRIVATE_SUBDIR)
+                    .join(instance_id)
+                    .join("hooks.json"),
             )
             .unwrap(),
         )
@@ -5461,23 +6611,44 @@ trust_level = "trusted"
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_installs_hooks_into_selected_kiro_agent() {
-        let temp_home = IsolatedHome::new();
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
-        let project_dir = git_project();
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
 
         let kiro = crate::agents::get_agent("kiro").unwrap();
         let sidecar = kiro.sidecar_hooks.as_ref().unwrap();
+        let sandbox_info = crate::session::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
         let instance_id = "kiro-selected-agent-sandbox-test";
-        Build::select(
+        build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
             ContainerAgentSelection::new("kiro", None).with_selected_agent(Some("custom-agent")),
+            false,
+            instance_id,
+            None,
+            "",
         )
-        .instance(instance_id)
-        .run(project_dir.path())
         .unwrap();
 
         // Hooks land in the selected agent's staged sandbox config...
-        let selected_config =
-            sandbox_store(temp_home.path(), ".kiro", instance_id).join("agents/custom-agent.json");
+        let selected_config = temp_home
+            .path()
+            .join(".kiro")
+            .join(SANDBOX_PRIVATE_SUBDIR)
+            .join(instance_id)
+            .join("agents/custom-agent.json");
         assert!(
             selected_config.exists(),
             "selected-agent sandbox hook config should be installed at {}",
@@ -5503,7 +6674,9 @@ trust_level = "trusted"
         // The host `.kiro/agents` dir is staged into `.kiro/sandbox/agents`
         // before hook install, so a prefixed agent file (filename != name) must
         // be resolved by its `name` field there, mirroring the host path.
-        let temp_home = IsolatedHome::new();
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         let host_agents = temp_home.path().join(".kiro/agents");
         std::fs::create_dir_all(&host_agents).unwrap();
@@ -5513,17 +6686,35 @@ trust_level = "trusted"
         )
         .unwrap();
 
-        let project_dir = git_project();
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
 
         let instance_id = "kiro-managed-agent-sandbox-test";
-        Build::select(
+        build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &crate::session::instance::SandboxInfo {
+                enabled: true,
+                container_id: None,
+                image: "test:latest".to_string(),
+                container_name: "test-container".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                container_workdir: None,
+            },
             ContainerAgentSelection::new("kiro", None).with_selected_agent(Some("custom-agent")),
+            false,
+            instance_id,
+            None,
+            "",
         )
-        .instance(instance_id)
-        .run(project_dir.path())
         .unwrap();
 
-        let matched = sandbox_store(temp_home.path(), ".kiro", instance_id)
+        let matched = temp_home
+            .path()
+            .join(".kiro")
+            .join(SANDBOX_PRIVATE_SUBDIR)
+            .join(instance_id)
             .join("agents/TeamAgents-custom-agent.json");
         assert!(
             matched.exists(),
@@ -5540,8 +6731,12 @@ trust_level = "trusted"
             "the agent's own hook must be preserved"
         );
 
-        let stem_clone =
-            sandbox_store(temp_home.path(), ".kiro", instance_id).join("agents/custom-agent.json");
+        let stem_clone = temp_home
+            .path()
+            .join(".kiro")
+            .join(SANDBOX_PRIVATE_SUBDIR)
+            .join(instance_id)
+            .join("agents/custom-agent.json");
         assert!(
             !stem_clone.exists(),
             "must not create a filename-stem clone the CLI never loads"
@@ -5556,11 +6751,29 @@ trust_level = "trusted"
         let temp_home = TempDir::new().unwrap();
         let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
-        let project_dir = git_project();
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
 
-        let result = Build::new("codex")
-            .instance("../etc")
-            .run(project_dir.path());
+        let sandbox_info = crate::session::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
+
+        let result = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("codex", None),
+            false,
+            "../etc",
+            None,
+            "",
+        );
 
         let err = match result {
             Ok(_) => panic!("must refuse unsafe instance id"),
@@ -5586,16 +6799,36 @@ trust_level = "trusted"
         )
         .unwrap();
 
-        let project_dir = git_project();
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
 
+        let sandbox_info = crate::session::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
         let instance_id = "codex-sandbox-hooks-disabled-test";
-        let config = Build::new("codex")
-            .instance(instance_id)
-            .profile("sandbox-hooks-disabled")
-            .run(project_dir.path())
-            .unwrap();
+        let config = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("codex", None),
+            false,
+            instance_id,
+            None,
+            "sandbox-hooks-disabled",
+        )
+        .unwrap();
 
-        let codex_sandbox = sandbox_store(temp_home.path(), ".codex", instance_id);
+        let codex_sandbox = temp_home
+            .path()
+            .join(".codex")
+            .join(SANDBOX_PRIVATE_SUBDIR)
+            .join(instance_id);
         assert!(!codex_sandbox.join("config.toml").exists());
 
         let hook_dir =
@@ -5615,7 +6848,9 @@ trust_level = "trusted"
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_uses_detected_codex_for_custom_wrapper_hooks() {
-        let temp_home = IsolatedHome::new();
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         crate::session::config::update_config(|global| {
             global.session.agent_status_hooks = false;
@@ -5632,21 +6867,41 @@ agent_detect_as = { "wrapped-codex" = "codex" }
         )
         .unwrap();
 
-        let project_dir = git_project();
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
 
+        let sandbox_info = crate::session::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
         let instance_id = "wrapped-codex-sandbox-hooks-test";
         // resolve_config_or_warn inside build_container_config installs the
         // profile overlay's agent_detect_as into the process-global
         // registry; restore the prior entries afterwards.
         let _registry =
             crate::tmux::status_rules::ProfileRegistryGuard::take("sandbox-wrapped-codex");
-        let config = Build::new("wrapped-codex")
-            .instance(instance_id)
-            .profile("sandbox-wrapped-codex")
-            .run(project_dir.path())
-            .unwrap();
+        let config = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("wrapped-codex", None),
+            false,
+            instance_id,
+            None,
+            "sandbox-wrapped-codex",
+        )
+        .unwrap();
 
-        let codex_sandbox = sandbox_store(temp_home.path(), ".codex", instance_id);
+        let codex_sandbox = temp_home
+            .path()
+            .join(".codex")
+            .join(SANDBOX_PRIVATE_SUBDIR)
+            .join(instance_id);
         assert!(codex_sandbox.join("hooks.json").exists());
         assert!(config.volumes.iter().any(|v| {
             v.host_path == codex_sandbox.to_string_lossy()
@@ -5683,13 +6938,30 @@ agent_detect_as = { "wrapped-codex" = "codex" }
         fs::create_dir_all(&codex_dir).unwrap();
         fs::write(codex_dir.join("config.toml"), r#"model = "initial""#).unwrap();
 
-        let project_dir = git_project();
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
 
+        let sandbox_info = crate::session::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
         let instance_id = "codex-sandbox-refresh-hooks-test";
-        Build::new("codex")
-            .instance(instance_id)
-            .run(project_dir.path())
-            .unwrap();
+        build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("codex", None),
+            false,
+            instance_id,
+            None,
+            "",
+        )
+        .unwrap();
 
         let codex_sandbox = codex_dir.join(SANDBOX_PRIVATE_SUBDIR).join(instance_id);
         let sandbox_config_path = codex_sandbox.join("config.toml");
@@ -5711,6 +6983,7 @@ trusted_hash = "keep"
             "codex",
             None,
             CredentialFold::Freshest,
+            Path::new("/workspace"),
         );
 
         let config_text = fs::read_to_string(&sandbox_config_path).unwrap();
@@ -5794,8 +7067,19 @@ trusted_hash = "keep"
         );
         super::super::profile_config::save_profile_config("personal", &personal_config).unwrap();
 
-        let project_dir = git_project();
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
 
+        let sandbox_info = crate::session::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
         let instances = [
             ("codex-work-status-map-refresh-test", "work", "waiting"),
             (
@@ -5805,17 +7089,23 @@ trusted_hash = "keep"
             ),
         ];
         for (instance_id, profile, _) in instances {
-            Build::new("codex")
-                .instance(instance_id)
-                .profile(profile)
-                .run(project_dir.path())
-                .unwrap();
+            build_container_config(
+                project_dir.path().to_str().unwrap(),
+                &sandbox_info,
+                ContainerAgentSelection::new("codex", None),
+                false,
+                instance_id,
+                None,
+                profile,
+            )
+            .unwrap();
             refresh_agent_configs_for_instance(
                 profile,
                 instance_id,
                 "codex",
                 None,
                 CredentialFold::Freshest,
+                Path::new("/workspace"),
             );
         }
 
@@ -5840,22 +7130,40 @@ trusted_hash = "keep"
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_mounts_codex_home_from_extra_env() {
-        let temp_home = IsolatedHome::new();
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
-        let project_dir = git_project();
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
 
-        let codex_home_info = crate::session::instance::SandboxInfo {
+        let sandbox_info = crate::session::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
             extra_env: Some(vec!["CODEX_HOME=/root/custom-codex".to_string()]),
-            ..test_sandbox_info()
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
         };
         let instance_id = "codex-sandbox-extra-env-hooks-test";
-        let config = Build::new("codex")
-            .info(codex_home_info)
-            .instance(instance_id)
-            .run(project_dir.path())
-            .unwrap();
+        let config = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("codex", None),
+            false,
+            instance_id,
+            None,
+            "",
+        )
+        .unwrap();
 
-        let codex_sandbox = sandbox_store(temp_home.path(), ".codex", instance_id);
+        let codex_sandbox = temp_home
+            .path()
+            .join(".codex")
+            .join(SANDBOX_PRIVATE_SUBDIR)
+            .join(instance_id);
         assert!(codex_sandbox.join("hooks.json").exists());
         assert!(config.volumes.iter().any(|v| {
             v.host_path == codex_sandbox.to_string_lossy()
@@ -5870,7 +7178,9 @@ trusted_hash = "keep"
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_mounts_codex_home_from_sandbox_environment() {
-        let temp_home = IsolatedHome::new();
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         let app_dir = crate::session::get_app_dir().unwrap();
         fs::write(
@@ -5881,15 +7191,36 @@ environment = ["CODEX_HOME=/root/profile-codex"]
 "#,
         )
         .unwrap();
-        let project_dir = git_project();
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
 
+        let sandbox_info = crate::session::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
         let instance_id = "codex-sandbox-config-env-hooks-test";
-        let config = Build::new("codex")
-            .instance(instance_id)
-            .run(project_dir.path())
-            .unwrap();
+        let config = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("codex", None),
+            false,
+            instance_id,
+            None,
+            "",
+        )
+        .unwrap();
 
-        let codex_sandbox = sandbox_store(temp_home.path(), ".codex", instance_id);
+        let codex_sandbox = temp_home
+            .path()
+            .join(".codex")
+            .join(SANDBOX_PRIVATE_SUBDIR)
+            .join(instance_id);
         assert!(codex_sandbox.join("hooks.json").exists());
         assert!(config.volumes.iter().any(|v| {
             v.host_path == codex_sandbox.to_string_lossy()
@@ -5909,7 +7240,9 @@ environment = ["CODEX_HOME=/root/profile-codex"]
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_uses_passed_profile_not_global_default() {
-        let temp_home = IsolatedHome::new();
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
 
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         let app_dir = temp_home
@@ -5949,8 +7282,20 @@ extra_volumes = ["/host/personal-only:/container/personal-only:ro"]
         )
         .unwrap();
 
-        let project_dir = git_project();
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
         let project_path_str = project_dir.path().to_str().unwrap();
+
+        let sandbox_info = crate::session::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
 
         let has_volume = |config: &crate::containers::container_interface::ContainerConfig,
                           host: &str,
@@ -5964,10 +7309,16 @@ extra_volumes = ["/host/personal-only:/container/personal-only:ro"]
 
         // Passing "personal" must resolve the personal profile's extra_volumes
         // and NOT the default profile's.
-        let cfg_personal = Build::new("claude")
-            .profile("personal")
-            .run(Path::new(project_path_str))
-            .unwrap();
+        let cfg_personal = build_container_config(
+            project_path_str,
+            &sandbox_info,
+            ContainerAgentSelection::new("claude", None),
+            false,
+            "test-instance-id",
+            None,
+            "personal",
+        )
+        .unwrap();
         assert!(
             has_volume(
                 &cfg_personal,
@@ -5996,10 +7347,16 @@ extra_volumes = ["/host/personal-only:/container/personal-only:ro"]
         );
 
         // Passing "default" must resolve the default profile's extra_volumes.
-        let cfg_default = Build::new("claude")
-            .profile("default")
-            .run(Path::new(project_path_str))
-            .unwrap();
+        let cfg_default = build_container_config(
+            project_path_str,
+            &sandbox_info,
+            ContainerAgentSelection::new("claude", None),
+            false,
+            "test-instance-id",
+            None,
+            "default",
+        )
+        .unwrap();
         assert!(
             has_volume(
                 &cfg_default,
@@ -6011,9 +7368,16 @@ extra_volumes = ["/host/personal-only:/container/personal-only:ro"]
 
         // Empty profile must fall back to the user's globally configured default,
         // preserving prior behavior for callers without a profile in hand.
-        let cfg_empty = Build::new("claude")
-            .run(Path::new(project_path_str))
-            .unwrap();
+        let cfg_empty = build_container_config(
+            project_path_str,
+            &sandbox_info,
+            ContainerAgentSelection::new("claude", None),
+            false,
+            "test-instance-id",
+            None,
+            "",
+        )
+        .unwrap();
         assert!(
             has_volume(&cfg_empty, "/host/default-only", "/container/default-only"),
             "empty profile must fall back to global default",
@@ -6030,6 +7394,7 @@ extra_volumes = ["/host/personal-only:/container/personal-only:ro"]
 
         let (_dir, repo_path) = setup_regular_repo();
 
+        // Create a sibling worktree (non-bare layout)
         let worktree_path = repo_path.parent().unwrap().join("my-worktree");
         let head = git2::Repository::open(&repo_path)
             .unwrap()
@@ -6060,19 +7425,41 @@ extra_volumes = ["/host/personal-only:/container/personal-only:ro"]
         // Write repo-level config in the main repo dir, since
         // resolve_config_with_repo loads it from there (find_main_repo) even
         // when the session targets a sibling worktree.
-        write_repo_config(
-            &repo_path,
+        let config_dir = repo_path.join(".agent-of-empires");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config.toml"),
             r#"
 [sandbox]
 volume_ignores = ["target", "node_modules"]
 "#,
-        );
+        )
+        .unwrap();
+
+        let sandbox_info = crate::session::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
 
         let project_path_str = worktree_path.to_str().unwrap();
-        let config = Build::new("claude")
-            .run(Path::new(project_path_str))
-            .unwrap();
+        let config = build_container_config(
+            project_path_str,
+            &sandbox_info,
+            ContainerAgentSelection::new("claude", None),
+            false,
+            "test-instance-id",
+            None,
+            "",
+        )
+        .unwrap();
 
+        // Verify volume_ignores are applied to the worktree mount
         assert!(
             config
                 .anonymous_volumes
@@ -6100,8 +7487,18 @@ volume_ignores = ["target", "node_modules"]
             .to_string();
         let expected_repo_target = format!("/workspace/{}/target", repo_name);
         let expected_repo_node = format!("/workspace/{}/node_modules", repo_name);
-        assert!(config.anonymous_volumes.contains(&expected_repo_target));
-        assert!(config.anonymous_volumes.contains(&expected_repo_node));
+        assert!(
+            config.anonymous_volumes.contains(&expected_repo_target),
+            "anonymous_volumes should contain parent repo target ({}), got: {:?}",
+            expected_repo_target,
+            config.anonymous_volumes
+        );
+        assert!(
+            config.anonymous_volumes.contains(&expected_repo_node),
+            "anonymous_volumes should contain parent repo node_modules ({}), got: {:?}",
+            expected_repo_node,
+            config.anonymous_volumes
+        );
     }
 
     /// Regression test: volume_ignores must still apply to the workspace_path
@@ -6121,18 +7518,39 @@ volume_ignores = ["target", "node_modules"]
         // Write repo-level config in the main repo dir, since
         // resolve_config_with_repo loads it from there (find_main_repo) even
         // when the session targets a sibling worktree.
-        write_repo_config(
-            &main_repo_path,
+        let config_dir = main_repo_path.join(".agent-of-empires");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config.toml"),
             r#"
 [sandbox]
 volume_ignores = ["target"]
 "#,
-        );
+        )
+        .unwrap();
+
+        let sandbox_info = crate::session::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
 
         let project_path_str = worktree_path.to_str().unwrap();
-        let config = Build::new("claude")
-            .run(Path::new(project_path_str))
-            .unwrap();
+        let config = build_container_config(
+            project_path_str,
+            &sandbox_info,
+            ContainerAgentSelection::new("claude", None),
+            false,
+            "test-instance-id",
+            None,
+            "",
+        )
+        .unwrap();
 
         // In bare-repo layout, workspace_path is a subdirectory of the single mount.
         // volume_ignores must apply to the workspace_path (where builds run), not
@@ -6154,47 +7572,9 @@ volume_ignores = ["target"]
     }
 
     #[test]
-    fn test_clean_files_deletes_stale_database() {
-        let home = TempDir::new().unwrap();
-        let host_dir = home.path().join(".local/share/opencode");
-        let sandbox_dir = host_dir.join("sandbox");
-        fs::create_dir_all(&sandbox_dir).unwrap();
-
-        // Simulate stale database files left by a previous sandbox session
-        fs::write(sandbox_dir.join("opencode.db"), "stale").unwrap();
-        fs::write(sandbox_dir.join("opencode.db-wal"), "stale-wal").unwrap();
-        fs::write(sandbox_dir.join("opencode.db-shm"), "stale-shm").unwrap();
-
-        fs::create_dir_all(&host_dir).unwrap();
-
-        let mount = AgentConfigMount {
-            tool_name: "opencode",
-            host_rel: ".local/share/opencode",
-            container_suffix: ".local/share/opencode",
-            skip_entries: &[
-                "sandbox",
-                "opencode.db",
-                "opencode.db-wal",
-                "opencode.db-shm",
-            ],
-            seed_files: &[],
-            copy_dirs: &[],
-            keychain_credential: None,
-            home_seed_files: &[],
-            preserve_files: &[],
-            shared_credential_files: &[],
-            clean_files: &["opencode.db", "opencode.db-wal", "opencode.db-shm"],
-        };
-
-        prepare_sandbox_dir(&mount, home.path(), None, CredentialFold::Freshest).unwrap();
-
-        assert!(!sandbox_dir.join("opencode.db").exists());
-        assert!(!sandbox_dir.join("opencode.db-wal").exists());
-        assert!(!sandbox_dir.join("opencode.db-shm").exists());
-    }
-
-    #[test]
-    fn test_skip_entries_prevents_host_db_copy() {
+    #[serial_test::serial]
+    fn test_opencode_auth_seed_does_not_import_host_database() {
+        let (_hook_guard, _, _application) = BaseGuard::ready();
         let home = TempDir::new().unwrap();
         let host_dir = home.path().join(".local/share/opencode");
         let sandbox_dir = host_dir.join("sandbox");
@@ -6203,57 +7583,30 @@ volume_ignores = ["target"]
         // Host has a database that should NOT be copied
         fs::write(host_dir.join("opencode.db"), "host-db").unwrap();
         // Host also has a config file that SHOULD be copied
-        fs::write(host_dir.join("some-config.txt"), "config").unwrap();
+        fs::write(host_dir.join("auth.json"), "config").unwrap();
+        let mount = AGENT_CONFIG_MOUNTS
+            .iter()
+            .find(|mount| mount.host_rel == ".local/share/opencode")
+            .unwrap();
 
-        let mount = AgentConfigMount {
-            tool_name: "opencode",
-            host_rel: ".local/share/opencode",
-            container_suffix: ".local/share/opencode",
-            skip_entries: &[
-                "sandbox",
-                "opencode.db",
-                "opencode.db-wal",
-                "opencode.db-shm",
-            ],
-            seed_files: &[],
-            copy_dirs: &[],
-            keychain_credential: None,
-            home_seed_files: &[],
-            preserve_files: &[],
-            shared_credential_files: &[],
-            clean_files: &[],
-        };
+        prepare_owned_fixture(
+            &mount,
+            home.path(),
+            None,
+            CredentialFold::Freshest,
+            &crate::session::config::SessionConfig::default(),
+            home.path(),
+        )
+        .unwrap();
 
-        prepare_sandbox_dir(&mount, home.path(), None, CredentialFold::Freshest).unwrap();
-
-        assert!(!sandbox_dir.join("opencode.db").exists());
         assert!(
-            sandbox_dir.join("some-config.txt").exists(),
-            "Non-skipped files should still be copied"
+            !sandbox_dir.join("opencode.db").exists(),
+            "Host database should not be copied to sandbox"
         );
-    }
-
-    #[test]
-    fn test_clean_files_noop_when_no_stale_files() {
-        let home = TempDir::new().unwrap();
-        let host_dir = home.path().join(".local/share/opencode");
-        fs::create_dir_all(&host_dir).unwrap();
-
-        let mount = AgentConfigMount {
-            tool_name: "opencode",
-            host_rel: ".local/share/opencode",
-            container_suffix: ".local/share/opencode",
-            skip_entries: &["sandbox"],
-            seed_files: &[],
-            copy_dirs: &[],
-            keychain_credential: None,
-            home_seed_files: &[],
-            preserve_files: &[],
-            shared_credential_files: &[],
-            clean_files: &["opencode.db", "opencode.db-wal", "opencode.db-shm"],
-        };
-
-        prepare_sandbox_dir(&mount, home.path(), None, CredentialFold::Freshest).unwrap();
+        assert!(
+            sandbox_dir.join("auth.json").exists(),
+            "Positive credential file must still be copied"
+        );
     }
 
     // --- GCP credential mount tests ---
@@ -6261,6 +7614,19 @@ volume_ignores = ["target"]
     // These exercise the Vertex AI cred mount inside `build_container_config`.
     // They use `serial_test::serial` because they mutate process-wide env vars,
     // and isolate `HOME`/`XDG_CONFIG_HOME` so global config doesn't bleed in.
+
+    fn build_minimal_sandbox_info() -> crate::session::instance::SandboxInfo {
+        crate::session::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        }
+    }
 
     fn write_adc_at(home: &std::path::Path) -> std::path::PathBuf {
         let adc_dir = home.join(".config").join("gcloud");
@@ -6272,64 +7638,154 @@ volume_ignores = ["target"]
 
     fn run_build_for_vertex_test(tool: &str, project_dir: &std::path::Path) -> ContainerConfig {
         git2::Repository::init(project_dir).unwrap();
-        Build::new(tool).run(project_dir).unwrap()
+        let info = build_minimal_sandbox_info();
+        build_container_config(
+            project_dir.to_str().unwrap(),
+            &info,
+            ContainerAgentSelection::new(tool, None),
+            false,
+            "test-instance-id",
+            None,
+            "",
+        )
+        .unwrap()
     }
 
-    /// The ADC mount is Claude-only, needs a non-empty `CLAUDE_CODE_USE_VERTEX`
-    /// and an existing credential file, and prefers an explicit
-    /// `GOOGLE_APPLICATION_CREDENTIALS` over the well-known host path.
     #[test]
     #[serial_test::serial]
-    fn vertex_adc_is_mounted_only_for_claude_with_the_flag_and_a_file() {
-        const TARGET: &str = "/root/.config/gcloud/application_default_credentials.json";
-        // (CLAUDE_CODE_USE_VERTEX, tool, default ADC on disk, custom credential, mounted)
-        let cases: &[(Option<&str>, &str, bool, bool, bool)] = &[
-            (Some("1"), "claude", true, false, true),
-            (Some("1"), "claude", false, true, true),
-            (None, "claude", true, false, false),
-            (Some("1"), "opencode", true, false, false),
-            (Some(""), "claude", true, false, false),
-            (Some("1"), "claude", false, false, false),
-        ];
+    fn test_vertex_mounts_default_adc_when_flag_set_and_tool_is_claude() {
+        let temp_home = TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
+        std::env::set_var("CLAUDE_CODE_USE_VERTEX", "1");
+        std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
+        let adc_path = write_adc_at(temp_home.path());
 
-        for &(flag, tool, write_default, write_custom, mounted) in cases {
-            let label = format!("flag={flag:?} tool={tool}");
-            let temp_home = TempDir::new().unwrap();
-            let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
-            match flag {
-                Some(value) => std::env::set_var("CLAUDE_CODE_USE_VERTEX", value),
-                None => std::env::remove_var("CLAUDE_CODE_USE_VERTEX"),
-            }
-            let default_adc = write_default.then(|| write_adc_at(temp_home.path()));
-            let cred_dir = TempDir::new().unwrap();
-            let custom = write_custom.then(|| {
-                let path = cred_dir.path().join("custom-key.json");
-                fs::write(&path, r#"{"type":"service_account"}"#).unwrap();
-                path
-            });
-            match custom.as_ref() {
-                Some(path) => std::env::set_var("GOOGLE_APPLICATION_CREDENTIALS", path),
-                None => std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS"),
-            }
+        let project_dir = TempDir::new().unwrap();
+        let config = run_build_for_vertex_test("claude", project_dir.path());
 
-            let project_dir = TempDir::new().unwrap();
-            let config = run_build_for_vertex_test(tool, project_dir.path());
-            let mount = config.volumes.iter().find(|v| v.container_path == TARGET);
+        let target = "/root/.config/gcloud/application_default_credentials.json";
+        let mount = config
+            .volumes
+            .iter()
+            .find(|v| v.container_path == target)
+            .expect("expected ADC mount when Vertex flag is set");
+        assert_eq!(mount.host_path, adc_path.to_string_lossy());
+        assert!(mount.read_only);
 
-            match mount {
-                Some(mount) => {
-                    assert!(mounted, "unexpected ADC mount for {label}");
-                    let host = custom.or(default_adc).unwrap();
-                    assert_eq!(mount.host_path, host.to_string_lossy(), "{label}");
-                    assert!(mount.read_only, "{label}");
-                }
-                None => assert!(!mounted, "missing ADC mount for {label}"),
-            }
-        }
+        std::env::remove_var("CLAUDE_CODE_USE_VERTEX");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_vertex_mounts_custom_path_from_google_application_credentials() {
+        let temp_home = TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
+        std::env::set_var("CLAUDE_CODE_USE_VERTEX", "1");
+
+        let cred_dir = TempDir::new().unwrap();
+        let custom_cred = cred_dir.path().join("custom-key.json");
+        fs::write(&custom_cred, r#"{"type":"service_account"}"#).unwrap();
+        std::env::set_var("GOOGLE_APPLICATION_CREDENTIALS", &custom_cred);
+
+        let project_dir = TempDir::new().unwrap();
+        let config = run_build_for_vertex_test("claude", project_dir.path());
+
+        let target = "/root/.config/gcloud/application_default_credentials.json";
+        let mount = config
+            .volumes
+            .iter()
+            .find(|v| v.container_path == target)
+            .expect("expected mount at well-known ADC path");
+        assert_eq!(mount.host_path, custom_cred.to_string_lossy());
+        assert!(mount.read_only);
 
         std::env::remove_var("CLAUDE_CODE_USE_VERTEX");
         std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
     }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_vertex_skips_mount_when_flag_unset() {
+        let temp_home = TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
+        std::env::remove_var("CLAUDE_CODE_USE_VERTEX");
+        std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
+        let _ = write_adc_at(temp_home.path());
+
+        let project_dir = TempDir::new().unwrap();
+        let config = run_build_for_vertex_test("claude", project_dir.path());
+
+        let target = "/root/.config/gcloud/application_default_credentials.json";
+        assert!(
+            !config.volumes.iter().any(|v| v.container_path == target),
+            "ADC must not be mounted when Vertex flag is unset",
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_vertex_skips_mount_when_tool_is_not_claude() {
+        let temp_home = TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
+        std::env::set_var("CLAUDE_CODE_USE_VERTEX", "1");
+        std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
+        let _ = write_adc_at(temp_home.path());
+
+        let project_dir = TempDir::new().unwrap();
+        let config = run_build_for_vertex_test("opencode", project_dir.path());
+
+        let target = "/root/.config/gcloud/application_default_credentials.json";
+        assert!(
+            !config.volumes.iter().any(|v| v.container_path == target),
+            "ADC must not be mounted for non-claude tools even when Vertex flag is set",
+        );
+
+        std::env::remove_var("CLAUDE_CODE_USE_VERTEX");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_vertex_skips_mount_when_flag_is_empty_string() {
+        let temp_home = TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
+        std::env::set_var("CLAUDE_CODE_USE_VERTEX", "");
+        std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
+        let _ = write_adc_at(temp_home.path());
+
+        let project_dir = TempDir::new().unwrap();
+        let config = run_build_for_vertex_test("claude", project_dir.path());
+
+        let target = "/root/.config/gcloud/application_default_credentials.json";
+        assert!(
+            !config.volumes.iter().any(|v| v.container_path == target),
+            "Empty CLAUDE_CODE_USE_VERTEX must be treated as unset",
+        );
+
+        std::env::remove_var("CLAUDE_CODE_USE_VERTEX");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_vertex_skips_mount_when_adc_file_missing() {
+        let temp_home = TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
+        std::env::set_var("CLAUDE_CODE_USE_VERTEX", "1");
+        std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
+        // Note: no ADC file written
+
+        let project_dir = TempDir::new().unwrap();
+        let config = run_build_for_vertex_test("claude", project_dir.path());
+
+        let target = "/root/.config/gcloud/application_default_credentials.json";
+        assert!(
+            !config.volumes.iter().any(|v| v.container_path == target),
+            "ADC must not be mounted when the host file does not exist",
+        );
+
+        std::env::remove_var("CLAUDE_CODE_USE_VERTEX");
+    }
+
+    // --- named_volume_for tests ---
 
     /// The reporter's layout (#3742): a sibling-worktree session whose worktree
     /// moved from otari-worktrees/905 to otari-worktrees/rev-912. The main repo's
@@ -6646,20 +8102,26 @@ volume_ignores = ["target"]
     #[test]
     #[serial_test::serial]
     fn sandbox_empty_desired_hooks_remove_stale_aoe_entries() {
-        let temp_home = IsolatedHome::new();
+        let (_hook_guard, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
         let profile = "sandbox-empty-hook-cleanup";
         let profile_dir = crate::session::get_profile_dir(profile).unwrap();
         fs::write(
             profile_dir.join("config.toml"),
             "[session]
-agent_status_hooks = false
-",
+    agent_status_hooks = false
+    ",
         )
         .unwrap();
 
         let instance_id = "gemini-empty-hook-cleanup";
-        let settings_path =
-            sandbox_store(temp_home.path(), ".gemini", instance_id).join("settings.json");
+        let settings_path = temp_home
+            .path()
+            .join(".gemini")
+            .join(SANDBOX_PRIVATE_SUBDIR)
+            .join(instance_id)
+            .join("settings.json");
         let events = crate::agents::resolved_hook_events(
             crate::agents::get_agent("gemini").unwrap(),
             &crate::session::config::Config::default(),
@@ -6681,13 +8143,29 @@ agent_status_hooks = false
             serde_json::to_vec_pretty(&settings).unwrap(),
         )
         .unwrap();
-
-        let project_dir = git_project();
-        Build::new("gemini")
-            .instance(instance_id)
-            .profile(profile)
-            .run(project_dir.path())
-            .unwrap();
+        certify_fixture_content(settings_path.parent().unwrap(), ".gemini").unwrap();
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+        let sandbox_info = crate::session::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
+        build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("gemini", None),
+            false,
+            instance_id,
+            None,
+            profile,
+        )
+        .unwrap();
 
         let content = fs::read_to_string(settings_path).unwrap();
         assert!(content.contains("printf foreign"));

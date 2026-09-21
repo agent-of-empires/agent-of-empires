@@ -34,7 +34,7 @@ mod v026_repoint_acp_default_agent;
 pub(crate) mod v027_isolate_sandbox_stores;
 mod v028_clear_archived_live_status;
 mod v029_fold_pending_initial_turn;
-pub(crate) mod v030_isolate_sandbox_content;
+pub(crate) mod v031_isolate_sandbox_content;
 
 /// Fixtures shared by the migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -80,7 +80,7 @@ use anyhow::Result;
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 30;
+const CURRENT_VERSION: u32 = 31;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -185,9 +185,9 @@ const MIGRATIONS: &[Migration] = &[
         v029_fold_pending_initial_turn::run,
     ),
     (
-        30,
+        31,
         "isolate_sandbox_content",
-        v030_isolate_sandbox_content::run,
+        v031_isolate_sandbox_content::run,
     ),
 ];
 
@@ -272,7 +272,8 @@ fn run_migrations_inner(reporter: Option<progress::Reporter>, announce: bool) ->
         );
     }
     if current == CURRENT_VERSION {
-        return v027_isolate_sandbox_stores::reconcile_pending(announce);
+        v027_isolate_sandbox_stores::reconcile_pending(announce)?;
+        return v031_isolate_sandbox_content::reconcile_pending(announce);
     }
 
     let pending: Vec<&Migration> = MIGRATIONS
