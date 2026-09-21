@@ -311,12 +311,8 @@ fn locked_update_scope<R>(
     .map_err(RegistryError::Other)?
 }
 
-/// Return `base_name` if no entry in `scope` already uses it (case
-/// insensitive, matching `add`'s own conflict check), otherwise
-/// `"{base_name}-2"`, `"{base_name}-3"`, ... until one is free. Only used
-/// when a name was auto-derived (e.g. from a path basename), never when
-/// the user typed one explicitly — an explicit collision is a real
-/// conflict the user should see, not silently rename around.
+/// `base_name`, or the first free `"{base_name}-N"` (N >= 2) in `scope`. For auto-derived names
+/// only: an explicit name that collides must stay a conflict.
 pub fn unique_name(profile: &str, scope: ProjectScope, base_name: &str) -> String {
     let existing = match scope {
         ProjectScope::Global => load_global().unwrap_or_default(),

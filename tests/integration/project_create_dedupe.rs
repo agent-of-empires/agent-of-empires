@@ -1,9 +1,5 @@
-//! Route-level coverage for auto-deduping project names derived from a path
-//! basename (#task-9). `create_project` derives a name from the path's
-//! basename when the request omits `name`; two projects at different paths
-//! that happen to share a basename must both register rather than the
-//! second hitting the registry's same-name 409, because neither caller
-//! chose that name. See `projects::unique_name` in `src/session/projects.rs`.
+//! `POST /api/projects` without a `name` derives one from the path basename; two paths sharing a
+//! basename must both register (see `projects::unique_name`) instead of the second getting a 409.
 
 use agent_of_empires::server::test_support::{build_router_for_test, build_test_app_state};
 use axum::body::Body;

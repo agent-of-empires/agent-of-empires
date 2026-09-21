@@ -1,13 +1,7 @@
 // @vitest-environment jsdom
 //
-// The sidebar's "+" quick-create (App.tsx's handleCreateSession) opens the
-// wizard with `prefill.path` already set to a known project, never going
-// through ProjectStep's own Recent/Browse/Clone selection — the only path
-// that previously reported a project's worktree-default override via
-// onSelectSavedProject. Without `prefill.worktreeEnabled`, that override was
-// silently dropped and the wizard fell back to the global default. Reported
-// live: setting a project's override to Off still showed the (conflicting)
-// global default of On after clicking "+".
+// The sidebar's "+" quick-create opens the wizard with `prefill.path` set, bypassing ProjectStep's
+// selection, so the override must arrive through `prefill.worktreeEnabled`.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
@@ -55,10 +49,7 @@ describe("SessionWizard prefill.worktreeEnabled (project override on quick-creat
   });
 
   it("applies the project's override even against a conflicting global default", async () => {
-    // The global default (worktree.enabled: true) deliberately conflicts
-    // with the project's override (false) — if the reducer ever ignored the
-    // override and just applied the profile default, this would still pass
-    // by coincidence with matching values.
+    // Conflicting values, so ignoring the override cannot pass by coincidence.
     let resolveSettings!: (settings: unknown) => void;
     fetchSettings.mockReturnValue(new Promise((resolve) => (resolveSettings = resolve)));
     const { getByText } = renderWizard({ path: "/repo/alpha", worktreeEnabled: false });
