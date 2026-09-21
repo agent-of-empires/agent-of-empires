@@ -493,6 +493,7 @@ impl Instance {
                     &self.project_path,
                     &stored,
                     &self.resolved_host_environment(),
+                    self.declared_agent_config_dir_for(&self.tool).as_deref(),
                 )
             {
                 tracing::info!(
@@ -3633,7 +3634,7 @@ pi = "~/.pi-personal"
 
     mod verify_on_resume {
         use super::*;
-        use crate::session::capture::encode_claude_project_path;
+        use crate::session::capture::{canonicalize_or_raw, encode_claude_project_path};
         use std::fs;
         use std::path::PathBuf;
         use std::time::{Duration, SystemTime};
@@ -3667,11 +3668,13 @@ pi = "~/.pi-personal"
             let (_hooks, _base, _hook_temp) = crate::hooks::test_support::BaseGuard::ready();
 
             let project_path = "/tmp/aoe-test-claude-sidecar-rotation";
-            let claude_dir = temp
-                .path()
-                .join(".claude")
-                .join("projects")
-                .join(encode_claude_project_path(project_path));
+            let claude_dir =
+                temp.path()
+                    .join(".claude")
+                    .join("projects")
+                    .join(encode_claude_project_path(
+                        &canonicalize_or_raw(project_path).to_string_lossy(),
+                    ));
             fs::create_dir_all(&claude_dir).unwrap();
             let stale = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
             let fresh = "11111111-2222-3333-4444-555555555555";
@@ -3700,11 +3703,13 @@ pi = "~/.pi-personal"
             let _guard = claude_home_guard(&temp);
 
             let project_path = "/tmp/aoe-test-observed-no-transcript";
-            let claude_dir = temp
-                .path()
-                .join(".claude")
-                .join("projects")
-                .join(encode_claude_project_path(project_path));
+            let claude_dir =
+                temp.path()
+                    .join(".claude")
+                    .join("projects")
+                    .join(encode_claude_project_path(
+                        &canonicalize_or_raw(project_path).to_string_lossy(),
+                    ));
             fs::create_dir_all(&claude_dir).unwrap();
 
             let stored = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
@@ -3778,11 +3783,13 @@ pi = "~/.pi-personal"
             let _guard = claude_home_guard(&temp);
 
             let project_path = "/tmp/aoe-test-stale-transcript";
-            let claude_dir = temp
-                .path()
-                .join(".claude")
-                .join("projects")
-                .join(encode_claude_project_path(project_path));
+            let claude_dir =
+                temp.path()
+                    .join(".claude")
+                    .join("projects")
+                    .join(encode_claude_project_path(
+                        &canonicalize_or_raw(project_path).to_string_lossy(),
+                    ));
             fs::create_dir_all(&claude_dir).unwrap();
 
             let stored = "12121212-3434-5656-7878-9a9a9a9a9a9a";
@@ -3829,7 +3836,9 @@ pi = "~/.pi-personal"
                 let claude_home = temp.path().join(format!(".claude-{profile}"));
                 let dir = claude_home
                     .join("projects")
-                    .join(encode_claude_project_path(project_path));
+                    .join(encode_claude_project_path(
+                        &canonicalize_or_raw(project_path).to_string_lossy(),
+                    ));
                 fs::create_dir_all(&dir).unwrap();
                 // The profile-scoped transcript, not another config tree,
                 // proves this stored id is resumable.
@@ -3935,11 +3944,13 @@ pi = "~/.pi-personal"
             let _guard = claude_home_guard(&temp);
 
             let project_path = "/tmp/aoe-test-2344-shared-cwd";
-            let claude_dir = temp
-                .path()
-                .join(".claude")
-                .join("projects")
-                .join(encode_claude_project_path(project_path));
+            let claude_dir =
+                temp.path()
+                    .join(".claude")
+                    .join("projects")
+                    .join(encode_claude_project_path(
+                        &canonicalize_or_raw(project_path).to_string_lossy(),
+                    ));
             fs::create_dir_all(&claude_dir).unwrap();
 
             // `mine` is this instance's real conversation (named by its
@@ -4021,11 +4032,13 @@ pi = "~/.pi-personal"
             let _guard = claude_home_guard(&temp);
 
             let project_path = "/tmp/aoe-test-2344-sandbox";
-            let claude_dir = temp
-                .path()
-                .join(".claude")
-                .join("projects")
-                .join(encode_claude_project_path(project_path));
+            let claude_dir =
+                temp.path()
+                    .join(".claude")
+                    .join("projects")
+                    .join(encode_claude_project_path(
+                        &canonicalize_or_raw(project_path).to_string_lossy(),
+                    ));
             fs::create_dir_all(&claude_dir).unwrap();
 
             // `stored` is distinct from the sidecar `mine`, so the assertion

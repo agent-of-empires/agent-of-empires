@@ -1916,7 +1916,7 @@ fn profile_move_group_metadata_survives_reload() {
             .entry("beta".to_string())
             .or_insert_with(|| GroupTree::new_with_groups(&[], &[]));
         let requested = view.instances["moved"].clone();
-        view.move_to_profile_with_effect("moved", "beta", requested, None, |_| Ok(()))
+        view.move_to_profile_with_effect("moved", "beta", requested, None, false, |_| Ok(()))
             .unwrap();
     }
 

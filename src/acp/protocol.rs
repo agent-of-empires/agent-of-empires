@@ -3,6 +3,7 @@
 //! queue and attachment types live in crate::daemon so no-default clients use
 //! the same JSON shape as the server.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -10,6 +11,23 @@ use serde::{Deserialize, Serialize};
 use super::approvals::ApprovalDecision;
 use super::state::{DiffComment, Event};
 use crate::daemon::PromptAttachmentKind;
+
+/// `BackgroundAgentLaunched::output_file` is a host filesystem path: persisted
+/// in event_json so a restarted daemon can re-tail the sub-agent, but never
+/// sent to clients. Every place an `Event` is serialized for a client goes
+/// through this so the invariant holds structurally.
+fn strip_transcript_path(event: &Event) -> Cow<'_, Event> {
+    match event {
+        Event::BackgroundAgentLaunched { output_file, .. } if !output_file.is_empty() => {
+            let mut stripped = event.clone();
+            if let Event::BackgroundAgentLaunched { output_file, .. } = &mut stripped {
+                output_file.clear();
+            }
+            Cow::Owned(stripped)
+        }
+        _ => Cow::Borrowed(event),
+    }
+}
 
 /// One frame on the per-AppState structured view broadcast channel: the structured view
 /// session id plus the typed structured view Event. Subscribed WebSocket
@@ -44,7 +62,7 @@ impl Serialize for AcpBroadcastFrame {
         let mut s = serializer.serialize_struct("AcpBroadcastFrame", 3)?;
         s.serialize_field("session_id", &self.session_id)?;
         s.serialize_field("seq", &self.seq)?;
-        s.serialize_field("event", &*self.event)?;
+        s.serialize_field("event", &*strip_transcript_path(&self.event))?;
         s.end()
     }
 }
@@ -396,6 +414,34 @@ mod tests {
         // and a frame parsed back from it carries no generation to trust.
         assert!(!json.contains("worker_generation"));
         assert_eq!(back.worker_generation, None);
+    }
+
+    #[test]
+    fn broadcast_frame_strips_background_agent_output_file() {
+        let frame = AcpBroadcastFrame {
+            session_id: "s-1".into(),
+            seq: 1,
+            event: Arc::new(Event::BackgroundAgentLaunched {
+                agent_id: "a1".into(),
+                tool_call_id: "tc1".into(),
+                description: "d".into(),
+                prompt: "p".into(),
+                model: "m".into(),
+                output_file: "/home/user/.aoe/transcripts/a1.jsonl".into(),
+                started_at: chrono::Utc::now(),
+            }),
+            worker_generation: None,
+        };
+        let json = serde_json::to_string(&frame).unwrap();
+        assert!(
+            !json.contains("transcripts"),
+            "transcript path must not reach the client: {json}"
+        );
+        let back: AcpBroadcastFrame = serde_json::from_str(&json).unwrap();
+        match &*back.event {
+            Event::BackgroundAgentLaunched { output_file, .. } => assert_eq!(output_file, ""),
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 
     #[test]

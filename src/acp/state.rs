@@ -886,10 +886,15 @@ pub enum Event {
         description: String,
         prompt: String,
         model: String,
-        /// Local transcript path the daemon tails. Never serialized (a
-        /// host fs path, useless and mildly sensitive to clients); read
-        /// by the notification handler to spawn the tailer, then dropped.
-        #[serde(default, skip_serializing)]
+        /// Local transcript path the daemon tails, read by the
+        /// notification handler to spawn the tailer. Persisted (in
+        /// `event_json`) so a daemon that restarts mid-run can re-tail a
+        /// sub-agent that survived it; a row from before this field existed
+        /// deserializes to the empty default, which the resume sweep treats
+        /// as untrackable and detaches instead. A host fs path, so it is
+        /// stripped before any client-facing frame; see
+        /// `protocol::strip_transcript_path`.
+        #[serde(default)]
         output_file: String,
         started_at: DateTime<Utc>,
     },
@@ -996,6 +1001,13 @@ pub enum Event {
         /// migration is needed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt_id: Option<String>,
+        /// True when the daemon queued this turn itself (a rate-limit resume
+        /// continuation) rather than the user typing it just now. The
+        /// transcript model skips rendering a row for it: the user already
+        /// saw this text once, before the park. `#[serde(default)]` keeps
+        /// pre-existing persisted events deserialising as non-synthesized.
+        #[serde(default)]
+        synthesized: bool,
     },
     /// The agent's prompt capabilities, captured from the ACP
     /// `initialize` response right after the handshake (and re-emitted
@@ -1665,6 +1677,7 @@ mod tests {
             prompt_id: None,
             text: text.into(),
             attachments: Vec::new(),
+            synthesized: false,
         }
     }
 
@@ -2037,6 +2050,7 @@ mod tests {
             prompt_id: None,
             text: "go".into(),
             attachments: Vec::new(),
+            synthesized: false,
         })
         .unwrap();
         s.apply_event(Event::BackgroundAgentLaunched {
@@ -2127,6 +2141,7 @@ mod tests {
             prompt_id: None,
             text: "go".into(),
             attachments: Vec::new(),
+            synthesized: false,
         })
         .unwrap();
         s.apply_event(Event::BackgroundAgentLaunched {

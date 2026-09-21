@@ -43,12 +43,13 @@ mod v030_serve_passphrase_policy;
 mod v031_pending_purge_owners;
 mod v032_capture_purge_runners;
 mod v033_canonical_sidebar;
+mod v034_fold_pending_initial_turn;
 
 use anyhow::Result;
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 33;
+const CURRENT_VERSION: u32 = 34;
 const VERSION_FILE: &str = ".schema_version";
 
 struct Migration {
@@ -222,6 +223,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 33,
         name: "canonical_sidebar",
         run: v033_canonical_sidebar::run,
+    },
+    Migration {
+        version: 34,
+        name: "fold_pending_initial_turn",
+        run: v034_fold_pending_initial_turn::run,
     },
 ];
 

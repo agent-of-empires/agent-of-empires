@@ -28,6 +28,12 @@ enum ProbeResult {
     Dead,
 }
 
+pub(crate) struct ResumeLaunchOptions {
+    pub(crate) resume_policy: ResumeAttemptPolicy,
+    pub(crate) restart: bool,
+    pub(crate) conversation_carry: Option<ConversationCarry>,
+}
+
 const RESUME_PROBE_MAX: std::time::Duration = std::time::Duration::from_millis(3000);
 
 const RESUME_PROBE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
@@ -68,17 +74,20 @@ impl Instance {
         skip_on_launch: bool,
         resume_policy: ResumeAttemptPolicy,
     ) -> Result<StartOutcome> {
-        self.orchestrate_resume_launch(size, skip_on_launch, resume_policy, true, false)
+        self.orchestrate_resume_launch(size, skip_on_launch, resume_policy, true, false, None)
     }
 
     /// Restart, first removing the sandbox container when `discard_sandbox_container`
-    /// is set so the launch recreates it with the current tool's mounts (#3959).
+    /// is set so the launch recreates it with the current tool's mounts (#3959),
+    /// and carrying the conversation into the incoming account's config root
+    /// when the swap changed only the account (#4030).
     /// Removal happens only once this restart owns the Launch reservation.
     pub fn restart_discarding_sandbox_container(
         &mut self,
         size: Option<(u16, u16)>,
         skip_on_launch: bool,
         discard_sandbox_container: bool,
+        conversation_carry: Option<ConversationCarry>,
     ) -> Result<StartOutcome> {
         self.orchestrate_resume_launch(
             size,
@@ -86,6 +95,7 @@ impl Instance {
             ResumeAttemptPolicy::HonorAutoResumeSetting,
             true,
             discard_sandbox_container,
+            conversation_carry,
         )
     }
 
@@ -191,7 +201,7 @@ impl Instance {
         skip_on_launch: bool,
         resume_policy: ResumeAttemptPolicy,
     ) -> Result<StartOutcome> {
-        self.orchestrate_resume_launch(size, skip_on_launch, resume_policy, false, false)
+        self.orchestrate_resume_launch(size, skip_on_launch, resume_policy, false, false, None)
     }
 
     fn orchestrate_resume_launch(
@@ -201,6 +211,7 @@ impl Instance {
         resume_policy: ResumeAttemptPolicy,
         restart: bool,
         discard_sandbox_container: bool,
+        conversation_carry: Option<ConversationCarry>,
     ) -> Result<StartOutcome> {
         crate::session::validate_instance_id(&self.id)
             .context("refusing to start: AOE_INSTANCE_ID failed validation")?;
@@ -243,12 +254,15 @@ impl Instance {
             &storage,
             size,
             skip_on_launch,
-            resume_policy,
-            restart,
             LaunchReservation {
                 generation,
                 title_lock,
                 lifecycle_lock,
+            },
+            ResumeLaunchOptions {
+                resume_policy,
+                restart,
+                conversation_carry,
             },
         )
     }
@@ -258,20 +272,13 @@ impl Instance {
         storage: &dyn crate::session::SessionStore,
         size: Option<(u16, u16)>,
         skip_on_launch: bool,
-        resume_policy: ResumeAttemptPolicy,
-        restart: bool,
         reservation: LaunchReservation,
+        options: ResumeLaunchOptions,
     ) -> Result<StartOutcome> {
-        let generation = self.prepare_reserved_launch_hooks(storage, restart, reservation)?;
+        let generation =
+            self.prepare_reserved_launch_hooks(storage, options.restart, reservation)?;
         let hook_result = self.run_pre_launch_hooks(skip_on_launch, storage, None);
-        self.finish_reserved_launch(
-            storage,
-            size,
-            resume_policy,
-            restart,
-            generation,
-            hook_result,
-        )
+        self.finish_reserved_launch(storage, size, options, generation, hook_result)
     }
     pub(crate) fn capture_before_restart_in(
         &mut self,
@@ -323,27 +330,31 @@ impl Instance {
         &mut self,
         storage: &dyn crate::session::SessionStore,
         size: Option<(u16, u16)>,
-        resume_policy: ResumeAttemptPolicy,
-        restart: bool,
+        options: ResumeLaunchOptions,
         generation: u64,
         hook_result: Result<()>,
     ) -> Result<StartOutcome> {
         let (_title_lock, _lifecycle_lock) =
             self.reacquire_launch_locks_after_hooks(storage, generation, hook_result)?;
+        let ResumeLaunchOptions {
+            resume_policy,
+            restart,
+            conversation_carry,
+        } = options;
         let skipped_failed_resume_sid = self.apply_resume_policy(resume_policy);
-        let mut prepared = match self
-            .apply_fresh_launch_intent(storage)
-            .and_then(|()| self.prepare_launch_command(storage))
-        {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                self.fail_reserved_launch(storage, generation, &error, false);
-                return Err(error);
-            }
-        };
+        if let Err(error) = self.apply_fresh_launch_intent(storage) {
+            self.fail_reserved_launch(storage, generation, &error, false);
+            return Err(error);
+        }
         let result = (|| {
             if restart {
                 self.kill_clean_locked()?;
+            }
+            if let Some(carry) = conversation_carry {
+                carry.run();
+            }
+            let mut prepared = self.prepare_launch_command(storage)?;
+            if restart {
                 prepared = self.refresh_prepared_prime_launch_after_pane_stop(
                     prepared,
                     crate::session::storage::CaptureStorage::Scoped(storage),
@@ -545,6 +556,78 @@ mod tests {
     use crate::session::instance::test_helpers::install_aliases;
     use serial_test::serial;
     use tempfile::tempdir;
+
+    /// Pins the order inside `stop_carry_and_prepare`: the launch command is
+    /// built from whether the incoming account's transcript exists, so the
+    /// carry has to have published it by then. Preparing first yields
+    /// `--session-id <sid>` on an id the agent rejects as already in use once
+    /// the carry creates the transcript (#3399, #4030).
+    #[test]
+    #[serial]
+    fn carry_runs_before_the_launch_command_picks_its_resume_flag() {
+        const SID: &str = "11111111-2222-3333-4444-555555555555";
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let home = dirs::home_dir().expect("home");
+        let app_dir = crate::session::get_app_dir().expect("app dir");
+        std::fs::create_dir_all(&app_dir).expect("app dir");
+        std::fs::write(
+            app_dir.join("config.toml"),
+            "[session.agent_detect_as]\n\
+             claude-1 = \"claude\"\n\
+             claude-2 = \"claude\"\n\
+             \n\
+             [session.agent_config_dir]\n\
+             claude-1 = \"~/dot-claude-1\"\n\
+             claude-2 = \"~/dot-claude-2\"\n",
+        )
+        .expect("config");
+        let profile = crate::session::config::effective_profile("");
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(&profile);
+        crate::session::config::profile_config::resolve_config_or_warn(&profile);
+
+        let project = home.join("project");
+        std::fs::create_dir_all(&project).expect("project");
+        let mut inst = Instance::new("t", project.to_str().unwrap());
+        inst.tool = "claude-1".to_string();
+        inst.detect_as = "claude".to_string();
+        // The renamed-wrapper shape these per-account tools take: a bare token
+        // the launch shell resolves, which keeps native resume available.
+        inst.command = "claude".to_string();
+        inst.agent_session_id = Some(SID.to_string());
+
+        // The outgoing account holds the conversation, the incoming one does not.
+        let encoded = crate::session::capture::encode_claude_project_path(
+            &crate::session::capture::canonicalize_or_raw(project.to_str().unwrap())
+                .to_string_lossy(),
+        );
+        let seeded = home.join("dot-claude-1").join("projects").join(&encoded);
+        std::fs::create_dir_all(&seeded).expect("seed dir");
+        std::fs::write(seeded.join(format!("{SID}.jsonl")), "conversation\n").expect("seed");
+
+        let carry = match crate::session::conversation_carry::classify(&inst, &profile, "claude-2")
+        {
+            crate::session::conversation_carry::ToolSwap::KeepConversation(Some(carry)) => carry,
+            other => panic!("expected a planned carry, got {other:?}"),
+        };
+        inst.swap_account("claude-2");
+
+        let storage = crate::session::storage::Storage::new_unwatched(&profile).unwrap();
+        carry.run();
+        let prepared = inst.prepare_launch_command(&storage).expect("prepare");
+
+        assert!(
+            prepared.is_existing,
+            "the carried transcript must be visible when the flag is chosen"
+        );
+        assert!(
+            prepared
+                .command
+                .as_deref()
+                .is_some_and(|command| command.contains(&format!("--resume {SID}"))),
+            "expected --resume on the carried conversation, got: {:?}",
+            prepared.command
+        );
+    }
     type PostShellCallback = Box<dyn FnOnce(&crate::tmux::Session)>;
     thread_local! {
         static POST_SHELL_OBSERVER: std::cell::RefCell<Option<PostShellCallback>> = const { std::cell::RefCell::new(None) };

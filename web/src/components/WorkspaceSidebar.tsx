@@ -67,6 +67,7 @@ import type {
   Workspace,
 } from "../lib/types";
 import { ProjectsSection } from "./ProjectsSection";
+import { SidebarSystemHealth } from "./SystemHealthStrip";
 import type { SidebarAxis } from "../lib/sidebarAxis";
 import {
   archivableWorkspaces,
@@ -4378,6 +4379,8 @@ export function WorkspaceSidebar({
             </div>
           )}
         </div>
+
+        <SidebarSystemHealth />
 
         <div className="border-t border-surface-700/20 p-2 flex items-center gap-1">
           {trashedWorkspaces.length > 0 && (

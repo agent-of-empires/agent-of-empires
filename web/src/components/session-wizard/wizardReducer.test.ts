@@ -26,6 +26,33 @@ function makeState(overrides: Partial<WizardState> = {}): WizardState {
 }
 
 describe("SessionWizard reducer / APPLY_PROFILE_DEFAULTS (#1142)", () => {
+  it("never re-enables a worktree on a path the repo probe already rejected", () => {
+    // A remembered or prefilled path resolves `/api/git/is-repo` at mount, often
+    // before the chained profile+settings fetch seeds the defaults. The seeded
+    // worktree default must not flip the toggle back on for a plain folder.
+    const state = makeState({ data: { ...initialData, path: "/tmp/plain", pathIsGitRepo: false, useWorktree: false } });
+    const next = reducer(state, {
+      type: "APPLY_PROFILE_DEFAULTS",
+      yoloMode: false,
+      sandboxEnabled: false,
+      worktreeEnabled: true,
+      tool: "claude",
+      extraEnv: [],
+    });
+    expect(next.data.useWorktree).toBe(false);
+    const repo = makeState({ data: { ...initialData, path: "/tmp/repo", pathIsGitRepo: true } });
+    expect(
+      reducer(repo, {
+        type: "APPLY_PROFILE_DEFAULTS",
+        yoloMode: false,
+        sandboxEnabled: false,
+        worktreeEnabled: true,
+        tool: "claude",
+        extraEnv: [],
+      }).data.useWorktree,
+    ).toBe(true);
+  });
+
   it("seeds yoloMode from a profile-resolved fetch on mount", () => {
     // Simulates the mount-time path: the user never touched the picker,
     // and /api/settings?profile=<active> resolved with yolo_mode_default

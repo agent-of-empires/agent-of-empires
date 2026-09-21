@@ -1332,6 +1332,7 @@ impl HomeView {
                     target_profile,
                     projected_move,
                     Some(&current_instance),
+                    false,
                     move |candidate| {
                         if tied_edit {
                             if let Some(worktree_info) = effect_instance.worktree_info.as_ref() {

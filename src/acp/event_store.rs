@@ -149,6 +149,14 @@ pub struct RateLimitPark {
     pub last_resume_attempt_ms: Option<i64>,
 }
 
+/// One unresolved `BackgroundAgentLaunched` row. See
+/// `EventStore::unresolved_background_agent_launches`.
+#[derive(Debug, Clone)]
+pub struct UnresolvedBackgroundAgentLaunch {
+    pub agent_id: String,
+    pub output_file: String,
+}
+
 /// SQLite-backed structured view event log. One row per (session_id, seq).
 ///
 /// The generic storage mechanics (schema, append, retention prune, keyset
@@ -1641,6 +1649,57 @@ impl EventStore {
         rows.filter_map(|r| r.ok()).collect()
     }
 
+    /// `agent_id` and `output_file` for `BackgroundAgentLaunched` events
+    /// with no matching `BackgroundAgentCompleted`, the same set as
+    /// [`Self::unresolved_background_agent_ids`] but carrying the
+    /// transcript path a resumed tailer needs. Used by `Supervisor::attach`
+    /// to resume tracking a sub-agent that survived the restart instead of
+    /// eagerly detaching it.
+    pub fn unresolved_background_agent_launches(
+        &self,
+        session_id: &str,
+    ) -> Vec<UnresolvedBackgroundAgentLaunch> {
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let mut stmt = match conn.prepare(
+            "SELECT json_extract(event_json, '$.BackgroundAgentLaunched.agent_id'),
+                    json_extract(event_json, '$.BackgroundAgentLaunched.output_file')
+             FROM acp_events
+             WHERE session_id = ?1
+               AND discriminant = 'BackgroundAgentLaunched'
+               AND json_extract(event_json, '$.BackgroundAgentLaunched.agent_id') IS NOT NULL
+               AND json_extract(event_json, '$.BackgroundAgentLaunched.agent_id') NOT IN (
+                   SELECT json_extract(event_json, '$.BackgroundAgentCompleted.agent_id')
+                   FROM acp_events
+                   WHERE session_id = ?1
+                     AND discriminant = 'BackgroundAgentCompleted'
+                     AND json_extract(event_json, '$.BackgroundAgentCompleted.agent_id') IS NOT NULL
+               )
+             ORDER BY seq ASC",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(target: "acp.event_store", "prepare unresolved_background_agent_launches for {session_id}: {e}");
+                return Vec::new();
+            }
+        };
+        let rows = match stmt.query_map(params![session_id], |row| {
+            Ok(UnresolvedBackgroundAgentLaunch {
+                agent_id: row.get(0)?,
+                output_file: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            })
+        }) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(target: "acp.event_store", "query unresolved_background_agent_launches for {session_id}: {e}");
+                return Vec::new();
+            }
+        };
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
     /// True iff the session has a `UserPromptSent` whose turn never
     /// terminated (no later `Stopped` or `AgentStartupError`). Used at
     /// daemon startup to decide whether to synthesize a `Stopped` event
@@ -2452,6 +2511,7 @@ mod tests {
             prompt_id: None,
             text: text.into(),
             attachments: vec![],
+            synthesized: false,
         }
     }
 
@@ -2570,6 +2630,7 @@ mod tests {
                 name: Some("shot.png".into()),
                 size: 7,
             }],
+            synthesized: false,
         }
     }
 
@@ -2580,6 +2641,7 @@ mod tests {
             prompt_id: None,
             text: text.into(),
             attachments: vec![],
+            synthesized: false,
         };
         // A session with no prompt yet => None (manual rename has nothing to
         // name from).
@@ -2885,6 +2947,7 @@ mod tests {
                     prompt_id: None,
                     text: "hello".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -3095,6 +3158,7 @@ mod tests {
                     prompt_id: None,
                     text: "hi".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -3403,6 +3467,7 @@ mod tests {
                     prompt_id: None,
                     text: "go".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -3465,6 +3530,7 @@ mod tests {
                     prompt_id: None,
                     text: "go".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -3510,6 +3576,7 @@ mod tests {
                     prompt_id: None,
                     text: "go".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -3536,6 +3603,7 @@ mod tests {
                     prompt_id: None,
                     text: "go".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -3571,6 +3639,7 @@ mod tests {
                     prompt_id: None,
                     text: "go".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -3599,6 +3668,7 @@ mod tests {
                     prompt_id: None,
                     text: "keep working".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -3637,6 +3707,7 @@ mod tests {
                     prompt_id: None,
                     text: "look at this".into(),
                     attachments: vec![att.clone()],
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -3667,6 +3738,7 @@ mod tests {
                     prompt_id: None,
                     text: "go".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -3695,6 +3767,7 @@ mod tests {
                     prompt_id: None,
                     text: "old prompt".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -3738,6 +3811,7 @@ mod tests {
                     prompt_id: None,
                     text: "first".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -3758,6 +3832,7 @@ mod tests {
                     prompt_id: None,
                     text: "second".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -3785,6 +3860,7 @@ mod tests {
                     prompt_id: None,
                     text: "schedule a wake in 2m".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -3807,6 +3883,7 @@ mod tests {
                     prompt_id: None,
                     text: "btw, ping me when you wake".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -3923,6 +4000,7 @@ mod tests {
                     prompt_id: None,
                     text: "stop watching".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -4019,6 +4097,7 @@ mod tests {
                     prompt_id: None,
                     text: "hi".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -4044,6 +4123,7 @@ mod tests {
                     prompt_id: None,
                     text: "schedule a wake".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -4066,6 +4146,7 @@ mod tests {
                     prompt_id: None,
                     text: "ping me when you wake".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -4097,6 +4178,7 @@ mod tests {
                     prompt_id: None,
                     text: "Wake-up fired. Confirm.".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -4123,6 +4205,7 @@ mod tests {
                     prompt_id: None,
                     text: "first prompt past at".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -4134,6 +4217,7 @@ mod tests {
                     prompt_id: None,
                     text: "second prompt past at".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -4158,6 +4242,7 @@ mod tests {
                         prompt_id: None,
                         text: "hello".into(),
                         attachments: Vec::new(),
+                        synthesized: false,
                     },
                 )
                 .unwrap();
@@ -4194,6 +4279,7 @@ mod tests {
                     prompt_id: None,
                     text: "go".into(),
                     attachments: Vec::new(),
+                    synthesized: false,
                 },
             )
             .unwrap();
@@ -4291,6 +4377,7 @@ mod tests {
                     text: "again".into(),
                     attachments: Vec::new(),
                     prompt_id: None,
+                    synthesized: false,
                 }],
                 false,
                 false,
@@ -5005,6 +5092,7 @@ mod tests {
             prompt_id: None,
             text: t.into(),
             attachments: vec![],
+            synthesized: false,
         };
         store.record("s-1", 2, &prompt("A")).unwrap();
         store.record("s-1", 3, &Event::ThinkingStarted).unwrap();

@@ -227,7 +227,12 @@ pub(crate) async fn spawn_structured_session(
         native.set_status_id(instance.id.clone());
         instance.created_by_plugin = created_by_plugin;
         instance.plugin_create_idempotency = plugin_create_idempotency;
-        instance.pending_initial_turn = pending_initial_turn;
+        instance.pending_initial_turn =
+            pending_initial_turn.map(|text| crate::session::PendingInitialTurn {
+                text,
+                attachments: Vec::new(),
+                synthesized: false,
+            });
         instance.acp_mode_id = acp_mode_id;
         instance.callback_url = callback_url;
         instance.idempotency_key = idempotency_key;
@@ -530,8 +535,15 @@ pub(crate) async fn spawn_structured_session(
             native.adopt_runtime_fields(&instance)?;
         } else {
             let outcome = instance.finish_reserved_launch(
-                store, size.map(|size| (size.cols.get(), size.rows.get())), crate::session::ResumeAttemptPolicy::HonorAutoResumeSetting,
-                false, generation, hooks,
+                store,
+                size.map(|size| (size.cols.get(), size.rows.get())),
+                crate::session::ResumeLaunchOptions {
+                    resume_policy: crate::session::ResumeAttemptPolicy::HonorAutoResumeSetting,
+                    restart: false,
+                    conversation_carry: None,
+                },
+                generation,
+                hooks,
             );
             let _title = crate::session::acquire_session_title_lock(&instance.id)?;
             let _lifecycle = native.storage().acquire_instance_lifecycle_lock(&instance.id)?;

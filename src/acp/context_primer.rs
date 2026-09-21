@@ -721,6 +721,7 @@ mod tests {
                 prompt_id: None,
                 text: text.to_string(),
                 attachments: Vec::new(),
+                synthesized: false,
             },
         )
     }

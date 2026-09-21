@@ -231,21 +231,13 @@ impl HomeView {
             }
         }
     }
-}
 
-impl HomeView {
-    /// Submit a daemon stop for `id` through the feed. On success the row is
-    /// left untouched: the daemon's canonical snapshot drives it. On refusal
-    /// the row is likewise untouched and the caller surfaces the returned
-    /// error (which carries reconnect guidance); the outcome is never
-    /// replayed. Returns the admitted submission for callers that need it.
+    /// Submit a daemon stop for id through the feed. The daemon snapshot remains authoritative.
     pub(in crate::tui) fn submit_daemon_stop_via_ui(&mut self, id: &str) -> anyhow::Result<()> {
         self.submit_daemon_stop(id).map(|_| ())
     }
 
-    /// Submit a daemon stop for `id`. `Ok(true)` admits the submit (row left
-    /// untouched for the canonical snapshot); `Ok(false)` refuses it with an
-    /// info dialog and no local write.
+    /// Submit a daemon stop and surface a refusal without mutating local state.
     pub(in crate::tui) fn submit_daemon_stop(&mut self, id: &str) -> anyhow::Result<bool> {
         match self
             .session_feed
