@@ -399,7 +399,7 @@ async fn native_creation_hooks_preserve_borrowed_scratch_resources() {
         if stage == "checkout_failure" {
             let git = h.install_path_command("git").join("git");
             std::fs::write(&git, format!(
-            "#!/bin/sh\nif [ \"$1\" = worktree ] && [ \"$2\" = add ]; then printf preserved > \"$3/foreign-file\"; printf '%s' \"$3\" > {failed_checkout:?}; echo checkout-refused >&2; exit 1; fi\nexec {real_git:?} \"$@\"\n"
+            "#!/bin/sh\nif [ \"$1\" = worktree ] && [ \"$2\" = add ]; then mkdir -p \"$3\"; printf preserved > \"$3/foreign-file\"; printf '%s' \"$3\" > {failed_checkout:?}; echo checkout-refused >&2; exit 1; fi\nexec {real_git:?} \"$@\"\n"
         )).unwrap();
         }
         let daemon = h.run_cli(&["serve", "--core-only", "--daemon"]);

@@ -952,6 +952,12 @@ pub fn daemon_pid() -> Option<u32> {
     }
 }
 
+/// Returns a verified daemon only when it exposes the web dashboard.
+pub(crate) fn web_daemon_pid() -> Option<u32> {
+    let pid = daemon_pid()?;
+    (!managed_launch(pid).is_ok_and(|launch| launch.core_only)).then_some(pid)
+}
+
 async fn validate_launch_args(profile: &str, args: &ServeArgs) -> Result<AuthMode> {
     crate::session::require_known_profile(profile)?;
     let auth_mode = if args.core_only {

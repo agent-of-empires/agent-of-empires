@@ -180,7 +180,7 @@ impl ServeView {
     /// Reattaches to a running daemon, otherwise opens the mode picker.
     pub fn new() -> Self {
         let pending_passphrase = load_or_generate_passphrase();
-        let state = if crate::cli::serve::daemon_pid().is_some() {
+        let state = if crate::cli::serve::web_daemon_pid().is_some() {
             // Daemons that predate `serve.mode` could only be Tunnel.
             let mode = read_serve_mode().unwrap_or(ServeMode::Tunnel);
             let passphrase = (mode == ServeMode::Tunnel)
