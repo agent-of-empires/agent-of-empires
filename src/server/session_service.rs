@@ -1245,27 +1245,22 @@ impl SessionService {
         let running = self.acp_supervisor.is_running(id).await;
         // Settled here, under the guard, rather than probed by each handler before it
         // claims one.
-        let rate_limit_exhausted =
-            !running && !idle_dormant && self.is_rate_limit_exhausted_park(id).await;
+        let rate_limit_parked = !running && !idle_dormant && self.is_rate_limit_parked(id).await;
         let liveness = crate::acp::dispatch::WorkerLiveness {
             running,
             idle_dormant,
-            rate_limit_exhausted,
+            rate_limit_parked,
         };
         crate::acp::dispatch::decide(&self.fold_control_state(id).await, liveness)
     }
 
-    /// Whether the session is parked on the redelivery cap.
-    async fn is_rate_limit_exhausted_park(&self, id: &str) -> bool {
+    /// See [`crate::acp::dispatch::WorkerLiveness::rate_limit_parked`].
+    async fn is_rate_limit_parked(&self, id: &str) -> bool {
         let store = Arc::clone(&self.acp_event_store);
         let id = id.to_string();
-        tokio::task::spawn_blocking(move || {
-            store
-                .rate_limit_park(&id)
-                .is_some_and(|park| park.cap_reached)
-        })
-        .await
-        .unwrap_or(false)
+        tokio::task::spawn_blocking(move || store.rate_limit_park(&id).is_some())
+            .await
+            .unwrap_or(false)
     }
 
     /// Drop a deleted session's submission lock, mirroring the `instance_locks` removal the

@@ -1026,7 +1026,7 @@ mod tests {
                     crate::acp::dispatch::WorkerLiveness {
                         running: true,
                         idle_dormant: false,
-                        rate_limit_exhausted: false,
+                        rate_limit_parked: false,
                     },
                 ),
                 expected,

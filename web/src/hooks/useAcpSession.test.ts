@@ -303,14 +303,35 @@ describe("sendPrompt outcomes", () => {
     });
   });
 
-  describe("rate-limit redelivery-cap park (#3688)", () => {
+  // A 503 that is not `worker_not_ready` is a real failure: it keeps its banner and the prompt
+  // is not silently parked on the queue.
+  it("does not re-enqueue a 503 that is not worker_not_ready", async () => {
+    calls = installAcpFakes(({ url, method }) => {
+      if (url.includes("/acp/replay")) return json({ frames: [], lost: false, highest_seq: 0 });
+      if (url.includes("/acp/prompt")) return new Response("worker_capacity_full (8/8)", { status: 503 });
+      if (url.includes("/queue") && method === "GET") return json([]);
+      return undefined;
+    });
+    const { result } = render("sess-capacity", "running", null, null);
+    await flushAsync();
+    await act(() => result.current.sendPrompt("no room at the inn"));
+    await flushAsync();
+    expect(posts("/queue")).toHaveLength(0);
+    expect(result.current.state.lastError).toMatch(/capacity/i);
+  });
+
+  // Both park kinds are sendable at `dispatch::decide`, and a still-limited spawn answers 503
+  // `worker_not_ready`, which re-queues the prompt. The armed park is the one a weekly limit
+  // produces (#3688 covers only the redelivery cap).
+  describe.each([
+    ["rate_limit_exhausted_retries", "rateLimitRetriesExhausted", "cap"],
+    ["rate_limited", "rateLimitParked", "armed"],
+  ] as const)("rate-limit park: %s", (reason, flag, tag) => {
     const parked =
       (isParked: boolean): Route =>
       ({ url, method }) => {
         if (url.includes("/acp/replay")) {
-          const frames = isParked
-            ? [{ session_id: "sess-cap", seq: 1, event: { Stopped: { reason: "rate_limit_exhausted_retries" } } }]
-            : [];
+          const frames = isParked ? [{ session_id: `sess-${tag}`, seq: 1, event: { Stopped: { reason } } }] : [];
           return json({ frames, lost: false, highest_seq: frames.length });
         }
         if (url.includes("/acp/prompt")) return new Response("worker_not_ready", { status: 503 });
@@ -318,25 +339,23 @@ describe("sendPrompt outcomes", () => {
         return undefined;
       };
 
-    it.each([
-      [true, 1],
-      [false, 0],
-    ])("parked=%s re-enqueues a 503'd prompt %i time(s)", async (isParked, enqueued) => {
+    // The re-queue keys on the daemon's `worker_not_ready`, not on this flag: a park the client
+    // has not learned about yet must not cost the prompt, so BOTH rows re-enqueue. The flag is
+    // still asserted because `canSendQueuedNow` reads it.
+    it.each([[true], [false]])("parked=%s re-enqueues a 503'd prompt", async (isParked) => {
       calls = installAcpFakes(parked(isParked));
-      const { result } = render("sess-cap", "running", null, null);
+      const { result } = render(`sess-${tag}`, "running", null, null);
       await flushAsync();
-      expect(result.current.state.rateLimitRetriesExhausted).toBe(isParked);
-      await act(() => result.current.sendPrompt("try again after the cap"));
+      expect(result.current.state[flag]).toBe(isParked);
+      await act(() => result.current.sendPrompt("try again after the park"));
       await flushAsync();
-      expect(posts("/queue")).toHaveLength(enqueued);
-      expect(result.current.state.queuedPrompts.map((q) => q.text)).toEqual(
-        enqueued ? ["try again after the cap"] : [],
-      );
+      expect(posts("/queue")).toHaveLength(1);
+      expect(result.current.state.queuedPrompts.map((q) => q.text)).toEqual(["try again after the park"]);
     });
 
     it("offers Send now on a row stranded behind the park", async () => {
       installAcpFakes(parked(true));
-      const { result } = await openSession("sess-cap-send", "absent", null, null);
+      const { result } = await openSession(`sess-${tag}-send`, "absent", null, null);
       expect(result.current.status).toBe("open");
       expect(result.current.canSendQueuedNow).toBe(true);
     });

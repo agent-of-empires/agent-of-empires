@@ -198,7 +198,7 @@ pub async fn acp_prompt_diff_comments(
     if let PromptDispatch::Queued { reason } = dispatch {
         return diff_comments_not_now(reason);
     }
-    // Idle-dormant and rate-limit-cap parks are sendable with no live worker.
+    // Idle-dormant sessions and rate-limit parks are sendable with no live worker.
     let needs_resume = woke_idle_dormant || !state.acp_supervisor.is_running(&id).await;
     if needs_resume {
         use crate::server::acp_reconciler::ResumeTrigger;
