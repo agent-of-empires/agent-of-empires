@@ -21,13 +21,18 @@ frames, `live.rs` the live pane messages. The daemon and the native client
 build the *same* types, so a field added to one reaches the other or fails to
 compile.
 
-The dashboard declares these shapes a third time, in TypeScript, and nothing
-can make that a compile error. `live.rs` therefore carries a test pinning its
-encoding, so a rename breaks a test before it can silently stop reaching the
-dashboard; `wire.rs` and `runtime.rs` test that they decode tolerantly but do
-not yet pin what they emit, and should. A new field on a live frame has to
-land in three places either way: the type here, the daemon that fills it, and
-`web/src/hooks/useLiveTerminal.ts`.
+The dashboard's copy of the live messages is generated from `live.rs` by
+[ts-rs](https://github.com/Aleph-Alpha/ts-rs) into `web/src/lib/liveWire.ts`,
+written whenever the lib tests run and checked in CI, so a new field on a live
+frame lands in two places rather than three: the type here and the daemon that
+fills it.
+
+Generated types agree on shape, not on meaning, so `live.rs` keeps its
+encoding test as well: the cursor-origin bug had both sides reading `cursor`
+and disagreeing about the grid it was measured from, which no schema catches.
+`wire.rs` and `runtime.rs` are still hand-mirrored in `web/src/lib/types.ts`;
+they test that they decode tolerantly but do not pin what they emit, and
+should.
 
 ## Which transport a surface uses
 

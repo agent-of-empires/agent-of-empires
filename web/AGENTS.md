@@ -17,6 +17,10 @@ npx tsc -b
 without `--features web` needs no JavaScript tooling. Use `npm run format` to fix oxfmt output;
 Prettier is not used.
 
+`src/lib/liveWire.ts` is generated from `src/daemon/live.rs` by `cargo test
+--lib daemon::live`. Change the Rust types and regenerate; edits to the
+TypeScript are overwritten and CI fails on a stale copy.
+
 ## Tests
 
 - Vitest with RTL and MSW: component logic and request payloads.

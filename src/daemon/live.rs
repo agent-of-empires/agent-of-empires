@@ -6,9 +6,12 @@
 //! client, and fields published on one side went unread on the other for
 //! releases at a time.
 //!
-//! The web dashboard declares the same shape a third time, in TypeScript, and
-//! nothing can make that one a compile error. `the_wire_is_what_both_clients_
-//! parse` in this module pins the encoding so a rename at least fails a test.
+//! The dashboard reads the same messages, and its copy is generated from
+//! these types into `web/src/lib/liveWire.ts` when the lib tests run, so a
+//! field added here reaches TypeScript as well. Generation agrees on shape
+//! and says nothing about meaning: `the_wire_is_what_both_clients_parse`
+//! stays because the cursor-origin bug had both sides reading the same field
+//! and disagreeing about what its number counted from.
 //!
 //! `docs/development/internals/client-transports.md` is the canonical
 //! description of this transport and the two beside it.
@@ -22,6 +25,11 @@ use serde::{Deserialize, Serialize};
 
 /// Cursor position, already translated onto the window grid by the daemon.
 /// Clients must not add a composite origin to it a second time.
+// The `TS` derives below write the dashboard's copy of these types when the
+// lib tests run. `export_to` is resolved against ts-rs's own `bindings/`
+// directory, which is why the path climbs out of it.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/liveWire.ts"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiveCursor {
     pub x: u16,
@@ -30,6 +38,8 @@ pub struct LiveCursor {
 
 /// Pane 0's rectangle inside a composited window. Input is pinned to pane 0,
 /// so a client maps pointer cells against this rather than the whole window.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/liveWire.ts"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LivePane0 {
     pub cols: u16,
@@ -40,6 +50,8 @@ pub struct LivePane0 {
 
 /// The pane state every content message carries. Each field defaults, so a
 /// frame from a daemon that predates one of them still parses.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/liveWire.ts"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LivePaneMeta {
@@ -66,10 +78,13 @@ pub struct LivePaneMeta {
     #[serde(default)]
     pub mouse_all: bool,
     #[serde(default)]
+    #[cfg_attr(test, ts(optional = nullable))]
     pub pane0: Option<LivePane0>,
 }
 
 /// Daemon to client.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/liveWire.ts"))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum LiveServerMessage {
@@ -80,6 +95,8 @@ pub enum LiveServerMessage {
         /// Absent only from a daemon that predates sequencing, which then
         /// cannot send patches either.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        // ts-rs maps u64 to `bigint`, which `JSON.parse` never produces.
+        #[cfg_attr(test, ts(type = "number | null"))]
         seq: Option<u64>,
         content: String,
         #[serde(flatten)]
@@ -89,7 +106,9 @@ pub enum LiveServerMessage {
     /// rows scrolled off the top.
     #[serde(rename = "patch")]
     Patch {
+        #[cfg_attr(test, ts(type = "number"))]
         seq: u64,
+        #[cfg_attr(test, ts(type = "number"))]
         base: u64,
         shift: usize,
         lines: Vec<(usize, String)>,
@@ -100,6 +119,7 @@ pub enum LiveServerMessage {
     #[serde(rename = "size_owner")]
     SizeOwner {
         is_owner: bool,
+        #[cfg_attr(test, ts(optional = nullable))]
         holder: Option<String>,
     },
     /// An OSC 52 copy from the pane, for the viewer's own clipboard.
@@ -118,6 +138,8 @@ pub enum LiveServerMessage {
 }
 
 /// Client to daemon. Binary messages are pane input and carry no envelope.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/liveWire.ts"))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum LiveClientMessage {
@@ -149,6 +171,7 @@ pub enum LiveClientMessage {
         patch: bool,
         /// What another client calls this one in its "took over" notice.
         #[serde(default)]
+        #[cfg_attr(test, ts(optional = nullable))]
         label: Option<String>,
     },
     /// Patch continuity is lost; send a full frame.

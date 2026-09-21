@@ -2,5 +2,5 @@
   "$schema": "./node_modules/oxfmt/configuration_schema.json",
   "printWidth": 120,
   "sortPackageJson": false,
-  "ignorePatterns": ["dist/", "coverage/", "node_modules/", "eslint-suppressions.json"]
+  "ignorePatterns": ["dist/", "coverage/", "node_modules/", "eslint-suppressions.json", "src/lib/liveWire.ts"]
 }

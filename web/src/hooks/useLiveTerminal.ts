@@ -3,6 +3,7 @@ import { getOrCreateDeviceBindingSecret } from "../lib/deviceBinding";
 import { getToken } from "../lib/token";
 import { buttonMouseBytes } from "../lib/liveMouse";
 import { createFrameInflater, supportsFrameDeflate, type FrameInflater } from "../lib/frameStream";
+import type { LiveClientMessage, LiveCursor, LivePane0, LiveServerMessage } from "../lib/liveWire";
 import { MAX_RETRIES, retryDelayMs } from "../lib/wsBackoff";
 import { reportTelemetrySeen } from "../lib/api";
 
@@ -27,18 +28,11 @@ const MAX_PENDING_INPUT_BYTES = 64 * 1024;
  * clamps whatever it is asked for. */
 const DEFAULT_MAX_WINDOW = 4000;
 
-export interface LiveCursor {
-  x: number;
-  y: number;
-}
-
-export interface LivePaneRect {
-  cols: number;
-  rows: number;
-  /** Optional origin within the composited window grid. Missing fields mean
-   *  `(0, 0)` for compatibility with older frames. */
-  left?: number;
-  top?: number;
+/** Sends a control message. Typing the argument is the point: the daemon's
+ *  `LiveClientMessage` is generated into `lib/liveWire.ts`, so a renamed or
+ *  added field fails here instead of being ignored on the wire. */
+function sendControl(ws: WebSocket, msg: LiveClientMessage) {
+  ws.send(JSON.stringify(msg));
 }
 
 /** Wire counters for the `?livedebug=1` overlay. Carried on the store
@@ -88,7 +82,7 @@ export interface LiveFrame {
   mouseAll: boolean;
   /** Pane 0's rectangle within the composited window grid (a split
    *  window). */
-  pane0?: LivePaneRect | null;
+  pane0?: LivePane0 | null;
 }
 
 export interface LiveTerminalState {
@@ -204,7 +198,7 @@ export function useLiveTerminal(
     desiredRef.current.window = lines;
     const ws = wsRef.current;
     if (ws?.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "window", lines }));
+      sendControl(ws, { type: "window", lines });
     }
   };
 
@@ -282,21 +276,21 @@ export function useLiveTerminal(
         // Negotiate ownership even if mobile keyboard occlusion has deferred
         // the first safe resize. The server claims only a vacant lock here;
         // an explicit takeover remains a separate user action.
-        ws.send(JSON.stringify({ type: "claim_if_vacant" }));
+        sendControl(ws, { type: "claim_if_vacant" });
         // Replay the component's desired geometry so a reconnected
         // server-side handler matches the client immediately.
         const desired = desiredRef.current;
         if (desired.resize) {
-          ws.send(JSON.stringify({ type: "resize", ...desired.resize }));
+          sendControl(ws, { type: "resize", ...desired.resize });
         }
         if (desired.window != null) {
-          ws.send(JSON.stringify({ type: "window", lines: desired.window }));
+          sendControl(ws, { type: "window", lines: desired.window });
         }
-        ws.send(JSON.stringify({ type: "cadence", fast: desired.fast }));
+        sendControl(ws, { type: "cadence", fast: desired.fast });
         // Advertise row patches, and the compressed frame stream where the
         // browser can inflate it; the server keeps sending full JSON text
         // frames otherwise (and old servers ignore the unknown message type).
-        ws.send(JSON.stringify({ type: "caps", deflate: supportsFrameDeflate(), patch: true }));
+        sendControl(ws, { type: "caps", deflate: supportsFrameDeflate(), patch: true });
         // Preserve the selector's gesture-bound first burst, but do not flush
         // it yet: the resize that establishes size ownership may still be in
         // flight, especially when a native TUI currently owns the pane.
@@ -309,33 +303,12 @@ export function useLiveTerminal(
       let resyncPending = false;
       const handleMessageText = (text: string) => {
         if (wsRef.current !== ws) return;
-        // Mirrors `LiveServerMessage` in src/daemon/live.rs, which is the
-        // contract's one authority. Nothing here can be a compile error, so a
-        // field added there has to be added here by hand; its
-        // `the_wire_is_what_both_clients_parse` test pins the names.
-        let msg: {
-          type?: string;
-          grid?: boolean;
-          maxWindow?: number;
-          content?: string;
-          seq?: number;
-          base?: number;
-          shift?: number;
-          lines?: [number, string][];
-          text?: string;
-          rows?: number;
-          history?: number;
-          cursor?: LiveCursor | null;
-          is_owner?: boolean;
-          holder?: string | null;
-          altScreen?: boolean;
-          mouse?: boolean;
-          mouseSgr?: boolean;
-          mouseAll?: boolean;
-          pane0?: LivePaneRect | null;
-        };
+        // `LiveServerMessage` is generated from src/daemon/live.rs, so a
+        // field added there arrives here. The cast is still a claim about a
+        // peer we do not control: read defensively below.
+        let msg: LiveServerMessage;
         try {
-          msg = JSON.parse(text) as typeof msg;
+          msg = JSON.parse(text) as LiveServerMessage;
         } catch {
           return;
         }
@@ -381,7 +354,7 @@ export function useLiveTerminal(
             if (!resyncPending) {
               resyncPending = true;
               stats.resyncs += 1;
-              ws.send(JSON.stringify({ type: "resync" }));
+              sendControl(ws, { type: "resync" });
             }
             return;
           }
@@ -398,7 +371,7 @@ export function useLiveTerminal(
         const incoming: LiveFrame = {
           content,
           lines,
-          seq: msg.seq,
+          seq: msg.seq ?? undefined,
           receivedAt: performance.now(),
           rows: msg.rows ?? 0,
           history: msg.history ?? 0,
@@ -561,7 +534,7 @@ export function useLiveTerminal(
   const claim = useCallback(() => {
     const ws = wsRef.current;
     if (ws?.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "claim" }));
+      sendControl(ws, { type: "claim" });
     }
   }, []);
 
@@ -577,15 +550,13 @@ export function useLiveTerminal(
   const forwardWheel = useCallback((up: boolean, col: number, row: number, count = 1) => {
     const ws = wsRef.current;
     if (ws?.readyState === WebSocket.OPEN && count > 0) {
-      ws.send(
-        JSON.stringify({
-          type: "wheel",
-          up,
-          col: Math.max(1, Math.floor(col)),
-          row: Math.max(1, Math.floor(row)),
-          count,
-        }),
-      );
+      sendControl(ws, {
+        type: "wheel",
+        up,
+        col: Math.max(1, Math.floor(col)),
+        row: Math.max(1, Math.floor(row)),
+        count,
+      });
     }
   }, []);
 
@@ -611,7 +582,7 @@ export function useLiveTerminal(
     desiredRef.current.resize = { cols, rows };
     const ws = wsRef.current;
     if (ws?.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "resize", cols, rows }));
+      sendControl(ws, { type: "resize", cols, rows });
     }
   }, []);
 
@@ -624,7 +595,7 @@ export function useLiveTerminal(
     desiredRef.current.fast = fast;
     const ws = wsRef.current;
     if (ws?.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "cadence", fast }));
+      sendControl(ws, { type: "cadence", fast });
     }
   }, []);
 
