@@ -1167,4 +1167,10 @@ fn test_reload_config_defaults_uses_project_worktree_override() {
     type_str(&mut dialog, &repo.path().to_string_lossy());
     dialog.handle_key(key(KeyCode::Tab));
     assert!(dialog.worktree_enabled);
+
+    // Submitting straight from the path field applies it too.
+    let mut dialog = single_tool_dialog();
+    dialog.path = Input::default();
+    type_str(&mut dialog, &repo.path().to_string_lossy());
+    assert!(submitted(dialog.handle_key(key(KeyCode::Enter))).worktree_enabled);
 }

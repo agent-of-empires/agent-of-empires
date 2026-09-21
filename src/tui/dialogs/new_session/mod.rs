@@ -1318,6 +1318,9 @@ impl NewSessionDialog {
             }
             KeyCode::Enter => {
                 self.error_message = None;
+                if self.focused_field == self.path_field() {
+                    self.seed_worktree_for_path();
+                }
                 // The server provisions the scratch dir, so no path check.
                 if !self.scratch {
                     let path_str = self.path.value().trim().to_string();
