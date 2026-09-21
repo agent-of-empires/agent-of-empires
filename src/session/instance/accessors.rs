@@ -393,10 +393,9 @@ impl Instance {
             .agent_config_dir_for(tool, &home)
     }
 
-    pub(super) fn sandbox_capture_store_dir(&self) -> Option<std::path::PathBuf> {
-        if !self.is_sandboxed()
-            || !crate::migrations::v031_isolate_sandbox_content::instance_ready(self).ok()?
-        {
+    /// Resolve the physical store without granting authority to read it.
+    pub(super) fn sandbox_capture_store_path(&self) -> Option<std::path::PathBuf> {
+        if !self.is_sandboxed() {
             return None;
         }
         let home = dirs::home_dir()?;
@@ -405,14 +404,36 @@ impl Instance {
         );
         let declared = config.session.agent_config_dir_for(&self.tool, &home);
         let agent = self.resolved_agent()?;
-        crate::session::config::container_config::sandbox_store_dir(
-            agent.name,
-            &home,
-            declared.as_deref(),
-            &self.id,
-        )
-        .ok()
-        .flatten()
+        if self.sandbox_store_generation
+            >= crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION
+        {
+            crate::session::config::container_config::sandbox_store_dir(
+                agent.name,
+                &home,
+                declared.as_deref(),
+                &self.id,
+            )
+            .ok()
+            .flatten()
+        } else {
+            crate::session::config::container_config::sandbox_store_migration_paths(
+                agent.name,
+                &home,
+                declared.as_deref(),
+                &self.id,
+            )
+            .ok()?
+            .into_iter()
+            .next()
+            .map(|(shared, _)| shared)
+        }
+    }
+
+    pub(super) fn sandbox_capture_store_dir(&self) -> Option<std::path::PathBuf> {
+        crate::migrations::v031_isolate_sandbox_content::instance_ready(self)
+            .ok()?
+            .then(|| self.sandbox_capture_store_path())
+            .flatten()
     }
     pub fn is_sub_session(&self) -> bool {
         self.parent_session_id.is_some()

@@ -100,11 +100,11 @@ impl<S: BroadcastSink> Supervisor<S> {
         debug!(
             target: "acp.supervisor",
             session = %session_id,
-            stored_id = ?req.stored_acp_session_id,
+            stored_id = ?config.stored_acp_session_id,
             "spawning structured view worker"
         );
         // Clear a partial replay from a failed import before session/load re-emits it.
-        if req.seed_history_replay {
+        if config.seed_history_replay {
             self.sink.clear_session_events(session_id);
         }
 
@@ -283,6 +283,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                     crate::acp::agent_profiles::resolve(native_key).native_config_agent;
                 let profile = req.source_profile.clone().unwrap_or_default();
                 let id = req.session_id.clone();
+                let continuation = req.sandbox_continuation;
                 let context = tokio::task::spawn_blocking(move || {
                     crate::migrations::v031_isolate_sandbox_content::prepare_acp_context(
                         &profile,
@@ -290,6 +291,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                         native_agent,
                         generation,
                         crate::migrations::v031_isolate_sandbox_content::AcpContextUse::Launch,
+                        continuation,
                     )
                 })
                 .await
@@ -598,6 +600,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                     native_agent,
                     generation,
                     crate::migrations::v031_isolate_sandbox_content::AcpContextUse::Attach,
+                    super::SandboxContinuation::Persisted,
                 )
             })
             .await

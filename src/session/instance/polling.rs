@@ -191,7 +191,7 @@ impl Instance {
                 {
                     continue;
                 }
-                let Some(peer_store) = peer.sandbox_capture_store_dir() else {
+                let Some(peer_store) = peer.sandbox_capture_store_path() else {
                     return false;
                 };
                 let Ok(peer_store) = std::fs::canonicalize(peer_store) else {
@@ -1041,14 +1041,13 @@ mod tests {
         current.source_profile = current_profile.to_string();
         let mut peer = sandboxed_gemini("peer", "/repos/peer", "/workspace/peer");
         peer.source_profile = peer_profile.to_string();
-        // The store is keyed by instance id (`sandbox-v2/<instance>`), so the
-        // one physical store two rows can still share is the same sandbox
-        // recorded in a second profile — the shape of a row moved or copied
-        // between profiles. Generation no longer selects the store path.
+        // A second profile can record the same generation-two sandbox before
+        // its local readiness proof is available. It still names the same
+        // physical store and must block capture.
         peer.id = current.id.clone();
         admit_fixture_content(&current);
         let shared_store = current.sandbox_capture_store_dir().unwrap();
-        assert_eq!(peer.sandbox_capture_store_dir().unwrap(), shared_store);
+        assert_eq!(peer.sandbox_capture_store_path().unwrap(), shared_store);
 
         current_storage
             .update(|instances, _| {
@@ -1067,12 +1066,14 @@ mod tests {
             "a peer row in another profile on the same physical store is not exclusive"
         );
 
-        // A peer sandbox with an id of its own resolves a store of its own, so
-        // the same cross-profile scan finds nothing to conflict with.
+        // A generation-one peer resolves the legacy shared store without
+        // needing readiness authority. It is physically distinct from the
+        // current private store, so it does not block capture.
         let mut peer = sandboxed_gemini("peer", "/repos/peer", "/workspace/peer");
         peer.source_profile = peer_profile.to_string();
-        admit_fixture_content(&peer);
-        let peer_store = peer.sandbox_capture_store_dir().unwrap();
+        peer.sandbox_store_generation = 1;
+        let peer_store = peer.sandbox_capture_store_path().unwrap();
+        std::fs::create_dir_all(&peer_store).unwrap();
         assert_ne!(peer_store, shared_store);
         peer_storage
             .update(|instances, _| {
@@ -1083,6 +1084,18 @@ mod tests {
         assert!(
             current.managed_capture_store_is_exclusive(backend),
             "distinct physical stores do not conflict"
+        );
+
+        let mut uncertified = sandboxed_gemini(
+            "uncertified",
+            "/repos/uncertified",
+            "/workspace/uncertified",
+        );
+        uncertified.source_profile = current_profile.to_string();
+        assert!(uncertified.sandbox_capture_store_dir().is_none());
+        assert!(
+            !uncertified.managed_capture_store_is_exclusive(backend),
+            "an uncertified current store never gains capture authority"
         );
     }
 

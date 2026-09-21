@@ -156,6 +156,7 @@ pub(crate) fn prepare_acp_context(
     agent: Option<&str>,
     generation: u64,
     usage: AcpContextUse,
+    continuation: crate::acp::supervisor::SandboxContinuation,
 ) -> Result<AcpLaunchContext> {
     let storage = crate::session::Storage::new_unwatched(profile)?;
     storage.update(|instances, _| {
@@ -180,11 +181,29 @@ pub(crate) fn prepare_acp_context(
         }
         let notice =
             claim_context_reset(instance, agent, NativeContextView::Structured, generation);
+        let (stored_session_id, fork_from, seed_history_replay) = match continuation {
+            crate::acp::supervisor::SandboxContinuation::Persisted => (
+                instance.acp_session_id.clone(),
+                instance.fork_pending.clone(),
+                instance.import_pending == Some(true),
+            ),
+            crate::acp::supervisor::SandboxContinuation::ImportTerminal if notice.is_none() => {
+                let id = instance
+                    .agent_session_id
+                    .as_deref()
+                    .filter(|id| !id.trim().is_empty())
+                    .map(str::to_owned);
+                let replay = id.is_some();
+                (id, None, replay)
+            }
+            crate::acp::supervisor::SandboxContinuation::ImportTerminal
+            | crate::acp::supervisor::SandboxContinuation::Fresh => (None, None, false),
+        };
         Ok(AcpLaunchContext {
             profile: storage.profile().to_owned(),
-            stored_session_id: instance.acp_session_id.clone(),
-            fork_from: instance.fork_pending.clone(),
-            seed_history_replay: instance.import_pending == Some(true),
+            stored_session_id,
+            fork_from,
+            seed_history_replay,
             notice,
         })
     })
@@ -917,6 +936,15 @@ fn extra_volume_host_source(entry: &str) -> Option<PathBuf> {
     std::env::current_dir().ok().map(|cwd| cwd.join(&source))
 }
 
+fn ordinary_mount_masks_bind(inspected: &crate::containers::InspectedContainer) -> bool {
+    inspected.ordinary_mounts.iter().any(|ordinary| {
+        inspected.bind_mounts.iter().any(|bind| {
+            let bind = Path::new(&bind.container_path);
+            ordinary.container_path.starts_with(bind) || bind.starts_with(&ordinary.container_path)
+        })
+    })
+}
+
 fn live_bind_sources(id: &str) -> Result<Vec<PathBuf>> {
     use std::os::unix::fs::MetadataExt;
     let mut container = crate::containers::DockerContainer::from_session_id(id);
@@ -941,13 +969,17 @@ fn live_bind_sources(id: &str) -> Result<Vec<PathBuf>> {
     // with any container. In those cases the declared bind sources are the
     // authoritative overlap evidence, which the caller still canonicalizes
     // against the recovery namespace.
-    if sources.is_empty()
-        || !can_prove_mounts(&inspected, crate::process::host_shares_container_kernel())
-    {
+    if !can_prove_mounts(&inspected, crate::process::host_shares_container_kernel()) {
         return Ok(sources);
     }
     if !inspected.opaque_mounts.is_empty() {
-        bail!("live sandbox {id} has opaque mounts; recovery exposure cannot be proven");
+        bail!("live sandbox {id} has unproven mounts; recovery exposure cannot be proven");
+    }
+    if ordinary_mount_masks_bind(&inspected) {
+        bail!("live sandbox {id} masks a bind destination needed for recovery exposure proof");
+    }
+    if sources.is_empty() {
+        return Ok(sources);
     }
     let boot = crate::process::boot_id().context("host kernel identity is unavailable")?;
     let boot = uuid::Uuid::parse_str(&boot).context("host kernel identity is malformed")?;
@@ -955,12 +987,14 @@ fn live_bind_sources(id: &str) -> Result<Vec<PathBuf>> {
         .iter()
         .map(|source| fs::metadata(source).map(|metadata| (metadata.dev(), metadata.ino())))
         .collect::<std::io::Result<_>>()?;
-    // Pin Docker/Podman's immutable runtime id. A local-looking socket is not
-    // same-kernel proof: Desktop/machine and remote daemons may sit behind it.
+    // Pin Docker/Podman's immutable runtime id.
     container.name = inspected.id;
-    let mut command = vec!["/bin/sh".to_owned(), "-c".to_owned(),
+    let mut command = vec![
+        "/bin/sh".to_owned(),
+        "-c".to_owned(),
         r#"PATH=/usr/bin:/bin; export PATH; stat -f -c %t /proc/sys/kernel/random/boot_id && cat /proc/sys/kernel/random/boot_id && stat -L -c %d:%i -- "$@""#.to_owned(),
-        "aoe-content-mount-proof".to_owned()];
+        "aoe-content-mount-proof".to_owned(),
+    ];
     command.extend(
         inspected
             .bind_mounts
@@ -1835,6 +1869,7 @@ fn migrate_target(
         record_reset_in(app, registry, id, tool, home, &config, &roots)?;
         return Ok(true);
     }
+    discard_stage(app, &mut receipt, &path)?;
     drop(registries.take());
     drop(transition.take());
     let workspace = Path::new(
@@ -2348,6 +2383,7 @@ mod tests {
             id: "c".into(),
             running,
             bind_mounts: Vec::new(),
+            ordinary_mounts: Vec::new(),
             opaque_mounts: Vec::new(),
             runtime_handler: handler.map(str::to_owned),
         };
@@ -2358,6 +2394,34 @@ mod tests {
         ));
         assert!(!can_prove_mounts(&inspected(true, None), false));
         assert!(!can_prove_mounts(&inspected(false, None), true));
+    }
+
+    #[test]
+    fn ordinary_volume_only_blocks_a_mount_proof_when_destinations_overlap() {
+        use crate::containers::container_interface::InspectedMount;
+        use crate::containers::{InspectedContainer, VolumeMount};
+
+        let mut inspected = InspectedContainer {
+            id: "c".into(),
+            running: true,
+            bind_mounts: vec![VolumeMount {
+                host_path: "/host/source".into(),
+                container_path: "/workspace".into(),
+                read_only: false,
+            }],
+            ordinary_mounts: vec![InspectedMount {
+                kind: "volume".into(),
+                name: Some("cache".into()),
+                source: Some("/runtime/cache".into()),
+                container_path: "/cache".into(),
+                read_only: false,
+            }],
+            opaque_mounts: Vec::new(),
+            runtime_handler: None,
+        };
+        assert!(!ordinary_mount_masks_bind(&inspected));
+        inspected.ordinary_mounts[0].container_path = "/workspace".into();
+        assert!(ordinary_mount_masks_bind(&inspected));
     }
 
     /// A named volume or a relative source is not a host path, so it is dropped
@@ -2934,6 +2998,113 @@ mod tests {
         }
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn acp_continuation_intent_controls_only_the_requested_history_lane() {
+        use crate::acp::supervisor::SandboxContinuation;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let project = temporary.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let mut instance = crate::session::Instance::new("claude", project.to_str().unwrap());
+        instance.tool = "claude".into();
+        instance.agent_session_id = Some("terminal-context".into());
+        instance.acp_session_id = Some("persisted-acp-context".into());
+        instance.fork_pending = Some("persisted-fork".into());
+        instance.import_pending = Some(true);
+        instance.sandbox_info = Some(crate::session::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".into(),
+            container_name: "aoe-sandbox-continuation".into(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: None,
+            before_start_env: Vec::new(),
+        });
+        drop(admit_fresh_instance(&instance).unwrap());
+        let storage = crate::session::Storage::new_unwatched("default").unwrap();
+        storage
+            .update(|instances, _| {
+                *instances = vec![instance.clone()];
+                Ok(())
+            })
+            .unwrap();
+
+        let imported = prepare_acp_context(
+            "default",
+            &instance.id,
+            Some("claude"),
+            7,
+            AcpContextUse::Launch,
+            SandboxContinuation::ImportTerminal,
+        )
+        .unwrap();
+        assert_eq!(
+            imported.stored_session_id.as_deref(),
+            Some("terminal-context")
+        );
+        assert!(imported.fork_from.is_none());
+        assert!(imported.seed_history_replay);
+
+        let fresh = prepare_acp_context(
+            "default",
+            &instance.id,
+            Some("claude"),
+            8,
+            AcpContextUse::Launch,
+            SandboxContinuation::Fresh,
+        )
+        .unwrap();
+        assert!(fresh.stored_session_id.is_none());
+        assert!(fresh.fork_from.is_none());
+        assert!(!fresh.seed_history_replay);
+
+        storage
+            .update(|instances, _| {
+                instances[0]
+                    .sandbox_content_resets
+                    .push(SandboxContentReset {
+                        slot: "claude".into(),
+                        transaction: "reset".into(),
+                        tool: "claude".into(),
+                        agent: "claude".into(),
+                        roots: Vec::new(),
+                        recovery: Vec::new(),
+                        terminal: ResetLane {
+                            pending: false,
+                            generation: None,
+                        },
+                        structured: ResetLane {
+                            pending: true,
+                            generation: None,
+                        },
+                        retired_terminal: Some("terminal-context".into()),
+                        retired_structured: vec![
+                            "persisted-acp-context".into(),
+                            "persisted-fork".into(),
+                        ],
+                        retired_import: true,
+                    });
+                Ok(())
+            })
+            .unwrap();
+        let reset_import = prepare_acp_context(
+            "default",
+            &instance.id,
+            Some("claude"),
+            9,
+            AcpContextUse::Launch,
+            SandboxContinuation::ImportTerminal,
+        )
+        .unwrap();
+        assert!(reset_import.notice.is_some());
+        assert!(reset_import.stored_session_id.is_none());
+        assert!(reset_import.fork_from.is_none());
+        assert!(!reset_import.seed_history_replay);
+    }
+
     /// An adapter that names no native agent still has to answer for a pending
     /// structured lane, or that row keeps resuming the retired conversation.
     #[test]
@@ -2987,11 +3158,26 @@ mod tests {
         fs::write(&registry, serde_json::to_vec(&vec![row]).unwrap()).unwrap();
 
         assert!(
-            prepare_acp_context("default", &instance.id, None, 1, AcpContextUse::Attach).is_err(),
+            prepare_acp_context(
+                "default",
+                &instance.id,
+                None,
+                1,
+                AcpContextUse::Attach,
+                crate::acp::supervisor::SandboxContinuation::Persisted,
+            )
+            .is_err(),
             "an adapter that names no native agent cannot attach to a moved lane"
         );
-        let context =
-            prepare_acp_context("default", &instance.id, None, 1, AcpContextUse::Launch).unwrap();
+        let context = prepare_acp_context(
+            "default",
+            &instance.id,
+            None,
+            1,
+            AcpContextUse::Launch,
+            crate::acp::supervisor::SandboxContinuation::Persisted,
+        )
+        .unwrap();
         assert!(
             context.notice.is_some(),
             "the structured lane is claimed and announced"
@@ -3086,6 +3272,65 @@ mod tests {
             "a stale stage is not published"
         );
         assert!(!stage.exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_staged_receipt_is_rebuilt_from_the_latest_stopped_content() {
+        let temporary = tempfile::tempdir().unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let home = dirs::home_dir().unwrap();
+        let app = crate::session::get_app_dir().unwrap();
+        let project = temporary.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let mut instance = crate::session::Instance::new("claude", project.to_str().unwrap());
+        instance.tool = "claude".to_owned();
+        let config = crate::session::Config::default();
+        let roots = container_config::sandbox_content_roots(
+            "claude",
+            None,
+            &config.session,
+            &home,
+            &instance.id,
+        )
+        .unwrap();
+        let root = &roots
+            .iter()
+            .find(|root| root.roles.iter().any(|role| role == ".claude"))
+            .unwrap()
+            .path;
+        let resume = root.join("projects/proj/session.jsonl");
+        fs::create_dir_all(resume.parent().unwrap()).unwrap();
+        fs::write(&resume, b"OLD").unwrap();
+        let mut row = serde_json::to_value(&instance).unwrap();
+        row["sandbox_info"] = serde_json::json!({
+            "enabled": true,
+            "image": "img",
+            "container_name": "aoe-sandbox-fixture",
+        });
+        let registry = app.join("sessions.json");
+        fs::write(&registry, serde_json::to_vec(&vec![row.clone()]).unwrap()).unwrap();
+        let (receipt_path, mut receipt) = checked_receipt(&app, &row, "claude", &roots).unwrap();
+        stage_receipt(&app, &mut receipt, &receipt_path, &home, &config, &project).unwrap();
+        assert_eq!(receipt.phase, Phase::Staged);
+        let staged_resume = receipt
+            .roots
+            .iter()
+            .find(|part| part.root.path == *root)
+            .unwrap()
+            .stage
+            .join("projects/proj/session.jsonl");
+        assert_eq!(fs::read(staged_resume).unwrap(), b"OLD");
+
+        fs::write(&resume, b"LATEST").unwrap();
+        let target = (registry.as_path(), instance.id.as_str(), "claude");
+        assert!(
+            migrate_target(&app, &home, target, &|_| Ok(false), &|_| Ok(true), &|_| {
+                Ok(Vec::new())
+            })
+            .unwrap()
+        );
+        assert_eq!(fs::read(&resume).unwrap(), b"LATEST");
     }
 
     #[test]

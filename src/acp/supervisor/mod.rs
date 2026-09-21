@@ -198,6 +198,14 @@ pub struct AgentCommandOverride {
     pub command: String,
 }
 
+/// Which durable continuation lane a sandboxed spawn may consume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxContinuation {
+    Persisted,
+    ImportTerminal,
+    Fresh,
+}
+
 #[derive(Debug, Clone)]
 pub struct SpawnRequest {
     pub session_id: String,
@@ -216,6 +224,7 @@ pub struct SpawnRequest {
     pub stored_acp_session_id: Option<String>,
     /// Parent ACP session id to `session/fork` from.
     pub fork_from: Option<String>,
+    pub sandbox_continuation: SandboxContinuation,
     pub sandbox_info: Option<SandboxInfo>,
     pub source_profile: Option<String>,
     pub yolo_mode: bool,
